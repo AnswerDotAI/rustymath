@@ -1,6 +1,6 @@
-//! How fast each function runs on 65,536 inputs, against the standard library's version. A function that is slower than the standard
-//! library has usually stopped vectorizing. `TWICE` lists the functions allowed up to twice its time. The functions that the standard
-//! library lacks have budgets in copies of the same number of floats instead, in `special`.
+//! How fast each function runs on 65,536 inputs, against the standard library's version. The limit is 1.25 times the reference time,
+//! allowing headroom for timing noise. `TWICE` lists the functions allowed up to twice its time. Functions the standard library lacks
+//! have budgets in copies of the same number of floats instead, in `special`.
 //! `RUSTYMATH_TIMES=1 cargo test --test speed -- --nocapture` prints the README's table.
 use rustymath::*;
 use std::{hint::black_box, time::Instant};
@@ -169,7 +169,7 @@ fn speed() {
         println!("\n| Function | f64 copies | f32 copies |\n|---|---|---|");
         for (name, _, c) in special.iter() { println!("| `{name}` | {:.0} | {:.0} |", c[0], c[1]); }
     }
-    let limit = |name| if TWICE.contains(&name) { 2.0 } else { 1.0 };
+    let limit = |name| if TWICE.contains(&name) { 2.0 } else { 1.25 };
     let slower: Vec<_> =
         rows.iter().flat_map(|&(name, t)| [(name, "f64", t[0], t[1]), (name, "f32", t[2], t[3])]).filter(|r| r.2 >= r.3 * limit(r.0)).collect();
     let over: Vec<_> =

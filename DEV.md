@@ -11,7 +11,7 @@ nbdev-preview
 ship-rs-build
 ```
 
-`cargo test` runs the accuracy tests, the speed test and the doc examples. `tests/speed.rs` fails when a function is slower than the standard library's version, or when `pow` or `root` takes more than twice its time. The special functions, which the standard library lacks, fail when they take more than their budget in copies of floats of the same width, about twice their cost on the Mac. Either failure usually means a loop stopped vectorizing. With `RUSTYMATH_TIMES` set, the test prints the README's table, then the special functions' costs.
+`cargo test` runs the accuracy tests, the speed test and the doc examples. `tests/speed.rs` fails when a function takes at least 1.25 times the standard library's time, or twice for `pow` and `root`. The margin allows headroom for timing noise. The special functions, which the standard library lacks, fail when they take more than their budget in copies of floats of the same width. Either failure usually means a loop stopped vectorizing. With `RUSTYMATH_TIMES` set, the test prints the README's table, then the special functions' costs.
 
 ## Layout
 
