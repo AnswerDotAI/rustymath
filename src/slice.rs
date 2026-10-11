@@ -1,8 +1,8 @@
 //! Slice forms of rustymath's functions. Each function object, such as [`Pow`], has a scalar form `one` and a slice form `many`.
-//! Both run code that rustymath compiles once for each float type, inside its own crate. A caller's build settings can't change that
+//! Both run code that rustymath compiles once for each item type, inside its own crate. A caller's build settings can't change that
 //! code, and rustymath's speed test times what callers run. An edit to a function's body rebuilds only rustymath.
 use crate::float::{
-    sealed::{Dispatch, Forms, Item, Kind, OutAt, RealForms},
+    sealed::{Forms, Item},
     Float,
 };
 use num_complex::Complex;
@@ -43,9 +43,8 @@ impl<T: Copy> Arg<'_, T> {
     }
 }
 
-/// Defines each arity's public trait, with two blanket impls: one at every [`Float`] type, through dispatch, and one at each concrete
-/// item type, whose forms `forms!` writes with no dispatch. The concrete types pass through `@concrete` one at a time, so that the
-/// argument names don't repeat inside the types' repetition.
+/// Defines each arity's public trait, with a blanket impl at each item type that reaches the forms `forms!` writes. The types pass
+/// through `@concrete` one at a time, so that the argument names don't repeat inside the types' repetition.
 macro_rules! arities {
     ($($(#[$doc:meta])* $name:ident<$n:literal>($($x:ident),+);)+) => {$(
         $(#[$doc])*
@@ -62,16 +61,7 @@ macro_rules! arities {
             /// `one`, or `None` where the item fails, as `many` reports.
             fn checked(&self, $($x: T),+) -> Option<Self::Out>;
         }
-        impl<F: Float, K: RealForms<$n>> $name<F> for K {
-            type Out = OutAt<K, F, $n>;
-            #[inline]
-            fn one(&self, $($x: F),+) -> Self::Out { F::call_one(self, [$($x),+]) }
-            #[inline]
-            fn many(&self, $($x: Arg<'_, F>,)+ n: usize, out: &mut Vec<Self::Out>) -> bool { F::call_many(self, [$($x),+], n, out) }
-            #[inline]
-            fn checked(&self, $($x: F),+) -> Option<Self::Out> { F::call_checked(self, [$($x),+]) }
-        }
-        arities!(@concrete $name, $n, ($($x),+): Complex<f32>, Complex<f64>, i8, i16, i32, i64, u8, u16, u32, u64);
+        arities!(@concrete $name, $n, ($($x),+): f16, f32, f64, Complex<f32>, Complex<f64>, i8, i16, i32, i64, u8, u16, u32, u64);
     )+};
     (@concrete $name:ident, $n:literal, $args:tt: $e:ty $(, $rest:ty)*) => {
         arities!(@impl $name, $n, $args, $e);
@@ -179,9 +169,8 @@ fn mapped<E: Copy, O, const N: usize>(x: &[Arg<'_, E>; N], n: usize, out: &mut V
 }
 
 /// Appends `f` for each of `n` results to `out`, for arguments `x`, and gives whether every result succeeded, as [`Outcome`] says.
-/// This is the loop that `forms!`'s default slice form runs, and a custom slice form runs it too once it has read its settings. The
-/// loop judges each output alone, and a [`Total`] output not at all. Only where some output is NaN does a second pass look at the
-/// arguments of the NaN outputs, which is rare.
+/// Slice forms call it through [`each!`]. The loop judges each output alone, and a [`Total`] output not at all. Only where some output
+/// is NaN does a second pass look at the arguments of the NaN outputs, which is rare.
 #[inline(always)]
 pub(crate) fn each<E: Item, O: Item, R: Outcome<O>, const N: usize>(
     x: [Arg<'_, E>; N], n: usize, out: &mut Vec<O>, f: impl Fn([E; N]) -> R,
@@ -191,76 +180,90 @@ pub(crate) fn each<E: Item, O: Item, R: Outcome<O>, const N: usize>(
         || (R::RESCUE && out[start..].iter().enumerate().all(|(i, &r)| kept(r, items(&x, i))))
 }
 
-/// Writes a function object's forms, compiled inside rustymath. `at real` writes them at `f32` and `f64`, and through dispatch every
-/// [`Float`] type then has them. Otherwise the list names concrete item types, such as `Complex<f32>` or `i64`. `=> T` makes the
+/// [`each`] with the item body marked `#[inline(always)]`. Every slice form runs its loop this way: `forms!`'s default slice form, and
+/// a custom slice form once it has read its settings. LLVM leaves a large unmarked body out of line, and its call stops the loop
+/// vectorizing.
+macro_rules! each {
+    ($x:expr, $n:expr, $out:expr, |$args:pat_param| $body:expr $(,)?) => {
+        crate::slice::each($x, $n, $out, #[inline(always)] |$args| $body)
+    };
+}
+
+/// Writes a function object's forms, compiled inside rustymath. The list names the item types, such as `Complex<f32>` or `i64`. `real`
+/// stands for `f32` and `f64`, and also writes an `f16` form, which runs the `f32` form and narrows its outputs. `=> T` makes the
 /// output type `T` in place of the item type: for each listed type, or after `real` for every float type. The object is the first
 /// argument of the item body, and its items the bracketed ones. The body gives an output, an `Option` of one, or a [`Total`] output,
-/// as [`Outcome`] says. A `many` body replaces the default slice form, which runs the item body through [`each`]. Its arguments are
+/// as [`Outcome`] says. A `many` body replaces the default slice form, which runs the item body through [`each!`]. Its arguments are
 /// the object, the bracketed `Arg`s, the number of results, and the vector they append to.
 ///
 /// A function object is a concrete type, never a generic one, so that its forms compile here. Settings that choose a loop, such as
-/// whether a tolerance is 0, are read once per call inside `many`, which then runs `each`.
+/// whether a tolerance is 0, are read once per call inside `many`, which then runs `each!`.
 ///
 /// ```ignore
 /// forms!(Sqrt at real: |_, [x]| x.sqrt());
 /// forms!(Abs at Complex<f32> => f32, Complex<f64> => f64: |_, [z]| p::hypot::<_, { crate::FUSED }>(z.re, z.im));
 /// forms!(Gcd at i64: |_, [x, y]| gcd(x, y));
 /// forms!(Less at real => bool: |k, [x, y]| with_tolerance!(k.0, |t| t.less(x, y)),
-///     many |k, [x, y], n, out| with_tolerance!(k.0, |t| crate::slice::each([x, y], n, out, |[x, y]| t.less(x, y))));
+///     many |k, [x, y], n, out| with_tolerance!(k.0, |t| each!([x, y], n, out, |[x, y]| t.less(x, y))));
 /// ```
 macro_rules! forms {
     ($object:ident at real $(=> $o:ty)? : |$k:pat_param, $args:tt| $body:expr $(, many |$mk:pat_param, $margs:tt, $n:ident, $out:ident| $many:expr)?) => {
-        forms!(@real $object, forms!(@kind $($o)?), $k, $args, $body, [$((|$mk, $margs, $n, $out| $many))?]);
+        forms!(@types $object, $k, $args, $body, [$((|$mk, $margs, $n, $out| $many))?], [f32 $(=> $o)?, f64 $(=> $o)?]);
+        forms!(@half $object, forms!(@out half::f16 $(, $o)?), forms!(@narrow $($o)?), $args);
     };
     ($object:ident at $($e:ty $(=> $o:ty)?),+ : |$k:pat_param, $args:tt| $body:expr $(, many |$mk:pat_param, $margs:tt, $n:ident, $out:ident| $many:expr)?) => {
         forms!(@types $object, $k, $args, $body, [$((|$mk, $margs, $n, $out| $many))?], [$($e $(=> $o)?),+]);
     };
-    // One concrete type at a time, so that the optional `many` group, which repeats on its own, needn't sit inside the types' repetition.
+    // One type at a time, so that the optional `many` group, which repeats on its own, needn't sit inside the types' repetition.
     (@types $object:ident, $k:pat_param, $args:tt, $body:expr, $many:tt, [$e:ty $(=> $o:ty)? $(, $($rest:tt)+)?]) => {
         forms!(@concrete $object, $e, forms!(@out $e $(, $o)?), $k, $args, $body, $many);
         $(forms!(@types $object, $k, $args, $body, $many, [$($rest)+]);)?
     };
-    (@real $object:ident, $kind:ty, $k:pat_param, [$($x:ident),+], $body:expr, $many:tt) => {
-        impl crate::float::sealed::RealForms<{ forms!(@n $($x),+) }> for $object {
-            type Kind = $kind;
-            forms!(@methods f32 => <$kind as crate::float::sealed::Kind>::At<f32>, scalar_f32, checked_f32, slice_f32, $k, [$($x),+], $body, $many);
-            forms!(@methods f64 => <$kind as crate::float::sealed::Kind>::At<f64>, scalar_f64, checked_f64, slice_f64, $k, [$($x),+], $body, $many);
-        }
-    };
     (@concrete $object:ident, $e:ty, $o:ty, $k:pat_param, [$($x:ident),+], $body:expr, $many:tt) => {
         impl crate::float::sealed::Forms<$e, { forms!(@n $($x),+) }> for $object {
             type Out = $o;
-            forms!(@methods $e => $o, scalar, checked_scalar, slice, $k, [$($x),+], $body, $many);
+            fn scalar(&self, [$($x),+]: [$e; forms!(@n $($x),+)]) -> $o {
+                let $k = self;
+                crate::slice::Outcome::<$o>::value($body)
+            }
+            fn checked_scalar(&self, [$($x),+]: [$e; forms!(@n $($x),+)]) -> Option<$o> {
+                let $k = self;
+                let (r, ok) = crate::slice::Outcome::<$o>::judged($body, [$($x),+]);
+                ok.then_some(r)
+            }
+            forms!(@slice $e => $o, $k, [$($x),+], $body, $many);
         }
     };
-    (@methods $e:ty => $o:ty, $scalar:ident, $checked:ident, $slice:ident, $k:pat_param, [$($x:ident),+], $body:expr, $many:tt) => {
-        fn $scalar(&self, [$($x),+]: [$e; forms!(@n $($x),+)]) -> $o {
+    (@slice $e:ty => $o:ty, $k:pat_param, [$($x:ident),+], $body:expr, []) => {
+        fn slice(&self, args: [crate::Arg<'_, $e>; forms!(@n $($x),+)], n: usize, out: &mut Vec<$o>) -> bool {
             let $k = self;
-            crate::slice::Outcome::<$o>::value($body)
-        }
-        fn $checked(&self, [$($x),+]: [$e; forms!(@n $($x),+)]) -> Option<$o> {
-            let $k = self;
-            let (r, ok) = crate::slice::Outcome::<$o>::judged($body, [$($x),+]);
-            ok.then_some(r)
-        }
-        forms!(@slice $e => $o, $slice, $k, [$($x),+], $body, $many);
-    };
-    (@slice $e:ty => $o:ty, $slice:ident, $k:pat_param, [$($x:ident),+], $body:expr, []) => {
-        fn $slice(&self, args: [crate::Arg<'_, $e>; forms!(@n $($x),+)], n: usize, out: &mut Vec<$o>) -> bool {
-            let $k = self;
-            crate::slice::each(args, n, out, #[inline(always)] |[$($x),+]| $body)
+            each!(args, n, out, |[$($x),+]| $body)
         }
     };
-    (@slice $e:ty => $o:ty, $slice:ident, $k:pat_param, $args:tt, $body:expr, [(|$mk:pat_param, [$($mx:ident),+], $n:ident, $out:ident| $many:expr)]) => {
-        fn $slice(&self, [$($mx),+]: [crate::Arg<'_, $e>; forms!(@n $($mx),+)], $n: usize, $out: &mut Vec<$o>) -> bool {
+    (@slice $e:ty => $o:ty, $k:pat_param, $args:tt, $body:expr, [(|$mk:pat_param, [$($mx:ident),+], $n:ident, $out:ident| $many:expr)]) => {
+        fn slice(&self, [$($mx),+]: [crate::Arg<'_, $e>; forms!(@n $($mx),+)], $n: usize, $out: &mut Vec<$o>) -> bool {
             let $mk = self;
             $many
         }
     };
-    (@kind) => { crate::float::sealed::Same };
-    (@kind $o:ty) => { crate::float::sealed::Fixed<$o> };
+    (@half $object:ident, $o:ty, $narrow:expr, [$($x:ident),+]) => {
+        impl crate::float::sealed::Forms<half::f16, { forms!(@n $($x),+) }> for $object {
+            type Out = $o;
+            fn scalar(&self, x: [half::f16; forms!(@n $($x),+)]) -> $o {
+                ($narrow)(crate::float::sealed::Forms::<f32, { forms!(@n $($x),+) }>::scalar(self, x.map(half::f16::to_f32)))
+            }
+            fn checked_scalar(&self, x: [half::f16; forms!(@n $($x),+)]) -> Option<$o> {
+                crate::float::sealed::Forms::<f32, { forms!(@n $($x),+) }>::checked_scalar(self, x.map(half::f16::to_f32)).map($narrow)
+            }
+            fn slice(&self, x: [crate::Arg<'_, half::f16>; forms!(@n $($x),+)], n: usize, out: &mut Vec<$o>) -> bool {
+                crate::slice::working(x, n, out, |x, m, o| crate::float::sealed::Forms::<f32, { forms!(@n $($x),+) }>::slice(self, x, m, o), $narrow)
+            }
+        }
+    };
     (@out $e:ty) => { $e };
     (@out $e:ty, $o:ty) => { $o };
+    (@narrow) => { half::f16::from_f32 };
+    (@narrow $o:ty) => { std::convert::identity };
     (@n $($x:ident),+) => { [$(stringify!($x)),+].len() };
 }
 
@@ -318,7 +321,8 @@ pub(crate) fn appended<B, T>(out: &mut Vec<B>, n: usize, write: impl FnOnce(&mut
 /// Appends `f` for each of `n` results, for arguments `x`, for a function `f` with a fast form that holds for all but rare items.
 /// `fast` computes every item with no branch, and gives `None` for the rare items. Each `CHUNK` of items runs in two passes. The first
 /// writes NaN for each rare item and judges each result alone, as [`each`] does. The second runs only if the chunk holds a NaN. It
-/// recomputes each NaN item with `f` and judges it by its arguments too. A rare item costs a scan of its own chunk only.
+/// recomputes each NaN item with `f` and judges it by its arguments too. A rare item costs a scan of its own chunk only. Slice forms
+/// call it through [`two_pass!`].
 #[inline(always)]
 pub(crate) fn two_pass<R: crate::Float, const N: usize>(
     x: [Arg<'_, R>; N], n: usize, out: &mut Vec<R>, fast: impl Fn([R; N]) -> Option<R>, f: impl Fn([R; N]) -> R,
@@ -341,9 +345,16 @@ pub(crate) fn two_pass<R: crate::Float, const N: usize>(
     ok
 }
 
-/// `f`, a slice form at `F`'s working type, for narrower floats: each `CHUNK` items convert to the working type and run, and `narrow`
-/// turns each output into the output at `F`.
-fn working<F: Float, O: Copy, P, const N: usize>(
+/// [`two_pass`] with both item bodies marked `#[inline(always)]`, as [`each!`] marks its body.
+macro_rules! two_pass {
+    ($x:expr, $n:expr, $out:expr, |$fa:pat_param| $fast:expr, |$sa:pat_param| $f:expr $(,)?) => {
+        crate::slice::two_pass($x, $n, $out, #[inline(always)] |$fa| $fast, #[inline(always)] |$sa| $f)
+    };
+}
+
+/// `f`, a slice form at `F`'s working type, for narrower floats, as `forms!`'s `f16` forms run it: each `CHUNK` items convert to the
+/// working type and run, and `narrow` turns each output into the output at `F`.
+pub(crate) fn working<F: Float, O: Copy, P, const N: usize>(
     x: [Arg<'_, F>; N], n: usize, out: &mut Vec<P>, f: impl Fn([Arg<'_, F::Working>; N], usize, &mut Vec<O>) -> bool,
     narrow: impl Fn(O) -> P,
 ) -> bool {
@@ -357,37 +368,6 @@ fn working<F: Float, O: Copy, P, const N: usize>(
         pairs(Arg::Many(&rs), Arg::One(()), m, out, |r, ()| (narrow(r), true));
     }
     ok
-}
-
-macro_rules! native_dispatch {
-    ($($t:ty: $scalar:ident, $checked:ident, $slice:ident);+) => {$(
-        impl Dispatch for $t {
-            #[inline]
-            fn call_one<K: RealForms<N>, const N: usize>(k: &K, x: [$t; N]) -> OutAt<K, $t, N> { k.$scalar(x) }
-            #[inline]
-            fn call_checked<K: RealForms<N>, const N: usize>(k: &K, x: [$t; N]) -> Option<OutAt<K, $t, N>> { k.$checked(x) }
-            #[inline]
-            fn call_many<K: RealForms<N>, const N: usize>(k: &K, x: [Arg<'_, $t>; N], n: usize, out: &mut Vec<OutAt<K, $t, N>>) -> bool {
-                k.$slice(x, n, out)
-            }
-        }
-    )+};
-}
-native_dispatch!(f32: scalar_f32, checked_f32, slice_f32; f64: scalar_f64, checked_f64, slice_f64);
-
-impl Dispatch for f16 {
-    #[inline]
-    fn call_one<K: RealForms<N>, const N: usize>(k: &K, x: [f16; N]) -> OutAt<K, f16, N> {
-        <K::Kind as Kind>::narrow::<f16>(k.scalar_f32(x.map(f16::working)))
-    }
-    #[inline]
-    fn call_checked<K: RealForms<N>, const N: usize>(k: &K, x: [f16; N]) -> Option<OutAt<K, f16, N>> {
-        k.checked_f32(x.map(f16::working)).map(<K::Kind as Kind>::narrow::<f16>)
-    }
-    #[inline]
-    fn call_many<K: RealForms<N>, const N: usize>(k: &K, x: [Arg<'_, f16>; N], n: usize, out: &mut Vec<OutAt<K, f16, N>>) -> bool {
-        working(x, n, out, |x, m, o| k.slice_f32(x, m, o), <K::Kind as Kind>::narrow::<f16>)
-    }
 }
 
 #[cfg(test)]
@@ -497,11 +477,11 @@ mod tests {
     struct Norm;
     forms!(Norm at Complex<f32> => f32, Complex<f64> => f64: |_, [z]| z.norm());
 
-    /// An output type other than the item type, at every float type through dispatch and at concrete complex types. A `bool` output is
+    /// An output type other than the item type, at each float type, f16 included, and at concrete complex types. A `bool` output is
     /// never NaN, so it never fails.
     #[test]
     fn outputs_can_differ_from_items() {
-        fn positive<F: Float>(x: &[F]) -> Vec<bool> {
+        fn positive<F: Float>(x: &[F]) -> Vec<bool> where Positive: Unary<F, Out = bool> {
             let mut out = Vec::new();
             assert!(Positive.many(Arg::Many(x), x.len(), &mut out));
             out

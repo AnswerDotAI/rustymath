@@ -254,7 +254,7 @@ macro_rules! tolerant {
     ($object:ident at $($e:ty $(=> $o:ty)?),+: $($rest:tt)+) => { tolerant!(@forms $object, ($($e $(=> $o)?),+), $($rest)+); };
     (@forms $object:ident, ($($at:tt)+), |$t:ident, [$($x:ident),+]| $body:expr) => {
         forms!($object at $($at)+: |k, [$($x),+]| with_tolerance!(k.0, |$t| $body),
-            many |k, [$($x),+], n, out| with_tolerance!(k.0, |$t| crate::slice::each([$($x),+], n, out, |[$($x),+]| $body)));
+            many |k, [$($x),+], n, out| with_tolerance!(k.0, |$t| each!([$($x),+], n, out, |[$($x),+]| $body)));
     };
 }
 

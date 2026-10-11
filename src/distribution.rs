@@ -95,7 +95,7 @@ macro_rules! law_objects {
         #[derive(Clone, Copy, Debug, PartialEq)]
         pub struct $object(pub Distribution);
         forms!($object at real: |k, [$x]| narrowed($x, |$x| each_law!(&k.0 .0, $d => $formula)),
-            many |k, [$x], n, out| each_law!(&k.0 .0, $d => crate::slice::each([$x], n, out, |[$x]| narrowed($x, |$x| $formula))));
+            many |k, [$x], n, out| each_law!(&k.0 .0, $d => each!([$x], n, out, |[$x]| narrowed($x, |$x| $formula))));
     )+};
 }
 

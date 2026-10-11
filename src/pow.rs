@@ -135,28 +135,18 @@ fn root_any<R: Native, const FUSED: bool>(n: R, y: R) -> R {
     if (n == R::zero()) | !n.is_finite() { R::nan() } else { r }
 }
 
-/// The slice forms of this module's functions, which `functions!` makes the function objects' `many`. Every item takes `fast`, and
-/// the rare items it rejects take the branch-free form in a second pass.
-pub(crate) mod slices {
-    use crate::{float::Native, slice::two_pass, Arg};
+/// [`pow`](crate::pow) as a function object. Its scalar form takes one branch to a fast path wherever one applies. Its slice form
+/// `many` computes every item the fast way, then redoes only the rare items with special values.
+#[derive(Clone, Copy, Debug)]
+pub struct Pow;
+forms!(Pow at real: |_, [x, y]| pow_one::<_, { crate::FUSED }>(x, y),
+    many |_, [x, y], n, out| two_pass!([x, y], n, out, |[a, b]| fast::<_, { crate::FUSED }>(a, b, false), |[a, b]| pow_any::<_, { crate::FUSED }>(a, b)));
 
-    // Closures, because the `Fn` call of a function item such as `super::pow_any::<f64, true>` can stay out of line.
-    pub(crate) fn pow<R: Native, const FUSED: bool>(x: Arg<'_, R>, y: Arg<'_, R>, count: usize, out: &mut Vec<R>) -> bool {
-        two_pass(
-            [x, y], count, out,
-            #[inline(always)] |[a, b]| super::fast::<R, FUSED>(a, b, false),
-            #[inline(always)] |[a, b]| super::pow_any::<R, FUSED>(a, b),
-        )
-    }
-
-    pub(crate) fn root<R: Native, const FUSED: bool>(n: Arg<'_, R>, y: Arg<'_, R>, count: usize, out: &mut Vec<R>) -> bool {
-        two_pass(
-            [n, y], count, out,
-            #[inline(always)] |[a, b]| super::fast::<R, FUSED>(b, a, true),
-            #[inline(always)] |[a, b]| super::root_any::<R, FUSED>(a, b),
-        )
-    }
-}
+/// [`root`](crate::root) as a function object, with a scalar form and a slice form that work as [`Pow`]'s do.
+#[derive(Clone, Copy, Debug)]
+pub struct Root;
+forms!(Root at real: |_, [n, y]| root_one::<_, { crate::FUSED }>(n, y),
+    many |_, [n, y], count, out| two_pass!([n, y], count, out, |[a, b]| fast::<_, { crate::FUSED }>(b, a, true), |[a, b]| root_any::<_, { crate::FUSED }>(a, b)));
 
 /// The bits of |x|^(-1/3) plus a third of the bits of |x|, both read as whole numbers without their low 12 bits. The sum is nearly the
 /// same for every positive normal x, and this choice keeps `cbrt`'s first estimate within 3.5%.

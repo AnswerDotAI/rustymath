@@ -64,15 +64,6 @@ pub fn power(x: i64, y: i64) -> Option<i64> {
     }
 }
 
-/// The square root of x where it's a whole number. `None` for a negative x, or one that isn't the square of a whole number.
-#[inline]
-pub fn sqrt(x: i64) -> Option<i64> {
-    // Rounding x to f64 moves its root by far less than one half, so adding a half and truncating gives the root of a square. That
-    // root is below 2^32, so its square fits a `u64`.
-    let r = ((x as f64).sqrt() + 0.5) as u64;
-    (x >= 0 && r * r == x as u64).then_some(r as i64)
-}
-
 /// The residue of y modulo x, y - x⌊y/x⌋, which takes the sign of x. A zero x gives y. Every residue fits an `i64`.
 pub fn residue(x: i64, y: i64) -> i64 { if x == 0 { y } else { floored(y.wrapping_rem(x), x) } }
 
@@ -117,9 +108,9 @@ forms!(Pow at i64: |_, [x, y]| power(x, y));
 forms!(
     Residue at i64: |_, [x, y]| residue(x, y),
     many |_, [x, y], n, out| if let Arg::One(d) = x && let Some(d) = Divisor::new(d) {
-        crate::slice::each([y], n, out, |[y]| d.residue(y))
+        each!([y], n, out, |[y]| d.residue(y))
     } else {
-        crate::slice::each([x, y], n, out, |[x, y]| residue(x, y))
+        each!([x, y], n, out, |[x, y]| residue(x, y))
     }
 );
 
@@ -137,7 +128,7 @@ mod tests {
     }
 
     #[test]
-    fn gcd_lcm_power_sqrt_residue() {
+    fn gcd_lcm_power_residue() {
         let fit = |v: i128| i64::try_from(v).ok();
         for &x in &samples() {
             for &y in &samples() {
@@ -159,11 +150,6 @@ mod tests {
                 let want = if y < 0 { (x.abs() == 1).then(|| if y % 2 == 0 { 1 } else { x }) } else { BigInt::from(x).pow(y as u32).try_into().ok() };
                 assert_eq!(power(x, y), want, "power({x}, {y})");
             }
-            let root = (x >= 0).then(|| num_integer::Roots::sqrt(&x)).filter(|r| r * r == x);
-            assert_eq!(sqrt(x), root, "sqrt({x})");
-            // A square near the top of the range, and the number below it, which no square is.
-            let s = (x.unsigned_abs() % 3_037_000_500) as i64;
-            assert!(sqrt(s * s) == Some(s) && (s < 2 || sqrt(s * s - 1).is_none()), "sqrt of {s}²");
         }
         assert_eq!([power(0, 0), power(0, -1), power(-1, i64::MIN), power(-2, 63), power(2, 63)], [Some(1), None, Some(1), Some(i64::MIN), None]);
     }

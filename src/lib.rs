@@ -33,6 +33,8 @@ pub use float::{Float, Native, FUSED};
 pub use slice::{pairs, Arg, Binary, Ternary, Unary, CHUNK};
 pub use parts::{Abs, Angle, Sign};
 pub use sqrts::Sqrt;
+pub use pow::{Pow, Root};
+pub use trig::{Cos, Sin, Tan};
 
 /// The check for a `_with` function's plain version, which can't fail.
 pub(crate) fn ok() -> Result<(), std::convert::Infallible> { Ok(()) }
@@ -43,20 +45,18 @@ pub(crate) const BETWEEN_CHECKS: usize = 1024;
 /// `unfused`, which choose for themselves. Each entry names the module whose function of the same name implements it, generic over
 /// `R: Native` and `const FUSED: bool`. Every wrapper is `#[inline(always)]`, because
 /// LLVM leaves a large function such as `gamma` out of line in a caller's loop, and the call stops that loop vectorizing. An entry
-/// marked `as` also declares a function object of that name, whose forms rustymath compiles at `f32` and `f64` and never inlines into
-/// a caller. Its slice form runs the function on each item, or with `with slices` the function of the same name in that submodule.
-/// Its scalar form calls the function, or with `one` the named function of the module. A free function that must stay branch-free,
-/// so that a caller's loop vectorizes, can then branch in the object's scalar form, which only ever computes one value per call. An
-/// entry marked `: total` never gives NaN from arguments that aren't NaN. Its object's body gives a [`Total`](slice::Total) output.
-/// The object's slice loop then tests no item.
+/// marked `as` also declares a function object of that name, whose forms rustymath compiles and never inlines into a caller. Its
+/// scalar form calls the function, and its slice form runs the function on each item. An entry marked `: total` never gives NaN from
+/// arguments that aren't NaN. Its object's body gives a [`Total`](slice::Total) output, and the object's slice loop tests no item. An
+/// object with forms of its own, such as [`Pow`], is written with `forms!` beside its function.
 macro_rules! functions {
-    ($($(#[doc = $doc:literal])* $name:ident($($x:ident),+) in $module:ident $(as $object:ident $(with $slices:ident)? $(one $one:ident)? $(: $outcome:ident)?)?;)+) => {
+    ($($(#[doc = $doc:literal])* $name:ident($($x:ident),+) in $module:ident $(as $object:ident $(: $outcome:ident)?)?;)+) => {
         $(
             $(#[doc = $doc])*
             #[inline(always)]
             pub fn $name<F: Float>($($x: F),+) -> F { functions!(@call FUSED, $module, $name, ($($x),+)) }
         )+
-        $(functions!(@object $($object $(with $slices)? $(one $one)? $(: $outcome)?)?; $name, $module, ($($x),+));)+
+        $(functions!(@object $($object $(: $outcome)?)?; $name, $module, ($($x),+));)+
         /// rustymath's functions with `mla` fused, whatever the target's `FUSED`. Code compiled with FMA enabled for itself, such as an
         /// AVX2 version of a loop chosen when the program runs, calls these on a target whose baseline lacks FMA.
         pub mod fused {
@@ -78,25 +78,14 @@ macro_rules! functions {
         }
     };
     (@object; $name:ident, $module:ident, ($($x:ident),+)) => {};
-    (@object $object:ident $(with $slices:ident)? $(one $one:ident)? $(: $outcome:ident)?; $name:ident, $module:ident, ($($x:ident),+)) => {
+    (@object $object:ident $(: $outcome:ident)?; $name:ident, $module:ident, ($($x:ident),+)) => {
         #[doc = concat!("[`", stringify!($name), "`](crate::", stringify!($name), ") as a function object, with the slice form `many`.")]
         #[derive(Clone, Copy, Debug)]
         pub struct $object;
-        functions!(@forms $object $(with $slices)?; [$name $($one)?], [$($outcome)?], $module, ($($x),+));
-    };
-    (@forms $object:ident; $scalar:tt, $outcome:tt, $module:ident, ($($x:ident),+)) => {
-        forms!($object at real: |_, [$($x),+]| functions!(@outcome $outcome, functions!(@scalar $module, $scalar, ($($x),+))));
-    };
-    (@forms $object:ident with $slices:ident; [$name:ident $($one:ident)?], $outcome:tt, $module:ident, ($($x:ident),+)) => {
-        forms!(
-            $object at real: |_, [$($x),+]| functions!(@outcome $outcome, functions!(@scalar $module, [$name $($one)?], ($($x),+))),
-            many |_, [$($x),+], count, out| crate::$module::$slices::$name::<_, { crate::FUSED }>($($x,)+ count, out)
-        );
+        forms!($object at real: |_, [$($x),+]| functions!(@outcome [$($outcome)?], crate::$module::$name::<_, { crate::FUSED }>($($x),+)));
     };
     (@outcome [], $e:expr) => { $e };
     (@outcome [total], $e:expr) => { crate::slice::Total($e) };
-    (@scalar $module:ident, [$name:ident], ($($x:ident),+)) => { crate::$module::$name::<_, { crate::FUSED }>($($x),+) };
-    (@scalar $module:ident, [$name:ident $one:ident], ($($x:ident),+)) => { crate::$module::$one::<_, { crate::FUSED }>($($x),+) };
     (@call $fused:expr, $module:ident, $name:ident, ($($x:ident),+)) => { F::from_working(crate::$module::$name::<_, { $fused }>($($x.working()),+)) };
 }
 
@@ -118,13 +107,13 @@ functions! {
     /// sin x. `sin(±0)` is ±0, and `sin(±∞)` and `sin(NaN)` are NaN. Beyond a magnitude of 2^23 at f64 or 2^20 at f32, x takes an
     /// exact reduction, which is slower and has a branch. A loop that calls `sin` therefore doesn't vectorize. [`Sin`]'s slice form
     /// does: it reduces every item the fast way, then gives only the rare large ones the exact reduction.
-    sin(x) in trig as Sin with slices;
+    sin(x) in trig;
     /// cos x. `cos(±0)` is 1, and `cos(±∞)` and `cos(NaN)` are NaN. Beyond the magnitude that `sin` gives,
     /// x takes the same exact reduction.
-    cos(x) in trig as Cos with slices;
+    cos(x) in trig;
     /// tan x. `tan(±0)` is ±0, and `tan(±∞)` and `tan(NaN)` are NaN. Beyond the magnitude that `sin`
     /// gives, x takes the same exact reduction.
-    tan(x) in trig as Tan with slices;
+    tan(x) in trig;
     /// asin x, from -π/2 to π/2. A magnitude beyond 1 gives NaN.
     asin(x) in arc as Asin;
     /// acos x, from 0 to π. A magnitude beyond 1 gives NaN.
@@ -144,10 +133,10 @@ functions! {
     /// atanh x. ±1 gives ±∞, and a magnitude beyond 1 gives NaN.
     atanh(x) in hyperbolic as Atanh;
     /// x^y. Special values follow IEEE 754's `pow`: x^0 and 1^y are 1, even for NaN, and a negative x has a power only for a whole y.
-    pow(x, y) in pow as Pow with slices one pow_one;
+    pow(x, y) in pow;
     /// The real nth root of y, computed without rounding 1/n first. A negative y has one only for an odd
     /// whole n. n = 0, an infinite n and NaN give NaN.
-    root(n, y) in pow as Root with slices one root_one;
+    root(n, y) in pow;
     /// The cube root of x.
     cbrt(x) in pow as Cbrt: total;
     /// √(x² + y²), with no overflow or underflow in between. An infinite argument gives ∞, even beside NaN.
