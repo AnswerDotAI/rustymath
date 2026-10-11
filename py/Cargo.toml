@@ -1,0 +1,16 @@
+[package]
+name = "rustymath-py"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+test = false
+
+[dependencies]
+rustymath = { path = ".." }
+pyo3 = { version = ">=0.29", features = ["extension-module"] }
+
+[build-dependencies]
+pyo3-build-config = ">=0.29"
