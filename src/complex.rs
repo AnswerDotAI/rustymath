@@ -11,8 +11,8 @@
 //! square root, which keep their digits near the branch points.
 use crate::{arc, exp as e, float::ln2, hyperbolic, ln as l, pow as p, special, trig, Native};
 use crate::{
-    Abs, Acos, Acosh, Angle, Asin, Asinh, Atan, Atanh, Binom, Cos, Cosh, Exp, Factorial, Gamma, Lgamma, Ln, Logb, Pow, Sign, Sin, Sinh,
-    Sqrt, Sqrt1mx2, Sqrt1px2, Sqrtx2m1, Tan, Tanh,
+    Abs, Acos, Acosh, Angle, Arg, Asin, Asinh, Atan, Atan2, Atanh, Binary, Binom, Cos, Cosh, Exp, Factorial, Gamma, Hypot, Lgamma, Ln,
+    Log1p, Logb, Pow, Sign, Sin, Sinh, Sqrt, Sqrt1mx2, Sqrt1px2, Sqrtx2m1, Tan, Tanh, Unary,
 };
 use num_complex::Complex;
 
@@ -30,6 +30,15 @@ fn unturned<R: Native>(z: Complex<R>) -> Complex<R> { c(z.im, -z.re) }
 /// π.
 #[inline(always)]
 fn pi<R: Native>() -> R { let (hi, _) = arc::half_pi::<R>(); hi + hi }
+
+/// |z| for the scalar functions. At f64 it is `hypot`. At f32 it adds the squares of z's parts in f64, where no square overflows or
+/// loses bits, and rounds the root once. That is within half an ulp, where `hypot` at f32's own width is within about one, and it
+/// costs less than `hypot`'s scaling.
+#[inline(always)]
+fn modulus<R: Native, const FUSED: bool>(x: R, y: R) -> R {
+    let (a, b) = (x.wide(), y.wide());
+    if R::WIDE { p::hypot::<R, FUSED>(x, y) } else { R::narrow((a * a + b * b).sqrt()) }
+}
 
 /// e^z = e^x (cos y + i sin y). e^x/2 times 2 cos y keeps the result finite where e^x overflows but the result doesn't. A real z gives
 /// a real result. At x = -∞ the result is 0, and at x = ∞ with an infinite or NaN y it is ∞ + i NaN.
@@ -58,7 +67,7 @@ pub(crate) fn ln<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R> {
     let (x, y) = (z.re, z.im);
     let (w, p) = scaled(z);
     let (hi, lo) = ln2::<R>();
-    let h = p::hypot::<R, FUSED>(w.re, w.im);
+    let h = modulus::<R, FUSED>(w.re, w.im);
     let near = (h > R::narrow(0.5)) & (h < R::narrow(2.0));
     let t = (x - R::one()).mla::<FUSED>(x + R::one(), y * y);
     let k = p + p;
@@ -69,9 +78,9 @@ pub(crate) fn ln<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R> {
 #[inline]
 fn ln1p<R: Native, const FUSED: bool>(w: Complex<R>) -> Complex<R> {
     let (u, v) = (w.re, w.im);
-    let small = p::hypot::<R, FUSED>(u, v) < R::narrow(0.5);
+    let small = modulus::<R, FUSED>(u, v) < R::narrow(0.5);
     let t = u.mla::<FUSED>(u + R::narrow(2.0), v * v);
-    let re = if small { l::log1p::<R, FUSED>(t) * R::narrow(0.5) } else { l::ln::<R, FUSED>(p::hypot::<R, FUSED>(R::one() + u, v)) };
+    let re = if small { l::log1p::<R, FUSED>(t) * R::narrow(0.5) } else { l::ln::<R, FUSED>(modulus::<R, FUSED>(R::one() + u, v)) };
     c(re, arc::atan2::<R, FUSED>(v, R::one() + u))
 }
 
@@ -82,21 +91,28 @@ fn ln1p<R: Native, const FUSED: bool>(w: Complex<R>) -> Complex<R> {
 pub(crate) fn sqrt<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R> {
     let (x, y) = (z.re, z.im);
     let (w, p) = scaled(z);
-    let h = p::hypot::<R, FUSED>(w.re, w.im);
+    let h = modulus::<R, FUSED>(w.re, w.im);
     let t = w.re.abs().mla::<FUSED>(R::narrow(0.5), h * R::narrow(0.5)).sqrt();
     let (re, im) = if w.re >= R::zero() { (t, w.im / (t + t)) } else { (w.im.abs() / (t + t), t.copysign(w.im)) };
     let k = R::pow2(R::SHIFT - p);
     if y.is_infinite() { c(R::infinity(), y) } else if (x == R::zero()) & (y == R::zero()) { c(R::zero(), y) } else { c(re * k, im * k) }
 }
 
+/// Whether z^w takes a special case of `pow`: w = 0, z = 0 with Re w > 0, or a real z and w whose power is real, which is a z from 0
+/// up or a whole w.
+#[inline(always)]
+fn pow_cases<R: Native>(z: Complex<R>, w: Complex<R>) -> (bool, bool, bool) {
+    let unit = (w.re == R::zero()) & (w.im == R::zero());
+    let zero = (z.re == R::zero()) & (z.im == R::zero()) & (w.re > R::zero());
+    (unit, zero, (z.im == R::zero()) & (w.im == R::zero()) & ((z.re >= R::zero()) | (w.re == w.re.trunc())))
+}
+
 /// z^w = e^(w ln z). w = 0 gives 1, even for NaN, and z = 0 gives 0 where Re w > 0. A real z and w whose power is real give the real
-/// power, as `pow` gives it: a z from 0 up, or a whole w. Its error grows with |w ln z|, as the module doc gives it.
+/// power, as `pow` gives it. Its error grows with |w ln z|, as the module doc gives it.
 #[inline]
 pub(crate) fn pow<R: Native, const FUSED: bool>(z: Complex<R>, w: Complex<R>) -> Complex<R> {
-    let real = (z.im == R::zero()) & (w.im == R::zero()) & ((z.re >= R::zero()) | (w.re == w.re.trunc()));
+    let (unit, zero, real) = pow_cases(z, w);
     let r = p::pow::<R, FUSED>(z.re, w.re);
-    let zero = (z.re == R::zero()) & (z.im == R::zero()) & (w.re > R::zero());
-    let unit = (w.re == R::zero()) & (w.im == R::zero());
     let general = exp::<R, FUSED>(w * ln::<R, FUSED>(z));
     if unit { c(R::one(), R::zero()) } else if zero { c(R::zero(), R::zero()) } else if real { c(r, R::zero()) } else { general }
 }
@@ -226,7 +242,7 @@ pub(crate) fn atanh<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R> {
     let (m, quarter, half) = (R::one() - x, R::narrow(0.25), R::narrow(0.5));
     let re = l::log1p::<R, FUSED>(R::narrow(4.0) * x / m.mla::<FUSED>(m, y * y)) * quarter;
     let im = arc::atan2::<R, FUSED>(y + y, m.mla::<FUSED>(R::one() + x, -(y * y))) * half;
-    let h = p::hypot::<R, FUSED>(x, y);
+    let h = modulus::<R, FUSED>(x, y);
     let (right, _) = arc::half_pi::<R>();
     let huge = h > R::narrow(if R::WIDE { 1e150 } else { 1e18 });
     let (re, im) = if x.is_infinite() | y.is_infinite() { (R::zero(), right.copysign(y)) } else if huge { (x / h / h, right.copysign(y)) } else { (re, im) };
@@ -335,22 +351,122 @@ pub(crate) fn binom<R: Native, const FUSED: bool>(n: Complex<R>, k: Complex<R>) 
 pub(crate) fn sign<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R> {
     let unit = |v: R| (if v.is_infinite() { R::one() } else { R::zero() }).copysign(v);
     let w = if z.re.is_infinite() | z.im.is_infinite() { c(unit(z.re), unit(z.im)) } else { z };
-    let h = p::hypot::<R, FUSED>(w.re, w.im);
+    let h = modulus::<R, FUSED>(w.re, w.im);
     if h == R::zero() { z } else { c(w.re / h, w.im / h) }
 }
 
-/// Attaches each function of one complex argument to its object, at both widths.
+/// Whether `scaled` scales z up, which the fast formulas of `ln` and `pow` leave to the scalar functions.
+#[inline(always)]
+fn tiny<R: Native>(z: Complex<R>) -> bool { scaled(z).1 != R::zero() }
+
+/// Whether both parts of z are finite.
+#[inline(always)]
+fn finite<R: Native>(z: Complex<R>) -> bool { z.re.is_finite() & z.im.is_finite() }
+
+/// e^z's parts, computed through real slice forms from slices of z's parts, as `exp` combines them. Where e^x overflows, or x is -∞
+/// beside an infinite or NaN y, a part is non-finite here, and the slice form gives the item to `exp`.
+fn exp_parts<R: Native>(x: &[R], y: &[R], re: &mut Vec<R>, im: &mut Vec<R>)
+where
+    Exp: Unary<R, Out = R>,
+    Cos: Unary<R, Out = R>,
+    Sin: Unary<R, Out = R>,
+{
+    let (n, mut e, mut cy, mut sy) = (x.len(), Vec::new(), Vec::new(), Vec::new());
+    Exp.many(Arg::Many(x), n, &mut e);
+    Cos.many(Arg::Many(y), n, &mut cy);
+    Sin.many(Arg::Many(y), n, &mut sy);
+    re.extend(e.iter().zip(&cy).map(|(&e, &c)| e * c));
+    im.extend(y.iter().zip(&e).zip(&sy).map(|((&y, &e), &s)| if y == R::zero() { y } else { e * s }));
+}
+
+/// sinh z's parts, or with `cosh` cosh z's, computed through real slice forms from slices of z's parts, as `sinh` and `cosh` combine
+/// them.
+fn hyperbolic_parts<R: Native>(x: &[R], y: &[R], cosh: bool, re: &mut Vec<R>, im: &mut Vec<R>)
+where
+    Sinh: Unary<R, Out = R>,
+    Cosh: Unary<R, Out = R>,
+    Sin: Unary<R, Out = R>,
+    Cos: Unary<R, Out = R>,
+{
+    let (n, mut sh, mut ch, mut s, mut c) = (x.len(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    Sinh.many(Arg::Many(x), n, &mut sh);
+    Cosh.many(Arg::Many(x), n, &mut ch);
+    Sin.many(Arg::Many(y), n, &mut s);
+    Cos.many(Arg::Many(y), n, &mut c);
+    let zero = R::zero();
+    if cosh {
+        re.extend(ch.iter().zip(&c).map(|(&ch, &c)| ch * c));
+        im.extend(x.iter().zip(y).zip(sh.iter().zip(&s)).map(|((&x, &y), (&sh, &s))| {
+            if (x == zero) | (y == zero) { zero.copysign(x) * zero.copysign(y) } else { sh * s }
+        }));
+    } else {
+        re.extend(x.iter().zip(&sh).zip(&c).map(|((&x, &sh), &c)| if x == zero { x } else { sh * c }));
+        im.extend(y.iter().zip(&ch).zip(&s).map(|((&y, &ch), &s)| if y == zero { y } else { ch * s }));
+    }
+}
+
+/// ln z's parts, computed through real slice forms from slices of z's parts, as `ln` combines them for a z that isn't tiny.
+fn ln_parts<R: Native>(x: &[R], y: &[R], re: &mut Vec<R>, im: &mut Vec<R>)
+where
+    Hypot: Binary<R, Out = R>,
+    Ln: Unary<R, Out = R>,
+    Log1p: Unary<R, Out = R>,
+    Atan2: Binary<R, Out = R>,
+{
+    let (n, mut h, mut lh, mut lt) = (x.len(), Vec::new(), Vec::new(), Vec::new());
+    Hypot.many(Arg::Many(x), Arg::Many(y), n, &mut h);
+    Ln.many(Arg::Many(&h), n, &mut lh);
+    let one = R::one();
+    let t: Vec<R> = x.iter().zip(y).map(|(&x, &y)| (x - one).mla::<{ crate::FUSED }>(x + one, y * y)).collect();
+    Log1p.many(Arg::Many(&t), n, &mut lt);
+    let near = |h: R| (h > R::narrow(0.5)) & (h < R::narrow(2.0));
+    re.extend(h.iter().zip(&lh).zip(&lt).map(|((&h, &lh), &lt)| if near(h) { lt * R::narrow(0.5) } else { lh }));
+    Atan2.many(Arg::Many(y), Arg::Many(x), n, im);
+}
+
+/// Attaches each function of one complex argument to its object, at both widths, with the slice form that runs it on each item.
 macro_rules! unary {
     ($($object:ident: $f:ident;)+) => {$(
         forms!($object at Complex<f32>, Complex<f64>: |_, [z]| $f::<_, { crate::FUSED }>(z));
     )+};
 }
 unary! {
-    Exp: exp; Ln: ln; Sqrt: sqrt; Sin: sin; Cos: cos; Tan: tan; Sinh: sinh; Cosh: cosh; Tanh: tanh; Asin: asin; Acos: acos;
-    Atan: atan; Asinh: asinh; Acosh: acosh; Atanh: atanh; Lgamma: lgamma; Gamma: gamma; Factorial: factorial; Sign: sign;
-    Sqrt1mx2: sqrt1mx2; Sqrt1px2: sqrt1px2; Sqrtx2m1: sqrtx2m1;
+    Tan: tan; Tanh: tanh; Asin: asin; Acos: acos; Atan: atan; Asinh: asinh; Acosh: acosh; Atanh: atanh; Lgamma: lgamma; Gamma: gamma;
+    Factorial: factorial; Sqrt: sqrt; Sign: sign; Sqrt1mx2: sqrt1mx2; Sqrt1px2: sqrt1px2; Sqrtx2m1: sqrtx2m1;
 }
-forms!(Pow at Complex<f32>, Complex<f64>: |_, [z, w]| pow::<_, { crate::FUSED }>(z, w));
+// The functions below have slice forms computed through real slice forms, by `split!`. sin z is sinh of iz turned back, and cos z is
+// cosh of iz, as `sin` and `cos` compute them.
+forms!(Exp at Complex<f32>, Complex<f64>: |_, [z]| exp::<_, { crate::FUSED }>(z),
+    many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| exp_parts(x, y, re, im), |_, r| !finite(r), |[z]| exp::<_, { crate::FUSED }>(z)));
+forms!(Sinh at Complex<f32>, Complex<f64>: |_, [z]| sinh::<_, { crate::FUSED }>(z),
+    many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| hyperbolic_parts(x, y, false, re, im), |_, _| false, |[z]| sinh::<_, { crate::FUSED }>(z)));
+forms!(Cosh at Complex<f32>, Complex<f64>: |_, [z]| cosh::<_, { crate::FUSED }>(z),
+    many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| hyperbolic_parts(x, y, true, re, im), |_, _| false, |[z]| cosh::<_, { crate::FUSED }>(z)));
+forms!(Sin at Complex<f32>, Complex<f64>: |_, [z]| sin::<_, { crate::FUSED }>(z),
+    many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| {
+        let (minus_y, mut a, mut b): (Vec<_>, _, _) = (y.iter().map(|&v| -v).collect(), Vec::new(), Vec::new());
+        hyperbolic_parts(&minus_y, x, false, &mut a, &mut b);
+        re.extend(b);
+        im.extend(a.iter().map(|&v| -v));
+    }, |_, _| false, |[z]| sin::<_, { crate::FUSED }>(z)));
+forms!(Cos at Complex<f32>, Complex<f64>: |_, [z]| cos::<_, { crate::FUSED }>(z),
+    many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| {
+        let minus_y: Vec<_> = y.iter().map(|&v| -v).collect();
+        hyperbolic_parts(&minus_y, x, true, re, im);
+    }, |_, _| false, |[z]| cos::<_, { crate::FUSED }>(z)));
+forms!(Ln at Complex<f32>, Complex<f64>: |_, [z]| ln::<_, { crate::FUSED }>(z),
+    many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| ln_parts(x, y, re, im), |[z], r| tiny(z) | !finite(r), |[z]| ln::<_, { crate::FUSED }>(z)));
+forms!(Pow at Complex<f32>, Complex<f64>: |_, [z, w]| pow::<_, { crate::FUSED }>(z, w),
+    many |_, [z, w], n, out| split!([z, w], n, out, |[(zx, zy), (wx, wy)], re, im| {
+        let (mut lr, mut li) = (Vec::new(), Vec::new());
+        ln_parts(zx, zy, &mut lr, &mut li);
+        let pr: Vec<_> = wx.iter().zip(wy).zip(lr.iter().zip(&li)).map(|((&a, &b), (&c, &d))| a * c - b * d).collect();
+        let pi: Vec<_> = wx.iter().zip(wy).zip(lr.iter().zip(&li)).map(|((&a, &b), (&c, &d))| a * d + b * c).collect();
+        exp_parts(&pr, &pi, re, im);
+    }, |[z, w], r| {
+        let (unit, zero, real) = pow_cases(z, w);
+        unit | zero | real | tiny(z) | !finite(r)
+    }, |[z, w]| pow::<_, { crate::FUSED }>(z, w)));
 forms!(Logb at Complex<f32>, Complex<f64>: |_, [b, z]| ln::<_, { crate::FUSED }>(z) / ln::<_, { crate::FUSED }>(b));
 forms!(Binom at Complex<f32>, Complex<f64>: |_, [n, k]| binom::<_, { crate::FUSED }>(n, k));
 forms!(Abs at Complex<f32> => f32, Complex<f64> => f64: |_, [z]| crate::slice::Total(p::hypot::<_, { crate::FUSED }>(z.re, z.im)));
@@ -394,6 +510,32 @@ mod tests {
         })
     }
 
+    /// The function named as in `complex.txt` through its object's slice form, for the functions whose slice forms compute through
+    /// real slice forms. Each case runs as a slice of one item.
+    fn sliced<R: Native>(name: &str, z: &[Complex<R>]) -> Option<Complex<R>>
+    where
+        Exp: Unary<Complex<R>, Out = Complex<R>>,
+        Ln: Unary<Complex<R>, Out = Complex<R>>,
+        Sin: Unary<Complex<R>, Out = Complex<R>>,
+        Cos: Unary<Complex<R>, Out = Complex<R>>,
+        Sinh: Unary<Complex<R>, Out = Complex<R>>,
+        Cosh: Unary<Complex<R>, Out = Complex<R>>,
+        Pow: Binary<Complex<R>, Out = Complex<R>>,
+    {
+        let (x, mut out) = (Arg::Many(&z[..1]), Vec::new());
+        match name {
+            "exp" => Exp.many(x, 1, &mut out),
+            "log" => Ln.many(x, 1, &mut out),
+            "sin" => Sin.many(x, 1, &mut out),
+            "cos" => Cos.many(x, 1, &mut out),
+            "sinh" => Sinh.many(x, 1, &mut out),
+            "cosh" => Cosh.many(x, 1, &mut out),
+            "pow" => Pow.many(x, Arg::Many(&z[1..2]), 1, &mut out),
+            _ => return None,
+        };
+        Some(out[0])
+    }
+
     /// Each line of `complex.txt` as its function's name, its arguments and the correctly rounded result.
     fn cases() -> Vec<(String, Vec<Complex<f64>>, Complex<f64>)> {
         include_str!("../testdata/complex.txt").lines().filter(|l| !l.starts_with('#')).map(|l| {
@@ -421,14 +563,17 @@ mod tests {
         }
     }
 
-    /// The worst error of each function, in ulps of its scale, over the cases whose arguments and result are finite and normal at `R`.
-    fn worst<R: Native, const FUSED: bool>(eps: f64, narrow: impl Fn(f64) -> R) -> Vec<(String, f64, Vec<Complex<f64>>)> {
+    /// The worst error of each function that `f` computes, in ulps of its scale, over the cases whose arguments and result are finite
+    /// and normal at `R`.
+    fn worst<R: Native>(
+        eps: f64, narrow: impl Fn(f64) -> R, f: impl Fn(&str, &[Complex<R>]) -> Option<Complex<R>>,
+    ) -> Vec<(String, f64, Vec<Complex<f64>>)> {
         let mut out: Vec<(String, f64, Vec<Complex<f64>>)> = Vec::new();
         let fits = |v: f64| v.is_finite() && narrow(v).wide() == v;
         let normal = |v: f64| v == 0.0 || (v.abs() >= R::min_positive_value().wide() && v.abs() <= R::max_value().wide());
         for (name, args, want) in cases() {
             if !args.iter().all(|z| fits(z.re) && fits(z.im)) || !(normal(want.re) && normal(want.im)) || !(want.re.is_finite() && want.im.is_finite()) { continue; }
-            let Some(got) = apply::<R, FUSED>(&name, &args.iter().map(|z| c(narrow(z.re), narrow(z.im))).collect::<Vec<_>>()) else { continue };
+            let Some(got) = f(&name, &args.iter().map(|z| c(narrow(z.re), narrow(z.im))).collect::<Vec<_>>()) else { continue };
             let d = (got.re.wide() - want.re).hypot(got.im.wide() - want.im);
             let s = scale(&name, &args, want);
             let err = if s == 0.0 { if d == 0.0 { 0.0 } else { f64::INFINITY } } else { d / (s * eps) };
@@ -444,12 +589,15 @@ mod tests {
     #[test]
     fn accuracy() {
         let rows = [
-            ("f64 fused", worst::<f64, true>(f64::EPSILON, |v| v)),
-            ("f64 unfused", worst::<f64, false>(f64::EPSILON, |v| v)),
-            ("f32 fused", worst::<f32, true>(f32::EPSILON.into(), |v| v as f32)),
-            ("f32 unfused", worst::<f32, false>(f32::EPSILON.into(), |v| v as f32)),
+            ("f64 fused", worst::<f64>(f64::EPSILON, |v| v, apply::<f64, true>)),
+            ("f64 unfused", worst::<f64>(f64::EPSILON, |v| v, apply::<f64, false>)),
+            ("f64 sliced", worst::<f64>(f64::EPSILON, |v| v, sliced::<f64>)),
+            ("f32 fused", worst::<f32>(f32::EPSILON.into(), |v| v as f32, apply::<f32, true>)),
+            ("f32 unfused", worst::<f32>(f32::EPSILON.into(), |v| v as f32, apply::<f32, false>)),
+            ("f32 sliced", worst::<f32>(f32::EPSILON.into(), |v| v as f32, sliced::<f32>)),
         ];
-        let over: Vec<_> = rows.iter().flat_map(|(how, r)| r.iter().filter(|(_, e, _)| *e > BOUND).map(move |(n, e, a)| (*how, n, *e, a))).collect();
+        let over: Vec<_> =
+            rows.iter().flat_map(|(how, r)| r.iter().filter(|(_, e, _)| *e > BOUND).map(move |(n, e, a)| (*how, n, *e, a))).collect();
         if std::env::var("RUSTYMATH_COMPLEX").is_ok() { for (how, r) in &rows { for (n, e, a) in r { println!("{how} {n} {e:.2} {a:?}"); } } }
         assert!(over.is_empty(), "{over:#?}");
     }

@@ -72,6 +72,13 @@ pub(crate) mod sealed {
         /// 1.5 × 2^m, where m is the number of mantissa bits. Adding it to a float of magnitude below 2^(m-1) rounds that float to a
         /// whole number, which the low bits of the sum hold.
         const SHIFT: Self;
+        /// The unsigned integer type with this float's bits.
+        type Bits: Copy;
+        /// `u - less` as a float, for a whole number u below 2^m, through the bits of 2^m + u. A loop that calls it vectorizes even
+        /// where the target has no vector conversion for u's type. [`convert`](crate::convert) builds on it.
+        fn from_low(u: Self::Bits, less: Self) -> Self;
+        /// The whole number nearest `self`, for `self` from 0 to below 2^m, as the low bits of 2^m + `self`. `from_low` reverses it.
+        fn to_low(self) -> Self::Bits;
         /// `self×b+c`, with one rounding when `FUSED` is true and two otherwise.
         fn mla<const FUSED: bool>(self, b: Self, c: Self) -> Self;
         /// 2^n, from `z` = `SHIFT + n`, for a whole n within the exponents of normal floats.
@@ -85,6 +92,9 @@ pub(crate) mod sealed {
         /// `self` with the low half of its mantissa bits cleared. The product of two such floats is exact, which double-word products
         /// without FMA rely on.
         fn upper(self) -> Self;
+        /// `(s, 1/s)` for the power of two s that brings `self` into [2, 4), after raising a smaller `self` to 2^(2 - bias). Both are
+        /// normal for every finite `self`, and they come from its exponent bits with no branch.
+        fn scales(self) -> (Self, Self);
     }
 }
 
@@ -132,20 +142,26 @@ macro_rules! native {
         impl sealed::Core for $t {
             const WIDE: bool = $mantissa == 52;
             const SHIFT: $t = 1.5 * (1u64 << $mantissa) as $t;
+            type Bits = $bits;
+            #[inline]
+            fn from_low(u: $bits, less: $t) -> $t {
+                let two_m = (1 as $bits << $mantissa) as $t;
+                $t::from_bits(two_m.to_bits() | u) - (two_m + less)
+            }
+            #[inline]
+            fn to_low(self) -> $bits { (self + (1 as $bits << $mantissa) as $t).to_bits() & ((1 << $mantissa) - 1) }
             #[inline]
             fn mla<const FUSED: bool>(self, b: $t, c: $t) -> $t { if FUSED { self.mul_add(b, c) } else { self * b + c } }
             // The low bits of `z` hold n. Adding the bias to them and shifting them into the exponent field gives 2^n. Integer adds
             // and shifts vectorize on every target, where a conversion from a float to a 64-bit integer doesn't on x86-64.
             #[inline]
             fn pow2(z: $t) -> $t { $t::from_bits(z.to_bits().wrapping_add($bias) << $mantissa) }
-            // e comes from the exponent field of `self÷0.75`. It converts to a float through the bits of 2^m + e, which avoids a
-            // conversion from an integer that wouldn't vectorize.
+            // e comes from the exponent field of `self÷0.75`, converted through `from_low`.
             #[inline]
             fn split(self) -> ($t, $t) {
                 let exponent = ((self * (1.0 / 0.75)).to_bits() >> $mantissa) & (2 * $bias + 1);
                 let m = $t::from_bits(self.to_bits().wrapping_sub(exponent.wrapping_sub($bias) << $mantissa));
-                let two_m = (1 as $bits << $mantissa) as $t;
-                (m, $t::from_bits(two_m.to_bits() | exponent) - (two_m + $bias as $t))
+                (m, Self::from_low(exponent, $bias as $t))
             }
             // The lowest bit of `z` is the parity of n. Shifted into the sign bit, it negates `self` with no branch.
             #[inline]
@@ -154,6 +170,12 @@ macro_rules! native {
             fn odd(self) -> bool { self.to_bits() & 1 == 1 }
             #[inline]
             fn upper(self) -> $t { $t::from_bits(self.to_bits() & !((1 << (($mantissa + 2) / 2)) - 1)) }
+            #[inline]
+            fn scales(self) -> ($t, $t) {
+                let bottom = $t::from_bits(2 << $mantissa);
+                let e = (if self < bottom { bottom } else { self }).to_bits() >> $mantissa;
+                ($t::from_bits((2 * $bias + 1 - e) << $mantissa), $t::from_bits((e - 1) << $mantissa))
+            }
         }
     };
 }

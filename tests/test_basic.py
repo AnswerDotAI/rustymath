@@ -14,6 +14,7 @@ def test_ufuncs():
             assert ulps(got, getattr(np, name)(x.astype(dt).astype(np.float64))).max() <= 4, (name, dt)
     assert ulps(rm.arccosh(1 + x), np.arccosh(1 + x)).max() <= 4
     assert ulps(rm.power(x, 2.5), x**2.5).max() <= 4 and ulps(rm.hypot(x, 3), np.hypot(x, 3)).max() <= 4
+    assert ulps(rm.arctan2(x, x - 0.5), np.arctan2(x, x - 0.5)).max() <= 4
     assert ulps(rm.root(3, x[::7]), np.cbrt(x[::7])).max() <= 4
     assert rm.exp(np.float32(1)).dtype == np.float32 and rm.exp(1).dtype == np.float64
     out = np.empty(3, np.float32)

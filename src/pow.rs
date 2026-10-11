@@ -9,9 +9,6 @@ use crate::{
     table,
 };
 
-/// 2^52, the magnitude at which consecutive floats are consecutive whole numbers.
-const TWO_52: f64 = 4503599627370496.0;
-
 /// Whether a is finite and nonzero, for an a whose sign bit is clear. 0, ∞ and NaN give false.
 #[inline]
 fn positive_finite(a: f64) -> bool { a.to_bits().wrapping_sub(1) < f64::INFINITY.to_bits() - 1 }
@@ -161,9 +158,9 @@ pub(crate) fn cbrt<R: Native, const FUSED: bool>(x: R) -> R {
     let a = x.wide().abs();
     let sub = R::WIDE & (a < f64::MIN_POSITIVE);
     let b = if sub { a * 18014398509481984.0 } else { a };
-    // b's bits, less the low 12, as a float through the bits of 2^52 plus them, and z's bits back through the same sum.
-    let t = (f64::from_bits(TWO_52.to_bits() | (b.to_bits() >> 12)) - TWO_52).mla::<FUSED>(-1.0 / 3.0, CBRT_MAGIC);
-    let mut z = f64::from_bits((t + TWO_52).to_bits() << 12);
+    // b's bits, less the low 12, as a whole number, and z's bits back from one.
+    let t = f64::from_low(b.to_bits() >> 12, 0.0).mla::<FUSED>(-1.0 / 3.0, CBRT_MAGIC);
+    let mut z = f64::from_bits(t.to_low() << 12);
     for _ in 0..if R::WIDE { 3 } else { 2 } {
         z = z * ((b * z) * (z * z)).mla::<FUSED>(-1.0 / 3.0, 4.0 / 3.0);
     }
@@ -177,24 +174,15 @@ pub(crate) fn cbrt<R: Native, const FUSED: bool>(x: R) -> R {
     R::narrow(y.copysign(x.wide()))
 }
 
-/// √(x² + y²), without overflow or underflow in between. At f64, both arguments first scale by the power of two that brings the larger
-/// into [2, 4), which is exact. The power and its inverse come from the larger's exponent bits with no branch. Raising a larger below
-/// 2^-1021 to that bound keeps both normal. Narrower types compute in f64, whose range holds their squares. An infinite x or y gives ∞,
-/// even beside NaN.
+/// √(x² + y²), without overflow or underflow in between. Both arguments first scale by the power of two that `scales` gives for the
+/// larger, which brings it into [2, 4) exactly. Each type computes at its own width. An infinite x or y gives ∞, even beside NaN.
 #[inline]
 pub(crate) fn hypot<R: Native, const FUSED: bool>(x: R, y: R) -> R {
-    const BOTTOM: f64 = f64::from_bits(2 << 52);
-    let (a, b) = (x.wide().abs(), y.wide().abs());
-    let (s, back) = if R::WIDE {
-        let big = if a > b { a } else { b };
-        let e = (if big < BOTTOM { BOTTOM } else { big }).to_bits() >> 52;
-        (f64::from_bits((2047 - e) << 52), f64::from_bits((e - 1) << 52))
-    } else {
-        (1.0, 1.0)
-    };
+    let (a, b) = (x.abs(), y.abs());
+    let (s, back) = (if a > b { a } else { b }).scales();
     let (sa, sb) = (a * s, b * s);
     let r = sa.mla::<FUSED>(sa, sb * sb).sqrt() * back;
-    R::narrow(if a.is_infinite() | b.is_infinite() { f64::INFINITY } else { r })
+    if a.is_infinite() | b.is_infinite() { R::infinity() } else { r }
 }
 
 #[cfg(test)]

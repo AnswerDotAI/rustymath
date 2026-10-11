@@ -38,6 +38,10 @@ Pow.many(Arg::Many(&[1.5, 2.0, 3.0]), Arg::One(2.0), 3, &mut squares); // square
 
 Use the slice forms of `Sin`, `Cos` and `Tan` for arrays. They reduce each item by multiples of π with a few multiply-adds, then give the rare items beyond 2^23 at f64, or 2^20 at f32, an exact reduction in integer arithmetic. The free `sin` takes a branch for those items. That branch stops a loop that calls it from vectorizing.
 
+`atan2(y, x)` and its object `Atan2` give the angle of the point (x, y), from -π to π. `y` comes first, as in `f64::atan2`.
+
+The complex slice forms of `Exp`, `Ln`, `Pow`, `Sin`, `Cos`, `Sinh` and `Cosh` vectorize too. Each one splits a chunk of complex items into their real and imaginary parts and computes the results from the real slice forms. It then redoes the rare items with the scalar complex function: items with a tiny or non-finite part, and `Pow`'s special cases. `Abs`, `Angle` and `Sqrt` keep their loop over items, which runs faster than a split for their short formulas. Other complex slice forms, such as `Lgamma`'s, compute one item at a time.
+
 ### Tolerant comparison
 
 The `tolerant` module has APL's tolerant comparison: x equals y when |x - y| is at most the tolerance times the larger of |x| and |y|. Its objects, such as `Equal`, `Less`, `Floor`, `Residue` and `Gcd`, each hold a `Tolerance`. With `Tolerance::EXACT`, a slice form runs a loop of plain IEEE comparisons, chosen once per call.
@@ -56,6 +60,7 @@ Equal(Tolerance::DEFAULT).many(Arg::Many(&[0.3, 0.1 + 0.2, 0.31]), Arg::One(0.3)
 - `reduce`: sums, products, maximums and minimums over a slice, and their running versions. Float sums and products vectorize by combining the items in any order.
 - `distribution`: sixteen distributions. The objects `Pdf`, `Cdf` and `Quantile` hold a distribution and evaluate it over a slice. Each distribution also samples from a seeded generator.
 - `random`: rolls and deals that fill a slice from one generator.
+- `convert`: `int` converts a whole float to an integer type. It gives `None` outside the type's range, and for `i64` and `u32` beyond a magnitude of 2^51 - 1. `float` converts an integer to the nearest float. Loops that call either vectorize on every target. AVX2 and wasm lack a vector instruction between `f64` and 64-bit integers. On those targets a loop that converts with `as` runs one item at a time.
 
 The special functions `gamma`, `lgamma`, `erf`, `erfc`, their inverses, the incomplete gamma and beta functions and Lambert W have free functions and objects at the crate root, as the elementary functions do.
 

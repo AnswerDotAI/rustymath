@@ -324,6 +324,12 @@ fn hypot_accuracy() {
 }
 
 #[test]
+fn atan2_accuracy() {
+    let ranges = [((-1e300, 1e300), (-1e300, 1e300)), ((-1e-300, 1e-300), (-1e-300, 1e-300)), ((-4.0, 4.0), (-4.0, 4.0))];
+    binary("atan2", variants!(atan2, 2), crate::atan2, f64::atan2, &ranges, &[]);
+}
+
+#[test]
 fn root_accuracy() {
     // Degrees whose reciprocals are floats, against pow, and degree 3, against cbrt.
     for n in [2.0, -2.0, 4.0, -4.0, 8.0, 0.5, -0.5, 1.0, -1.0] {

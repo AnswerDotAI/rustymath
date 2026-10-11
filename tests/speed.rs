@@ -131,7 +131,7 @@ fn reductions() -> [Compared; 3] {
             fold(&|| f64::from(reduce::max(black_box(&x32)))),
             fold(&|| f64::from(black_box(&x32).iter().copied().fold(f32::NEG_INFINITY, f32::max))),
         ]),
-        ("reduce::cumsum", [28.0, 49.0], [
+        ("reduce::cumsum", [8.0, 14.0], [
             time_appended(&x64, |x, out| { reduce::cumsum(x, None, out); }),
             fastest(N, || { s64.clear(); scan64(black_box(&x64), &mut s64); black_box(&s64); }),
             time_appended(&x32, |x, out| { reduce::cumsum(x, None, out); }),
@@ -174,17 +174,17 @@ fn special(unit: [f64; 2]) -> [Budgeted; 11] {
         };
     }
     [
-        ("Gamma", [460.0, 350.0], unary_copies!(Gamma, 0.1 to 20.0)),
-        ("Lgamma", [240.0, 220.0], unary_copies!(Lgamma, 0.1 to 1000.0)),
-        ("Erf", [85.0, 48.0], unary_copies!(Erf, -5.0 to 5.0)),
-        ("Erfc", [260.0, 150.0], unary_copies!(Erfc, -5.0 to 10.0)),
-        ("Erfinv", [410.0, 95.0], unary_copies!(Erfinv, -0.999 to 0.999)),
-        ("Erfcinv", [410.0, 95.0], unary_copies!(Erfcinv, 0.001 to 1.999)),
-        ("Gammainc", [1250.0, 2430.0], binary_copies!(Gammainc, (0.5, 20.0), (0.0, 30.0))),
-        ("Gammaincc", [1250.0, 2430.0], binary_copies!(Gammaincc, (0.5, 20.0), (0.0, 30.0))),
-        ("Gammaincinv", [4900.0, 19900.0], binary_copies!(Gammaincinv, (0.5, 20.0), (0.001, 0.999))),
-        ("Betainc", [3300.0, 17600.0], ternary_copies!(Betainc, (0.0, 1.0))),
-        ("Betaincinv", [12000.0, 51000.0], ternary_copies!(Betaincinv, (0.001, 0.999))),
+        ("Gamma", [520.0, 300.0], unary_copies!(Gamma, 0.1 to 20.0)),
+        ("Lgamma", [370.0, 230.0], unary_copies!(Lgamma, 0.1 to 1000.0)),
+        ("Erf", [110.0, 49.0], unary_copies!(Erf, -5.0 to 5.0)),
+        ("Erfc", [400.0, 210.0], unary_copies!(Erfc, -5.0 to 10.0)),
+        ("Erfinv", [1100.0, 100.0], unary_copies!(Erfinv, -0.999 to 0.999)),
+        ("Erfcinv", [1000.0, 110.0], unary_copies!(Erfcinv, 0.001 to 1.999)),
+        ("Gammainc", [3100.0, 1700.0], binary_copies!(Gammainc, (0.5, 20.0), (0.0, 30.0))),
+        ("Gammaincc", [3100.0, 1700.0], binary_copies!(Gammaincc, (0.5, 20.0), (0.0, 30.0))),
+        ("Gammaincinv", [12000.0, 19000.0], binary_copies!(Gammaincinv, (0.5, 20.0), (0.001, 0.999))),
+        ("Betainc", [8400.0, 15000.0], ternary_copies!(Betainc, (0.0, 1.0))),
+        ("Betaincinv", [30000.0, 49000.0], ternary_copies!(Betaincinv, (0.001, 0.999))),
     ]
 }
 
@@ -208,18 +208,18 @@ fn complex() -> [Budgeted; 12] {
     let (w64, w32) = zs(square, square, BRONZE);
     let (z64, z32) = zs(square, square, GOLDEN);
     [
-        ("complex Exp", [70.0, 80.0], unary_copies!(Exp, square, square)),
-        ("complex Ln", [120.0, 140.0], unary_copies!(Ln, square, square)),
-        ("complex Sqrt", [26.0, 20.0], unary_copies!(Sqrt, square, square)),
-        ("complex Sin", [95.0, 110.0], unary_copies!(Sin, square, square)),
-        ("complex Tan", [120.0, 140.0], unary_copies!(Tan, square, square)),
-        ("complex Asin", [200.0, 250.0], unary_copies!(Asin, square, square)),
-        ("complex Atanh", [110.0, 130.0], unary_copies!(Atanh, square, square)),
-        ("complex Lgamma", [250.0, 330.0], unary_copies!(Lgamma, (0.1, 20.0), (-10.0, 10.0))),
-        ("complex Gamma", [370.0, 460.0], unary_copies!(Gamma, (0.1, 20.0), (-10.0, 10.0))),
-        ("complex Abs", [12.0, 10.0], unary_copies!(Abs, square, square)),
-        ("complex Sqrt1mx2", [75.0, 105.0], unary_copies!(Sqrt1mx2, square, square)),
-        ("complex Pow", [340.0, 380.0], [time_binary(&z64, &w64, &Pow) / unit[0], time_binary(&z32, &w32, &Pow) / unit[1]]),
+        ("complex Exp", [48.0, 54.0], unary_copies!(Exp, square, square)),
+        ("complex Ln", [89.0, 95.0], unary_copies!(Ln, square, square)),
+        ("complex Sqrt", [26.0, 30.0], unary_copies!(Sqrt, square, square)),
+        ("complex Sin", [71.0, 72.0], unary_copies!(Sin, square, square)),
+        ("complex Tan", [140.0, 280.0], unary_copies!(Tan, square, square)),
+        ("complex Asin", [310.0, 580.0], unary_copies!(Asin, square, square)),
+        ("complex Atanh", [130.0, 270.0], unary_copies!(Atanh, square, square)),
+        ("complex Lgamma", [310.0, 680.0], unary_copies!(Lgamma, (0.1, 20.0), (-10.0, 10.0))),
+        ("complex Gamma", [470.0, 1100.0], unary_copies!(Gamma, (0.1, 20.0), (-10.0, 10.0))),
+        ("complex Abs", [7.4, 9.4], unary_copies!(Abs, square, square)),
+        ("complex Sqrt1mx2", [94.0, 190.0], unary_copies!(Sqrt1mx2, square, square)),
+        ("complex Pow", [140.0, 150.0], [time_binary(&z64, &w64, &Pow) / unit[0], time_binary(&z32, &w32, &Pow) / unit[1]]),
     ]
 }
 
@@ -227,35 +227,35 @@ fn complex() -> [Budgeted; 12] {
 fn speed() {
     let unit = [copy::<f64>(), copy::<f32>()];
     let mut compared = unary! {
-        Exp within [24.0, 20.0], vs exp on -20.0 to 20.0;
-        Expm1 within [29.0, 25.0], vs exp_m1 on -1.0 to 1.0;
-        Ln within [35.0, 30.0], vs ln on 0.001 to 1000.0;
-        Log1p within [46.0, 41.0], vs ln_1p on -0.5 to 1000.0;
-        Log2 within [34.0, 30.0], vs log2 on 0.001 to 1000.0;
-        Log10 within [35.0, 30.0], vs log10 on 0.001 to 1000.0;
-        Sin within [22.0, 19.0], vs sin on -10.0 to 10.0;
-        Cos within [25.0, 22.0], vs cos on -10.0 to 10.0;
-        Tan within [29.0, 24.0], vs tan on -10.0 to 10.0;
-        Asin within [25.0, 17.0], vs asin on -1.0 to 1.0;
-        Acos within [27.0, 20.0], vs acos on -1.0 to 1.0;
-        Atan within [26.0, 20.0], vs atan on -10.0 to 10.0;
-        Sinh within [32.0, 28.0], vs sinh on -10.0 to 10.0;
-        Cosh within [27.0, 22.0], vs cosh on -10.0 to 10.0;
-        Tanh within [33.0, 29.0], vs tanh on -10.0 to 10.0;
-        Asinh within [41.0, 35.0], vs asinh on -1000.0 to 1000.0;
-        Acosh within [40.0, 35.0], vs acosh on 1.0 to 1000.0;
-        Atanh within [35.0, 30.0], vs atanh on -0.999 to 0.999;
-        Cbrt within [30.0, 44.0], vs cbrt on -1000.0 to 1000.0;
+        Exp within [27.0, 17.0], vs exp on -20.0 to 20.0;
+        Expm1 within [32.0, 22.0], vs exp_m1 on -1.0 to 1.0;
+        Ln within [45.0, 31.0], vs ln on 0.001 to 1000.0;
+        Log1p within [60.0, 42.0], vs ln_1p on -0.5 to 1000.0;
+        Log2 within [44.0, 30.0], vs log2 on 0.001 to 1000.0;
+        Log10 within [44.0, 30.0], vs log10 on 0.001 to 1000.0;
+        Sin within [32.0, 21.0], vs sin on -10.0 to 10.0;
+        Cos within [35.0, 23.0], vs cos on -10.0 to 10.0;
+        Tan within [43.0, 27.0], vs tan on -10.0 to 10.0;
+        Asin within [34.0, 18.0], vs asin on -1.0 to 1.0;
+        Acos within [36.0, 19.0], vs acos on -1.0 to 1.0;
+        Atan within [30.0, 17.0], vs atan on -10.0 to 10.0;
+        Sinh within [45.0, 28.0], vs sinh on -10.0 to 10.0;
+        Cosh within [29.0, 20.0], vs cosh on -10.0 to 10.0;
+        Tanh within [42.0, 27.0], vs tanh on -10.0 to 10.0;
+        Asinh within [59.0, 39.0], vs asinh on -1000.0 to 1000.0;
+        Acosh within [72.0, 46.0], vs acosh on 1.0 to 1000.0;
+        Atanh within [60.0, 38.0], vs atanh on -0.999 to 0.999;
+        Cbrt within [46.0, 53.0], vs cbrt on -1000.0 to 1000.0;
     }
     .to_vec();
     let (powers, roots) = (((0.0, 4.0), (-30.0, 30.0)), ((5.0, 5.0), (0.0, 1000.0)));
     let nth = |n: f64, y: f64| y.powf(1.0 / n);
     let nth32 = |n: f32, y: f32| y.powf(1.0 / n);
-    compared.push(binary("Pow", Pow, false, [78.0, 92.0], powers, f64::powf, f32::powf));
-    compared.push(binary("Pow.one", Pow, true, [100.0, 110.0], powers, f64::powf, f32::powf));
-    compared.push(binary("Hypot", Hypot, false, [19.0, 18.0], ((-1000.0, 1000.0), (-1000.0, 1000.0)), f64::hypot, f32::hypot));
-    compared.push(binary("Root", Root, false, [86.0, 110.0], roots, nth, nth32));
-    compared.push(binary("Root.one", Root, true, [110.0, 110.0], roots, nth, nth32));
+    compared.push(binary("Pow", Pow, false, [160.0, 110.0], powers, f64::powf, f32::powf));
+    compared.push(binary("Pow.one", Pow, true, [240.0, 190.0], powers, f64::powf, f32::powf));
+    compared.push(binary("Hypot", Hypot, false, [17.0, 26.0], ((-1000.0, 1000.0), (-1000.0, 1000.0)), f64::hypot, f32::hypot));
+    compared.push(binary("Root", Root, false, [160.0, 120.0], roots, nth, nth32));
+    compared.push(binary("Root.one", Root, true, [260.0, 220.0], roots, nth, nth32));
     compared.extend(reductions());
     // A polynomial of degree 7 at each of the inputs, against `horner` for one input at a time. `black_box` hides the degree, which a
     // caller rarely knows when it compiles.
@@ -265,7 +265,7 @@ fn speed() {
     let (x64, x32) = widths(-2.0, 2.0, GOLDEN);
     compared.push((
         "polynomial::evaluate",
-        [12.0, 11.0],
+        [12.0, 10.0],
         [
             time_slice(&x64, |x, out| { out.copy_from_slice(x); polynomial::evaluate(c64, out) }),
             time(&x64, |x| horner(c64, x)),

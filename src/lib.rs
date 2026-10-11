@@ -18,6 +18,7 @@ mod special;
 mod sqrts;
 mod table;
 mod trig;
+pub mod convert;
 pub mod distribution;
 pub mod integer;
 pub mod number_theory;
@@ -120,6 +121,9 @@ functions! {
     acos(x) in arc as Acos;
     /// atan x, from -π/2 to π/2.
     atan(x) in arc as Atan: total;
+    /// The angle of the point (x, y) from the positive x axis, from -π to π, with y first as in `f64::atan2`. Zeros and infinities give
+    /// C99's angles: atan2(±0, -0) is ±π, and atan2(±∞, ±∞) is an odd multiple of ±π/4.
+    atan2(y, x) in arc as Atan2: total;
     /// sinh x. It stays finite up to where sinh itself overflows, beyond the point where e^x does.
     sinh(x) in hyperbolic as Sinh: total;
     /// cosh x. It stays finite up to where cosh itself overflows, beyond the point where e^x does.

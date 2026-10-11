@@ -13,6 +13,7 @@
 //! Tolerant equality isn't transitive: `x` can equal `y` and `y` equal `z` while `x` doesn't equal `z`. Hash maps and sorting need a
 //! transitive `PartialEq`. This module therefore has no float type with a tolerant `==`. Each comparison is a method of the tolerance.
 use crate::{
+    convert::{float, int},
     float::{Float, Native},
     ok, BETWEEN_CHECKS,
     search::{self, Chains, Key},
@@ -108,7 +109,7 @@ pub trait Tolerant: Copy {
         let (x, y) = (x.abs().max(y.abs()), x.abs().min(y.abs()));
         if y == 0.0 { return F::narrow(x); }
         let whole = x.fract() == 0.0 && y.fract() == 0.0 && x * y < 1e14 && self.value() <= Tolerance::DEFAULT.value();
-        if let Some(g) = whole.then(|| crate::integer::gcd(x as i64, y as i64)).flatten() { return F::narrow(g as f64); }
+        if let Some(g) = whole.then(|| crate::integer::gcd(int(x)?, int(y)?)).flatten() { return float(g); }
         let scale = BigRational::from_float(x).unwrap();
         let ratio = &scale / BigRational::from_float(y).unwrap();
         let tolerance = BigRational::from_float(self.value()).unwrap() * &ratio;

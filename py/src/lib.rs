@@ -422,6 +422,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         power(x, y) = Pow, int, real, complex: "x^y. An integer power that doesn't fit int64 gives 0 and NumPy's overflow warning.";
         root(n, y) = Root, real: "The real nth root of y, computed without rounding 1/n first.";
         hypot(x, y) = Hypot, real: "√(x² + y²), with no overflow or underflow in between.";
+        arctan2(y, x) = Atan2, real: "The angle of the point (x, y) from the positive x axis, from -π to π.";
         binom(n, k) = Binom, real, complex: "The binomial coefficient of n and k.";
         gammainc(a, x) = Gammainc, real: "The regularized lower incomplete gamma function P(a, x).";
         gammaincc(a, x) = Gammaincc, real: "The regularized upper incomplete gamma function Q(a, x) = 1 - P(a, x).";

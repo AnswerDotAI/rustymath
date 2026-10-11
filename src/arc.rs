@@ -90,9 +90,8 @@ pub(crate) fn atan<R: Native, const FUSED: bool>(x: R) -> R {
     (hi + ((u * z).mla::<FUSED>(p, u) + lo)).copysign(x)
 }
 
-/// The angle of the point (x, y) from the positive x axis, from -π to π, as atan(y/x) in the point's quadrant. The ratio it takes the
-/// arctangent of is the smaller magnitude over the larger, which never overflows. Zeros and infinities give C99's angles: atan2(±0, -0)
-/// is ±π, and atan2(±∞, ±∞) is an odd multiple of ±π/4.
+/// [`atan2`](crate::atan2), as atan(y/x) in the point's quadrant. It takes the arctangent of the smaller magnitude over the larger,
+/// which never overflows.
 #[inline]
 pub(crate) fn atan2<R: Native, const FUSED: bool>(y: R, x: R) -> R {
     let (ax, ay) = (x.abs(), y.abs());

@@ -10,7 +10,7 @@ import sys
 import numpy as np
 from . import _core, polynomial
 from .polynomial import _dtype
-from ._core import (__version__, CT, absolute, add, angle, arccos, arccosh, arcsin, arcsinh, arctan, arctanh, betainc, betaincinv, binom,
+from ._core import (__version__, CT, absolute, add, angle, arccos, arccosh, arcsin, arcsinh, arctan, arctan2, arctanh, betainc, betaincinv, binom,
     cbrt, cos, cosh, distribution, erf, erfc, erfcinv, erfinv, exp, expm1, fmax, fmin, gamma, gammainc, gammaincc, gammaincinv, gammaln,
     hypot, lambertw, log, log10, log1p, log2, loggamma, multiply, number_theory, power, root, sign, sin, sinh, sqrt, sqrt1mx2, sqrt1px2, sqrtx2m1,
     tan, tanh)

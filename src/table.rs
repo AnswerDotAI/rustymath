@@ -9,11 +9,11 @@ use std::f64::consts::LOG2_E;
 
 /// `ix - off`, k as an f64 and the bits of z, for the float with bits `ix` = z × 2^k and z from the float with bits `off` to twice it.
 /// The table index is in the bits of `ix - off` below its top 12, which hold k. They're read with a bias of 2048, so that no shift
-/// needs a sign, and k converts through the bits of `Core::SHIFT` + k.
+/// needs a sign, and k converts through `Core::from_low`.
 #[inline]
 fn split(ix: u64, off: u64) -> (u64, f64, u64) {
     let tmp = ix.wrapping_sub(off);
-    let k = f64::from_bits(f64::SHIFT.to_bits() + (tmp.wrapping_add(2048 << 52) >> 52)) - (f64::SHIFT + 2048.0);
+    let k = f64::from_low(tmp.wrapping_add(2048 << 52) >> 52, 2048.0);
     (tmp, k, ix.wrapping_sub(tmp & (0xfff << 52)))
 }
 

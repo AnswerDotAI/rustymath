@@ -1,0 +1,127 @@
+//! Conversions between floats and integers whose loops vectorize on every target. AVX2 and wasm have no vector instruction for
+//! converting between `f64` and a 64-bit integer. AArch64 converts bytes to floats two lanes at a time. A loop that converts such
+//! types with `as` runs one item at a time on those targets. [`int`] and [`float`] convert them through a float's bits. They use the
+//! conversion instruction for types that every target converts in vector form, and for 64-bit integers where the target can.
+use crate::float::{sealed::{Core, Sealed}, Float};
+
+/// An integer type that [`int`] and [`float`] convert: `i8`, `i16`, `i32`, `i64`, `u8`, `u16` or `u32`.
+pub trait Int: Copy + Sealed + sealed::Ways {}
+
+pub(crate) mod sealed {
+    /// One integer type's conversions from and to `f32` and `f64`, which [`int`](super::int) and [`float`](super::float) pick by
+    /// the float type.
+    pub trait Ways: Copy {
+        fn from_f32(x: f32) -> Option<Self>;
+        fn from_f64(x: f64) -> Option<Self>;
+        fn to_f32(self) -> f32;
+        fn to_f64(self) -> f64;
+    }
+}
+
+/// `x`, a whole float, as an integer of type `I`. `None` where `x` is NaN or infinite, or lies outside `I`. For `i64` and `u32`, a
+/// magnitude beyond 2^51 - 1 also gives `None`, and so does `i32::MIN` from an `f32`. A fraction gives an integer next to it, or
+/// `None`.
+#[inline(always)]
+pub fn int<I: Int, F: Float>(x: F) -> Option<I> {
+    if <F::Working as Core>::WIDE { I::from_f64(x.wide()) } else { I::from_f32(x.wide() as f32) }
+}
+
+/// `i` as the nearest float of type `F`.
+#[inline(always)]
+pub fn float<F: Float, I: Int>(i: I) -> F {
+    if <F::Working as Core>::WIDE { F::narrow(i.to_f64()) } else { F::narrow(i.to_f32().into()) }
+}
+
+/// Whether the target converts between `f64` and 64-bit integers in vector form, as AArch64 and x86-64 with AVX-512 do. Elsewhere
+/// they convert through a float's bits. Both ways give the same results for whole floats.
+const NATIVE_64: bool = cfg!(any(target_arch = "aarch64", target_feature = "avx512dq"));
+
+/// Whether the target converts floats to `i32` with saturation in vector form, as AArch64's `fcvtzs` and wasm's `trunc_sat` do. On
+/// x86-64, where Rust's saturating `as` compiles to one scalar conversion per item, floats convert without saturation after a range
+/// check.
+const SATURATING: bool = !cfg!(target_arch = "x86_64");
+
+/// The magnitude up to which the bits of `f64::SHIFT` + x hold the whole number x.
+const WIDE_LIMIT: f64 = 2251799813685247.0;
+
+/// `i` as the nearest `f64`, natively or through `halves`.
+#[inline(always)]
+fn wide_float(i: i64) -> f64 { if NATIVE_64 { i as f64 } else { halves(i) } }
+
+/// `i` as the nearest `f64` through bits. The high half converts through the bits of 2^84 + 2^63 plus it times 2^32, and the low
+/// half through `from_low`. Both convert exactly, and their sum rounds once.
+#[inline(always)]
+fn halves(i: i64) -> f64 {
+    let high = f64::from_bits(0x4530_0000_0000_0000 | ((i as u64 >> 32) ^ 0x8000_0000)) - f64::from_bits(0x4530_0000_8000_0000);
+    high + f64::from_low(i as u64 & 0xffff_ffff, 0.0)
+}
+
+/// The whole number nearest `x`, for a magnitude up to `WIDE_LIMIT`, through the bits of `f64::SHIFT` + x.
+#[inline(always)]
+fn shifted(x: f64) -> i64 { (x + f64::SHIFT).to_bits().wrapping_sub(f64::SHIFT.to_bits()) as i64 }
+
+/// Writes each integer type's conversions. `narrow` types fit an `i32`, and every target converts a float to an `i32` in vector form.
+/// `wide` types convert from a float through the bits of `f64::SHIFT` + x, unless the target has `NATIVE_64`. The two expressions
+/// convert `i` to `f32` and `f64`.
+macro_rules! ints {
+    ($($t:ty: $kind:ident, |$i:ident| $f32:expr, $f64:expr;)+) => {$(
+        impl Int for $t {}
+        impl sealed::Ways for $t {
+            #[inline(always)]
+            fn from_f32(x: f32) -> Option<$t> { ints!(@$kind f32, $t, x) }
+            #[inline(always)]
+            fn from_f64(x: f64) -> Option<$t> { ints!(@$kind f64, $t, x) }
+            #[inline(always)]
+            fn to_f32(self) -> f32 { let $i = self; $f32 }
+            #[inline(always)]
+            fn to_f64(self) -> f64 { let $i = self; $f64 }
+        }
+    )+};
+    (@narrow $f:ty, $t:ty, $x:ident) => {{
+        // One comparison, of the distance from the middle of `$t`'s range, keeps the loop to one mask.
+        let (mid, half) = ((<$t>::MIN as f64 + <$t>::MAX as f64) / 2.0, (<$t>::MAX as f64 - <$t>::MIN as f64 + 1.0) / 2.0);
+        (($x - mid as $f).abs() < half as $f).then(|| {
+            if SATURATING { return $x as i32 as $t }
+            // SAFETY: the comparison excludes NaN, the infinities and every float that truncates outside `$t`, which `i32` holds.
+            // The conversion then needs no saturation.
+            unsafe { $x.to_int_unchecked::<i32>() as $t }
+        })
+    }};
+    (@wide f32, $t:ty, $x:ident) => { Self::from_f64($x.into()) };
+    (@wide f64, $t:ty, $x:ident) => {{
+        let n = if NATIVE_64 { $x as i64 } else { shifted($x) };
+        ($x.abs() <= WIDE_LIMIT).then_some(n).and_then(|n| <$t>::try_from(n).ok())
+    }};
+}
+
+// A byte or a `u16` reads as a float through `from_low`. AArch64's own conversion handles bytes two lanes at a time.
+ints! {
+    i8: narrow, |i| i as f32, i as f64;
+    i16: narrow, |i| i as f32, i as f64;
+    i32: narrow, |i| i as f32, i as f64;
+    u8: narrow, |i| f32::from_low(i.into(), 0.0), f32::from_low(i.into(), 0.0).into();
+    u16: narrow, |i| f32::from_low(i.into(), 0.0), f32::from_low(i.into(), 0.0).into();
+    u32: wide, |i| f64::from_low(i.into(), 0.0) as f32, f64::from_low(i.into(), 0.0);
+    i64: wide, |i| wide_float(i) as f32, wide_float(i);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use half::f16;
+
+    /// Each conversion against `as` and exact arithmetic, at the edges of each type's range and of the wide limit.
+    #[test]
+    fn conversions() {
+        assert_eq!((int::<i32, f64>(-2147483648.0), int::<i32, f32>(-2147483648.0), int::<i32, f32>(2147483648.0)), (Some(i32::MIN), None, None));
+        assert_eq!((int::<u8, f64>(255.0), int::<u8, f64>(256.0), int::<u8, f32>(-1.0), int::<u16, f32>(65535.0)), (Some(255), None, None, Some(65535)));
+        assert_eq!((int::<i16, f16>(f16::from_f32(-300.0)), int::<i8, f64>(f64::NAN), int::<i8, f32>(f32::INFINITY)), (Some(-300), None, None));
+        assert_eq!((int::<i64, f64>(-2251799813685247.0), int::<i64, f64>(2251799813685248.0)), (Some(-2251799813685247), None));
+        assert_eq!((int::<i64, f32>(-1e15), int::<u32, f64>(4294967295.0), int::<u32, f64>(4294967296.0)), (Some(-999999986991104), Some(u32::MAX), None));
+        for x in [0.0, -1.0, 2251799813685247.0, -2251799813685247.0, 1e15] { assert_eq!(shifted(x), x as i64, "{x}"); }
+        for i in [0, 1, -1, 255, 1 << 31, -(1 << 31) - 1, (1 << 53) + 1, (1 << 53) + 3, i64::MAX, i64::MIN, 0x7fff_ffff_ffff_fdff] {
+            assert_eq!((float::<f64, i64>(i), halves(i), float::<f32, i64>(i)), (i as f64, i as f64, i as f64 as f32), "{i}");
+        }
+        assert_eq!((float::<f64, u8>(255), float::<f32, u16>(65535), float::<f64, u32>(u32::MAX), float::<f16, i32>(-3)), (255.0, 65535.0, 4294967295.0, f16::from_f32(-3.0)));
+    }
+}

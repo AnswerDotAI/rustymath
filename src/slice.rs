@@ -352,6 +352,57 @@ macro_rules! two_pass {
     };
 }
 
+/// Appends `f` for each of `n` results, for complex arguments `x`, through real slice forms. Each `CHUNK` of items splits into a slice
+/// of real parts and a slice of imaginary parts for each argument, with a `One` argument repeated. `fast` computes the results' real
+/// and imaginary parts from those slices, through real slice forms, and appends them. Each result that `rare` picks, from its
+/// arguments and its fast value, then takes `f`, the scalar function, which handles what the fast formula doesn't, such as tiny or
+/// infinite parts. The results succeed as [`each`] judges them. Slice forms call it through [`split!`].
+pub(crate) fn split<R: crate::Native, const N: usize>(
+    x: [Arg<'_, Complex<R>>; N], n: usize, out: &mut Vec<Complex<R>>, fast: impl Fn([(&[R], &[R]); N], &mut Vec<R>, &mut Vec<R>),
+    rare: impl Fn([Complex<R>; N], Complex<R>) -> bool, f: impl Fn([Complex<R>; N]) -> Complex<R>,
+) -> bool
+where
+    Complex<R>: Item,
+{
+    let (start, mut parts, mut re, mut im) = (out.len(), [(); N].map(|()| (Vec::new(), Vec::new())), Vec::new(), Vec::new());
+    for from in (0..n).step_by(CHUNK) {
+        let (m, base) = (CHUNK.min(n - from), out.len());
+        let x = x.map(|a| a.part(from, m));
+        for ((xs, ys), a) in parts.iter_mut().zip(x) {
+            xs.clear();
+            ys.clear();
+            match a {
+                Arg::One(z) => {
+                    xs.resize(m, z.re);
+                    ys.resize(m, z.im);
+                }
+                Arg::Many(s) => {
+                    xs.extend(s.iter().map(|z| z.re));
+                    ys.extend(s.iter().map(|z| z.im));
+                }
+            }
+        }
+        re.clear();
+        im.clear();
+        fast(std::array::from_fn(|k| (&parts[k].0[..], &parts[k].1[..])), &mut re, &mut im);
+        out.extend(re.iter().zip(&im).map(|(&a, &b)| Complex::new(a, b)));
+        if (0..m).fold(false, |any, i| any | rare(items(&x, i), out[base + i])) {
+            for i in 0..m {
+                let a = items(&x, i);
+                if rare(a, out[base + i]) { out[base + i] = f(a); }
+            }
+        }
+    }
+    out[start..].iter().all(|r| !r.has_nan()) || out[start..].iter().enumerate().all(|(i, &r)| kept(r, items(&x, i)))
+}
+
+/// [`split`] with `rare` marked `#[inline(always)]`, as [`each!`] marks its body, because the scan for rare items runs on every item.
+macro_rules! split {
+    ($x:expr, $n:expr, $out:expr, |$pa:pat_param, $re:pat_param, $im:pat_param| $fast:expr, |$ra:pat_param, $rr:pat_param| $rare:expr, |$fa:pat_param| $f:expr $(,)?) => {
+        crate::slice::split($x, $n, $out, |$pa, $re, $im| $fast, #[inline(always)] |$ra, $rr| $rare, |$fa| $f)
+    };
+}
+
 /// `f`, a slice form at `F`'s working type, for narrower floats, as `forms!`'s `f16` forms run it: each `CHUNK` items convert to the
 /// working type and run, and `narrow` turns each output into the output at `F`.
 pub(crate) fn working<F: Float, O: Copy, P, const N: usize>(
@@ -465,7 +516,7 @@ mod tests {
         each_width!(
             unary: Exp, Expm1, Ln, Log1p, Log2, Log10, Sin, Cos, Tan, Asin, Acos, Atan, Sinh, Cosh, Tanh, Asinh, Acosh, Atanh, Cbrt, Gamma,
                 Lgamma, Erf, Erfc, Erfinv, Erfcinv, LambertW, Sqrt, Sqrt1mx2, Sqrt1px2, Sqrtx2m1, Abs, Sign, Angle;
-            binary: Pow, Root, Hypot, Gammainc, Gammaincc, Gammaincinv, Binom, Fmax, Fmin;
+            binary: Pow, Root, Hypot, Atan2, Gammainc, Gammaincc, Gammaincinv, Binom, Fmax, Fmin;
             ternary: Betainc, Betaincinv
         );
     }
