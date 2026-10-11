@@ -1,4 +1,7 @@
-#![doc = include_str!("../README.md")]
+//! Fast maths functions for `f16`, `f32` and `f64` in plain Rust, each within 4 units in the last place (ulps) of the correctly
+//! rounded result. The crate also has APL's tolerant comparison, number theory and polynomials. Its Python package gives the same
+//! functions as NumPy ufuncs.
+#![doc = include_str!("lib.md")]
 mod arc;
 mod dd;
 mod exp;

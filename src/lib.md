@@ -1,0 +1,94 @@
+## Using rustymath from Rust
+
+Each function is generic over `f32`, `f64` and `half::f16`. It's an ordinary scalar function with no branches on its usual path. The compiler inlines it into the loop that calls it and vectorizes that loop, as it would for `+` or `*`:
+
+```rust
+use rustymath::{exp, ln};
+
+let xs = [0.5f32, 1.0, 2.0];
+let ys: Vec<f32> = xs.iter().map(|&x| exp(x)).collect();
+assert!((ln(ys[2]) - 2.0).abs() < 1e-6);
+assert_eq!(ln(1.0f64), 0.0);
+```
+
+`sin`, `cos` and `tan` reduce their argument by multiples of π. Up to a magnitude of 2^23 at f64 or 2^20 at f32, a few multiply-adds do it. Beyond that, an exact reduction in integer arithmetic keeps the same accuracy for every finite argument. That reduction needs a branch, and a branch stops the loop vectorizing. `checked_sin`, `checked_cos` and `checked_tan` have no branch. Beyond those magnitudes they give `None`:
+
+```rust
+use rustymath::checked_sin;
+
+let sines: Option<Vec<f64>> = [0.5, 1e6].iter().map(|&x| checked_sin(x)).collect();
+assert!(sines.is_some());
+```
+
+### Tolerant comparison
+
+The `tolerant` module has the tolerant comparison that the Python functions use. A `Tolerance` gives tolerant equality, order, floor, ceiling, residue, whole numbers and greatest common divisors, and the range of floats equal to a number. With a tolerance of 0, `with_tolerance!` picks `Exactly` instead. Its methods compile to plain IEEE comparisons.
+
+```rust
+use rustymath::tolerant::{Tolerance, Tolerant};
+
+let t = Tolerance::DEFAULT;
+assert!(t.equal(0.1 + 0.2, 0.3));
+assert_eq!(t.floor(2.9999999999999996), 3.0);
+```
+
+### Number theory
+
+The `number_theory` module tests primality, factorises, finds the next and previous primes, computes Euler's totient, and enumerates and counts primes. Each function on one integer takes a `u64`, a `u128` or a `BigUint`. It computes in the narrowest of those that holds the value. A function that can run for a long time also has a `_with` version. Its extra argument is a check that can stop it, such as a time limit.
+
+```rust
+use rustymath::number_theory::{factor, prime_count};
+
+assert_eq!(factor(&360u64), [(2, 3), (3, 2), (5, 1)]);
+assert_eq!(prime_count(1_000_000), 78_498);
+```
+
+### Polynomials
+
+The `polynomial` module works on polynomials of one variable. A polynomial is a slice of its coefficients, in ascending order. `evaluate` replaces each item of a slice with the polynomial's value there. It applies Horner's rule to a block of items at a time, and that loop vectorizes. `roots` gives the eigenvalues of the companion matrix, `from_roots` builds a polynomial from its roots, `derivative` differentiates, and `fit` fits points by least squares. `roots` and `fit` compute in `f64` through `faer`.
+
+```rust
+use rustymath::polynomial::{derivative, evaluate};
+
+let c = [2.0, -3.0, 1.0];
+let mut x = [0.0, 1.5, 3.0];
+evaluate(&c, &mut x);
+assert_eq!(x, [2.0, -0.25, 2.0]);
+assert_eq!(derivative(&c), [-3.0, 2.0]);
+```
+
+## Accuracy and speed
+
+The table gives nanoseconds per item for a loop over 65,536 inputs on an Apple M5 Max, in October 2026, beside the standard library's version of each function. The rows for `sin`, `cos` and `tan` call `checked_sin`, `checked_cos` and `checked_tan`. To print the table on your own machine, run `RUSTYMATH_TIMES=1 cargo test --test speed -- --nocapture`.
+
+| Function | f64 | std f64 | f32 | std f32 |
+|---|---|---|---|---|
+| `exp` | 0.95 | 1.56 | 0.36 | 0.97 |
+| `expm1` | 1.29 | 1.90 | 0.48 | 1.73 |
+| `ln` | 1.45 | 1.63 | 0.62 | 1.39 |
+| `log1p` | 2.03 | 2.33 | 0.86 | 1.39 |
+| `log2` | 1.43 | 1.63 | 0.62 | 1.28 |
+| `log10` | 1.48 | 1.75 | 0.63 | 1.28 |
+| `sin` | 0.75 | 2.14 | 0.29 | 1.34 |
+| `cos` | 0.94 | 2.17 | 0.37 | 1.76 |
+| `tan` | 1.22 | 2.43 | 0.44 | 1.69 |
+| `asin` | 0.94 | 2.24 | 0.30 | 1.34 |
+| `acos` | 1.08 | 1.97 | 0.35 | 1.30 |
+| `atan` | 1.05 | 2.31 | 0.36 | 2.26 |
+| `sinh` | 1.46 | 2.30 | 0.58 | 1.39 |
+| `cosh` | 1.18 | 2.23 | 0.40 | 1.47 |
+| `tanh` | 1.54 | 2.26 | 0.58 | 1.32 |
+| `asinh` | 2.21 | 2.57 | 0.96 | 1.88 |
+| `acosh` | 2.38 | 2.32 | 0.98 | 1.64 |
+| `atanh` | 2.09 | 2.50 | 0.84 | 1.63 |
+| `cbrt` | 1.15 | 1.63 | 0.89 | 1.86 |
+| `pow` | 5.37 | 4.63 | 3.15 | 2.10 |
+| `hypot` | 0.61 | 0.87 | 0.29 | 0.65 |
+| `root` | 5.52 | 4.42 | 3.12 | 2.16 |
+| `polynomial::evaluate` | 0.43 | 2.57 | 0.22 | 1.87 |
+
+An `f16` computes in `f32` and rounds once. Special values, such as infinities, NaN and signed zeros, give IEEE's results. The tests compare each function with a correctly rounded reference at every `f16` input, at samples of `f32` and `f64` inputs, and at published hard cases.
+
+Where the target has a fused multiply-add instruction, as on AArch64 and on x86-64 with FMA, the functions use it. Elsewhere, as in wasm, they multiply and add separately, because a call to a software `fma` would stop the loop vectorizing. `FUSED` says which the target uses. The modules `fused` and `unfused` hold every function again, with the choice made. A loop compiled with FMA for itself, such as an AVX2 version chosen when your program runs, calls `fused`. The 4-ulp bound holds either way.
+
+`pow` computes e^(y ln |x|) with ln |x| and its product with y as double words, through Arm Optimized Routines' tables. The result stays within 4 ulps even where y ln |x| nears the overflow threshold. A power or root whose exact result is a float, such as 15^4 or ∛27, comes out exactly. `root` divides ln |y| by n the same way, without rounding 1/n first. At `f32` and `f16`, `pow`, `root` and `hypot` compute in `f64` and round once.

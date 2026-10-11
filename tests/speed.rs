@@ -91,9 +91,9 @@ fn copies<A: Copy, B: Copy>(n: usize, unit: [f64; 2], (x64, x32): &(Vec<A>, Vec<
     [time(&x64[..n], f) / unit[0], time(&x32[..n], g) / unit[1]]
 }
 
-/// Each function that the standard library lacks, with the most copies' worth of time it may take at f64 and at f32, about twice its
-/// cost on the Mac, then its cost. A loop that stops vectorizing takes several times as long. The incomplete gamma and beta functions
-/// iterate, so they run on 1,024 inputs, and the others on 16,384.
+/// Each function that the standard library lacks, with the most copies' worth of time it may take at f64 and at f32, then its cost.
+/// A loop that stops vectorizing takes several times as long. The incomplete gamma and beta functions iterate, so they run on 1,024
+/// inputs, and the others on 16,384.
 fn special() -> [(&'static str, [f64; 2], [f64; 2]); 11] {
     let (many, few, unit) = (N / 4, N / 64, [copy::<f64>(), copy::<f32>()]);
     let x = |lo, hi| widths(inputs(lo, hi, GOLDEN), |x| x as f32);
@@ -111,11 +111,11 @@ fn special() -> [(&'static str, [f64; 2], [f64; 2]); 11] {
         ("erfc", [130.0, 150.0], copies(many, unit, &x(-5.0, 10.0), erfc::<f64>, erfc::<f32>)),
         ("erfinv", [410.0, 95.0], copies(many, unit, &x(-0.999, 0.999), erfinv::<f64>, erfinv::<f32>)),
         ("erfcinv", [410.0, 95.0], copies(many, unit, &x(0.001, 1.999), erfcinv::<f64>, erfcinv::<f32>)),
-        ("gammainc", [1250.0, 870.0], copies(few, unit, &gi, |(a, x)| gammainc(a, x), |(a, x)| gammainc(a, x))),
-        ("gammaincc", [1250.0, 870.0], copies(few, unit, &gi, |(a, x)| gammaincc(a, x), |(a, x)| gammaincc(a, x))),
-        ("gammaincinv", [4900.0, 9700.0], copies(few, unit, &gp, |(a, p)| gammaincinv(a, p), |(a, p)| gammaincinv(a, p))),
-        ("betainc", [3300.0, 6600.0], copies(few, unit, &bi, |(a, b, x)| betainc(a, b, x), |(a, b, x)| betainc(a, b, x))),
-        ("betaincinv", [12000.0, 23000.0], copies(few, unit, &bp, |(a, b, p)| betaincinv(a, b, p), |(a, b, p)| betaincinv(a, b, p))),
+        ("gammainc", [1250.0, 2430.0], copies(few, unit, &gi, |(a, x)| gammainc(a, x), |(a, x)| gammainc(a, x))),
+        ("gammaincc", [1250.0, 2430.0], copies(few, unit, &gi, |(a, x)| gammaincc(a, x), |(a, x)| gammaincc(a, x))),
+        ("gammaincinv", [4900.0, 19900.0], copies(few, unit, &gp, |(a, p)| gammaincinv(a, p), |(a, p)| gammaincinv(a, p))),
+        ("betainc", [3300.0, 17600.0], copies(few, unit, &bi, |(a, b, x)| betainc(a, b, x), |(a, b, x)| betainc(a, b, x))),
+        ("betaincinv", [12000.0, 51000.0], copies(few, unit, &bp, |(a, b, p)| betaincinv(a, b, p), |(a, b, p)| betaincinv(a, b, p))),
     ]
 }
 

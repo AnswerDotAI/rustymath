@@ -23,7 +23,7 @@ The other modules have one file each in `py/src/`. `polynomial.rs` takes contigu
 
 ## Documentation
 
-The docs site is built by nbdev and Quarto from `nbs/`. `index.ipynb` is its home page, with Python examples as code cells and Rust examples as fenced blocks. `nbdev-test` runs the notebooks' code cells, and CI runs it after `pytest`. `_quarto.yml` turns execution off, so the site shows the outputs stored in each notebook. `nbdev-preview` serves the site locally, and `.github/workflows/docs.yml` deploys it to GitHub Pages on each push to `main`. The README is written by hand and holds the same content as `index.ipynb`.
+The docs site is built by nbdev and Quarto from `nbs/`. `index.ipynb` is its home page, with Python examples as code cells and Rust examples as fenced blocks. `nbdev-test` runs the notebooks' code cells, and CI runs it after `pytest`. `_quarto.yml` turns execution off, so the site shows the outputs stored in each notebook. `nbdev-preview` serves the site locally, and `.github/workflows/docs.yml` deploys it to GitHub Pages on each push to `main`. `nbdev-readme` writes the README from `index.ipynb`. The Rust section and the accuracy notes live in `src/lib.md`. `lib.rs` includes that file as the crate docs, and `cargo test` runs its examples. `index.ipynb` includes it through Quarto's `include` shortcode.
 
 ## Functions
 
