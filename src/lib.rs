@@ -2,27 +2,37 @@
 //! rounded result. The crate also has APL's tolerant comparison, number theory and polynomials. Its Python package gives the same
 //! functions as NumPy ufuncs.
 #![doc = include_str!("lib.md")]
+#[macro_use]
+mod slice;
 mod arc;
+mod complex;
 mod dd;
 mod exp;
 mod float;
 mod hyperbolic;
+mod lambert;
 mod ln;
+mod parts;
 mod pow;
 mod special;
-mod slice;
+mod sqrts;
 mod table;
 mod trig;
 pub mod distribution;
+pub mod integer;
 pub mod number_theory;
 pub mod polynomial;
+pub mod reduce;
+pub mod random;
 pub mod search;
 pub mod tolerant;
 #[cfg(test)]
 mod accuracy;
 
 pub use float::{Float, Native, FUSED};
-pub use slice::{pairs, Arg, Binary, CHUNK};
+pub use slice::{pairs, Arg, Binary, Ternary, Unary, CHUNK};
+pub use parts::{Abs, Angle, Sign};
+pub use sqrts::Sqrt;
 
 /// The check for a `_with` function's plain version, which can't fail.
 pub(crate) fn ok() -> Result<(), std::convert::Infallible> { Ok(()) }
@@ -31,18 +41,22 @@ pub(crate) const BETWEEN_CHECKS: usize = 1024;
 
 /// Declares each function at the crate root, where it multiplies and adds as the target's `FUSED` says, and in `fused` and
 /// `unfused`, which choose for themselves. Each entry names the module whose function of the same name implements it, generic over
-/// `R: Native` and `const FUSED: bool`. An entry marked `Option` gives an `Option`. Every wrapper is `#[inline(always)]`, because
+/// `R: Native` and `const FUSED: bool`. Every wrapper is `#[inline(always)]`, because
 /// LLVM leaves a large function such as `gamma` out of line in a caller's loop, and the call stops that loop vectorizing. An entry
 /// marked `as` also declares a function object of that name, whose forms rustymath compiles at `f32` and `f64` and never inlines into
-/// a caller. Its slice form is the function of the same name in the module's `slices`.
+/// a caller. Its slice form runs the function on each item, or with `with slices` the function of the same name in that submodule.
+/// Its scalar form calls the function, or with `one` the named function of the module. A free function that must stay branch-free,
+/// so that a caller's loop vectorizes, can then branch in the object's scalar form, which only ever computes one value per call. An
+/// entry marked `: total` never gives NaN from arguments that aren't NaN. Its object's body gives a [`Total`](slice::Total) output.
+/// The object's slice loop then tests no item.
 macro_rules! functions {
-    ($($(#[doc = $doc:literal])* $name:ident($($x:ident),+) $(-> $option:ident)? in $module:ident $(as $object:ident)?;)+) => {
+    ($($(#[doc = $doc:literal])* $name:ident($($x:ident),+) in $module:ident $(as $object:ident $(with $slices:ident)? $(one $one:ident)? $(: $outcome:ident)?)?;)+) => {
         $(
             $(#[doc = $doc])*
             #[inline(always)]
-            pub fn $name<F: Float>($($x: F),+) -> functions!(@ret $($option)?) { functions!(@call FUSED, $module, $name, ($($x),+) $($option)?) }
+            pub fn $name<F: Float>($($x: F),+) -> F { functions!(@call FUSED, $module, $name, ($($x),+)) }
         )+
-        $(functions!(@object $($object)?; $name, $module);)+
+        $(functions!(@object $($object $(with $slices)? $(one $one)? $(: $outcome)?)?; $name, $module, ($($x),+));)+
         /// rustymath's functions with `mla` fused, whatever the target's `FUSED`. Code compiled with FMA enabled for itself, such as an
         /// AVX2 version of a loop chosen when the program runs, calls these on a target whose baseline lacks FMA.
         pub mod fused {
@@ -50,7 +64,7 @@ macro_rules! functions {
             $(
                 #[doc = concat!("[`", stringify!($name), "`](crate::", stringify!($name), "), with `mla` fused.")]
                 #[inline(always)]
-                pub fn $name<F: Float>($($x: F),+) -> functions!(@ret $($option)?) { functions!(@call true, $module, $name, ($($x),+) $($option)?) }
+                pub fn $name<F: Float>($($x: F),+) -> F { functions!(@call true, $module, $name, ($($x),+)) }
             )+
         }
         /// rustymath's functions with `mla` unfused, whatever the target's `FUSED`.
@@ -59,130 +73,125 @@ macro_rules! functions {
             $(
                 #[doc = concat!("[`", stringify!($name), "`](crate::", stringify!($name), "), with `mla` unfused.")]
                 #[inline(always)]
-                pub fn $name<F: Float>($($x: F),+) -> functions!(@ret $($option)?) { functions!(@call false, $module, $name, ($($x),+) $($option)?) }
+                pub fn $name<F: Float>($($x: F),+) -> F { functions!(@call false, $module, $name, ($($x),+)) }
             )+
         }
     };
-    (@object; $name:ident, $module:ident) => {};
-    (@object $object:ident; $name:ident, $module:ident) => {
+    (@object; $name:ident, $module:ident, ($($x:ident),+)) => {};
+    (@object $object:ident $(with $slices:ident)? $(one $one:ident)? $(: $outcome:ident)?; $name:ident, $module:ident, ($($x:ident),+)) => {
         #[doc = concat!("[`", stringify!($name), "`](crate::", stringify!($name), ") as a function object, with the slice form `many`.")]
         #[derive(Clone, Copy, Debug)]
         pub struct $object;
-        impl float::sealed::BinaryForms for $object {
-            fn one_f32(x: f32, y: f32) -> f32 { crate::$module::$name::<f32, FUSED>(x, y) }
-            fn one_f64(x: f64, y: f64) -> f64 { crate::$module::$name::<f64, FUSED>(x, y) }
-            fn many_f32(x: Arg<'_, f32>, y: Arg<'_, f32>, n: usize, out: &mut Vec<f32>) -> bool {
-                crate::$module::slices::$name::<f32, FUSED>(x, y, n, out)
-            }
-            fn many_f64(x: Arg<'_, f64>, y: Arg<'_, f64>, n: usize, out: &mut Vec<f64>) -> bool {
-                crate::$module::slices::$name::<f64, FUSED>(x, y, n, out)
-            }
-        }
+        functions!(@forms $object $(with $slices)?; [$name $($one)?], [$($outcome)?], $module, ($($x),+));
     };
-    (@ret) => { F };
-    (@ret Option) => { Option<F> };
+    (@forms $object:ident; $scalar:tt, $outcome:tt, $module:ident, ($($x:ident),+)) => {
+        forms!($object at real: |_, [$($x),+]| functions!(@outcome $outcome, functions!(@scalar $module, $scalar, ($($x),+))));
+    };
+    (@forms $object:ident with $slices:ident; [$name:ident $($one:ident)?], $outcome:tt, $module:ident, ($($x:ident),+)) => {
+        forms!(
+            $object at real: |_, [$($x),+]| functions!(@outcome $outcome, functions!(@scalar $module, [$name $($one)?], ($($x),+))),
+            many |_, [$($x),+], count, out| crate::$module::$slices::$name::<_, { crate::FUSED }>($($x,)+ count, out)
+        );
+    };
+    (@outcome [], $e:expr) => { $e };
+    (@outcome [total], $e:expr) => { crate::slice::Total($e) };
+    (@scalar $module:ident, [$name:ident], ($($x:ident),+)) => { crate::$module::$name::<_, { crate::FUSED }>($($x),+) };
+    (@scalar $module:ident, [$name:ident $one:ident], ($($x:ident),+)) => { crate::$module::$one::<_, { crate::FUSED }>($($x),+) };
     (@call $fused:expr, $module:ident, $name:ident, ($($x:ident),+)) => { F::from_working(crate::$module::$name::<_, { $fused }>($($x.working()),+)) };
-    (@call $fused:expr, $module:ident, $name:ident, ($($x:ident),+) Option) => {
-        crate::$module::$name::<_, { $fused }>($($x.working()),+).map(F::from_working)
-    };
 }
 
 functions! {
     /// e^x. `exp(∞)` is ∞, `exp(-∞)` is 0, and `exp(NaN)` is NaN.
-    exp(x) in exp;
+    exp(x) in exp as Exp: total;
     /// e^x - 1, without the loss of digits near 0 that `exp(x) - 1` has.
-    expm1(x) in exp;
+    expm1(x) in exp as Expm1: total;
     /// The natural logarithm of x. `ln(0)` is -∞, `ln(∞)` is ∞, and a negative x or NaN gives NaN.
-    ln(x) in ln;
+    ln(x) in ln as Ln;
     /// ln(1 + x), without the loss of digits near 0 that `ln(1 + x)` has. `log1p(-1)` is -∞.
-    log1p(x) in ln;
+    log1p(x) in ln as Log1p;
     /// The logarithm of x to base 2.
-    log2(x) in ln;
+    log2(x) in ln as Log2;
     /// The logarithm of x to base 10.
-    log10(x) in ln;
-    /// sin x. `sin(±0)` is ±0, and `sin(±∞)` and `sin(NaN)` are NaN. Beyond a magnitude of 2^23 at
-    /// f64 or 2^20 at f32, x takes an exact reduction, which is slower and has a branch. A loop that calls `sin` therefore doesn't
-    /// vectorize. A loop that calls `checked_sin` does.
-    sin(x) in trig;
+    log10(x) in ln as Log10;
+    /// The logarithm of x to base b, ln x / ln b. Base 2 and base 10 take `log2` and `log10`, which are exact at powers of their base.
+    logb(b, x) in ln as Logb;
+    /// sin x. `sin(±0)` is ±0, and `sin(±∞)` and `sin(NaN)` are NaN. Beyond a magnitude of 2^23 at f64 or 2^20 at f32, x takes an
+    /// exact reduction, which is slower and has a branch. A loop that calls `sin` therefore doesn't vectorize. [`Sin`]'s slice form
+    /// does: it reduces every item the fast way, then gives only the rare large ones the exact reduction.
+    sin(x) in trig as Sin with slices;
     /// cos x. `cos(±0)` is 1, and `cos(±∞)` and `cos(NaN)` are NaN. Beyond the magnitude that `sin` gives,
     /// x takes the same exact reduction.
-    cos(x) in trig;
+    cos(x) in trig as Cos with slices;
     /// tan x. `tan(±0)` is ±0, and `tan(±∞)` and `tan(NaN)` are NaN. Beyond the magnitude that `sin`
     /// gives, x takes the same exact reduction.
-    tan(x) in trig;
-    /// sin x, as `sin` gives it, with no branch: `None` for a finite x beyond the magnitude where `sin` takes its exact reduction. A
-    /// loop that calls it vectorizes.
-    ///
-    /// ```
-    /// assert_eq!(rustymath::checked_sin(1e6f64), Some(rustymath::sin(1e6)));
-    /// assert_eq!(rustymath::checked_sin(1e6f32), Some(rustymath::sin(1e6)));
-    /// assert_eq!(rustymath::checked_sin(2e6f32), None);
-    /// assert_eq!(rustymath::checked_sin(1e8f64), None);
-    /// assert!(rustymath::checked_sin(f64::INFINITY).unwrap().is_nan());
-    /// ```
-    checked_sin(x) -> Option in trig;
-    /// cos x, as `cos` gives it, with no branch: `None` where `checked_sin` gives `None`.
-    checked_cos(x) -> Option in trig;
-    /// tan x, as `tan` gives it, with no branch: `None` where `checked_sin` gives `None`.
-    checked_tan(x) -> Option in trig;
+    tan(x) in trig as Tan with slices;
     /// asin x, from -π/2 to π/2. A magnitude beyond 1 gives NaN.
-    asin(x) in arc;
+    asin(x) in arc as Asin;
     /// acos x, from 0 to π. A magnitude beyond 1 gives NaN.
-    acos(x) in arc;
+    acos(x) in arc as Acos;
     /// atan x, from -π/2 to π/2.
-    atan(x) in arc;
+    atan(x) in arc as Atan: total;
     /// sinh x. It stays finite up to where sinh itself overflows, beyond the point where e^x does.
-    sinh(x) in hyperbolic;
+    sinh(x) in hyperbolic as Sinh: total;
     /// cosh x. It stays finite up to where cosh itself overflows, beyond the point where e^x does.
-    cosh(x) in hyperbolic;
+    cosh(x) in hyperbolic as Cosh: total;
     /// tanh x.
-    tanh(x) in hyperbolic;
+    tanh(x) in hyperbolic as Tanh: total;
     /// asinh x.
-    asinh(x) in hyperbolic;
+    asinh(x) in hyperbolic as Asinh: total;
     /// acosh x. x below 1 gives NaN.
-    acosh(x) in hyperbolic;
+    acosh(x) in hyperbolic as Acosh;
     /// atanh x. ±1 gives ±∞, and a magnitude beyond 1 gives NaN.
-    atanh(x) in hyperbolic;
+    atanh(x) in hyperbolic as Atanh;
     /// x^y. Special values follow IEEE 754's `pow`: x^0 and 1^y are 1, even for NaN, and a negative x has a power only for a whole y.
-    ///
-    /// ```
-    /// assert!((rustymath::pow(2.0f64, 0.5) - std::f64::consts::SQRT_2).abs() < 1e-15);
-    /// assert!(rustymath::pow(-2.0f32, 3.0) < 0.0);
-    /// assert!(rustymath::pow(-2.0f64, 0.5).is_nan());
-    /// assert_eq!(rustymath::pow(f64::NAN, 0.0), 1.0);
-    /// ```
-    pow(x, y) in pow as Pow;
+    pow(x, y) in pow as Pow with slices one pow_one;
     /// The real nth root of y, computed without rounding 1/n first. A negative y has one only for an odd
     /// whole n. n = 0, an infinite n and NaN give NaN.
-    root(n, y) in pow;
+    root(n, y) in pow as Root with slices one root_one;
     /// The cube root of x.
-    cbrt(x) in pow;
+    cbrt(x) in pow as Cbrt: total;
     /// √(x² + y²), with no overflow or underflow in between. An infinite argument gives ∞, even beside NaN.
-    hypot(x, y) in pow;
+    hypot(x, y) in pow as Hypot: total;
+    /// √(1 - x²), without the digits that squaring x first loses near |x| = 1. A magnitude beyond 1 gives NaN.
+    sqrt1mx2(x) in sqrts as Sqrt1mx2;
+    /// √(1 + x²), with no overflow where x² would overflow.
+    sqrt1px2(x) in sqrts as Sqrt1px2: total;
+    /// √(x - 1) √(x + 1): √(x² - 1) with the sign of x, without the digits that squaring x first loses near |x| = 1. A magnitude
+    /// below 1 gives NaN.
+    sqrtx2m1(x) in sqrts as Sqrtx2m1;
     /// Γ(x). Γ(±0) is ±∞, a negative whole x and -∞ give NaN, and Γ(∞) is ∞.
-    gamma(x) in special;
+    gamma(x) in special as Gamma;
+    /// Γ(x + 1), which is x! for a whole x from 0.
+    factorial(x) in special as Factorial;
     /// ln |Γ(x)|. It is ∞ at 0, at the negative whole numbers and at ±∞. Near its zeros at 1 and 2 its error is within 4 ulps of 2,
     /// not of the result.
-    lgamma(x) in special;
+    lgamma(x) in special as Lgamma: total;
+    /// C(n, k), the binomial coefficient. Whole n and k from 0 multiply out exactly while the result times |n| + k is a whole number
+    /// the type holds, and a negative whole n gives (-1)^k C(k - n - 1, k). Other arguments go through Γ, with the complex binomial
+    /// coefficient's error.
+    binom(n, k) in special as Binom;
     /// The error function, 2/√π times the integral of e^-t² from 0 to x.
-    erf(x) in special;
+    erf(x) in special as Erf: total;
     /// 1 - erf(x), without the loss of digits for large x that `1 - erf(x)` has.
-    erfc(x) in special;
+    erfc(x) in special as Erfc: total;
     /// The x with erf(x) = p. ±1 gives ±∞, and a magnitude beyond 1 gives NaN.
-    erfinv(p) in special;
+    erfinv(p) in special as Erfinv;
     /// The x with erfc(x) = q. 0 gives ∞, 2 gives -∞, and q outside 0 to 2 gives NaN.
-    erfcinv(q) in special;
+    erfcinv(q) in special as Erfcinv;
+    /// W0(x), the principal branch of the Lambert W function: the w of at least -1 with w e^w = x. x below -1/e gives NaN, except
+    /// within half an ulp of -1/e, where W0 is -1.
+    lambertw(x) in lambert as LambertW;
     /// The regularized lower incomplete gamma function P(a, x): the integral of t^(a-1) e^-t from 0 to x, divided by Γ(a). a must be
     /// positive and x nonnegative, or the result is NaN.
-    gammainc(a, x) in special;
+    gammainc(a, x) in special as Gammainc;
     /// The regularized upper incomplete gamma function Q(a, x) = 1 - P(a, x), without the loss of digits that `1 - gammainc(a, x)`
     /// has where Q is small.
-    gammaincc(a, x) in special;
+    gammaincc(a, x) in special as Gammaincc;
     /// The x with P(a, x) = p, for p from 0 to 1.
-    gammaincinv(a, p) in special;
+    gammaincinv(a, p) in special as Gammaincinv;
     /// The regularized incomplete beta function I_x(a, b): the integral of t^(a-1) (1-t)^(b-1) from 0 to x, divided by B(a, b). a and
     /// b must be positive and x from 0 to 1, or the result is NaN.
-    betainc(a, b, x) in special;
+    betainc(a, b, x) in special as Betainc;
     /// The x with I_x(a, b) = p, for p from 0 to 1.
-    betaincinv(a, b, p) in special;
+    betaincinv(a, b, p) in special as Betaincinv;
 }

@@ -35,7 +35,7 @@ const ATAN_32: [f64; 4] = [0.08053722977638245, -0.13877679407596588, 0.19977709
 
 /// π/2 as the nearest float and the rest. Halving or doubling both parts gives π/4 or π exactly.
 #[inline]
-fn half_pi<R: Native>() -> (R, R) {
+pub(crate) fn half_pi<R: Native>() -> (R, R) {
     let (hi, lo) = if R::WIDE { (1.5707963267948966, 6.123233995736766e-17) } else { (1.5707963705062866, -4.3711390001862426e-08) };
     (R::narrow(hi), R::narrow(lo))
 }
@@ -88,4 +88,21 @@ pub(crate) fn atan<R: Native, const FUSED: bool>(x: R) -> R {
     let (hi, lo) = half_pi::<R>();
     let (hi, lo) = if far { (hi, lo) } else if mid { (hi * c(0.5), lo * c(0.5)) } else { (R::zero(), R::zero()) };
     (hi + ((u * z).mla::<FUSED>(p, u) + lo)).copysign(x)
+}
+
+/// The angle of the point (x, y) from the positive x axis, from -π to π, as atan(y/x) in the point's quadrant. The ratio it takes the
+/// arctangent of is the smaller magnitude over the larger, which never overflows. Zeros and infinities give C99's angles: atan2(±0, -0)
+/// is ±π, and atan2(±∞, ±∞) is an odd multiple of ±π/4.
+#[inline]
+pub(crate) fn atan2<R: Native, const FUSED: bool>(y: R, x: R) -> R {
+    let (ax, ay) = (x.abs(), y.abs());
+    let steep = ay > ax;
+    let (num, den) = if steep { (ax, ay) } else { (ay, ax) };
+    // The ratio is 0 at zeros and 1 at two infinities, where the quotient is NaN.
+    let q = if den == R::zero() { R::zero() } else if ax.is_infinite() & ay.is_infinite() { R::one() } else { num / den };
+    let a = atan::<R, FUSED>(q);
+    let (hi, lo) = half_pi::<R>();
+    let a = if steep { hi - (a - lo) } else { a };
+    let a = if x.is_sign_negative() { (hi + hi) - (a - (lo + lo)) } else { a };
+    a.copysign(y)
 }

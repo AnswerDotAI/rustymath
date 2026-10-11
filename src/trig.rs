@@ -30,14 +30,27 @@ pub(crate) fn cos<R: Native, const FUSED: bool>(x: R) -> R { if within(x) { fast
 #[inline]
 pub(crate) fn tan<R: Native, const FUSED: bool>(x: R) -> R { if within(x) { fast::<R, FUSED>(x, Kind::Tan) } else { slow::<R, FUSED>(x, Kind::Tan) } }
 
-#[inline]
-pub(crate) fn checked_sin<R: Native, const FUSED: bool>(x: R) -> Option<R> { within(x).then_some(fast::<R, FUSED>(x, Kind::Sin)) }
+/// The slice forms of sine, cosine and tangent, which `functions!` makes the function objects' `many`. Every item takes the fast
+/// reduction, and the rare items beyond `limit` take the scalar function, with its exact reduction, in a second pass.
+pub(crate) mod slices {
+    use super::{fast, within, Kind};
+    use crate::{float::Native, slice::two_pass, Arg};
 
-#[inline]
-pub(crate) fn checked_cos<R: Native, const FUSED: bool>(x: R) -> Option<R> { within(x).then_some(fast::<R, FUSED>(x, Kind::Cos)) }
-
-#[inline]
-pub(crate) fn checked_tan<R: Native, const FUSED: bool>(x: R) -> Option<R> { within(x).then_some(fast::<R, FUSED>(x, Kind::Tan)) }
+    // A closure's type comes from where it's written. Closures written once in a shared function would give all three kinds one loop
+    // that tests the kind on every item. Each function writes its own, and its loop has its kind fixed.
+    macro_rules! slices {
+        ($($name:ident: $kind:expr),+) => {$(
+            pub(crate) fn $name<R: Native, const FUSED: bool>(x: Arg<'_, R>, n: usize, out: &mut Vec<R>) -> bool {
+                two_pass(
+                    [x], n, out,
+                    #[inline(always)] |[a]| within(a).then_some(fast::<R, FUSED>(a, $kind)),
+                    #[inline(always)] |[a]| super::$name::<R, FUSED>(a),
+                )
+            }
+        )+};
+    }
+    slices!(sin: Kind::Sin, cos: Kind::Cos, tan: Kind::Tan);
+}
 
 /// The magnitude up to which `fast` holds: 2^23 at f64 and 2^20 at f32.
 #[inline]

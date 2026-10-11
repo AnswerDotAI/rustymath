@@ -27,7 +27,8 @@ num-complex = ">=0.4.6, <1"
 num-integer = ">=0.1.46, <1"
 num-rational = ">=0.4.2, <1"
 num-traits = ">=0.2.19, <1"
-rand = { version = ">=0.10.2, <1", default-features = false }
+rand = { version = ">=0.10.2, <1", default-features = false, features = ["alloc"] }
+strength_reduce = ">=0.2.4, <1"
 
 [dev-dependencies]
 # A seeded generator for the distributions' sampling tests.

@@ -132,8 +132,16 @@ fn at32(cases: &[(f64, f64)]) -> Vec<(f32, f32)> {
     cases.iter().filter(|&&(x, _)| x as f32 as f64 == x || x.is_nan()).map(|&(x, y)| (x as f32, y as f32)).collect()
 }
 
+/// A version of a function at f64 and at f32, named for the checks' messages.
+type Variant<W, N> = (W, N, &'static str);
 /// The function at f64 and f32 with `mla` fused, and the same unfused.
-type Variants<W, N> = [(W, N, &'static str); 2];
+type Variants<W, N> = [Variant<W, N>; 2];
+/// `Pow`'s and `Root`'s scalar forms, which take fast paths of their own, as a variant beside the free functions' `fused` and
+/// `unfused`.
+const POW_ONE: Variant<fn((f64, f64)) -> f64, fn((f32, f32)) -> f32> =
+    (|(x, y)| crate::Binary::one(&crate::Pow, x, y), |(x, y)| crate::Binary::one(&crate::Pow, x, y), "object");
+const ROOT_ONE: Variant<fn((f64, f64)) -> f64, fn((f32, f32)) -> f32> =
+    (|(n, y)| crate::Binary::one(&crate::Root, n, y), |(n, y)| crate::Binary::one(&crate::Root, n, y), "object");
 macro_rules! variants {
     ($f:ident) => {
         [
@@ -188,7 +196,7 @@ fn unary(
 /// random f16 pairs. It also checks the hard cases in `testdata/core-math.txt` and the cases in `VECTORS`.
 fn binary(
     name: &str,
-    variants: Variants<fn((f64, f64)) -> f64, fn((f32, f32)) -> f32>,
+    variants: impl IntoIterator<Item = Variant<fn((f64, f64)) -> f64, fn((f32, f32)) -> f32>>,
     f16: fn(f16, f16) -> f16,
     libm: fn(f64, f64) -> f64,
     ranges: &[((f64, f64), (f64, f64))],
@@ -306,7 +314,7 @@ fn pow_accuracy() {
     // Powers that are floats, and powers near overflow and underflow of a base near 1, where the error of ln |x| grows most.
     let exact: Vec<(f64, f64)> = (2..=12).flat_map(|b| (-30..=60).map(move |k| (b as f64, k as f64))).collect();
     let near = [((0.5, 2.0), (-1000.0, 1000.0)), ((1.2, 1.5), (1500.0, 2700.0)), ((0.0, 4.0), (-30.0, 30.0)), ((-8.0, 0.0), (-20.0, 20.0))];
-    binary("pow", variants!(pow, 2), crate::pow, f64::powf, &near, &exact);
+    binary("pow", variants!(pow, 2).into_iter().chain([POW_ONE]), crate::pow, f64::powf, &near, &exact);
 }
 
 #[test]
@@ -319,13 +327,13 @@ fn hypot_accuracy() {
 fn root_accuracy() {
     // Degrees whose reciprocals are floats, against pow, and degree 3, against cbrt.
     for n in [2.0, -2.0, 4.0, -4.0, 8.0, 0.5, -0.5, 1.0, -1.0] {
-        for (wide, narrow, how) in variants!(root, 2) {
+        for (wide, narrow, how) in variants!(root, 2).into_iter().chain([ROOT_ONE]) {
             check_libm(&format!("f64 root {n} at scattered inputs, {how}"), worst(SAMPLES, |i| scattered(i).abs(), |y| wide((n, y)), |y| y.powf(1.0 / n)));
             check(&format!("f32 root {n}, {how}"), worst(1 << 16, |i| spread32(i).abs(), |y| narrow((n as f32, y)), |y| f64::from(y).powf(1.0 / n) as f32));
         }
     }
     let fifths: Vec<f64> = (-100..=100).map(|k: i32| (k as f64).powi(5)).collect();
-    for (wide, _, how) in variants!(root, 2) {
+    for (wide, _, how) in variants!(root, 2).into_iter().chain([ROOT_ONE]) {
         check_libm(&format!("f64 root 3, {how}"), worst(SAMPLES, scattered, |y| wide((3.0, y)), f64::cbrt));
         check(&format!("f64 root 5 of fifth powers, {how}"), worst(fifths.len() as u64, |i| fifths[i as usize], |y| wide((5.0, y)), |y| y.signum() * y.abs().powf(0.2).round()));
     }
@@ -356,7 +364,7 @@ fn exact_accuracy() {
     let roots: Vec<((f64, f64), f64)> = (4..=40)
         .flat_map(|n| (2..).map(f64::from).take_while(move |b| b.powi(n) < 2f64.powi(53)).map(move |b| ((n as f64, b.powi(n)), b)))
         .collect();
-    for (wide, narrow, how) in variants!(pow, 2) {
+    for (wide, narrow, how) in variants!(pow, 2).into_iter().chain([POW_ONE]) {
         exactly(&format!("f64 pow of exact powers, {how}"), &p64, wide);
         exactly(&format!("f32 pow of exact powers, {how}"), &p32, narrow);
     }
@@ -364,7 +372,7 @@ fn exact_accuracy() {
         exactly(&format!("f64 cbrt of exact cubes, {how}"), &c64, wide);
         exactly(&format!("f32 cbrt of exact cubes, {how}"), &c32, narrow);
     }
-    for (wide, _, how) in variants!(root, 2) { exactly(&format!("f64 root of exact powers, {how}"), &roots, wide); }
+    for (wide, _, how) in variants!(root, 2).into_iter().chain([ROOT_ONE]) { exactly(&format!("f64 root of exact powers, {how}"), &roots, wide); }
 }
 
 /// The checks of a special function, against its rows in `testdata/mpmath.txt` called `name`: at f64, at f32 where the input is a
@@ -394,6 +402,18 @@ fn erfinv_accuracy() { special("erfinv", variants!(erfinv), crate::erfinv, crate
 
 #[test]
 fn erfcinv_accuracy() { special("erfcinv", variants!(erfcinv), crate::erfcinv, crate::erfcinv::<f64>); }
+
+#[test]
+fn lambertw_accuracy() { special("lambertw", variants!(lambertw), crate::lambertw, crate::lambertw::<f64>); }
+
+#[test]
+fn sqrt1mx2_accuracy() { special("sqrt1mx2", variants!(sqrt1mx2), crate::sqrt1mx2, crate::sqrt1mx2::<f64>); }
+
+#[test]
+fn sqrt1px2_accuracy() { special("sqrt1px2", variants!(sqrt1px2), crate::sqrt1px2, crate::sqrt1px2::<f64>); }
+
+#[test]
+fn sqrtx2m1_accuracy() { special("sqrtx2m1", variants!(sqrtx2m1), crate::sqrtx2m1, crate::sqrtx2m1::<f64>); }
 
 /// The worst error of `f` at `cases` of inputs and reference results, in units of `eps` times the larger of |reference| and `floor`,
 /// with the input that gives it. Infinities and NaN must match exactly.

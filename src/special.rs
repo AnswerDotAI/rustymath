@@ -1,7 +1,7 @@
-//! Special functions: gamma and its logarithm, the error function and its inverses, and the regularized incomplete gamma and beta
-//! functions with their inverses. f64 computes in f64. Narrower types round an f64 result, from a cheaper f64 algorithm where one
-//! has the precision they need. `gamma`, `lgamma` and `erf` have no branch on their usual path, and loops that call them vectorize.
-//! The others choose a method by range, or iterate until they converge.
+//! Special functions: gamma, its logarithm and binomial coefficients, the error function and its inverses, and the regularized
+//! incomplete gamma and beta functions with their inverses. f64 computes in f64. Narrower types round an f64 result, from a cheaper
+//! f64 algorithm where one has the precision they need. `gamma`, `lgamma` and `erf` have no branch on their usual path, and loops that
+//! call them vectorize. The others choose a method by range, or iterate until they converge.
 use crate::{
     dd::Double,
     exp::{exp, exp_narrow, exp_plus},
@@ -9,6 +9,7 @@ use crate::{
     ln::{ln, ln_narrow, ln_double, ln_split, log1p},
     Native,
 };
+use num_complex::Complex;
 use std::f64::consts::PI;
 
 /// Each function at every type: it computes in f64, and narrower types round the result.
@@ -32,10 +33,46 @@ pub(crate) fn gamma<R: Native, const FUSED: bool>(x: R) -> R {
     R::narrow(if R::WIDE { gamma64::<FUSED>(x.wide()) } else { gamma_plain::<FUSED>(x.wide()) })
 }
 
+/// Γ(x + 1).
+#[inline(always)]
+pub(crate) fn factorial<R: Native, const FUSED: bool>(x: R) -> R { gamma::<R, FUSED>(x + R::one()) }
+
 /// ln |Γ(x)|, with f64 and narrower types computing as `gamma` does.
 #[inline(always)]
 pub(crate) fn lgamma<R: Native, const FUSED: bool>(x: R) -> R {
     R::narrow(if R::WIDE { lgamma64::<FUSED>(x.wide()) } else { lgamma_stirling::<FUSED>(x.wide()) })
+}
+
+/// The most factors that `binom` multiplies at f64 and at narrower types. C(n, k) with that many steps, the smaller of k and n - k,
+/// is at least C(2k, k), which overflows the type, so more steps give ±∞ at once.
+const BINOM_STEPS: (f64, f64) = (600.0, 80.0);
+
+/// C(n, k). For whole n and a whole k from 0, it multiplies by (top - i)/(i + 1) for i below the smaller of k and top - k, where top
+/// is n, or k - n - 1 for a negative n, which gives (-1)^k C(top, k). Each step's quotient is a whole number, so the result is exact
+/// while the result times top is a whole number the type holds. Other arguments take Γ(n + 1)/(Γ(k + 1) Γ(n - k + 1)) through the
+/// complex binomial coefficient's real part.
+#[inline]
+pub(crate) fn binom<R: Native, const FUSED: bool>(n: R, k: R) -> R {
+    let whole = |v: R| v.trunc() == v;
+    if whole(n) & whole(k) & (k >= R::zero()) {
+        if (n >= R::zero()) & (k > n) { return R::zero() }
+        if k.is_finite() {
+            let (top, negative) = if n >= R::zero() { (n, false) } else { (k - n - R::one(), (k * R::narrow(0.5)).fract() != R::zero()) };
+            let steps = if k < top - k { k } else { top - k };
+            let c = if steps > R::narrow(if R::WIDE { BINOM_STEPS.0 } else { BINOM_STEPS.1 }) {
+                R::infinity()
+            } else {
+                let (mut c, mut i) = (R::one(), R::zero());
+                while i < steps {
+                    c = c * (top - i) / (i + R::one());
+                    i = i + R::one();
+                }
+                c
+            };
+            return if negative { -c } else { c };
+        }
+    }
+    crate::complex::binom::<R, FUSED>(Complex::new(n, R::zero()), Complex::new(k, R::zero())).re
 }
 
 /// The g of the Lanczos approximation that musl's `tgamma` uses, and g - 1/2.
@@ -50,10 +87,22 @@ const LN2_512: (f64, f64) = (354.891356446692, 1.1873519686893054e-14);
 const TWO_M512: f64 = 7.458340731200207e-155;
 /// π - `PI`.
 const PI_LO: f64 = 1.2246467991473532e-16;
-/// ln(2π)/2, and the coefficients of Stirling's series after its leading terms, as a polynomial in 1/z², highest degree first:
-/// ln Γ(z) ≈ (z - 1/2) ln z - z + ln(2π)/2 + (1/z)(1/12 - 1/(360 z²) + 1/(1260 z⁴)).
-const HALF_LN_2PI: f64 = 0.9189385332046728;
-const STIRLING: [f64; 3] = [1.0 / 1260.0, -1.0 / 360.0, 1.0 / 12.0];
+/// ln(2π)/2, and the coefficients of Stirling's series after its leading terms, B_2k / (2k(2k-1)) for k from 10 down to 1, as a
+/// polynomial in 1/z², highest degree first: ln Γ(z) ≈ (z - 1/2) ln z - z + ln(2π)/2 + (1/z)(1/12 - 1/(360 z²) + 1/(1260 z⁴) - …).
+/// Narrower types need only the last three, and complex ln Γ all ten.
+pub(crate) const HALF_LN_2PI: f64 = 0.9189385332046728;
+pub(crate) const STIRLING: [f64; 10] = [
+    -1.3924322169059011,
+    0.17964437236883057,
+    -0.029550653594771242,
+    0.00641025641025641,
+    -0.0019175269175269176,
+    0.0008417508417508417,
+    -0.0005952380952380953,
+    0.0007936507936507937,
+    -0.002777777777777778,
+    0.08333333333333333,
+];
 
 /// The numerator and denominator of the Lanczos sum S from musl's `tgamma`, as polynomials in 1/y times y^12, highest degree first:
 /// Γ(y) = S(y) e^-g e^((y - 1/2)(ln(y + g - 1/2) - 1)).
@@ -210,7 +259,7 @@ fn shifted(y: f64) -> (f64, f64) {
 
 /// ln(2π)/2 plus Stirling's series after its leading terms, at w = 1/z: ln Γ(z) - (z - 1/2) ln z + z, within 3e-10 from z = 8 up.
 #[inline(always)]
-fn stirling_tail<const FUSED: bool>(w: f64) -> f64 { w.mla::<FUSED>(horner::<f64, FUSED, 3>(w * w, STIRLING), HALF_LN_2PI) }
+fn stirling_tail<const FUSED: bool>(w: f64) -> f64 { w.mla::<FUSED>(horner::<f64, FUSED, 3>(w * w, [STIRLING[7], STIRLING[8], STIRLING[9]]), HALF_LN_2PI) }
 
 /// ln |Γ(x)| for the narrower types, in plain f64, from Stirling's series at (z, P) = `shifted(y)`. Below 1/2, ln |Γ(x)| =
 /// ln(π / |sin πx|) - ln Γ(1 - x). The shift's product and the reflection's quotient share one logarithm.
@@ -330,18 +379,22 @@ fn erf_small<R: Native, const FUSED: bool>(x: R) -> R {
 fn erfc_tail<R: Native, const FUSED: bool>(a: R) -> R {
     let t = erf_table::<R>();
     let one = R::one();
-    let mid = || { let s = a - one; (one - R::narrow(t.erx)) - horner::<R, FUSED, 7>(s, t.pa) / horner::<R, FUSED, 7>(s, t.qa) };
-    let far = || {
-        let v = one / (a * a);
-        let near = a < R::narrow(1.0 / 0.35);
-        let rs = horner_either::<R, FUSED, 8>(v, near, t.ra, t.rb) / horner_either::<R, FUSED, 9>(v, near, t.sa, t.sb);
-        // z has the high half of a's bits, so z² is exact, and -a² = -z² + (z - a)(z + a) holds as a double word.
-        let z = a.upper();
-        let h = Double::sum(-z * z, R::narrow(-0.5625));
-        let u = Double::sum(h.hi, (z - a) * (z + a) + rs);
-        exp_plus::<R, FUSED>(u.hi, u.lo + h.lo) / a
-    };
-    either(a < R::narrow(1.25), mid, far)
+    either(
+        a < R::narrow(1.25),
+        #[inline(always)]
+        || { let s = a - one; (one - R::narrow(t.erx)) - horner::<R, FUSED, 7>(s, t.pa) / horner::<R, FUSED, 7>(s, t.qa) },
+        #[inline(always)]
+        || {
+            let v = one / (a * a);
+            let near = a < R::narrow(1.0 / 0.35);
+            let rs = horner_either::<R, FUSED, 8>(v, near, t.ra, t.rb) / horner_either::<R, FUSED, 9>(v, near, t.sa, t.sb);
+            // z has the high half of a's bits, so z² is exact, and -a² = -z² + (z - a)(z + a) holds as a double word.
+            let z = a.upper();
+            let h = Double::sum(-z * z, R::narrow(-0.5625));
+            let u = Double::sum(h.hi, (z - a) * (z + a) + rs);
+            exp_plus::<R, FUSED>(u.hi, u.lo + h.lo) / a
+        },
+    )
 }
 
 /// `first()` where `use_first` holds, and `second()` elsewhere. f32 computes both and selects, so that a loop that calls it
@@ -394,12 +447,16 @@ pub(crate) fn erf<R: Native, const FUSED: bool>(x: R) -> R {
 #[inline(always)]
 pub(crate) fn erfc<R: Native, const FUSED: bool>(x: R) -> R {
     let (a, one, half, two) = (x.abs(), R::one(), R::narrow(0.5), R::narrow(2.0));
-    let small = || {
-        let y = erf_small::<R, FUSED>(x);
-        if x < R::narrow(0.25) { one - (x + x * y) } else { half - (x - half + x * y) }
-    };
-    let large = || { let t = erfc_tail::<R, FUSED>(a); if x < R::zero() { two - t } else { t } };
-    let r = either(a < R::narrow(0.84375), small, large);
+    let r = either(
+        a < R::narrow(0.84375),
+        #[inline(always)]
+        || {
+            let y = erf_small::<R, FUSED>(x);
+            if x < R::narrow(0.25) { one - (x + x * y) } else { half - (x - half + x * y) }
+        },
+        #[inline(always)]
+        || { let t = erfc_tail::<R, FUSED>(a); if x < R::zero() { two - t } else { t } },
+    );
     if x.is_nan() { x } else if a < R::narrow(28.0) { r } else if x < R::zero() { two } else { R::zero() }
 }
 

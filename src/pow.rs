@@ -51,48 +51,111 @@ fn signed<R: Native>(r: R, x: R, odd: bool, exists: bool) -> R {
 }
 
 /// x^y. Special values follow IEEE 754's `pow`: x^0 and 1^y are 1, even for NaN, and a negative x has a power only for a whole y.
-/// ln |x| is -∞ at 0 and ∞ at ∞, so e^(y ln |x|) is already right at zeros and infinities, and for an infinite y beside every |x|
-/// but 1. Where y is 0 or |x| is 1, the magnitude is 1. e^(y ln |x|) would give NaN there wherever the product is 0 × ∞ or holds a
-/// NaN.
+/// At f64 it is `pow_one`: the f64 loop reads tables, which targets without gathers run one item at a time anyway. Narrower types
+/// have no branch, so the loops that call them vectorize.
 #[inline(always)]
-pub(crate) fn pow<R: Native, const FUSED: bool>(x: R, y: R) -> R {
-    let (whole, odd) = parity(y);
-    let r = pow_plain::<R, FUSED>(x, y);
-    signed(if (y == R::zero()) | (x.abs() == R::one()) { R::one() } else { r }, x, odd, whole)
-}
+pub(crate) fn pow<R: Native, const FUSED: bool>(x: R, y: R) -> R { if R::WIDE { pow_one::<R, FUSED>(x, y) } else { pow_any::<R, FUSED>(x, y) } }
 
-/// x^y for a positive x other than 1 and a nonzero y, where `pow` needs none of its special cases. The slice form computes this for
-/// every item, then recomputes with `pow` the few items where `plain` is false.
+/// The real nth root of y, y^(1/n), computed as e^(ln |y| / n) without rounding 1/n first. A negative y has one only for an odd
+/// whole n. n = 0, an infinite n and NaN give NaN. It branches as `pow` does.
 #[inline(always)]
-fn pow_plain<R: Native, const FUSED: bool>(x: R, y: R) -> R { R::narrow(power_of::<R, FUSED>(x.wide(), y.wide(), false)) }
+pub(crate) fn root<R: Native, const FUSED: bool>(n: R, y: R) -> R { if R::WIDE { root_one::<R, FUSED>(n, y) } else { root_any::<R, FUSED>(n, y) } }
 
-/// Whether `pow_plain` gives x^y: x is not negative, y is not 0 and |x| is not 1.
+/// `pow` with one branch to its fast path wherever that applies, at every width, as Arm's scalar `pow` and `powf` do. `Pow`'s
+/// scalar form takes it, because each call computes one value, which no loop around it can vectorize. At f64 the fast path is
+/// `fast`, and at narrower widths `fast_single`.
 #[inline(always)]
-fn plain<R: Native>(x: R, y: R) -> bool { !x.is_sign_negative() & (y != R::zero()) & (x != R::one()) }
-
-/// The slice forms of this module's functions, which `functions!` makes the function objects' `many`.
-pub(crate) mod slices {
-    use crate::{float::Native, slice::{two_pass, Arg}};
-
-    /// x^y for each pair. Every item takes `pow_plain`, and the rare items where `plain` fails take `pow` in a second pass.
-    pub(crate) fn pow<R: Native, const FUSED: bool>(x: Arg<'_, R>, y: Arg<'_, R>, n: usize, out: &mut Vec<R>) -> bool {
-        // Closures, because the `Fn` call of a function item such as `super::pow::<f64, true>` can stay out of line.
-        two_pass(
-            x, y, n, out,
-            #[inline(always)] |a, b| super::pow::<R, FUSED>(a, b),
-            #[inline(always)] |a, b| super::pow_plain::<R, FUSED>(a, b),
-            #[inline(always)] |a, b| super::plain(a, b),
-        )
+pub(crate) fn pow_one<R: Native, const FUSED: bool>(x: R, y: R) -> R {
+    match if R::WIDE { fast::<R, FUSED>(x, y, false) } else { fast_single::<R, FUSED>(x, y, false) } {
+        Some(r) => r,
+        None => pow_any::<R, FUSED>(x, y),
     }
 }
 
-/// The real nth root of y, y^(1/n), computed as e^(ln |y| / n) without rounding 1/n first. A negative y has one only for an odd
-/// whole n. n = 0, an infinite n and NaN give NaN.
+/// `root` with one branch, as `pow_one` has. `Root`'s scalar form takes it.
 #[inline(always)]
-pub(crate) fn root<R: Native, const FUSED: bool>(n: R, y: R) -> R {
+pub(crate) fn root_one<R: Native, const FUSED: bool>(n: R, y: R) -> R {
+    match if R::WIDE { fast::<R, FUSED>(y, n, true) } else { fast_single::<R, FUSED>(y, n, true) } {
+        Some(r) => r,
+        None => root_any::<R, FUSED>(n, y),
+    }
+}
+
+/// x^y, or the yth root of x when `divide`, where neither function needs a special case, or `None`. x must be positive, finite and
+/// nonzero, and y `usable`. At f64 the exponent must also be within `table::NORMAL`, where the result is a normal float. That path
+/// skips the selects for special values in `table`'s logarithm and exponential. No branch.
+#[inline(always)]
+fn fast<R: Native, const FUSED: bool>(x: R, y: R, divide: bool) -> Option<R> {
+    let (a, y) = (x.wide(), y.wide());
+    let (r, normal) = if R::WIDE {
+        let l = table::ln_normal::<FUSED>(a);
+        let d = if divide { l.div::<FUSED>(Double::new(y, 0.0)) } else { l.mul_float::<FUSED>(y) };
+        (table::exp_normal::<FUSED>(d.hi, d.lo), d.hi.abs() < table::NORMAL)
+    } else {
+        let l = ln_narrow::<FUSED>(a);
+        (exp_narrow::<FUSED>(if divide { l / y } else { l * y }), true)
+    };
+    // A narrower float widens to a normal f64, so this tests positive, finite and nonzero at every width.
+    let base = a.to_bits().wrapping_sub(f64::MIN_POSITIVE.to_bits()) < f64::INFINITY.to_bits() - f64::MIN_POSITIVE.to_bits();
+    (base & normal & usable(y, divide)).then_some(R::narrow(r))
+}
+
+/// `fast` for one f32 or f16 value, through `table`'s single-precision logarithm and exponential, as Arm's scalar `powf` does. x must
+/// be a positive normal f32, y `usable`, and the exponent below 124 in magnitude, where the result is a normal f32.
+#[inline(always)]
+fn fast_single<R: Native, const FUSED: bool>(x: R, y: R, divide: bool) -> Option<R> {
+    let (ix, y) = ((x.wide() as f32).to_bits(), y.wide());
+    let l = table::log2_single::<FUSED>(ix);
+    let v = if divide { l / y } else { l * y };
+    let normal = ix.wrapping_sub(0x0080_0000) < 0x7f80_0000 - 0x0080_0000;
+    // Below 124, |v| has top bits below 126's, which is how Arm's `powf` tests that the result is a normal f32.
+    let small = (v.to_bits() >> 47 & 0xffff) < 126f64.to_bits() >> 47;
+    (normal && usable(y, divide) && small).then(|| R::narrow(table::exp2_single::<FUSED>(v)))
+}
+
+/// Whether y can be the exponent of a fast path: finite, and nonzero as a root's degree.
+#[inline(always)]
+fn usable(y: f64, divide: bool) -> bool { y.is_finite() & !(divide & (y == 0.0)) }
+
+/// `pow` for any arguments, with no branch. ln |x| is -∞ at 0 and ∞ at ∞, so e^(y ln |x|) is already right at zeros and infinities,
+/// and for an infinite y beside every |x| but 1. Where y is 0 or |x| is 1, the magnitude is 1. e^(y ln |x|) would give NaN there
+/// wherever the product is 0 × ∞ or holds a NaN.
+#[inline(always)]
+fn pow_any<R: Native, const FUSED: bool>(x: R, y: R) -> R {
+    let (whole, odd) = parity(y);
+    let r = R::narrow(power_of::<R, FUSED>(x.wide(), y.wide(), false));
+    signed(if (y == R::zero()) | (x.abs() == R::one()) { R::one() } else { r }, x, odd, whole)
+}
+
+/// `root` for any arguments, with no branch.
+#[inline(always)]
+fn root_any<R: Native, const FUSED: bool>(n: R, y: R) -> R {
     let (_, odd) = parity(n);
     let r = signed(R::narrow(power_of::<R, FUSED>(y.wide(), n.wide(), true)), y, odd, odd);
     if (n == R::zero()) | !n.is_finite() { R::nan() } else { r }
+}
+
+/// The slice forms of this module's functions, which `functions!` makes the function objects' `many`. Every item takes `fast`, and
+/// the rare items it rejects take the branch-free form in a second pass.
+pub(crate) mod slices {
+    use crate::{float::Native, slice::two_pass, Arg};
+
+    // Closures, because the `Fn` call of a function item such as `super::pow_any::<f64, true>` can stay out of line.
+    pub(crate) fn pow<R: Native, const FUSED: bool>(x: Arg<'_, R>, y: Arg<'_, R>, count: usize, out: &mut Vec<R>) -> bool {
+        two_pass(
+            [x, y], count, out,
+            #[inline(always)] |[a, b]| super::fast::<R, FUSED>(a, b, false),
+            #[inline(always)] |[a, b]| super::pow_any::<R, FUSED>(a, b),
+        )
+    }
+
+    pub(crate) fn root<R: Native, const FUSED: bool>(n: Arg<'_, R>, y: Arg<'_, R>, count: usize, out: &mut Vec<R>) -> bool {
+        two_pass(
+            [n, y], count, out,
+            #[inline(always)] |[a, b]| super::fast::<R, FUSED>(b, a, true),
+            #[inline(always)] |[a, b]| super::root_any::<R, FUSED>(a, b),
+        )
+    }
 }
 
 /// The bits of |x|^(-1/3) plus a third of the bits of |x|, both read as whole numbers without their low 12 bits. The sum is nearly the
@@ -142,4 +205,19 @@ pub(crate) fn hypot<R: Native, const FUSED: bool>(x: R, y: R) -> R {
     let (sa, sb) = (a * s, b * s);
     let r = sa.mla::<FUSED>(sa, sb * sb).sqrt() * back;
     R::narrow(if a.is_infinite() | b.is_infinite() { f64::INFINITY } else { r })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Binary, Pow};
+
+    /// IEEE 754's special values for `pow`, through the free function and through `Pow`'s scalar form, which has its own fast path.
+    #[test]
+    fn special_values() {
+        for p in [crate::pow::<f64> as fn(f64, f64) -> f64, |x, y| Pow.one(x, y)] {
+            assert_eq!((p(f64::NAN, 0.0), p(1.0, f64::NAN), p(-2.0, 3.0), p(0.0, -1.0)), (1.0, 1.0, -8.0, f64::INFINITY));
+            assert!(p(-2.0, 0.5).is_nan() && (p(2.0, 0.5) - std::f64::consts::SQRT_2).abs() < 1e-15);
+        }
+        assert!(crate::pow(-2.0f32, 3.0) == -8.0 && Pow.one(-2.0f32, 0.5).is_nan());
+    }
 }

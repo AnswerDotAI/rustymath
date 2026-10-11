@@ -85,6 +85,12 @@ pub(crate) fn log10<R: Native, const FUSED: bool>(x: R) -> R {
     log::<R, FUSED>(x, (R::narrow(hi), R::narrow(lo)), LOG10_E)
 }
 
+/// The logarithm of x to base b.
+#[inline]
+pub(crate) fn logb<R: Native, const FUSED: bool>(b: R, x: R) -> R {
+    if b == R::narrow(2.0) { log2::<R, FUSED>(x) } else if b == R::narrow(10.0) { log10::<R, FUSED>(x) } else { ln::<R, FUSED>(x) / ln::<R, FUSED>(b) }
+}
+
 /// ln(1 + x). Rounding u = 1 + x loses c = x - (u - 1). With u = m × 2^e and c' = c × 2^-e, the quotient
 /// s = (m - 1 + c')/(m + 1 + c') restores it, and a small x keeps its relative accuracy with one division. Beyond 2^53, c is 0. e
 /// stops at `top` there, to keep 2^-e a normal float.

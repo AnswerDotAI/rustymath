@@ -4,32 +4,33 @@ use numpy::ndarray::ArrayD;
 use numpy::{AllowTypeChange, IntoPyArray, PyArrayLikeDyn};
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyFloat};
 use rand::{rngs::StdRng, SeedableRng};
-use rustymath::distribution::{self as dist, standard::*};
+use rustymath::{distribution::{self as dist, standard::*}, Arg, Unary};
 
 /// A probability distribution, with a density, a cumulative distribution, a quantile function and a sampler.
 #[pyclass(module = "rustymath.distribution", frozen)]
 pub struct Distribution(dist::Distribution);
 
-/// `f` applied to `x`'s items, written to an array of `x`'s shape, or a float for a number.
-fn each<'py>(py: Python<'py>, x: PyArrayLikeDyn<'py, f64, AllowTypeChange>, f: impl Fn(&[f64], &mut [f64])) -> Bound<'py, PyAny> {
+/// `f`'s slice form over `x`'s items, as an array of `x`'s shape, or a float for a number.
+fn each<'py>(py: Python<'py>, x: PyArrayLikeDyn<'py, f64, AllowTypeChange>, f: impl Unary<f64, Out = f64>) -> Bound<'py, PyAny> {
     let x = x.as_array();
     let x = x.as_standard_layout();
-    let mut out = ArrayD::zeros(x.raw_dim());
-    f(x.as_slice().expect("a standard-layout array is one slice"), out.as_slice_mut().expect("a new array is one slice"));
+    let mut out = Vec::with_capacity(x.len());
+    f.many(Arg::Many(x.as_slice().expect("a standard-layout array is one slice")), x.len(), &mut out);
+    let out = ArrayD::from_shape_vec(x.raw_dim(), out).expect("one result for each item");
     if out.ndim() == 0 { PyFloat::new(py, *out.first().expect("a 0-d array has one item")).into_any() } else { out.into_pyarray(py).into_any() }
 }
 
 #[pymethods]
 impl Distribution {
     /// The density at each item of `x`, or for a discrete distribution the probability of each.
-    fn pdf<'py>(&self, py: Python<'py>, x: PyArrayLikeDyn<'py, f64, AllowTypeChange>) -> Bound<'py, PyAny> { each(py, x, |x, out| self.0.pdfs(x, out)) }
+    fn pdf<'py>(&self, py: Python<'py>, x: PyArrayLikeDyn<'py, f64, AllowTypeChange>) -> Bound<'py, PyAny> { each(py, x, dist::Pdf(self.0)) }
 
     /// The probability of a value at most each item of `x`.
-    fn cdf<'py>(&self, py: Python<'py>, x: PyArrayLikeDyn<'py, f64, AllowTypeChange>) -> Bound<'py, PyAny> { each(py, x, |x, out| self.0.cdfs(x, out)) }
+    fn cdf<'py>(&self, py: Python<'py>, x: PyArrayLikeDyn<'py, f64, AllowTypeChange>) -> Bound<'py, PyAny> { each(py, x, dist::Cdf(self.0)) }
 
     /// The least value whose `cdf` is at least each item of `p`. A `p` outside 0 to 1 gives NaN.
     fn quantile<'py>(&self, py: Python<'py>, p: PyArrayLikeDyn<'py, f64, AllowTypeChange>) -> Bound<'py, PyAny> {
-        each(py, p, |p, out| self.0.quantiles(p, out))
+        each(py, p, dist::Quantile(self.0))
     }
 
     /// Values drawn from the distribution: one float with no `size`, or else an array of shape `size`. The same `seed` gives the same

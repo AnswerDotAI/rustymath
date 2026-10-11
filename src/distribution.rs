@@ -1,8 +1,8 @@
-//! Probability distributions. Each has a density, a cumulative distribution, a quantile function and a sampler, for one value or
-//! over slices. A slice method chooses the distribution's formulas once, outside its loop, so the loops of the closed-form
-//! distributions vectorize. A discrete distribution's density is its mass at a whole x, and its quantile function and sampler give
-//! whole numbers.
-use crate::{atan, betainc, betaincinv, cos, erfc, erfcinv, exp, expm1, gammainc, gammaincc, gammaincinv, lgamma, ln, log1p, pow, sin, tan};
+//! Probability distributions. Each has a density, a cumulative distribution, a quantile function and a sampler. The first three are
+//! also function objects, `Pdf`, `Cdf` and `Quantile`, which hold the distribution. Their slice forms choose the distribution's
+//! formulas once, outside the loop, so the loops of the closed-form distributions vectorize. A discrete distribution's density is its
+//! mass at a whole x, and its quantile function and sampler give whole numbers.
+use crate::{atan, betainc, betaincinv, cos, erfc, erfcinv, exp, expm1, gammainc, gammaincc, gammaincinv, lgamma, ln, log1p, pow, sin, tan, Float, Unary};
 use rand::{
     distr::{Distribution as _, Open01, StandardUniform},
     Rng,
@@ -79,29 +79,44 @@ trait Formulas {
     }
 }
 
-/// `f` of each item of `x`, written to `out`, which must have the same length.
-fn fill(x: &[f64], out: &mut [f64], f: impl Fn(f64) -> f64) {
-    assert_eq!(x.len(), out.len(), "the input and output slices must have the same length");
-    for (o, &x) in out.iter_mut().zip(x) { *o = f(x); }
+/// The quantile of p from a distribution's formulas, which take p from 0 to 1. Any other p gives NaN.
+fn quantile_of(d: &impl Formulas, p: f64) -> f64 { if (0.0..=1.0).contains(&p) { d.quantile(p) } else { f64::NAN } }
+
+/// `f` of `x`, computed in `f64` and rounded to `x`'s type.
+#[inline(always)]
+fn narrowed<F: Float>(x: F, f: impl Fn(f64) -> f64) -> F { F::narrow(f(x.wide())) }
+
+/// Writes function objects that each hold a distribution and give one of its functions at every float type, computed in `f64`. A
+/// slice form picks the distribution's formulas once, outside its loop. An item fails where its result is NaN and its argument isn't,
+/// as for a quantile of p outside 0 to 1.
+macro_rules! law_objects {
+    ($($(#[$doc:meta])* $object:ident = |$d:ident, $x:ident| $formula:expr;)+) => {$(
+        $(#[$doc])*
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        pub struct $object(pub Distribution);
+        forms!($object at real: |k, [$x]| narrowed($x, |$x| each_law!(&k.0 .0, $d => $formula)),
+            many |k, [$x], n, out| each_law!(&k.0 .0, $d => crate::slice::each([$x], n, out, |[$x]| narrowed($x, |$x| $formula))));
+    )+};
+}
+
+law_objects! {
+    /// [`Distribution::pdf`] as a function object.
+    Pdf = |d, x| d.pdf(x);
+    /// [`Distribution::cdf`] as a function object.
+    Cdf = |d, x| d.cdf(x);
+    /// [`Distribution::quantile`] as a function object.
+    Quantile = |d, p| quantile_of(d, p);
 }
 
 impl Distribution {
     /// The density at x, or for a discrete distribution the probability of x.
-    pub fn pdf(&self, x: f64) -> f64 { each_law!(&self.0, d => d.pdf(x)) }
+    pub fn pdf(&self, x: f64) -> f64 { Pdf(*self).one(x) }
     /// The probability of a value at most x.
-    pub fn cdf(&self, x: f64) -> f64 { each_law!(&self.0, d => d.cdf(x)) }
+    pub fn cdf(&self, x: f64) -> f64 { Cdf(*self).one(x) }
     /// The least x whose `cdf` is at least p. p outside 0 to 1 gives NaN.
-    pub fn quantile(&self, p: f64) -> f64 { if (0.0..=1.0).contains(&p) { each_law!(&self.0, d => d.quantile(p)) } else { f64::NAN } }
+    pub fn quantile(&self, p: f64) -> f64 { Quantile(*self).one(p) }
     /// One value drawn from the distribution.
     pub fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { each_law!(&self.0, d => d.sample(rng)) }
-    /// `pdf` of each item of `x`, written to `out`. The slices must have the same length.
-    pub fn pdfs(&self, x: &[f64], out: &mut [f64]) { each_law!(&self.0, d => fill(x, out, |x| d.pdf(x))) }
-    /// `cdf` of each item of `x`, written to `out`. The slices must have the same length.
-    pub fn cdfs(&self, x: &[f64], out: &mut [f64]) { each_law!(&self.0, d => fill(x, out, |x| d.cdf(x))) }
-    /// `quantile` of each item of `p`, written to `out`. The slices must have the same length.
-    pub fn quantiles(&self, p: &[f64], out: &mut [f64]) {
-        each_law!(&self.0, d => fill(p, out, |p| if (0.0..=1.0).contains(&p) { d.quantile(p) } else { f64::NAN }))
-    }
     /// Fills `out` with values drawn from the distribution.
     pub fn samples<R: Rng + ?Sized>(&self, rng: &mut R, out: &mut [f64]) { each_law!(&self.0, d => d.samples(rng, out)) }
     /// Whether the distribution's values are whole numbers.
@@ -715,6 +730,7 @@ impl Formulas for Poisson {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Arg;
     use rand::{rngs::StdRng, SeedableRng};
 
     /// One of each distribution, with each sampling method's case: binomials that draw by inversion, by BTRD and reflected, and
@@ -782,5 +798,29 @@ mod tests {
         let mut one = [0.0; 1];
         Distribution::poisson(0.0).unwrap().samples(&mut rng, &mut one);
         assert_eq!(one[0], 0.0);
+    }
+
+    /// `f`'s slice form against `scalar` for each item of `xs`, at f64 and at f32. Gives whether the slice form reported every item
+    /// as succeeding.
+    fn matches_scalar(f: impl Unary<f64, Out = f64> + Unary<f32, Out = f32>, scalar: impl Fn(f64) -> f64, xs: &[f64]) -> bool {
+        let same = |a: f64, b: f64| a == b || (a.is_nan() && b.is_nan());
+        let (mut out, mut out32) = (Vec::new(), Vec::new());
+        let ok = f.many(Arg::Many(xs), xs.len(), &mut out);
+        let xs32: Vec<f32> = xs.iter().map(|&x| x as f32).collect();
+        assert_eq!(f.many(Arg::Many(&xs32), xs32.len(), &mut out32), ok);
+        assert!(out.iter().zip(xs).all(|(&r, &x)| same(r, scalar(x))), "{out:?}");
+        assert!(out32.iter().zip(&xs32).all(|(&r, &x)| same(r.into(), scalar(x.into()) as f32 as f64)), "{out32:?}");
+        ok
+    }
+
+    /// Each distribution's function objects give their scalar functions' results. A quantile fails where p lies outside 0 to 1.
+    #[test]
+    fn objects_match_scalars() {
+        let (xs, ps) = ([-1.0, 0.0, 0.25, 0.5, 1.0, 3.0, f64::NAN], [0.001, 0.25, 0.5, 0.999, f64::NAN]);
+        for d in cases() {
+            assert!(matches_scalar(Pdf(d), |x| d.pdf(x), &xs) && matches_scalar(Cdf(d), |x| d.cdf(x), &xs), "{d:?}");
+            assert!(matches_scalar(Quantile(d), |p| d.quantile(p), &ps), "{d:?}");
+            assert!(!matches_scalar(Quantile(d), |p| d.quantile(p), &xs), "{d:?}");
+        }
     }
 }

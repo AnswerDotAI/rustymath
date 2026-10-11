@@ -7,7 +7,7 @@ use crate::search::{Key, RadixKey};
 pub const FUSED: bool = cfg!(any(target_arch = "aarch64", target_feature = "fma"));
 
 /// A float type that rustymath's functions take: `half::f16`, `f32` or `f64`.
-pub trait Float: num_traits::Float + sealed::Sealed + sealed::Dispatch {
+pub trait Float: num_traits::Float + Default + sealed::Sealed + sealed::Item + sealed::Dispatch + crate::reduce::Fold {
     /// The type this float computes in, its working precision: `f32` for `f16`, and the type itself otherwise. A function of an `f16`
     /// computes in `f32` and rounds once. Sums keep their running totals in this type.
     type Working: Native;
@@ -40,23 +40,70 @@ pub trait Native: Float<Working = Self> + sealed::Core {
     fn algebraic_mul(self, other: Self) -> Self;
 }
 
-/// Traits that only rustymath implements. `Core` holds the bit-level operations that the algorithms build on. `BinaryForms` holds a
-/// function object's forms, and `Dispatch` picks the form for a float type.
+/// Traits that only rustymath implements. `Core` holds the bit-level operations that the algorithms build on. `Item`, `Forms`,
+/// `RealForms` and `Kind` describe function objects, and `Dispatch` picks a float function object's form for a float type.
 pub(crate) mod sealed {
-    use crate::slice::Arg;
+    use crate::{slice::Arg, Float};
+    use num_complex::Complex;
+    use std::marker::PhantomData;
     pub trait Sealed {}
-    /// A function object of two floats, as forms compiled inside rustymath at `f32` and `f64`. `functions!` writes them.
-    pub trait BinaryForms: Copy {
-        fn one_f32(x: f32, y: f32) -> f32;
-        fn one_f64(x: f64, y: f64) -> f64;
-        fn many_f32(x: Arg<'_, f32>, y: Arg<'_, f32>, n: usize, out: &mut Vec<f32>) -> bool;
-        fn many_f64(x: Arg<'_, f64>, y: Arg<'_, f64>, n: usize, out: &mut Vec<f64>) -> bool;
+    /// A type that function objects take or give: a float, a complex number, an integer or a Boolean.
+    pub trait Item: Copy {
+        /// Whether this item is NaN, or for a complex number has a NaN part. An integer or Boolean never is.
+        fn has_nan(self) -> bool;
     }
-    /// A function object's form at this type: its own at `f32` and `f64`, and the `f32` form, rounded once, at `f16`.
-    pub trait Dispatch: Sized {
-        fn binary_one<K: BinaryForms>(x: Self, y: Self) -> Self;
-        fn binary_many<K: BinaryForms>(x: Arg<'_, Self>, y: Arg<'_, Self>, n: usize, out: &mut Vec<Self>) -> bool;
+    /// A function object of `N` arguments at a concrete item type `E`, such as a complex or integer type, compiled inside rustymath and
+    /// never inlined into a caller. `forms!` writes the impls, and [`Unary`](crate::Unary) and [`Binary`](crate::Binary) call them.
+    pub trait Forms<E: Item, const N: usize> {
+        type Out: Item;
+        fn scalar(&self, x: [E; N]) -> Self::Out;
+        fn checked_scalar(&self, x: [E; N]) -> Option<Self::Out>;
+        fn slice(&self, x: [Arg<'_, E>; N], n: usize, out: &mut Vec<Self::Out>) -> bool;
     }
+    /// How a float function object's output type follows its item type. `Same` gives the item type and `Fixed<T>` always gives `T`.
+    /// `narrow` turns an output at the working type into the output at `F`, which an `f16` item needs.
+    pub trait Kind {
+        type At<F: Item>: Item;
+        fn narrow<F: Float>(x: Self::At<F::Working>) -> Self::At<F>;
+    }
+    pub struct Same;
+    impl Kind for Same {
+        type At<F: Item> = F;
+        #[inline(always)]
+        fn narrow<F: Float>(x: F::Working) -> F { F::from_working(x) }
+    }
+    pub struct Fixed<T>(PhantomData<T>);
+    impl<T: Item> Kind for Fixed<T> {
+        type At<F: Item> = T;
+        #[inline(always)]
+        fn narrow<F: Float>(x: T) -> T { x }
+    }
+    /// A float function object of `N` arguments: its forms at `f32` and `f64`, compiled inside rustymath and never inlined into a
+    /// caller, with outputs that follow `Kind`. `forms!` writes the impls, and `Dispatch` picks the form for a generic float type.
+    pub trait RealForms<const N: usize> {
+        type Kind: Kind;
+        fn scalar_f32(&self, x: [f32; N]) -> OutAt<Self, f32, N>;
+        fn checked_f32(&self, x: [f32; N]) -> Option<OutAt<Self, f32, N>>;
+        fn slice_f32(&self, x: [Arg<'_, f32>; N], n: usize, out: &mut Vec<OutAt<Self, f32, N>>) -> bool;
+        fn scalar_f64(&self, x: [f64; N]) -> OutAt<Self, f64, N>;
+        fn checked_f64(&self, x: [f64; N]) -> Option<OutAt<Self, f64, N>>;
+        fn slice_f64(&self, x: [Arg<'_, f64>; N], n: usize, out: &mut Vec<OutAt<Self, f64, N>>) -> bool;
+    }
+    /// The output type of float function object `K` at float type `F`.
+    pub type OutAt<K, F, const N: usize> = <<K as RealForms<N>>::Kind as Kind>::At<F>;
+    /// A float function object's form at this type: its own at `f32` and `f64`, and the `f32` form, narrowed by its `Kind`, at `f16`.
+    pub trait Dispatch: Item {
+        fn call_one<K: RealForms<N>, const N: usize>(k: &K, x: [Self; N]) -> OutAt<K, Self, N>;
+        fn call_checked<K: RealForms<N>, const N: usize>(k: &K, x: [Self; N]) -> Option<OutAt<K, Self, N>>;
+        fn call_many<K: RealForms<N>, const N: usize>(k: &K, x: [Arg<'_, Self>; N], n: usize, out: &mut Vec<OutAt<K, Self, N>>) -> bool;
+    }
+    macro_rules! nan_items { ($($t:ty),+) => {$( impl Item for $t { #[inline(always)] fn has_nan(self) -> bool { self.is_nan() } } )+} }
+    nan_items!(f32, f64, half::f16, Complex<f32>, Complex<f64>);
+    macro_rules! exact_items { ($($t:ty),+) => {$( impl Item for $t { #[inline(always)] fn has_nan(self) -> bool { false } } )+} }
+    exact_items!(i8, i16, i32, i64, u8, u16, u32, u64, bool, std::cmp::Ordering);
+    macro_rules! sealed { ($($t:ty),+) => {$( impl Sealed for $t {} )+} }
+    sealed!(i8, i16, i32, i64, u8, u16, u32);
+
     pub trait Core: Copy {
         /// Whether this is `f64`. Algorithms pick their constants by it, and the compiler removes the branch.
         const WIDE: bool;

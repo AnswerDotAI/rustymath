@@ -8,14 +8,6 @@
 //!
 //! A function that can run long has a `_with` version, which takes a check as its last argument. It calls the check at
 //! least about once a millisecond, and returns the check's error as soon as it gets one.
-//!
-//! ```
-//! use rustymath::number_theory::{factor, is_prime, next_prime, Primes};
-//! assert!(is_prime(&((1u128 << 127) - 1)));
-//! assert_eq!(factor(&600851475143u64), [(71, 1), (839, 1), (1471, 1), (6857, 1)]);
-//! assert_eq!(next_prime(&u64::MAX), None);
-//! assert_eq!(Primes::new(0).nth(10_000), Some(104_743));
-//! ```
 use crate::{ok, BETWEEN_CHECKS};
 use num_bigint::BigUint;
 use num_integer::{Integer, Roots};

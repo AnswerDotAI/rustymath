@@ -18,14 +18,54 @@ def test_ufuncs():
     assert rm.exp(np.float32(1)).dtype == np.float32 and rm.exp(1).dtype == np.float64
     out = np.empty(3, np.float32)
     assert rm.sin(np.zeros(3, np.float32), out=out) is out
+    # Strided inputs and outputs, and a broadcast item, give what contiguous ones give.
+    y = np.linspace(-3, 3, 10_000)
+    assert (rm.sin(y[::3]) == rm.sin(y)[::3]).all() and (rm.power(2.0, y[::-2]) == rm.power(np.full(5000, 2.0), y[::-2])).all()
+    out = np.zeros(20_000)
+    rm.exp(y, out=out[::2])
+    assert (out[::2] == rm.exp(y)).all() and (out[1::2] == 0).all()
+
+def test_complex():
+    z = (np.linspace(-2, 2, 40)[:, None] + 1j * np.linspace(-1.9, 2.1, 40)).ravel()
+    for name in ['exp', 'log', 'sqrt', 'sin', 'cos', 'tan', 'sinh', 'cosh', 'tanh', 'arcsin', 'arccos', 'arctan', 'arcsinh', 'arccosh',
+                 'arctanh']:
+        for dt in [np.complex64, np.complex128]:
+            got, want = getattr(rm, name)(z.astype(dt)), getattr(np, name)(z.astype(dt).astype(np.complex128))
+            assert got.dtype == dt, name
+            # NumPy's complex functions err by an ulp or two themselves, so this bound is loose. The Rust tests compare with mpmath.
+            assert (np.abs(got - want) <= 16 * np.finfo(got.real.dtype).eps * np.abs(want)).all(), (name, dt)
+    assert np.allclose(rm.power(z, 0.5 + 1j), z**(0.5 + 1j)) and rm.absolute(z).dtype == np.float64 and rm.abs is rm.absolute
+    assert np.allclose(rm.absolute(z), np.abs(z)) and np.allclose(rm.angle(z), np.angle(z)) and np.allclose(rm.sign(z), z / np.abs(z))
+    assert rm.sign(-2.5) == -1 and rm.angle(-1.0) == np.pi
+
+def test_integers():
+    a, b = np.arange(-30, 30), np.arange(1, 61)[::-1] - 25
+    assert (rm.gcd(a, b) == np.gcd(a, b)).all() and (rm.lcm(a, b) == np.lcm(a, b)).all() and rm.gcd(a, b).dtype == np.int64
+    assert (rm.remainder(a, b + 100) == np.remainder(a, b + 100)).all() and rm.mod is rm.remainder
+    assert (rm.power(a, 3) == a**3).all() and rm.power(a, 3).dtype == np.int64
+    with np.errstate(over='raise'), pytest.raises(FloatingPointError): rm.power(np.int64(10), 30)
+
+def test_reductions():
+    x = np.random.default_rng(0).random(10_001)
+    assert np.isclose(rm.add.reduce(x), x.sum()) and np.allclose(rm.add.accumulate(x), np.cumsum(x))
+    assert np.isclose(rm.multiply.reduce(1 + x[:100] / 100), np.prod(1 + x[:100] / 100))
+    m = x[:10_000].reshape(100, 100)
+    assert np.allclose(rm.add.reduce(m, axis=0), m.sum(0)) and np.allclose(rm.add.reduce(m, axis=1), m.sum(1))
+    v = np.array([3.0, np.nan, 5.0, 1.0])
+    assert rm.fmax.reduce(v) == 5 and rm.fmin.accumulate(v).tolist() == [3, 3, 3, 1] and rm.fmax.reduce(x[::7]) == x[::7].max()
+    assert rm.power.reduce([2.0, 3.0, 2.0]) == 64 and rm.power.accumulate([2.0, 3.0, 2.0]).tolist() == [2, 8, 64]
+    big = np.array([2**62, 2**62, 2**62])
+    assert rm.add.reduce(big) == np.add.reduce(big) and (rm.add.accumulate(big) == np.add.accumulate(big)).all()
 
 def test_tolerant():
     assert rm.equal(0.1 + 0.2, 0.3) and not rm.equal(0.1 + 0.2, 0.3, ct=0)
     assert not rm.equal(1, 1 + 3e-14) and rm.equal([1, 2], 1 + 3e-14, ct=1e-13).tolist() == [True, False]
+    assert not rm.less(0.3, 0.1 + 0.2) and rm.less(0.3, 0.1 + 0.2, ct=0) and rm.greater_equal(0.3, 0.1 + 0.2) and not rm.not_equal(0.3, 0.1 + 0.2)
     assert rm.floor(0.5 + 0.5 - 1e-16) == 1 and rm.ceil(1 + 1e-15) == 1 and rm.floor(1 - 1e-15, ct=0) == 0
     assert rm.remainder([-5.0, 5.0], 3).tolist() == np.remainder([-5.0, 5.0], 3).tolist() and rm.remainder(0.3, 0.1) == 0
-    assert abs(rm.gcd(0.6, 0.4) - 0.2) < 1e-15
+    assert abs(rm.gcd(0.6, 0.4) - 0.2) < 1e-15 and abs(rm.lcm(-0.6, 0.4) - 1.2) < 1e-14
     with pytest.raises(ValueError): rm.equal(1, 1, ct=1)
+    with np.errstate(invalid='raise'), pytest.raises(FloatingPointError): rm.log(-1.0)
 
 def test_tolerant_search():
     a = np.random.default_rng(0).integers(0, 50, (20, 30))
@@ -69,6 +109,14 @@ def test_special():
     assert np.allclose(rm.betainc(2, 3, p), special.betainc(2, 3, p)) and np.allclose(rm.betaincinv(2, 3, p), special.betaincinv(2, 3, p))
     # SciPy's erfc is up to 16 ulps from mpmath near 4.8, so this check is loose. The Rust tests compare erfc with mpmath.
     assert np.allclose(rm.erfc(x), special.erfc(x), rtol=1e-14, atol=0)
+    w = np.linspace(-0.36, 20, 300)
+    assert np.allclose(rm.lambertw(w), special.lambertw(w).real)
+    with pytest.warns(RuntimeWarning, match='invalid value'): assert np.isnan(rm.lambertw(-1.0))
+    assert np.allclose(rm.lambertw(w + 1j), special.lambertw(w + 1j))
+    n, k = np.linspace(-5.5, 30, 50), np.linspace(0, 12, 50)
+    assert np.allclose(rm.binom(n, k), special.binom(n, k)) and rm.binom(10.0, 3.0) == 120
+    z = x[::10] + 1j * x[::-10]
+    assert np.allclose(rm.loggamma(z), special.loggamma(z)) and np.allclose(rm.gamma(z), special.gamma(z))
 
 def test_distribution():
     from scipy import stats

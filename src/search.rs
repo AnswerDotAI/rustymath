@@ -5,14 +5,6 @@
 //! `index_of`, `classes` and `firsts` index the first position of each key. The index is a table when the keys span at most twice
 //! the slice's length, or 1024, and a hash map otherwise. `sort_rows` sorts with an LSD radix sort that skips any byte that is the same
 //! in every key.
-//!
-//! ```
-//! use rustymath::search::{classes, index_of, sort_rows};
-//! let x = [30, 10, 20, 10];
-//! assert_eq!(index_of(&x, &[10, 40]), [1, 4]);
-//! assert_eq!(classes(&x), [0, 1, 2, 1]);
-//! assert_eq!(sort_rows(x.len(), 1, |r, _| x[r] as u32), [1, 3, 2, 0]);
-//! ```
 use hashbrown::{HashMap, hash_map::Entry};
 use std::{hash::Hash, ops::Not};
 
@@ -246,4 +238,17 @@ impl Chains {
 /// The positions linked from `first` through `next`, in the order they were pushed.
 fn links(next: &[u32], first: u32) -> impl Iterator<Item = usize> + '_ {
     std::iter::successors(Some(first), |&i| Some(next[i as usize]).filter(|&j| j != u32::MAX)).map(|i| i as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_and_sort() {
+        let x = [30, 10, 20, 10];
+        assert_eq!(index_of(&x, &[10, 40]), [1, 4]);
+        assert_eq!(classes(&x), [0, 1, 2, 1]);
+        assert_eq!(sort_rows(x.len(), 1, |r, _| x[r] as u32), [1, 3, 2, 0]);
+    }
 }

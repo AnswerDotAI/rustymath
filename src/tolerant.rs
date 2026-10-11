@@ -5,19 +5,13 @@
 //! A tolerance is a value of a type that implements `Tolerant`: a `Tolerance`, or `Exactly`, whose methods compile to plain IEEE
 //! comparisons and `floor`. A function written once over `Tolerant` compiles to a version for each. `with_tolerance!` picks one when
 //! the program runs, outside any loop. The methods are generic over the float type and compute at its width. `TolerantComplex` gives
-//! the complex versions.
+//! the complex versions. The function objects `Equal`, `NotEqual`, `Less`, `LessEqual`, `Greater`, `GreaterEqual`, `Matches`,
+//! `Compare`, `Floor`, `Ceil`, `Residue`, `Gcd` and `Lcm` each hold a `Tolerance` and give the same results as the methods, one item
+//! at a time or over slices. A slice form picks its loop with `with_tolerance!` once. `Residue`, `Gcd` and `Lcm` also have `i64`
+//! forms, from the `integer` module, which ignore the tolerance.
 //!
 //! Tolerant equality isn't transitive: `x` can equal `y` and `y` equal `z` while `x` doesn't equal `z`. Hash maps and sorting need a
 //! transitive `PartialEq`. This module therefore has no float type with a tolerant `==`. Each comparison is a method of the tolerance.
-//!
-//! ```
-//! use rustymath::tolerant::{Exactly, Tolerance, Tolerant};
-//! let t = Tolerance::DEFAULT;
-//! assert!(t.equal(0.1 + 0.2, 0.3));
-//! assert!(!Exactly.equal(0.1 + 0.2, 0.3));
-//! assert_eq!(t.floor(2.9999999999999996), 3.0);
-//! assert_eq!(Exactly.floor(2.9999999999999996), 2.0);
-//! ```
 use crate::{
     float::{Float, Native},
     ok, BETWEEN_CHECKS,
@@ -60,6 +54,18 @@ pub trait Tolerant: Copy {
     /// Whether `x` and `y` match: they are equal, or both are NaN. A search that must find NaN compares with `matches`.
     #[inline]
     fn matches<F: Float>(self, x: F, y: F) -> bool { self.equal(x, y) | (x.is_nan() & y.is_nan()) }
+    /// Whether `x` is below `y` and doesn't equal it. Comparisons with NaN are false.
+    #[inline]
+    fn less<F: Float>(self, x: F, y: F) -> bool { (x < y) & !self.equal(x, y) }
+    /// Whether `x` is below `y` or equals it. Comparisons with NaN are false.
+    #[inline]
+    fn less_equal<F: Float>(self, x: F, y: F) -> bool { (x <= y) | self.equal(x, y) }
+    /// Whether `x` is above `y` and doesn't equal it. Comparisons with NaN are false.
+    #[inline]
+    fn greater<F: Float>(self, x: F, y: F) -> bool { self.less(y, x) }
+    /// Whether `x` is above `y` or equals it. Comparisons with NaN are false.
+    #[inline]
+    fn greater_equal<F: Float>(self, x: F, y: F) -> bool { self.less_equal(y, x) }
     /// The order of `x` and `y`, which is `Equal` when they are equal. `None` when either is NaN.
     #[inline]
     fn compare<F: Float>(self, x: F, y: F) -> Option<Ordering> { if self.equal(x, y) { Some(Ordering::Equal) } else { x.partial_cmp(&y) } }
@@ -94,12 +100,15 @@ pub trait Tolerant: Copy {
         Some((end(lo, F::next_down, F::next_up), end(hi, F::next_up, F::next_down)))
     }
     /// The greatest common divisor of `x` and `y`: the larger magnitude divided by the numerator of the first convergent of the ratio of
-    /// the magnitudes that equals the ratio. It computes in `f64` and rounds. NaN when either argument is NaN or infinite.
+    /// the magnitudes that equals the ratio. It computes in `f64` and rounds. NaN when either argument is NaN or infinite. Whole
+    /// magnitudes whose product is below 1e14 take integer gcd, which gives the same result at any tolerance up to the default.
     fn gcd<F: Float>(self, x: F, y: F) -> F {
         let (x, y) = (x.wide(), y.wide());
         if !(x.is_finite() && y.is_finite()) { return F::nan(); }
         let (x, y) = (x.abs().max(y.abs()), x.abs().min(y.abs()));
         if y == 0.0 { return F::narrow(x); }
+        let whole = x.fract() == 0.0 && y.fract() == 0.0 && x * y < 1e14 && self.value() <= Tolerance::DEFAULT.value();
+        if let Some(g) = whole.then(|| crate::integer::gcd(x as i64, y as i64)).flatten() { return F::narrow(g as f64); }
         let scale = BigRational::from_float(x).unwrap();
         let ratio = &scale / BigRational::from_float(y).unwrap();
         let tolerance = BigRational::from_float(self.value()).unwrap() * &ratio;
@@ -194,18 +203,35 @@ pub trait TolerantComplex: Tolerant {
         let q = y / x;
         if self.complex_equal(x * Complex::new(nearest(q.re), nearest(q.im)), y) { Complex::zero() } else { y - x * self.complex_floor(q) }
     }
+    /// The greatest common divisor of `x` and `y` as complex numbers, by Euclid's algorithm with the quotient rounded to the nearest
+    /// Gaussian integer. It stops once the remainder is within the tolerance of the larger magnitude, and turns the result into the
+    /// first quadrant, real part above 0. Two real numbers give `gcd`. A non-finite argument, or a remainder that stops shrinking, gives
+    /// NaN.
+    fn complex_gcd<R: Native>(self, x: Complex<R>, y: Complex<R>) -> Complex<R> {
+        if x.im == R::zero() && y.im == R::zero() { return Complex::new(self.gcd(x.re, y.re), R::zero()); }
+        let nan = Complex::new(R::nan(), R::nan());
+        let scale = x.norm().max(y.norm());
+        if !scale.is_finite() { return nan; }
+        let original = if x.norm() >= y.norm() { x } else { y };
+        let t = R::narrow(self.value()) * scale;
+        let whole = |z: Complex<R>| Complex::new(z.re.round(), z.im.round());
+        let small = |z: Complex<R>| Complex::new(if z.re.abs() <= t { R::zero() } else { z.re }, if z.im.abs() <= t { R::zero() } else { z.im });
+        let (mut x, mut y) = (x, y);
+        while y.norm() > t {
+            let r = x - y * whole(x / y);
+            if !(r.norm() < y.norm()) { return nan; }
+            (x, y) = (y, r);
+        }
+        let mut x = small(x);
+        if x.is_zero() { return x; }
+        while x.re <= R::zero() || x.im < R::zero() { x = Complex::new(-x.im, x.re); }
+        small(original / whole(original / x))
+    }
 }
 impl<T: Tolerant> TolerantComplex for T {}
 
 /// Runs `$body` with `$t` bound to `Exactly` when the `Tolerance` `$tolerance` is 0, and to the tolerance otherwise. Each binding
 /// has its own compiled copy of `$body`. The choice happens once, outside any loop in `$body`.
-///
-/// ```
-/// use rustymath::{tolerant::{Tolerance, Tolerant}, with_tolerance};
-/// let xs = [0.3, 0.1 + 0.2, 0.31];
-/// let count = |t: Tolerance| with_tolerance!(t, |t| xs.iter().filter(|&&x| t.equal(x, 0.3)).count());
-/// assert_eq!((count(Tolerance::DEFAULT), count(Tolerance::EXACT)), (2, 1));
-/// ```
 #[macro_export]
 macro_rules! with_tolerance {
     ($tolerance:expr, |$t:ident| $body:expr) => {{
@@ -220,16 +246,104 @@ macro_rules! with_tolerance {
     }};
 }
 
+/// Writes a tolerant function object's forms from one item body over a tolerance `$t`, at `real` or at a list of concrete types, as
+/// `forms!` takes them. The object holds a `Tolerance`. Its slice form reads it once and runs the body's loop at `Exactly` where the
+/// tolerance is 0.
+macro_rules! tolerant {
+    ($object:ident at real $(=> $o:ty)?: $($rest:tt)+) => { tolerant!(@forms $object, (real $(=> $o)?), $($rest)+); };
+    ($object:ident at $($e:ty $(=> $o:ty)?),+: $($rest:tt)+) => { tolerant!(@forms $object, ($($e $(=> $o)?),+), $($rest)+); };
+    (@forms $object:ident, ($($at:tt)+), |$t:ident, [$($x:ident),+]| $body:expr) => {
+        forms!($object at $($at)+: |k, [$($x),+]| with_tolerance!(k.0, |$t| $body),
+            many |k, [$($x),+], n, out| with_tolerance!(k.0, |$t| crate::slice::each([$($x),+], n, out, |[$($x),+]| $body)));
+    };
+}
+
+/// [`Tolerant::equal`], or [`TolerantComplex::complex_equal`] for complex items, at the tolerance it holds, as a function object.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Equal(pub Tolerance);
+tolerant!(Equal at real => bool: |t, [x, y]| t.equal(x, y));
+tolerant!(Equal at Complex<f32> => bool, Complex<f64> => bool: |t, [x, y]| t.complex_equal(x, y));
+
+/// The negation of [`Equal`] at the tolerance it holds, as a function object, for real and complex items.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NotEqual(pub Tolerance);
+tolerant!(NotEqual at real => bool: |t, [x, y]| !t.equal(x, y));
+tolerant!(NotEqual at Complex<f32> => bool, Complex<f64> => bool: |t, [x, y]| !t.complex_equal(x, y));
+
+/// [`Tolerant::less`] at the tolerance it holds, as a function object.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Less(pub Tolerance);
+tolerant!(Less at real => bool: |t, [x, y]| t.less(x, y));
+
+/// [`Tolerant::less_equal`] at the tolerance it holds, as a function object.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LessEqual(pub Tolerance);
+tolerant!(LessEqual at real => bool: |t, [x, y]| t.less_equal(x, y));
+
+/// [`Tolerant::greater`] at the tolerance it holds, as a function object.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Greater(pub Tolerance);
+tolerant!(Greater at real => bool: |t, [x, y]| t.greater(x, y));
+
+/// [`Tolerant::greater_equal`] at the tolerance it holds, as a function object.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GreaterEqual(pub Tolerance);
+tolerant!(GreaterEqual at real => bool: |t, [x, y]| t.greater_equal(x, y));
+
+/// [`Tolerant::matches`] at the tolerance it holds, as a function object: `equal`, except that NaN matches NaN.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Matches(pub Tolerance);
+tolerant!(Matches at real => bool: |t, [x, y]| t.matches(x, y));
+
+/// [`Tolerant::compare`] at the tolerance it holds, as a function object. NaN orders after every number and equal to NaN, as
+/// [`Tolerant::matches`] has NaN match NaN.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Compare(pub Tolerance);
+tolerant!(Compare at real => Ordering: |t, [x, y]| t.compare(x, y).unwrap_or(x.is_nan().cmp(&y.is_nan())));
+
+/// [`Tolerant::floor`], or [`TolerantComplex::complex_floor`] for complex items, at the tolerance it holds, as a function object.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Floor(pub Tolerance);
+tolerant!(Floor at real: |t, [y]| t.floor(y));
+tolerant!(Floor at Complex<f32>, Complex<f64>: |t, [y]| t.complex_floor(y));
+
+/// [`Tolerant::ceil`], or [`TolerantComplex::complex_ceil`] for complex items, at the tolerance it holds, as a function object.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Ceil(pub Tolerance);
+tolerant!(Ceil at real: |t, [y]| t.ceil(y));
+tolerant!(Ceil at Complex<f32>, Complex<f64>: |t, [y]| t.complex_ceil(y));
+
+/// [`Tolerant::residue`], or [`TolerantComplex::complex_residue`] for complex items, at the tolerance it holds, as a function object:
+/// `y` modulo `x`, for arguments `x` and `y` in that order. Its `i64` form is [`integer::residue`](crate::integer::residue), which
+/// needs no tolerance.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Residue(pub Tolerance);
+tolerant!(Residue at real: |t, [x, y]| t.residue(x, y));
+tolerant!(Residue at Complex<f32>, Complex<f64>: |t, [x, y]| t.complex_residue(x, y));
+
+/// [`Tolerant::gcd`], or [`TolerantComplex::complex_gcd`] for complex items, at the tolerance it holds, as a function object. A
+/// non-finite argument gives NaN, which marks the item failed. Its `i64` form is [`integer::gcd`](crate::integer::gcd).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Gcd(pub Tolerance);
+tolerant!(Gcd at real: |t, [x, y]| t.gcd(x, y));
+tolerant!(Gcd at Complex<f32>, Complex<f64>: |t, [x, y]| t.complex_gcd(x, y));
+
+/// The least common multiple x y / gcd(x, y), with the sign of x y, at the tolerance it holds, as a function object. Where the gcd
+/// is 0, so is the result. Its `i64` form is [`integer::lcm`](crate::integer::lcm).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Lcm(pub Tolerance);
+tolerant!(Lcm at real: |t, [x, y]| {
+    let g = t.gcd(x, y);
+    if g == 0.0 { g } else { x / g * y }
+});
+tolerant!(Lcm at Complex<f32>, Complex<f64>: |t, [x, y]| {
+    let g = t.complex_gcd(x, y);
+    if g == Complex::new(0.0, 0.0) { g } else { x / g * y }
+});
+
 /// For each item of `y`, the position of the first item of `x` that it matches within tolerance `t`, or the length of `x` where none
 /// does. NaN matches NaN. With `Exactly`, the search indexes order keys (`search::index_of`). With a `Tolerance`, it files the items of
 /// `x` in buckets of neighbouring floats (`Near`), and compares each item of `y` with the items in the two buckets nearest it.
-///
-/// ```
-/// use rustymath::tolerant::{index_of, Exactly, Tolerance};
-/// let x = [0.3, 1.0, 0.1 + 0.2];
-/// assert_eq!(index_of(Tolerance::DEFAULT, &x, &[0.1 + 0.2, 2.0]), [0, 3]);
-/// assert_eq!(index_of(Exactly, &x, &[0.1 + 0.2, 2.0]), [2, 3]);
-/// ```
 pub fn index_of<F: Float>(t: impl Tolerant, x: &[F], y: &[F]) -> Vec<usize> {
     let Ok(found) = index_of_with(t, x, y, ok);
     found
@@ -330,6 +444,7 @@ fn order_keys<F: Float>(x: &[F]) -> Vec<F::OrderKey> { x.iter().map(|v| v.order_
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Arg, Binary, Unary};
     use half::f16;
     use num_complex::Complex64;
 
@@ -349,10 +464,16 @@ mod tests {
         assert!(T.equal(f64::INFINITY, f64::INFINITY) && !T.equal(f64::INFINITY, f64::MAX) && !T.equal(f64::NAN, f64::NAN));
         assert!(T.matches(f64::NAN, f64::NAN) && !T.matches(f64::NAN, 1.0));
         assert_eq!((T.compare(0.3, 0.1 + 0.2), T.compare(1.0, 2.0), T.compare(f64::NAN, 1.0)), (Some(Ordering::Equal), Some(Ordering::Less), None));
+        // Below and above leave out what's equal within the tolerance, and comparisons with NaN are false.
+        assert!(!T.less(0.3, 0.1 + 0.2) && T.less_equal(0.1 + 0.2, 0.3) && Exactly.less(0.3, 0.1 + 0.2) && !Exactly.greater(0.3, 0.1 + 0.2));
+        assert!(!T.less(f64::NAN, 1.0) && !T.less_equal(f64::NAN, f64::NAN) && !T.greater_equal(1.0, f64::NAN));
         // At f32, a tolerance of 4 units in the last place.
         let t32 = Tolerance::new(4.0 * f32::EPSILON as f64).unwrap();
         assert!(t32.equal(1.0f32, 1.0 + 4.0 * f32::EPSILON) && !t32.equal(1.0f32, 1.0 + 5.0 * f32::EPSILON));
         assert_eq!((Tolerance::new(-1e-14), Tolerance::new(1.0), Tolerance::new(f64::NAN)), (None, None, None));
+        // `with_tolerance!` runs its body at `Exactly` for a tolerance of 0.
+        let count = |t: Tolerance| with_tolerance!(t, |t| [0.3, 0.1 + 0.2, 0.31].iter().filter(|&&x| t.equal(x, 0.3)).count());
+        assert_eq!((count(T), count(Tolerance::EXACT)), (2, 1));
     }
 
     #[test]
@@ -389,6 +510,10 @@ mod tests {
         let r = [c(2.0, 3.0), c(3.0, 4.0), c(5.0, 6.0)].map(|y| T.complex_residue(c(1.0, 2.0), y));
         assert_eq!(r, [c(1.0, 1.0), c(-1.0, 1.0), c(0.0, 1.0)]);
         assert_eq!(T.complex_residue(c(0.0, 0.0), c(2.0, 1.0)), c(2.0, 1.0));
+        // 5 = (2+i)(2-i) and 3+4i = (2+i)², so their gcd is 2+i, the associate in the first quadrant. Halving both halves it.
+        assert_eq!((T.complex_gcd(c(5.0, 0.0), c(3.0, 4.0)), T.complex_gcd(c(2.5, 0.0), c(1.5, 2.0))), (c(2.0, 1.0), c(1.0, 0.5)));
+        assert_eq!((T.complex_gcd(c(0.0, 0.0), c(-4.0, 3.0)), T.complex_gcd(c(12.0, 0.0), c(18.0, 0.0))), (c(3.0, 4.0), c(6.0, 0.0)));
+        assert!(T.complex_gcd(c(f64::INFINITY, 1.0), c(2.0, 1.0)).re.is_nan());
     }
 
     /// `range(c)` gives the last floats equal to `c` on each side.
@@ -432,6 +557,48 @@ mod tests {
         assert!(T.gcd(f64::NAN, 1.0).is_nan() && T.gcd(f64::NAN, f64::NAN).is_nan() && T.gcd(f64::INFINITY, 1.0).is_nan());
     }
 
+    /// Each tolerant object gives its method's result for each item, at the default tolerance and at 0, for slices beside slices and
+    /// one item beside a slice, at f32, f64 and complex items. Only `Gcd`'s infinite argument fails.
+    #[test]
+    fn objects() {
+        let (xs, ys) = (&[3.0, -3.0, 0.3, 0.0, f64::NAN, 2.0][..], &[-5.0, 5.0, 0.1 + 0.2, 7.0, 1.0, 2.9999999999999996][..]);
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for t in [T, Tolerance::EXACT] {
+            let (mut floors, mut residues, mut equal, mut order) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            assert!(Floor(t).many(Arg::Many(ys), 6, &mut floors) & Ceil(t).many(Arg::Many(ys), 6, &mut floors));
+            assert!(Residue(t).many(Arg::Many(xs), Arg::Many(ys), 6, &mut residues) & Residue(t).many(Arg::One(3.0), Arg::Many(ys), 6, &mut residues));
+            assert!(Equal(t).many(Arg::Many(xs), Arg::Many(ys), 6, &mut equal) & Matches(t).many(Arg::Many(xs), Arg::One(f64::NAN), 6, &mut equal));
+            assert!(Compare(t).many(Arg::Many(xs), Arg::Many(ys), 6, &mut order));
+            let floor: Vec<f64> = ys.iter().map(|&y| t.floor(y)).chain(ys.iter().map(|&y| t.ceil(y))).collect();
+            let residue: Vec<f64> = (0..6).map(|i| t.residue(xs[i], ys[i])).chain(ys.iter().map(|&y| t.residue(3.0, y))).collect();
+            let eq: Vec<bool> = (0..6).map(|i| t.equal(xs[i], ys[i])).chain(xs.iter().map(|&x| t.matches(x, f64::NAN))).collect();
+            assert_eq!((bits(&floors), bits(&residues), equal), (bits(&floor), bits(&residue), eq));
+            assert_eq!(order, (0..6).map(|i| t.compare(xs[i], ys[i]).unwrap_or(Ordering::Greater)).collect::<Vec<_>>());
+            let check = |many: &dyn Fn(&mut Vec<bool>) -> bool, one: &dyn Fn(f64, f64) -> bool| {
+                let mut got = Vec::new();
+                assert!(many(&mut got));
+                assert_eq!(got, (0..6).map(|i| one(xs[i], ys[i])).collect::<Vec<_>>());
+            };
+            check(&|o| NotEqual(t).many(Arg::Many(xs), Arg::Many(ys), 6, o), &|x, y| !t.equal(x, y));
+            check(&|o| Less(t).many(Arg::Many(xs), Arg::Many(ys), 6, o), &|x, y| t.less(x, y));
+            check(&|o| LessEqual(t).many(Arg::Many(xs), Arg::Many(ys), 6, o), &|x, y| t.less_equal(x, y));
+            check(&|o| Greater(t).many(Arg::Many(xs), Arg::Many(ys), 6, o), &|x, y| t.greater(x, y));
+            check(&|o| GreaterEqual(t).many(Arg::Many(xs), Arg::Many(ys), 6, o), &|x, y| t.greater_equal(x, y));
+            let (ys32, mut floors32) = (ys.iter().map(|&y| y as f32).collect::<Vec<_>>(), Vec::new());
+            assert!(Floor(t).many(Arg::Many(&ys32), 6, &mut floors32));
+            assert_eq!(floors32, ys32.iter().map(|&y| t.floor(y)).collect::<Vec<_>>());
+            let (zs, mut complex) = (&[c(2.3, -1.7), c(0.5, 0.5), c(-1.0, 2.0)][..], Vec::new());
+            assert!(Floor(t).many(Arg::Many(zs), 3, &mut complex) & Residue(t).many(Arg::One(c(1.0, 1.0)), Arg::Many(zs), 3, &mut complex));
+            let want: Vec<Complex64> = zs.iter().map(|&z| t.complex_floor(z)).chain(zs.iter().map(|&z| t.complex_residue(c(1.0, 1.0), z))).collect();
+            assert_eq!(complex, want);
+        }
+        assert_eq!(Gcd(T).one(12.0, 18.0), 6.0);
+        assert!(!Gcd(T).many(Arg::One(f64::INFINITY), Arg::Many(&[2.0][..]), 1, &mut Vec::new()));
+        // Lcm has the sign of x y, gives 0 where the gcd is 0, and divides at the tolerance's gcd.
+        assert_eq!([Lcm(T).one(-4.0, 6.0), Lcm(T).one(0.0, 5.0), Lcm(T).one(0.6, 0.4)], [-12.0, 0.0, 1.2000000000000002]);
+        assert_eq!(Lcm(T).one(c(2.0, 0.0), c(0.0, 3.0)), c(0.0, 6.0));
+    }
+
     /// Tolerant search finds the first match that a brute-force search finds, at every width and at small and large tolerances, among
     /// floats crowded near a few values, and among zeros, infinities and NaN.
     #[test]
@@ -450,5 +617,7 @@ mod tests {
             assert_eq!(index_of(t, &x, &y), brute, "{t:?}");
         }
         for t in [T, Tolerance::new(1e-3).unwrap(), Tolerance::new(0.3).unwrap()] { check::<f64>(t); check::<f32>(t); check::<f16>(t); }
+        let x = [0.3, 1.0, 0.1 + 0.2];
+        assert_eq!((index_of(T, &x, &[0.1 + 0.2, 2.0]), index_of(Exactly, &x, &[0.1 + 0.2, 2.0])), (vec![0, 3], vec![2, 3]));
     }
 }

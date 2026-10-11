@@ -2,7 +2,8 @@
 //! a centre c whose reciprocal has few bits, so that z/c - 1 needs no division, and looks up ln c. The exponential reduces by
 //! multiples of ln 2/256 and looks up 2^(j/256) as a float and the tail of its rounding, which leaves a short polynomial. Both steps
 //! carry a double word. Each item reads its own table entries, so LLVM vectorizes the loops that call them only where the target has
-//! gathers, as AVX2 does. On NEON and in wasm they run one item at a time. See `THIRD-PARTY.md`.
+//! gathers, as AVX2 does. On NEON and in wasm they run one item at a time. `log2_single` and `exp2_single` are the logarithm and
+//! exponential of Arm's scalar `powf`, for `Pow`'s and `Root`'s scalar forms at f32 and f16. See `THIRD-PARTY.md`.
 use crate::{dd::Double, exp::{clamp, limit}, float::sealed::Core};
 use std::f64::consts::LOG2_E;
 
@@ -133,6 +134,18 @@ const A: [f64; 7] = [-0.5, -0.6666666666666679, 0.5000000000000007, 0.7999999995
 #[inline(always)]
 pub(crate) fn ln<const FUSED: bool>(x: f64) -> Double<f64> {
     let ix = if x < f64::MIN_POSITIVE { (x * 4503599627370496.0).to_bits().wrapping_sub(52 << 52) } else { x.to_bits() };
+    let y = ln_bits::<FUSED>(ix);
+    let y = if x.is_nan() | (x == f64::INFINITY) { Double::new(x, 0.0) } else { y };
+    if x == 0.0 { Double::new(f64::NEG_INFINITY, 0.0) } else { y }
+}
+
+/// `ln` for a positive normal x, with none of its special cases. Other arguments give a meaningless result.
+#[inline(always)]
+pub(crate) fn ln_normal<const FUSED: bool>(x: f64) -> Double<f64> { ln_bits::<FUSED>(x.to_bits()) }
+
+/// ln of the float with bits `ix`, read as a positive normal float. `ln` passes a subnormal's bits scaled into that range.
+#[inline(always)]
+fn ln_bits<const FUSED: bool>(ix: u64) -> Double<f64> {
     let (tmp, k, iz) = split(ix, OFF);
     let i = (tmp >> 45) as usize & 127;
     let (z, invc) = (f64::from_bits(iz), INVC[i]);
@@ -160,9 +173,7 @@ pub(crate) fn ln<const FUSED: bool>(x: f64) -> Double<f64> {
     };
     let p = r.mla::<FUSED>(A[6], A[5]).mla::<FUSED>(ar2, r.mla::<FUSED>(A[4], A[3])).mla::<FUSED>(ar2, r.mla::<FUSED>(A[2], A[1])) * (r * ar2);
     let lo = lo1 + lo2 + lo3 + lo4 + p;
-    let y = Double::new(hi + lo, hi - (hi + lo) + lo);
-    let y = if x.is_nan() | (x == f64::INFINITY) { Double::new(x, 0.0) } else { y };
-    if x == 0.0 { Double::new(f64::NEG_INFINITY, 0.0) } else { y }
+    Double::new(hi + lo, hi - (hi + lo) + lo)
 }
 
 /// 2^(j/256) for j from 0 to 255, each with j × 2^44 subtracted from its bits, so that adding k × 2^44 for the whole k = 256e + j
@@ -310,18 +321,115 @@ const C: [f64; 3] = [0.49999999999999756, 0.1666666799409282, 0.0416666705449092
 #[inline(always)]
 pub(crate) fn exp<const FUSED: bool>(hi: f64, lo: f64) -> f64 {
     let x = clamp(hi, limit());
-    let s = x.mla::<FUSED>(256.0 * LOG2_E, f64::SHIFT);
-    let k = s - f64::SHIFT;
-    let r = k.mla::<FUSED>(-LN2_256.1, k.mla::<FUSED>(-LN2_256.0, x));
-    let r = if x == hi { r + lo } else { r };
-    // The low 52 bits of s are 2^51 + k.
-    let ki = s.to_bits() & ((1 << 52) - 1);
+    let (ki, r) = reduce::<FUSED>(x);
     let j = ki & 255;
     let t = f64::from_bits(SBITS[j as usize] + (j << 44));
-    let r2 = r * r;
-    let y = t.mla::<FUSED>(f64::from_bits(TAIL[j as usize]) + r2.mla::<FUSED>(C[0], r) + r * r2 * r.mla::<FUSED>(C[2], C[1]), t);
+    let y = t.mla::<FUSED>(series::<FUSED>(j, if x == hi { r + lo } else { r }), t);
     // e + 2048, and its halves as exponent fields.
     let e = (ki >> 8) - ((1 << 43) - 2048);
     let h = e >> 1;
     y * f64::from_bits((h - 1) << 52) * f64::from_bits((e - h - 1) << 52)
+}
+
+/// The largest |hi| that `exp_normal` takes. Below it, e^hi is a normal float.
+pub(crate) const NORMAL: f64 = 512.0;
+
+/// `exp` for |hi| below `NORMAL`, with no clamp. 2^e joins the exponent bits of 2^(j/256), so no multiply scales the result. Other
+/// arguments give a meaningless result.
+#[inline(always)]
+pub(crate) fn exp_normal<const FUSED: bool>(hi: f64, lo: f64) -> f64 {
+    let (ki, r) = reduce::<FUSED>(hi);
+    let j = ki & 255;
+    // `ki << 44` puts j and e in their bit positions and shifts out the 2^51.
+    let t = f64::from_bits(SBITS[j as usize].wrapping_add(ki << 44));
+    t.mla::<FUSED>(series::<FUSED>(j, r + lo), t)
+}
+
+/// The bits of `SHIFT` + k, whose low 52 hold 2^51 + k, and r, for x = k ln 2/256 + r.
+#[inline(always)]
+fn reduce<const FUSED: bool>(x: f64) -> (u64, f64) {
+    let s = x.mla::<FUSED>(256.0 * LOG2_E, f64::SHIFT);
+    let k = s - f64::SHIFT;
+    (s.to_bits() & ((1 << 52) - 1), k.mla::<FUSED>(-LN2_256.1, k.mla::<FUSED>(-LN2_256.0, x)))
+}
+
+/// e^r - 1 plus the relative rounding error of 2^(j/256) as `SBITS` carries it.
+#[inline(always)]
+fn series<const FUSED: bool>(j: u64, r: f64) -> f64 {
+    let r2 = r * r;
+    f64::from_bits(TAIL[j as usize]) + r2.mla::<FUSED>(C[0], r) + r * r2 * r.mla::<FUSED>(C[2], C[1])
+}
+
+/// The bits of 0x1.66p-1 as an f32. `log2_single` reduces x by a centre c of one of 16 subintervals from it to twice it.
+const OFF_SINGLE: u32 = 0x3f330000;
+/// 1/c for each of `log2_single`'s subintervals.
+const INVC_SINGLE: [f64; 16] = [
+    1.398907162146528, 1.3403141896637998, 1.286432210124115, 1.2367150214269895,
+    1.1906977166711752, 1.1479821020556429, 1.1082251448272158, 1.0711297413057381,
+    1.036437278977283, 1.0, 0.9492859795739057, 0.8951049428609004,
+    0.8476821620351103, 0.8050314851692001, 0.7664671008843108, 0.731428603316328,
+];
+/// log2 c for each of `log2_single`'s subintervals.
+const LOGC_SINGLE: [f64; 16] = [
+    -0.48430022186289673, -0.42257122959194704, -0.3633754347673556, -0.30651309567405577,
+    -0.25180720160537634, -0.19910014943794563, -0.14825100623281615, -0.09913323807318392,
+    -0.051632812977629436, 0.0, 0.07508531937943004, 0.15987125980713107,
+    0.2384046664317681, 0.31288288605863257, 0.38370422656453185, 0.451211048935815,
+];
+/// The coefficients of log2(1 + r), highest degree first, for r = z/c - 1.
+const A_SINGLE: [f64; 5] = [0.288457581109214, -0.36092606229713164, 0.480898481472577, -0.7213474675006291, 1.4426950408774342];
+
+/// log2 x in f64, for the bits `ix` of a positive normal f32, within about 2^-33 relative. It's Arm Optimized Routines' scalar
+/// `powf` logarithm. Each item reads its own table entries, so only scalar code calls it. It reads its polynomial through
+/// `loaded`, which makes LLVM load each coefficient with one instruction. Otherwise LLVM builds each one on every call from four
+/// moves and a transfer between registers, which costs about a sixth of the time of `Pow`'s scalar form at f32.
+#[inline(always)]
+pub(crate) fn log2_single<const FUSED: bool>(ix: u32) -> f64 {
+    let tmp = ix.wrapping_sub(OFF_SINGLE);
+    let i = (tmp >> 19) as usize % 16;
+    let top = tmp & 0xff800000;
+    let z = f64::from(f32::from_bits(ix.wrapping_sub(top)));
+    let r = z.mla::<FUSED>(INVC_SINGLE[i], -1.0);
+    let y0 = LOGC_SINGLE[i] + f64::from(top as i32 >> 23);
+    let r2 = r * r;
+    let a = loaded(&A_SINGLE);
+    let y = r.mla::<FUSED>(a[0], a[1]);
+    let p = r.mla::<FUSED>(a[2], a[3]);
+    y.mla::<FUSED>(r2 * r2, p.mla::<FUSED>(r2, r.mla::<FUSED>(a[4], y0)))
+}
+
+/// The bits of 2^(i/32), less i << 47, for each i below 32. Adding k << 47 for k = 32 m + i gives the bits of 2^(k/32).
+const EXP2_SINGLE: [u64; 32] = [
+    0x3ff0000000000000, 0x3fefd9b0d3158574, 0x3fefb5586cf9890f, 0x3fef9301d0125b51,
+    0x3fef72b83c7d517b, 0x3fef54873168b9aa, 0x3fef387a6e756238, 0x3fef1e9df51fdee1,
+    0x3fef06fe0a31b715, 0x3feef1a7373aa9cb, 0x3feedea64c123422, 0x3feece086061892d,
+    0x3feebfdad5362a27, 0x3feeb42b569d4f82, 0x3feeab07dd485429, 0x3feea47eb03a5585,
+    0x3feea09e667f3bcd, 0x3fee9f75e8ec5f74, 0x3feea11473eb0187, 0x3feea589994cce13,
+    0x3feeace5422aa0db, 0x3feeb737b0cdc5e5, 0x3feec49182a3f090, 0x3feed503b23e255d,
+    0x3feee89f995ad3ad, 0x3feeff76f2fb5e47, 0x3fef199bdd85529c, 0x3fef3720dcef9069,
+    0x3fef5818dcfba487, 0x3fef7c97337b9b5f, 0x3fefa4afa2a490da, 0x3fefd0765b6e4540,
+];
+/// The coefficients of 2^r - 1, highest degree first, for |r| up to 1/64.
+const C_SINGLE: [f64; 3] = [0.05550361559341535, 0.2402284522445722, 0.6931471806916203];
+
+/// 2^x in f64, for |x| below 126, where an f32 result is normal, within about 2^-34 relative. It's Arm Optimized Routines' scalar
+/// `powf` exponential. Each item reads its own table entry, so only scalar code calls it. It reads its polynomial as `log2_single`
+/// does.
+#[inline(always)]
+pub(crate) fn exp2_single<const FUSED: bool>(x: f64) -> f64 {
+    const SHIFT: f64 = 1.5 * 4503599627370496.0 / 32.0;
+    let s = x + SHIFT;
+    let r = x - (s - SHIFT);
+    let ki = s.to_bits();
+    let t = f64::from_bits(EXP2_SINGLE[ki as usize % 32].wrapping_add(ki << 47));
+    let c = loaded(&C_SINGLE);
+    let y = r.mla::<FUSED>(c[0], c[1]).mla::<FUSED>(r * r, r.mla::<FUSED>(c[2], 1.0));
+    y * t
+}
+
+/// The constants `c`, read from memory as loads that LLVM can't fold into the code.
+#[inline(always)]
+fn loaded<const N: usize>(c: &'static [f64; N]) -> [f64; N] {
+    // SAFETY: `c` refers to a valid, aligned array that lives for the whole program.
+    unsafe { std::ptr::read_volatile(c) }
 }

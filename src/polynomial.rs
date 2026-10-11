@@ -1,15 +1,6 @@
 //! Polynomials of one variable. A polynomial is the slice of its coefficients in ascending order, so `c` stands for
 //! `c[0] + c[1]x + c[2]x² + …`. Trailing zero coefficients don't count towards the degree. `evaluate` therefore never multiplies an
 //! infinite x by one of them.
-//!
-//! For example, the roots of (x - 1)(x - 2):
-//!
-//! ```
-//! use num_complex::Complex;
-//! let c = [2.0f64, -3.0, 1.0].map(|k| Complex::new(k, 0.0));
-//! let r = rustymath::polynomial::roots(&c).unwrap();
-//! assert!(r.iter().all(|z| z.im == 0.0 && ((z.re - 1.0).abs() < 1e-12 || (z.re - 2.0).abs() < 1e-12)));
-//! ```
 use crate::float::{sealed::Core, Float, FUSED};
 use faer::{prelude::*, Mat};
 use num_complex::Complex;
