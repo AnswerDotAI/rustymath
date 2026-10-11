@@ -19,15 +19,22 @@ repository = "https://github.com/AnswerDotAI/rustymath"
 name = "rustymath"
 
 [dependencies]
+faer = { version = ">=0.24.4, <1", default-features = false, features = ["std", "linalg"] }
 half = { version = ">=2.7.1, <3", features = ["num-traits"] }
+hashbrown = ">=0.15, <1"
 num-bigint = ">=0.4.6, <0.5"
 num-complex = ">=0.4.6, <1"
+num-integer = ">=0.1.46, <1"
 num-rational = ">=0.4.2, <1"
 num-traits = ">=0.2.19, <1"
+rand = { version = ">=0.10.2, <1", default-features = false }
 
 [dev-dependencies]
-# Correctly rounded references for the accuracy tests.
-pxfm = ">=0.1.30, <1"
+# A seeded generator for the distributions' sampling tests.
+rand = { version = ">=0.10.2, <1", features = ["std_rng"] }
+
+[profile.test]
+inherits = "release"
 
 [profile.release]
 lto = false

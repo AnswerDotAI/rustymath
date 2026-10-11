@@ -12,3 +12,7 @@ venv/
 .DS_Store
 .ipynb_checkpoints/
 Cargo.lock
+links/
+_proc/
+_docs/
+.quarto/

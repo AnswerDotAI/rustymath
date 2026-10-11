@@ -1,0 +1,38 @@
+# Directed cases from compiler-builtins' libm-test/src/generate/case_list.rs
+# (https://github.com/rust-lang/compiler-builtins), converted to decimal. Each line is a function name, its inputs and its correctly rounded result.
+#
+#
+# rust-lang/libm as a whole is available for use under the MIT license:
+#
+# ------------------------------------------------------------------------------
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+asinhf -0.37330312 -0.3651353
+asinhf -0.421092 -0.40954682
+expf -0.004595062229782343 0.995415449142456
+expf 0.014499125070869923 1.0146046876907349
+expf -59.51073455810547 1.4282898305033913e-26
+log1pf -0.37751373648643494 -0.4740337133407593
+log1pf 0.5367535948753357 0.42967212200164795
+log1pf -0.3909253776073456 -0.4958144724369049
+log1p -0.39119285298213696 -0.49625373298671077
+tan 1.7976931348622997e+308 1.7712978640447568
+tan -6.727678711835269e+265 1.8085299376127755
+tanh 0.24804252907365554 0.24307773043639194
+tanhf 0.24503659 0.24024734
+tanhf 0.19125812 0.18895969

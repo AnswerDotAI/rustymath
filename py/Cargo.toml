@@ -10,7 +10,12 @@ test = false
 
 [dependencies]
 rustymath = { path = ".." }
-pyo3 = { version = ">=0.29", features = ["extension-module"] }
+pyo3 = { version = ">=0.29", features = ["extension-module", "num-bigint"] }
+numpy = { version = ">=0.29", features = ["half"] }
+half = ">=2.7.1, <3"
+num-bigint = ">=0.4.6, <0.5"
+num-traits = ">=0.2.19, <1"
+rand = { version = ">=0.10.2, <1", default-features = false, features = ["std_rng", "sys_rng"] }
 
 [build-dependencies]
 pyo3-build-config = ">=0.29"

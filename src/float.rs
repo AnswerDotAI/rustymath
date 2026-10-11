@@ -1,4 +1,5 @@
 //! The float types that rustymath's functions take, and the operations that its algorithms build on.
+use crate::search::{Key, RadixKey};
 
 /// Whether `mla` fuses its multiply and add into one operation with one rounding. It does where the target has a fused multiply-add
 /// instruction, as on AArch64 and on x86-64 with FMA. Elsewhere, as in wasm and on baseline x86-64, `mul_add` calls a software `fma`,
@@ -19,6 +20,13 @@ pub trait Float: num_traits::Float + sealed::Sealed {
     fn next_up(self) -> Self;
     /// The greatest float of this type below `self`, as `f64::next_down` gives it.
     fn next_down(self) -> Self;
+    /// The unsigned type, of this float's width, that `order_key` gives.
+    type OrderKey: RadixKey + Key;
+    /// A key whose unsigned order is the order of `total_cmp`, after `¯0` becomes `0` and every NaN becomes one NaN. So `¯0` and `0`
+    /// share a key, NaN's key follows every other, and two floats match exactly when their keys are equal.
+    fn order_key(self) -> Self::OrderKey;
+    /// The float whose `order_key` is `k`. Every NaN reads back as one NaN, and `¯0` as `0`.
+    fn from_order_key(k: Self::OrderKey) -> Self;
 }
 
 /// A float type that rustymath's algorithms run in: `f32` or `f64`.
@@ -48,7 +56,28 @@ pub(crate) mod sealed {
         fn wide(self) -> f64;
         /// `self` negated when the whole number n is odd, for `z` = `SHIFT + n`.
         fn flip(self, z: Self) -> Self;
+        /// Whether the whole number n is odd, for `self` = `SHIFT + n`.
+        fn odd(self) -> bool;
+        /// `self` with the low half of its mantissa bits cleared. The product of two such floats is exact, which double-word products
+        /// without FMA rely on.
+        fn upper(self) -> Self;
     }
+}
+
+/// `Float`'s order-key items, for a float whose bits have type `$k`. A key is the bits with the sign bit flipped, and a negative float's
+/// other bits flipped too. `¯0` adds to `0` first, and every NaN takes the greatest key.
+macro_rules! order_key {
+    ($k:ty) => {
+        type OrderKey = $k;
+        #[inline(always)]
+        fn order_key(self) -> $k {
+            if self.is_nan() { return <$k>::MAX }
+            let bits = (self + <Self as num_traits::Zero>::zero()).to_bits();
+            if bits >> (<$k>::BITS - 1) == 1 { !bits } else { bits | 1 << (<$k>::BITS - 1) }
+        }
+        #[inline(always)]
+        fn from_order_key(k: $k) -> Self { Self::from_bits(if k >> (<$k>::BITS - 1) == 1 { k & !(1 << (<$k>::BITS - 1)) } else { !k }) }
+    };
 }
 
 macro_rules! native {
@@ -66,6 +95,7 @@ macro_rules! native {
             fn next_up(self) -> $t { $t::next_up(self) }
             #[inline]
             fn next_down(self) -> $t { $t::next_down(self) }
+            order_key!($bits);
         }
         impl Native for $t {
             #[inline]
@@ -96,6 +126,10 @@ macro_rules! native {
             // The lowest bit of `z` is the parity of n. Shifted into the sign bit, it negates `self` with no branch.
             #[inline]
             fn flip(self, z: $t) -> $t { $t::from_bits(self.to_bits() ^ (z.to_bits() << (<$bits>::BITS - 1))) }
+            #[inline]
+            fn odd(self) -> bool { self.to_bits() & 1 == 1 }
+            #[inline]
+            fn upper(self) -> $t { $t::from_bits(self.to_bits() & !((1 << (($mantissa + 2) / 2)) - 1)) }
         }
     };
 }
@@ -121,6 +155,7 @@ impl Float for half::f16 {
     }
     #[inline]
     fn next_down(self) -> Self { -(-self).next_up() }
+    order_key!(u16);
 }
 
 /// The polynomial with coefficients `c`, highest degree first, at `x`, by Horner's rule. The coefficients convert to `R` when the
@@ -130,4 +165,33 @@ pub(crate) fn horner<R: Native, const FUSED: bool, const N: usize>(x: R, c: [f64
     let mut y = R::narrow(c[0]);
     for &k in &c[1..] { y = y.mla::<FUSED>(x, R::narrow(k)); }
     y
+}
+
+/// ln 2, split into a part whose product with any whole number up to 2^11 at f64 or 2^8 at f32 is exact, and the rest. That covers
+/// every exponent of a float and every n that `exp` reduces by.
+#[inline]
+pub(crate) fn ln2<R: Native>() -> (R, R) {
+    let (hi, lo) = if R::WIDE {
+        (0.69314718055966295651160180568695068359375, 0.28235290563031577122588448175013436025525412068e-12)
+    } else {
+        (0.693145751953125, 1.428606765330187e-06)
+    };
+    (R::narrow(hi), R::narrow(lo))
+}
+
+/// y × 2^n, for a whole n, in two factors. The first multiplication is exact, so a result below the normal floats rounds once, in the
+/// second.
+#[inline]
+pub(crate) fn pow2_times<R: Native, const FUSED: bool>(y: R, n: R) -> R {
+    let half = n.mla::<FUSED>(R::narrow(0.5), R::SHIFT);
+    y * R::pow2(half) * R::pow2(n - (half - R::SHIFT) + R::SHIFT)
+}
+
+/// (m, e) with x = m × 2^e, m from 0.75 to 1.5 and e whole, for a positive x, subnormals included. A subnormal x scales up by 2^64
+/// first, so that its bits split as a normal float's do.
+#[inline]
+pub(crate) fn split_positive<R: Native>(x: R) -> (R, R) {
+    let subnormal = x < R::min_positive_value();
+    let (m, e) = (if subnormal { x * R::narrow(18446744073709551616.0) } else { x }).split();
+    (m, if subnormal { e - R::narrow(64.0) } else { e })
 }

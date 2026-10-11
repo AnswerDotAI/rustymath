@@ -18,12 +18,16 @@
 //! assert_eq!(t.floor(2.9999999999999996), 3.0);
 //! assert_eq!(Exactly.floor(2.9999999999999996), 2.0);
 //! ```
-use crate::float::{sealed::Core, Float, Native};
+use crate::{
+    float::{sealed::Core, Float, Native},
+    ok, BETWEEN_CHECKS,
+    search::{self, Chains, Key},
+};
 use num_bigint::BigInt;
 use num_complex::Complex;
 use num_rational::BigRational;
 use num_traits::{Signed, ToPrimitive, Zero};
-use std::cmp::Ordering;
+use std::{cmp::Ordering, marker::PhantomData};
 
 /// A relative tolerance, from 0 up to but not including 1. A tolerance of 0 compares exactly, as `Exactly` does, but with more work.
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
@@ -35,8 +39,10 @@ impl Tolerance {
     /// Dyalog APL's default comparison tolerance, 1e-14. It is about 45 units in the last place of an `f64`.
     pub const DEFAULT: Self = Self(1e-14);
     /// The tolerance `t`, when it lies from 0 up to but not including 1. `None` for any other `t`, including NaN.
+    #[inline]
     pub fn new(t: f64) -> Option<Self> { (0.0..1.0).contains(&t).then_some(Self(t)) }
     /// Whether this tolerance is 0.
+    #[inline]
     pub fn is_exact(self) -> bool { self.0 == 0.0 }
 }
 
@@ -62,14 +68,14 @@ pub trait Tolerant: Copy {
     #[inline]
     fn residue<F: Float>(self, x: F, y: F) -> F {
         let q = y / x;
-        let r = if self.equal(x * q.round(), y) { F::zero() } else { y - x * self.floor(q) };
+        let r = if self.equal(x * nearest(q), y) { F::zero() } else { y - x * self.floor(q) };
         if x == F::zero() { y } else { r }
     }
     /// The whole number equal to `y`, when there is one.
     #[inline]
     fn whole<F: Float>(self, y: F) -> Option<F> {
-        let n = y.round();
-        ((y - n).abs() <= F::narrow(self.value()) * y.abs().max(n.abs())).then_some(n)
+        let n = nearest(y);
+        ((y - n).abs() <= F::narrow(self.value()) * larger(y.abs(), n.abs())).then_some(n)
     }
     /// The floats equal to `c`, as `(lo, hi)`: `equal(x, c)` holds exactly when `lo <= x && x <= hi`. Comparing many floats with `c`
     /// then takes two plain comparisons for each, in a loop that vectorizes. `None` when `c` is NaN, which equals nothing.
@@ -112,6 +118,19 @@ pub trait Tolerant: Copy {
     }
 }
 
+/// The larger of `a` and `b`. A NaN argument makes the caller's comparison false, whichever one this returns. wasm SIMD has an
+/// instruction for this choice. It has none for `max`, which must return the number beside a NaN.
+#[inline(always)]
+fn larger<F: Float>(a: F, b: F) -> F { if a > b { a } else { b } }
+
+/// The whole number nearest to `y`, with a tie going down. It's built on `floor`, an instruction on every target. In wasm, `round` is a
+/// library call, and a call in a loop stops it vectorizing.
+#[inline(always)]
+fn nearest<F: Float>(y: F) -> F {
+    let f = y.floor();
+    if y - f > F::narrow(0.5) { f + F::one() } else { f }
+}
+
 /// Exact comparison, as a tolerance of 0 gives, through plain IEEE comparisons and `floor`.
 #[derive(Clone, Copy, Debug)]
 pub struct Exactly;
@@ -132,12 +151,12 @@ impl Tolerant for Tolerance {
     #[inline]
     fn equal<F: Float>(self, x: F, y: F) -> bool {
         let t = F::narrow(self.0);
-        (x == y) | (x.is_finite() & y.is_finite() & ((x - y).abs() <= t * x.abs().max(y.abs())))
+        (x == y) | (x.is_finite() & y.is_finite() & ((x - y).abs() <= t * larger(x.abs(), y.abs())))
     }
     #[inline]
     fn floor<F: Float>(self, y: F) -> F {
-        let (n, t) = (y.round(), F::narrow(self.0));
-        if (n > y) & (n - y > t * y.abs().max(n.abs())) { n - F::one() } else { n }
+        let (n, t) = (y.floor() + F::one(), F::narrow(self.0));
+        if n - y <= t * larger(y.abs(), n.abs()) { n } else { n - F::one() }
     }
 }
 
@@ -173,7 +192,7 @@ pub trait TolerantComplex: Tolerant {
     fn complex_residue<R: Native>(self, x: Complex<R>, y: Complex<R>) -> Complex<R> {
         if x.is_zero() { return y; }
         let q = y / x;
-        if self.complex_equal(x * Complex::new(q.re.round(), q.im.round()), y) { Complex::zero() } else { y - x * self.complex_floor(q) }
+        if self.complex_equal(x * Complex::new(nearest(q.re), nearest(q.im)), y) { Complex::zero() } else { y - x * self.complex_floor(q) }
     }
 }
 impl<T: Tolerant> TolerantComplex for T {}
@@ -200,6 +219,113 @@ macro_rules! with_tolerance {
         }
     }};
 }
+
+/// For each item of `y`, the position of the first item of `x` that it matches within tolerance `t`, or the length of `x` where none
+/// does. NaN matches NaN. With `Exactly`, the search indexes order keys (`search::index_of`). With a `Tolerance`, it files the items of
+/// `x` in buckets of neighbouring floats (`Near`), and compares each item of `y` with the items in the two buckets nearest it.
+///
+/// ```
+/// use rustymath::tolerant::{index_of, Exactly, Tolerance};
+/// let x = [0.3, 1.0, 0.1 + 0.2];
+/// assert_eq!(index_of(Tolerance::DEFAULT, &x, &[0.1 + 0.2, 2.0]), [0, 3]);
+/// assert_eq!(index_of(Exactly, &x, &[0.1 + 0.2, 2.0]), [2, 3]);
+/// ```
+pub fn index_of<F: Float>(t: impl Tolerant, x: &[F], y: &[F]) -> Vec<usize> {
+    let Ok(found) = index_of_with(t, x, y, ok);
+    found
+}
+
+/// `index_of`, calling `check` before each block of `BETWEEN_CHECKS` items of `y`, and returning `check`'s error at once.
+pub fn index_of_with<F: Float, E>(t: impl Tolerant, x: &[F], y: &[F], mut check: impl FnMut() -> Result<(), E>) -> Result<Vec<usize>, E> {
+    if t.value() == 0.0 { return Ok(search::index_of(&order_keys(x), &order_keys(y))); }
+    let near = Near::new(t, x, |j, i| x[j].order_key() == x[i].order_key());
+    let mut found = Vec::with_capacity(y.len());
+    for block in y.chunks(BETWEEN_CHECKS) {
+        check()?;
+        for &v in block {
+            let mut first = x.len();
+            for i in near.near(v) { if i < first && t.matches(x[i], v) { first = i; } }
+            found.push(first);
+        }
+    }
+    Ok(found)
+}
+
+/// The position of the earliest item of each item's class within tolerance `t`. With `Exactly`, a class holds equal floats. With a
+/// `Tolerance`, a class is a run that `runs` gives, so two items of one class needn't match each other.
+pub fn classes<F: Float>(t: impl Tolerant, x: &[F]) -> Vec<usize> {
+    let Ok(classes) = classes_with(t, x, ok);
+    classes
+}
+
+/// `classes`, calling `check` after about every `BETWEEN_CHECKS` items, and returning `check`'s error at once.
+pub fn classes_with<F: Float, E>(t: impl Tolerant, x: &[F], mut check: impl FnMut() -> Result<(), E>) -> Result<Vec<usize>, E> {
+    if t.value() == 0.0 { return Ok(search::classes(&order_keys(x))); }
+    let (mut classes, mut since) = (vec![0; x.len()], 0);
+    runs(t, x, |run| {
+        since += run.len();
+        if since >= BETWEEN_CHECKS { since = 0; check()?; }
+        for &i in run { classes[i] = run[0]; }
+        Ok(())
+    })?;
+    Ok(classes)
+}
+
+/// Whether each item of `x` is the first of its class, with the classes that `classes` gives.
+pub fn firsts<F: Float>(t: impl Tolerant, x: &[F]) -> Vec<bool> {
+    if t.value() == 0.0 { return search::firsts(&order_keys(x)); }
+    classes(t, x).into_iter().enumerate().map(|(i, c)| c == i).collect()
+}
+
+/// Calls `each` with the positions of each run of `x`, in ascending order of position. A run is a longest sequence of floats, taken in
+/// ascending order, in which each matches the next within tolerance `t`. Every float that a float matches lies in one interval
+/// (`Tolerant::range`), so a run holds every match of each of its floats. An error from `each` ends the walk, and `runs` returns it.
+/// The floats sort by their order keys, which read back as floats in memory order.
+pub fn runs<F: Float, E>(t: impl Tolerant, x: &[F], mut each: impl FnMut(&[usize]) -> Result<(), E>) -> Result<(), E> {
+    let sorted = search::sorted(x.iter().zip(0..).map(|(&v, i)| (v.order_key(), i)).collect());
+    let mut run = Vec::new();
+    for pairs in sorted.chunk_by(|a, b| t.matches(F::from_order_key(a.0), F::from_order_key(b.0))) {
+        run.clear();
+        run.extend(pairs.iter().map(|&(_, i)| i as usize));
+        run.sort_unstable();
+        each(&run)?;
+    }
+    Ok(())
+}
+
+/// Floats filed in buckets of neighbouring order keys, for tolerant search. Two floats within tolerance `t` of each other lie at most
+/// `2t/((1-t)ε)` floats apart, where `ε` is the type's epsilon. A bucket holds a power of 2 of keys, at least four times that. A key in
+/// the lower half of its bucket is therefore far enough from the upper edge that every float it matches lies in its own bucket or the
+/// neighbour on the side of its half. At f64 with the default tolerance, a bucket holds 512 keys.
+pub struct Near<F> { chains: Chains, shift: u32, width: PhantomData<F> }
+
+impl<F: Float> Near<F> {
+    /// Files each item of `x` in its bucket, except an item `i` for which `copies(j, i)` holds with an item `j` already in the bucket.
+    /// A copy can't be a first match, because an earlier item matches whatever it matches.
+    pub fn new(t: impl Tolerant, x: &[F], copies: impl Fn(usize, usize) -> bool) -> Self {
+        let (t, epsilon) = (t.value(), F::epsilon().to_f64().unwrap_or(1.0));
+        let apart = (4.0 * t / ((1.0 - t) * epsilon)).ceil() + 1.0;
+        let shift = (2.0 * (apart + 1.0)).log2().ceil().min(64.0) as u32;
+        let mut near = Self { chains: Chains::new(x.len()), shift, width: PhantomData };
+        for (i, &v) in x.iter().enumerate() { near.chains.push_new(near.bucket(v).0, i, |j| copies(j, i)); }
+        near
+    }
+    /// The bucket of `y`, and whether `y` lies in its upper half.
+    #[inline]
+    fn bucket(&self, y: F) -> (u64, bool) {
+        let k = y.order_key().key() as u64;
+        (k.checked_shr(self.shift).unwrap_or(0), self.shift > 0 && (k >> (self.shift - 1)) & 1 == 1)
+    }
+    /// The positions filed near `y`: those in its bucket, then those in the neighbour on the side of its half, each in order of position.
+    #[inline]
+    pub fn near(&self, y: F) -> impl Iterator<Item = usize> + '_ {
+        let (b, upper) = self.bucket(y);
+        [Some(b), if upper { b.checked_add(1) } else { b.checked_sub(1) }].into_iter().flatten().flat_map(|b| self.chains.chain(b))
+    }
+}
+
+/// The order key of each float.
+fn order_keys<F: Float>(x: &[F]) -> Vec<F::OrderKey> { x.iter().map(|v| v.order_key()).collect() }
 
 #[cfg(test)]
 mod tests {
@@ -304,5 +430,25 @@ mod tests {
         assert!((T.gcd(0.6, 0.4) - 0.2).abs() < 1e-15 && Exactly.gcd(0.6, 0.4) < 1e-15);
         assert_eq!((T.gcd(12.0, 18.0), T.gcd(-12.0, 18.0), T.gcd(0.0, 2.5), T.gcd(0.0, 0.0), T.gcd(12.0f32, 18.0)), (6.0, 6.0, 2.5, 0.0, 6.0));
         assert!(T.gcd(f64::NAN, 1.0).is_nan() && T.gcd(f64::NAN, f64::NAN).is_nan() && T.gcd(f64::INFINITY, 1.0).is_nan());
+    }
+
+    /// Tolerant search finds the first match that a brute-force search finds, at every width and at small and large tolerances, among
+    /// floats crowded near a few values, and among zeros, infinities and NaN.
+    #[test]
+    fn slice_search() {
+        fn check<F: Float + std::fmt::Debug>(t: Tolerance) {
+            let base = [1.0, -1.0, 3.0, 1e-3, 0.0, 1000.0];
+            let x: Vec<F> = (0..400u64)
+                .map(|i| {
+                    let r = crate::accuracy::random(i);
+                    F::narrow(base[(r % 6) as usize] * (1.0 + (((r >> 8) % 9) as f64 - 4.0) * t.value() / 2.0))
+                })
+                .chain([F::nan(), F::infinity(), F::neg_infinity(), F::neg_zero()])
+                .collect();
+            let y: Vec<F> = x.iter().rev().copied().chain([F::narrow(7.0)]).collect();
+            let brute: Vec<usize> = y.iter().map(|&v| x.iter().position(|&h| t.matches(h, v)).unwrap_or(x.len())).collect();
+            assert_eq!(index_of(t, &x, &y), brute, "{t:?}");
+        }
+        for t in [T, Tolerance::new(1e-3).unwrap(), Tolerance::new(0.3).unwrap()] { check::<f64>(t); check::<f32>(t); check::<f16>(t); }
     }
 }
