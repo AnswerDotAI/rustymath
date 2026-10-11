@@ -4,9 +4,9 @@
 //! The others choose a method by range, or iterate until they converge.
 use crate::{
     dd::Double,
-    exp::{exp, exp_plus},
+    exp::{exp, exp_narrow, exp_plus},
     float::{horner, sealed::Core},
-    ln::{ln, ln_coarse, ln_double, ln_split, log1p},
+    ln::{ln, ln_narrow, ln_double, ln_split, log1p},
     Native,
 };
 use std::f64::consts::PI;
@@ -46,7 +46,7 @@ const EXP_NEG_G: f64 = 0.00241832520904651;
 /// √π/2.
 const SQRT_PI_2: f64 = 0.886226925452758;
 /// 512 ln 2 as a double word, and 2^-512.
-const SHIFT: (f64, f64) = (354.891356446692, 1.1873519686893054e-14);
+const LN2_512: (f64, f64) = (354.891356446692, 1.1873519686893054e-14);
 const TWO_M512: f64 = 7.458340731200207e-155;
 /// π - `PI`.
 const PI_LO: f64 = 1.2246467991473532e-16;
@@ -81,29 +81,17 @@ const DEN: [f64; 13] = [
 #[inline(always)]
 fn lanczos<const FUSED: bool>(y: Double<f64>) -> (Double<f64>, Double<f64>) {
     let v = 1.0 / y.hi;
-    (horner_dd::<FUSED>(v, NUM).div::<FUSED>(horner_dd::<FUSED>(v, DEN)), exponent::<FUSED>(y, true))
+    (Double::horner::<FUSED>(v, NUM).div::<FUSED>(Double::horner::<FUSED>(v, DEN)), exponent::<FUSED>(y, true))
 }
 
 /// The Lanczos exponent (y - 1/2)(ln(y + g - 1/2) - 1) as a double word, for y as `lanczos` takes it, with the logarithm that `ln_dd`
 /// chooses by `fine`.
 #[inline(always)]
 fn exponent<const FUSED: bool>(y: Double<f64>, fine: bool) -> Double<f64> {
-    let l = ln_dd::<FUSED>(plus(Double::sum(y.hi, G_HALF), Double::new(y.lo, 0.0)), fine);
-    let m = plus(l, Double::new(-1.0, 0.0));
+    let l = ln_dd::<FUSED>(Double::sum(y.hi, G_HALF).plus(Double::new(y.lo, 0.0)), fine);
+    let m = l.plus(Double::new(-1.0, 0.0));
     let e = m.mul_float::<FUSED>(y.hi - 0.5);
     Double::new(e.hi, e.lo + m.hi * y.lo)
-}
-
-/// The polynomial of degree 12 with coefficients `c`, highest degree first, at `x`, by Horner's rule in double words. The steps are
-/// written out because at opt-level 2, as basedpl builds, LLVM leaves a loop of them rolled, and that loop stops the caller's loop
-/// vectorizing.
-#[inline(always)]
-fn horner_dd<const FUSED: bool>(x: f64, c: [f64; 13]) -> Double<f64> {
-    let step = |y: Double<f64>, k: f64| plus(y.mul_float::<FUSED>(x), Double::new(k, 0.0));
-    let y = step(step(step(Double::new(c[0], 0.0), c[1]), c[2]), c[3]);
-    let y = step(step(step(y, c[4]), c[5]), c[6]);
-    let y = step(step(step(y, c[7]), c[8]), c[9]);
-    step(step(step(y, c[10]), c[11]), c[12])
 }
 
 /// ln u for a double word u, as a double word, from `ln_double` if `fine` and from `ln_split` otherwise.
@@ -113,23 +101,12 @@ fn ln_dd<const FUSED: bool>(u: Double<f64>, fine: bool) -> Double<f64> {
     Double::new(l.hi, l.lo + u.lo / u.hi)
 }
 
-/// The sum of two double words.
-#[inline(always)]
-fn plus(a: Double<f64>, b: Double<f64>) -> Double<f64> {
-    let s = Double::sum(a.hi, b.hi);
-    Double::new(s.hi, s.lo + a.lo + b.lo)
-}
-
-/// -a for a double word.
-#[inline(always)]
-fn neg(a: Double<f64>) -> Double<f64> { Double::new(-a.hi, -a.lo) }
-
 /// ln Γ(y) as a double word, for y > 0. From 1/2 up it keeps the Lanczos exponent's double word, so that a sum of such logarithms
 /// cancels without rounding. Below 1/2 it is small, and one float holds it.
 fn lgamma_dd<const FUSED: bool>(y: Double<f64>) -> Double<f64> {
     if y.hi < 0.5 { return Double::new(lgamma64::<FUSED>(y.hi), 0.0); }
     let (s, e) = lanczos::<FUSED>(y);
-    plus(e, Double::new(ln::<f64, FUSED>(s.hi * EXP_NEG_G), s.lo / s.hi))
+    e.plus(Double::new(ln::<f64, FUSED>(s.hi * EXP_NEG_G), s.lo / s.hi))
 }
 
 /// sin πr / r and cos πr as polynomials in r², highest degree first: their Taylor series, which are within an ulp up to |r| = 1/4.
@@ -184,8 +161,8 @@ fn gamma64<const FUSED: bool>(x: f64) -> f64 {
     // carries a factor of 2^512, which the other factor gives back first, to keep its rounding from growing.
     let d = Double::sum(e.hi, -G);
     let (hi, lo) = (d.hi, d.lo + e.lo);
-    let up = Double::sum(-hi, SHIFT.0);
-    let p = if reflect { exp_plus::<f64, FUSED>(up.hi, up.lo - lo + SHIFT.1) } else { exp_plus::<f64, FUSED>(hi, lo) };
+    let up = Double::sum(-hi, LN2_512.0);
+    let p = if reflect { exp_plus::<f64, FUSED>(up.hi, up.lo - lo + LN2_512.1) } else { exp_plus::<f64, FUSED>(hi, lo) };
     // Below 1/2, π / (sin πx S(y)) is a double-word quotient, so the result rounds once more, in the last product.
     let f = Double::new(PI, PI_LO).div::<FUSED>(s.mul_float::<FUSED>(sinpi::<FUSED>(x)));
     let g = if reflect { (f.hi * TWO_M512).mla::<FUSED>(p, f.lo * TWO_M512 * p) } else { s.hi.mla::<FUSED>(p, s.lo * p) };
@@ -202,7 +179,7 @@ fn lgamma64<const FUSED: bool>(x: f64) -> f64 {
     // and the same logarithm takes |x| instead.
     let tiny = x.abs() < 1e-17;
     let l = ln_split::<FUSED>(if tiny { x.abs() } else if reflect { PI / (sinpi::<FUSED>(x).abs() * s) } else { s });
-    let r = plus(l, if reflect { neg(e) } else { e });
+    let r = l.plus(if reflect { -e } else { e });
     if x.is_infinite() || (x <= 0.0 && x == x.floor()) { f64::INFINITY } else if tiny { -l.hi } else { r.hi + r.lo }
 }
 
@@ -219,7 +196,7 @@ fn gamma_plain<const FUSED: bool>(x: f64) -> f64 {
     let reflect = x < 0.5;
     let y = if reflect { 1.0 - x } else { x };
     let s = sum_plain::<FUSED>(y);
-    let p = exp::<f64, FUSED>((y - 0.5) * (ln::<f64, FUSED>(y + G_HALF) - 1.0) - G);
+    let p = exp_narrow::<FUSED>((y - 0.5) * (ln::<f64, FUSED>(y + G_HALF) - 1.0) - G);
     let g = if reflect { PI / (sinpi_plain::<FUSED>(x) * s * p) } else { s * p };
     if x == 0.0 { 1.0 / x } else if x < 0.0 && x == x.floor() { f64::NAN } else { g }
 }
@@ -241,9 +218,9 @@ fn stirling_tail<const FUSED: bool>(w: f64) -> f64 { w.mla::<FUSED>(horner::<f64
 fn lgamma_stirling<const FUSED: bool>(x: f64) -> f64 {
     let reflect = x < 0.5;
     let (z, p) = shifted(if reflect { 1.0 - x } else { x });
-    let s = (z - 0.5).mla::<FUSED>(ln_coarse::<FUSED>(z), stirling_tail::<FUSED>(1.0 / z) - z);
+    let s = (z - 0.5).mla::<FUSED>(ln_narrow::<FUSED>(z), stirling_tail::<FUSED>(1.0 / z) - z);
     let (num, den) = if reflect { (PI * p, sinpi_plain::<FUSED>(x).abs()) } else { (1.0, p) };
-    let l = ln_coarse::<FUSED>(num / den);
+    let l = ln_narrow::<FUSED>(num / den);
     let r = if reflect { l - s } else { s + l };
     if x.is_infinite() || (x <= 0.0 && x == x.floor()) { f64::INFINITY } else { r }
 }
@@ -516,8 +493,8 @@ const RESCALE: f64 = 4503599627370496.0;
 /// x^a e^-x / Γ(a), the factor before the incomplete gamma function's series and continued fraction. Its exponent stays a double
 /// word until the exponential, so its large terms cancel without rounding.
 fn gamma_factor<const FUSED: bool>(a: f64, x: f64) -> f64 {
-    let t = plus(ln_dd::<FUSED>(Double::new(x, 0.0), true).mul_float::<FUSED>(a), Double::new(-x, 0.0));
-    let t = plus(t, neg(lgamma_dd::<FUSED>(Double::new(a, 0.0))));
+    let t = ln_dd::<FUSED>(Double::new(x, 0.0), true).mul_float::<FUSED>(a).plus(Double::new(-x, 0.0));
+    let t = t.plus(-lgamma_dd::<FUSED>(Double::new(a, 0.0)));
     exp_plus::<f64, FUSED>(t.hi, t.lo)
 }
 
@@ -528,9 +505,9 @@ fn gamma_factor_plain<const FUSED: bool>(a: f64, x: f64) -> f64 {
     let (z, p) = shifted(a);
     let w = 1.0 / z;
     let u = if z > a { let w2 = w * w; let w4 = w2 * w2; p * (w4 * w4) } else { 1.0 };
-    let half_log = 0.5 * ln_coarse::<FUSED>(z * u * u);
+    let half_log = 0.5 * ln_narrow::<FUSED>(z * u * u);
     let e = a.mla::<FUSED>(ln::<f64, FUSED>(x * w), half_log + (z - x) - stirling_tail::<FUSED>(w));
-    exp::<f64, FUSED>(e)
+    exp_narrow::<FUSED>(e)
 }
 
 /// The regularized lower and upper incomplete gamma functions P(a, x) and Q(a, x) = 1 - P(a, x), at f64 if `wide` and for the
@@ -660,9 +637,9 @@ fn betainc64<const FUSED: bool>(a: f64, b: f64, x: f64) -> f64 {
     if x == 0.0 || x == 1.0 { return x; }
     // a ln x + b ln(1 - x) - ln B(a, b), with 1 - x and a + b exact as double words, and every term a double word until the exponential.
     let (one, sum) = (Double::new(1.0, 0.0), Double::sum(a, b));
-    let (lx, l1x) = (ln_dd::<FUSED>(Double::new(x, 0.0), true), ln_dd::<FUSED>(plus(one, Double::new(-x, 0.0)), true));
-    let t = plus(lx.mul_float::<FUSED>(a), l1x.mul_float::<FUSED>(b));
-    let t = plus(plus(t, lgamma_dd::<FUSED>(sum)), neg(plus(lgamma_dd::<FUSED>(Double::new(a, 0.0)), lgamma_dd::<FUSED>(Double::new(b, 0.0)))));
+    let (lx, l1x) = (ln_dd::<FUSED>(Double::new(x, 0.0), true), ln_dd::<FUSED>(one.plus(Double::new(-x, 0.0)), true));
+    let t = lx.mul_float::<FUSED>(a).plus(l1x.mul_float::<FUSED>(b));
+    let t = t.plus(lgamma_dd::<FUSED>(sum)).plus(-lgamma_dd::<FUSED>(Double::new(a, 0.0)).plus(lgamma_dd::<FUSED>(Double::new(b, 0.0))));
     let front = exp_plus::<f64, FUSED>(t.hi, t.lo);
     if x < (a + 1.0) / (a + b + 2.0) { front * beta_fraction(a, b, x) / a } else { 1.0 - front * beta_fraction(b, a, 1.0 - x) / b }
 }

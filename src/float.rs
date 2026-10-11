@@ -7,13 +7,16 @@ use crate::search::{Key, RadixKey};
 pub const FUSED: bool = cfg!(any(target_arch = "aarch64", target_feature = "fma"));
 
 /// A float type that rustymath's functions take: `half::f16`, `f32` or `f64`.
-pub trait Float: num_traits::Float + sealed::Sealed {
-    /// The type this float computes in: `f32` for `f16`, and the type itself otherwise. A function of an `f16` computes in `f32` and
-    /// rounds once. Sums keep their running totals in this type.
-    type Total: Native;
-    fn total(self) -> Self::Total;
+pub trait Float: num_traits::Float + sealed::Sealed + sealed::Dispatch {
+    /// The type this float computes in, its working precision: `f32` for `f16`, and the type itself otherwise. A function of an `f16`
+    /// computes in `f32` and rounds once. Sums keep their running totals in this type.
+    type Working: Native;
+    /// This float in its working type, which holds it exactly.
+    fn working(self) -> Self::Working;
     /// `t` rounded to this type.
-    fn from_total(t: Self::Total) -> Self;
+    fn from_working(t: Self::Working) -> Self;
+    /// This float as an `f64`, which holds it exactly.
+    fn wide(self) -> f64;
     /// `x` rounded to the nearest float of this type.
     fn narrow(x: f64) -> Self;
     /// The least float of this type above `self`, as `f64::next_up` gives it.
@@ -30,16 +33,30 @@ pub trait Float: num_traits::Float + sealed::Sealed {
 }
 
 /// A float type that rustymath's algorithms run in: `f32` or `f64`.
-pub trait Native: Float<Total = Self> + sealed::Core {
+pub trait Native: Float<Working = Self> + sealed::Core {
     /// `+` that may be reordered with other algebraic operations. A sum of them vectorizes.
     fn algebraic_add(self, other: Self) -> Self;
     /// `×` that may be reordered with other algebraic operations.
     fn algebraic_mul(self, other: Self) -> Self;
 }
 
-/// Traits that only rustymath implements. `Core` holds the bit-level operations that the algorithms build on.
+/// Traits that only rustymath implements. `Core` holds the bit-level operations that the algorithms build on. `BinaryForms` holds a
+/// function object's forms, and `Dispatch` picks the form for a float type.
 pub(crate) mod sealed {
+    use crate::slice::Arg;
     pub trait Sealed {}
+    /// A function object of two floats, as forms compiled inside rustymath at `f32` and `f64`. `functions!` writes them.
+    pub trait BinaryForms: Copy {
+        fn one_f32(x: f32, y: f32) -> f32;
+        fn one_f64(x: f64, y: f64) -> f64;
+        fn many_f32(x: Arg<'_, f32>, y: Arg<'_, f32>, n: usize, out: &mut Vec<f32>) -> bool;
+        fn many_f64(x: Arg<'_, f64>, y: Arg<'_, f64>, n: usize, out: &mut Vec<f64>) -> bool;
+    }
+    /// A function object's form at this type: its own at `f32` and `f64`, and the `f32` form, rounded once, at `f16`.
+    pub trait Dispatch: Sized {
+        fn binary_one<K: BinaryForms>(x: Self, y: Self) -> Self;
+        fn binary_many<K: BinaryForms>(x: Arg<'_, Self>, y: Arg<'_, Self>, n: usize, out: &mut Vec<Self>) -> bool;
+    }
     pub trait Core: Copy {
         /// Whether this is `f64`. Algorithms pick their constants by it, and the compiler removes the branch.
         const WIDE: bool;
@@ -52,8 +69,6 @@ pub(crate) mod sealed {
         fn pow2(z: Self) -> Self;
         /// `(m, e)` with `self` = m × 2^e, m from 0.75 to 1.5 and e whole, for a positive normal `self`.
         fn split(self) -> (Self, Self);
-        /// This float as an `f64`, which holds it exactly.
-        fn wide(self) -> f64;
         /// `self` negated when the whole number n is odd, for `z` = `SHIFT + n`.
         fn flip(self, z: Self) -> Self;
         /// Whether the whole number n is odd, for `self` = `SHIFT + n`.
@@ -84,11 +99,13 @@ macro_rules! native {
     ($t:ident, $bits:ty, $mantissa:literal, $bias:literal) => {
         impl sealed::Sealed for $t {}
         impl Float for $t {
-            type Total = $t;
+            type Working = $t;
             #[inline]
-            fn total(self) -> $t { self }
+            fn working(self) -> $t { self }
             #[inline]
-            fn from_total(t: $t) -> $t { t }
+            fn from_working(t: $t) -> $t { t }
+            #[inline]
+            fn wide(self) -> f64 { self as f64 }
             #[inline]
             fn narrow(x: f64) -> $t { x as $t }
             #[inline]
@@ -121,8 +138,6 @@ macro_rules! native {
                 let two_m = (1 as $bits << $mantissa) as $t;
                 (m, $t::from_bits(two_m.to_bits() | exponent) - (two_m + $bias as $t))
             }
-            #[inline]
-            fn wide(self) -> f64 { self as f64 }
             // The lowest bit of `z` is the parity of n. Shifted into the sign bit, it negates `self` with no branch.
             #[inline]
             fn flip(self, z: $t) -> $t { $t::from_bits(self.to_bits() ^ (z.to_bits() << (<$bits>::BITS - 1))) }
@@ -138,11 +153,13 @@ native!(f64, u64, 52, 1023);
 
 impl sealed::Sealed for half::f16 {}
 impl Float for half::f16 {
-    type Total = f32;
+    type Working = f32;
     #[inline]
-    fn total(self) -> f32 { self.to_f32() }
+    fn working(self) -> f32 { self.to_f32() }
     #[inline]
-    fn from_total(t: f32) -> Self { half::f16::from_f32(t) }
+    fn from_working(t: f32) -> Self { half::f16::from_f32(t) }
+    #[inline]
+    fn wide(self) -> f64 { self.to_f64() }
     #[inline]
     fn narrow(x: f64) -> Self { half::f16::from_f64(x) }
     // The float above a positive float has the next bit pattern. The float above a negative float has the previous one. Both zeros

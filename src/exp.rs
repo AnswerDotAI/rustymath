@@ -1,6 +1,6 @@
 //! e^x and e^x - 1. The f64 reduction and the form of the final step come from SLEEF's `xexp`, and the f32 polynomial of `exp` and
 //! the f32 split of ln 2 from Arm Optimized Routines' AdvSIMD `expf`. The other polynomials are minimax fits. See `THIRD-PARTY.md`.
-use crate::float::{horner, ln2, pow2_times, Native};
+use crate::float::{horner, ln2, pow2_times, sealed::Core, Native};
 
 /// The coefficients of h(r) = (e^r - 1)/r, highest degree first, for |r| up to about ln 2 / 2. `exp` needs h only to within its
 /// error in e^r = 1 + r h, which shrinks with r.
@@ -17,6 +17,10 @@ const EXP_64: [f64; 10] = [
     1.0000000000000056,
 ];
 const EXP_32: [f64; 5] = [0.008247390389442444, 0.04189976677298546, 0.16668395698070526, 0.4999912679195404, 0.9999994039535522];
+/// The same, to about 2^-28 relative in e^r, for f32 and f16 results computed in f64. At that accuracy, a power whose exact result is
+/// a narrower float comes out exactly.
+const EXP_NARROW: [f64; 6] =
+    [0.0013941108433972674, 0.008375126398153335, 0.04166635289677515, 0.16666415514653277, 0.5000000047117757, 1.000000037716214];
 /// h to within a fraction of an ulp relative to h itself, for `expm1`, whose result near 0 is r h.
 const H_64: [f64; 11] = [
     2.5052099500253996e-08,
@@ -36,11 +40,11 @@ const H_32: [f64; 6] = [0.0013888871762901545, 0.00836906861513853, 0.0416671372
 /// The magnitude beyond which e^x is 0 or ∞ at every width this crate computes in. Each half of n stays within the exponents of
 /// normal floats.
 #[inline]
-fn limit<R: Native>() -> R { R::narrow(if R::WIDE { 1100.0 } else { 150.0 }) }
+pub(crate) fn limit<R: Native>() -> R { R::narrow(if R::WIDE { 1100.0 } else { 150.0 }) }
 
-/// x limited to ±`limit`. Comparisons with NaN fail, so NaN passes through.
+/// x limited to ±l. Comparisons with NaN fail, so NaN passes through.
 #[inline]
-fn clamp<R: Native>(x: R) -> R { let l = limit::<R>(); if x < -l { -l } else if x > l { l } else { x } }
+pub(crate) fn clamp<R: Native>(x: R, l: R) -> R { if x < -l { -l } else if x > l { l } else { x } }
 
 /// n and r with x = n ln 2 + r, n whole and |r| at most about ln 2 / 2, for |x| up to `limit`.
 #[inline]
@@ -57,18 +61,23 @@ fn scaled<R: Native, const FUSED: bool, const N: usize>(n: R, r: R, poly: [f64; 
     pow2_times::<R, FUSED>(r.mla::<FUSED>(horner::<R, FUSED, N>(r, poly), R::one()), n)
 }
 
+/// e^(x + lo) × 2^k, for a lo far below x and a whole k. lo joins the reduced argument, except where `clamp` changes x and the
+/// result is 0 or ∞ whatever lo is. Scaling by 2^k inside keeps e^x/2 finite where e^x would overflow. A caller passes -0 for a part
+/// it lacks. The compiler drops such a part, because adding -0 changes no value.
 #[inline]
-pub(crate) fn exp<R: Native, const FUSED: bool>(x: R) -> R {
-    let (n, r) = reduce::<R, FUSED>(clamp(x));
-    if R::WIDE { scaled::<R, FUSED, 10>(n, r, EXP_64) } else { scaled::<R, FUSED, 5>(n, r, EXP_32) }
-}
-
-/// e^x × 2^k, for a whole k. The power of two joins the scaling, so e^x/2 stays finite where e^x would overflow.
-#[inline]
-pub(crate) fn exp_times<R: Native, const FUSED: bool>(x: R, k: R) -> R {
-    let (n, r) = reduce::<R, FUSED>(clamp(x));
+fn exp_parts<R: Native, const FUSED: bool>(x: R, lo: R, k: R) -> R {
+    let c = clamp(x, limit());
+    let (n, r) = reduce::<R, FUSED>(c);
+    let r = if c == x { r + lo } else { r };
     if R::WIDE { scaled::<R, FUSED, 10>(n + k, r, EXP_64) } else { scaled::<R, FUSED, 5>(n + k, r, EXP_32) }
 }
+
+#[inline]
+pub(crate) fn exp<R: Native, const FUSED: bool>(x: R) -> R { exp_parts::<R, FUSED>(x, R::neg_zero(), R::neg_zero()) }
+
+/// e^x × 2^k, for a whole k.
+#[inline]
+pub(crate) fn exp_times<R: Native, const FUSED: bool>(x: R, k: R) -> R { exp_parts::<R, FUSED>(x, R::neg_zero(), k) }
 
 #[inline]
 pub(crate) fn expm1<R: Native, const FUSED: bool>(x: R) -> R { expm1_times::<R, FUSED>(x, R::zero()) }
@@ -81,7 +90,7 @@ pub(crate) fn expm1<R: Native, const FUSED: bool>(x: R) -> R { expm1_times::<R, 
 pub(crate) fn expm1_times<R: Native, const FUSED: bool>(x: R, k: R) -> R {
     let c = R::narrow;
     let (low, top) = if R::WIDE { (c(-40.0), c(1023.0)) } else { (c(-18.0), c(127.0)) };
-    let (n, r) = reduce::<R, FUSED>(clamp(if x < low { low } else { x }));
+    let (n, r) = reduce::<R, FUSED>(clamp(if x < low { low } else { x }, limit()));
     let h = if R::WIDE { horner::<R, FUSED, 11>(r, H_64) } else { horner::<R, FUSED, 6>(r, H_32) };
     let m = if n > top { top } else { n };
     let scale = R::pow2(m + R::SHIFT);
@@ -90,12 +99,14 @@ pub(crate) fn expm1_times<R: Native, const FUSED: bool>(x: R, k: R) -> R {
     if x == R::zero() { x } else { y }
 }
 
-/// e^(hi + lo), for a double word whose lo is far below hi, as `pow` gives it. lo joins the reduced argument, except where `clamp`
-/// changes hi and the result is 0 or ∞ whatever lo is.
+/// e^(hi + lo), for a double word whose lo is far below hi.
 #[inline]
-pub(crate) fn exp_plus<R: Native, const FUSED: bool>(hi: R, lo: R) -> R {
-    let x = clamp(hi);
-    let (n, r) = reduce::<R, FUSED>(x);
-    let r = if x == hi { r + lo } else { r };
-    if R::WIDE { scaled::<R, FUSED, 10>(n, r, EXP_64) } else { scaled::<R, FUSED, 5>(n, r, EXP_32) }
+pub(crate) fn exp_plus<R: Native, const FUSED: bool>(hi: R, lo: R) -> R { exp_parts::<R, FUSED>(hi, lo, R::neg_zero()) }
+
+/// e^x in f64 for an f32 or f16 result. Beyond 110 in magnitude, e^x is 0 or ∞ at those widths. x stops there. One power of two
+/// then scales the result.
+#[inline]
+pub(crate) fn exp_narrow<const FUSED: bool>(x: f64) -> f64 {
+    let (n, r) = reduce::<f64, FUSED>(clamp(x, 110.0));
+    r.mla::<FUSED>(horner::<f64, FUSED, 6>(r, EXP_NARROW), 1.0) * f64::pow2(n + f64::SHIFT)
 }

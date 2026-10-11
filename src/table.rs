@@ -3,19 +3,16 @@
 //! multiples of ln 2/256 and looks up 2^(j/256) as a float and the tail of its rounding, which leaves a short polynomial. Both steps
 //! carry a double word. Each item reads its own table entries, so LLVM vectorizes the loops that call them only where the target has
 //! gathers, as AVX2 does. On NEON and in wasm they run one item at a time. See `THIRD-PARTY.md`.
-use crate::{dd::Double, float::sealed::Core};
+use crate::{dd::Double, exp::{clamp, limit}, float::sealed::Core};
 use std::f64::consts::LOG2_E;
-
-/// 1.5 × 2^52. Adding it to a magnitude below 2^51 rounds that to a whole number, which the low bits of the sum hold.
-const SHIFT: f64 = 6755399441055744.0;
 
 /// `ix - off`, k as an f64 and the bits of z, for the float with bits `ix` = z × 2^k and z from the float with bits `off` to twice it.
 /// The table index is in the bits of `ix - off` below its top 12, which hold k. They're read with a bias of 2048, so that no shift
-/// needs a sign, and k converts through the bits of `SHIFT` + k.
+/// needs a sign, and k converts through the bits of `Core::SHIFT` + k.
 #[inline]
 fn split(ix: u64, off: u64) -> (u64, f64, u64) {
     let tmp = ix.wrapping_sub(off);
-    let k = f64::from_bits(SHIFT.to_bits() + (tmp.wrapping_add(2048 << 52) >> 52)) - (SHIFT + 2048.0);
+    let k = f64::from_bits(f64::SHIFT.to_bits() + (tmp.wrapping_add(2048 << 52) >> 52)) - (f64::SHIFT + 2048.0);
     (tmp, k, ix.wrapping_sub(tmp & (0xfff << 52)))
 }
 
@@ -307,17 +304,14 @@ const TAIL: [u64; 256] = [
 const LN2_256: (f64, f64) = (0.0027076061742263846, -1.6409824502660487e-13);
 /// The coefficients of (e^r - 1 - r)/r² in the grouping that `exp` evaluates, for |r| up to ln 2/512.
 const C: [f64; 3] = [0.49999999999999756, 0.1666666799409282, 0.04166667054490923];
-/// The magnitude beyond which e^x is 0 or ∞. Each factor of `exp`'s final scaling stays within the exponents of normal floats.
-const LIMIT: f64 = 1100.0;
-
-/// e^(hi + lo), for a double word whose lo is far below hi. lo joins the reduced argument, except where hi is beyond `LIMIT` and the
+/// e^(hi + lo), for a double word whose lo is far below hi. lo joins the reduced argument, except where `clamp` changes hi and the
 /// result is 0 or ∞ whatever lo is. The result is 2^e × 2^(j/256) × e^r, with 2^(j/256) carried as `SBITS` and its `TAIL`. 2^e
 /// multiplies in two factors, so a result below the normal floats rounds once, in the second.
 #[inline(always)]
 pub(crate) fn exp<const FUSED: bool>(hi: f64, lo: f64) -> f64 {
-    let x = if hi < -LIMIT { -LIMIT } else if hi > LIMIT { LIMIT } else { hi };
-    let s = x.mla::<FUSED>(256.0 * LOG2_E, SHIFT);
-    let k = s - SHIFT;
+    let x = clamp(hi, limit());
+    let s = x.mla::<FUSED>(256.0 * LOG2_E, f64::SHIFT);
+    let k = s - f64::SHIFT;
     let r = k.mla::<FUSED>(-LN2_256.1, k.mla::<FUSED>(-LN2_256.0, x));
     let r = if x == hi { r + lo } else { r };
     // The low 52 bits of s are 2^51 + k.

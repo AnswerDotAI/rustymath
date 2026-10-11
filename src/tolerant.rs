@@ -19,7 +19,7 @@
 //! assert_eq!(Exactly.floor(2.9999999999999996), 2.0);
 //! ```
 use crate::{
-    float::{sealed::Core, Float, Native},
+    float::{Float, Native},
     ok, BETWEEN_CHECKS,
     search::{self, Chains, Key},
 };
@@ -96,7 +96,7 @@ pub trait Tolerant: Copy {
     /// The greatest common divisor of `x` and `y`: the larger magnitude divided by the numerator of the first convergent of the ratio of
     /// the magnitudes that equals the ratio. It computes in `f64` and rounds. NaN when either argument is NaN or infinite.
     fn gcd<F: Float>(self, x: F, y: F) -> F {
-        let (x, y) = (x.total().wide(), y.total().wide());
+        let (x, y) = (x.wide(), y.wide());
         if !(x.is_finite() && y.is_finite()) { return F::nan(); }
         let (x, y) = (x.abs().max(y.abs()), x.abs().min(y.abs()));
         if y == 0.0 { return F::narrow(x); }

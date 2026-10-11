@@ -1,7 +1,8 @@
 //! Logarithms. They share SLEEF's reduction from `xlog` and `xlogf`: x = m × 2^e with m from 0.75 to 1.5, and
-//! ln m = ln((1+s)/(1-s)) with s = (m-1)/(m+1), from SLEEF's f64 polynomial and a minimax f32 one. See `THIRD-PARTY.md`.
+//! ln m = ln((1+s)/(1-s)) with s = (m-1)/(m+1), from SLEEF's f64 polynomial and minimax ones for narrower results. See
+//! `THIRD-PARTY.md`.
 use crate::{dd::Double, float::{horner, ln2, sealed::Core, split_positive, Native}};
-use std::f64::consts::{LOG10_E, LOG2_E};
+use std::f64::consts::{LN_2, LOG10_E, LOG2_E};
 
 /// The coefficients of (ln((1+s)/(1-s)) - 2s)/s³ as a polynomial in s², highest degree first, for |s| up to 0.2.
 const POLY_64: [f64; 7] = [
@@ -15,6 +16,9 @@ const POLY_64: [f64; 7] = [
 ];
 /// The coefficients of ln((1+s)/(1-s))/s as a polynomial in s², highest degree first, for |s| up to 0.2.
 const POLY_32: [f64; 4] = [0.30434924364089966, 0.3995267450809479, 0.6666705012321472, 2.0];
+/// The same, to about 2^-35 relative, for f32 and f16 results computed in f64. They need that even where a power multiplies the
+/// logarithm.
+const POLY_NARROW: [f64; 5] = [0.24145279203110395, 0.28502925464850143, 0.40000986365881785, 0.6666666171721365, 2.0000000000396225];
 /// log10(2), split into a part whose product with any exponent of an f64 is exact, and the rest.
 const LOG10_2: (f64, f64) = (0.30102999566361177, 3.694239077158931e-13);
 
@@ -49,12 +53,18 @@ fn log<R: Native, const FUSED: bool>(x: R, base: (R, R), k: f64) -> R {
 #[inline]
 pub(crate) fn ln<R: Native, const FUSED: bool>(x: R) -> R { log::<R, FUSED>(x, ln2(), 1.0) }
 
-/// ln x for a positive normal x in f64 with f32's polynomial. Its absolute error is below 2e-9, which f32 results computed in f64
-/// can afford.
+/// ln x for a positive, finite, nonzero x, computed in f64 for an f32 or f16 result. Such an x is never a subnormal f64. At this
+/// accuracy, ln 2 needs no lower part.
 #[inline(always)]
-pub(crate) fn ln_coarse<const FUSED: bool>(x: f64) -> f64 {
+pub(crate) fn ln_narrow<const FUSED: bool>(x: f64) -> f64 {
     let (m, e) = x.split();
-    based::<f64, FUSED>((m - 1.0) / (m + 1.0), e, ln2(), 1.0, false)
+    let s = (m - 1.0) / (m + 1.0);
+    // Estrin's form, which shortens the chain of dependent operations.
+    let [a4, a3, a2, a1, a0] = POLY_NARROW;
+    let u = s * s;
+    let u2 = u * u;
+    let p = u2.mla::<FUSED>(a4, u.mla::<FUSED>(a3, a2)).mla::<FUSED>(u2, u.mla::<FUSED>(a1, a0));
+    e.mla::<FUSED>(LN_2, s * p)
 }
 
 /// ln x for a positive x as the unrounded double word e ln 2 + ln m. Its absolute error is that of ln m, about 1e-16, whatever x's

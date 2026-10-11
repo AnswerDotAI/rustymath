@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 jobs:
-  test-rust:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -19,24 +19,16 @@ jobs:
       - run: cargo generate-lockfile
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
-
-  test-python:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      # The repository has no `Cargo.lock`. Creating one first makes rust-cache's key change when a dependency publishes a new version.
-      - run: cargo generate-lockfile
-      - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - run: pip install -e '.[dev]'
+      - run: cargo develop
       - run: pytest -q
       - run: nbdev-test
 
   build:
-    needs: [test-rust, test-python]
+    needs: [test]
     strategy:
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]

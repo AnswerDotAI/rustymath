@@ -1,6 +1,6 @@
 [build-system]
-requires = ["maturin>=1.0,<2.0"]
-build-backend = "maturin"
+requires = ["maturin>=1.0,<2.0", "fastws-cli>=0.0.25"]
+build-backend = "fastws.build_backend"
 
 [project]
 name = "rustymath"
@@ -14,7 +14,7 @@ classifiers = ["Programming Language :: Rust", "Programming Language :: Python :
 dependencies = ["numpy"]
 
 [project.optional-dependencies]
-dev = ["fastship>=0.0.11", "maturin>=1.0,<2.0", "pytest", "nbdev", "scipy"]
+dev = ["fastship>=0.0.11", "fastws-cli>=0.0.25", "maturin>=1.0,<2.0", "pytest", "nbdev", "scipy"]
 
 [project.urls]
 Homepage = "https://github.com/AnswerDotAI/rustymath"

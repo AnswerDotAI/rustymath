@@ -10,17 +10,27 @@ const N: usize = 65_536;
 /// table reads. The Mac's libm beats them at both widths.
 const TWICE: [&str; 2] = ["pow", "root"];
 
-/// The fastest of a few runs of `f`, which writes one output for each of `inputs`, in ns per item.
-fn time_slice<A, T: Copy + Default>(inputs: &[A], f: impl Fn(&[A], &mut [T])) -> f64 {
-    let mut out = vec![T::default(); inputs.len()];
+/// The fastest of a few runs of `run`, in ns for each of `n` items.
+fn fastest(n: usize, mut run: impl FnMut()) -> f64 {
     (0..5)
         .map(|_| {
             let start = Instant::now();
-            f(black_box(inputs), &mut out);
-            black_box(&mut out);
-            start.elapsed().as_secs_f64() * 1e9 / inputs.len() as f64
+            run();
+            start.elapsed().as_secs_f64() * 1e9 / n as f64
         })
         .fold(f64::INFINITY, f64::min)
+}
+
+/// The fastest of a few runs of `f`, which writes one output for each of `inputs`, in ns per item.
+fn time_slice<A, T: Copy + Default>(inputs: &[A], f: impl Fn(&[A], &mut [T])) -> f64 {
+    let mut out = vec![T::default(); inputs.len()];
+    fastest(inputs.len(), || { f(black_box(inputs), &mut out); black_box(&mut out); })
+}
+
+/// The fastest of a few runs of `f`, which appends one output for each of `inputs` to an empty vector, in ns per item.
+fn time_appended<A, T>(inputs: &[A], f: impl Fn(&[A], &mut Vec<T>)) -> f64 {
+    let mut out = Vec::with_capacity(inputs.len());
+    fastest(inputs.len(), || { out.clear(); f(black_box(inputs), &mut out); black_box(&mut out); })
 }
 
 /// The fastest of a few runs of `f` on each of `inputs`, in ns per item.
@@ -48,8 +58,11 @@ fn widths<T: Copy, U>(xs: Vec<T>, narrow: impl Fn(T) -> U) -> (Vec<T>, Vec<U>) {
 fn pairs(xs: (f64, f64), ys: (f64, f64)) -> Vec<(f64, f64)> { inputs(xs.0, xs.1, GOLDEN).into_iter().zip(inputs(ys.0, ys.1, SILVER)).collect() }
 
 /// `sin`, `cos` and `tan` without the branch for large arguments, as a loop that vectorizes calls them.
+#[inline]
 fn sin<F: Float>(x: F) -> F { checked_sin(x).unwrap_or(x) }
+#[inline]
 fn cos<F: Float>(x: F) -> F { checked_cos(x).unwrap_or(x) }
+#[inline]
 fn tan<F: Float>(x: F) -> F { checked_tan(x).unwrap_or(x) }
 
 /// The times of a function and of a reference version on inputs from `lo` to `hi`. `f` holds both at f64. `g` holds both at f32.
@@ -146,6 +159,18 @@ fn speed() {
     rows.push(binary("pow", ((0.0, 4.0), (-30.0, 30.0)), (pow, f64::powf), (pow, f32::powf)));
     rows.push(binary("hypot", ((-1000.0, 1000.0), (-1000.0, 1000.0)), (hypot, f64::hypot), (hypot, f32::hypot)));
     rows.push(binary("root", ((5.0, 5.0), (0.0, 1000.0)), (root, |n: f64, y: f64| y.powf(1.0 / n)), (root, |n: f32, y: f32| y.powf(1.0 / n))));
+    // `Pow`'s slice form, which basedpl's kernels and the Python ufunc run, on the pairs that the `pow` row uses.
+    let (x64, y64): (Vec<f64>, Vec<f64>) = pairs((0.0, 4.0), (-30.0, 30.0)).into_iter().unzip();
+    let (x32, y32): (Vec<f32>, Vec<f32>) = x64.iter().zip(&y64).map(|(&x, &y)| (x as f32, y as f32)).unzip();
+    rows.push((
+        "Pow::many",
+        [
+            time_appended(&x64, |x, out| { Pow.many(Arg::Many(x), Arg::Many(&y64), x.len(), out); }),
+            time_slice(&x64, |x, out| for i in 0..x.len() { out[i] = x[i].powf(y64[i]) }),
+            time_appended(&x32, |x, out| { Pow.many(Arg::Many(x), Arg::Many(&y32), x.len(), out); }),
+            time_slice(&x32, |x, out| for i in 0..x.len() { out[i] = x[i].powf(y32[i]) }),
+        ],
+    ));
     // A polynomial of degree 7 at each of the inputs, against `horner` for one input at a time. `black_box` hides the degree, which a
     // caller rarely knows when it compiles.
     let c64 = [0.5, -1.25, 0.75, 2.0, -0.125, 0.0625, -1.5, 0.25];

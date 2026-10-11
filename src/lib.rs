@@ -10,6 +10,7 @@ mod hyperbolic;
 mod ln;
 mod pow;
 mod special;
+mod slice;
 mod table;
 mod trig;
 pub mod distribution;
@@ -21,6 +22,7 @@ pub mod tolerant;
 mod accuracy;
 
 pub use float::{Float, Native, FUSED};
+pub use slice::{pairs, Arg, Binary, CHUNK};
 
 /// The check for a `_with` function's plain version, which can't fail.
 pub(crate) fn ok() -> Result<(), std::convert::Infallible> { Ok(()) }
@@ -30,14 +32,17 @@ pub(crate) const BETWEEN_CHECKS: usize = 1024;
 /// Declares each function at the crate root, where it multiplies and adds as the target's `FUSED` says, and in `fused` and
 /// `unfused`, which choose for themselves. Each entry names the module whose function of the same name implements it, generic over
 /// `R: Native` and `const FUSED: bool`. An entry marked `Option` gives an `Option`. Every wrapper is `#[inline(always)]`, because
-/// LLVM leaves a large function such as `gamma` out of line in a caller's loop, and the call stops that loop vectorizing.
+/// LLVM leaves a large function such as `gamma` out of line in a caller's loop, and the call stops that loop vectorizing. An entry
+/// marked `as` also declares a function object of that name, whose forms rustymath compiles at `f32` and `f64` and never inlines into
+/// a caller. Its slice form is the function of the same name in the module's `slices`.
 macro_rules! functions {
-    ($($(#[doc = $doc:literal])* $name:ident($($x:ident),+) $(-> $option:ident)? in $module:ident;)+) => {
+    ($($(#[doc = $doc:literal])* $name:ident($($x:ident),+) $(-> $option:ident)? in $module:ident $(as $object:ident)?;)+) => {
         $(
             $(#[doc = $doc])*
             #[inline(always)]
             pub fn $name<F: Float>($($x: F),+) -> functions!(@ret $($option)?) { functions!(@call FUSED, $module, $name, ($($x),+) $($option)?) }
         )+
+        $(functions!(@object $($object)?; $name, $module);)+
         /// rustymath's functions with `mla` fused, whatever the target's `FUSED`. Code compiled with FMA enabled for itself, such as an
         /// AVX2 version of a loop chosen when the program runs, calls these on a target whose baseline lacks FMA.
         pub mod fused {
@@ -58,11 +63,27 @@ macro_rules! functions {
             )+
         }
     };
+    (@object; $name:ident, $module:ident) => {};
+    (@object $object:ident; $name:ident, $module:ident) => {
+        #[doc = concat!("[`", stringify!($name), "`](crate::", stringify!($name), ") as a function object, with the slice form `many`.")]
+        #[derive(Clone, Copy, Debug)]
+        pub struct $object;
+        impl float::sealed::BinaryForms for $object {
+            fn one_f32(x: f32, y: f32) -> f32 { crate::$module::$name::<f32, FUSED>(x, y) }
+            fn one_f64(x: f64, y: f64) -> f64 { crate::$module::$name::<f64, FUSED>(x, y) }
+            fn many_f32(x: Arg<'_, f32>, y: Arg<'_, f32>, n: usize, out: &mut Vec<f32>) -> bool {
+                crate::$module::slices::$name::<f32, FUSED>(x, y, n, out)
+            }
+            fn many_f64(x: Arg<'_, f64>, y: Arg<'_, f64>, n: usize, out: &mut Vec<f64>) -> bool {
+                crate::$module::slices::$name::<f64, FUSED>(x, y, n, out)
+            }
+        }
+    };
     (@ret) => { F };
     (@ret Option) => { Option<F> };
-    (@call $fused:expr, $module:ident, $name:ident, ($($x:ident),+)) => { F::from_total(crate::$module::$name::<_, { $fused }>($($x.total()),+)) };
+    (@call $fused:expr, $module:ident, $name:ident, ($($x:ident),+)) => { F::from_working(crate::$module::$name::<_, { $fused }>($($x.working()),+)) };
     (@call $fused:expr, $module:ident, $name:ident, ($($x:ident),+) Option) => {
-        crate::$module::$name::<_, { $fused }>($($x.total()),+).map(F::from_total)
+        crate::$module::$name::<_, { $fused }>($($x.working()),+).map(F::from_working)
     };
 }
 
@@ -130,7 +151,7 @@ functions! {
     /// assert!(rustymath::pow(-2.0f64, 0.5).is_nan());
     /// assert_eq!(rustymath::pow(f64::NAN, 0.0), 1.0);
     /// ```
-    pow(x, y) in pow;
+    pow(x, y) in pow as Pow;
     /// The real nth root of y, computed without rounding 1/n first. A negative y has one only for an odd
     /// whole n. n = 0, an infinite n and NaN give NaN.
     root(n, y) in pow;

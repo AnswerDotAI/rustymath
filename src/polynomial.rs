@@ -18,8 +18,6 @@ use num_traits::{Num, Zero};
 /// `c` without its trailing zeros.
 fn trimmed<T: Zero>(c: &[T]) -> &[T] { &c[..c.iter().rposition(|k| !k.is_zero()).map_or(0, |i| i + 1)] }
 
-fn wide<F: Float>(x: F) -> f64 { x.total().wide() }
-
 /// Replaces each `x[i]` with the value of the polynomial `c` at `x[i]`, by Horner's rule. An f16 polynomial computes in f32 and rounds
 /// each result once.
 pub fn evaluate<F: Float>(c: &[F], x: &mut [F]) {
@@ -41,18 +39,18 @@ const LANES: usize = 32;
 /// length brings in.
 #[inline]
 fn horner<F: Float>(top: F, rest: &[F], xs: &mut [F; LANES]) {
-    let mut y = [top.total(); LANES];
+    let mut y = [top.working(); LANES];
     for &k in rest.iter().rev() {
-        let k = k.total();
-        for i in 0..LANES { y[i] = y[i].mla::<FUSED>(xs[i].total(), k); }
+        let k = k.working();
+        for i in 0..LANES { y[i] = y[i].mla::<FUSED>(xs[i].working(), k); }
     }
-    for i in 0..LANES { xs[i] = F::from_total(y[i]); }
+    for i in 0..LANES { xs[i] = F::from_working(y[i]); }
 }
 
 /// The roots of the polynomial `c`, as the eigenvalues of its companion matrix, which `faer` computes in f64. When every coefficient
 /// is real, a real root has an imaginary part of exactly 0. `None` when the eigenvalue solver doesn't converge.
 pub fn roots<F: Float>(c: &[Complex<F>]) -> Option<Vec<Complex<F>>> {
-    let c: Vec<Complex<f64>> = trimmed(c).iter().map(|z| Complex::new(wide(z.re), wide(z.im))).collect();
+    let c: Vec<Complex<f64>> = trimmed(c).iter().map(|z| Complex::new(z.re.wide(), z.im.wide())).collect();
     let n = c.len().saturating_sub(1);
     if n == 0 { return Some(Vec::new()); }
     // The companion matrix has ones below its diagonal and -c[i]/c[n] down its last column. Real coefficients divide as reals: complex
@@ -91,8 +89,8 @@ pub fn derivative<T: Copy + Num>(c: &[T]) -> Vec<T> {
 /// decomposition. Panics if `x` and `y` differ in length or hold fewer than `degree + 1` points.
 pub fn fit<F: Float>(x: &[F], y: &[F], degree: usize) -> Vec<F> {
     assert_eq!(x.len(), y.len(), "fit needs one y for each x");
-    let powers = Mat::from_fn(x.len(), degree + 1, |i, j| wide(x[i]).powi(j as i32));
-    let solution = powers.qr().solve_lstsq(Mat::from_fn(y.len(), 1, |i, _| wide(y[i])));
+    let powers = Mat::from_fn(x.len(), degree + 1, |i, j| x[i].wide().powi(j as i32));
+    let solution = powers.qr().solve_lstsq(Mat::from_fn(y.len(), 1, |i, _| y[i].wide()));
     (0..=degree).map(|i| F::narrow(solution[(i, 0)])).collect()
 }
 
