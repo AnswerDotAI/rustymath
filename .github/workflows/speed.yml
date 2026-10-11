@@ -1,0 +1,16 @@
+name: Speed
+
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  costs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo generate-lockfile
+      - uses: Swatinem/rust-cache@v2
+      - run: RUSTYMATH_TIMES=1 cargo test --test speed -- --nocapture

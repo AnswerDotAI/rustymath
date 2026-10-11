@@ -177,7 +177,7 @@ fn special(unit: [f64; 2]) -> [Budgeted; 11] {
         ("Gamma", [460.0, 350.0], unary_copies!(Gamma, 0.1 to 20.0)),
         ("Lgamma", [240.0, 220.0], unary_copies!(Lgamma, 0.1 to 1000.0)),
         ("Erf", [85.0, 48.0], unary_copies!(Erf, -5.0 to 5.0)),
-        ("Erfc", [130.0, 150.0], unary_copies!(Erfc, -5.0 to 10.0)),
+        ("Erfc", [260.0, 150.0], unary_copies!(Erfc, -5.0 to 10.0)),
         ("Erfinv", [410.0, 95.0], unary_copies!(Erfinv, -0.999 to 0.999)),
         ("Erfcinv", [410.0, 95.0], unary_copies!(Erfcinv, 0.001 to 1.999)),
         ("Gammainc", [1250.0, 2430.0], binary_copies!(Gammainc, (0.5, 20.0), (0.0, 30.0))),

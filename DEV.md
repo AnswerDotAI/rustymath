@@ -11,7 +11,7 @@ nbdev-preview
 ship-rs-build
 ```
 
-`cargo test` runs the accuracy tests, the speed test and the doc examples, in about a second. Run plain `cargo test` while you work. `tests/speed.rs` gives each function a budget at f64 and at f32, in copies of the same number of items, and fails when a function goes over. Each budget is twice the higher of the function's cost on the Mac and on CI. A loop that stops vectorizing takes several times as long and goes over budget. With `RUSTYMATH_TIMES` set, the test prints the README's table, which compares each function with the standard library's version where it has one, then every function's cost in copies.
+`cargo test` runs the accuracy tests, the speed test and the doc examples, in about a second. Run plain `cargo test` while you work. `tests/speed.rs` gives each function a budget at f64 and at f32, in copies of the same number of items, and fails when a function goes over. Each budget is twice the higher of the function's cost on the Mac and on CI. A loop that stops vectorizing takes several times as long and goes over budget. With `RUSTYMATH_TIMES` set, the test prints the README's table, which compares each function with the standard library's version where it has one, then every function's cost in copies. The `Speed` workflow prints the same on CI's runner. It runs only when started by hand.
 
 ## Layout
 
