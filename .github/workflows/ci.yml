@@ -1,42 +1,21 @@
-name: CI
+name: Release
 
 on:
   push:
-    branches: [main]
     tags: ['v*']
-  pull_request:
 
 permissions:
   contents: read
 
 jobs:
-  test:
-    runs-on: ubicloud-standard-4
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      # The repository has no `Cargo.lock`. Creating one first makes rust-cache's key change when a dependency publishes a new version.
-      - run: cargo generate-lockfile
-      - uses: Swatinem/rust-cache@v2
-      - run: grep -m1 'model name' /proc/cpuinfo
-      - run: cargo test
-      - uses: actions/setup-python@v7
-        with:
-          python-version: '3.12'
-      - run: pip install -e '.[dev]'
-      - run: cargo develop
-      - run: pytest -q
-      - run: nbdev-test
-
   build:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [test]
     strategy:
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
       - uses: PyO3/maturin-action@v1
         with:
           args: --profile dist --out dist -i python3.10 -i python3.11 -i python3.12 -i python3.13
@@ -47,7 +26,6 @@ jobs:
           path: dist
 
   sdist:
-    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -61,7 +39,6 @@ jobs:
           path: dist
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/v')
     needs: [build, sdist]
     runs-on: ubuntu-latest
     permissions:

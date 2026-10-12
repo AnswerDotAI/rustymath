@@ -1,0 +1,31 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubicloud-standard-4
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # The repository has no `Cargo.lock`. Creating one first makes rust-cache's key change when a dependency publishes a new version.
+      - run: cargo generate-lockfile
+      # The `Speed` workflow restores this cache, by its `shared-key`.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: native
+      - run: grep -m1 'model name' /proc/cpuinfo
+      - run: cargo test
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: pip install -e '.[dev]'
+      - run: cargo develop
+      - run: pytest -q
+      - run: nbdev-test

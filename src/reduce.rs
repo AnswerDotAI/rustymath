@@ -205,11 +205,41 @@ mod lanes {
     }
 }
 
-/// Elsewhere, as on x86-64, whose `maxpd` gives its second argument beside NaN, the folds and scans use `Extremes`' defaults.
+/// Elsewhere, the folds and scans use `Extremes`' defaults, whose fold loops vectorize. On x86-64, a scan's step is SSE2's `maxsd` or
+/// `maxss`, which gives `y` where either argument is NaN, then a mask that gives `x` where `x` is NaN. As intrinsics, the four steps in
+/// each of `grouped`'s groups stay scalar. As `Core::maximum`, the straight-line vectorizer packs them into one vector. Each group's
+/// total then waits on a lane extract and a NaN mask, which made `cummax` 2.5 times slower.
 #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
 mod plain {
+    #[cfg(not(target_arch = "x86_64"))]
     impl super::Extremes for f32 {}
+    #[cfg(not(target_arch = "x86_64"))]
     impl super::Extremes for f64 {}
+    #[cfg(target_arch = "x86_64")]
+    macro_rules! sse2 {
+        ($($t:ty: $set:ident, $get:ident, $max:ident, $min:ident, $unordered:ident, $and:ident, $andnot:ident, $or:ident;)+) => {$(
+            impl super::Extremes for $t {
+                #[inline(always)]
+                fn step_max(x: $t, y: $t) -> $t { sse2!(@step x, y, $set, $get, $max, $unordered, $and, $andnot, $or) }
+                #[inline(always)]
+                fn step_min(x: $t, y: $t) -> $t { sse2!(@step x, y, $set, $get, $min, $unordered, $and, $andnot, $or) }
+            }
+        )+};
+        (@step $x:ident, $y:ident, $set:ident, $get:ident, $op:ident, $unordered:ident, $and:ident, $andnot:ident, $or:ident) => {{
+            use core::arch::x86_64::*;
+            // SAFETY: every x86-64 target has SSE and SSE2.
+            unsafe {
+                let (x, y) = ($set($x), $set($y));
+                let nan = $unordered(x, x);
+                $get($or($and(nan, x), $andnot(nan, $op(x, y))))
+            }
+        }};
+    }
+    #[cfg(target_arch = "x86_64")]
+    sse2! {
+        f64: _mm_set_sd, _mm_cvtsd_f64, _mm_max_sd, _mm_min_sd, _mm_cmpunord_sd, _mm_and_pd, _mm_andnot_pd, _mm_or_pd;
+        f32: _mm_set_ss, _mm_cvtss_f32, _mm_max_ss, _mm_min_ss, _mm_cmpunord_ss, _mm_and_ps, _mm_andnot_ps, _mm_or_ps;
+    }
 }
 
 impl Fold for f16 {

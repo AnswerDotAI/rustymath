@@ -11,7 +11,7 @@ nbdev-preview
 ship-rs-build
 ```
 
-`cargo test` runs the accuracy tests, the speed test and the doc examples, in about a second. Run plain `cargo test` while you work. Build nothing else without explicit discussion first, such as scratch crates, `--release` builds, other target directories, `-p` builds or builds for other targets. `tests/speed.rs` gives each function a budget at f64 and at f32, in copies of the same number of items, and fails when a function goes over. Each budget is twice the higher of the function's cost on the Mac and on CI. A loop that stops vectorizing takes several times as long and goes over budget. With `RUSTYMATH_TIMES` set, the test prints the README's table, which compares each function with the standard library's version where it has one, then every function's cost in copies. The `Speed` workflow prints the same on CI's runner. It runs only when started by hand. CI's `test` job and the `Speed` workflow run on Ubicloud's `ubicloud-standard-4` runner. The budgets come from that runner. The release jobs run on GitHub's runners.
+`cargo test` runs the accuracy tests, the speed test and the doc examples, in about a second. Run plain `cargo test` while you work. Build nothing else without explicit discussion first, such as scratch crates, `--release` builds, other target directories, `-p` builds or builds for other targets. `tests/speed.rs` gives each function a budget at f64 and at f32, in copies of the same number of items, and fails when a function goes over. Each budget is twice the higher of the function's cost on the Mac and on CI. A loop that stops vectorizing takes several times as long and goes over budget. With `RUSTYMATH_TIMES` set, the test prints the README's table, which compares each function with the standard library's version where it has one, then every function's cost in copies. The `Speed` workflow prints the same on CI's runner. It runs only when started by hand. The `Test` workflow, in `test.yml`, runs the `test` job on each push to main and each pull request. It and the `Speed` workflow run on Ubicloud's `ubicloud-standard-4` runner. The budgets come from that runner. The `Speed` workflow restores the cache that the `test` job saves. The `Release` workflow, in `ci.yml`, runs only on a `v*` tag, on GitHub's runners. It runs no tests, because the tagged commit's tests ran when it was pushed. It builds the wheels and the sdist. Once the builds pass, it publishes the crate to crates.io. It publishes the wheels and the sdist to PyPI and attaches them to the GitHub release.
 
 Timings and builds keep apart through a lock on `/tmp/aai-ws-timing.lock`, which rustymath and basedpl share. The speed test takes it exclusively, as basedpl's timing tools do. `cargo develop` and basedpl's `cargo wasm` take it shared. A timing waits while builds or another timing hold the lock. A build waits while a timing holds it. Each waits up to 5 minutes. After that a timing fails. A build goes ahead without the lock. The operating system releases the lock when its process ends, even by a crash.
 
@@ -95,7 +95,7 @@ The profiles match basedpl's line for line. Cargo ignores a dependency's own pro
 
 `release` compiles at opt-level 2, incrementally and without LTO, into Cargo's default of 256 codegen units. `cargo test` and `cargo develop` share the `test` profile, which inherits `release`. `cargo develop` installs the extension from that build into the editable package. Editable installs through `uv sync` or `pip install -e` compile no Rust, because the build backend is `fastws.build_backend`. In CI, `cargo develop` runs after `cargo test` in the same job and reuses its build. Don't use `maturin develop`. It compiles a second copy of the crate, unoptimized unless given `--release`.
 
-CI builds distributed wheels with `dist`. It turns incremental compilation off and strips the result. Without incremental compilation, Cargo uses 16 codegen units, with thin LTO across them.
+The `Release` workflow builds distributed wheels with `dist`. It turns incremental compilation off and strips the result. Without incremental compilation, Cargo uses 16 codegen units, with thin LTO across them.
 
 ## Release
 
@@ -103,4 +103,4 @@ CI builds distributed wheels with `dist`. It turns incremental compilation off a
 2. Confirm the release version in `Cargo.toml` (`[workspace.package].version`).
 3. Run `ship-release`.
 
-`ship-release` pushes a `v<version>` tag, which starts the release workflow in GitHub Actions, then bumps the version.
+`ship-release` pushes a `v<version>` tag, which starts the `Release` workflow, in `ci.yml`, then bumps the version.

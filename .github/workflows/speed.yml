@@ -6,12 +6,16 @@ permissions:
   contents: read
 
 jobs:
-  costs:
+  native:
     runs-on: ubicloud-standard-4
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo generate-lockfile
+      # Only the `Test` workflow's `test` job saves this cache. This job builds only part of what `test` builds. GitHub never replaces a saved cache under the same key.
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: native
+          save-if: false
       - run: grep -m1 'model name' /proc/cpuinfo
       - run: RUSTYMATH_TIMES=1 cargo test --test speed -- --nocapture
