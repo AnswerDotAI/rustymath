@@ -190,9 +190,9 @@ arithmetic!(Multiply: |x, y| x.wrapping_mul(y), [fold |acc, x| reduce::prod(x).m
     scan |start, x, out| running(start, x, out, i64::wrapping_mul)]; i64);
 arithmetic!(Add: |x, y| x + y, []; Complex32, Complex64);
 arithmetic!(Multiply: |x, y| x * y, []; Complex32, Complex64);
-arithmetic!(reduce::Fmax = reduce::Fmax, [fold |acc, x| reduce::Fmax.one(acc, reduce::max(x)),
+arithmetic!(reduce::Maximum = reduce::Maximum, [fold |acc, x| reduce::Maximum.one(acc, reduce::max(x)),
     scan |start, x, out| reduce::cummax(x, Some(start), out)]; f16, f32, f64, i64);
-arithmetic!(reduce::Fmin = reduce::Fmin, [fold |acc, x| reduce::Fmin.one(acc, reduce::min(x)),
+arithmetic!(reduce::Minimum = reduce::Minimum, [fold |acc, x| reduce::Minimum.one(acc, reduce::min(x)),
     scan |start, x, out| reduce::cummin(x, Some(start), out)]; f16, f32, f64, i64);
 
 /// Whether the array at `p` with stride `step` holds contiguous, aligned items of type `T`.
@@ -433,8 +433,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     ufuncs! { m;
         add(x, y) identity ZERO: Add = Add, int, real, complex: "x + y. Its `reduce` and `accumulate` run rustymath's sums.";
         multiply(x, y) identity ONE: Multiply = Multiply, int, real, complex: "x × y. Its `reduce` and `accumulate` run rustymath's products.";
-        fmax(x, y) identity REORDERABLE: reduce::Fmax = reduce::Fmax, int, real: "The larger of x and y, or the other one where one is NaN.";
-        fmin(x, y) identity REORDERABLE: reduce::Fmin = reduce::Fmin, int, real: "The smaller of x and y, or the other one where one is NaN.";
+        maximum(x, y) identity REORDERABLE: reduce::Maximum = reduce::Maximum, int, real: "The larger of x and y, or NaN where either is NaN.";
+        minimum(x, y) identity REORDERABLE: reduce::Minimum = reduce::Minimum, int, real: "The smaller of x and y, or NaN where either is NaN.";
         equal(x, y; ct): Obj<Equal> = Obj(Equal(tolerance(ct))), real, complex: "Whether x equals y within the tolerance.";
         not_equal(x, y; ct): Obj<NotEqual> = Obj(NotEqual(tolerance(ct))), real, complex: "Whether x doesn't equal y within the tolerance.";
         less(x, y; ct): Obj<Less> = Obj(Less(tolerance(ct))), real: "Whether x is below y and doesn't equal it within the tolerance.";

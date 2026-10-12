@@ -6,7 +6,7 @@
 //! pair by pair, as a caller with one value at a time runs them.
 //! `RUSTYMATH_TIMES=1 cargo test --test speed -- --nocapture` prints the README's table, then every function's cost in copies.
 use rustymath::*;
-use std::{hint::black_box, time::Instant};
+use std::{hint::black_box, ops::Neg, time::Instant};
 
 const N: usize = 65_536;
 /// A function's name, its budgets at f64 and at f32 in copies, and its times in ns per item: its own at f64, the standard library's
@@ -111,13 +111,15 @@ fn binary<K: Binary<f64, Out = f64> + Binary<f32, Out = f32>>(
 
 /// The budgets and times of a reduction or scan of `rustymath::reduce`, and the times of the same taken item by item in order, which
 /// the compiler can't vectorize for floats.
-fn reductions() -> [Compared; 3] {
+fn reductions() -> [Compared; 4] {
     let (x64, x32) = widths(-1.0, 1.0, GOLDEN);
     let fold = |run: &dyn Fn() -> f64| fastest(N, || { black_box(run()); });
     let mut s64 = Vec::with_capacity(N);
     let mut s32 = Vec::with_capacity(N);
     let scan64 = |x: &[f64], out: &mut Vec<f64>| { let mut t = 0.0; out.extend(x.iter().map(|&v| { t += v; t })); };
     let scan32 = |x: &[f32], out: &mut Vec<f32>| { let mut t = 0.0; out.extend(x.iter().map(|&v| { t += v; t })); };
+    let max64 = |x: &[f64], out: &mut Vec<f64>| { let mut t = f64::NEG_INFINITY; out.extend(x.iter().map(|&v| { t = t.max(v); t })); };
+    let max32 = |x: &[f32], out: &mut Vec<f32>| { let mut t = f32::NEG_INFINITY; out.extend(x.iter().map(|&v| { t = t.max(v); t })); };
     [
         ("reduce::sum", [2.0, 2.0], [
             fold(&|| reduce::sum(black_box(&x64)).unwrap()),
@@ -125,7 +127,7 @@ fn reductions() -> [Compared; 3] {
             fold(&|| f64::from(reduce::sum(black_box(&x32)).unwrap())),
             fold(&|| f64::from(black_box(&x32).iter().sum::<f32>())),
         ]),
-        ("reduce::max", [2.0, 2.0], [
+        ("reduce::max", [4.0, 4.0], [
             fold(&|| reduce::max(black_box(&x64))),
             fold(&|| black_box(&x64).iter().copied().fold(f64::NEG_INFINITY, f64::max)),
             fold(&|| f64::from(reduce::max(black_box(&x32)))),
@@ -137,11 +139,22 @@ fn reductions() -> [Compared; 3] {
             time_appended(&x32, |x, out| { reduce::cumsum(x, None, out); }),
             fastest(N, || { s32.clear(); scan32(black_box(&x32), &mut s32); black_box(&s32); }),
         ]),
+        ("reduce::cummax", [8.8, 16.0], [
+            time_appended(&x64, |x, out| reduce::cummax(x, None, out)),
+            fastest(N, || { s64.clear(); max64(black_box(&x64), &mut s64); black_box(&s64); }),
+            time_appended(&x32, |x, out| reduce::cummax(x, None, out)),
+            fastest(N, || { s32.clear(); max32(black_box(&x32), &mut s32); black_box(&s32); }),
+        ]),
     ]
 }
 
-/// The time to copy `N` items of `T`, in ns per item: the unit of every budget.
-fn copy<T: Copy + Default>() -> f64 { time_slice(&vec![T::default(); N], |x, out: &mut [T]| out.copy_from_slice(x)) }
+/// Writes each item of `x`, negated, to `out`. It moves the data that a copy does, in a vector loop as the functions do. The compiler
+/// would turn a plain copy into a call to `memcpy`. The speed of `memcpy` varies with the CPU and with how the two buffers align.
+fn negate<T: Copy + Neg<Output = T>>(x: &[T], out: &mut [T]) { for (o, &v) in out.iter_mut().zip(x) { *o = -v } }
+
+/// The time to `negate` `N` items, each `v`, in ns per item: the unit of every budget, called a copy. A nonzero `v` makes `vec!` write
+/// every item. Zeros could come from untouched pages. Every read of an untouched page finds the same page of zeros in the cache.
+fn copy<T: Copy + Default + Neg<Output = T>>(v: T) -> f64 { time_slice(&vec![v; N], negate) }
 
 /// The functions that the standard library lacks, with their budgets and costs in copies of floats, `unit` at f64 and at f32. The
 /// incomplete gamma and beta functions iterate, and run on 1,024 inputs. The others run on 16,384.
@@ -192,7 +205,7 @@ fn special(unit: [f64; 2]) -> [Budgeted; 11] {
 fn complex() -> [Budgeted; 12] {
     use num_complex::Complex;
     let n = N / 4;
-    let unit = [copy::<Complex<f64>>(), copy::<Complex<f32>>()];
+    let unit = [copy(Complex::new(1.0f64, 1.0)), copy(Complex::new(1.0f32, 1.0))];
     let zs = |re: (f64, f64), im: (f64, f64), step: f64| {
         let z64: Vec<_> = inputs(re.0, re.1, step).into_iter().zip(inputs(im.0, im.1, SILVER)).take(n).map(|(x, y)| Complex::new(x, y)).collect();
         let z32: Vec<_> = z64.iter().map(|z| Complex::new(z.re as f32, z.im as f32)).collect();
@@ -225,7 +238,7 @@ fn complex() -> [Budgeted; 12] {
 
 #[test]
 fn speed() {
-    let unit = [copy::<f64>(), copy::<f32>()];
+    let unit = [copy(1.0f64), copy(1.0f32)];
     let mut compared = unary! {
         Exp within [27.0, 17.0], vs exp on -20.0 to 20.0;
         Expm1 within [32.0, 22.0], vs exp_m1 on -1.0 to 1.0;
@@ -256,9 +269,12 @@ fn speed() {
     compared.push(binary("Hypot", Hypot, false, [17.0, 26.0], ((-1000.0, 1000.0), (-1000.0, 1000.0)), f64::hypot, f32::hypot));
     compared.push(binary("Root", Root, false, [160.0, 120.0], roots, nth, nth32));
     compared.push(binary("Root.one", Root, true, [260.0, 220.0], roots, nth, nth32));
+    // `Maximum`, `reduce::max` and `reduce::cummax` have no CI figures for their current code, which on x86-64 compares and selects
+    // where it used `maxpd`. Their budgets allow CI to cost four times the Mac's copies.
+    compared.push(binary("Maximum", reduce::Maximum, false, [12.0, 13.0], ((-1.0, 1.0), (-1.0, 1.0)), f64::max, f32::max));
     compared.extend(reductions());
-    // A polynomial of degree 7 at each of the inputs, against `horner` for one input at a time. `black_box` hides the degree, which a
-    // caller rarely knows when it compiles.
+    // A polynomial of degree 7 at the negative of each input, against `horner` for one input at a time. `black_box` hides the degree,
+    // which a caller rarely knows when it compiles.
     let c64 = [0.5, -1.25, 0.75, 2.0, -0.125, 0.0625, -1.5, 0.25];
     let c32 = c64.map(|k| k as f32);
     let (c64, c32): (&[f64], &[f32]) = (black_box(&c64), black_box(&c32));
@@ -267,9 +283,9 @@ fn speed() {
         "polynomial::evaluate",
         [12.0, 10.0],
         [
-            time_slice(&x64, |x, out| { out.copy_from_slice(x); polynomial::evaluate(c64, out) }),
+            time_slice(&x64, |x, out| { negate(x, out); polynomial::evaluate(c64, out) }),
             time(&x64, |x| horner(c64, x)),
-            time_slice(&x32, |x, out| { out.copy_from_slice(x); polynomial::evaluate(c32, out) }),
+            time_slice(&x32, |x, out| { negate(x, out); polynomial::evaluate(c32, out) }),
             time(&x32, |x| horner(c32, x)),
         ],
     ));

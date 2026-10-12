@@ -1,12 +1,12 @@
 //! Reductions and scans over a contiguous slice: sums, products, maximums and minimums, and their running versions. Each compiles
 //! inside rustymath once for each item type. A float sum or product may combine the items in any order, which lets its loop
-//! vectorize, so its last bits can differ from a sum taken item by item. A float maximum or minimum skips NaN, as `f64::max` does.
-//! It starts from -∞ or ∞, which an empty slice, or one holding only NaN, gives. `f16` items compute in `f32` and round once. An
+//! vectorize, so its last bits can differ from a sum taken item by item. A float maximum or minimum is NaN where any item is NaN,
+//! as [`maximum`] and [`minimum`] are for two floats. An empty slice gives -∞ or ∞. `f16` items compute in `f32` and round once. An
 //! integer sum or product is exact at `i64`, and is `None` where it doesn't fit.
 use crate::{
-    float::sealed::{Item, Sealed},
+    float::sealed::{Core, Item, Sealed},
     slice::appended,
-    Native,
+    Float, Native,
 };
 use half::f16;
 
@@ -51,17 +51,25 @@ pub fn cummax<T: Fold>(x: &[T], start: Option<T>, out: &mut Vec<T>) { T::slice_c
 #[inline]
 pub fn cummin<T: Fold>(x: &[T], start: Option<T>, out: &mut Vec<T>) { T::slice_cummin(x, start, out) }
 
-/// The greater of x and y, as a function object, under the same rule as `max`: beside NaN, the other argument. NumPy calls it `fmax`.
-#[derive(Clone, Copy, Debug)]
-pub struct Fmax;
-forms!(Fmax at real: |_, [x, y]| crate::slice::Total(x.max(y)));
-forms!(Fmax at i8, i16, i32, i64, u8, u16, u32, u64: |_, [x, y]| x.max(y));
+/// The greater of x and y, or NaN where either is NaN, as [`max`] gives the greatest item. NumPy calls it `maximum`.
+#[inline(always)]
+pub fn maximum<F: Float>(x: F, y: F) -> F { F::from_working(Core::maximum(x.working(), y.working())) }
 
-/// The lesser of x and y, as `Fmax` gives the greater.
+/// The lesser of x and y, or NaN where either is NaN, as [`min`] gives the least item. NumPy calls it `minimum`.
+#[inline(always)]
+pub fn minimum<F: Float>(x: F, y: F) -> F { F::from_working(Core::minimum(x.working(), y.working())) }
+
+/// [`maximum`] as a function object, which also takes integers.
 #[derive(Clone, Copy, Debug)]
-pub struct Fmin;
-forms!(Fmin at real: |_, [x, y]| crate::slice::Total(x.min(y)));
-forms!(Fmin at i8, i16, i32, i64, u8, u16, u32, u64: |_, [x, y]| x.min(y));
+pub struct Maximum;
+forms!(Maximum at real: |_, [x, y]| crate::slice::Total(maximum(x, y)));
+forms!(Maximum at i8, i16, i32, i64, u8, u16, u32, u64: |_, [x, y]| x.max(y));
+
+/// [`minimum`] as a function object, which also takes integers.
+#[derive(Clone, Copy, Debug)]
+pub struct Minimum;
+forms!(Minimum at real: |_, [x, y]| crate::slice::Total(minimum(x, y)));
+forms!(Minimum at i8, i16, i32, i64, u8, u16, u32, u64: |_, [x, y]| x.min(y));
 
 /// How many running results a fold keeps along its slice: 32, which measured faster on the Mac than 8 or 16 for every item type.
 const RUNNING: usize = 32;
@@ -111,8 +119,8 @@ macro_rules! native {
             type Sum = $t;
             fn slice_sum(x: &[$t]) -> Option<$t> { Some(folded(x, 0.0, Native::algebraic_add, Native::algebraic_add)) }
             fn slice_prod(x: &[$t]) -> Option<$t> { Some(folded(x, 1.0, Native::algebraic_mul, Native::algebraic_mul)) }
-            fn slice_max(x: &[$t]) -> $t { folded(x, <$t>::NEG_INFINITY, <$t>::max, <$t>::max) }
-            fn slice_min(x: &[$t]) -> $t { folded(x, <$t>::INFINITY, <$t>::min, <$t>::min) }
+            fn slice_max(x: &[$t]) -> $t { <$t>::fold_max(x) }
+            fn slice_min(x: &[$t]) -> $t { <$t>::fold_min(x) }
             fn slice_cumsum(x: &[$t], start: Option<$t>, out: &mut Vec<$t>) -> bool {
                 grouped(x, start, out, |v| v, |a, b| a + b, |t| t);
                 true
@@ -121,20 +129,78 @@ macro_rules! native {
                 grouped(x, start, out, |v| v, |a, b| a * b, |t| t);
                 true
             }
-            fn slice_cummax(x: &[$t], start: Option<$t>, out: &mut Vec<$t>) { grouped(x, start, out, |v| v, <$t>::max, |t| t) }
-            fn slice_cummin(x: &[$t], start: Option<$t>, out: &mut Vec<$t>) { grouped(x, start, out, |v| v, <$t>::min, |t| t) }
+            fn slice_cummax(x: &[$t], start: Option<$t>, out: &mut Vec<$t>) { grouped(x, start, out, |v| v, <$t>::step_max, |t| t) }
+            fn slice_cummin(x: &[$t], start: Option<$t>, out: &mut Vec<$t>) { grouped(x, start, out, |v| v, <$t>::step_min, |t| t) }
         }
     )+};
 }
 native!(f32, f64);
+
+/// The folds of `f32` and `f64` by maximum and minimum, and the step of their scans. Their defaults run through `Core::maximum` and
+/// `minimum`, whose loops vectorize.
+trait Extremes: Native {
+    fn fold_max(x: &[Self]) -> Self { folded(x, Self::neg_infinity(), Core::maximum, Core::maximum) }
+    fn fold_min(x: &[Self]) -> Self { folded(x, Self::infinity(), Core::minimum, Core::minimum) }
+    #[inline(always)]
+    fn step_max(x: Self, y: Self) -> Self { Core::maximum(x, y) }
+    #[inline(always)]
+    fn step_min(x: Self, y: Self) -> Self { Core::minimum(x, y) }
+}
+#[cfg(not(target_arch = "aarch64"))]
+impl Extremes for f32 {}
+#[cfg(not(target_arch = "aarch64"))]
+impl Extremes for f64 {}
+
+/// AArch64's `fmax` and `fmin` give NaN where either argument is NaN, each in one instruction, where `Core::maximum` takes four. A
+/// loop of their `core::arch` calls runs one item at a time, so a fold calls their vector forms directly on `PARTS` running vectors,
+/// and a scan's step, which waits for the step before, runs the scalar instruction.
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use super::*;
+    use core::arch::{aarch64::*, asm};
+    /// How many running vectors a fold keeps.
+    const PARTS: usize = 8;
+    macro_rules! neon {
+        ($($t:ty: $lanes:literal, $reg:literal, $dup:ident, $load:ident, $max:ident, $maxv:ident, $min:ident, $minv:ident;)+) => {$(
+            impl Extremes for $t {
+                fn fold_max(x: &[$t]) -> $t { neon!(@fold x, $t, $lanes, NEG_INFINITY, $dup, $load, $max, $maxv, step_max) }
+                fn fold_min(x: &[$t]) -> $t { neon!(@fold x, $t, $lanes, INFINITY, $dup, $load, $min, $minv, step_min) }
+                #[inline(always)]
+                fn step_max(x: $t, y: $t) -> $t { neon!(@step "fmax", $reg, x, y) }
+                #[inline(always)]
+                fn step_min(x: $t, y: $t) -> $t { neon!(@step "fmin", $reg, x, y) }
+            }
+        )+};
+        (@fold $x:ident, $t:ty, $lanes:literal, $unit:ident, $dup:ident, $load:ident, $op:ident, $across:ident, $step:ident) => {{
+            let (chunks, rest) = $x.as_chunks::<{ PARTS * $lanes }>();
+            // SAFETY: every AArch64 target has NEON. Each load reads `$lanes` items of one chunk.
+            let total = unsafe {
+                let mut parts = [$dup(<$t>::$unit); PARTS];
+                for c in chunks { for k in 0..PARTS { parts[k] = $op(parts[k], $load(c.as_ptr().add(k * $lanes))) } }
+                $across(parts.into_iter().reduce(|a, b| $op(a, b)).expect("a fold keeps `PARTS` vectors"))
+            };
+            rest.iter().fold(total, |s, &v| <$t>::$step(s, v))
+        }};
+        (@step $ins:literal, $reg:literal, $x:ident, $y:ident) => {{
+            let r;
+            // SAFETY: the instruction reads two registers and writes a third, with no memory access.
+            unsafe { asm!(concat!($ins, " {0:", $reg, "}, {1:", $reg, "}, {2:", $reg, "}"), lateout(vreg) r, in(vreg) $x, in(vreg) $y, options(pure, nomem, nostack)) }
+            r
+        }};
+    }
+    neon! {
+        f64: 2, "d", vdupq_n_f64, vld1q_f64, vmaxq_f64, vmaxvq_f64, vminq_f64, vminvq_f64;
+        f32: 4, "s", vdupq_n_f32, vld1q_f32, vmaxq_f32, vmaxvq_f32, vminq_f32, vminvq_f32;
+    }
+}
 
 impl Fold for f16 {
     type Sum = f16;
     fn slice_sum(x: &[f16]) -> Option<f16> { Some(f16::from_f32(folded(x, 0.0f32, |s, v| s.algebraic_add(v.to_f32()), f32::algebraic_add))) }
     fn slice_prod(x: &[f16]) -> Option<f16> { Some(f16::from_f32(folded(x, 1.0f32, |s, v| s.algebraic_mul(v.to_f32()), f32::algebraic_mul))) }
     // The greatest or least item is one of the items, or ∓∞, so it narrows exactly.
-    fn slice_max(x: &[f16]) -> f16 { f16::from_f32(folded(x, f32::NEG_INFINITY, |s, v| s.max(v.to_f32()), f32::max)) }
-    fn slice_min(x: &[f16]) -> f16 { f16::from_f32(folded(x, f32::INFINITY, |s, v| s.min(v.to_f32()), f32::min)) }
+    fn slice_max(x: &[f16]) -> f16 { f16::from_f32(folded(x, f32::NEG_INFINITY, |s, v| Core::maximum(s, v.to_f32()), <f32 as Core>::maximum)) }
+    fn slice_min(x: &[f16]) -> f16 { f16::from_f32(folded(x, f32::INFINITY, |s, v| Core::minimum(s, v.to_f32()), <f32 as Core>::minimum)) }
     fn slice_cumsum(x: &[f16], start: Option<f16>, out: &mut Vec<f16>) -> bool {
         grouped(x, start.map(f16::to_f32), out, f16::to_f32, |a, b| a + b, f16::from_f32);
         true
@@ -143,8 +209,8 @@ impl Fold for f16 {
         grouped(x, start.map(f16::to_f32), out, f16::to_f32, |a, b| a * b, f16::from_f32);
         true
     }
-    fn slice_cummax(x: &[f16], start: Option<f16>, out: &mut Vec<f16>) { grouped(x, start.map(f16::to_f32), out, f16::to_f32, f32::max, f16::from_f32) }
-    fn slice_cummin(x: &[f16], start: Option<f16>, out: &mut Vec<f16>) { grouped(x, start.map(f16::to_f32), out, f16::to_f32, f32::min, f16::from_f32) }
+    fn slice_cummax(x: &[f16], start: Option<f16>, out: &mut Vec<f16>) { grouped(x, start.map(f16::to_f32), out, f16::to_f32, f32::step_max, f16::from_f32) }
+    fn slice_cummin(x: &[f16], start: Option<f16>, out: &mut Vec<f16>) { grouped(x, start.map(f16::to_f32), out, f16::to_f32, f32::step_min, f16::from_f32) }
 }
 
 /// The exact sum of integers narrower than 64 bits. Sums of up to 2^31 of them fit `i64`, which their running results hold.
@@ -250,8 +316,15 @@ mod tests {
     #[test]
     fn edges() {
         assert_eq!((sum::<f64>(&[]), prod::<i32>(&[]), max::<f32>(&[]), min::<i16>(&[])), (Some(0.0), Some(1), f32::NEG_INFINITY, i16::MAX));
-        assert_eq!(max(&[f64::NAN, 1.0, f64::NAN]), 1.0);
-        assert_eq!(max(&[f64::NAN]), f64::NEG_INFINITY);
+        // NaN at item 40 of 101 lies inside a fold's running results, which vectorize, and not in the remainder.
+        let mut v = vec![1.0f64; 101];
+        v[40] = f64::NAN;
+        let v32: Vec<f32> = v.iter().map(|&x| x as f32).collect();
+        assert_eq!((max(&v).is_nan(), min(&v32).is_nan(), max(&[f16::ONE, f16::NAN]).is_nan()), (true, true, true));
+        assert_eq!((maximum(1.0, f64::NAN).is_nan(), minimum(f32::NAN, 1.0).is_nan(), maximum(-1.0, 2.0), minimum(f16::ONE, f16::ZERO)), (true, true, 2.0, f16::ZERO));
+        let mut out = Vec::new();
+        cummax(&[1.0, 3.0, f64::NAN, 5.0, 2.0, 1.0], None, &mut out);
+        assert_eq!(out.iter().map(|v| v.is_nan()).collect::<Vec<_>>(), [false, false, true, true, true, true]);
         assert_eq!(sum(&[i64::MAX, 1]), None);
         assert_eq!(sum(&[i64::MAX, 1, -2]), Some(i64::MAX - 1));
         assert!(!cumsum(&[i64::MAX, 1], None, &mut Vec::new()));

@@ -424,7 +424,7 @@ pub(crate) fn working<F: Float, O: Copy, P, const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{reduce::{Fmax, Fmin}, *};
+    use crate::{reduce::{Maximum, Minimum}, *};
     use std::fmt::Debug;
 
     /// Whether `a` and `b` agree: both NaN, the same value with the same sign, or finite and nonzero within 8 units in the last place
@@ -516,7 +516,7 @@ mod tests {
         each_width!(
             unary: Exp, Expm1, Ln, Log1p, Log2, Log10, Sin, Cos, Tan, Asin, Acos, Atan, Sinh, Cosh, Tanh, Asinh, Acosh, Atanh, Cbrt, Gamma,
                 Lgamma, Erf, Erfc, Erfinv, Erfcinv, LambertW, Sqrt, Sqrt1mx2, Sqrt1px2, Sqrtx2m1, Abs, Sign, Angle;
-            binary: Pow, Root, Hypot, Atan2, Gammainc, Gammaincc, Gammaincinv, Binom, Fmax, Fmin;
+            binary: Pow, Root, Hypot, Atan2, Gammainc, Gammaincc, Gammaincinv, Binom, Maximum, Minimum;
             ternary: Betainc, Betaincinv
         );
     }

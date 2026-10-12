@@ -7,10 +7,11 @@ permissions:
 
 jobs:
   costs:
-    runs-on: ubuntu-latest
+    runs-on: ubicloud-standard-4
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo generate-lockfile
       - uses: Swatinem/rust-cache@v2
+      - run: grep -m1 'model name' /proc/cpuinfo
       - run: RUSTYMATH_TIMES=1 cargo test --test speed -- --nocapture

@@ -11,14 +11,16 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # A `v*` tag runs this job on GitHub's runner, like the release jobs, without the speed test. The speed budgets come from Ubicloud's runner.
+    runs-on: ${{ startsWith(github.ref, 'refs/tags/v') && 'ubuntu-latest' || 'ubicloud-standard-4' }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       # The repository has no `Cargo.lock`. Creating one first makes rust-cache's key change when a dependency publishes a new version.
       - run: cargo generate-lockfile
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test
+      - run: grep -m1 'model name' /proc/cpuinfo
+      - run: cargo test -- ${{ startsWith(github.ref, 'refs/tags/v') && '--skip speed' || '' }}
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'

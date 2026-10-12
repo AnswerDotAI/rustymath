@@ -19,7 +19,7 @@ pip install rustymath
 
 ## Using rustymath from Python
 
-The maths functions are NumPy ufuncs. Each takes arrays of any shape, broadcasts them as NumPy does, and gives a result of the same width. A complex array works wherever the function has complex values. An integer array works wherever NumPy’s version takes one. `add`, `multiply`, `fmax` and `fmin` have `reduce` and `accumulate` methods that run rustymath’s vectorized sums, products, maximums and minimums. Import rustymath beside NumPy:
+The maths functions are NumPy ufuncs. Each takes arrays of any shape, broadcasts them as NumPy does, and gives a result of the same width. A complex array works wherever the function has complex values. An integer array works wherever NumPy’s version takes one. `add`, `multiply`, `maximum` and `minimum` have `reduce` and `accumulate` methods that run rustymath’s vectorized sums, products, maximums and minimums. Import rustymath beside NumPy:
 
 ``` python
 import numpy as np, rustymath as rm
@@ -232,9 +232,11 @@ The table gives nanoseconds per item for a loop over 65,536 inputs on an Apple M
 | `Hypot`                | 0.55 | 1.08    | 0.26 | 0.87    |
 | `Root`                 | 3.26 | 4.00    | 1.79 | 1.98    |
 | `Root.one`             | 4.23 | 4.03    | 2.17 | 1.95    |
+| `Maximum`              | 0.18 | 0.19    | 0.09 | 0.09    |
 | `reduce::sum`          | 0.06 | 0.46    | 0.03 | 0.46    |
-| `reduce::max`          | 0.08 | 0.11    | 0.04 | 0.06    |
+| `reduce::max`          | 0.05 | 0.11    | 0.03 | 0.06    |
 | `reduce::cumsum`       | 0.14 | 2.62    | 0.14 | 2.50    |
+| `reduce::cummax`       | 0.12 | 1.27    | 0.11 | 2.54    |
 | `polynomial::evaluate` | 0.48 | 3.26    | 0.20 | 2.61    |
 
 An `f16` computes in `f32` and rounds once. Special values, such as infinities, NaN and signed zeros, give IEEE’s results. The tests compare each function with a correctly rounded reference at every `f16` input, at samples of `f32` and `f64` inputs, and at published hard cases.

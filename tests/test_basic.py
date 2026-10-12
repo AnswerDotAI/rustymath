@@ -52,8 +52,9 @@ def test_reductions():
     assert np.isclose(rm.multiply.reduce(1 + x[:100] / 100), np.prod(1 + x[:100] / 100))
     m = x[:10_000].reshape(100, 100)
     assert np.allclose(rm.add.reduce(m, axis=0), m.sum(0)) and np.allclose(rm.add.reduce(m, axis=1), m.sum(1))
-    v = np.array([3.0, np.nan, 5.0, 1.0])
-    assert rm.fmax.reduce(v) == 5 and rm.fmin.accumulate(v).tolist() == [3, 3, 3, 1] and rm.fmax.reduce(x[::7]) == x[::7].max()
+    v = np.array([3.0, 1.0, np.nan, 5.0])
+    assert np.isnan(rm.maximum.reduce(v)) and np.array_equal(rm.minimum.accumulate(v), np.minimum.accumulate(v), equal_nan=True)
+    assert rm.maximum.reduce(x[::7]) == x[::7].max() and np.isnan(rm.minimum(np.nan, 1.0))
     assert rm.power.reduce([2.0, 3.0, 2.0]) == 64 and rm.power.accumulate([2.0, 3.0, 2.0]).tolist() == [2, 8, 64]
     big = np.array([2**62, 2**62, 2**62])
     assert rm.add.reduce(big) == np.add.reduce(big) and (rm.add.accumulate(big) == np.add.accumulate(big)).all()

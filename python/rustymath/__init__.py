@@ -3,7 +3,7 @@ number theory. The ufuncs take float16, float32 and float64 arrays, complex64 an
 values, and int64 arrays where NumPy's version does.
 
 Functions that NumPy or SciPy also has keep their names, so code switches by changing an import. Every result is within 4 units in the
-last place. `add`, `multiply`, `fmax` and `fmin` sum, multiply and compare as NumPy's do, and their `reduce` and `accumulate` run
+last place. `add`, `multiply`, `maximum` and `minimum` sum, multiply and compare as NumPy's do, and their `reduce` and `accumulate` run
 rustymath's vectorized sums, products, maximums and minimums. `polynomial` has the functions of `numpy.polynomial.polynomial`,
 `distribution` has the distributions, and `number_theory` works on Python integers of any size."""
 import sys
@@ -11,9 +11,9 @@ import numpy as np
 from . import _core, polynomial
 from .polynomial import _dtype
 from ._core import (__version__, CT, absolute, add, angle, arccos, arccosh, arcsin, arcsinh, arctan, arctan2, arctanh, betainc, betaincinv, binom,
-    cbrt, cos, cosh, distribution, erf, erfc, erfcinv, erfinv, exp, expm1, fmax, fmin, gamma, gammainc, gammaincc, gammaincinv, gammaln,
-    hypot, lambertw, log, log10, log1p, log2, loggamma, multiply, number_theory, power, root, sign, sin, sinh, sqrt, sqrt1mx2, sqrt1px2, sqrtx2m1,
-    tan, tanh)
+    cbrt, cos, cosh, distribution, erf, erfc, erfcinv, erfinv, exp, expm1, gamma, gammainc, gammaincc, gammaincinv, gammaln, hypot,
+    lambertw, log, log10, log1p, log2, loggamma, maximum, minimum, multiply, number_theory, power, root, sign, sin, sinh, sqrt, sqrt1mx2,
+    sqrt1px2, sqrtx2m1, tan, tanh)
 
 abs = absolute
 
