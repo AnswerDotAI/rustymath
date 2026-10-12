@@ -51,11 +51,13 @@ pub fn cummax<T: Fold>(x: &[T], start: Option<T>, out: &mut Vec<T>) { T::slice_c
 #[inline]
 pub fn cummin<T: Fold>(x: &[T], start: Option<T>, out: &mut Vec<T>) { T::slice_cummin(x, start, out) }
 
-/// The greater of x and y, or NaN where either is NaN, as [`max`] gives the greatest item. NumPy calls it `maximum`.
+/// The greater of x and y, or NaN where either is NaN, as [`max`] gives the greatest item. Of +0 and -0, it gives y. NumPy calls it
+/// `maximum`.
 #[inline(always)]
 pub fn maximum<F: Float>(x: F, y: F) -> F { F::from_working(Core::maximum(x.working(), y.working())) }
 
-/// The lesser of x and y, or NaN where either is NaN, as [`min`] gives the least item. NumPy calls it `minimum`.
+/// The lesser of x and y, or NaN where either is NaN, as [`min`] gives the least item. Of +0 and -0, it gives y. NumPy calls it
+/// `minimum`.
 #[inline(always)]
 pub fn minimum<F: Float>(x: F, y: F) -> F { F::from_working(Core::minimum(x.working(), y.working())) }
 
@@ -146,52 +148,68 @@ trait Extremes: Native {
     #[inline(always)]
     fn step_min(x: Self, y: Self) -> Self { Core::minimum(x, y) }
 }
-#[cfg(not(target_arch = "aarch64"))]
-impl Extremes for f32 {}
-#[cfg(not(target_arch = "aarch64"))]
-impl Extremes for f64 {}
 
-/// AArch64's `fmax` and `fmin` give NaN where either argument is NaN, each in one instruction, where `Core::maximum` takes four. A
-/// loop of their `core::arch` calls runs one item at a time, so a fold calls their vector forms directly on `PARTS` running vectors,
-/// and a scan's step, which waits for the step before, runs the scalar instruction.
-#[cfg(target_arch = "aarch64")]
-mod neon {
+/// AArch64's `fmax` and `fmin`, and wasm's `max` and `min`, give NaN where either argument is NaN, each in one instruction, where
+/// `Core::maximum` takes four. A fold runs their vector forms on `PARTS` running vectors. Each step of a scan depends on the step
+/// before. It runs the scalar instruction. In wasm, the step takes lane 0 of the vector instruction on two splats, which the
+/// compiler turns into the scalar instruction. The same code on AArch64 keeps a `dup` before each `fmax` at `f32`, which has no
+/// one-lane vector type. The step there is inline assembly.
+#[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
+mod lanes {
     use super::*;
+    #[cfg(target_arch = "aarch64")]
     use core::arch::{aarch64::*, asm};
+    #[cfg(target_arch = "wasm32")]
+    use core::arch::wasm32::*;
     /// How many running vectors a fold keeps.
     const PARTS: usize = 8;
-    macro_rules! neon {
-        ($($t:ty: $lanes:literal, $reg:literal, $dup:ident, $load:ident, $max:ident, $maxv:ident, $min:ident, $minv:ident;)+) => {$(
+    macro_rules! lanes {
+        ($($t:ty: $lanes:literal, $splat:ident, $load:ident, $max:ident, $min:ident, $step:ident($arg:tt);)+) => {$(
             impl Extremes for $t {
-                fn fold_max(x: &[$t]) -> $t { neon!(@fold x, $t, $lanes, NEG_INFINITY, $dup, $load, $max, $maxv, step_max) }
-                fn fold_min(x: &[$t]) -> $t { neon!(@fold x, $t, $lanes, INFINITY, $dup, $load, $min, $minv, step_min) }
+                fn fold_max(x: &[$t]) -> $t { lanes!(@fold x, $t, $lanes, NEG_INFINITY, $splat, $load, $max, step_max) }
+                fn fold_min(x: &[$t]) -> $t { lanes!(@fold x, $t, $lanes, INFINITY, $splat, $load, $min, step_min) }
                 #[inline(always)]
-                fn step_max(x: $t, y: $t) -> $t { neon!(@step "fmax", $reg, x, y) }
+                fn step_max(x: $t, y: $t) -> $t { lanes!(@$step $arg, "fmax", $splat, $max, x, y) }
                 #[inline(always)]
-                fn step_min(x: $t, y: $t) -> $t { neon!(@step "fmin", $reg, x, y) }
+                fn step_min(x: $t, y: $t) -> $t { lanes!(@$step $arg, "fmin", $splat, $min, x, y) }
             }
         )+};
-        (@fold $x:ident, $t:ty, $lanes:literal, $unit:ident, $dup:ident, $load:ident, $op:ident, $across:ident, $step:ident) => {{
+        (@fold $x:ident, $t:ty, $lanes:literal, $unit:ident, $splat:ident, $load:ident, $op:ident, $step:ident) => {{
             let (chunks, rest) = $x.as_chunks::<{ PARTS * $lanes }>();
-            // SAFETY: every AArch64 target has NEON. Each load reads `$lanes` items of one chunk.
-            let total = unsafe {
-                let mut parts = [$dup(<$t>::$unit); PARTS];
-                for c in chunks { for k in 0..PARTS { parts[k] = $op(parts[k], $load(c.as_ptr().add(k * $lanes))) } }
-                $across(parts.into_iter().reduce(|a, b| $op(a, b)).expect("a fold keeps `PARTS` vectors"))
+            // SAFETY: this module compiles only for targets with these instructions. Each load reads `$lanes` items of one chunk, and
+            // a vector holds `$lanes` items of `$t`.
+            let lanes: [$t; $lanes] = unsafe {
+                let mut parts = [$splat(<$t>::$unit); PARTS];
+                for c in chunks { for k in 0..PARTS { parts[k] = $op(parts[k], $load(c.as_ptr().add(k * $lanes).cast())) } }
+                core::mem::transmute(parts.into_iter().reduce(|a, b| $op(a, b)).expect("a fold keeps `PARTS` vectors"))
             };
-            rest.iter().fold(total, |s, &v| <$t>::$step(s, v))
+            lanes.into_iter().chain(rest.iter().copied()).fold(<$t>::$unit, <$t>::$step)
         }};
-        (@step $ins:literal, $reg:literal, $x:ident, $y:ident) => {{
+        (@asm $reg:literal, $ins:literal, $splat:ident, $op:ident, $x:ident, $y:ident) => {{
             let r;
             // SAFETY: the instruction reads two registers and writes a third, with no memory access.
             unsafe { asm!(concat!($ins, " {0:", $reg, "}, {1:", $reg, "}, {2:", $reg, "}"), lateout(vreg) r, in(vreg) $x, in(vreg) $y, options(pure, nomem, nostack)) }
             r
         }};
+        (@lane $lane:ident, $ins:literal, $splat:ident, $op:ident, $x:ident, $y:ident) => { $lane::<0>($op($splat($x), $splat($y))) };
     }
-    neon! {
-        f64: 2, "d", vdupq_n_f64, vld1q_f64, vmaxq_f64, vmaxvq_f64, vminq_f64, vminvq_f64;
-        f32: 4, "s", vdupq_n_f32, vld1q_f32, vmaxq_f32, vmaxvq_f32, vminq_f32, vminvq_f32;
+    #[cfg(target_arch = "aarch64")]
+    lanes! {
+        f64: 2, vdupq_n_f64, vld1q_f64, vmaxq_f64, vminq_f64, asm("d");
+        f32: 4, vdupq_n_f32, vld1q_f32, vmaxq_f32, vminq_f32, asm("s");
     }
+    #[cfg(target_arch = "wasm32")]
+    lanes! {
+        f64: 2, f64x2_splat, v128_load, f64x2_max, f64x2_min, lane(f64x2_extract_lane);
+        f32: 4, f32x4_splat, v128_load, f32x4_max, f32x4_min, lane(f32x4_extract_lane);
+    }
+}
+
+/// Elsewhere, as on x86-64, whose `maxpd` gives its second argument beside NaN, the folds and scans use `Extremes`' defaults.
+#[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
+mod plain {
+    impl super::Extremes for f32 {}
+    impl super::Extremes for f64 {}
 }
 
 impl Fold for f16 {

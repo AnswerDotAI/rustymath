@@ -5,6 +5,7 @@
 //! item by item is measured too, for the README's table, but sets no limit. The rows `Pow.one` and `Root.one` time the scalar forms
 //! pair by pair, as a caller with one value at a time runs them.
 //! `RUSTYMATH_TIMES=1 cargo test --test speed -- --nocapture` prints the README's table, then every function's cost in copies.
+//! The test holds the machine's timing lock while it runs, as `timing_lock` describes.
 use rustymath::*;
 use std::{hint::black_box, ops::Neg, time::Instant};
 
@@ -236,8 +237,30 @@ fn complex() -> [Budgeted; 12] {
     ]
 }
 
+/// The file whose lock keeps timings and builds apart on this machine, as DEV.md describes. Timings take it exclusively. Builds take
+/// it shared.
+const TIMING_LOCK: &str = "/tmp/aai-ws-timing.lock";
+
+/// Takes the timing lock exclusively, and returns the file that holds it until dropped. It waits up to 5 minutes while a build or
+/// another timing holds the lock. The operating system releases the lock when the test ends, even by a crash.
+fn timing_lock() -> std::fs::File {
+    let file = std::fs::File::options().create(true).append(true).open(TIMING_LOCK).expect("the timing lock's file opens");
+    let (start, mut waiting) = (Instant::now(), false);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return file,
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(e)) => panic!("{TIMING_LOCK}: {e}"),
+        }
+        assert!(start.elapsed().as_secs() < 300, "a build or another timing has held {TIMING_LOCK} for 5 minutes");
+        if !waiting { eprintln!("waiting for a build or another timing to release {TIMING_LOCK}"); }
+        waiting = true;
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
 #[test]
 fn speed() {
+    let _lock = timing_lock();
     let unit = [copy(1.0f64), copy(1.0f32)];
     let mut compared = unary! {
         Exp within [15.0, 12.0], vs exp on -20.0 to 20.0;

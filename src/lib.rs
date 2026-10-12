@@ -34,6 +34,7 @@ pub use float::{Float, Native, FUSED};
 pub use slice::{pairs, Arg, Binary, Ternary, Unary, CHUNK};
 pub use parts::{Abs, Angle, Sign};
 pub use sqrts::Sqrt;
+pub use ln::Logb;
 pub use pow::{Pow, Root};
 pub use trig::{Cos, Sin, Tan};
 
@@ -99,12 +100,12 @@ functions! {
     ln(x) in ln as Ln;
     /// ln(1 + x), without the loss of digits near 0 that `ln(1 + x)` has. `log1p(-1)` is -∞.
     log1p(x) in ln as Log1p;
-    /// The logarithm of x to base 2.
+    /// The logarithm of x to base 2. It is k exactly at 2^k.
     log2(x) in ln as Log2;
-    /// The logarithm of x to base 10.
+    /// The logarithm of x to base 10. It is k exactly at 10^k, and at the float nearest 10^k where 10^k isn't a float.
     log10(x) in ln as Log10;
     /// The logarithm of x to base b, ln x / ln b. Base 2 and base 10 take `log2` and `log10`, which are exact at powers of their base.
-    logb(b, x) in ln as Logb;
+    logb(b, x) in ln;
     /// sin x. `sin(±0)` is ±0, and `sin(±∞)` and `sin(NaN)` are NaN. Beyond a magnitude of 2^23 at f64 or 2^20 at f32, x takes an
     /// exact reduction, which is slower and has a branch. A loop that calls `sin` therefore doesn't vectorize. [`Sin`]'s slice form
     /// does: it reduces every item the fast way, then gives only the rare large ones the exact reduction.

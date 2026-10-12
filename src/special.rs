@@ -80,8 +80,6 @@ const G: f64 = 6.024680040776729583740234375;
 const G_HALF: f64 = 5.524680040776729583740234375;
 /// e^-g.
 const EXP_NEG_G: f64 = 0.00241832520904651;
-/// √π/2.
-const SQRT_PI_2: f64 = 0.886226925452758;
 /// 512 ln 2 as a double word, and 2^-512.
 const LN2_512: (f64, f64) = (354.891356446692, 1.1873519686893054e-14);
 const TWO_M512: f64 = 7.458340731200207e-155;
@@ -485,7 +483,7 @@ fn giles<R: Native, const FUSED: bool>(p: R, d: R) -> R {
     if d == R::zero() { R::infinity().copysign(p) } else { x }
 }
 
-/// The x with erf(x) = p. f32 takes Giles's approximation as it is. f64 refines it.
+/// The x with erf(x) = p. f32 takes Giles's approximation. f64 takes Boost.Math's, through `maddock`.
 #[inline(always)]
 pub(crate) fn erfinv<R: Native, const FUSED: bool>(p: R) -> R {
     let one = R::one();
@@ -499,42 +497,143 @@ pub(crate) fn erfcinv<R: Native, const FUSED: bool>(q: R) -> R {
     if R::WIDE { R::narrow(erfcinv64::<FUSED>(q.wide())) } else { giles::<R, FUSED>(one - q, q * (R::narrow(2.0) - q)) }
 }
 
-/// erfinv(p) for |p| up to 1/2: Giles's approximation, then one Halley step. Each step triples the digits that are right.
-fn erfinv_central<const FUSED: bool>(p: f64) -> f64 {
-    let x = giles::<f64, FUSED>(p, (1.0 - p) * (1.0 + p));
-    let u = (erf_near::<f64, FUSED, 13>(x, ERF_A64) - p) * SQRT_PI_2 * exp::<f64, FUSED>(x * x);
-    x - u / (1.0 + x * u)
-}
-
-/// erfcinv(q) for q from 0 to 1/2. `giles` holds while -ln q is below 100, and two Halley steps refine it. Beyond, x² = -ln q -
-/// ln(x√π) to first order, and three steps refine it. Each step scales the residual by q e^x², computed as e^(x² + ln q), which stays
-/// finite where e^x² alone would overflow.
-fn erfcinv_tail<const FUSED: bool>(q: f64) -> f64 {
-    let t = -ln::<f64, FUSED>(q);
-    let near = t < 100.0;
-    let mut x = if near { giles::<f64, FUSED>(1.0 - q, q * (2.0 - q)) } else { (t - 0.5 * ln::<f64, FUSED>(PI * t)).sqrt() };
-    for _ in 0..if near { 1 } else { 3 } {
-        let u = (1.0 - erfc::<f64, FUSED>(x) / q) * SQRT_PI_2 * exp::<f64, FUSED>(x * x - t);
-        x -= u / (1.0 + x * u);
-    }
-    x
-}
-
 fn erfinv64<const FUSED: bool>(p: f64) -> f64 {
     let a = p.abs();
-    if a <= 0.5 { erfinv_central::<FUSED>(p) }
-    else if a < 1.0 { erfcinv_tail::<FUSED>(1.0 - a).copysign(p) }
+    if a < 1.0 { maddock::<FUSED>(a, 1.0 - a).copysign(p) }
     else if a == 1.0 { f64::INFINITY.copysign(p) }
     else { f64::NAN }
 }
 
+/// For q above 1, the result is -erfcinv(2 - q), by the reflection erfc(-x) = 2 - erfc(x).
 fn erfcinv64<const FUSED: bool>(q: f64) -> f64 {
-    if (0.5..=1.5).contains(&q) { erfinv_central::<FUSED>(1.0 - q) }
-    else if q > 0.0 && q < 0.5 { erfcinv_tail::<FUSED>(q) }
-    else if q > 1.5 && q < 2.0 { -erfcinv_tail::<FUSED>(2.0 - q) }
+    if q > 1.0 && q < 2.0 { -maddock::<FUSED>(q - 1.0, 2.0 - q) }
+    else if q > 0.0 && q <= 1.0 { maddock::<FUSED>(1.0 - q, q) }
     else if q == 0.0 { f64::INFINITY }
     else if q == 2.0 { f64::NEG_INFINITY }
     else { f64::NAN }
+}
+
+/// erfinv(p) for p from 0 to 1, given p and q = 1 - p, by John Maddock's rational approximations in Boost.Math's 64-bit
+/// `erf_inv_imp`. They need no iteration. Each region gives y + r, for a constant y and a ratio r of polynomials. Up to p = 1/2, the
+/// result is g(y + r) with g = p(p + 10). Beyond p = 1/2, the regions read only q. Both callers compute it exactly there. From
+/// q = 1/4 up, the result is √(-2 ln q) / (y + r). Below q = 1/4, the result is g(y + r) with g = √(-ln q), and g also chooses the
+/// region.
+#[inline(always)]
+fn maddock<const FUSED: bool>(p: f64, q: f64) -> f64 {
+    use erfinv_regions::*;
+    if p <= 0.5 { CENTRAL.scaled::<FUSED>(p * (p + 10.0), p) }
+    else if q >= 0.25 { (-2.0 * ln::<f64, FUSED>(q)).sqrt() / (UPPER.y + UPPER.ratio::<FUSED>(q)) }
+    else {
+        let g = (-ln::<f64, FUSED>(q)).sqrt();
+        if g < 3.0 { BELOW_3.scaled::<FUSED>(g, g) }
+        else if g < 6.0 { BELOW_6.scaled::<FUSED>(g, g) }
+        else if g < 18.0 { BELOW_18.scaled::<FUSED>(g, g) }
+        else { BELOW_44.scaled::<FUSED>(g, g) }
+    }
+}
+
+/// One region of `maddock`: polynomials `p` and `q`, highest degree first, in x - `shift`, and the constant `y` that their ratio
+/// corrects.
+struct Region<const P: usize, const Q: usize> {
+    y: f64,
+    shift: f64,
+    p: [f64; P],
+    q: [f64; Q],
+}
+
+impl<const P: usize, const Q: usize> Region<P, Q> {
+    /// P(x - shift) / Q(x - shift).
+    #[inline(always)]
+    fn ratio<const FUSED: bool>(&self, x: f64) -> f64 {
+        let s = x - self.shift;
+        horner::<f64, FUSED, P>(s, self.p) / horner::<f64, FUSED, Q>(s, self.q)
+    }
+
+    /// g y + g r, for the ratio r at x, as Boost.Math computes it.
+    #[inline(always)]
+    fn scaled<const FUSED: bool>(&self, g: f64, x: f64) -> f64 { g.mla::<FUSED>(self.ratio::<FUSED>(x), g * self.y) }
+}
+
+/// The regions of `maddock`, from Boost.Math's `erf_inv.hpp`. `CENTRAL` serves p up to 1/2, and `UPPER` q from 1/4 to 1/2. Below
+/// q = 1/4, each region serves √(-ln q) below the bound in its name. At f64, √(-ln q) is at most 27.3, at the least subnormal q.
+/// Only wider floats reach Boost.Math's region beyond 44. This module leaves it out.
+mod erfinv_regions {
+    use super::Region;
+    pub(super) const CENTRAL: Region<8, 10> = Region {
+        y: 0.08913147449493408,
+        shift: 0.0,
+        p: [
+            -0.005387729650712429, 0.008226878746769157, 0.02198786811111689, -0.03656379714117627,
+            -0.012692614766297404, 0.03348066254097446, -0.008368748197417368, -0.0005087819496582806,
+        ],
+        q: [
+            0.0008862163904564247, -0.0023339375937419, 0.07952836873415717, -0.05273963823400997, -0.7122890234154284,
+            0.662328840472003, 1.5622155839842302, -1.5657455823417585, -0.9700050433032906, 1.0,
+        ],
+    };
+    pub(super) const UPPER: Region<9, 9> = Region {
+        y: 2.249481201171875,
+        shift: 0.25,
+        p: [
+            -3.6719225470772936, 21.12946554483405, 17.445385985570866, -44.6382324441787, -18.851064805871424,
+            17.644729840837403, 8.3705032834312, 0.10526468069939171, -0.20243350835593876,
+        ],
+        q: [
+            1.7211476576120028, -22.643693341313973, 10.826866735546016, 48.560921310873994, -20.14326346804852,
+            -28.66081804998, 3.971343795334387, 6.242641248542475, 1.0,
+        ],
+    };
+    pub(super) const BELOW_3: Region<11, 8> = Region {
+        y: 0.807220458984375,
+        shift: 1.125,
+        p: [
+            -6.81149956853777e-10, 2.8522533178221704e-08, -6.794655751811263e-07, 0.0021455899538880526,
+            0.029015791000532906, 0.14286953440815717, 0.3377855389120359, 0.38707973897260434, 0.11703015634199525,
+            -0.16379404719331705, -0.1311027816799519,
+        ],
+        q: [
+            0.011059242293464892, 0.15226433829533179, 0.848854343457902, 2.5930192162362027, 4.778465929458438,
+            5.381683457070069, 3.4662540724256723, 1.0,
+        ],
+    };
+    pub(super) const BELOW_6: Region<9, 7> = Region {
+        y: 0.9399557113647461,
+        shift: 3.0,
+        p: [
+            2.6633922742578204e-12, -2.304047769118826e-10, 4.60469890584318e-06, 0.00015754461742496055,
+            0.0018712349281955923, 0.009508047013259196, 0.018557330651423107, -0.0022242652921344794,
+            -0.0350353787183178,
+        ],
+        q: [
+            7.646752923027944e-05, 0.00263861676657016, 0.03415891436709477, 0.22009110576413124, 0.7620591645536234,
+            1.3653349817554064, 1.0,
+        ],
+    };
+    pub(super) const BELOW_18: Region<9, 7> = Region {
+        y: 0.9836282730102539,
+        shift: 6.0,
+        p: [
+            9.905570997331033e-17, -2.811287356288318e-14, 4.625961635228786e-09, 4.4969678992770644e-07,
+            1.4962478375834237e-05, 0.00020938631748758808, 0.001056288621524929, -0.0011295143874558028,
+            -0.016743100507663373,
+        ],
+        q: [
+            2.82243172016108e-07, 2.7533547476472603e-05, 0.0009640118070051656, 0.016074608709367652,
+            0.1381518657490833, 0.5914293448864175, 1.0,
+        ],
+    };
+    pub(super) const BELOW_44: Region<8, 7> = Region {
+        y: 0.9971456527709961,
+        shift: 18.0,
+        p: [
+            -1.1676501239718427e-18, 1.4559628671867504e-12, 4.116328311909442e-10, 3.963410113048012e-08,
+            1.6239777734251093e-06, 2.5472303741302746e-05, -7.79190719229054e-06, -0.002497821279189813,
+        ],
+        q: [
+            5.097612765997785e-10, 1.4443775662814415e-07, 1.4500735981823264e-05, 0.0006905382656226846,
+            0.01694108381209759, 0.2071231122144225, 1.0,
+        ],
+    };
 }
 
 /// The most steps that a series or continued fraction takes. Each stops sooner, once a step changes its result by less than an f64

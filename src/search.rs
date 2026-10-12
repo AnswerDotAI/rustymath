@@ -3,8 +3,9 @@
 //! functions, so a slice holds at most `u32::MAX` items. `tolerant` builds its searches over floats on these functions.
 //!
 //! `index_of`, `classes` and `firsts` index the first position of each key. The index is a table when the keys span at most twice
-//! the slice's length, or 1024, and a hash map otherwise. `sort_rows` sorts with an LSD radix sort that skips any byte that is the same
-//! in every key.
+//! the slice's length, or 1024, and a hash map otherwise. `counts` counts the items with each key in such a table. `sort_rows` sorts
+//! keys that span such a table by counting them. It sorts other keys with an LSD radix sort that skips any byte that is the same in
+//! every key.
 use hashbrown::{HashMap, hash_map::Entry};
 use std::{hash::Hash, ops::Not};
 
@@ -80,13 +81,34 @@ pub fn firsts<K: Key>(x: &[K]) -> Vec<bool> {
     mask
 }
 
-/// The least key of `x`, and a table with an entry for each key from it to the greatest, each `empty`, when that range is at most
-/// twice the length of `x` or 1024.
+/// The least key of `x`, and the number of items with each key from it to the greatest, when `tabled` allows that range. With fewer
+/// than 64 keys, runs of one key are common, and each count would wait for the previous one to be stored. So the items then go to
+/// four tables in turn, which are summed at the end. On the Mac, that makes 2 keys 3 times as fast, and 64 keys or more no faster.
+pub fn counts<K: Key>(x: &[K]) -> Option<(i64, Vec<usize>)> {
+    let (min, mut counts) = table(x, 0)?;
+    let n = counts.len();
+    let at = |k: &K| k.key().wrapping_sub(min) as usize;
+    if n >= 64 {
+        for k in x { counts[at(k)] += 1 }
+        return Some((min, counts));
+    }
+    let mut parts = vec![0; 4 * n];
+    let (chunks, rest) = x.as_chunks::<4>();
+    for chunk in chunks { for (p, k) in chunk.iter().enumerate() { parts[p * n + at(k)] += 1 } }
+    for k in rest { parts[at(k)] += 1 }
+    for (g, count) in counts.iter_mut().enumerate() { *count = (0..4).map(|p| parts[p * n + g]).sum() }
+    Some((min, counts))
+}
+
+/// The least key of `x`, and a table with an entry for each key from it to the greatest, each `empty`, when `tabled` allows that range.
 fn table<K: Key>(x: &[K], empty: usize) -> Option<(i64, Vec<usize>)> {
     let (min, max) = x.iter().fold((i64::MAX, i64::MIN), |(lo, hi), n| (lo.min(n.key()), hi.max(n.key())));
     let range = usize::try_from(max.checked_sub(min)?).ok()?.checked_add(1)?;
-    (range <= x.len().saturating_mul(2).max(1024)).then(|| (min, vec![empty; range]))
+    tabled(range, x.len()).then(|| (min, vec![empty; range]))
 }
+
+/// Whether `len` keys that span `range` values index a table: when `range` is at most twice `len`, or 1024.
+fn tabled(range: usize, len: usize) -> bool { range <= len.saturating_mul(2).max(1024) }
 
 /// Writes the first position of each key in `x` to its entry in `first`, whose entries start at key `min`. The positions are written
 /// from the last to the first, so each entry ends with its key's first position, and the loop never reads what it writes. The table
@@ -137,20 +159,36 @@ pub fn grouped(groups: &[usize], n: usize) -> (Vec<usize>, Vec<usize>) {
 
 /// The rows of an `n`-row table in ascending order, comparing entries column by column from the first. Rows that compare equal keep
 /// their order of position. `key(row, column)` gives each entry as a key whose unsigned order is the order you want. Fewer than 256
-/// rows take a comparison sort. More take the radix sort once for each column, from the last.
+/// rows take a comparison sort. One column whose keys `tabled` allows takes a counting sort. Other tables take the radix sort once
+/// for each column, from the last.
 pub fn sort_rows<K: RadixKey>(n: usize, width: usize, key: impl Fn(usize, usize) -> K) -> Vec<usize> {
     if n < 256 {
         let mut order: Vec<usize> = (0..n).collect();
         order.sort_by(|&a, &b| (0..width).map(|c| key(a, c).cmp(&key(b, c))).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal));
         return order;
     }
-    let (mut items, mut spare): (Vec<(K, u32)>, _) = ((0..n as u32).map(|i| (K::default(), i)).collect(), vec![(K::default(), 0); n]);
+    let (mut items, mut spare): (Vec<(K, u32)>, _) = ((0..n as u32).map(|i| (K::default(), i)).collect(), Vec::new());
     for column in (0..width).rev() {
         for item in &mut items { item.0 = key(item.1 as usize, column); }
+        if width == 1 && let Some(order) = counted(&items) { return order; }
+        spare.resize(n, (K::default(), 0));
         radix(&mut items, &mut spare);
     }
     items.into_iter().map(|(_, i)| i as usize).collect()
 }
+
+/// The order of one column of `items`, each a key and its row, by counting, when `tabled` allows the range of their keys. Rows with
+/// equal keys keep their order. Each key's place follows the places of all smaller keys.
+fn counted<K: RadixKey>(items: &[(K, u32)]) -> Option<Vec<usize>> {
+    let (lo, hi) = items.iter().fold((!K::default(), K::default()), |(lo, hi), &(k, _)| (lo.min(k), hi.max(k)));
+    let range = usize::try_from(word(hi) - word(lo)).ok()?.checked_add(1)?;
+    if !tabled(range, items.len()) { return None; }
+    let groups: Vec<usize> = items.iter().map(|&(k, _)| (word(k) - word(lo)) as usize).collect();
+    Some(grouped(&groups, range).0)
+}
+
+/// `k` as a number, from its bytes.
+fn word<K: RadixKey>(k: K) -> u64 { (0..K::BYTES).fold(0, |w, b| w | (k.byte(b) as u64) << (8 * b)) }
 
 /// `items` sorted by key, keeping their order among equal keys.
 pub(crate) fn sorted<K: RadixKey>(mut items: Vec<(K, u32)>) -> Vec<(K, u32)> {
@@ -250,5 +288,16 @@ mod tests {
         assert_eq!(index_of(&x, &[10, 40]), [1, 4]);
         assert_eq!(classes(&x), [0, 1, 2, 1]);
         assert_eq!(sort_rows(x.len(), 1, |r, _| x[r] as u32), [1, 3, 2, 0]);
+        // 300 rows take the counting sort. Equal keys keep their order of position, also under complemented keys, which reverse it.
+        let y: Vec<u32> = (0..300).map(|i| i * 7 % 5).collect();
+        let mut stable: Vec<usize> = (0..300).collect();
+        stable.sort_by_key(|&r| y[r]);
+        assert_eq!(sort_rows(y.len(), 1, |r, _| y[r]), stable);
+        stable.sort_by_key(|&r| !y[r]);
+        assert_eq!(sort_rows(y.len(), 1, |r, _| !y[r]), stable);
+        // 299 items of 5 keys go to four tables, with 3 left over. A range of 2^20 + 1 is too wide for a table.
+        let z = &y[..299];
+        assert_eq!(counts(z), Some((0, (0..5).map(|k| z.iter().filter(|&&v| v == k).count()).collect())));
+        assert_eq!((counts(&[3, 1, 3, 2]), counts(&[0, 1 << 20])), (Some((1, vec![1, 1, 2])), None));
     }
 }

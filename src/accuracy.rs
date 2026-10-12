@@ -267,6 +267,33 @@ fn log10_accuracy() {
     unary("log10", variants!(log10), crate::log10, f64::log10, &[(0.5, 2.0)], &powers);
 }
 
+/// `log2` gives k exactly at 2^k, and `log10` gives k at 10^k, or at the float nearest 10^k where 10^k isn't a float. Each does at
+/// every width, fused and unfused. So does `Logb` in base 2 and base 10: in its scalar form, and in its slice form with the base
+/// constant, the argument constant or neither.
+#[test]
+fn logarithms_exact() {
+    use crate::{Arg, Binary, Float, Logb};
+    use std::ops::RangeInclusive;
+    fn exact<F: Float + Debug>(twos: RangeInclusive<i32>, tens: RangeInclusive<i32>)
+    where
+        Logb: Binary<F, Out = F>,
+    {
+        // 2^k in two exact factors. `powi` alone gives 0 below 2^-1022, from the reciprocal of a power that overflows.
+        let cases = twos.map(|k| (2.0, 2f64.powi(k / 2) * 2f64.powi(k - k / 2), k)).chain(tens.map(|k| (10.0, 10f64.powi(k), k)));
+        for (b, x, k) in cases {
+            let (b, x, k) = (F::narrow(b), F::narrow(x), F::narrow(k.into()));
+            let alone = if b == F::narrow(2.0) { [crate::fused::log2(x), crate::unfused::log2(x)] } else { [crate::fused::log10(x), crate::unfused::log10(x)] };
+            let mut out = Vec::new();
+            assert!(Logb.many(Arg::One(b), Arg::Many(&[x]), 1, &mut out) & Logb.many(Arg::Many(&[b, F::narrow(3.0)]), Arg::One(x), 2, &mut out));
+            assert!(Logb.many(Arg::Many(&[b]), Arg::Many(&[x]), 1, &mut out));
+            assert_eq!([alone[0], alone[1], Logb.one(b, x), out[0], out[1], out[3]], [k; 6], "the logarithm of {x:?} to base {b:?}");
+        }
+    }
+    exact::<f64>(-1074..=1023, -307..=22);
+    exact::<f32>(-149..=127, -37..=10);
+    exact::<f16>(-24..=15, -4..=4);
+}
+
 #[test]
 fn sin_accuracy() { unary("sin", variants!(sin), crate::sin, f64::sin, TRIG, &reduction()); }
 

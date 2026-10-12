@@ -95,9 +95,9 @@ pub(crate) mod sealed {
         /// `(s, 1/s)` for the power of two s that brings `self` into [2, 4), after raising a smaller `self` to 2^(2 - bias). Both are
         /// normal for every finite `self`, and they come from its exponent bits with no branch.
         fn scales(self) -> (Self, Self);
-        /// The greater of `self` and `y`, or NaN where either is NaN, from a comparison and a select. A loop of them vectorizes on
-        /// every target. AArch64's `fmax` computes it in one instruction, but stable Rust reaches it only through `core::arch`, and a
-        /// loop of those calls runs one item at a time.
+        /// The greater of `self` and `y`, or NaN where either is NaN, from a comparison and a select. Two equal arguments give `y`. Where
+        /// they are +0 and -0, the result has the sign of `y`. A loop of them vectorizes on every target. AArch64's `fmax` computes it in
+        /// one instruction, but stable Rust reaches it only through `core::arch`, and a loop of those calls runs one item at a time.
         fn maximum(self, y: Self) -> Self;
         /// The lesser of `self` and `y`, or NaN where either is NaN, as `maximum` gives the greater.
         fn minimum(self, y: Self) -> Self;

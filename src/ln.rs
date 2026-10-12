@@ -1,7 +1,7 @@
 //! Logarithms. They share SLEEF's reduction from `xlog` and `xlogf`: x = m × 2^e with m from 0.75 to 1.5, and
 //! ln m = ln((1+s)/(1-s)) with s = (m-1)/(m+1), from SLEEF's f64 polynomial and minimax ones for narrower results. See
 //! `THIRD-PARTY.md`.
-use crate::{dd::Double, float::{horner, ln2, sealed::Core, split_positive, Native}};
+use crate::{dd::Double, float::{horner, ln2, sealed::Core, split_positive, Native}, Arg};
 use std::f64::consts::{LN_2, LOG10_E, LOG2_E};
 
 /// The coefficients of (ln((1+s)/(1-s)) - 2s)/s³ as a polynomial in s², highest degree first, for |s| up to 0.2.
@@ -19,8 +19,6 @@ const POLY_32: [f64; 4] = [0.30434924364089966, 0.3995267450809479, 0.6666705012
 /// The same, to about 2^-35 relative, for f32 and f16 results computed in f64. They need that even where a power multiplies the
 /// logarithm.
 const POLY_NARROW: [f64; 5] = [0.24145279203110395, 0.28502925464850143, 0.40000986365881785, 0.6666666171721365, 2.0000000000396225];
-/// log10(2), split into a part whose product with any exponent of an f64 is exact, and the rest.
-const LOG10_2: (f64, f64) = (0.30102999566361177, 3.694239077158931e-13);
 
 /// ln((1+s)/(1-s)), for |s| up to 0.2, with f64's polynomial if `fine` and f32's otherwise.
 #[inline]
@@ -32,17 +30,18 @@ fn series<R: Native, const FUSED: bool>(s: R, fine: bool) -> R {
 /// The logarithm e·hi + (e·lo + k·ln((1+s)/(1-s))), to the base whose logarithm of 2 is (hi, lo) and of e is k, with f64's
 /// polynomial if `fine` and f32's otherwise.
 #[inline]
-fn based<R: Native, const FUSED: bool>(s: R, e: R, (hi, lo): (R, R), k: f64, fine: bool) -> R {
-    e.mla::<FUSED>(hi, series::<R, FUSED>(s, fine).mla::<FUSED>(R::narrow(k), e * lo))
+fn based<R: Native, const FUSED: bool>(s: R, e: R, (hi, lo): (R, R), k: R, fine: bool) -> R {
+    e.mla::<FUSED>(hi, series::<R, FUSED>(s, fine).mla::<FUSED>(k, e * lo))
 }
 
 /// e ln 2 + ln((1+s)/(1-s)): the natural logarithm of m × 2^e, for s = (m-1)/(m+1) or a more accurate form of it.
 #[inline]
-pub(crate) fn ln_parts<R: Native, const FUSED: bool>(s: R, e: R) -> R { based::<R, FUSED>(s, e, ln2(), 1.0, R::WIDE) }
+pub(crate) fn ln_parts<R: Native, const FUSED: bool>(s: R, e: R) -> R { based::<R, FUSED>(s, e, ln2(), R::one(), R::WIDE) }
 
-/// A logarithm of x with its special values: -∞ at 0, ∞ at ∞, and NaN for a negative x or NaN.
+/// The logarithm of x to the base that `(base, k)` gives, as `based` takes them, with its special values: -∞ at 0, ∞ at ∞, and
+/// NaN for a negative x or NaN.
 #[inline]
-fn log<R: Native, const FUSED: bool>(x: R, base: (R, R), k: f64) -> R {
+fn log<R: Native, const FUSED: bool>(x: R, (base, k): ((R, R), R)) -> R {
     let (m, e) = split_positive(x);
     let y = based::<R, FUSED>((m - R::one()) / (m + R::one()), e, base, k, R::WIDE);
     let y = if x == R::infinity() { x } else { y };
@@ -51,7 +50,7 @@ fn log<R: Native, const FUSED: bool>(x: R, base: (R, R), k: f64) -> R {
 }
 
 #[inline]
-pub(crate) fn ln<R: Native, const FUSED: bool>(x: R) -> R { log::<R, FUSED>(x, ln2(), 1.0) }
+pub(crate) fn ln<R: Native, const FUSED: bool>(x: R) -> R { log::<R, FUSED>(x, (ln2(), R::one())) }
 
 /// ln x for a positive, finite, nonzero x, computed in f64 for an f32 or f16 result. Such an x is never a subnormal f64. At this
 /// accuracy, ln 2 needs no lower part.
@@ -76,20 +75,73 @@ pub(crate) fn ln_split<const FUSED: bool>(x: f64) -> Double<f64> {
     Double::sum(e * hi, e.mla::<FUSED>(lo, series::<f64, FUSED>((m - 1.0) / (m + 1.0), true)))
 }
 
-#[inline]
-pub(crate) fn log2<R: Native, const FUSED: bool>(x: R) -> R { log::<R, FUSED>(x, (R::one(), R::zero()), LOG2_E) }
+/// The logarithm of 2 to base 2, as `based` takes it, and the logarithm of e to base 2.
+#[inline(always)]
+fn base2<R: Native>() -> ((R, R), R) { ((R::one(), R::zero()), R::narrow(LOG2_E)) }
 
-#[inline]
-pub(crate) fn log10<R: Native, const FUSED: bool>(x: R) -> R {
-    let (hi, lo) = LOG10_2;
-    log::<R, FUSED>(x, (R::narrow(hi), R::narrow(lo)), LOG10_E)
+/// The logarithm of 2 to base 10, as `based` takes it, split as `ln2` splits ln 2, and the logarithm of e to base 10. At f32 the split
+/// has its own high part. The f64 high part, rounded to f32, would make e times it inexact.
+#[inline(always)]
+fn base10<R: Native>() -> ((R, R), R) {
+    let (hi, lo) = if R::WIDE { (0.30102999566361177, 3.694239077158931e-13) } else { (0.30103302001953125, -3.024355464731343e-6) };
+    ((R::narrow(hi), R::narrow(lo)), R::narrow(LOG10_E))
 }
 
-/// The logarithm of x to base b.
 #[inline]
+pub(crate) fn log2<R: Native, const FUSED: bool>(x: R) -> R { log::<R, FUSED>(x, base2()) }
+
+#[inline]
+pub(crate) fn log10<R: Native, const FUSED: bool>(x: R) -> R { log::<R, FUSED>(x, base10()) }
+
+/// Base 2's value, base 10's or every other base's, chosen for base b with selects, not branches.
+#[inline(always)]
+fn by_base<R: Native, T>(b: R, [two, ten, other]: [T; 3]) -> T {
+    if b == R::narrow(2.0) { two } else if b == R::narrow(10.0) { ten } else { other }
+}
+
+/// The constants that `log` takes for base b, and the divisor of its result. Base 2 and base 10 take the constants of `log2` and
+/// `log10`, which are exact at powers of their base, and divide by 1. Any other base takes the natural logarithm's constants and
+/// divides by ln b. It computes ln b even at base 2 and base 10. Computing it only for other bases would take a branch.
+#[inline(always)]
+fn for_base<R: Native, const FUSED: bool>(b: R) -> (((R, R), R), R) {
+    let lb = ln::<R, FUSED>(b);
+    (by_base(b, [base2(), base10(), (ln2(), R::one())]), by_base(b, [R::one(), R::one(), lb]))
+}
+
+/// The logarithm of x to base b. Base 2 gives `log2` and base 10 gives `log10`, which are exact at powers of their base. Any other
+/// base gives ln x / ln b. It is always inlined. Out of line, its call would stop a caller's loop vectorizing.
+#[inline(always)]
 pub(crate) fn logb<R: Native, const FUSED: bool>(b: R, x: R) -> R {
-    if b == R::narrow(2.0) { log2::<R, FUSED>(x) } else if b == R::narrow(10.0) { log10::<R, FUSED>(x) } else { ln::<R, FUSED>(x) / ln::<R, FUSED>(b) }
+    let (to, d) = for_base::<R, FUSED>(b);
+    log::<R, FUSED>(x, to) / d
 }
+
+/// [`logb`](crate::logb) as a function object. Its slice form computes the logarithm of a constant argument once, before its loop.
+#[derive(Clone, Copy, Debug)]
+pub struct Logb;
+forms!(Logb at real: |_, [b, x]| logb::<_, { crate::FUSED }>(b, x),
+    many |_, [b, x], n, out| match (b, x) {
+        (Arg::One(c), _) => {
+            // Bases 2 and 10 divide by 1, which their loop skips.
+            let (to, d) = for_base::<_, { crate::FUSED }>(c);
+            if d == 1.0 {
+                each!([b, x], n, out, |[_, x]| log::<_, { crate::FUSED }>(x, to))
+            } else {
+                each!([b, x], n, out, |[_, x]| log::<_, { crate::FUSED }>(x, to) / d)
+            }
+        }
+        (Arg::Many(bs), Arg::One(c)) => {
+            // A base of exactly 2 or 10 takes `log2` or `log10` of c. A second pass writes those items, because a select in the main
+            // loop stops it vectorizing. At those bases either result is NaN only where c is negative or NaN. The main loop's outcome
+            // holds.
+            let (start, l) = (out.len(), ln::<_, { crate::FUSED }>(c));
+            let ok = each!([b, x], n, out, |[b, _]| l / ln::<_, { crate::FUSED }>(b));
+            let exact = [log2::<_, { crate::FUSED }>(c), log10::<_, { crate::FUSED }>(c)];
+            for (r, &b) in out[start..].iter_mut().zip(bs) { *r = by_base(b, [exact[0], exact[1], *r]) }
+            ok
+        }
+        _ => each!([b, x], n, out, |[b, x]| logb::<_, { crate::FUSED }>(b, x)),
+    });
 
 /// ln(1 + x). Rounding u = 1 + x loses c = x - (u - 1). With u = m × 2^e and c' = c × 2^-e, the quotient
 /// s = (m - 1 + c')/(m + 1 + c') restores it, and a small x keeps its relative accuracy with one division. Beyond 2^53, c is 0. e

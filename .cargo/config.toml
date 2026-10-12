@@ -1,3 +1,8 @@
+# rustc runs LLVM's straight-line (SLP) vectorizer only at opt-level 3. `passes=slp-vectorizer` adds it to our opt-level 2 builds.
+# A target's own `rustflags` replace these. The x86-64 entry repeats the pass.
+[build]
+rustflags = ["-C", "passes=slp-vectorizer"]
+
 # Target AVX2-class x86-64 CPUs for vectorized maths kernels.
 [target.'cfg(target_arch = "x86_64")']
-rustflags = ["-C", "target-cpu=x86-64-v3"]
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "passes=slp-vectorizer"]

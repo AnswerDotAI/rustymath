@@ -30,6 +30,12 @@ FOR ANY DAMAGES OR OTHER LIABILITY, WHETHER IN CONTRACT, TORT OR OTHERWISE,
 ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
+## Boost.Math
+
+Copyright John Maddock 2006 and Matt Borland 2024.
+
+Boost Software License - Version 1.0. The SLEEF notice above gives its text.
+
 ## Arm Optimized Routines
 
 Arm Optimized Routines is available under MIT OR Apache-2.0 WITH LLVM-exception. rustymath uses it under the MIT license.

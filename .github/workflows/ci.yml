@@ -11,8 +11,7 @@ permissions:
 
 jobs:
   test:
-    # A `v*` tag runs this job on GitHub's runner, like the release jobs, without the speed test. The speed budgets come from Ubicloud's runner.
-    runs-on: ${{ startsWith(github.ref, 'refs/tags/v') && 'ubuntu-latest' || 'ubicloud-standard-4' }}
+    runs-on: ubicloud-standard-4
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -20,7 +19,7 @@ jobs:
       - run: cargo generate-lockfile
       - uses: Swatinem/rust-cache@v2
       - run: grep -m1 'model name' /proc/cpuinfo
-      - run: cargo test -- ${{ startsWith(github.ref, 'refs/tags/v') && '--skip speed' || '' }}
+      - run: cargo test
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
