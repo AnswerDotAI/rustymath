@@ -4,27 +4,37 @@
 //! [`Binom`] and [`Pow`]. A slice form appends results to a vector and reports whether every item fitted. [`Divisor`] divides many
 //! integers by one, with multiplications in place of division instructions. `Residue`'s slice form uses one where every item has
 //! the same divisor.
+//!
+//! `Gcd`, `Lcm`, `Pow` and `Residue` also take every narrower integer type, which they compute through these functions. Their `u64`
+//! forms have functions of their own, because a `u64` can exceed `i64::MAX`. A result that doesn't fit its type fails. The tolerant
+//! comparisons, [`Floor`] and [`Ceil`] take every integer type exactly, ignoring the tolerance. [`Abs`] and [`Sign`] take every
+//! integer type through [`Overflowing`](crate::Overflowing): `Abs` of a signed type's least value wraps to itself, as NumPy's does.
+//! `Floor`, `Ceil` and `Abs` keep Booleans as they are.
 use crate::{
-    tolerant::{Gcd, Lcm, Residue},
-    Arg, Binom, Pow,
+    tolerant::{Ceil, Equal, Floor, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue},
+    Abs, Arg, Binom, Pow,
 };
 use strength_reduce::StrengthReducedU64;
 
 /// The greatest common divisor of x and y, which is never negative. `gcd(0, 0)` is 0. `None` only where it is 2^63, as for
 /// `gcd(i64::MIN, 0)`.
-pub fn gcd(x: i64, y: i64) -> Option<i64> {
-    let (mut a, mut b) = (x.unsigned_abs(), y.unsigned_abs());
-    if a == 0 || b == 0 { return i64::try_from(a | b).ok() }
-    // Stein's algorithm: shifts and subtractions, with no division.
+pub fn gcd(x: i64, y: i64) -> Option<i64> { i64::try_from(unsigned_gcd(x.unsigned_abs(), y.unsigned_abs())).ok() }
+
+/// The greatest common divisor of a and b by Stein's algorithm, with shifts and subtractions and no division. It is 0 for 0 and 0.
+fn unsigned_gcd(mut a: u64, mut b: u64) -> u64 {
+    if a == 0 || b == 0 { return a | b }
     let shift = (a | b).trailing_zeros();
     a >>= a.trailing_zeros();
     loop {
         b >>= b.trailing_zeros();
         if a > b { std::mem::swap(&mut a, &mut b) }
         b -= a;
-        if b == 0 { return i64::try_from(a << shift).ok() }
+        if b == 0 { return a << shift }
     }
 }
+
+/// The least common multiple of x and y, which is 0 where either is 0. `None` where it is beyond `u64`.
+fn unsigned_lcm(x: u64, y: u64) -> Option<u64> { if x == 0 || y == 0 { Some(0) } else { (x / unsigned_gcd(x, y)).checked_mul(y) } }
 
 /// The least common multiple of x and y, with the sign of x × y. It is 0 where either is 0.
 pub fn lcm(x: i64, y: i64) -> Option<i64> {
@@ -60,6 +70,15 @@ pub fn power(x: i64, y: i64) -> Option<i64> {
         -1 => Some(if y % 2 == 0 { 1 } else { -1 }),
         _ if y < 0 => None,
         0 => Some(i64::from(y == 0)),
+        _ => x.checked_pow(u32::try_from(y).ok()?),
+    }
+}
+
+/// x^y, where 0^0 is 1. `None` where it is beyond `u64`.
+fn unsigned_power(x: u64, y: u64) -> Option<u64> {
+    match x {
+        0 => Some(u64::from(y == 0)),
+        1 => Some(1),
         _ => x.checked_pow(u32::try_from(y).ok()?),
     }
 }
@@ -113,11 +132,43 @@ forms!(
         each!([x, y], n, out, |[x, y]| residue(x, y))
     }
 );
+forms!(Gcd at u64: |_, [x, y]| unsigned_gcd(x, y));
+forms!(Lcm at u64: |_, [x, y]| unsigned_lcm(x, y));
+forms!(Pow at u64: |_, [x, y]| unsigned_power(x, y));
+forms!(Residue at u64: |_, [x, y]| if x == 0 { y } else { y % x });
+
+/// The narrower types' forms of `Gcd`, `Lcm`, `Pow` and `Residue`, which compute at `i64`. A result that doesn't fit the type fails,
+/// as one beyond `i64` does. Every residue fits.
+macro_rules! narrower {
+    ($($t:ty),+) => {$(
+        forms!(Gcd at $t: |_, [x, y]| gcd(x.into(), y.into()).and_then(|r| <$t>::try_from(r).ok()));
+        forms!(Lcm at $t: |_, [x, y]| lcm(x.into(), y.into()).and_then(|r| <$t>::try_from(r).ok()));
+        forms!(Pow at $t: |_, [x, y]| power(x.into(), y.into()).and_then(|r| <$t>::try_from(r).ok()));
+        forms!(Residue at $t: |_, [x, y]| residue(x.into(), y.into()) as $t);
+    )+};
+}
+narrower!(i8, i16, i32, u8, u16, u32);
+
+/// `$object`'s forms at every integer type, with Boolean outputs where `=> bool` says so.
+macro_rules! every_width {
+    ($object:ident $(=> $o:ty)?: $($body:tt)+) => {
+        forms!($object at i8 $(=> $o)?, i16 $(=> $o)?, i32 $(=> $o)?, i64 $(=> $o)?, u8 $(=> $o)?, u16 $(=> $o)?, u32 $(=> $o)?, u64 $(=> $o)?: $($body)+);
+    };
+}
+every_width!(Equal => bool: |_, [x, y]| x == y);
+every_width!(NotEqual => bool: |_, [x, y]| x != y);
+every_width!(Less => bool: |_, [x, y]| x < y);
+every_width!(LessEqual => bool: |_, [x, y]| x <= y);
+every_width!(Greater => bool: |_, [x, y]| x > y);
+every_width!(GreaterEqual => bool: |_, [x, y]| x >= y);
+forms!(Floor at i8, i16, i32, i64, u8, u16, u32, u64, bool: |_, [x]| x);
+forms!(Ceil at i8, i16, i32, i64, u8, u16, u32, u64, bool: |_, [x]| x);
+forms!(Abs at bool: |_, [x]| x);
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{accuracy::random, Binary};
+    use crate::{accuracy::random, Binary, Sign, Unary};
     use num_bigint::BigInt;
 
     /// Integers that exercise overflow and sign: the extremes, small numbers, powers of two and random bits.
@@ -198,5 +249,42 @@ mod tests {
         assert_eq!(Binary::<i64>::checked(&Pow, 3, 40), None);
         assert_eq!(Binom.one(5i64, 2), 10);
         assert_eq!(Lcm(t).one(-4i64, 6), -12);
+    }
+
+    #[test]
+    fn other_widths() {
+        let t = crate::tolerant::Tolerance::DEFAULT;
+        // Every pair of `i8`s agrees with the `i64` functions where the result fits, and fails where it doesn't.
+        for x in i8::MIN..=i8::MAX {
+            for y in i8::MIN..=i8::MAX {
+                let (a, b) = (i64::from(x), i64::from(y));
+                let fit = |r: Option<i64>| r.and_then(|r| i8::try_from(r).ok());
+                assert_eq!(Binary::<i8>::checked(&Gcd(t), x, y), fit(gcd(a, b)), "gcd({x}, {y})");
+                assert_eq!(Binary::<i8>::checked(&Lcm(t), x, y), fit(lcm(a, b)), "lcm({x}, {y})");
+                assert_eq!(Binary::<i8>::checked(&Pow, x, y), fit(power(a, b)), "power({x}, {y})");
+                assert_eq!(i64::from(Residue(t).one(x, y)), residue(a, b), "residue({x}, {y})");
+            }
+        }
+        // `u64`s, some beyond `i64::MAX`, against exact arithmetic.
+        let big = [0, 1, 2, 3, 12, 18, 1 << 32, 1 << 63, (1 << 63) + 1, u64::MAX - 1, u64::MAX];
+        for &x in &big {
+            for &y in &big {
+                let (a, b) = (u128::from(x), u128::from(y));
+                let g = num_integer::Integer::gcd(&a, &b);
+                assert_eq!(u128::from(Gcd(t).one(x, y)), g, "gcd({x}, {y})");
+                assert_eq!(Binary::<u64>::checked(&Lcm(t), x, y), if g == 0 { Some(0) } else { u64::try_from(a / g * b).ok() }, "lcm({x}, {y})");
+                assert_eq!(Residue(t).one(x, y), if x == 0 { y } else { y % x }, "residue({x}, {y})");
+                assert_eq!((Equal(t).one(x, y), Less(t).one(x, y)), (x == y, x < y), "comparisons of {x} and {y}");
+            }
+            for y in 0..70u64 {
+                assert_eq!(Binary::<u64>::checked(&Pow, x, y), BigInt::from(x).pow(y as u32).try_into().ok(), "power({x}, {y})");
+            }
+        }
+        // Integers compare exactly, however close they are within the tolerance.
+        let (n, m) = (1_000_000_000_000_000i64, 1_000_000_000_000_001i64);
+        assert_eq!([Equal(t).one(n, m), NotEqual(t).one(n, m), LessEqual(t).one(m, n), GreaterEqual(t).one(m, n), Greater(t).one(m, n)], [false, true, false, true, true]);
+        assert_eq!((Floor(t).one(m), Ceil(t).one(-m), Floor(t).one(true)), (m, -m, true));
+        assert_eq!((Abs.one(i8::MIN), Abs.one(-5i16), Abs.one(7u8), Abs.one(false)), (i8::MIN, 5, 7, false));
+        assert_eq!((Sign.one(-9i32), Sign.one(0i64), Sign.one(200u8)), (-1, 0, 1));
     }
 }

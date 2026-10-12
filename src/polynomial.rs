@@ -2,12 +2,11 @@
 //! `c[0] + c[1]x + c[2]x² + …`. Trailing zero coefficients don't count towards the degree. `evaluate` therefore never multiplies an
 //! infinite x by one of them.
 use crate::float::{sealed::Core, Float, FUSED};
-use faer::{prelude::*, Mat};
 use num_complex::Complex;
 use num_traits::{Num, Zero};
 
 /// `c` without its trailing zeros.
-fn trimmed<T: Zero>(c: &[T]) -> &[T] { &c[..c.iter().rposition(|k| !k.is_zero()).map_or(0, |i| i + 1)] }
+pub fn trimmed<T: Zero>(c: &[T]) -> &[T] { &c[..c.iter().rposition(|k| !k.is_zero()).map_or(0, |i| i + 1)] }
 
 /// Replaces each `x[i]` with the value of the polynomial `c` at `x[i]`, by Horner's rule. An f16 polynomial computes in f32 and rounds
 /// each result once.
@@ -38,25 +37,23 @@ fn horner<F: Float>(top: F, rest: &[F], xs: &mut [F; LANES]) {
     for i in 0..LANES { xs[i] = F::from_working(y[i]); }
 }
 
-/// The roots of the polynomial `c`, as the eigenvalues of its companion matrix, which `faer` computes in f64. When every coefficient
-/// is real, a real root has an imaginary part of exactly 0. `None` when the eigenvalue solver doesn't converge.
+/// The roots of the polynomial `c`, as the eigenvalues of its companion matrix, computed in f64 by
+/// [`eigenvalues`](crate::linalg::eigenvalues), sorted by real part, then imaginary part. Real coefficients take the real solver, so a
+/// real root has an imaginary part of exactly 0. `None` when the eigenvalue solver doesn't converge.
 pub fn roots<F: Float>(c: &[Complex<F>]) -> Option<Vec<Complex<F>>> {
     let c: Vec<Complex<f64>> = trimmed(c).iter().map(|z| Complex::new(z.re.wide(), z.im.wide())).collect();
     let n = c.len().saturating_sub(1);
     if n == 0 { return Some(Vec::new()); }
-    // The companion matrix has ones below its diagonal and -c[i]/c[n] down its last column. Real coefficients divide as reals: complex
-    // division gives NaN for 1/∞, where real division gives 0.
-    let a: Vec<Complex<f64>> = if c.iter().all(|z| z.im == 0.0) {
-        c[..n].iter().map(|k| Complex::new(-k.re / c[n].re, 0.0)).collect()
+    // The companion matrix has ones below its diagonal and -c[i]/c[n] down its last column.
+    let a: Vec<Complex<f64>> = c[..n].iter().map(|&k| -crate::complex::divide(k, c[n])).collect();
+    let companion: Vec<Complex<f64>> = (0..n * n).map(|k| if k % n == n - 1 { a[k / n] } else { Complex::new(f64::from(k / n == k % n + 1), 0.0) }).collect();
+    let mut values = if a.iter().all(|z| z.im == 0.0) {
+        crate::linalg::eigenvalues(&companion.iter().map(|z| z.re).collect::<Vec<f64>>(), n)?
     } else {
-        c[..n].iter().map(|&k| -k / c[n]).collect()
+        crate::linalg::eigenvalues(&companion, n)?
     };
-    let values = if a.iter().all(|z| z.im == 0.0) {
-        Mat::from_fn(n, n, |i, j| if j == n - 1 { a[i].re } else { f64::from(i == j + 1) }).eigenvalues()
-    } else {
-        Mat::from_fn(n, n, |i, j| if j == n - 1 { a[i] } else { Complex::new(f64::from(i == j + 1), 0.0) }).eigenvalues()
-    };
-    Some(values.ok()?.into_iter().map(|z| Complex::new(F::narrow(z.re), F::narrow(z.im))).collect())
+    values.sort_by(|x, y| x.re.total_cmp(&y.re).then(x.im.total_cmp(&y.im)));
+    Some(values.into_iter().map(|z| Complex::new(F::narrow(z.re), F::narrow(z.im))).collect())
 }
 
 /// The polynomial `m` times the product of `x - r` over the roots `r`.
@@ -76,13 +73,14 @@ pub fn derivative<T: Copy + Num>(c: &[T]) -> Vec<T> {
     c.iter().skip(1).map(|&k| { n = n + T::one(); n * k }).collect()
 }
 
-/// The polynomial of degree `degree` that fits the points `(x[i], y[i])` by least squares, which `faer` solves in f64 through a QR
-/// decomposition. Panics if `x` and `y` differ in length or hold fewer than `degree + 1` points.
+/// The polynomial of degree `degree` that fits the points `(x[i], y[i])` by least squares, which [`lstsq`](crate::linalg::lstsq) solves
+/// in f64. Where fewer than `degree + 1` distinct points fix the polynomial, it's the fit whose coefficients have the least norm. Panics if
+/// `x` and `y` differ in length.
 pub fn fit<F: Float>(x: &[F], y: &[F], degree: usize) -> Vec<F> {
     assert_eq!(x.len(), y.len(), "fit needs one y for each x");
-    let powers = Mat::from_fn(x.len(), degree + 1, |i, j| x[i].wide().powi(j as i32));
-    let solution = powers.qr().solve_lstsq(Mat::from_fn(y.len(), 1, |i, _| y[i].wide()));
-    (0..=degree).map(|i| F::narrow(solution[(i, 0)])).collect()
+    let powers: Vec<f64> = x.iter().flat_map(|x| (0..=degree).map(move |j| x.wide().powi(j as i32))).collect();
+    let y: Vec<f64> = y.iter().map(|y| y.wide()).collect();
+    crate::linalg::lstsq(&powers, &y, [x.len(), degree + 1], 1).0.into_iter().map(F::narrow).collect()
 }
 
 #[cfg(test)]
@@ -113,14 +111,13 @@ mod tests {
         evaluate(&k.map(f16::from_f64), &mut half);
         assert!(half.iter().zip(&want).all(|(&g, &w)| (g.to_f64() - w).abs() <= 1e-2 * w.abs().max(1.0)));
 
-        let mut r = roots(&c.map(|k| Complex::new(k, 0.0))).unwrap();
-        r.sort_by(|a, b| a.re.total_cmp(&b.re));
+        let r = roots(&c.map(|k| Complex::new(k, 0.0))).unwrap();
         assert!(r[0].im == 0.0 && r[1].im == 0.0 && (r[0].re - 1.0).abs() < 1e-12 && (r[1].re - 2.0).abs() < 1e-12);
         // x² + 1, and a polynomial with complex coefficients, (x - i)(x - 2).
         let r = roots(&[1.0f32, 0.0, 1.0].map(|k| Complex::new(k, 0.0))).unwrap();
         assert!(r.iter().all(|z| z.re.abs() < 1e-6 && (z.im.abs() - 1.0).abs() < 1e-6));
         let r = roots(&from_roots(Complex::new(1.0, 0.0), &[Complex::new(0.0, 1.0), Complex::new(2.0, 0.0)])).unwrap();
-        assert!(r.iter().any(|z| (z - Complex::new(0.0, 1.0)).norm() < 1e-12) && r.iter().any(|z| (z - Complex::new(2.0, 0.0)).norm() < 1e-12));
+        assert!((r[0] - Complex::new(0.0, 1.0)).norm() < 1e-12 && (r[1] - Complex::new(2.0, 0.0)).norm() < 1e-12);
         assert!(roots::<f64>(&[Complex::new(3.0, 0.0)]).unwrap().is_empty());
         // 1 + ∞x has the root -1/∞, which is -0.
         let r = roots(&[1.0, f64::INFINITY].map(|k| Complex::new(k, 0.0))).unwrap();

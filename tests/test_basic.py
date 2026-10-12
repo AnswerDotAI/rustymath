@@ -41,10 +41,35 @@ def test_complex():
 
 def test_integers():
     a, b = np.arange(-30, 30), np.arange(1, 61)[::-1] - 25
-    assert (rm.gcd(a, b) == np.gcd(a, b)).all() and (rm.lcm(a, b) == np.lcm(a, b)).all() and rm.gcd(a, b).dtype == np.int64
+    assert (rm.gcd(a, b) == np.gcd(a, b)).all() and (rm.lcm(a, b) == np.sign(a * b) * np.lcm(a, b)).all() and rm.gcd(a, b).dtype == np.int64
     assert (rm.remainder(a, b + 100) == np.remainder(a, b + 100)).all() and rm.mod is rm.remainder
     assert (rm.power(a, 3) == a**3).all() and rm.power(a, 3).dtype == np.int64
     with np.errstate(over='raise'), pytest.raises(FloatingPointError): rm.power(np.int64(10), 30)
+    # Every integer width keeps its type, as in NumPy, with add and multiply wrapping at the narrow widths.
+    for t in [np.int8, np.uint8, np.int16, np.uint16, np.int32, np.uint32, np.int64, np.uint64]:
+        x, y = np.arange(1, 40).astype(t), np.arange(40, 1, -1).astype(t)
+        for name in ['add', 'multiply', 'maximum', 'minimum', 'remainder', 'gcd']:
+            got, want = getattr(rm, name)(x, y), getattr(np, name)(x, y)
+            assert got.dtype == want.dtype and (got == want).all(), (name, t)
+        for name in ['floor', 'ceil', 'absolute', 'sign']:
+            got, want = getattr(rm, name)(x), getattr(np, name)(x)
+            assert got.dtype == want.dtype and (got == want).all(), (name, t)
+        assert rm.equal(x, y).dtype == bool and (rm.less(x, y) == (x < y)).all(), t
+    # Integers compare exactly, where float64 would round them to one value.
+    assert not rm.equal(10**15, 10**15 + 1) and rm.less(2**62, 2**62 + 1)
+    # Beside a float, integers still take the float loops and the tolerance, as NumPy picks the first loop they cast to safely.
+    assert rm.add(np.arange(3, dtype=np.int8), 0.5).dtype == np.add(np.arange(3, dtype=np.int8), 0.5).dtype
+    assert rm.equal(np.arange(3), 1 + 1e-15).tolist() == [False, True, False]
+    big = np.array([2**63 + 1], np.uint64)
+    assert rm.add(big, big)[0] == np.add(big, big)[0] and rm.not_equal(big, big + np.uint64(1))[0]
+    assert rm.maximum.reduce(np.array([3, -7, 5], np.int8)).dtype == np.int8 and rm.add.reduce(np.array([100, 100], np.int8)) == 200
+    # A signed type's least value has no magnitude of its type, so `absolute` wraps it to itself, as NumPy's arrays do.
+    assert rm.absolute(np.array([-128], np.int8))[0] == -128
+    p, q = np.array([True, True, False, False]), np.array([True, False, True, False])
+    for name in ['add', 'multiply', 'maximum', 'minimum']:
+        got, want = getattr(rm, name)(p, q), getattr(np, name)(p, q)
+        assert got.dtype == bool and (got == want).all(), name
+    assert rm.floor(p).dtype == bool and rm.absolute(p).dtype == bool and rm.add.reduce(p) == 2
 
 def test_reductions():
     x = np.random.default_rng(0).random(10_001)
@@ -65,19 +90,23 @@ def test_tolerant():
     assert not rm.less(0.3, 0.1 + 0.2) and rm.less(0.3, 0.1 + 0.2, ct=0) and rm.greater_equal(0.3, 0.1 + 0.2) and not rm.not_equal(0.3, 0.1 + 0.2)
     assert rm.floor(0.5 + 0.5 - 1e-16) == 1 and rm.ceil(1 + 1e-15) == 1 and rm.floor(1 - 1e-15, ct=0) == 0
     assert rm.remainder([-5.0, 5.0], 3).tolist() == np.remainder([-5.0, 5.0], 3).tolist() and rm.remainder(0.3, 0.1) == 0
-    assert abs(rm.gcd(0.6, 0.4) - 0.2) < 1e-15 and abs(rm.lcm(-0.6, 0.4) - 1.2) < 1e-14
+    assert abs(rm.gcd(0.6, 0.4) - 0.2) < 1e-15 and abs(rm.lcm(-0.6, 0.4) + 1.2) < 1e-14
     with pytest.raises(ValueError): rm.equal(1, 1, ct=1)
     with np.errstate(invalid='raise'), pytest.raises(FloatingPointError): rm.log(-1.0)
 
 def test_tolerant_search():
     a = np.random.default_rng(0).integers(0, 50, (20, 30))
-    got, want = rm.unique(a, True, True, True, ct=0), np.unique(a, True, True, True)
-    assert all(np.array_equal(g, w) for g, w in zip(got, want)) and got[0].dtype == a.dtype
+    vals, first, inverse, counts = rm.unique(a)
+    flat = a.ravel()
+    assert np.array_equal(first, np.sort(np.unique(flat, return_index=True)[1])) and np.array_equal(vals, flat[first]) and vals.dtype == a.dtype
+    assert np.array_equal(vals[inverse], flat) and np.array_equal(counts, np.bincount(inverse))
+    # Integers match exactly, where floats this large would match within the tolerance.
+    assert rm.index(np.int64([10**15]), 10**15 + 1) == 1 and rm.index(np.uint8([3, 7]), [7, 9]).tolist() == [1, 2]
     x = [0.3, 1.0, 0.1 + 0.2, 2.0]
-    assert rm.unique(x).tolist() == [0.3, 1.0, 2.0] and len(rm.unique(x, ct=0)) == 4
-    assert [v.tolist() for v in rm.unique(x, return_inverse=True, return_counts=True)[1:]] == [[0, 1, 0, 2], [2, 1, 1]]
+    assert rm.unique(x).values.tolist() == [0.3, 1.0, 2.0] and len(rm.unique(x, ct=0).values) == 4
+    assert [v.tolist() for v in rm.unique(x)[2:]] == [[0, 1, 0, 2], [2, 1, 1]]
     assert rm.index(x, [0.1 + 0.2, 5.0]).tolist() == [0, 4] and rm.index(x, 0.1 + 0.2, ct=0) == 2
-    assert rm.isin(np.float32([0.3, 5]), np.float32([0.3])).tolist() == [True, False] and rm.isin(5.0, x, invert=True)
+    assert rm.isin(np.float32([0.3, 5]), np.float32([0.3])).tolist() == [True, False] and not rm.isin(5.0, x)
     with pytest.raises(TypeError): rm.index(x, [1j])
 
 def test_polynomial():
@@ -85,10 +114,13 @@ def test_polynomial():
     c, x = [2.0, -3.0, 1.0], np.linspace(-2, 3, 50)
     assert rm.polynomial.polyval(2.0, [1, 2, 3]) == 17 and rm.polynomial.polyval(np.float32(x), np.float32(c)).dtype == np.float32
     assert np.allclose(rm.polynomial.polyval(x.reshape(5, 10), c), P.polyval(x, c).reshape(5, 10))
-    assert np.allclose(rm.polynomial.polyroots(c), [1, 2]) and rm.polynomial.polyroots(np.float16(c)).dtype == np.float16
+    assert np.allclose(rm.polynomial.polyroots(c), [1, 2]) and rm.polynomial.polyroots(np.float16(c)).dtype == np.complex64
     assert np.allclose(rm.polynomial.polyroots([1.0, 0, 1]), [-1j, 1j]) and len(rm.polynomial.polyroots([5.0])) == 0
+    # The eigenvalue solver fails on NaN coefficients, so each root is NaN and NumPy reports an invalid value.
+    with np.errstate(invalid='raise'), pytest.raises(FloatingPointError): rm.polynomial.polyroots([np.nan, 0, 1.0])
+    with np.errstate(invalid='ignore'): assert np.isnan(rm.polynomial.polyroots([np.nan, 0, 1.0, 0])).sum() == 2
     assert rm.polynomial.polyfromroots([1, 2]).tolist() == [2, -3, 1] and rm.polynomial.polyfromroots([1j, -1j]).tolist() == [1, 0, 1]
-    for args in [([3.0],), ([1, 2, 3, 4], 2, 3)]: assert rm.polynomial.polyder(*args).tolist() == P.polyder(*args).tolist()
+    assert rm.polynomial.polyder([1, 2, 3, 4]).tolist() == [2, 6, 12] and len(rm.polynomial.polyder([3.0])) == 0
     assert np.allclose(rm.polynomial.polyfit([0, 1, 2, 3], [1, 3, 7, 13], 2), [1, 1, 1])
 
 def test_number_theory():
@@ -130,3 +162,74 @@ def test_distribution():
     assert d.sample((2, 3)).shape == (2, 3) and (d.sample(5, seed=1) == d.sample(5, seed=1)).all()
     with pytest.raises(ValueError): normal(0, -1)
     assert normal().cdf(0.0) == 0.5
+
+@pytest.mark.parametrize('kind', [float, complex])
+def test_linalg(kind):
+    la, rng = rm.linalg, np.random.default_rng(0)
+    H = lambda x: np.conj(np.swapaxes(x, -1, -2))
+    rand = lambda *shape: rng.standard_normal(shape) + 1j * rng.standard_normal(shape) if kind is complex else rng.standard_normal(shape)
+    a, b = rand(4, 5, 5), rand(4, 5, 3)
+    v = b[0, :, 0]
+    assert np.allclose(la.solve(a, b), np.linalg.solve(a, b)) and np.allclose(la.solve(a[0], v), np.linalg.solve(a[0], v))
+    assert np.allclose(la.inv(a), np.linalg.inv(a)) and np.allclose(la.det(a), np.linalg.det(a))
+    sign, log = la.slogdet(a)
+    assert np.allclose(sign, np.linalg.slogdet(a).sign) and np.allclose(log, np.linalg.slogdet(a).logabsdet)
+    l, u, p = la.lu(a)
+    assert np.allclose(l @ u, np.take_along_axis(a, p[..., :, None], axis=-2)) and np.allclose(np.tril(l), l) and np.allclose(np.triu(u), u)
+    assert np.allclose(rm.matmul(a, b), a @ b) and np.allclose(rm.matmul(a, v), a @ v) and np.isclose(rm.matmul(v, v), v @ v)
+    spd = a @ H(a) + 5 * np.eye(5)
+    assert np.allclose(la.cholesky(spd), np.linalg.cholesky(spd))
+    # Signs and phases that NumPy leaves to LAPACK can differ, so factorizations are checked by what they multiply back to.
+    for x in rand(3, 4, 7), rand(3, 7, 4):
+        q, r = la.qr(x)
+        d = np.diagonal(r, axis1=-2, axis2=-1)
+        assert np.allclose(q @ r, x) and (d.real >= 0).all() and (d.imag == 0).all()
+        q, r = la.qr(x, complete=True)
+        assert np.allclose(q @ r, x) and np.allclose(H(q) @ q, np.eye(x.shape[-2]))
+        u, s, v = la.svd(x)
+        assert np.allclose(u * s[..., None, :] @ H(v), x) and np.allclose(H(u) @ u, np.eye(u.shape[-1])) and np.allclose(H(v) @ v, np.eye(v.shape[-1]))
+        assert np.allclose(s, np.linalg.svd(x, compute_uv=False)) and np.allclose(la.svdvals(x), s) and np.allclose(la.pinv(x), np.linalg.pinv(x))
+    sym = a + H(a)
+    w, vecs = la.eigh(sym)
+    assert np.allclose(w, np.linalg.eigvalsh(sym)) and np.allclose(vecs * w[..., None, :] @ H(vecs), sym) and np.allclose(la.eigvalsh(sym), w)
+    w, vecs = la.eig(a)
+    assert np.allclose(a @ vecs, vecs * w[..., None, :]) and np.allclose(np.sort_complex(w), np.sort_complex(np.linalg.eigvals(a)))
+    assert la.eig(sym).values.dtype == la.eigvals(a).dtype == np.result_type(a, 1j)
+    # A rank-deficient or non-square matrix gives the least-norm least-squares solution, and its pseudoinverse.
+    A, B = rand(9, 4), rand(9, 2)
+    deficient = A[:, [0, 1, 1, 3]]
+    for x, y in (A, B), (A, B[:, 0]), (deficient, B):
+        (got, s), want = la.lstsq(x, y), np.linalg.lstsq(x, y)
+        assert np.allclose(got, want[0]) and np.allclose(s, want[3]) and np.allclose(la.solve(x, y), want[0])
+    singular = deficient[:4]
+    assert np.allclose(la.inv(singular), np.linalg.pinv(singular)) and la.matrix_rank(deficient) == 3 and (la.matrix_rank(a) == 5).all()
+    if kind is complex:
+        # complex64 computes at its own width, with real results, such as singular values, in float32.
+        eye = np.eye(3, dtype=np.complex64)
+        assert la.inv(eye).dtype == np.complex64 and la.svd(eye).s.dtype == np.float32 and la.slogdet(eye)[1].dtype == np.float32
+        with pytest.raises(TypeError, match='real matrices'): la.semiring(np.maximum, np.add)(a, b)
+        return
+    # Min-plus products give shortest paths, and or-and products give reachability.
+    d = np.array([[0, 3, np.inf], [np.inf, 0, 1], [2, np.inf, 0]])
+    assert (la.semiring(np.minimum, np.add)(d, d) == np.min(d[:, :, None] + d[None], axis=1)).all()
+    assert np.allclose(la.semiring(rm.maximum, rm.add)(a, b), np.max(a[..., :, :, None] + b[..., None, :, :], axis=-2))
+    g = rng.random((6, 6)) < 0.3
+    assert (rm.matmul(g, g) == np.matmul(g, g)).all() and (la.semiring(np.logical_or, np.logical_and)(g, g) == np.matmul(g, g)).all()
+    # float16 computes in float32 and rounds back.
+    assert la.inv(np.eye(3, dtype=np.float16)).dtype == np.float16 and la.svd(np.eye(3, dtype=np.float32)).s.dtype == np.float32
+    # Integer products compute in int64. An int8 argument converts to it, so these sums of 3 million don't overflow.
+    i8 = np.full((2, 300), 100, np.int8)
+    assert rm.matmul(i8, i8.T).dtype == np.int64 and (rm.matmul(i8, i8.T) == 3_000_000).all()
+    # Integer max-plus and min-plus products, and the counts of equal and unequal items, match NumPy's results built item by item.
+    n, p = rng.integers(-5, 5, (5, 7)), rng.integers(-5, 5, (7, 4))
+    assert (la.semiring(np.maximum, np.add)(n, p) == np.max(n[:, :, None] + p[None], axis=1)).all()
+    assert (la.semiring(np.minimum, np.add)(n, p) == np.min(n[:, :, None] + p[None], axis=1)).all()
+    equal = (n[:, :, None] == p[None]).sum(axis=1)
+    assert (la.semiring(np.add, np.equal)(n, p) == equal).all() and (la.semiring(np.add, np.not_equal)(n, p) == 7 - equal).all()
+    assert (la.semiring(np.add, np.equal)(n / 2, p / 2) == equal).all()
+    # Integer arithmetic wraps on overflow: 2^62 times 4 is 2^64, which wraps to 0.
+    assert rm.matmul([[2**62]], [[4]])[0, 0] == 0
+    # A matrix that can't be factored gives NaN and NumPy's "invalid value" warning, as a failing item of a ufunc does.
+    for f, x in (la.cholesky, -np.eye(2)), (la.eig, [[1., np.nan], [0, 1]]):
+        with pytest.warns(RuntimeWarning, match='invalid value'): assert np.isnan(f(np.array(x))[0]).all()
+    assert la.slogdet([[1., 2], [2, 4]]) == (0, -np.inf) and la.inv(np.zeros((0, 0))).shape == (0, 0)

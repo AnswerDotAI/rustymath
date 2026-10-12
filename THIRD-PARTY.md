@@ -60,3 +60,8 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+## faer
+
+Copyright (c) 2026 sarah quiñones el kazdadi.
+
+MIT License. The Arm Optimized Routines notice above gives its text.

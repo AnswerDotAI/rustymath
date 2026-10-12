@@ -64,7 +64,8 @@ pub(crate) mod sealed {
     macro_rules! exact_items { ($($t:ty),+) => {$( impl Item for $t { #[inline(always)] fn has_nan(self) -> bool { false } } )+} }
     exact_items!(i8, i16, i32, i64, u8, u16, u32, u64, bool, std::cmp::Ordering);
     macro_rules! sealed { ($($t:ty),+) => {$( impl Sealed for $t {} )+} }
-    sealed!(i8, i16, i32, i64, u8, u16, u32);
+    sealed!(i8, i16, i32, i64, u8, u16, u32, u64);
+    impl<T: super::Native> Sealed for Complex<T> {}
 
     pub trait Core: Copy {
         /// Whether this is `f64`. Algorithms pick their constants by it, and the compiler removes the branch.

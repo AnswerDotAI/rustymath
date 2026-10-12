@@ -7,16 +7,18 @@
 //! the program runs, outside any loop. The methods are generic over the float type and compute at its width. `TolerantComplex` gives
 //! the complex versions. The function objects `Equal`, `NotEqual`, `Less`, `LessEqual`, `Greater`, `GreaterEqual`, `Matches`,
 //! `Compare`, `Floor`, `Ceil`, `Residue`, `Gcd` and `Lcm` each hold a `Tolerance` and give the same results as the methods, one item
-//! at a time or over slices. A slice form picks its loop with `with_tolerance!` once. `Residue`, `Gcd` and `Lcm` also have `i64`
-//! forms, from the `integer` module, which ignore the tolerance.
+//! at a time or over slices. A slice form picks its loop with `with_tolerance!` once. A comparison's slice form compares many items
+//! with one number through the range of floats equal to it (`Tolerant::range`), so each item takes one or two plain comparisons. All
+//! but `Matches` and `Compare` also have integer forms, from the `integer` module, which ignore the tolerance. `Floor` and `Ceil` also
+//! take Booleans.
 //!
 //! Tolerant equality isn't transitive: `x` can equal `y` and `y` equal `z` while `x` doesn't equal `z`. Hash maps and sorting need a
 //! transitive `PartialEq`. This module therefore has no float type with a tolerant `==`. Each comparison is a method of the tolerance.
 use crate::{
     convert::{float, int},
     float::{Float, Native},
-    ok, BETWEEN_CHECKS,
-    search::{self, Chains, Key},
+    ok, pairs, Arg, BETWEEN_CHECKS,
+    search::{self, Chains, Key, Links},
 };
 use num_bigint::BigInt;
 use num_complex::Complex;
@@ -259,42 +261,87 @@ macro_rules! tolerant {
     };
 }
 
+/// Writes a tolerant comparison's forms at `real`: its item body over a tolerance `$t`, as `tolerant!` writes them, and a slice form
+/// that compares many items with one number through `against`. `$left` is the band an item must lie in when it is on the left of the
+/// one number, and `$right` the band when it is on the right.
+macro_rules! compared {
+    ($object:ident: |$t:ident, [$x:ident, $y:ident]| $body:expr, $left:ident, $right:ident) => {
+        forms!($object at real => bool: |k, [$x, $y]| with_tolerance!(k.0, |$t| $body),
+            many |k, [$x, $y], n, out| match against(k.0, $x, $y, n, out, Band::$left, Band::$right) {
+                Some(ok) => ok,
+                None => with_tolerance!(k.0, |$t| each!([$x, $y], n, out, |[$x, $y]| $body)),
+            });
+    };
+}
+
+/// Where an item must lie against the range of floats equal to one number (`Tolerant::range`) for a comparison with that number to
+/// hold. `NotAbove` and `NotBelow` include the range itself.
+#[derive(Clone, Copy)]
+enum Band { Inside, Outside, Below, NotAbove, Above, NotBelow }
+
+/// Compares each item of the `Many` argument with the `One` argument `c`, through the range of floats equal to `c`, worked out once.
+/// Each item then takes one or two plain comparisons, in a loop that vectorizes. `left` is the band an item on the left of `c` must
+/// lie in, and `right` the band for an item on its right. `None`, appending nothing, unless exactly one argument is `One` and `c`
+/// isn't NaN.
+#[inline(always)]
+fn against<F: Float>(t: Tolerance, x: Arg<'_, F>, y: Arg<'_, F>, n: usize, out: &mut Vec<bool>, left: Band, right: Band) -> Option<bool> {
+    let (items, (lo, hi), band) = match (x, y) {
+        (Arg::Many(_), Arg::One(c)) => (x, t.range(c)?, left),
+        (Arg::One(c), Arg::Many(_)) => (y, t.range(c)?, right),
+        _ => return None,
+    };
+    Some(match band {
+        Band::Inside => mask(items, n, out, #[inline(always)] |v| (lo <= v) & (v <= hi)),
+        Band::Outside => mask(items, n, out, #[inline(always)] |v| !((lo <= v) & (v <= hi))),
+        Band::Below => mask(items, n, out, #[inline(always)] |v| v < lo),
+        Band::NotAbove => mask(items, n, out, #[inline(always)] |v| v <= hi),
+        Band::Above => mask(items, n, out, #[inline(always)] |v| v > hi),
+        Band::NotBelow => mask(items, n, out, #[inline(always)] |v| v >= lo),
+    })
+}
+
+/// Appends `f` on each of `n` items of `items` to `out`, through `pairs`.
+#[inline(always)]
+fn mask<F: Copy>(items: Arg<'_, F>, n: usize, out: &mut Vec<bool>, f: impl Fn(F) -> bool) -> bool {
+    pairs(items, Arg::One(()), n, out, #[inline(always)] |v, ()| (f(v), true))
+}
+
 /// [`Tolerant::equal`], or [`TolerantComplex::complex_equal`] for complex items, at the tolerance it holds, as a function object.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Equal(pub Tolerance);
-tolerant!(Equal at real => bool: |t, [x, y]| t.equal(x, y));
+compared!(Equal: |t, [x, y]| t.equal(x, y), Inside, Inside);
 tolerant!(Equal at Complex<f32> => bool, Complex<f64> => bool: |t, [x, y]| t.complex_equal(x, y));
 
 /// The negation of [`Equal`] at the tolerance it holds, as a function object, for real and complex items.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NotEqual(pub Tolerance);
-tolerant!(NotEqual at real => bool: |t, [x, y]| !t.equal(x, y));
+compared!(NotEqual: |t, [x, y]| !t.equal(x, y), Outside, Outside);
 tolerant!(NotEqual at Complex<f32> => bool, Complex<f64> => bool: |t, [x, y]| !t.complex_equal(x, y));
 
 /// [`Tolerant::less`] at the tolerance it holds, as a function object.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Less(pub Tolerance);
-tolerant!(Less at real => bool: |t, [x, y]| t.less(x, y));
+compared!(Less: |t, [x, y]| t.less(x, y), Below, Above);
 
 /// [`Tolerant::less_equal`] at the tolerance it holds, as a function object.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LessEqual(pub Tolerance);
-tolerant!(LessEqual at real => bool: |t, [x, y]| t.less_equal(x, y));
+compared!(LessEqual: |t, [x, y]| t.less_equal(x, y), NotAbove, NotBelow);
 
 /// [`Tolerant::greater`] at the tolerance it holds, as a function object.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Greater(pub Tolerance);
-tolerant!(Greater at real => bool: |t, [x, y]| t.greater(x, y));
+compared!(Greater: |t, [x, y]| t.greater(x, y), Above, Below);
 
 /// [`Tolerant::greater_equal`] at the tolerance it holds, as a function object.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GreaterEqual(pub Tolerance);
-tolerant!(GreaterEqual at real => bool: |t, [x, y]| t.greater_equal(x, y));
+compared!(GreaterEqual: |t, [x, y]| t.greater_equal(x, y), NotBelow, NotAbove);
 
 /// [`Tolerant::matches`] at the tolerance it holds, as a function object: `equal`, except that NaN matches NaN.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Matches(pub Tolerance);
-tolerant!(Matches at real => bool: |t, [x, y]| t.matches(x, y));
+compared!(Matches: |t, [x, y]| t.matches(x, y), Inside, Inside);
 
 /// [`Tolerant::compare`] at the tolerance it holds, as a function object. NaN orders after every number and equal to NaN, as
 /// [`Tolerant::matches`] has NaN match NaN.
@@ -343,15 +390,21 @@ tolerant!(Lcm at Complex<f32>, Complex<f64>: |t, [x, y]| {
 });
 
 /// For each item of `y`, the position of the first item of `x` that it matches within tolerance `t`, or the length of `x` where none
-/// does. NaN matches NaN. With `Exactly`, the search indexes order keys (`search::index_of`). With a `Tolerance`, it files the items of
-/// `x` in buckets of neighbouring floats (`Near`), and compares each item of `y` with the items in the two buckets nearest it.
+/// does. NaN matches NaN. Up to `search::SCANNED` items of `y` each take one pass over `x`, which compares every item with the range of
+/// floats equal to it. When every item of both equals a whole number below `whole_limit(t)`, the search indexes those whole numbers
+/// (`search::index_of`), so items equal to one whole number match each other. Otherwise, with `Exactly`, the search indexes order
+/// keys. With a `Tolerance`, it files the items of `x` in buckets of neighbouring floats (`Near`), and compares each item of `y` with
+/// the items in the two buckets nearest it.
 pub fn index_of<F: Float>(t: impl Tolerant, x: &[F], y: &[F]) -> Vec<usize> {
     let Ok(found) = index_of_with(t, x, y, ok);
     found
 }
 
 /// `index_of`, calling `check` before each block of `BETWEEN_CHECKS` items of `y`, and returning `check`'s error at once.
+#[inline(never)]
 pub fn index_of_with<F: Float, E>(t: impl Tolerant, x: &[F], y: &[F], mut check: impl FnMut() -> Result<(), E>) -> Result<Vec<usize>, E> {
+    if y.len() <= search::SCANNED { return Ok(y.iter().map(|&v| scan(t, x, v)).collect()); }
+    if let Some(keys) = wholes(t, x) && let Some(y) = wholes(t, y) { return Ok(search::index_of(&keys, &y)); }
     if t.value() == 0.0 { return Ok(search::index_of(&order_keys(x), &order_keys(y))); }
     let near = Near::new(t, x, |j, i| x[j].order_key() == x[i].order_key());
     let mut found = Vec::with_capacity(y.len());
@@ -366,15 +419,18 @@ pub fn index_of_with<F: Float, E>(t: impl Tolerant, x: &[F], y: &[F], mut check:
     Ok(found)
 }
 
-/// The position of the earliest item of each item's class within tolerance `t`. With `Exactly`, a class holds equal floats. With a
-/// `Tolerance`, a class is a run that `runs` gives, so two items of one class needn't match each other.
+/// The position of the earliest item of each item's class within tolerance `t`. When every item equals a whole number below
+/// `whole_limit(t)`, a class holds the items equal to one whole number. Otherwise, with `Exactly`, a class holds equal floats, and with
+/// a `Tolerance`, a class is a run that `runs` gives. Two items of one class therefore needn't match each other.
 pub fn classes<F: Float>(t: impl Tolerant, x: &[F]) -> Vec<usize> {
     let Ok(classes) = classes_with(t, x, ok);
     classes
 }
 
 /// `classes`, calling `check` after about every `BETWEEN_CHECKS` items, and returning `check`'s error at once.
+#[inline(never)]
 pub fn classes_with<F: Float, E>(t: impl Tolerant, x: &[F], mut check: impl FnMut() -> Result<(), E>) -> Result<Vec<usize>, E> {
+    if let Some(keys) = wholes(t, x) { return Ok(search::classes(&keys)); }
     if t.value() == 0.0 { return Ok(search::classes(&order_keys(x))); }
     let (mut classes, mut since) = (vec![0; x.len()], 0);
     runs(t, x, |run| {
@@ -388,14 +444,23 @@ pub fn classes_with<F: Float, E>(t: impl Tolerant, x: &[F], mut check: impl FnMu
 
 /// Whether each item of `x` is the first of its class, with the classes that `classes` gives.
 pub fn firsts<F: Float>(t: impl Tolerant, x: &[F]) -> Vec<bool> {
-    if t.value() == 0.0 { return search::firsts(&order_keys(x)); }
-    classes(t, x).into_iter().enumerate().map(|(i, c)| c == i).collect()
+    let Ok(mask) = firsts_with(t, x, ok);
+    mask
+}
+
+/// `firsts`, calling `check` as `classes_with` does, and returning `check`'s error at once.
+#[inline(never)]
+pub fn firsts_with<F: Float, E>(t: impl Tolerant, x: &[F], check: impl FnMut() -> Result<(), E>) -> Result<Vec<bool>, E> {
+    if let Some(keys) = wholes(t, x) { return Ok(search::firsts(&keys)); }
+    if t.value() == 0.0 { return Ok(search::firsts(&order_keys(x))); }
+    Ok(classes_with(t, x, check)?.into_iter().enumerate().map(|(i, c)| c == i).collect())
 }
 
 /// Calls `each` with the positions of each run of `x`, in ascending order of position. A run is a longest sequence of floats, taken in
 /// ascending order, in which each matches the next within tolerance `t`. Every float that a float matches lies in one interval
 /// (`Tolerant::range`), so a run holds every match of each of its floats. An error from `each` ends the walk, and `runs` returns it.
 /// The floats sort by their order keys, which read back as floats in memory order.
+#[inline(never)]
 pub fn runs<F: Float, E>(t: impl Tolerant, x: &[F], mut each: impl FnMut(&[usize]) -> Result<(), E>) -> Result<(), E> {
     let sorted = search::sorted(x.iter().zip(0..).map(|(&v, i)| (v.order_key(), i)).collect());
     let mut run = Vec::new();
@@ -433,14 +498,36 @@ impl<F: Float> Near<F> {
     }
     /// The positions filed near `y`: those in its bucket, then those in the neighbour on the side of its half, each in order of position.
     #[inline]
-    pub fn near(&self, y: F) -> impl Iterator<Item = usize> + '_ {
+    pub fn near(&self, y: F) -> Links<'_> {
         let (b, upper) = self.bucket(y);
-        [Some(b), if upper { b.checked_add(1) } else { b.checked_sub(1) }].into_iter().flatten().flat_map(|b| self.chains.chain(b))
+        self.chains.chains(b, if upper { b.checked_add(1) } else { b.checked_sub(1) })
     }
 }
 
 /// The order key of each float.
 fn order_keys<F: Float>(x: &[F]) -> Vec<F::OrderKey> { x.iter().map(|v| v.order_key()).collect() }
+
+/// The magnitude below which each whole number equals no other whole number within tolerance `t`, nor do floats equal to different
+/// whole numbers equal each other: 1/(4t), or 2^53 for a tolerance of 0. It is never above 2^53, below which an `f64` holds every whole
+/// number.
+pub fn whole_limit(t: impl Tolerant) -> f64 { (0.25 / t.value()).min(9_007_199_254_740_992.0) }
+
+/// Each item of `x` as the whole number it equals within tolerance `t`, when every item equals one below `whole_limit(t)` in
+/// magnitude. A search can then index these integers in place of the floats.
+fn wholes<F: Float>(t: impl Tolerant, x: &[F]) -> Option<Vec<i64>> {
+    let limit = whole_limit(t);
+    x.iter().map(|&v| t.whole(v).map(F::wide).filter(|n| n.abs() < limit).map(|n| n as i64)).collect()
+}
+
+/// The position of the first item of `x` that matches `v` within tolerance `t`, or the length of `x`. One pass compares each item with
+/// the range of floats equal to `v`. A NaN `v` matches the first NaN.
+fn scan<F: Float>(t: impl Tolerant, x: &[F], v: F) -> usize {
+    let found = match t.range(v) {
+        Some((lo, hi)) => x.iter().position(|&h| (lo <= h) & (h <= hi)),
+        None => x.iter().position(|h| h.is_nan()),
+    };
+    found.unwrap_or(x.len())
+}
 
 #[cfg(test)]
 mod tests {
@@ -558,6 +645,35 @@ mod tests {
         assert!(T.gcd(f64::NAN, 1.0).is_nan() && T.gcd(f64::NAN, f64::NAN).is_nan() && T.gcd(f64::INFINITY, 1.0).is_nan());
     }
 
+    /// Checks each real comparison's slice form against its scalar form for many items against one number, in either order, with each
+    /// item of `items` as the number.
+    fn against_one<F: Float + std::fmt::Debug>(t: Tolerance, items: &[f64])
+    where
+        Equal: Binary<F, Out = bool>,
+        NotEqual: Binary<F, Out = bool>,
+        Less: Binary<F, Out = bool>,
+        LessEqual: Binary<F, Out = bool>,
+        Greater: Binary<F, Out = bool>,
+        GreaterEqual: Binary<F, Out = bool>,
+        Matches: Binary<F, Out = bool>,
+    {
+        fn check<F: Copy + std::fmt::Debug, K: Binary<F, Out = bool> + std::fmt::Debug>(k: K, x: &[F]) {
+            for &c in x {
+                let (mut left, mut right) = (Vec::new(), Vec::new());
+                assert!(k.many(Arg::Many(x), Arg::One(c), x.len(), &mut left) & k.many(Arg::One(c), Arg::Many(x), x.len(), &mut right));
+                assert_eq!(left, x.iter().map(|&v| k.one(v, c)).collect::<Vec<_>>(), "{k:?} with {c:?} on the right");
+                assert_eq!(right, x.iter().map(|&v| k.one(c, v)).collect::<Vec<_>>(), "{k:?} with {c:?} on the left");
+            }
+        }
+        let x: Vec<F> = items.iter().map(|&v| F::narrow(v)).collect();
+        check(Equal(t), &x);
+        check(NotEqual(t), &x);
+        check(Less(t), &x);
+        check(LessEqual(t), &x);
+        check(Greater(t), &x);
+        check(GreaterEqual(t), &x);
+        check(Matches(t), &x);
+    }
     /// Each tolerant object gives its method's result for each item, at the default tolerance and at 0, for slices beside slices and
     /// one item beside a slice, at f32, f64 and complex items. Only `Gcd`'s infinite argument fails.
     #[test]
@@ -593,6 +709,13 @@ mod tests {
             let want: Vec<Complex64> = zs.iter().map(|&z| t.complex_floor(z)).chain(zs.iter().map(|&z| t.complex_residue(c(1.0, 1.0), z))).collect();
             assert_eq!(complex, want);
         }
+        // Many items against one number take the range of floats equal to it, in either order. Each test item serves as the number.
+        let items = [3.0, -3.0, 0.3, 0.1 + 0.2, 0.0, -0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 2.0, 2.9999999999999996, 1e-310, 1.0 + 3e-14];
+        for t in [T, Tolerance::EXACT] {
+            against_one::<f64>(t, &items);
+            against_one::<f32>(t, &items);
+            against_one::<f16>(t, &items);
+        }
         assert_eq!(Gcd(T).one(12.0, 18.0), 6.0);
         assert!(!Gcd(T).many(Arg::One(f64::INFINITY), Arg::Many(&[2.0][..]), 1, &mut Vec::new()));
         // Lcm has the sign of x y, gives 0 where the gcd is 0, and divides at the tolerance's gcd.
@@ -601,7 +724,7 @@ mod tests {
     }
 
     /// Tolerant search finds the first match that a brute-force search finds, at every width and at small and large tolerances, among
-    /// floats crowded near a few values, and among zeros, infinities and NaN.
+    /// floats crowded near a few values, and among zeros, infinities and NaN, whether it scans for a few items or indexes many.
     #[test]
     fn slice_search() {
         fn check<F: Float + std::fmt::Debug>(t: Tolerance) {
@@ -616,9 +739,20 @@ mod tests {
             let y: Vec<F> = x.iter().rev().copied().chain([F::narrow(7.0)]).collect();
             let brute: Vec<usize> = y.iter().map(|&v| x.iter().position(|&h| t.matches(h, v)).unwrap_or(x.len())).collect();
             assert_eq!(index_of(t, &x, &y), brute, "{t:?}");
+            assert_eq!(index_of(t, &x, &y[..5]), brute[..5], "{t:?}, scanning");
         }
         for t in [T, Tolerance::new(1e-3).unwrap(), Tolerance::new(0.3).unwrap()] { check::<f64>(t); check::<f32>(t); check::<f16>(t); }
         let x = [0.3, 1.0, 0.1 + 0.2];
         assert_eq!((index_of(T, &x, &[0.1 + 0.2, 2.0]), index_of(Exactly, &x, &[0.1 + 0.2, 2.0])), (vec![0, 3], vec![2, 3]));
+        // Floats that each equal a whole number index as integers. At a tolerance of 0.3, which makes 3 equal 4, `whole_limit` lets only
+        // 0 qualify, so the search falls back to buckets.
+        let wx: Vec<f64> = (0..300u64).map(|i| (crate::accuracy::random(i) % 50) as f64 - 25.0).collect();
+        let wy: Vec<f64> = (0..40).map(|i| i as f64 - 30.0).collect();
+        for t in [T, Tolerance::EXACT, Tolerance::new(0.3).unwrap()] {
+            let brute: Vec<usize> = wy.iter().map(|&v| wx.iter().position(|&h| t.matches(h, v)).unwrap_or(wx.len())).collect();
+            assert_eq!(index_of(t, &wx, &wy), brute, "{t:?}");
+        }
+        let ints: Vec<i64> = wx.iter().map(|&v| v as i64).collect();
+        assert_eq!((classes(T, &wx), firsts(T, &wx)), (search::classes(&ints), search::firsts(&ints)));
     }
 }

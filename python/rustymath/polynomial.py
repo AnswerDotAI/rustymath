@@ -1,10 +1,10 @@
-"""Polynomials of one variable, under the names and argument orders of `numpy.polynomial.polynomial`, so code switches by changing an
-import. A polynomial is the array of its coefficients in ascending order: `c` stands for `c[0] + c[1]*x + c[2]*x**2 + ...`."""
+"""Polynomials of one variable, under the names of NumPy's similar functions in `numpy.polynomial.polynomial`. A polynomial is the array
+of its coefficients in ascending order: `c` stands for `c[0] + c[1]*x + c[2]*x**2 + ...`."""
 import numpy as np
 from . import _core
 
 def _dtype(*arrays):
-    "The float or complex dtype that NumPy's polynomial functions compute `arrays` in, at least float16"
+    "The float or complex dtype that `arrays` compute in, at least float16"
     return np.result_type(*(a if isinstance(a, (int, float, complex)) else np.asarray(a) for a in arrays), np.float16)
 
 def _contiguous(a, dt):
@@ -25,13 +25,9 @@ def polyval(
 def polyroots(
     c, # Real or complex coefficients in ascending order
 ):
-    "The roots of `c`, sorted, as the eigenvalues of its companion matrix. They're real when every root is real"
+    "The roots of `c` as complex numbers, sorted by real part, then imaginary part, from the eigenvalues of its companion matrix. With real coefficients, a real root has an imaginary part of exactly 0. Where the eigenvalue solver doesn't converge, each root is NaN and NumPy reports an invalid value"
     c = np.asarray(c)
-    real = np.finfo(_dtype(c)).dtype
-    r = _core.polyroots(np.ascontiguousarray(c, np.complex128))
-    if r is None: raise np.linalg.LinAlgError("the eigenvalue solver didn't converge")
-    r = np.sort(r)
-    return r.real.astype(real) if not r.imag.any() else r.astype(np.result_type(real, np.complex64))
+    return _core.polyroots(np.ascontiguousarray(c, np.complex128)).astype(np.result_type(_dtype(c), np.complex64))
 
 def polyfromroots(
     roots, # Real or complex roots
@@ -42,24 +38,17 @@ def polyfromroots(
 
 def polyder(
     c, # Real or complex coefficients in ascending order
-    m=1, # How many times to differentiate
-    scl=1, # A factor that each differentiation also multiplies by, for a change of variable
 ):
-    "The `m`th derivative of `c`. As in NumPy, a derivative with no terms left is `[0]`"
+    "The derivative of `c`. A constant's derivative is empty, which is the zero polynomial"
     dt = _dtype(c)
-    d = _contiguous(c, dt)
-    for _ in range(m): d = _core.polyder(d)
-    d = (d * scl**m).astype(dt)
-    return d if len(d) else np.zeros(1, dt)
+    return _core.polyder(_contiguous(c, dt)).astype(dt)
 
 def polyfit(
     x, # The points' x coordinates
     y, # The points' y coordinates, one for each x
     deg, # The degree of the polynomial
 ):
-    "The coefficients, in ascending order, of the polynomial of degree `deg` that fits the points by least squares"
-    x, y = np.asarray(x), np.asarray(y)
-    if x.ndim != 1 or x.shape != y.shape: raise ValueError("polyfit needs x and y as vectors of one length")
-    if len(x) <= deg: raise ValueError(f"polyfit needs more than {deg} points for degree {deg}")
+    "The coefficients, in ascending order, of the polynomial of degree `deg` that fits the points by least squares. Where fewer than `deg + 1` distinct points fix it, it's the fit whose coefficients have the least norm"
+    if np.shape(x) != np.shape(y): raise ValueError("polyfit needs one y for each x")
     dt = _dtype(x, y)
     return _core.polyfit(_contiguous(x, dt), _contiguous(y, dt), deg)

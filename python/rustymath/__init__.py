@@ -1,14 +1,14 @@
-"""Fast maths functions as NumPy ufuncs, plus APL's tolerant comparison, special functions, polynomials, probability distributions and
-number theory. The ufuncs take float16, float32 and float64 arrays, complex64 and complex128 arrays where the function has complex
-values, and int64 arrays where NumPy's version does.
+"""Fast maths functions for f16, f32 and f64 in plain Rust.
 
-Functions that NumPy or SciPy also has keep their names, so code switches by changing an import. Every result is within 4 units in the
-last place. `add`, `multiply`, `maximum` and `minimum` sum, multiply and compare as NumPy's do, and their `reduce` and `accumulate` run
-rustymath's vectorized sums, products, maximums and minimums. `polynomial` has the functions of `numpy.polynomial.polynomial`,
-`distribution` has the distributions, and `number_theory` works on Python integers of any size."""
+Modules:
+
+- `rustymath.linalg`: rustymath's linear algebra, under the names of NumPy's similar functions. Each function takes a stack of matrices in the last two axes of its arguments, and broadcasts the axes before them as NumPy's generalized ufuncs do. float32, float64, complex64 and complex128 matrices compute at their own width. float16 matrices compute in float32, with each result rounded to float16. Integers and Booleans compute as float64, except in `matmul` and `semiring`, where integers compute in int64."""
+
 import sys
+from typing import NamedTuple
 import numpy as np
-from . import _core, polynomial
+from . import _core, linalg, polynomial
+from .linalg import matmul
 from .polynomial import _dtype
 from ._core import (__version__, CT, absolute, add, angle, arccos, arccosh, arcsin, arcsinh, arctan, arctan2, arctanh, betainc, betaincinv, binom,
     cbrt, cos, cosh, distribution, erf, erfc, erfcinv, erfinv, exp, expm1, gamma, gammainc, gammaincc, gammaincinv, gammaln, hypot,
@@ -32,7 +32,7 @@ def _comparison(name, relation):
         **kwargs # Passed to the ufunc, such as `out=`
     ): return ufunc(x1, x2, _check(ct), **kwargs)
     compare.__name__ = compare.__qualname__ = name
-    compare.__doc__ = f"Whether `x1` {relation} `x2`, with items equal within tolerance `ct` as APL compares them"
+    compare.__doc__ = f"Whether `x1` {relation} `x2`, with floats equal within tolerance `ct` as APL compares them, and integers compared exactly"
     return compare
 
 equal = _comparison('equal', "equals")
@@ -63,7 +63,7 @@ def remainder(
     ct=CT, # Relative tolerance for floats: a quotient within `ct` of a whole number counts as whole, giving 0
     **kwargs # Passed to the ufunc, such as `out=`
 ):
-    "The remainder of `x1` divided by `x2`, with the sign of `x2`, as `numpy.remainder` gives it, within tolerance `ct`"
+    "The remainder of `x1` divided by `x2`, with the sign of `x2`, as `numpy.remainder` gives it, within tolerance `ct`. A zero `x2` gives `x1`, by APL's rule."
     return _core.remainder(x1, x2, _check(ct), **kwargs)
 
 mod = remainder
@@ -81,53 +81,45 @@ def lcm(
     ct=CT, # Relative tolerance for each remainder step of floats
     **kwargs # Passed to the ufunc, such as `out=`
 ):
-    "The least common multiple of `x1` and `x2`, never negative, as `numpy.lcm` gives it, within tolerance `ct`"
+    "The least common multiple of `x1` and `x2`, with the sign of `x1 x2`, within tolerance `ct`"
     return _core.lcm(x1, x2, _check(ct), **kwargs)
 
-def _floats(*arrays):
-    "`arrays` as flat contiguous vectors of the float dtype that NumPy would compute them in, at least float16"
-    dt = _dtype(*arrays)
-    if dt.kind != 'f': raise TypeError(f"tolerant searches take real numbers, not {dt}")
+def _searched(*arrays):
+    "`arrays` as flat contiguous vectors of one dtype: the Boolean or integer dtype that NumPy would compute them in, or else its float dtype, at least float16"
+    dt = np.result_type(*(a if isinstance(a, (bool, int, float)) else np.asarray(a) for a in arrays))
+    if dt.kind not in 'biu': dt = _dtype(*arrays)
+    if dt.kind not in 'biuf': raise TypeError(f"searches take Booleans, integers or real numbers, not {dt}")
     return [np.ascontiguousarray(np.ravel(a), dt) for a in arrays]
+
+class Unique(NamedTuple):
+    values: np.ndarray
+    firsts: np.ndarray
+    numbers: np.ndarray
+    counts: np.ndarray
 
 def unique(
     ar, # Array of any shape, flattened first
-    return_index=False, # Also return where each unique value first occurs in the flattened `ar`?
-    return_inverse=False, # Also return, shaped like `ar`, where each item's value is in the result?
-    return_counts=False, # Also return how many items of `ar` each unique value stands for?
-    *, ct=CT, # Relative tolerance: each run of floats that match within `ct` counts as one value
+    *, ct=CT, # Relative tolerance: each run of floats that match within `ct` counts as one value. Booleans and integers match exactly
 ):
-    "The sorted unique values of `ar` within tolerance `ct`, each the first item of its class, with the extras `numpy.unique` gives"
-    ar = np.asarray(ar)
-    flat, ct = ar.ravel(), _check(ct)
-    [x] = _floats(flat)
-    classes = _core.classes(x, ct) if return_inverse or return_counts else None
-    first = np.flatnonzero(_core.firsts(x, ct) if classes is None else classes == np.arange(len(classes)))
-    first = first[np.argsort(x[first], kind='stable')]
-    res = [flat[first]]
-    if return_index: res.append(first)
-    if classes is not None:
-        rank = np.empty(len(flat), np.intp)
-        rank[first] = np.arange(len(first))
-        inverse = rank[classes]
-        if return_inverse: res.append(inverse.reshape(ar.shape))
-        if return_counts: res.append(np.bincount(inverse, minlength=len(first)))
-    return res[0] if len(res) == 1 else tuple(res)
+    "The unique values of `ar` in order of first occurrence, each the first item of its class, with each value's first position, each item's class number and each class's size"
+    ar = np.ravel(ar)
+    [x] = _searched(ar)
+    firsts, numbers, counts = _core.unique(x, _check(ct))
+    return Unique(ar[firsts], firsts, numbers, counts)
 
 def index(
     x, # Array to search, flattened first
     y, # A number, or an array of any shape, of values to find
-    *, ct=CT, # Relative tolerance: an item matches a value when they differ by at most `ct` times the larger magnitude
+    *, ct=CT, # Relative tolerance for floats: an item matches a value when they differ by at most `ct` times the larger magnitude
 ):
-    "Where in the flattened `x` each item of `y` first matches within tolerance `ct`, or the size of `x` where nothing does, shaped like `y`"
-    fx, fy = _floats(x, y)
+    "Where in the flattened `x` each item of `y` first matches, or the size of `x` where nothing does, shaped like `y`. Booleans and integers match exactly"
+    fx, fy = _searched(x, y)
     return _core.index_of(fx, fy, _check(ct)).reshape(np.shape(y))[()]
 
 def isin(
     element, # A number, or an array of any shape
     test_elements, # Values to test against, flattened first
-    *, invert=False, # Return whether each item matches none of `test_elements`?
-    ct=CT, # Relative tolerance, as for `index`
+    *, ct=CT, # Relative tolerance, as for `index`
 ):
-    "Whether each item of `element` matches an item of `test_elements` within tolerance `ct`, shaped like `element`, as `numpy.isin` gives it"
-    return np.asarray((index(test_elements, element, ct=ct) < np.size(test_elements)) != invert)
+    "Whether each item of `element` matches an item of `test_elements` within tolerance `ct`, shaped like `element`"
+    return np.asarray(index(test_elements, element, ct=ct) < np.size(test_elements))

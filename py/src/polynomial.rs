@@ -23,10 +23,18 @@ pub fn polyval(x: &Bound<'_, PyUntypedArray>, c: &Bound<'_, PyUntypedArray>) -> 
     })
 }
 
-/// The roots of the polynomial `c`, or `None` when the eigenvalue solver doesn't converge.
+/// The roots of the polynomial `c`. Where the eigenvalue solver doesn't converge, each root is NaN and NumPy reports "invalid value".
 #[pyfunction]
-pub fn polyroots<'py>(py: Python<'py>, c: PyReadonlyArray1<'py, Complex64>) -> PyResult<Option<Bound<'py, PyArray1<Complex64>>>> {
-    Ok(polynomial::roots(c.as_slice()?).map(|r| PyArray1::from_vec(py, r)))
+pub fn polyroots<'py>(py: Python<'py>, c: PyReadonlyArray1<'py, Complex64>) -> PyResult<Bound<'py, PyArray1<Complex64>>> {
+    let c = c.as_slice()?;
+    let roots = match polynomial::roots(c) {
+        Some(roots) => roots,
+        None => {
+            crate::report_invalid(py, c"polyroots")?;
+            vec![Complex64::new(f64::NAN, f64::NAN); polynomial::trimmed(c).len() - 1]
+        }
+    };
+    Ok(PyArray1::from_vec(py, roots))
 }
 
 /// The monic polynomial whose roots are `roots`.

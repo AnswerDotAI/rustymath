@@ -42,6 +42,8 @@ Use the slice forms of `Sin`, `Cos` and `Tan` for arrays. They reduce each item 
 
 The complex slice forms of `Exp`, `Ln`, `Pow`, `Sin`, `Cos`, `Sinh` and `Cosh` vectorize too. Each one splits a chunk of complex items into their real and imaginary parts and computes the results from the real slice forms. It then redoes the rare items with the scalar complex function: items with a tiny or non-finite part, and `Pow`'s special cases. `Abs`, `Angle` and `Sqrt` keep their loop over items, which runs faster than a split for their short formulas. Other complex slice forms, such as `Lgamma`'s, compute one item at a time.
 
+`divide(x, y)` divides complex numbers, inline in the caller's loop, as the free functions do. Two real arguments divide as reals, so a real zero divisor gives ±∞ or NaN with an imaginary part of 0. Its formula's |y|² overflows beyond about 1e154 at f64 and 1e19 at f32.
+
 ### Tolerant comparison
 
 The `tolerant` module has APL's tolerant comparison: x equals y when |x - y| is at most the tolerance times the larger of |x| and |y|. Its objects, such as `Equal`, `Less`, `Floor`, `Residue` and `Gcd`, each hold a `Tolerance`. With `Tolerance::EXACT`, a slice form runs a loop of plain IEEE comparisons, chosen once per call.
@@ -56,13 +58,16 @@ Equal(Tolerance::DEFAULT).many(Arg::Many(&[0.3, 0.1 + 0.2, 0.31]), Arg::One(0.3)
 ### Other modules
 
 - `number_theory`: primality, factorisation, next and previous primes, Euler's totient, and the enumeration and counting of primes, on a `u64`, a `u128` or a `BigUint`. Each computes in the narrowest of those that holds the value. A function that can run for a long time also has a `_with` version, whose extra argument is a check that can stop it.
-- `polynomial`: evaluation over a slice by Horner's rule, roots from the eigenvalues of the companion matrix, building from roots, derivatives and least-squares fitting.
-- `reduce`: sums, products, maximums and minimums over a slice, and their running versions. Float sums and products vectorize by combining the items in any order.
+- `polynomial`: evaluation over a slice by Horner's rule, roots from the eigenvalues of the companion matrix, sorted by real part, then imaginary part, building from roots, derivatives and least-squares fitting.
+- `reduce`: sums, products, maximums and minimums over a slice, and their running versions. `Reduction` gives each fold's unit and its step for one more item, for lanes whose items aren't consecutive. Float sums and products vectorize by combining the items in any order. An integer sum or product, and each running one, wraps where it doesn't fit, and reports whether it fits. `running` scans by any `Reduction`, such as Booleans by `Max`. `rows` folds each row of a matrix, with a loop of its own for each row length below 16, such as an image's 3 channels. `Count` counts the trues among Booleans into a byte or an `i64`.
+- `linalg`: inner products of row-major matrices through the `Inner` trait: the matrix product `PlusTimes`, which also takes complex matrices, the max-plus and min-plus products `MaxPlus` and `MinPlus`, the counts of equal and unequal items `PlusEqual` and `PlusNotEqual`, and the Boolean product `OrAnd`. Each numeric pair also takes `i64` matrices, whose arithmetic wraps. `Inner::checked` gives `None` where an integer result could overflow. They block for the caches, as GotoBLAS and BLIS do. Their innermost loops run on explicit vectors on AArch64, in wasm and on x86-64 with AVX2. Its decompositions of real and complex matrices, at `f32`, `f64` and `Complex` with parts of either type, are `lu`, `cholesky`, `qr`, `qr_complete` and `svd`, with `Lu::solve`, `Lu::inverse`, `Lu::lower`, `Lu::upper`, `Lu::determinant`, `Lu::log_determinant`, `Svd::solve`, `Svd::pseudoinverse`, `singular_values` and the least-squares solver `lstsq`. `solve` and `pinv` give the least-norm solution and the pseudoinverse of any matrix, singular or not. `rank` counts the singular values above `lstsq`'s cutoff. `eigh` and `hermitian_eigenvalues` take Hermitian matrices, and `eig` and `eigenvalues` any square matrix. `transpose_into` transposes a matrix through 8×8 tiles, applying a conversion to each item. `Scalar` is the sealed trait of the four item types.
 - `distribution`: sixteen distributions. The objects `Pdf`, `Cdf` and `Quantile` hold a distribution and evaluate it over a slice. Each distribution also samples from a seeded generator.
 - `random`: rolls and deals that fill a slice from one generator.
 - `convert`: `int` converts a whole float to an integer type. It gives `None` outside the type's range, and for `i64` and `u32` beyond a magnitude of 2^51 - 1. `float` converts an integer to the nearest float. Loops that call either vectorize on every target. AVX2 and wasm lack a vector instruction between `f64` and 64-bit integers. On those targets a loop that converts with `as` runs one item at a time.
 
 The special functions `gamma`, `lgamma`, `erf`, `erfc`, their inverses, the incomplete gamma and beta functions and Lambert W have free functions and objects at the crate root, as the elementary functions do.
+
+`Add`, `Subtract` and `Multiply` are objects at the crate root, for every float, complex and integer type. Their integer forms wrap, as NumPy's integer arrays do. `Overflowing` gives each integer type's arithmetic with whether its result fits, for callers that keep integers exact.
 
 ## Accuracy and speed
 

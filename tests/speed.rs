@@ -4,6 +4,9 @@
 //! that stops vectorizing takes several times as long and goes over budget. Where the standard library has the function, its time
 //! item by item is measured too, for the README's table, but sets no limit. The rows `Pow.one` and `Root.one` time the scalar forms
 //! pair by pair, as a caller with one value at a time runs them.
+//! The inner products multiply 256×256 matrices, whose results hold the same number of items. The decompositions factor 256×256 real
+//! matrices and 128×128 complex ones, and `lstsq` solves a 4096×16 real one. Each of these counts copies of as many items as its
+//! matrix holds. None of them has CI figures yet. Their budgets are four times their cost on the Mac.
 //! `RUSTYMATH_TIMES=1 cargo test --test speed -- --nocapture` prints the README's table, then every function's cost in copies.
 //! The test holds the machine's timing lock while it runs, as `timing_lock` describes.
 use rustymath::*;
@@ -123,9 +126,9 @@ fn reductions() -> [Compared; 4] {
     let max32 = |x: &[f32], out: &mut Vec<f32>| { let mut t = f32::NEG_INFINITY; out.extend(x.iter().map(|&v| { t = t.max(v); t })); };
     [
         ("reduce::sum", [1.0, 1.0], [
-            fold(&|| reduce::sum(black_box(&x64)).unwrap()),
+            fold(&|| reduce::sum(black_box(&x64)).0),
             fold(&|| black_box(&x64).iter().sum::<f64>()),
-            fold(&|| f64::from(reduce::sum(black_box(&x32)).unwrap())),
+            fold(&|| f64::from(reduce::sum(black_box(&x32)).0)),
             fold(&|| f64::from(black_box(&x32).iter().sum::<f32>())),
         ]),
         ("reduce::max", [1.0, 1.6], [
@@ -237,6 +240,82 @@ fn complex() -> [Budgeted; 12] {
     ]
 }
 
+/// Inner products of 256×256 matrices, whose results hold `N` items. In the integer rows, the 64-bit column times items large enough
+/// to need the 64-bit kernels, and the 32-bit column items small enough for the 32-bit kernels. Both count copies of 64-bit items.
+fn inner_products(unit: [f64; 2]) -> [Budgeted; 6] {
+    use linalg::*;
+    let size = [256; 3];
+    let ((a64, a32), (b64, b32)) = (widths(-1.0, 1.0, GOLDEN), widths(-1.0, 1.0, SILVER));
+    let run = |k: &dyn Fn() -> usize| fastest(N, || { black_box(k()); });
+    macro_rules! copies {
+        ($k:expr) => { [run(&|| $k.inner(black_box(&a64), black_box(&b64), size).len()) / unit[0], run(&|| $k.inner(black_box(&a32), black_box(&b32), size).len()) / unit[1]] };
+    }
+    let whole = |x: &[f64], scale: f64| x.iter().map(|&v| (v * scale) as i64).collect::<Vec<_>>();
+    let (large, small) = ([whole(&a64, 1e6), whole(&b64, 1e6)], [whole(&a64, 100.0), whole(&b64, 100.0)]);
+    let wide = large.clone().map(|x| x.into_iter().map(|v| v << 20).collect::<Vec<_>>());
+    macro_rules! integer_copies {
+        ($k:expr, $large:expr, $small:expr) => {
+            [$large, $small].map(|[a, b]: &[Vec<i64>; 2]| run(&|| $k.inner(black_box(a.as_slice()), black_box(b.as_slice()), size).len()) / unit[0])
+        };
+    }
+    [
+        ("linalg::PlusTimes", [290.0, 340.0], copies!(PlusTimes)),
+        ("linalg::MaxPlus", [610.0, 660.0], copies!(MaxPlus)),
+        ("linalg::MinPlus", [610.0, 660.0], copies!(MinPlus)),
+        ("linalg::PlusEqual", [620.0, 640.0], copies!(PlusEqual)),
+        ("linalg::PlusTimes at i64", [320.0, 190.0], integer_copies!(PlusTimes, &large, &small)),
+        ("linalg::PlusEqual at i64", [590.0, 420.0], integer_copies!(PlusEqual, &wide, &small)),
+    ]
+}
+
+/// Decompositions of 256×256 real matrices and 128×128 complex ones, and a least-squares solution for a 4096×16 real matrix. Each cost
+/// counts copies of as many items as the matrix holds. `s` is symmetric positive definite, and `h` is Hermitian.
+fn decompositions(unit: [f64; 2]) -> Vec<Budgeted> {
+    use linalg::*;
+    use num_complex::Complex;
+    let mut seed = 1u64;
+    let mut random = |len: usize| -> Vec<f64> {
+        (0..len)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (seed >> 11) as f64 / (1u64 << 52) as f64 - 1.0
+            })
+            .collect()
+    };
+    let (a64, t64, b64, c64) = (random(N), random(N), random(256), random(4096));
+    let at: Vec<f64> = (0..N).map(|k| a64[k % 256 * 256 + k / 256]).collect();
+    let mut s64 = linalg::PlusTimes.inner(&a64, &at, [256; 3]);
+    for i in 0..256 { s64[i * 257] += 256.0 }
+    let narrow = |x: &[f64]| x.iter().map(|&v| v as f32).collect::<Vec<f32>>();
+    let (a32, t32, b32, c32, s32) = (narrow(&a64), narrow(&t64), narrow(&b64), narrow(&c64), narrow(&s64));
+    let run = |items: usize, k: &dyn Fn() -> usize| fastest(items, || { black_box(k()); });
+    let real = |k64: &dyn Fn() -> usize, k32: &dyn Fn() -> usize| [run(N, k64) / unit[0], run(N, k32) / unit[1]];
+    let n = 128;
+    let complex_unit = [copy(Complex::new(1.0f64, 1.0)), copy(Complex::new(1.0f32, 1.0))];
+    let z64: Vec<Complex<f64>> = a64.iter().zip(&t64).take(n * n).map(|(&re, &im)| Complex::new(re, im)).collect();
+    let h64: Vec<Complex<f64>> = (0..n * n).map(|k| z64[k] + z64[k % n * n + k / n].conj()).collect();
+    let zb64: Vec<Complex<f64>> = b64.iter().zip(&c64).take(n).map(|(&re, &im)| Complex::new(re, im)).collect();
+    let narrowed = |x: &[Complex<f64>]| x.iter().map(|z| Complex::new(z.re as f32, z.im as f32)).collect::<Vec<_>>();
+    let (z32, h32, zb32) = (narrowed(&z64), narrowed(&h64), narrowed(&zb64));
+    let complex = |k64: &dyn Fn() -> usize, k32: &dyn Fn() -> usize| [run(n * n, k64) / complex_unit[0], run(n * n, k32) / complex_unit[1]];
+    vec![
+        ("linalg::Lu::solve", [220.0, 290.0], real(&|| lu(black_box(&a64), 256).solve(&b64, 1).len(), &|| lu(black_box(&a32), 256).solve(&b32, 1).len())),
+        ("linalg::Lu::inverse", [620.0, 780.0], real(&|| lu(black_box(&a64), 256).inverse().len(), &|| lu(black_box(&a32), 256).inverse().len())),
+        ("linalg::cholesky", [120.0, 150.0], real(&|| cholesky(black_box(&s64), 256).map_or(0, |l| l.len()), &|| cholesky(black_box(&s32), 256).map_or(0, |l| l.len()))),
+        ("linalg::qr", [960.0, 1300.0], real(&|| qr(black_box(&a64), [256, 256]).0.len(), &|| qr(black_box(&a32), [256, 256]).0.len())),
+        ("linalg::svd", [6300.0, 7300.0], real(&|| svd(black_box(&a64), [256, 256]).u.len(), &|| svd(black_box(&a32), [256, 256]).u.len())),
+        ("linalg::eigh", [2900.0, 3800.0], real(&|| eigh(black_box(&s64), 256).map_or(0, |f| f.vectors.len()), &|| eigh(black_box(&s32), 256).map_or(0, |f| f.vectors.len()))),
+        ("linalg::eig", [11000.0, 13000.0], real(&|| eig(black_box(&a64), 256).map_or(0, |f| f.vectors.len()), &|| eig(black_box(&a32), 256).map_or(0, |f| f.vectors.len()))),
+        ("linalg::eigenvalues", [5800.0, 7500.0], real(&|| eigenvalues(black_box(&a64), 256).map_or(0, |v| v.len()), &|| eigenvalues(black_box(&a32), 256).map_or(0, |v| v.len()))),
+        ("linalg::lstsq", [150.0, 210.0], real(&|| lstsq(black_box(&t64), &c64, [4096, 16], 1).0.len(), &|| lstsq(black_box(&t32), &c32, [4096, 16], 1).0.len())),
+        ("complex linalg::Lu::solve", [240.0, 330.0], complex(&|| lu(black_box(&z64), n).solve(&zb64, 1).len(), &|| lu(black_box(&z32), n).solve(&zb32, 1).len())),
+        ("complex linalg::qr", [1300.0, 1800.0], complex(&|| qr(black_box(&z64), [n, n]).0.len(), &|| qr(black_box(&z32), [n, n]).0.len())),
+        ("complex linalg::svd", [4400.0, 5400.0], complex(&|| svd(black_box(&z64), [n, n]).u.len(), &|| svd(black_box(&z32), [n, n]).u.len())),
+        ("complex linalg::eigh", [2000.0, 2700.0], complex(&|| eigh(black_box(&h64), n).map_or(0, |f| f.vectors.len()), &|| eigh(black_box(&h32), n).map_or(0, |f| f.vectors.len()))),
+        ("complex linalg::eig", [10000.0, 12000.0], complex(&|| eig(black_box(&z64), n).map_or(0, |f| f.vectors.len()), &|| eig(black_box(&z32), n).map_or(0, |f| f.vectors.len()))),
+    ]
+}
+
 /// The file whose lock keeps timings and builds apart on this machine, as DEV.md describes. Timings take it exclusively. Builds take
 /// it shared.
 const TIMING_LOCK: &str = "/tmp/aai-ws-timing.lock";
@@ -315,6 +394,8 @@ fn speed() {
         .map(|&(name, budget, t)| (name, budget, [t[0] / unit[0], t[2] / unit[1]]))
         .chain(special(unit))
         .chain(complex())
+        .chain(inner_products(unit))
+        .chain(decompositions(unit))
         .collect();
     if std::env::var_os("RUSTYMATH_TIMES").is_some() {
         println!("| Function | f64 | std f64 | f32 | std f32 |\n|---|---|---|---|---|");

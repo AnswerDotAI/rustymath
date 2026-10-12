@@ -61,7 +61,7 @@ macro_rules! arities {
             /// `one`, or `None` where the item fails, as `many` reports.
             fn checked(&self, $($x: T),+) -> Option<Self::Out>;
         }
-        arities!(@concrete $name, $n, ($($x),+): f16, f32, f64, Complex<f32>, Complex<f64>, i8, i16, i32, i64, u8, u16, u32, u64);
+        arities!(@concrete $name, $n, ($($x),+): f16, f32, f64, Complex<f32>, Complex<f64>, i8, i16, i32, i64, u8, u16, u32, u64, bool);
     )+};
     (@concrete $name:ident, $n:literal, $args:tt: $e:ty $(, $rest:ty)*) => {
         arities!(@impl $name, $n, $args, $e);
@@ -83,7 +83,7 @@ macro_rules! arities {
 
 arities! {
     /// A function of one item as a value, with a scalar form and a slice form. rustymath's function objects, such as [`Exp`](crate::Exp),
-    /// implement it at each item type they take: every [`Float`] type for a float function, and complex numbers or integers for others.
+    /// implement it at each item type they take: every [`Float`] type for a float function, and complex numbers, integers or Booleans for others.
     /// `Out` is the type of each result, which is the item type unless the function gives another, as [`Abs`](crate::Abs) gives the
     /// real magnitude of a complex number. Its methods take `&self`, so a function object can hold settings.
     Unary<1>(x);

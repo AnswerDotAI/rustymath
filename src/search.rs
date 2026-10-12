@@ -2,10 +2,11 @@
 //! you want (`RadixKey`). `Float::order_key` gives each float such a word, as wide as the float. Positions take 32 bits inside these
 //! functions, so a slice holds at most `u32::MAX` items. `tolerant` builds its searches over floats on these functions.
 //!
-//! `index_of`, `classes` and `firsts` index the first position of each key. The index is a table when the keys span at most twice
-//! the slice's length, or 1024, and a hash map otherwise. `counts` counts the items with each key in such a table. `sort_rows` sorts
-//! keys that span such a table by counting them. It sorts other keys with an LSD radix sort that skips any byte that is the same in
-//! every key.
+//! `index_of`, `classes` and `firsts` index the first position of each key. `index_of` passes over `x` once for each item of `y` when
+//! `y` has at most `SCANNED` items. The index is a table when the keys span at most twice the slice's length, or 1024, and a hash map
+//! otherwise. `numbered` numbers the classes in order of first position, with each one's size. `counts` counts the items with each
+//! key in such a table. `sort_rows` sorts keys that span such a table by counting them. It sorts other keys with an LSD radix sort that
+//! skips any byte that is the same in every key.
 use hashbrown::{HashMap, hash_map::Entry};
 use std::{hash::Hash, ops::Not};
 
@@ -48,8 +49,14 @@ macro_rules! radix_keys {
 }
 radix_keys!(u16, u32, u64);
 
+/// The number of items of `y` up to which `index_of` and `tolerant::index_of` pass over `x` once for each, in place of building an
+/// index.
+pub const SCANNED: usize = 16;
+
 /// For each item of `y`, the first position of its key in `x`, or the length of `x` when it has none.
+#[inline(never)]
 pub fn index_of<K: Key>(x: &[K], y: &[K]) -> Vec<usize> {
+    if y.len() <= SCANNED { return y.iter().map(|n| x.iter().position(|h| h == n).unwrap_or(x.len())).collect(); }
     let miss = x.len();
     if let Some((min, mut table)) = table(x, miss) {
         let first = write_first(x, min, &mut table);
@@ -60,6 +67,7 @@ pub fn index_of<K: Key>(x: &[K], y: &[K]) -> Vec<usize> {
 }
 
 /// The first position of each item's key in `x`, which represents the item's class.
+#[inline(never)]
 pub fn classes<K: Key>(x: &[K]) -> Vec<usize> {
     if let Some((min, mut table)) = table(x, 0) {
         let first = write_first(x, min, &mut table);
@@ -71,6 +79,7 @@ pub fn classes<K: Key>(x: &[K]) -> Vec<usize> {
 
 /// Whether each item of `x` is the first with its key. Once the index holds the first position of each key, marking those positions
 /// gives the result, with no second pass over `x`.
+#[inline(never)]
 pub fn firsts<K: Key>(x: &[K]) -> Vec<bool> {
     let mut mask = vec![false; x.len()];
     if let Some((min, mut table)) = table(x, usize::MAX) {
@@ -84,6 +93,7 @@ pub fn firsts<K: Key>(x: &[K]) -> Vec<bool> {
 /// The least key of `x`, and the number of items with each key from it to the greatest, when `tabled` allows that range. With fewer
 /// than 64 keys, runs of one key are common, and each count would wait for the previous one to be stored. So the items then go to
 /// four tables in turn, which are summed at the end. On the Mac, that makes 2 keys 3 times as fast, and 64 keys or more no faster.
+#[inline(never)]
 pub fn counts<K: Key>(x: &[K]) -> Option<(i64, Vec<usize>)> {
     let (min, mut counts) = table(x, 0)?;
     let n = counts.len();
@@ -98,6 +108,34 @@ pub fn counts<K: Key>(x: &[K]) -> Option<(i64, Vec<usize>)> {
     for k in rest { parts[at(k)] += 1 }
     for (g, count) in counts.iter_mut().enumerate() { *count = (0..4).map(|p| parts[p * n + g]).sum() }
     Some((min, counts))
+}
+
+/// The classes that `classes` gives, numbered from 0 in order of their first positions.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Numbered {
+    /// The first position of each class, in ascending order.
+    pub firsts: Vec<usize>,
+    /// Each item's class number.
+    pub numbers: Vec<usize>,
+    /// The number of items in each class.
+    pub counts: Vec<usize>,
+}
+
+/// Numbers the classes in `classes`, which gives each item the first position of its class, as `classes` and `tolerant::classes` do.
+pub fn numbered(classes: &[usize]) -> Numbered {
+    let mut number = vec![0; classes.len()];
+    let (mut firsts, mut numbers, mut counts) = (Vec::new(), Vec::with_capacity(classes.len()), Vec::new());
+    for (i, &c) in classes.iter().enumerate() {
+        if c == i {
+            number[i] = firsts.len();
+            firsts.push(i);
+            counts.push(0);
+        }
+        let k = number[c];
+        numbers.push(k);
+        counts[k] += 1;
+    }
+    Numbered { firsts, numbers, counts }
 }
 
 /// The least key of `x`, and a table with an entry for each key from it to the greatest, each `empty`, when `tabled` allows that range.
@@ -128,6 +166,7 @@ fn first_positions<K: Key>(x: &[K]) -> HashMap<K, u32> {
 /// The positions of `groups` in order of group, keeping their order within each group, and the number of positions in each of the
 /// `n` groups. With few groups, a run of one group would make each count wait for the previous one to be stored. So the positions
 /// are then split into four parts, and each part has its own counts and its own next place in each group.
+#[inline(never)]
 pub fn grouped(groups: &[usize], n: usize) -> (Vec<usize>, Vec<usize>) {
     let len = groups.len();
     let parts = if n.saturating_mul(16) <= len { 4 } else { 1 };
@@ -161,6 +200,7 @@ pub fn grouped(groups: &[usize], n: usize) -> (Vec<usize>, Vec<usize>) {
 /// their order of position. `key(row, column)` gives each entry as a key whose unsigned order is the order you want. Fewer than 256
 /// rows take a comparison sort. One column whose keys `tabled` allows takes a counting sort. Other tables take the radix sort once
 /// for each column, from the last.
+#[inline(never)]
 pub fn sort_rows<K: RadixKey>(n: usize, width: usize, key: impl Fn(usize, usize) -> K) -> Vec<usize> {
     if n < 256 {
         let mut order: Vec<usize> = (0..n).collect();
@@ -257,7 +297,7 @@ impl Chains {
         match self.ends.entry(key) {
             Entry::Occupied(mut e) => {
                 let (first, last) = e.get_mut();
-                if links(&self.next, *first).any(copy) { return; }
+                if links(&self.next, *first, u32::MAX).any(copy) { return; }
                 self.next[*last as usize] = i as u32;
                 *last = i as u32;
             }
@@ -268,14 +308,35 @@ impl Chains {
     }
     /// The positions in `key`'s chain, in the order they were pushed.
     #[inline]
-    pub fn chain(&self, key: u64) -> impl Iterator<Item = usize> + '_ {
-        self.ends.get(&key).into_iter().flat_map(|&(first, _)| links(&self.next, first))
-    }
+    pub fn chain(&self, key: u64) -> Links<'_> { links(&self.next, self.first(key), u32::MAX) }
+    /// The positions in `key`'s chain, then those in `then`'s chain if `then` is given, each in the order they were pushed.
+    #[inline]
+    pub fn chains(&self, key: u64, then: Option<u64>) -> Links<'_> { links(&self.next, self.first(key), then.map_or(u32::MAX, |k| self.first(k))) }
+    /// The first position pushed with `key`, or `u32::MAX` where there's none.
+    #[inline]
+    fn first(&self, key: u64) -> u32 { self.ends.get(&key).map_or(u32::MAX, |&(first, _)| first) }
 }
 
-/// The positions linked from `first` through `next`, in the order they were pushed.
-fn links(next: &[u32], first: u32) -> impl Iterator<Item = usize> + '_ {
-    std::iter::successors(Some(first), |&i| Some(next[i as usize]).filter(|&j| j != u32::MAX)).map(|i| i as usize)
+/// The positions linked from `at` through `next`, then those linked from `then`.
+#[inline]
+fn links(next: &[u32], at: u32, then: u32) -> Links<'_> { Links { next, at, then } }
+
+/// The positions in one or two of [`Chains`]' chains, each in the order they were pushed. Keep `next` this small: the search loops
+/// that call it rely on it inlining.
+pub struct Links<'a> { next: &'a [u32], at: u32, then: u32 }
+
+impl Iterator for Links<'_> {
+    type Item = usize;
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        if self.at == u32::MAX {
+            if self.then == u32::MAX { return None; }
+            (self.at, self.then) = (self.then, u32::MAX);
+        }
+        let i = self.at;
+        self.at = self.next[i as usize];
+        Some(i as usize)
+    }
 }
 
 #[cfg(test)]
@@ -286,6 +347,10 @@ mod tests {
     fn search_and_sort() {
         let x = [30, 10, 20, 10];
         assert_eq!(index_of(&x, &[10, 40]), [1, 4]);
+        // More than `SCANNED` needles build the index in place of scanning.
+        let many: Vec<i32> = (0..20).map(|i| [10, 40, 30][i % 3]).collect();
+        assert_eq!(index_of(&x, &many), (0..20).map(|i| [1, 4, 0][i % 3]).collect::<Vec<_>>());
+        assert_eq!(numbered(&classes(&x)), Numbered { firsts: vec![0, 1, 2], numbers: vec![0, 1, 2, 1], counts: vec![1, 2, 1] });
         assert_eq!(classes(&x), [0, 1, 2, 1]);
         assert_eq!(sort_rows(x.len(), 1, |r, _| x[r] as u32), [1, 3, 2, 0]);
         // 300 rows take the counting sort. Equal keys keep their order of position, also under complemented keys, which reverse it.

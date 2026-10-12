@@ -5,6 +5,7 @@
 #[macro_use]
 mod slice;
 mod arc;
+mod arith;
 mod complex;
 mod dd;
 mod exp;
@@ -21,6 +22,7 @@ mod trig;
 pub mod convert;
 pub mod distribution;
 pub mod integer;
+pub mod linalg;
 pub mod number_theory;
 pub mod polynomial;
 pub mod reduce;
@@ -37,6 +39,8 @@ pub use sqrts::Sqrt;
 pub use ln::Logb;
 pub use pow::{Pow, Root};
 pub use trig::{Cos, Sin, Tan};
+pub use complex::divide;
+pub use arith::{Add, Multiply, Overflowing, Subtract};
 
 /// The check for a `_with` function's plain version, which can't fail.
 pub(crate) fn ok() -> Result<(), std::convert::Infallible> { Ok(()) }

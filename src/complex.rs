@@ -9,6 +9,9 @@
 //! a cut.
 //! The inverse functions use the formulas from Kahan's "Branch Cuts for Complex Elementary Functions" (1987), built on the complex
 //! square root, which keep their digits near the branch points.
+//!
+//! `exp` and the powers that compute through it give an exact direction at the float nearest a whole number of quarter turns. e^(iπ/2)
+//! is then exactly i, where the exponential of that float has a real part of about 6e-17. These results lie outside the error bound.
 use crate::{arc, exp as e, float::ln2, hyperbolic, ln as l, pow as p, special, trig, Native};
 use crate::{
     Abs, Acos, Acosh, Angle, Arg, Asin, Asinh, Atan, Atan2, Atanh, Binary, Binom, Cos, Cosh, Exp, Factorial, Gamma, Hypot, Lgamma, Ln,
@@ -31,6 +34,30 @@ fn unturned<R: Native>(z: Complex<R>) -> Complex<R> { c(z.im, -z.re) }
 #[inline(always)]
 fn pi<R: Native>() -> R { let (hi, _) = arc::half_pi::<R>(); hi + hi }
 
+/// cos y and sin y as exactly 1, 0 or -1, where y is the float nearest kπ/2 for a whole number k of quarter turns, with |k| up to 256.
+#[inline(always)]
+fn quarter<R: Native>(y: R) -> Option<(R, R)> {
+    let (q, _) = arc::half_pi::<R>();
+    let k = (y * R::narrow(std::f64::consts::FRAC_2_PI)).round();
+    if !((k.abs() <= R::narrow(256.0)) & (k * q == y)) { return None }
+    let (zero, one, m) = (R::zero(), R::one(), k - R::narrow(4.0) * (k * R::narrow(0.25)).floor());
+    Some(if m == zero { (one, zero) } else if m == one { (zero, one) } else if m == one + one { (-one, zero) } else { (zero, -one) })
+}
+
+/// A part of e^z: `scale` times `d`, the cosine or sine of y. A part that `quarter` makes exactly 0 stays 0, even where e^x overflows,
+/// unless x is NaN.
+#[inline(always)]
+fn part<R: Native>(x: R, d: R, scale: R) -> R { if (d == R::zero()) & !x.is_nan() { d } else { scale * d } }
+
+/// x / y for complex numbers, inline in the caller's loop, by num_complex's formula. Two real arguments divide as reals, so a real zero
+/// divisor gives ±∞ or NaN with an imaginary part of 0. Any other zero divisor gives NaN parts. |y|² overflows beyond about 1e154 at
+/// f64 and 1e19 at f32, and underflows below their inverses, where the quotient loses its digits. The decompositions' `Scalar::quotient`
+/// uses Smith's algorithm, which avoids that at the cost of speed in a vector loop.
+#[inline(always)]
+pub fn divide<R: Native>(x: Complex<R>, y: Complex<R>) -> Complex<R> {
+    if (x.im == R::zero()) & (y.im == R::zero()) { c(x.re / y.re, R::zero()) } else { x / y }
+}
+
 /// |z| for the scalar functions. At f64 it is `hypot`. At f32 it adds the squares of z's parts in f64, where no square overflows or
 /// loses bits, and rounds the root once. That is within half an ulp, where `hypot` at f32's own width is within about one, and it
 /// costs less than `hypot`'s scaling.
@@ -40,14 +67,15 @@ fn modulus<R: Native, const FUSED: bool>(x: R, y: R) -> R {
     if R::WIDE { p::hypot::<R, FUSED>(x, y) } else { R::narrow((a * a + b * b).sqrt()) }
 }
 
-/// e^z = e^x (cos y + i sin y). e^x/2 times 2 cos y keeps the result finite where e^x overflows but the result doesn't. A real z gives
-/// a real result. At x = -∞ the result is 0, and at x = ∞ with an infinite or NaN y it is ∞ + i NaN.
+/// e^z = e^x (cos y + i sin y). A y that is the float nearest a whole number of quarter turns, up to 256 of them, gives an exact
+/// direction: e^(iπ/2) is i and e^(iπ) is -1. e^x/2 times 2 cos y keeps the result finite where e^x overflows but the result doesn't.
+/// A real z gives a real result. At x = -∞ the result is 0, and at x = ∞ with an infinite or NaN y it is ∞ + i NaN.
 #[inline]
 pub(crate) fn exp<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R> {
     let (x, y) = (z.re, z.im);
     let half = e::exp_times::<R, FUSED>(x, -R::one());
-    let (cy, sy) = (trig::cos::<R, FUSED>(y), trig::sin::<R, FUSED>(y));
-    let r = c(half * (cy + cy), if y == R::zero() { y } else { half * (sy + sy) });
+    let (cy, sy) = quarter(y).unwrap_or_else(|| (trig::cos::<R, FUSED>(y), trig::sin::<R, FUSED>(y)));
+    let r = c(part(x, cy + cy, half), if y == R::zero() { y } else { part(x, sy + sy, half) });
     let lost = x.is_infinite() & !y.is_finite();
     if lost { if x > R::zero() { c(x, R::nan()) } else { c(R::zero(), R::zero().copysign(y)) } } else { r }
 }
@@ -375,8 +403,10 @@ where
     Exp.many(Arg::Many(x), n, &mut e);
     Cos.many(Arg::Many(y), n, &mut cy);
     Sin.many(Arg::Many(y), n, &mut sy);
-    re.extend(e.iter().zip(&cy).map(|(&e, &c)| e * c));
-    im.extend(y.iter().zip(&e).zip(&sy).map(|((&y, &e), &s)| if y == R::zero() { y } else { e * s }));
+    re.extend(x.iter().zip(y).zip(e.iter().zip(&cy)).map(|((&x, &y), (&e, &c))| part(x, quarter(y).map_or(c, |q| q.0), e)));
+    im.extend(x.iter().zip(y).zip(e.iter().zip(&sy)).map(|((&x, &y), (&e, &s))| {
+        if y == R::zero() { y } else { part(x, quarter(y).map_or(s, |q| q.1), e) }
+    }));
 }
 
 /// sinh z's parts, or with `cosh` cosh z's, computed through real slice forms from slices of z's parts, as `sinh` and `cosh` combine
@@ -467,7 +497,7 @@ forms!(Pow at Complex<f32>, Complex<f64>: |_, [z, w]| pow::<_, { crate::FUSED }>
         let (unit, zero, real) = pow_cases(z, w);
         unit | zero | real | tiny(z) | !finite(r)
     }, |[z, w]| pow::<_, { crate::FUSED }>(z, w)));
-forms!(Logb at Complex<f32>, Complex<f64>: |_, [b, z]| ln::<_, { crate::FUSED }>(z) / ln::<_, { crate::FUSED }>(b));
+forms!(Logb at Complex<f32>, Complex<f64>: |_, [b, z]| divide(ln::<_, { crate::FUSED }>(z), ln::<_, { crate::FUSED }>(b)));
 forms!(Binom at Complex<f32>, Complex<f64>: |_, [n, k]| binom::<_, { crate::FUSED }>(n, k));
 forms!(Abs at Complex<f32> => f32, Complex<f64> => f64: |_, [z]| crate::slice::Total(p::hypot::<_, { crate::FUSED }>(z.re, z.im)));
 forms!(Angle at Complex<f32> => f32, Complex<f64> => f64: |_, [z]| crate::slice::Total(arc::atan2::<_, { crate::FUSED }>(z.im, z.re)));
@@ -634,5 +664,52 @@ mod tests {
         assert_eq!(sign::<f64, false>(k(-0.0, 0.0)), k(-0.0, 0.0));
         assert!(lgamma::<f64, false>(k(-3.0, 0.0)).re.is_nan());
         assert_eq!(binom::<f64, false>(k(2.0, 0.0), k(3.0, 0.0)), k(0.0, 0.0));
+    }
+
+    /// Division divides two reals as reals, so a real zero divisor gives ∞ with an imaginary part of 0. Any other zero divisor gives NaN.
+    #[test]
+    fn division() {
+        let k = |re: f64, im: f64| c(re, im);
+        let q = divide(k(3.0, 4.0), k(1.0, 2.0));
+        assert!((q - k(2.2, -0.4)).norm() <= 4.0 * f64::EPSILON * 2.3, "{q}");
+        assert_eq!(divide(k(5.0, 0.0), k(2.0, 0.0)), k(2.5, 0.0));
+        assert_eq!(divide(k(1.0, 0.0), k(0.0, 0.0)), k(f64::INFINITY, 0.0));
+        let z = divide(k(1.0, -2.0), k(0.0, 0.0));
+        assert!(z.re.is_nan() && z.im.is_nan(), "{z}");
+    }
+
+    /// e^(iy) at the float nearest kπ/2 is exactly i^k, through the scalar and slice forms of `Exp` and of the `Pow`s that compute
+    /// through it. A part the quarter turn makes 0 stays 0 where e^x overflows, and NaN in x still gives NaN.
+    #[test]
+    fn quarter_turns() {
+        fn check<R: Native + std::fmt::Debug>(big: f64)
+        where
+            Exp: Unary<Complex<R>, Out = Complex<R>>,
+            Pow: Binary<Complex<R>, Out = Complex<R>>,
+        {
+            let (q, _) = arc::half_pi::<R>();
+            let (zero, one) = (R::zero(), R::one());
+            let turns = [c(one, zero), c(zero, one), c(-one, zero), c(zero, -one)];
+            let sliced = |z: Complex<R>| {
+                let mut out = Vec::new();
+                Exp.many(Arg::Many(&[z]), 1, &mut out);
+                out[0]
+            };
+            for k in -8i32..=8 {
+                let (z, want) = (c(zero, R::narrow(k as f64) * q), turns[k.rem_euclid(4) as usize]);
+                assert_eq!((exp::<R, true>(z), sliced(z)), (want, want), "k = {k}");
+            }
+            let (above, nan) = (c(R::narrow(big), q), c(R::nan(), q));
+            assert_eq!((exp::<R, true>(above), sliced(above)), (c(zero, R::infinity()), c(zero, R::infinity())));
+            assert!(exp::<R, true>(nan).re.is_nan() && sliced(nan).re.is_nan());
+            let (minus, half, three) = (c(-one, zero), c(R::narrow(0.5), zero), c(R::narrow(1.5), zero));
+            for (z, w, want) in [(minus, half, turns[1]), (minus, three, turns[3]), (turns[1], c(one + one, zero), turns[2])] {
+                let mut out = Vec::new();
+                Pow.many(Arg::Many(&[z]), Arg::Many(&[w]), 1, &mut out);
+                assert_eq!((pow::<R, true>(z, w), out[0]), (want, want), "{z:?}^{w:?}");
+            }
+        }
+        check::<f64>(800.0);
+        check::<f32>(100.0);
     }
 }

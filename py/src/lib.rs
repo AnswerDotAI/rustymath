@@ -2,15 +2,16 @@
 //! input with stride 0 is one item beside the others, and a strided input is copied into a buffer first. Through `numpy.errstate`,
 //! NumPy reports "invalid value" for a NaN result from arguments that aren't NaN, and "overflow" for an integer result that doesn't
 //! fit. Each loop clears the other floating-point status flags, which rustymath's branch-free code sets in lanes it discards.
-use std::ffi::{c_char, c_int, c_void, CString};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::{array, ptr, slice};
 
 use half::f16;
 use numpy::npyffi::{npy_intp, PyUFuncGenericFunction, NPY_TYPES, PY_UFUNC_API};
 use numpy::{Complex32, Complex64};
 use pyo3::prelude::*;
+use pyo3::types::PyCapsule;
 use rustymath::tolerant::{Ceil, Equal, Floor, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue, Tolerance, Tolerant};
-use rustymath::{reduce, Arg, Binary, Ternary, Unary, CHUNK};
+use rustymath::{reduce::{self, Reduction}, Arg, Binary, Ternary, Unary, CHUNK};
 
 /// Runs `$body` with `$t` as the element type of the float array `$a`.
 macro_rules! floats {
@@ -24,12 +25,24 @@ macro_rules! floats {
 }
 
 mod distribution;
+mod linalg;
 mod number_theory;
 mod polynomial;
 mod search;
 
 /// The tolerance that `ct` gives, or `Tolerance::EXACT` where it's out of range. The Python wrappers check the range first.
 fn tolerance(ct: f64) -> Tolerance { Tolerance::new(ct).unwrap_or(Tolerance::EXACT) }
+
+/// Reports NumPy's "invalid value" for the function `name`, as NumPy does after a ufunc loop with a failed item. `numpy.errstate` then
+/// decides whether it warns, raises or does nothing. It calls `PyUFunc_GiveFloatingpointErrors`, slot 46 of NumPy 2's ufunc API. The
+/// `numpy` crate doesn't bind that slot.
+fn report_invalid(py: Python<'_>, name: &CStr) -> PyResult<()> {
+    const NPY_FPE_INVALID: c_int = 8;
+    let api = py.import("numpy._core.umath")?.getattr("_UFUNC_API")?.cast_into::<PyCapsule>()?.pointer_checked(None)?;
+    // SAFETY: slot 46 holds `int PyUFunc_GiveFloatingpointErrors(const char *, int)`.
+    let give: unsafe extern "C" fn(*const c_char, c_int) -> c_int = unsafe { std::mem::transmute(*api.cast::<*const c_void>().as_ptr().add(46)) };
+    if unsafe { give(name.as_ptr(), NPY_FPE_INVALID) } < 0 { Err(PyErr::fetch(py)) } else { Ok(()) }
+}
 
 /// The C library's floating-point status flags, as each platform's `fenv.h` numbers them.
 mod fe {
@@ -69,18 +82,16 @@ trait Code: Copy + Default {
 }
 
 macro_rules! codes {
+    (overflow: $($t:ty => $code:ident),+) => {$(impl Code for $t { const CODE: NPY_TYPES = NPY_TYPES::$code; const FLAG: c_int = fe::OVERFLOW; })+};
     ($($t:ty => $code:ident),+) => {$(impl Code for $t { const CODE: NPY_TYPES = NPY_TYPES::$code; })+};
 }
 codes!(f16 => NPY_HALF, f32 => NPY_FLOAT, f64 => NPY_DOUBLE, Complex32 => NPY_CFLOAT, Complex64 => NPY_CDOUBLE, bool => NPY_BOOL);
-
-impl Code for i64 {
-    #[cfg(not(windows))]
-    const CODE: NPY_TYPES = NPY_TYPES::NPY_LONG;
-    #[cfg(windows)]
-    const CODE: NPY_TYPES = NPY_TYPES::NPY_LONGLONG;
-    /// An integer item fails where its result doesn't fit, and NumPy reports "overflow".
-    const FLAG: c_int = fe::OVERFLOW;
-}
+// An integer item fails where its result doesn't fit, and NumPy reports "overflow".
+codes!(overflow: i8 => NPY_BYTE, u8 => NPY_UBYTE, i16 => NPY_SHORT, u16 => NPY_USHORT, i32 => NPY_INT, u32 => NPY_UINT);
+#[cfg(not(windows))]
+codes!(overflow: i64 => NPY_LONG, u64 => NPY_ULONG);
+#[cfg(windows)]
+codes!(overflow: i64 => NPY_LONGLONG, u64 => NPY_ULONGLONG);
 
 /// A ufunc's function at element type `E`, with `N` inputs.
 trait Kernel<E, const N: usize> {
@@ -124,76 +135,52 @@ impl<E, K: Kernel<E, 2>> Kernel<E, 2> for Swapped<K> {
     fn many(&self, [x, y]: [Arg<'_, E>; 2], n: usize, out: &mut Vec<K::Out>) -> bool { self.0.many([y, x], n, out) }
 }
 
-/// A result without its sign.
-trait Magnitude { fn magnitude(self) -> Self; }
-impl Magnitude for f16 { fn magnitude(self) -> Self { f16::from_bits(self.to_bits() & 0x7fff) } }
-impl Magnitude for f32 { fn magnitude(self) -> Self { self.abs() } }
-impl Magnitude for f64 { fn magnitude(self) -> Self { self.abs() } }
-impl Magnitude for i64 { fn magnitude(self) -> Self { self.wrapping_abs() } }
-
-/// `K` with each result's sign dropped, for NumPy's `lcm`, which is never negative.
-#[derive(Clone, Copy)]
-struct Absolute<K>(K);
-
-impl<E, K: Kernel<E, N, Out: Magnitude>, const N: usize> Kernel<E, N> for Absolute<K> {
-    type Out = K::Out;
-    fn many(&self, x: [Arg<'_, E>; N], n: usize, out: &mut Vec<K::Out>) -> bool {
-        let start = out.len();
-        let ok = self.0.many(x, n, out);
-        for r in &mut out[start..] { *r = r.magnitude() }
-        ok
-    }
-}
-
-/// NumPy's `add` and `multiply`. Their `reduce` and `accumulate` run `rustymath::reduce` where it has the type.
+/// NumPy's `add` and `multiply`, which run rustymath's `Add` and `Multiply`. On Booleans they run `Maximum` and `Minimum`, the `or` and
+/// `and` that NumPy gives. Where rustymath's `reduce` folds a type into itself, their `reduce` and `accumulate` run its sums and
+/// products. Narrower integers and complex numbers fold item by item.
 #[derive(Clone, Copy)]
 struct Add;
 #[derive(Clone, Copy)]
 struct Multiply;
 
-/// The running values of `f` from `start` over `x`, appended to `out`.
-fn running<T: Copy>(start: T, x: &[T], out: &mut Vec<T>, f: impl Fn(T, T) -> T) {
-    out.extend(x.iter().scan(start, |s, &v| { *s = f(*s, v); Some(*s) }));
-}
-
-/// Writes each type's kernel for `$k`, whose items combine by the closure after `:` or by the function object after `=`. The
-/// bracketed `fold` and `scan`, where given, give `reduce` and `accumulate`.
+/// Writes each type's kernel for `$k`, which runs the function object `$obj`. With the bracketed `fold` and `scan`, `reduce` folds
+/// each chunk by `fold`, then combines that with the running result by `$obj`, and `accumulate` runs `scan`. An integer fold or scan
+/// wraps, as `$obj` does, so the kernel ignores whether it fits.
 macro_rules! arithmetic {
-    (@one $k:ty, $e:ty, $many:tt, [$(fold $fold:expr, scan $scan:expr)?]) => {
+    (@one $k:ty, $e:ty, $obj:expr, [$(fold $fold:expr, scan $scan:expr)?]) => {
         impl Kernel<$e, 2> for $k {
             type Out = $e;
             const FOLDS: bool = arithmetic!(@folds $($fold)?);
-            fn many(&self, [x, y]: [Arg<'_, $e>; 2], n: usize, out: &mut Vec<$e>) -> bool { arithmetic!(@many $many, $e, x, y, n, out) }
+            fn many(&self, [x, y]: [Arg<'_, $e>; 2], n: usize, out: &mut Vec<$e>) -> bool { Binary::<$e>::many(&$obj, x, y, n, out) }
             $(
-                fn fold(&self, acc: $e, x: &[$e]) -> $e { let fold: fn($e, &[$e]) -> $e = $fold; fold(acc, x) }
-                fn scan(&self, start: $e, x: &[$e], out: &mut Vec<$e>) { let scan: fn($e, &[$e], &mut Vec<$e>) = $scan; scan(start, x, out) }
+                fn fold(&self, acc: $e, x: &[$e]) -> $e {
+                    let fold: fn(&[$e]) -> ($e, bool) = $fold;
+                    Binary::<$e>::one(&$obj, acc, fold(x).0)
+                }
+                fn scan(&self, start: $e, x: &[$e], out: &mut Vec<$e>) {
+                    let scan: fn(&[$e], Option<$e>, &mut Vec<$e>) -> bool = $scan;
+                    scan(x, Some(start), out);
+                }
             )?
         }
     };
-    (@many (|$x:ident, $y:ident| $f:expr), $e:ty, $a:ident, $b:ident, $n:ident, $out:ident) => {
-        rustymath::pairs($a, $b, $n, $out, |$x: $e, $y: $e| ($f, true))
-    };
-    (@many ($obj:expr), $e:ty, $a:ident, $b:ident, $n:ident, $out:ident) => { Binary::<$e>::many(&$obj, $a, $b, $n, $out) };
     (@folds) => { false };
     (@folds $fold:expr) => { true };
-    ($k:ident: |$x:ident, $y:ident| $f:expr, $folds:tt; $($e:ty),+) => { $(arithmetic!(@one $k, $e, (|$x, $y| $f), $folds);)+ };
-    ($k:ty = $obj:expr, $folds:tt; $($e:ty),+) => { $(arithmetic!(@one $k, $e, ($obj), $folds);)+ };
+    ($k:ty = $obj:expr, $folds:tt; $($e:ty),+) => { $(arithmetic!(@one $k, $e, $obj, $folds);)+ };
 }
 
-arithmetic!(Add: |x, y| x + y, [fold |acc, x| acc + reduce::sum(x).expect("a float sum always exists"),
-    scan |start, x, out| { reduce::cumsum(x, Some(start), out); }]; f16, f32, f64);
-arithmetic!(Multiply: |x, y| x * y, [fold |acc, x| acc * reduce::prod(x).expect("a float product always exists"),
-    scan |start, x, out| { reduce::cumprod(x, Some(start), out); }]; f16, f32, f64);
-arithmetic!(Add: |x, y| x.wrapping_add(y), [fold |acc, x| reduce::sum(x).map_or_else(|| x.iter().fold(acc, |a, &v| a.wrapping_add(v)), |s| acc.wrapping_add(s)),
-    scan |start, x, out| running(start, x, out, i64::wrapping_add)]; i64);
-arithmetic!(Multiply: |x, y| x.wrapping_mul(y), [fold |acc, x| reduce::prod(x).map_or_else(|| x.iter().fold(acc, |a, &v| a.wrapping_mul(v)), |p| acc.wrapping_mul(p)),
-    scan |start, x, out| running(start, x, out, i64::wrapping_mul)]; i64);
-arithmetic!(Add: |x, y| x + y, []; Complex32, Complex64);
-arithmetic!(Multiply: |x, y| x * y, []; Complex32, Complex64);
-arithmetic!(reduce::Maximum = reduce::Maximum, [fold |acc, x| reduce::Maximum.one(acc, reduce::max(x)),
-    scan |start, x, out| reduce::cummax(x, Some(start), out)]; f16, f32, f64, i64);
-arithmetic!(reduce::Minimum = reduce::Minimum, [fold |acc, x| reduce::Minimum.one(acc, reduce::min(x)),
-    scan |start, x, out| reduce::cummin(x, Some(start), out)]; f16, f32, f64, i64);
+arithmetic!(Add = rustymath::Add, [fold reduce::sum, scan reduce::cumsum]; f16, f32, f64, i64, u64);
+arithmetic!(Multiply = rustymath::Multiply, [fold reduce::prod, scan reduce::cumprod]; f16, f32, f64, i64, u64);
+arithmetic!(Add = rustymath::Add, []; i8, i16, i32, u8, u16, u32, Complex32, Complex64);
+arithmetic!(Multiply = rustymath::Multiply, []; i8, i16, i32, u8, u16, u32, Complex32, Complex64);
+arithmetic!(reduce::Maximum = reduce::Maximum, [fold |x| (reduce::max(x), true), scan |x, start, out| { reduce::cummax(x, start, out); true }];
+    f16, f32, f64, i8, i16, i32, i64, u8, u16, u32, u64);
+arithmetic!(reduce::Minimum = reduce::Minimum, [fold |x| (reduce::min(x), true), scan |x, start, out| { reduce::cummin(x, start, out); true }];
+    f16, f32, f64, i8, i16, i32, i64, u8, u16, u32, u64);
+arithmetic!(Add = reduce::Maximum, [fold |x| (reduce::Max::slice(x), true), scan |x, start, out| { reduce::running::<_, reduce::Max>(x, start, out); true }]; bool);
+arithmetic!(Multiply = reduce::Minimum, [fold |x| (reduce::Min::slice(x), true), scan |x, start, out| { reduce::running::<_, reduce::Min>(x, start, out); true }]; bool);
+arithmetic!(reduce::Maximum = reduce::Maximum, [fold |x| (reduce::Max::slice(x), true), scan |x, start, out| { reduce::running::<_, reduce::Max>(x, start, out); true }]; bool);
+arithmetic!(reduce::Minimum = reduce::Minimum, [fold |x| (reduce::Min::slice(x), true), scan |x, start, out| { reduce::running::<_, reduce::Min>(x, start, out); true }]; bool);
 
 /// Whether the array at `p` with stride `step` holds contiguous, aligned items of type `T`.
 fn dense<T>(p: *mut c_char, step: npy_intp) -> bool { step == size_of::<T>() as npy_intp && p as usize % align_of::<T>() == 0 }
@@ -309,12 +296,30 @@ where
     (Some(inner::<M, E, N>), codes)
 }
 
-/// The loops at `i64`. NumPy picks the first loop whose types its inputs cast to safely, so integer loops come before float ones.
+/// The loop at `bool`. NumPy picks the first loop whose types its inputs cast to safely, so it comes before every other loop.
+fn boolean<M: Make, const N: usize>() -> Vec<Loop>
+where
+    M::K: Kernel<bool, N>,
+{
+    vec![entry::<M, bool, N>()]
+}
+
+/// The loops at every integer type, narrower before wider and signed before unsigned, as NumPy orders its own. They come before the
+/// float loops.
 fn int<M: Make, const N: usize>() -> Vec<Loop>
 where
-    M::K: Kernel<i64, N>,
+    M::K: Kernel<i8, N> + Kernel<u8, N> + Kernel<i16, N> + Kernel<u16, N> + Kernel<i32, N> + Kernel<u32, N> + Kernel<i64, N> + Kernel<u64, N>,
 {
-    vec![entry::<M, i64, N>()]
+    vec![
+        entry::<M, i8, N>(),
+        entry::<M, u8, N>(),
+        entry::<M, i16, N>(),
+        entry::<M, u16, N>(),
+        entry::<M, i32, N>(),
+        entry::<M, u32, N>(),
+        entry::<M, i64, N>(),
+        entry::<M, u64, N>(),
+    ]
 }
 
 /// The loops at `float16`, `float32` and `float64`.
@@ -333,16 +338,19 @@ where
     vec![entry::<M, Complex32, N>(), entry::<M, Complex64, N>()]
 }
 
-/// Adds the ufunc `name` with `nin` inputs, NumPy identity `identity` and `loops` to `m`.
-fn register(m: &Bound<'_, PyModule>, name: &str, doc: &str, nin: usize, identity: c_int, loops: Vec<Loop>) -> PyResult<()> {
+/// Adds the ufunc `name` with `nin` inputs and `nout` outputs, NumPy identity `identity` and `loops` to `m`.
+/// A `signature`, such as `"(m,n),(n,p)->(m,p)"`, makes it a generalized ufunc. Each of its loops then takes whole core matrices.
+fn register(m: &Bound<'_, PyModule>, name: &str, doc: &str, [nin, nout]: [usize; 2], identity: c_int, signature: Option<&str>, loops: Vec<Loop>) -> PyResult<()> {
     let (funcs, codes): (Vec<_>, Vec<Vec<c_char>>) = loops.into_iter().unzip();
     // NumPy keeps these pointers for the life of the ufunc, which is the life of the process.
     let (count, funcs, types) = (funcs.len(), Vec::leak(funcs), Vec::leak(codes.concat()));
     let data = Vec::leak(vec![ptr::null_mut(); count]);
     let (name_c, doc_c) = (CString::new(name)?.into_raw(), CString::new(doc)?.into_raw());
+    let signature_c = signature.map(CString::new).transpose()?.map_or(ptr::null(), |s| s.into_raw().cast_const());
     let ufunc = unsafe {
-        PY_UFUNC_API.PyUFunc_FromFuncAndData(
-            m.py(), funcs.as_mut_ptr(), data.as_mut_ptr(), types.as_mut_ptr(), count as c_int, nin as c_int, 1, identity, name_c, doc_c, 0,
+        PY_UFUNC_API.PyUFunc_FromFuncAndDataAndSignature(
+            m.py(), funcs.as_mut_ptr(), data.as_mut_ptr(), types.as_mut_ptr(), count as c_int, nin as c_int, nout as c_int, identity, name_c,
+            doc_c, 0, signature_c,
         )
     };
     m.add(name, unsafe { Bound::from_owned_ptr_or_err(m.py(), ufunc)? })
@@ -369,7 +377,7 @@ macro_rules! ufuncs {
         }
         const N: usize = [$(stringify!($x)),+].len();
         let identity = [$($id,)? NONE][0];
-        register($m, stringify!($name), $doc, N + <$name as Make>::CT as usize, identity, [$($group::<$name, N>()),+].concat())?;
+        register($m, stringify!($name), $doc, [N + <$name as Make>::CT as usize, 1], identity, None, [$($group::<$name, N>()),+].concat())?;
     })+};
     (@ct) => { false };
     (@ct $ct:ident) => { true };
@@ -405,8 +413,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         arcsinh(x) = Asinh, real, complex: "asinh x.";
         arccosh(x) = Acosh, real, complex: "acosh x.";
         arctanh(x) = Atanh, real, complex: "atanh x.";
-        absolute(x) = Abs, real, complex: "|x|, a real number for a complex x.";
-        sign(x) = Sign, real, complex: "-1, 0 or 1 for a real x, and x/|x| for a complex x.";
+        absolute(x) = Abs, boolean, int, real, complex: "|x|, a real number for a complex x. A signed integer type's least value gives itself, as in NumPy.";
+        sign(x) = Sign, int, real, complex: "-1, 0 or 1 for a real x, and x/|x| for a complex x.";
         angle(x) = Angle, real, complex: "The angle of x from the positive real axis, from -π to π.";
         sqrt1mx2(x) = Sqrt1mx2, real, complex: "√(1 - x²), the principal root for a complex x.";
         sqrt1px2(x) = Sqrt1px2, real, complex: "√(1 + x²), the principal root for a complex x.";
@@ -419,7 +427,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         erfc(x) = Erfc, real: "1 - erf(x), without the loss of digits for large x that `1 - erf(x)` has.";
         erfinv(p) = Erfinv, real: "The x with erf(x) = p.";
         erfcinv(q) = Erfcinv, real: "The x with erfc(x) = q.";
-        power(x, y) = Pow, int, real, complex: "x^y. An integer power that doesn't fit int64 gives 0 and NumPy's overflow warning.";
+        power(x, y) = Pow, int, real, complex: "x^y. An integer power gives 0 and NumPy's overflow warning where it doesn't fit its type, or where y is negative and x isn't 1 or -1.";
         root(n, y) = Root, real: "The real nth root of y, computed without rounding 1/n first.";
         hypot(x, y) = Hypot, real: "√(x² + y²), with no overflow or underflow in between.";
         arctan2(y, x) = Atan2, real: "The angle of the point (x, y) from the positive x axis, from -π to π.";
@@ -431,26 +439,26 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         betaincinv(a, b, p) = Betaincinv, real: "The x with I_x(a, b) = p.";
     }
     ufuncs! { m;
-        add(x, y) identity ZERO: Add = Add, int, real, complex: "x + y. Its `reduce` and `accumulate` run rustymath's sums.";
-        multiply(x, y) identity ONE: Multiply = Multiply, int, real, complex: "x × y. Its `reduce` and `accumulate` run rustymath's products.";
-        maximum(x, y) identity REORDERABLE: reduce::Maximum = reduce::Maximum, int, real: "The larger of x and y, or NaN where either is NaN.";
-        minimum(x, y) identity REORDERABLE: reduce::Minimum = reduce::Minimum, int, real: "The smaller of x and y, or NaN where either is NaN.";
-        equal(x, y; ct): Obj<Equal> = Obj(Equal(tolerance(ct))), real, complex: "Whether x equals y within the tolerance.";
-        not_equal(x, y; ct): Obj<NotEqual> = Obj(NotEqual(tolerance(ct))), real, complex: "Whether x doesn't equal y within the tolerance.";
-        less(x, y; ct): Obj<Less> = Obj(Less(tolerance(ct))), real: "Whether x is below y and doesn't equal it within the tolerance.";
-        less_equal(x, y; ct): Obj<LessEqual> = Obj(LessEqual(tolerance(ct))), real: "Whether x is below y or equals it within the tolerance.";
-        greater(x, y; ct): Obj<Greater> = Obj(Greater(tolerance(ct))), real: "Whether x is above y and doesn't equal it within the tolerance.";
-        greater_equal(x, y; ct): Obj<GreaterEqual> = Obj(GreaterEqual(tolerance(ct))), real: "Whether x is above y or equals it within the tolerance.";
-        floor(x; ct): Obj<Floor> = Obj(Floor(tolerance(ct))), real, complex: "The tolerant floor of x.";
-        ceil(x; ct): Obj<Ceil> = Obj(Ceil(tolerance(ct))), real, complex: "The tolerant ceiling of x.";
+        add(x, y) identity ZERO: Add = Add, boolean, int, real, complex: "x + y, which for Booleans is their `or`. Its `reduce` and `accumulate` run rustymath's sums.";
+        multiply(x, y) identity ONE: Multiply = Multiply, boolean, int, real, complex: "x × y, which for Booleans is their `and`. Its `reduce` and `accumulate` run rustymath's products.";
+        maximum(x, y) identity REORDERABLE: reduce::Maximum = reduce::Maximum, boolean, int, real: "The larger of x and y, or NaN where either is NaN.";
+        minimum(x, y) identity REORDERABLE: reduce::Minimum = reduce::Minimum, boolean, int, real: "The smaller of x and y, or NaN where either is NaN.";
+        equal(x, y; ct): Obj<Equal> = Obj(Equal(tolerance(ct))), int, real, complex: "Whether x equals y, within the tolerance for floats.";
+        not_equal(x, y; ct): Obj<NotEqual> = Obj(NotEqual(tolerance(ct))), int, real, complex: "Whether x doesn't equal y, within the tolerance for floats.";
+        less(x, y; ct): Obj<Less> = Obj(Less(tolerance(ct))), int, real: "Whether x is below y and doesn't equal it, within the tolerance for floats.";
+        less_equal(x, y; ct): Obj<LessEqual> = Obj(LessEqual(tolerance(ct))), int, real: "Whether x is below y or equals it, within the tolerance for floats.";
+        greater(x, y; ct): Obj<Greater> = Obj(Greater(tolerance(ct))), int, real: "Whether x is above y and doesn't equal it, within the tolerance for floats.";
+        greater_equal(x, y; ct): Obj<GreaterEqual> = Obj(GreaterEqual(tolerance(ct))), int, real: "Whether x is above y or equals it, within the tolerance for floats.";
+        floor(x; ct): Obj<Floor> = Obj(Floor(tolerance(ct))), boolean, int, real, complex: "The tolerant floor of x. Integers and Booleans keep their values.";
+        ceil(x; ct): Obj<Ceil> = Obj(Ceil(tolerance(ct))), boolean, int, real, complex: "The tolerant ceiling of x. Integers and Booleans keep their values.";
         remainder(x, y; ct): Swapped<Obj<Residue>> = Swapped(Obj(Residue(tolerance(ct)))), int, real, complex:
-            "The remainder of x divided by y, with the sign of y. The tolerance applies to floats.";
+            "The remainder of x divided by y, with the sign of y. A zero y gives x, by APL's rule. The tolerance applies to floats.";
         gcd(x, y; ct): Obj<Gcd> = Obj(Gcd(tolerance(ct))), int, real, complex: "The greatest common divisor of x and y. The tolerance applies to floats.";
-        lcm(x, y; ct): Absolute<Obj<Lcm>> = Absolute(Obj(Lcm(tolerance(ct)))), int, real: "The least common multiple of x and y, never negative. The tolerance applies to floats.";
+        lcm(x, y; ct): Obj<Lcm> = Obj(Lcm(tolerance(ct))), int, real: "The least common multiple of x and y, with the sign of x y. The tolerance applies to floats.";
     }
     polynomial::add(m)?;
     search::add(m)?;
-    for (name, add) in [("number_theory", number_theory::add as fn(&Bound<'_, PyModule>) -> PyResult<()>), ("distribution", distribution::add)] {
+    for (name, add) in [("number_theory", number_theory::add as fn(&Bound<'_, PyModule>) -> PyResult<()>), ("distribution", distribution::add), ("linalg", linalg::add)] {
         let sub = PyModule::new(m.py(), name)?;
         add(&sub)?;
         m.add_submodule(&sub)?;
