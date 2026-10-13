@@ -5,9 +5,8 @@ compute as float64, except in `matmul` and `semiring`, where integers compute in
 
 `solve` and `pinv` give a result for every matrix: the least-squares solution with the least norm, and the pseudoinverse, through LU
 where a matrix is square and regular. A matrix that `cholesky` can't factor, or whose eigenvalues don't converge, gives NaN results and
-NumPy's "invalid value" warning, as a failing item of any rustymath ufunc does. Each column of U in an SVD, and each eigenvector, has its
-largest component real and positive. R in a QR factorization has a real diagonal with no negative item. `matmul` and `semiring`
-multiply matrices, including through APL's inner products, such as the min-plus product of shortest paths."""
+NumPy's "invalid value" warning, as a failing item of any rustymath ufunc does. R in a QR factorization has a real diagonal. `matmul`
+and `semiring` multiply matrices, including through APL's inner products, such as the min-plus product of shortest paths."""
 from typing import NamedTuple
 import numpy as np
 from ._core import linalg as _g

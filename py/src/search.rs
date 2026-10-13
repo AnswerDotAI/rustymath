@@ -30,7 +30,9 @@ macro_rules! items {
 }
 
 /// `positions` as an array of NumPy's index type.
-fn indices(py: Python<'_>, positions: Vec<usize>) -> Bound<'_, PyArray1<isize>> { PyArray1::from_iter(py, positions.into_iter().map(|i| i as isize)) }
+fn indices(py: Python<'_>, positions: impl IntoIterator<Item = usize>) -> Bound<'_, PyArray1<isize>> {
+    PyArray1::from_iter(py, positions.into_iter().map(|i| i as isize))
+}
 
 /// The classes of `x`, numbered from 0 in order of first position, as `search::numbered` gives them: each class's first position, each
 /// item's class number, and each class's size.
@@ -49,10 +51,11 @@ pub fn unique<'py>(
 pub fn index_of<'py>(py: Python<'py>, x: &Bound<'py, PyUntypedArray>, y: &Bound<'py, PyUntypedArray>, ct: f64) -> PyResult<Bound<'py, PyArray1<isize>>> {
     items!(x, T => keys: {
         let (x, y) = (x.extract::<PyReadonlyArray1<T>>()?, y.extract::<PyReadonlyArray1<T>>()?);
-        Ok(indices(py, search::index_of(x.as_slice()?, y.as_slice()?)))
+        Ok(indices(py, search::index_of(x.as_slice()?, y.as_slice()?).into_iter().map(|p| p as usize)))
     }, floats: {
         let (x, y) = (x.extract::<PyReadonlyArray1<T>>()?, y.extract::<PyReadonlyArray1<T>>()?);
-        Ok(indices(py, with_tolerance!(tolerance(ct), |t| tolerant::index_of_with(t, x.as_slice()?, y.as_slice()?, || py.check_signals()))?))
+        let found = with_tolerance!(tolerance(ct), |t| tolerant::index_of_with(t, x.as_slice()?, y.as_slice()?, || py.check_signals()))?;
+        Ok(indices(py, found.into_iter().map(|p| p as usize)))
     })
 }
 

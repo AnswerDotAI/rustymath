@@ -2,7 +2,7 @@
 //! also function objects, `Pdf`, `Cdf` and `Quantile`, which hold the distribution. Their slice forms choose the distribution's
 //! formulas once, outside the loop, so the loops of the closed-form distributions vectorize. A discrete distribution's density is its
 //! mass at a whole x, and its quantile function and sampler give whole numbers.
-use crate::{atan, betainc, betaincinv, cos, erfc, erfcinv, exp, expm1, gammainc, gammaincc, gammaincinv, lgamma, ln, log1p, pow, sin, tan, Float, Unary};
+use crate::{atan, betainc, betaincinv, cos, erfc, erfcinv, exp, expm1, gammainc, gammaincc, gammaincinv, lgamma, ln, log1p, pow, sin, tan, Arg, Erfcinv, Float, Unary, CHUNK};
 use rand::{
     distr::{Distribution as _, Open01, StandardUniform},
     Rng,
@@ -104,8 +104,32 @@ law_objects! {
     Pdf = |d, x| d.pdf(x);
     /// [`Distribution::cdf`] as a function object.
     Cdf = |d, x| d.cdf(x);
-    /// [`Distribution::quantile`] as a function object.
-    Quantile = |d, p| quantile_of(d, p);
+}
+
+/// [`Distribution::quantile`] as a function object. The normal and log-normal distributions' slice forms take erfcinv(2p) from
+/// [`Erfcinv`]'s slice form, whose loops don't branch on each item's region.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Quantile(pub Distribution);
+forms!(Quantile at real: |k, [p]| narrowed(p, |p| each_law!(&k.0 .0, d => quantile_of(d, p))),
+    many |k, [p], n, out| match (&k.0 .0, p) {
+        (Law::Normal(d), Arg::Many(p)) => normal_quantiles(&p[..n], out, #[inline(always)] |e| d.mean - d.sd * SQRT_2 * e),
+        (Law::LogNormal(d), Arg::Many(p)) => normal_quantiles(&p[..n], out, #[inline(always)] |e| exp(d.location - d.scale * SQRT_2 * e)),
+        (law, p) => each_law!(law, d => each!([p], n, out, |[p]| narrowed(p, |p| quantile_of(d, p)))),
+    });
+
+/// `from(erfcinv(2p))` for each item of `p`, appended to `out`, with erfcinv from [`Erfcinv`]'s f64 slice form on each block of
+/// `CHUNK` items. Gives `false` where a result is NaN and its item isn't.
+fn normal_quantiles<F: Float>(p: &[F], out: &mut Vec<F>, from: impl Fn(f64) -> f64) -> bool {
+    let (mut q, mut e) = (Vec::with_capacity(p.len().min(CHUNK)), Vec::with_capacity(p.len().min(CHUNK)));
+    let mut ok = true;
+    for p in p.chunks(CHUNK) {
+        q.clear();
+        e.clear();
+        q.extend(p.iter().map(|&v| 2.0 * v.wide()));
+        ok &= Erfcinv.many(Arg::Many(&q), q.len(), &mut e);
+        out.extend(e.iter().map(|&v| F::narrow(from(v))));
+    }
+    ok
 }
 
 impl Distribution {
@@ -731,7 +755,7 @@ impl Formulas for Poisson {
 mod tests {
     use super::*;
     use crate::Arg;
-    use rand::{rngs::StdRng, SeedableRng};
+    use rand::{rngs::StdRng, RngExt, SeedableRng};
 
     /// One of each distribution, with each sampling method's case: binomials that draw by inversion, by BTRD and reflected, and
     /// Poisson distributions that draw by multiplying and by PTRS.
@@ -821,6 +845,12 @@ mod tests {
             assert!(matches_scalar(Pdf(d), |x| d.pdf(x), &xs) && matches_scalar(Cdf(d), |x| d.cdf(x), &xs), "{d:?}");
             assert!(matches_scalar(Quantile(d), |p| d.quantile(p), &ps), "{d:?}");
             assert!(!matches_scalar(Quantile(d), |p| d.quantile(p), &xs), "{d:?}");
+        }
+        // Several blocks of uniform p reach every region of the inverse error function, in random order.
+        let mut rng = StdRng::seed_from_u64(1);
+        let uniform: Vec<f64> = (0..5000).map(|_| rng.random()).collect();
+        for d in [Distribution::normal(1.0, 2.0).unwrap(), Distribution::log_normal(0.0, 0.5).unwrap()] {
+            assert!(matches_scalar(Quantile(d), |p| d.quantile(p), &uniform), "{d:?}");
         }
     }
 }

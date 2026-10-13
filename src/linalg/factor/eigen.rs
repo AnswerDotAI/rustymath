@@ -9,8 +9,7 @@
 use super::*;
 
 /// The eigen decomposition of a Hermitian `n`×`n` matrix: `a = V diag(values) Vᴴ`. `values` is real and in ascending order. Column
-/// `j` of the `n`×`n` matrix `vectors` is a unit eigenvector for `values[j]`, with its largest component real and positive. Without
-/// eigenvectors, `vectors` is empty.
+/// `j` of the `n`×`n` matrix `vectors` is a unit eigenvector for `values[j]`. Without eigenvectors, `vectors` is empty.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Eigh<T: Scalar> {
     pub values: Vec<T::Real>,
@@ -58,16 +57,7 @@ where
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&i, &j| d[i].partial_cmp(&d[j]).unwrap_or(Ordering::Equal));
     let values = order.iter().map(|&i| scale.map_or(d[i], |s| d[i] / s)).collect();
-    let vectors = if vt.is_empty() { Vec::new() } else {
-        let mut vectors = vec![T::zero(); n * n];
-        for (j, &k) in order.iter().enumerate() {
-            let row = &vt[k * n..(k + 1) * n];
-            let (top, phase) = lead(row.iter().copied());
-            for (i, &x) in row.iter().enumerate() { vectors[i * n + j] = x * phase }
-            vectors[top * n + j] = T::from_real(vectors[top * n + j].re());
-        }
-        vectors
-    };
+    let vectors = if vt.is_empty() { Vec::new() } else { (0..n * n).map(|ij| vt[order[ij % n] * n + ij / n]).collect() };
     Some(Eigh { values, vectors })
 }
 
@@ -181,14 +171,13 @@ pub(super) fn blocked<T: Scalar + Tiled>(w: &[T], taus: &[T], n: usize) -> Refle
     let blocks = (0..p)
         .step_by(width)
         .map(|k0| {
-            let (nb, rows) = ((k0 + width).min(p) - k0, p - k0);
+            let nb = (k0 + width).min(p) - k0;
             // Row c of the panel holds reflection k0 + c from column k0 + 1 of `w`, where `householder` reads it.
-            let panel: Vec<T> = (0..nb).flat_map(|c| w[(k0 + c) * n + k0 + 1..(k0 + c + 1) * n].to_vec()).collect();
-            let t = triangular(&panel, &taus[k0..k0 + nb], rows);
-            (k0, nb, panel, t)
+            let panel = (0..nb).flat_map(|c| w[(k0 + c) * n + k0 + 1..(k0 + c + 1) * n].to_vec()).collect();
+            Block::new(k0, panel, &taus[k0..k0 + nb])
         })
         .collect();
-    Reflections { size: [p, p], f: Vec::new(), blocks }
+    Reflections { m: p, blocks }
 }
 
 /// Diagonalises the real symmetric tridiagonal matrix with diagonal `d` and subdiagonal `e` by implicit QL iterations, as EISPACK's
@@ -410,7 +399,7 @@ fn merge<R: Native + Tiled>(d: &mut [R], z: &[R], rho: R, s0: &[R], s1: &[R], n1
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{distance, norm, orthogonality, product, random, real_positive_lead, RealItem, wide};
+    use super::super::tests::{distance, norm, orthogonality, product, random, RealItem, wide};
     use super::*;
 
     /// The symmetric `n`×`n` matrix whose lower triangle comes from `lower`, with `junk` in its upper triangle, which `eigh` never reads.
@@ -430,18 +419,14 @@ mod tests {
             .collect()
     }
 
-    /// Checks that `f` decomposes the symmetric `n`×`n` matrix `a`: ascending values, orthonormal vectors with their largest component
-    /// positive, and a small residual `A V - V Λ`, all within `bound`.
+    /// Checks that `f` decomposes the symmetric `n`×`n` matrix `a`: ascending values, orthonormal vectors, and a small residual
+    /// `A V - V Λ`, all within `bound`.
     fn check(a: &[f64], n: usize, f: &Eigh<f64>, bound: f64, what: &str) {
         assert!(f.values.windows(2).all(|w| w[0] <= w[1]), "values ascend for {what}");
         let (v, scale) = (&f.vectors, norm(a).max(f64::MIN_POSITIVE));
         let vl: Vec<f64> = (0..n * n).map(|k| v[k] * f.values[k % n]).collect();
         assert!(distance(&product(a, v, [n; 3]), &vl, scale) < bound, "residual for {what}");
         assert!(orthogonality(v, n, n) < bound, "orthogonal vectors for {what}");
-        for j in 0..n {
-            let column: Vec<_> = (0..n).map(|i| num_complex::Complex::from(v[i * n + j])).collect();
-            assert!(real_positive_lead(&column, 0.0), "the largest component of vector {j} is positive for {what}");
-        }
     }
 
     /// Checks `eigh` at `T` on random symmetric matrices, where `tolerance` is a few times `T`'s epsilon.

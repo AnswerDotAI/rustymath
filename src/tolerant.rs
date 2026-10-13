@@ -80,11 +80,17 @@ pub trait Tolerant: Copy {
         let r = if self.equal(x * nearest(q), y) { F::zero() } else { y - x * self.floor(q) };
         if x == F::zero() { y } else { r }
     }
+    /// The whole number nearest `y`, and whether `y` equals it within this tolerance.
+    #[inline]
+    fn nearest_whole<F: Float>(self, y: F) -> (F, bool) {
+        let n = nearest(y);
+        (n, (y - n).abs() <= F::narrow(self.value()) * larger(y.abs(), n.abs()))
+    }
     /// The whole number equal to `y`, when there is one.
     #[inline]
     fn whole<F: Float>(self, y: F) -> Option<F> {
-        let n = nearest(y);
-        ((y - n).abs() <= F::narrow(self.value()) * larger(y.abs(), n.abs())).then_some(n)
+        let (n, equal) = self.nearest_whole(y);
+        equal.then_some(n)
     }
     /// The floats equal to `c`, as `(lo, hi)`: `equal(x, c)` holds exactly when `lo <= x && x <= hi`. Comparing many floats with `c`
     /// then takes two plain comparisons for each, in a loop that vectorizes. `None` when `c` is NaN, which equals nothing.
@@ -175,10 +181,28 @@ impl Tolerant for Tolerance {
 /// The complex versions of `Tolerant`'s comparisons, for every tolerance.
 pub trait TolerantComplex: Tolerant {
     /// Whether `x` equals `y`: the magnitude of `x-y` is at most the tolerance times the larger magnitude, as Dyalog APL defines it. A
-    /// number with an infinite or NaN part equals only itself, as IEEE compares it. Two real numbers compare as `equal` compares them.
+    /// number with an infinite or NaN part equals only itself, as IEEE compares it. A tolerance of 0 compares the parts exactly.
     #[inline]
     fn complex_equal<R: Native>(self, x: Complex<R>, y: Complex<R>) -> bool {
-        if x.im == R::zero() && y.im == R::zero() { return self.equal(x.re, y.re); }
+        let (equal, decided) = self.squared_equal(x, y);
+        if decided { equal } else { self.scaled_equal(x, y) }
+    }
+    /// `complex_equal` through squared magnitudes, |x-y|² ≤ t² max(|x|², |y|²), with no branch or square root, and whether that test
+    /// decides it. A tolerance of 0 compares the parts exactly, which always decides. Otherwise the test decides wherever the larger
+    /// squared magnitude lies between 2^-800 and 2^1000 at f64, or 2^-80 and 2^120 at f32. In that range no square overflows, and t²
+    /// times one doesn't underflow. A NaN part gives `false`, as IEEE compares it.
+    #[inline(always)]
+    fn squared_equal<R: Native>(self, x: Complex<R>, y: Complex<R>) -> (bool, bool) {
+        let t = R::narrow(self.value());
+        let (low, high) = if R::WIDE { (2f64.powi(-800), 2f64.powi(1000)) } else { (2f64.powi(-80), 2f64.powi(120)) };
+        let size = x.norm_sqr().max(y.norm_sqr());
+        let near = (x - y).norm_sqr() <= t * t * size;
+        let exact = t == R::zero();
+        ((exact & (x == y)) | (!exact & near), exact | ((size >= R::narrow(low)) & (size <= R::narrow(high))))
+    }
+    /// `complex_equal` from the magnitudes themselves, which `norm` computes without overflow or underflow, for the pairs that
+    /// `squared_equal` leaves undecided.
+    fn scaled_equal<R: Native>(self, x: Complex<R>, y: Complex<R>) -> bool {
         let finite = |z: Complex<R>| z.re.is_finite() & z.im.is_finite();
         if !finite(x) || !finite(y) { return x == y; }
         let t = R::narrow(self.value());
@@ -310,13 +334,30 @@ fn mask<F: Copy>(items: Arg<'_, F>, n: usize, out: &mut Vec<bool>, f: impl Fn(F)
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Equal(pub Tolerance);
 compared!(Equal: |t, [x, y]| t.equal(x, y), Inside, Inside);
-tolerant!(Equal at Complex<f32> => bool, Complex<f64> => bool: |t, [x, y]| t.complex_equal(x, y));
+forms!(Equal at Complex<f32> => bool, Complex<f64> => bool: |k, [x, y]| with_tolerance!(k.0, |t| t.complex_equal(x, y)),
+    many |k, [x, y], n, out| with_tolerance!(k.0, |t| complex_equals(t, [x, y], n, out, false)));
 
 /// The negation of [`Equal`] at the tolerance it holds, as a function object, for real and complex items.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NotEqual(pub Tolerance);
 compared!(NotEqual: |t, [x, y]| !t.equal(x, y), Outside, Outside);
-tolerant!(NotEqual at Complex<f32> => bool, Complex<f64> => bool: |t, [x, y]| !t.complex_equal(x, y));
+forms!(NotEqual at Complex<f32> => bool, Complex<f64> => bool: |k, [x, y]| with_tolerance!(k.0, |t| !t.complex_equal(x, y)),
+    many |k, [x, y], n, out| with_tolerance!(k.0, |t| complex_equals(t, [x, y], n, out, true)));
+
+/// `Equal`'s slice form on complex items, or with `negate` `NotEqual`'s. Each `CHUNK` of items splits into slices of real and
+/// imaginary parts, as in `slice::split`, so `squared_equal` runs over plain slices with no branch and vectorizes. `scaled_equal` then
+/// takes the pairs it leaves undecided, one at a time. No result fails.
+#[inline(always)]
+fn complex_equals<T: TolerantComplex, R: Native>(t: T, [x, y]: [Arg<'_, Complex<R>>; 2], n: usize, out: &mut Vec<bool>, negate: bool) -> bool {
+    let start = out.len();
+    if pairs(x, y, n, out, #[inline(always)] |a, b| { let (equal, decided) = t.squared_equal(a, b); (equal != negate, decided) }) { return true; }
+    let at = |a: Arg<'_, Complex<R>>, i: usize| match a { Arg::One(v) => v, Arg::Many(s) => s[i] };
+    for i in 0..n {
+        let (a, b) = (at(x, i), at(y, i));
+        if !t.squared_equal(a, b).1 { out[start + i] = t.scaled_equal(a, b) != negate }
+    }
+    true
+}
 
 /// [`Tolerant::less`] at the tolerance it holds, as a function object.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -392,19 +433,26 @@ tolerant!(Lcm at Complex<f32>, Complex<f64>: |t, [x, y]| {
 /// For each item of `y`, the position of the first item of `x` that it matches within tolerance `t`, or the length of `x` where none
 /// does. NaN matches NaN. Up to `search::SCANNED` items of `y` each take one pass over `x`, which compares every item with the range of
 /// floats equal to it. When every item of both equals a whole number below `whole_limit(t)`, the search indexes those whole numbers
-/// (`search::index_of`), so items equal to one whole number match each other. Otherwise, with `Exactly`, the search indexes order
+/// (`search::index_of`), then checks that each item of `y` matches the first item of `x` with its whole number. When one doesn't, as two
+/// floats on either side of one whole number may not, the search takes the buckets below. Otherwise, with `Exactly`, the search indexes order
 /// keys. With a `Tolerance`, it files the items of `x` in buckets of neighbouring floats (`Near`), and compares each item of `y` with
 /// the items in the two buckets nearest it.
-pub fn index_of<F: Float>(t: impl Tolerant, x: &[F], y: &[F]) -> Vec<usize> {
+pub fn index_of<F: Float>(t: impl Tolerant, x: &[F], y: &[F]) -> Vec<u32> {
     let Ok(found) = index_of_with(t, x, y, ok);
     found
 }
 
 /// `index_of`, calling `check` before each block of `BETWEEN_CHECKS` items of `y`, and returning `check`'s error at once.
 #[inline(never)]
-pub fn index_of_with<F: Float, E>(t: impl Tolerant, x: &[F], y: &[F], mut check: impl FnMut() -> Result<(), E>) -> Result<Vec<usize>, E> {
-    if y.len() <= search::SCANNED { return Ok(y.iter().map(|&v| scan(t, x, v)).collect()); }
-    if let Some(keys) = wholes(t, x) && let Some(y) = wholes(t, y) { return Ok(search::index_of(&keys, &y)); }
+pub fn index_of_with<F: Float, E>(t: impl Tolerant, x: &[F], y: &[F], mut check: impl FnMut() -> Result<(), E>) -> Result<Vec<u32>, E> {
+    if y.len() <= search::SCANNED { return Ok(y.iter().map(|&v| scan(t, x, v) as u32).collect()); }
+    if let Some((keys, exact)) = wholes(t, x, whole_limit(t)) && let Some((whole_y, _)) = wholes(t, y, whole_limit(t)) {
+        // Two floats near one whole number each equal it, but needn't equal each other. Unless every item of `x` is a whole number,
+        // each needle must be identical to its first candidate or within tolerance of it, or the buckets below search instead.
+        // Floats near other whole numbers can't match.
+        let found = search::index_of(&keys, &whole_y);
+        if exact || found.iter().zip(y).all(|(&p, &v)| p as usize == x.len() || x[p as usize] == v || t.matches(x[p as usize], v)) { return Ok(found); }
+    }
     if t.value() == 0.0 { return Ok(search::index_of(&order_keys(x), &order_keys(y))); }
     let near = Near::new(t, x, |j, i| x[j].order_key() == x[i].order_key());
     let mut found = Vec::with_capacity(y.len());
@@ -413,7 +461,7 @@ pub fn index_of_with<F: Float, E>(t: impl Tolerant, x: &[F], y: &[F], mut check:
         for &v in block {
             let mut first = x.len();
             for i in near.near(v) { if i < first && t.matches(x[i], v) { first = i; } }
-            found.push(first);
+            found.push(first as u32);
         }
     }
     Ok(found)
@@ -422,21 +470,21 @@ pub fn index_of_with<F: Float, E>(t: impl Tolerant, x: &[F], y: &[F], mut check:
 /// The position of the earliest item of each item's class within tolerance `t`. When every item equals a whole number below
 /// `whole_limit(t)`, a class holds the items equal to one whole number. Otherwise, with `Exactly`, a class holds equal floats, and with
 /// a `Tolerance`, a class is a run that `runs` gives. Two items of one class therefore needn't match each other.
-pub fn classes<F: Float>(t: impl Tolerant, x: &[F]) -> Vec<usize> {
+pub fn classes<F: Float>(t: impl Tolerant, x: &[F]) -> Vec<u32> {
     let Ok(classes) = classes_with(t, x, ok);
     classes
 }
 
 /// `classes`, calling `check` after about every `BETWEEN_CHECKS` items, and returning `check`'s error at once.
 #[inline(never)]
-pub fn classes_with<F: Float, E>(t: impl Tolerant, x: &[F], mut check: impl FnMut() -> Result<(), E>) -> Result<Vec<usize>, E> {
-    if let Some(keys) = wholes(t, x) { return Ok(search::classes(&keys)); }
+pub fn classes_with<F: Float, E>(t: impl Tolerant, x: &[F], mut check: impl FnMut() -> Result<(), E>) -> Result<Vec<u32>, E> {
+    if let Some((keys, _)) = wholes(t, x, whole_limit(t)) { return Ok(search::classes(&keys)); }
     if t.value() == 0.0 { return Ok(search::classes(&order_keys(x))); }
     let (mut classes, mut since) = (vec![0; x.len()], 0);
     runs(t, x, |run| {
         since += run.len();
         if since >= BETWEEN_CHECKS { since = 0; check()?; }
-        for &i in run { classes[i] = run[0]; }
+        for &i in run { classes[i] = run[0] as u32; }
         Ok(())
     })?;
     Ok(classes)
@@ -451,9 +499,9 @@ pub fn firsts<F: Float>(t: impl Tolerant, x: &[F]) -> Vec<bool> {
 /// `firsts`, calling `check` as `classes_with` does, and returning `check`'s error at once.
 #[inline(never)]
 pub fn firsts_with<F: Float, E>(t: impl Tolerant, x: &[F], check: impl FnMut() -> Result<(), E>) -> Result<Vec<bool>, E> {
-    if let Some(keys) = wholes(t, x) { return Ok(search::firsts(&keys)); }
+    if let Some((keys, _)) = wholes(t, x, whole_limit(t)) { return Ok(search::firsts(&keys)); }
     if t.value() == 0.0 { return Ok(search::firsts(&order_keys(x))); }
-    Ok(classes_with(t, x, check)?.into_iter().enumerate().map(|(i, c)| c == i).collect())
+    Ok(classes_with(t, x, check)?.into_iter().enumerate().map(|(i, c)| c as usize == i).collect())
 }
 
 /// Calls `each` with the positions of each run of `x`, in ascending order of position. A run is a longest sequence of floats, taken in
@@ -462,13 +510,15 @@ pub fn firsts_with<F: Float, E>(t: impl Tolerant, x: &[F], check: impl FnMut() -
 /// The floats sort by their order keys, which read back as floats in memory order.
 #[inline(never)]
 pub fn runs<F: Float, E>(t: impl Tolerant, x: &[F], mut each: impl FnMut(&[usize]) -> Result<(), E>) -> Result<(), E> {
-    let sorted = search::sorted(x.iter().zip(0..).map(|(&v, i)| (v.order_key(), i)).collect());
-    let mut run = Vec::new();
-    for pairs in sorted.chunk_by(|a, b| t.matches(F::from_order_key(a.0), F::from_order_key(b.0))) {
+    let (keys, order) = search::sorted(x.iter().map(|&v| v.order_key()).collect());
+    let (mut run, mut start) = (Vec::new(), 0);
+    for end in 1..=keys.len() {
+        if end < keys.len() && t.matches(F::from_order_key(keys[end - 1]), F::from_order_key(keys[end])) { continue; }
         run.clear();
-        run.extend(pairs.iter().map(|&(_, i)| i as usize));
+        run.extend(order[start..end].iter().map(|&i| i as usize));
         run.sort_unstable();
         each(&run)?;
+        start = end;
     }
     Ok(())
 }
@@ -512,11 +562,29 @@ fn order_keys<F: Float>(x: &[F]) -> Vec<F::OrderKey> { x.iter().map(|v| v.order_
 /// number.
 pub fn whole_limit(t: impl Tolerant) -> f64 { (0.25 / t.value()).min(9_007_199_254_740_992.0) }
 
-/// Each item of `x` as the whole number it equals within tolerance `t`, when every item equals one below `whole_limit(t)` in
-/// magnitude. A search can then index these integers in place of the floats.
-fn wholes<F: Float>(t: impl Tolerant, x: &[F]) -> Option<Vec<i64>> {
-    let limit = whole_limit(t);
-    x.iter().map(|&v| t.whole(v).map(F::wide).filter(|n| n.abs() < limit).map(|n| n as i64)).collect()
+/// Each item of `x` as the whole number it equals within tolerance `t`, when every item equals one below `limit` in magnitude, and
+/// whether every item is exactly its whole number. A search can then index these integers in place of the floats, with
+/// `whole_limit(t)` as the limit. A `limit` of at most 2^63 keeps every whole number within `i64`. Each block of `WHOLES` items
+/// is rounded to its nearest whole numbers in one loop that vectorizes. A block with an item that isn't exactly whole then tests
+/// each item against the tolerance in a second loop. The first block that fails ends the conversion.
+pub fn wholes<F: Float>(t: impl Tolerant, x: &[F], limit: f64) -> Option<(Vec<i64>, bool)> {
+    const WHOLES: usize = 256;
+    let (limit, mut keys, mut exact) = (F::narrow(limit), Vec::with_capacity(x.len()), true);
+    for block in x.chunks(WHOLES) {
+        let (fits, whole) = crate::slice::appended(&mut keys, block.len(), |slots| {
+            let (mut fits, mut whole) = (true, true);
+            for (slot, &y) in slots.iter_mut().zip(block) {
+                let n = nearest(y);
+                fits &= n.abs() < limit;
+                whole &= n == y;
+                slot.write(n.wide() as i64);
+            }
+            (fits, whole)
+        });
+        if !fits || !whole && !block.iter().fold(true, |equal, &y| equal & t.nearest_whole(y).1) { return None; }
+        exact &= whole;
+    }
+    Some((keys, exact))
 }
 
 /// The position of the first item of `x` that matches `v` within tolerance `t`, or the length of `x`. One pass compares each item with
@@ -602,6 +670,17 @@ mod tests {
         assert_eq!((T.complex_gcd(c(5.0, 0.0), c(3.0, 4.0)), T.complex_gcd(c(2.5, 0.0), c(1.5, 2.0))), (c(2.0, 1.0), c(1.0, 0.5)));
         assert_eq!((T.complex_gcd(c(0.0, 0.0), c(-4.0, 3.0)), T.complex_gcd(c(12.0, 0.0), c(18.0, 0.0))), (c(3.0, 4.0), c(6.0, 0.0)));
         assert!(T.complex_gcd(c(f64::INFINITY, 1.0), c(2.0, 1.0)).re.is_nan());
+        // Squared magnitudes would overflow at ±1e300 and lose the tolerance at 1e-300, so those pairs compare magnitudes themselves.
+        let (huge, tiny) = (c(1e300, 1e300), c(1e-300, 1e-300));
+        assert!(T.complex_equal(huge, huge * (1.0 + 1e-15)) && !T.complex_equal(c(1e300, 0.0), c(-1e300, 0.0)));
+        assert!(T.complex_equal(tiny, tiny * (1.0 + 1e-15)) && !T.complex_equal(tiny, tiny * 2.0));
+        // The slice forms decide most pairs from squared magnitudes, in a loop with no branch, then redo the rest.
+        let zs = [c(2.0, 1.0), huge, tiny, c(0.0, 0.0), c(f64::INFINITY, 1.0), c(f64::NAN, 0.0), c(-1e300, 0.0)];
+        let (xs, ys): (Vec<_>, Vec<_>) = zs.iter().flat_map(|&x| zs.iter().map(move |&y| (x, y * (1.0 + 1e-15)))).unzip();
+        let (mut equal, mut unequal) = (Vec::new(), Vec::new());
+        assert!(Equal(T).many(Arg::Many(&xs), Arg::Many(&ys), xs.len(), &mut equal));
+        assert!(NotEqual(T).many(Arg::Many(&xs), Arg::Many(&ys), xs.len(), &mut unequal));
+        for i in 0..xs.len() { assert!(equal[i] == T.complex_equal(xs[i], ys[i]) && unequal[i] != equal[i], "{:?} {:?}", xs[i], ys[i]) }
     }
 
     /// `range(c)` gives the last floats equal to `c` on each side.
@@ -737,7 +816,7 @@ mod tests {
                 .chain([F::nan(), F::infinity(), F::neg_infinity(), F::neg_zero()])
                 .collect();
             let y: Vec<F> = x.iter().rev().copied().chain([F::narrow(7.0)]).collect();
-            let brute: Vec<usize> = y.iter().map(|&v| x.iter().position(|&h| t.matches(h, v)).unwrap_or(x.len())).collect();
+            let brute: Vec<u32> = y.iter().map(|&v| x.iter().position(|&h| t.matches(h, v)).unwrap_or(x.len()) as u32).collect();
             assert_eq!(index_of(t, &x, &y), brute, "{t:?}");
             assert_eq!(index_of(t, &x, &y[..5]), brute[..5], "{t:?}, scanning");
         }
@@ -749,9 +828,13 @@ mod tests {
         let wx: Vec<f64> = (0..300u64).map(|i| (crate::accuracy::random(i) % 50) as f64 - 25.0).collect();
         let wy: Vec<f64> = (0..40).map(|i| i as f64 - 30.0).collect();
         for t in [T, Tolerance::EXACT, Tolerance::new(0.3).unwrap()] {
-            let brute: Vec<usize> = wy.iter().map(|&v| wx.iter().position(|&h| t.matches(h, v)).unwrap_or(wx.len())).collect();
+            let brute: Vec<u32> = wy.iter().map(|&v| wx.iter().position(|&h| t.matches(h, v)).unwrap_or(wx.len()) as u32).collect();
             assert_eq!(index_of(t, &wx, &wy), brute, "{t:?}");
         }
+        // Floats near one whole number each equal it, but needn't equal each other. An indexed search finds only true matches, as a
+        // scan of 16 or fewer does.
+        let near = [1.0 - 8e-15, 1.0, 1.0 + 8e-15];
+        assert_eq!((index_of(T, &near[..1], &[near[2]; 17]), index_of(T, &near[..2], &[near[2]; 17])), (vec![1; 17], vec![1; 17]));
         let ints: Vec<i64> = wx.iter().map(|&v| v as i64).collect();
         assert_eq!((classes(T, &wx), firsts(T, &wx)), (search::classes(&ints), search::firsts(&ints)));
     }

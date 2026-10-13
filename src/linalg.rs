@@ -14,13 +14,19 @@
 //! The private module `factor` holds decompositions of real and complex matrices, whose blocked updates run on these loops. This module
 //! re-exports its public items, and [`Scalar`], the trait of the item types they take. [`transpose_into`] transposes a matrix through 8×8
 //! tiles.
-use crate::{float::{sealed::Core, FUSED}, Native};
+use crate::{convert, float::{sealed::Core, FUSED}, Float, Native};
 use num_complex::Complex;
 
 mod factor;
 mod scalar;
+pub mod exact;
 pub use factor::*;
 pub use scalar::Scalar;
+
+/// The `n`×`n` identity matrix.
+pub(crate) fn identity<T: num_traits::Zero + num_traits::One>(n: usize) -> Vec<T> {
+    (0..n * n).map(|k| if k % (n + 1) == 0 { T::one() } else { T::zero() }).collect()
+}
 
 /// Writes the transpose of the `rows`×`cols` matrix in `src`, whose rows start `ls` items apart, into `dst`, whose rows start `ld`
 /// items apart. Each item passes through `f`: `dst[c * ld + r]` is `f(src[r * ls + c])`. Each 8×8 tile reads eight runs of 8
@@ -68,10 +74,13 @@ pub struct MaxPlus;
 pub struct MinPlus;
 /// `∨.∧` on Booleans: whether some `p` has both `a[i][p]` and `b[p][j]`.
 pub struct OrAnd;
-/// `+.=`, at `i32`, `i64`, `f32` and `f64`: the number of `p` where `a[i][p]` equals `b[p][j]`. The count has the width of the items,
-/// as `i32` or `i64`, so an `i32` count needs `k` below 2^31. Floats compare exactly, so NaN equals nothing.
+/// `∧.∨` on Booleans: whether every `p` has `a[i][p]` or `b[p][j]`.
+pub struct AndOr;
+/// `+.=`, at `i16`, `i32`, `i64`, `f32` and `f64`: the number of `p` where `a[i][p]` equals `b[p][j]`. The count has the width of the
+/// items, as `i16`, `i32` or `i64`, so an `i16` count needs `k` below 2^15 and an `i32` count below 2^31. Floats compare exactly, so NaN
+/// equals nothing.
 pub struct PlusEqual;
-/// `+.≠`, at `i32`, `i64`, `f32` and `f64`: the number of `p` where `a[i][p]` differs from `b[p][j]`, with `+.=`'s count type.
+/// `+.≠`, at `i16`, `i32`, `i64`, `f32` and `f64`: the number of `p` where `a[i][p]` differs from `b[p][j]`, with `+.=`'s count type.
 pub struct PlusNotEqual;
 
 /// The scalar operations of a pair at item type `T`.
@@ -126,6 +135,54 @@ impl Pair<bool> for OrAnd {
     #[inline(always)]
     fn f(x: bool, y: bool) -> bool { x | y }
 }
+
+impl Pair<bool> for AndOr {
+    type Out = bool;
+    const UNIT: bool = true;
+    #[inline(always)]
+    fn g(a: bool, b: bool) -> bool { a | b }
+    #[inline(always)]
+    fn f(x: bool, y: bool) -> bool { x & y }
+}
+
+impl Inner<bool> for OrAnd {
+    type Out = bool;
+    fn inner(&self, a: &[bool], b: &[bool], size: [usize; 3]) -> Vec<bool> { packed::<false>(a, b, size) }
+}
+
+impl Inner<bool> for AndOr {
+    type Out = bool;
+    fn inner(&self, a: &[bool], b: &[bool], size: [usize; 3]) -> Vec<bool> { packed::<true>(a, b, size) }
+}
+
+/// `∨.∧` of `a` and `b`, or with `NOT` set, `∧.∨`, which is `~(~a)∨.∧(~b)`. `NOT` flips each item of `a` and `b` as it is read, and
+/// each result as it is written. Each row of the result ORs together the rows of `b` where the row of `a` is true. The rows of `b`
+/// are packed 64 items to a word, in blocks of `WORDS` words, and each block of a row's results folds in a local array that stays in
+/// registers. An item of `a` becomes a mask of all ones or none, so the loop over it has no branch.
+fn packed<const NOT: bool>(a: &[bool], b: &[bool], [m, k, n]: [usize; 3]) -> Vec<bool> {
+    const WORDS: usize = 4;
+    assert!(a.len() == m * k && b.len() == k * n, "`a` must hold `m`×`k` items and `b` `k`×`n`");
+    let mut c = vec![NOT; m * n];
+    if k == 0 || n == 0 { return c }
+    let blocks = n.div_ceil(64 * WORDS);
+    let mut packed = vec![[0u64; WORDS]; k * blocks];
+    for (row, bits) in b.chunks_exact(n).zip(packed.chunks_exact_mut(blocks)) {
+        for (j, chunk) in row.chunks(64).enumerate() {
+            bits[j / WORDS][j % WORDS] = chunk.iter().enumerate().fold(0, |w, (t, &v)| w | u64::from(v ^ NOT) << t);
+        }
+    }
+    for (row, out) in a.chunks_exact(k).zip(c.chunks_exact_mut(n)) {
+        for (block, out) in out.chunks_mut(64 * WORDS).enumerate() {
+            let mut acc = [0u64; WORDS];
+            for (&x, bits) in row.iter().zip(packed[block..].iter().step_by(blocks)) {
+                let mask = u64::from(x ^ NOT).wrapping_neg();
+                for t in 0..WORDS { acc[t] |= bits[t] & mask }
+            }
+            for (j, o) in out.iter_mut().enumerate() { *o = (acc[j / 64] >> (j % 64) & 1 != 0) ^ NOT }
+        }
+    }
+    c
+}
 impl Pair<i64> for PlusTimes {
     type Out = i64;
     const UNIT: i64 = 0;
@@ -162,7 +219,7 @@ macro_rules! counts {
         }
     )+};
 }
-counts!(i64 => i64, i32 => i32, f64 => i64, f32 => i32);
+counts!(i64 => i64, i32 => i32, i16 => i16, f64 => i64, f32 => i32);
 
 /// Steps of `p` in each packed block.
 const KC: usize = 256;
@@ -183,7 +240,7 @@ mod tiles {
     pub(super) const TIMES32: [usize; 2] = [8, 8];
     pub(super) const COMPARES64: [usize; 2] = [6, 8];
     pub(super) const COMPARES32: [usize; 2] = [6, 16];
-    pub(super) const BOOLEANS: [usize; 2] = [8, 32];
+    pub(super) const COMPARES16: [usize; 2] = [6, 32];
 }
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
 mod tiles {
@@ -192,7 +249,7 @@ mod tiles {
     pub(super) const TIMES32: [usize; 2] = [6, 16];
     pub(super) const COMPARES64: [usize; 2] = [4, 8];
     pub(super) const COMPARES32: [usize; 2] = [4, 16];
-    pub(super) const BOOLEANS: [usize; 2] = [8, 32];
+    pub(super) const COMPARES16: [usize; 2] = [4, 32];
 }
 #[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))))]
 mod tiles {
@@ -201,7 +258,7 @@ mod tiles {
     pub(super) const TIMES32: [usize; 2] = [4, 8];
     pub(super) const COMPARES64: [usize; 2] = [4, 4];
     pub(super) const COMPARES32: [usize; 2] = [4, 8];
-    pub(super) const BOOLEANS: [usize; 2] = [4, 32];
+    pub(super) const COMPARES16: [usize; 2] = [4, 16];
 }
 
 /// The tile of the plain kernel on 64-bit integers, which only products too large for f64's 53 bits reach.
@@ -239,22 +296,35 @@ inner! {
     MaxPlus at f32 => f32: tiles::COMPARES32, max_plus32;
     MinPlus at f64 => f64: tiles::COMPARES64, min_plus64;
     MinPlus at f32 => f32: tiles::COMPARES32, min_plus32;
-    OrAnd at bool => bool: tiles::BOOLEANS, or_and;
     PlusEqual at i32 => i32: tiles::COMPARES32, equal_i32;
+    PlusEqual at i16 => i16: tiles::COMPARES16, equal_i16;
     PlusEqual at f64 => i64: tiles::COMPARES64, equal64;
     PlusEqual at f32 => i32: tiles::COMPARES32, equal32;
 }
 
-/// `+.=` at `i64` counts at `i32` where every item fits in 32 bits, which puts twice as many items in each vector.
+/// `+.=` at `i64` counts at `i16` where `windowed` maps both arguments into it, and otherwise at `i32` where every item fits in 32
+/// bits. A narrower count puts more items in each vector.
 impl Inner<i64> for PlusEqual {
     type Out = i64;
     fn inner(&self, a: &[i64], b: &[i64], size: [usize; 3]) -> Vec<i64> {
+        if let Some(c) = windowed(a, b, size) { return c.into_iter().map(i64::from).collect() }
         let narrow = |x: &[i64]| x.iter().map(|&v| i32::try_from(v).ok()).collect::<Option<Vec<_>>>();
         if let (Some(a), Some(b)) = (narrow(a), narrow(b)) { return self.inner(&a, &b, size).into_iter().map(i64::from).collect() }
         const MR: usize = tiles::COMPARES64[0];
         const NR: usize = tiles::COMPARES64[1];
         tiled_inner::<i64, PlusEqual, MR, NR>(a, b, size, equal_i64::<MR, NR, { NR * size_of::<i64>() / tiles::BYTES }>)
     }
+}
+
+/// `+.=` of `a` and `b` counted at `i16`, where `k` is below 2^15 and every item of both lies in one window of 2^16 values. Each item
+/// becomes its distance from the window's start, read as an `i16`, so two items are equal exactly where they were before.
+fn windowed(a: &[i64], b: &[i64], size: [usize; 3]) -> Option<Vec<i16>> {
+    if size[1] > i16::MAX as usize { return None }
+    let ((la, ha), (lb, hb)) = (crate::reduce::extremes(a), crate::reduce::extremes(b));
+    let (lo, hi) = (la.min(lb), ha.max(hb));
+    if i128::from(hi) - i128::from(lo) > i128::from(u16::MAX) { return None }
+    let shifted = |x: &[i64]| x.iter().map(|&v| v.wrapping_sub(lo) as u16 as i16).collect::<Vec<_>>();
+    Some(PlusEqual.inner(&shifted(a), &shifted(b), size))
 }
 
 /// `+.≠` as `k` less `+.=`.
@@ -269,13 +339,13 @@ macro_rules! differences {
         }
     )+};
 }
-differences!(i64 => i64, i32 => i32, f64 => i64, f32 => i32);
+differences!(i64 => i64, i32 => i32, i16 => i16, f64 => i64, f32 => i32);
 
 /// The largest magnitude among the items of `x`.
 fn magnitude(x: &[i64]) -> u128 { u128::from(x.iter().fold(0, |m, v| m.max(v.unsigned_abs()))) }
 
 /// The integer inner products of the float pairs. Each computes at the narrowest item type that holds every value the product forms
-/// exactly: `f32` where none exceeds 2^24 in magnitude, `f64` where none exceeds 2^53, and otherwise `i64` with wrapping arithmetic. The
+/// exactly: `f32` where none exceeds 2^24 in magnitude, `f64` where all lie below 2^51, and otherwise `i64` with wrapping arithmetic. The
 /// float paths run the float kernels and give the integers that wrapping arithmetic gives. `$bound` gives the largest magnitude that a
 /// product can form, from the largest magnitudes in `a` and `b` and from `k`.
 macro_rules! integers {
@@ -304,15 +374,17 @@ where
     P: Inner<f32, Out = f32> + Inner<f64, Out = f64> + Pair<i64, Out = i64>,
 {
     assert!(a.len() == m * k && b.len() == k * n, "`a` must hold `m`×`k` items and `b` `k`×`n`");
-    if bound <= 1 << 24 {
-        let (a, b): (Vec<f32>, Vec<f32>) = (a.iter().map(|&x| x as f32).collect(), b.iter().map(|&x| x as f32).collect());
-        return Inner::<f32>::inner(pair, &a, &b, [m, k, n]).into_iter().map(|x| x as i64).collect();
-    }
-    if bound <= 1 << 53 {
-        let (a, b): (Vec<f64>, Vec<f64>) = (a.iter().map(|&x| x as f64).collect(), b.iter().map(|&x| x as f64).collect());
-        return Inner::<f64>::inner(pair, &a, &b, [m, k, n]).into_iter().map(|x| x as i64).collect();
-    }
+    if k == 0 { return vec![<P as Pair<i64>>::UNIT; m * n]; }
+    if bound <= 1 << 24 { return exactly::<f32, P>(pair, a, b, [m, k, n]); }
+    if bound <= convert::WIDE_LIMIT as u128 { return exactly::<f64, P>(pair, a, b, [m, k, n]); }
     tiled_inner::<i64, P, { PLAIN[0] }, { PLAIN[1] }>(a, b, [m, k, n], micro::<i64, P, { PLAIN[0] }, { PLAIN[1] }>)
+}
+
+/// `pair`'s inner product of `a` and `b` at the float type `F`, which holds every value it forms exactly. The conversions go
+/// through `convert`, because `as` between `f64` and `i64` converts one item at a time on AVX2 and in wasm.
+fn exactly<F: Float, P: Inner<F, Out = F>>(pair: &P, a: &[i64], b: &[i64], size: [usize; 3]) -> Vec<i64> {
+    let floats = |x: &[i64]| x.iter().map(|&v| convert::float::<F, i64>(v)).collect::<Vec<F>>();
+    pair.inner(&floats(a), &floats(b), size).into_iter().map(|x| convert::shifted(x.wide())).collect()
 }
 
 /// Item types whose matrix products run on the tiled `+.×` kernels: `f32` and `f64`, and complex numbers with parts of either type.
@@ -390,7 +462,9 @@ macro_rules! complex_inner {
 }
 complex_inner!(f32, f64);
 
-/// The micro-kernels in plain Rust. Each takes the number of vectors in a tile row, `V`, as the explicit ones do, and ignores it.
+/// The micro-kernels in plain Rust, for targets without the explicit ones. Each takes the number of vectors in a tile row, `V`, as
+/// the explicit ones do, and ignores it.
+#[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"), all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))))]
 mod plain {
     use super::*;
     macro_rules! plain {
@@ -407,10 +481,6 @@ mod plain {
         )+};
     }
     plain! {
-        or_and: bool, OrAnd;
-    }
-    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"), all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))))]
-    plain! {
         times64: f64, PlusTimes;
         times32: f32, PlusTimes;
         max_plus64: f64, MaxPlus;
@@ -421,8 +491,10 @@ mod plain {
         equal32: f32, PlusEqual;
         equal_i64: i64, PlusEqual;
         equal_i32: i32, PlusEqual;
+        equal_i16: i16, PlusEqual;
     }
 }
+#[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"), all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))))]
 use plain::*;
 
 /// Micro-kernels on explicit vectors: 16 bytes on AArch64 and in wasm, and 32 with AVX2. Each entry gives its first step from `a`
@@ -511,8 +583,9 @@ mod lanes {
             _mm256_blendv_ps(s, c, _mm256_or_ps(_mm256_cmp_ps::<_CMP_LT_OQ>(c, s), _mm256_cmp_ps::<_CMP_UNORD_Q>(c, c)))
         };
     }
-    /// Micro-kernels for `PlusEqual`, as `super::micro` on vectors of `$lanes` items, with each row of the tile `V` vectors. Where items
-    /// are equal, a comparison gives a lane of all ones, which is -1 as an integer. Subtracting it adds 1 to the count.
+    /// Micro-kernels whose tile starts at zero, for `PlusEqual`, as `super::micro` on vectors of `$lanes` items, with each row of the tile
+    /// `V` vectors. Where items are equal, a comparison gives a lane of all ones, which is -1 as an integer. Subtracting it adds 1 to the
+    /// count.
     macro_rules! equalities {
         ($($name:ident: $t:ty => $out:ty, $lanes:literal, $splat:ident, $load:ident, $zero:expr, $load_count:ident, $store_count:ident, |$a:ident, $b:ident, $c:ident| $step:expr;)+) => {$(
             #[inline(always)]
@@ -527,7 +600,7 @@ mod lanes {
                     for p in 0..steps {
                         let y: [_; V] = core::array::from_fn(|v| $load(bp.add(p * NR + $lanes * v).cast()));
                         for r in 0..MR {
-                            let $a = $splat(*ap.add(p * MR + r));
+                            let $a = $splat(*ap.add(p * MR + r) as _);
                             for v in 0..V { acc[r][v] = { let ($c, $b) = (acc[r][v], y[v]); $step } }
                         }
                     }
@@ -542,6 +615,7 @@ mod lanes {
         equal32: f32 => i32, 4, vdupq_n_f32, vld1q_f32, vdupq_n_s32(0), vld1q_s32, vst1q_s32, |a, b, c| vsubq_s32(c, vreinterpretq_s32_u32(vceqq_f32(a, b)));
         equal_i64: i64 => i64, 2, vdupq_n_s64, vld1q_s64, vdupq_n_s64(0), vld1q_s64, vst1q_s64, |a, b, c| vsubq_s64(c, vreinterpretq_s64_u64(vceqq_s64(a, b)));
         equal_i32: i32 => i32, 4, vdupq_n_s32, vld1q_s32, vdupq_n_s32(0), vld1q_s32, vst1q_s32, |a, b, c| vsubq_s32(c, vreinterpretq_s32_u32(vceqq_s32(a, b)));
+        equal_i16: i16 => i16, 8, vdupq_n_s16, vld1q_s16, vdupq_n_s16(0), vld1q_s16, vst1q_s16, |a, b, c| vsubq_s16(c, vreinterpretq_s16_u16(vceqq_s16(a, b)));
     }
     #[cfg(target_arch = "wasm32")]
     equalities! {
@@ -549,6 +623,7 @@ mod lanes {
         equal32: f32 => i32, 4, f32x4_splat, v128_load, i32x4_splat(0), v128_load, v128_store, |a, b, c| i32x4_sub(c, f32x4_eq(a, b));
         equal_i64: i64 => i64, 2, i64x2_splat, v128_load, i64x2_splat(0), v128_load, v128_store, |a, b, c| i64x2_sub(c, i64x2_eq(a, b));
         equal_i32: i32 => i32, 4, i32x4_splat, v128_load, i32x4_splat(0), v128_load, v128_store, |a, b, c| i32x4_sub(c, i32x4_eq(a, b));
+        equal_i16: i16 => i16, 8, i16x8_splat, v128_load, i16x8_splat(0), v128_load, v128_store, |a, b, c| i16x8_sub(c, i16x8_eq(a, b));
     }
     #[cfg(target_arch = "x86_64")]
     equalities! {
@@ -563,6 +638,9 @@ mod lanes {
         };
         equal_i32: i32 => i32, 8, _mm256_set1_epi32, _mm256_loadu_si256, _mm256_setzero_si256(), _mm256_loadu_si256, _mm256_storeu_si256, |a, b, c| {
             _mm256_sub_epi32(c, _mm256_cmpeq_epi32(a, b))
+        };
+        equal_i16: i16 => i16, 16, _mm256_set1_epi16, _mm256_loadu_si256, _mm256_setzero_si256(), _mm256_loadu_si256, _mm256_storeu_si256, |a, b, c| {
+            _mm256_sub_epi16(c, _mm256_cmpeq_epi16(a, b))
         };
     }
 }
@@ -675,12 +753,18 @@ mod tests {
             assert_eq!(MinPlus.inner(&a32, &b32, size), folded::<f32, MinPlus>(&a32, &b32, size));
             let (ab, bb): (Vec<bool>, Vec<bool>) = (a64.iter().map(|&x| x > 4.0).collect(), b64.iter().map(|&x| x > 4.0).collect());
             assert_eq!(OrAnd.inner(&ab, &bb, size), folded::<bool, OrAnd>(&ab, &bb, size));
+            assert_eq!(AndOr.inner(&ab, &bb, size), folded::<bool, AndOr>(&ab, &bb, size));
             let (ai, bi): (Vec<i64>, Vec<i64>) = (a64.iter().map(|&x| x as i64).collect(), b64.iter().map(|&x| x as i64).collect());
-            // Items too large for 32 bits take `+.=`'s 64-bit kernel, and smaller ones its 32-bit kernel.
+            // Items too large for 32 bits take `+.=`'s 64-bit kernel. Items that fit 32 bits but no window of 2^16 values take its 32-bit
+            // kernel. Small items, and items in a narrow window far from 0, take its 16-bit kernel.
             let (wa, wb): (Vec<i64>, Vec<i64>) = (ai.iter().map(|&x| x << 40).collect(), bi.iter().map(|&x| x << 40).collect());
+            let (ma, mb): (Vec<i64>, Vec<i64>) = (ai.iter().map(|&x| x << 20).collect(), bi.iter().map(|&x| x << 20).collect());
+            let (fa, fb): (Vec<i64>, Vec<i64>) = (ai.iter().map(|&x| x - (1 << 50)).collect(), bi.iter().map(|&x| x - (1 << 50)).collect());
             let (a3, b3): (Vec<i32>, Vec<i32>) = (ai.iter().map(|&x| x as i32).collect(), bi.iter().map(|&x| x as i32).collect());
             assert_eq!(PlusEqual.inner(&ai, &bi, size), folded::<i64, PlusEqual>(&ai, &bi, size));
             assert_eq!(PlusEqual.inner(&wa, &wb, size), folded::<i64, PlusEqual>(&wa, &wb, size));
+            assert_eq!(PlusEqual.inner(&ma, &mb, size), folded::<i64, PlusEqual>(&ma, &mb, size));
+            assert_eq!(PlusEqual.inner(&fa, &fb, size), folded::<i64, PlusEqual>(&fa, &fb, size));
             assert_eq!(PlusEqual.inner(&a3, &b3, size), folded::<i32, PlusEqual>(&a3, &b3, size));
             assert_eq!(PlusEqual.inner(&a64, &b64, size), folded::<f64, PlusEqual>(&a64, &b64, size));
             assert_eq!(PlusEqual.inner(&a32, &b32, size), folded::<f32, PlusEqual>(&a32, &b32, size));

@@ -11,57 +11,39 @@
 //! `bidiag_svd.rs`, and share `secular::root` with `eigen`'s divide and conquer. See `THIRD-PARTY.md`.
 use super::*;
 
-/// `svd` for `T`: the thin SVD `a = U Σ Vᴴ` of the `m`×`n` matrix `a`. It gives the singular vectors only where `vectors` is true. Each
-/// column of U has its largest component real and positive. A matrix holding a NaN or an infinity gives NaN for every result.
+/// `svd` for `T`: the thin SVD `a = U Σ Vᴴ` of the `m`×`n` matrix `a`. It gives the singular vectors only where `vectors` is true. A
+/// matrix holding a NaN or an infinity gives NaN for every result.
 pub(super) fn svd_factor<T: Scalar + Tiled>(a: &[T], [m, n]: [usize; 2], vectors: bool) -> Svd<T>
 where
     T::Real: Tiled,
 {
     assert_eq!(a.len(), m * n, "`a` must hold `m`×`n` items");
-    let (mut u, s, mut v) = unsigned(a, [m, n], vectors);
-    if vectors {
-        let p = s.len();
-        for k in 0..p {
-            let (top, phase) = lead((0..m).map(|i| u[i * p + k]));
-            if phase == T::one() { continue }
-            for i in 0..m { u[i * p + k] = u[i * p + k] * phase }
-            for i in 0..n { v[i * p + k] = v[i * p + k] * phase }
-            u[top * p + k] = T::from_real(u[top * p + k].re());
-        }
-    }
-    Svd { size: [m, n], u, s, v }
-}
-
-/// `svd_factor`'s SVD, before it sets the phase of each pair of singular vectors.
-fn unsigned<T: Scalar + Tiled>(a: &[T], [m, n]: [usize; 2], vectors: bool) -> (Vec<T>, Vec<T::Real>, Vec<T>)
-where
-    T::Real: Tiled,
-{
     if m < n {
         // The conjugate transpose's SVD is V Σ Uᴴ.
-        let (u, s, v) = unsigned(&adjoint(a, m, n), [n, m], vectors);
-        return (v, s, u);
+        let Svd { u, s, v, .. } = svd_factor(&adjoint(a, m, n), [n, m], vectors);
+        return Svd { size: [m, n], u: v, s, v: u };
     }
+    let svd = |(u, s, v)| Svd { size: [m, n], u, s, v };
     let undefined = || {
         let nan = T::Real::nan();
         let filled = |len| if vectors { vec![T::from_real(nan); len] } else { Vec::new() };
-        (filled(m * n), vec![nan; n], filled(n * n))
+        svd((filled(m * n), vec![nan; n], filled(n * n)))
     };
     if a.iter().any(|x| !(x.re().is_finite() && x.im().is_finite())) { return undefined() }
-    if 6 * m < 11 * n { return bidiagonal_svd(a, [m, n], vectors).unwrap_or_else(undefined) }
+    if 6 * m < 11 * n { return bidiagonal_svd(a, [m, n], vectors).map_or_else(undefined, svd) }
     // A tall matrix's SVD is the SVD of its R, with U multiplied by Q.
-    let reflections = reflect(a, [m, n]);
-    let Some((ur, s, v)) = bidiagonal_svd(&reflections.r(), [n, n], vectors) else { return undefined() };
+    let (reflections, r) = reflect(a, [m, n]);
+    let Some((ur, s, v)) = bidiagonal_svd(&r, [n, n], vectors) else { return undefined() };
     let mut u = Vec::new();
     if vectors {
         u = vec![T::zero(); m * n];
         u[..n * n].copy_from_slice(&ur);
         reflections.apply(&mut u, n);
     }
-    (u, s, v)
+    svd((u, s, v))
 }
 
-/// The SVD of the finite `m`×`n` matrix `a`, where `m` is at least `n`, through its bidiagonal form B, as `unsigned` gives it. Singular
+/// The SVD of the finite `m`×`n` matrix `a`, where `m` is at least `n`, through its bidiagonal form B, as `svd_factor` gives it. Singular
 /// values descend. With vectors and more than `SPLIT` columns, divide and conquer gives B's singular vectors, and the reflections then
 /// apply to them. Otherwise the QR algorithm rotates the reflections' Q into B's singular vectors. `None` where the QR algorithm doesn't
 /// converge.
@@ -168,16 +150,8 @@ fn bidiagonalize<T: Scalar>(w: &mut [T], [m, n]: [usize; 2]) -> (Vec<T::Real>, V
 /// The left reflections that `bidiagonalize` leaves in `w`, in QR's blocked form.
 fn left_reflections<T: Scalar + Tiled>(w: &[T], taus: &[T], [m, n]: [usize; 2]) -> Reflections<T> {
     let width = qr_block(n);
-    let blocks = (0..n)
-        .step_by(width)
-        .map(|k0| {
-            let k1 = (k0 + width).min(n);
-            let panel = transposed(w, n, k0, k1);
-            let t = triangular(&panel, &taus[k0..k1], m - k0);
-            (k0, k1 - k0, panel, t)
-        })
-        .collect();
-    Reflections { size: [m, n], f: Vec::new(), blocks }
+    let blocks = (0..n).step_by(width).map(|k0| { let k1 = (k0 + width).min(n); Block::new(k0, transposed(w, n, k0, k1), &taus[k0..k1]) }).collect();
+    Reflections { m, blocks }
 }
 
 /// Drives the superdiagonal `e` of the real upper bidiagonal matrix with diagonal `d` to zero, leaving its singular values in `d`, some

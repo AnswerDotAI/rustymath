@@ -71,7 +71,7 @@ impl<T: Native> Scalar for Complex<T> {
     #[inline(always)]
     fn abs1(self) -> T { self.re.abs() + self.im.abs() }
     #[inline(always)]
-    fn modulus(self) -> T { self.norm() }
+    fn modulus(self) -> T { crate::complex::modulus::<T, FUSED>(self.re, self.im) }
     #[inline(always)]
     fn mul_real(self, x: T) -> Self { Complex::new(self.re * x, self.im * x) }
     #[inline(always)]

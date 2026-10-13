@@ -12,7 +12,7 @@ version.workspace = true
 edition.workspace = true
 rust-version = "1.98"
 license = "Apache-2.0"
-description = "Fast maths functions for f16, f32 and f64 in plain Rust."
+description = "Maths in plain Rust, from fast f16, f32 and f64 functions to exact rationals."
 repository = "https://github.com/AnswerDotAI/rustymath"
 
 [lib]
@@ -32,6 +32,10 @@ strength_reduce = ">=0.2.4, <1"
 [dev-dependencies]
 # A seeded generator for the distributions' sampling tests.
 rand = { version = ">=0.10.2, <1", features = ["std_rng"] }
+
+[target.'cfg(target_vendor = "apple")'.dev-dependencies]
+# The speed test's QoS call, which keeps its timings on the performance cores.
+libc = ">=0.2.190, <1"
 
 [profile.test]
 inherits = "release"

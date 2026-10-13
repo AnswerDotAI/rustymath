@@ -11,7 +11,7 @@ use numpy::{Complex32, Complex64};
 use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
 use rustymath::tolerant::{Ceil, Equal, Floor, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue, Tolerance, Tolerant};
-use rustymath::{reduce::{self, Reduction}, Arg, Binary, Ternary, Unary, CHUNK};
+use rustymath::{reduce::{self, Reduction}, Arg, Binary, Flipped, Ternary, Unary, CHUNK};
 
 /// Runs `$body` with `$t` as the element type of the float array `$a`.
 macro_rules! floats {
@@ -126,15 +126,6 @@ impl<E: Copy, K: Ternary<E, Out: Code>> Kernel<E, 3> for Obj<K> {
     fn many(&self, [x, y, z]: [Arg<'_, E>; 3], n: usize, out: &mut Vec<K::Out>) -> bool { self.0.many(x, y, z, n, out) }
 }
 
-/// `K` with its two arguments in the other order, for a ufunc whose NumPy order differs from rustymath's.
-#[derive(Clone, Copy)]
-struct Swapped<K>(K);
-
-impl<E, K: Kernel<E, 2>> Kernel<E, 2> for Swapped<K> {
-    type Out = K::Out;
-    fn many(&self, [x, y]: [Arg<'_, E>; 2], n: usize, out: &mut Vec<K::Out>) -> bool { self.0.many([y, x], n, out) }
-}
-
 /// NumPy's `add` and `multiply`, which run rustymath's `Add` and `Multiply`. On Booleans they run `Maximum` and `Minimum`, the `or` and
 /// `and` that NumPy gives. Where rustymath's `reduce` folds a type into itself, their `reduce` and `accumulate` run its sums and
 /// products. Narrower integers and complex numbers fold item by item.
@@ -143,44 +134,34 @@ struct Add;
 #[derive(Clone, Copy)]
 struct Multiply;
 
-/// Writes each type's kernel for `$k`, which runs the function object `$obj`. With the bracketed `fold` and `scan`, `reduce` folds
-/// each chunk by `fold`, then combines that with the running result by `$obj`, and `accumulate` runs `scan`. An integer fold or scan
+/// Writes each type's kernel for `$k`, which runs the function object `$obj`. With a bracketed reduction `$r`, `reduce` folds each
+/// chunk by `$r`, then combines that with the running result by `$obj`, and `accumulate` runs `$r`'s scan. An integer fold or scan
 /// wraps, as `$obj` does, so the kernel ignores whether it fits.
 macro_rules! arithmetic {
-    (@one $k:ty, $e:ty, $obj:expr, [$(fold $fold:expr, scan $scan:expr)?]) => {
+    (@one $k:ty, $e:ty, $obj:expr, [$($r:ty)?]) => {
         impl Kernel<$e, 2> for $k {
             type Out = $e;
-            const FOLDS: bool = arithmetic!(@folds $($fold)?);
+            const FOLDS: bool = arithmetic!(@folds $($r)?);
             fn many(&self, [x, y]: [Arg<'_, $e>; 2], n: usize, out: &mut Vec<$e>) -> bool { Binary::<$e>::many(&$obj, x, y, n, out) }
             $(
-                fn fold(&self, acc: $e, x: &[$e]) -> $e {
-                    let fold: fn(&[$e]) -> ($e, bool) = $fold;
-                    Binary::<$e>::one(&$obj, acc, fold(x).0)
-                }
-                fn scan(&self, start: $e, x: &[$e], out: &mut Vec<$e>) {
-                    let scan: fn(&[$e], Option<$e>, &mut Vec<$e>) -> bool = $scan;
-                    scan(x, Some(start), out);
-                }
+                fn fold(&self, acc: $e, x: &[$e]) -> $e { Binary::<$e>::one(&$obj, acc, <$r as Reduction<$e>>::slice(x).0) }
+                fn scan(&self, start: $e, x: &[$e], out: &mut Vec<$e>) { <$r as Reduction<$e>>::scan(x, Some(start), out); }
             )?
         }
     };
     (@folds) => { false };
-    (@folds $fold:expr) => { true };
+    (@folds $r:ty) => { true };
     ($k:ty = $obj:expr, $folds:tt; $($e:ty),+) => { $(arithmetic!(@one $k, $e, $obj, $folds);)+ };
 }
 
-arithmetic!(Add = rustymath::Add, [fold reduce::sum, scan reduce::cumsum]; f16, f32, f64, i64, u64);
-arithmetic!(Multiply = rustymath::Multiply, [fold reduce::prod, scan reduce::cumprod]; f16, f32, f64, i64, u64);
+arithmetic!(Add = rustymath::Add, [reduce::Sum]; f16, f32, f64, i64, u64);
+arithmetic!(Multiply = rustymath::Multiply, [reduce::Product]; f16, f32, f64, i64, u64);
 arithmetic!(Add = rustymath::Add, []; i8, i16, i32, u8, u16, u32, Complex32, Complex64);
 arithmetic!(Multiply = rustymath::Multiply, []; i8, i16, i32, u8, u16, u32, Complex32, Complex64);
-arithmetic!(reduce::Maximum = reduce::Maximum, [fold |x| (reduce::max(x), true), scan |x, start, out| { reduce::cummax(x, start, out); true }];
-    f16, f32, f64, i8, i16, i32, i64, u8, u16, u32, u64);
-arithmetic!(reduce::Minimum = reduce::Minimum, [fold |x| (reduce::min(x), true), scan |x, start, out| { reduce::cummin(x, start, out); true }];
-    f16, f32, f64, i8, i16, i32, i64, u8, u16, u32, u64);
-arithmetic!(Add = reduce::Maximum, [fold |x| (reduce::Max::slice(x), true), scan |x, start, out| { reduce::running::<_, reduce::Max>(x, start, out); true }]; bool);
-arithmetic!(Multiply = reduce::Minimum, [fold |x| (reduce::Min::slice(x), true), scan |x, start, out| { reduce::running::<_, reduce::Min>(x, start, out); true }]; bool);
-arithmetic!(reduce::Maximum = reduce::Maximum, [fold |x| (reduce::Max::slice(x), true), scan |x, start, out| { reduce::running::<_, reduce::Max>(x, start, out); true }]; bool);
-arithmetic!(reduce::Minimum = reduce::Minimum, [fold |x| (reduce::Min::slice(x), true), scan |x, start, out| { reduce::running::<_, reduce::Min>(x, start, out); true }]; bool);
+arithmetic!(Add = reduce::Maximum, [reduce::Max]; bool);
+arithmetic!(Multiply = reduce::Minimum, [reduce::Min]; bool);
+arithmetic!(reduce::Maximum = reduce::Maximum, [reduce::Max]; bool, f16, f32, f64, i8, i16, i32, i64, u8, u16, u32, u64);
+arithmetic!(reduce::Minimum = reduce::Minimum, [reduce::Min]; bool, f16, f32, f64, i8, i16, i32, i64, u8, u16, u32, u64);
 
 /// Whether the array at `p` with stride `step` holds contiguous, aligned items of type `T`.
 fn dense<T>(p: *mut c_char, step: npy_intp) -> bool { step == size_of::<T>() as npy_intp && p as usize % align_of::<T>() == 0 }
@@ -451,7 +432,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         greater_equal(x, y; ct): Obj<GreaterEqual> = Obj(GreaterEqual(tolerance(ct))), int, real: "Whether x is above y or equals it, within the tolerance for floats.";
         floor(x; ct): Obj<Floor> = Obj(Floor(tolerance(ct))), boolean, int, real, complex: "The tolerant floor of x. Integers and Booleans keep their values.";
         ceil(x; ct): Obj<Ceil> = Obj(Ceil(tolerance(ct))), boolean, int, real, complex: "The tolerant ceiling of x. Integers and Booleans keep their values.";
-        remainder(x, y; ct): Swapped<Obj<Residue>> = Swapped(Obj(Residue(tolerance(ct)))), int, real, complex:
+        remainder(x, y; ct): Obj<Flipped<Residue>> = Obj(Flipped(Residue(tolerance(ct)))), int, real, complex:
             "The remainder of x divided by y, with the sign of y. A zero y gives x, by APL's rule. The tolerance applies to floats.";
         gcd(x, y; ct): Obj<Gcd> = Obj(Gcd(tolerance(ct))), int, real, complex: "The greatest common divisor of x and y. The tolerance applies to floats.";
         lcm(x, y; ct): Obj<Lcm> = Obj(Lcm(tolerance(ct))), int, real: "The least common multiple of x and y, with the sign of x y. The tolerance applies to floats.";

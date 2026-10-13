@@ -33,7 +33,7 @@ pub trait Float: num_traits::Float + sealed::Sealed + sealed::Item {
 }
 
 /// A float type that rustymath's algorithms run in: `f32` or `f64`.
-pub trait Native: Float<Working = Self> + sealed::Core {
+pub trait Native: Float<Working = Self> + sealed::Core + sealed::Extremes {
     /// `+` that may be reordered with other algebraic operations. A sum of them vectorizes.
     fn algebraic_add(self, other: Self) -> Self;
     /// `×` that may be reordered with other algebraic operations.
@@ -102,6 +102,19 @@ pub(crate) mod sealed {
         fn maximum(self, y: Self) -> Self;
         /// The lesser of `self` and `y`, or NaN where either is NaN, as `maximum` gives the greater.
         fn minimum(self, y: Self) -> Self;
+    }
+    /// The folds and scans of floats by maximum and minimum, each NaN from the first NaN on. The defaults' fold loops vectorize. Their
+    /// scans find the first NaN before they start, so that each step is a comparison with no NaN test. `reduce.rs` overrides them
+    /// where a target has an instruction that does better.
+    pub trait Extremes: Core + num_traits::Float {
+        fn fold_max(x: &[Self]) -> Self { crate::reduce::folded(x, Self::neg_infinity(), Self::maximum, Self::maximum) }
+        fn fold_min(x: &[Self]) -> Self { crate::reduce::folded(x, Self::infinity(), Self::minimum, Self::minimum) }
+        fn scan_max(x: &[Self], start: Option<Self>, out: &mut Vec<Self>) {
+            crate::reduce::until_nan(x, start, out, #[inline(always)] |t, v| if t > v { t } else { v })
+        }
+        fn scan_min(x: &[Self], start: Option<Self>, out: &mut Vec<Self>) {
+            crate::reduce::until_nan(x, start, out, #[inline(always)] |t, v| if t < v { t } else { v })
+        }
     }
 }
 

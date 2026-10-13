@@ -2,6 +2,7 @@
 //! converting between `f64` and a 64-bit integer. AArch64 converts bytes to floats two lanes at a time. A loop that converts such
 //! types with `as` runs one item at a time on those targets. [`int`] and [`float`] convert them through a float's bits. They use the
 //! conversion instruction for types that every target converts in vector form, and for 64-bit integers where the target can.
+//! [`count`] writes runs of whole numbers as floats, and in wasm it converts none of them.
 use crate::float::{sealed::{Core, Sealed}, Float};
 
 /// An integer type that [`int`] and [`float`] convert: `i8`, `i16`, `i32`, `i64`, `u8`, `u16` or `u32`.
@@ -32,6 +33,28 @@ pub fn float<F: Float, I: Int>(i: I) -> F {
     if <F::Working as Core>::WIDE { F::narrow(i.to_f64()) } else { F::narrow(i.to_f32().into()) }
 }
 
+/// Appends the `n` floats `start`, `start + 1`, `start + 2` and so on to `out`, or `start`, `start - 1` and so on where `down` is
+/// true, each exact while it stays below 2^53 in magnitude. Most targets convert each item from an integer, as [`float`] does. Wasm
+/// has no vector instruction for that, so there each block of 8 items adds 0 to 7 steps to the block's first item, which comes from the
+/// block's position.
+pub fn count(out: &mut Vec<f64>, start: i64, down: bool, n: usize) {
+    if !cfg!(target_arch = "wasm32") {
+        return if down { out.extend((0..n).map(move |i| wide_float(start - i as i64))) } else { out.extend((0..n).map(move |i| wide_float(start + i as i64))) };
+    }
+    let step = if down { -1 } else { 1 };
+    let offsets: [f64; 8] = std::array::from_fn(|k| wide_float(step * k as i64));
+    let first = move |j: usize| wide_float(start + step * (8 * j) as i64);
+    crate::slice::appended(out, n, |slots| {
+        let (blocks, rest) = slots.as_chunks_mut::<8>();
+        let whole = blocks.len();
+        for (j, block) in blocks.iter_mut().enumerate() {
+            let first = first(j);
+            for k in 0..8 { block[k].write(first + offsets[k]); }
+        }
+        for (slot, &offset) in rest.iter_mut().zip(&offsets) { slot.write(first(whole) + offset); }
+    });
+}
+
 /// Whether the target converts between `f64` and 64-bit integers in vector form, as AArch64 and x86-64 with AVX-512 do. Elsewhere
 /// they convert through a float's bits. Both ways give the same results for whole floats.
 const NATIVE_64: bool = cfg!(any(target_arch = "aarch64", target_feature = "avx512dq"));
@@ -42,7 +65,7 @@ const NATIVE_64: bool = cfg!(any(target_arch = "aarch64", target_feature = "avx5
 const SATURATING: bool = !cfg!(target_arch = "x86_64");
 
 /// The magnitude up to which the bits of `f64::SHIFT` + x hold the whole number x.
-const WIDE_LIMIT: f64 = 2251799813685247.0;
+pub(crate) const WIDE_LIMIT: f64 = 2251799813685247.0;
 
 /// `i` as the nearest `f64`, natively or through `halves`.
 #[inline(always)]
@@ -58,7 +81,7 @@ fn halves(i: i64) -> f64 {
 
 /// The whole number nearest `x`, for a magnitude up to `WIDE_LIMIT`, through the bits of `f64::SHIFT` + x.
 #[inline(always)]
-fn shifted(x: f64) -> i64 { (x + f64::SHIFT).to_bits().wrapping_sub(f64::SHIFT.to_bits()) as i64 }
+pub(crate) fn shifted(x: f64) -> i64 { (x + f64::SHIFT).to_bits().wrapping_sub(f64::SHIFT.to_bits()) as i64 }
 
 /// Writes each integer type's conversions. `narrow` types fit an `i32`, and every target converts a float to an `i32` in vector form.
 /// `wide` types convert from a float through the bits of `f64::SHIFT` + x, unless the target has `NATIVE_64`. The two expressions
@@ -123,5 +146,9 @@ mod tests {
             assert_eq!((float::<f64, i64>(i), halves(i), float::<f32, i64>(i)), (i as f64, i as f64, i as f64 as f32), "{i}");
         }
         assert_eq!((float::<f64, u8>(255), float::<f32, u16>(65535), float::<f64, u32>(u32::MAX), float::<f16, i32>(-3)), (255.0, 65535.0, 4294967295.0, f16::from_f32(-3.0)));
+        let mut counts = Vec::new();
+        count(&mut counts, 0, false, 21);
+        count(&mut counts, 20, true, 21);
+        assert_eq!(counts, (0..21).chain((0..21).rev()).map(|i| i as f64).collect::<Vec<_>>());
     }
 }

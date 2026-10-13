@@ -7,10 +7,11 @@ use crate::{
     exp::{exp, exp_narrow, exp_plus},
     float::{horner, sealed::Core},
     ln::{ln, ln_narrow, ln_double, ln_split, log1p},
-    Native,
+    slice::appended,
+    Arg, Native,
 };
 use num_complex::Complex;
-use std::f64::consts::PI;
+use std::{f64::consts::PI, mem::MaybeUninit};
 
 /// Each function at every type: it computes in f64, and narrower types round the result.
 macro_rules! in_f64 {
@@ -395,11 +396,15 @@ fn erfc_tail<R: Native, const FUSED: bool>(a: R) -> R {
     )
 }
 
-/// `first()` where `use_first` holds, and `second()` elsewhere. f32 computes both and selects, so that a loop that calls it
-/// vectorizes. f64 loops over these functions don't vectorize, so f64 computes only the one it needs.
+/// `first()` where `use_first` holds, and `second()` elsewhere. f32, and f64 on x86-64, compute both and select, so that a loop
+/// that calls it vectorizes. Elsewhere f64 computes only the one it needs. On the Mac, computing both made f64 `erfc` 1.3 times
+/// slower, because two f64 lanes in a NEON vector don't repay computing every region. On CI's x86-64 runner, the branching f64
+/// `erfc` cost 2.7 times as many copies as on the Mac, where AVX2 holds four lanes and a mispredicted branch costs more.
 #[inline(always)]
 fn either<R: Native>(use_first: bool, first: impl Fn() -> R, second: impl Fn() -> R) -> R {
-    if R::WIDE { if use_first { first() } else { second() } } else { let (a, b) = (first(), second()); if use_first { a } else { b } }
+    if R::WIDE && !cfg!(target_arch = "x86_64") { return if use_first { first() } else { second() } }
+    let (a, b) = (first(), second());
+    if use_first { a } else { b }
 }
 
 /// Arm Optimized Routines' erff: erf(x) = x + x a(x²) below 0.875, and 1 - e^-(|x| + |x| b(|x|)) up to 4. Each polynomial is highest
@@ -497,6 +502,7 @@ pub(crate) fn erfcinv<R: Native, const FUSED: bool>(q: R) -> R {
     if R::WIDE { R::narrow(erfcinv64::<FUSED>(q.wide())) } else { giles::<R, FUSED>(one - q, q * (R::narrow(2.0) - q)) }
 }
 
+#[inline(always)]
 fn erfinv64<const FUSED: bool>(p: f64) -> f64 {
     let a = p.abs();
     if a < 1.0 { maddock::<FUSED>(a, 1.0 - a).copysign(p) }
@@ -504,13 +510,92 @@ fn erfinv64<const FUSED: bool>(p: f64) -> f64 {
     else { f64::NAN }
 }
 
-/// For q above 1, the result is -erfcinv(2 - q), by the reflection erfc(-x) = 2 - erfc(x).
+/// For q above 1, the result is -erfcinv(2 - q), by the reflection erfc(-x) = 2 - erfc(x). Both halves share one call to `maddock`,
+/// with arguments |q - 1| and min(q, 2 - q). A branch between the halves would be mispredicted on uniform q.
+#[inline(always)]
 fn erfcinv64<const FUSED: bool>(q: f64) -> f64 {
-    if q > 1.0 && q < 2.0 { -maddock::<FUSED>(q - 1.0, 2.0 - q) }
-    else if q > 0.0 && q <= 1.0 { maddock::<FUSED>(1.0 - q, q) }
-    else if q == 0.0 { f64::INFINITY }
-    else if q == 2.0 { f64::NEG_INFINITY }
-    else { f64::NAN }
+    if !(q > 0.0 && q < 2.0) { return if q == 0.0 { f64::INFINITY } else if q == 2.0 { f64::NEG_INFINITY } else { f64::NAN } }
+    maddock::<FUSED>((q - 1.0).abs(), q.min(2.0 - q)).copysign(1.0 - q)
+}
+
+/// [`erfinv`](crate::erfinv) as a function object, with the slice form `many`, which runs `regions` on a slice of f64s.
+#[derive(Clone, Copy, Debug)]
+pub struct Erfinv;
+forms!(Erfinv at real: |_, [p]| erfinv::<_, { crate::FUSED }>(p),
+    many |_, [p], n, out| inverses(p, n, out, #[inline(always)] |p| erfinv::<_, { crate::FUSED }>(p), #[inline(always)] |p| (p.abs(), 1.0 - p.abs(), p)));
+
+/// [`erfcinv`](crate::erfcinv) as a function object, with the slice form `many`, which runs `regions` on a slice of f64s.
+#[derive(Clone, Copy, Debug)]
+pub struct Erfcinv;
+forms!(Erfcinv at real: |_, [q]| erfcinv::<_, { crate::FUSED }>(q),
+    many |_, [q], n, out| inverses(q, n, out, #[inline(always)] |q| erfcinv::<_, { crate::FUSED }>(q), #[inline(always)] |q| ((q - 1.0).abs(), q.min(2.0 - q), 1.0 - q)));
+
+/// The slice form of [`Erfinv`] and [`Erfcinv`]: `regions` on a slice of f64s, and `f` on each item otherwise. `parts` gives an f64
+/// item's `maddock` arguments and the value whose sign its result takes.
+fn inverses<R: Native>(x: Arg<'_, R>, n: usize, out: &mut Vec<R>, f: impl Fn(R) -> R, parts: impl Fn(f64) -> (f64, f64, f64)) -> bool {
+    match x {
+        Arg::Many(x) if R::WIDE => regions::<R, { crate::FUSED }>(&x[..n], out, f, parts),
+        x => each!([x], n, out, |[x]| f(x)),
+    }
+}
+
+/// `maddock` on each item of `x`, appended to `out`, with no branch on an item's region. In each block of `BLOCK` items, one pass
+/// places the central items' positions from the front and the others' from the back, and a second pass splits the others the same
+/// way by whether q is at least 1/4. Each region's formula then runs on its items' arguments, gathered into one buffer. On uniform
+/// arguments, `maddock`'s branches were mispredicted about three times in four, which took half its time. Items outside the domain,
+/// and NaN, take `f`. Gives `false` where an output is NaN and its item isn't.
+fn regions<R: Native, const FUSED: bool>(x: &[R], out: &mut Vec<R>, f: impl Fn(R) -> R, parts: impl Fn(f64) -> (f64, f64, f64)) -> bool {
+    const BLOCK: usize = 512;
+    let (mut place, mut split, mut t) = ([0u16; BLOCK], [0u16; BLOCK], [0.0; BLOCK]);
+    appended(out, x.len(), |slots| {
+        let mut ok = true;
+        for (xs, os) in x.chunks(BLOCK).zip(slots.chunks_mut(BLOCK)) {
+            let item = |i: u16| parts(xs[usize::from(i)].wide());
+            let (mut lo, mut hi) = (0, xs.len());
+            for i in 0..xs.len() as u16 {
+                let central = item(i).0 <= 0.5;
+                (place[lo], place[hi - 1]) = (i, i);
+                lo += usize::from(central);
+                hi -= usize::from(!central);
+            }
+            let (central, others) = place[..xs.len()].split_at(lo);
+            let (mut up, mut down) = (0, others.len());
+            for &i in others {
+                let upper = item(i).1 >= 0.25;
+                (split[up], split[down - 1]) = (i, i);
+                up += usize::from(upper);
+                down -= usize::from(!upper);
+            }
+            let (upper, below) = split[..others.len()].split_at(up);
+            gathered(central, &mut t, os, &item, #[inline(always)] |(p, _, _)| p, #[inline(always)] |t| for v in t { *v = maddock_central::<FUSED>(*v) });
+            gathered(upper, &mut t, os, &item, #[inline(always)] |(_, q, _)| q, #[inline(always)] |t| for v in t { *v = maddock_upper::<FUSED>(*v) });
+            gathered(below, &mut t, os, &item, #[inline(always)] |(_, q, _)| q, #[inline(always)] |t| {
+                for v in t.iter_mut() { *v = maddock_g::<FUSED>(*v) }
+                for v in t { *v = maddock_below::<FUSED>(*v) }
+            });
+            for (i, (&v, o)) in xs.iter().zip(os.iter_mut()).enumerate() {
+                if !(item(i as u16).0 < 1.0) {
+                    let r = f(v);
+                    o.write(r);
+                    ok &= !r.is_nan() | v.is_nan();
+                }
+            }
+        }
+        ok
+    })
+}
+
+/// `formula` on the argument that `read` takes from each item at `positions`, gathered into `t`. Each result goes to its item's place
+/// in `os`, with the item's sign.
+#[inline(always)]
+fn gathered<R: Native>(
+    positions: &[u16], t: &mut [f64], os: &mut [MaybeUninit<R>], item: impl Fn(u16) -> (f64, f64, f64),
+    read: impl Fn((f64, f64, f64)) -> f64, formula: impl Fn(&mut [f64]),
+) {
+    let t = &mut t[..positions.len()];
+    for (v, &i) in t.iter_mut().zip(positions) { *v = read(item(i)) }
+    formula(t);
+    for (&v, &i) in t.iter().zip(positions) { os[usize::from(i)].write(R::narrow(v.copysign(item(i).2))); }
 }
 
 /// erfinv(p) for p from 0 to 1, given p and q = 1 - p, by John Maddock's rational approximations in Boost.Math's 64-bit
@@ -520,16 +605,34 @@ fn erfcinv64<const FUSED: bool>(q: f64) -> f64 {
 /// region.
 #[inline(always)]
 fn maddock<const FUSED: bool>(p: f64, q: f64) -> f64 {
+    if p <= 0.5 { maddock_central::<FUSED>(p) }
+    else if q >= 0.25 { maddock_upper::<FUSED>(q) }
+    else { maddock_below::<FUSED>(maddock_g::<FUSED>(q)) }
+}
+
+/// `maddock` up to p = 1/2.
+#[inline(always)]
+fn maddock_central<const FUSED: bool>(p: f64) -> f64 { erfinv_regions::CENTRAL.scaled::<FUSED>(p * (p + 10.0), p) }
+
+/// `maddock` for q from 1/4 to 1/2.
+#[inline(always)]
+fn maddock_upper<const FUSED: bool>(q: f64) -> f64 {
+    use erfinv_regions::UPPER;
+    (-2.0 * ln::<f64, FUSED>(q)).sqrt() / (UPPER.y + UPPER.ratio::<FUSED>(q))
+}
+
+/// √(-ln q), which chooses among `maddock`'s regions below q = 1/4.
+#[inline(always)]
+fn maddock_g<const FUSED: bool>(q: f64) -> f64 { (-ln::<f64, FUSED>(q)).sqrt() }
+
+/// `maddock` below q = 1/4, from g = √(-ln q).
+#[inline(always)]
+fn maddock_below<const FUSED: bool>(g: f64) -> f64 {
     use erfinv_regions::*;
-    if p <= 0.5 { CENTRAL.scaled::<FUSED>(p * (p + 10.0), p) }
-    else if q >= 0.25 { (-2.0 * ln::<f64, FUSED>(q)).sqrt() / (UPPER.y + UPPER.ratio::<FUSED>(q)) }
-    else {
-        let g = (-ln::<f64, FUSED>(q)).sqrt();
-        if g < 3.0 { BELOW_3.scaled::<FUSED>(g, g) }
-        else if g < 6.0 { BELOW_6.scaled::<FUSED>(g, g) }
-        else if g < 18.0 { BELOW_18.scaled::<FUSED>(g, g) }
-        else { BELOW_44.scaled::<FUSED>(g, g) }
-    }
+    if g < 3.0 { BELOW_3.scaled::<FUSED>(g, g) }
+    else if g < 6.0 { BELOW_6.scaled::<FUSED>(g, g) }
+    else if g < 18.0 { BELOW_18.scaled::<FUSED>(g, g) }
+    else { BELOW_44.scaled::<FUSED>(g, g) }
 }
 
 /// One region of `maddock`: polynomials `p` and `q`, highest degree first, in x - `shift`, and the constant `y` that their ratio

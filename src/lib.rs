@@ -1,6 +1,6 @@
-//! Fast maths functions for `f16`, `f32` and `f64` in plain Rust, each within 4 units in the last place (ulps) of the correctly
-//! rounded result. The crate also has APL's tolerant comparison, number theory and polynomials. Its Python package gives the same
-//! functions as NumPy ufuncs.
+//! Maths in plain Rust. Its float functions take `f16`, `f32` and `f64`, each within 4 units in the last place (ulps) of the correctly
+//! rounded result. The crate also has APL's tolerant comparison, exact rationals, linear algebra, number theory and polynomials. Its
+//! Python package gives the float functions as NumPy ufuncs.
 #![doc = include_str!("lib.md")]
 #[macro_use]
 mod slice;
@@ -9,6 +9,7 @@ mod arith;
 mod complex;
 mod dd;
 mod exp;
+mod field;
 mod float;
 mod hyperbolic;
 mod lambert;
@@ -21,6 +22,8 @@ mod table;
 mod trig;
 pub mod convert;
 pub mod distribution;
+pub mod gather;
+pub mod exact;
 pub mod integer;
 pub mod linalg;
 pub mod number_theory;
@@ -33,19 +36,20 @@ pub mod tolerant;
 mod accuracy;
 
 pub use float::{Float, Native, FUSED};
-pub use slice::{pairs, Arg, Binary, Ternary, Unary, CHUNK};
+pub use slice::{pairs, Arg, Binary, Flipped, Ternary, Unary, CHUNK};
 pub use parts::{Abs, Angle, Sign};
 pub use sqrts::Sqrt;
 pub use ln::Logb;
 pub use pow::{Pow, Root};
 pub use trig::{Cos, Sin, Tan};
-pub use complex::divide;
+pub use special::{Erfcinv, Erfinv};
+pub use complex::{divide, Cis};
 pub use arith::{Add, Multiply, Overflowing, Subtract};
 
 /// The check for a `_with` function's plain version, which can't fail.
 pub(crate) fn ok() -> Result<(), std::convert::Infallible> { Ok(()) }
 /// How many items a `_with` function handles between calls to its check, which keeps the call out of the loop over items.
-pub(crate) const BETWEEN_CHECKS: usize = 1024;
+pub const BETWEEN_CHECKS: usize = 1024;
 
 /// Declares each function at the crate root, where it multiplies and adds as the target's `FUSED` says, and in `fused` and
 /// `unfused`, which choose for themselves. Each entry names the module whose function of the same name implements it, generic over
@@ -173,9 +177,9 @@ functions! {
     /// 1 - erf(x), without the loss of digits for large x that `1 - erf(x)` has.
     erfc(x) in special as Erfc: total;
     /// The x with erf(x) = p. ±1 gives ±∞, and a magnitude beyond 1 gives NaN.
-    erfinv(p) in special as Erfinv;
+    erfinv(p) in special;
     /// The x with erfc(x) = q. 0 gives ∞, 2 gives -∞, and q outside 0 to 2 gives NaN.
-    erfcinv(q) in special as Erfcinv;
+    erfcinv(q) in special;
     /// W0(x), the principal branch of the Lambert W function: the w of at least -1 with w e^w = x. x below -1/e gives NaN, except
     /// within half an ulp of -1/e, where W0 is -1.
     lambertw(x) in lambert as LambertW;

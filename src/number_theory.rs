@@ -436,6 +436,22 @@ pub fn totient<N: Natural>(n: &N) -> N {
     t
 }
 
+/// n!, the product of the whole numbers from 1 to `n`.
+pub fn factorial_with<E>(n: u64, mut check: impl FnMut() -> Result<(), E>) -> Result<BigUint, E> {
+    let mut product = BigUint::from(1u8);
+    for i in 2..=n {
+        if i % BETWEEN_CHECKS as u64 == 0 { check()?; }
+        product *= i;
+    }
+    Ok(product)
+}
+
+/// [`factorial_with`] with no check.
+pub fn factorial(n: u64) -> BigUint {
+    let Ok(p) = factorial_with(n, ok);
+    p
+}
+
 /// The primes below 7. The sieve stores only numbers that none of them divide, so it gives these separately.
 const WHEEL: [u64; 3] = [2, 3, 5];
 /// The residues modulo 30 of the numbers that `WHEEL`'s primes don't divide. A segment has one byte for each 30 numbers.

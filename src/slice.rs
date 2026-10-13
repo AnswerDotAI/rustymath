@@ -12,6 +12,15 @@ use half::f16;
 /// many items stay in cache.
 pub const CHUNK: usize = 4096;
 
+/// How many independent running values a loop keeps, each of `size` bytes: a fold's partial results, or a block of items under
+/// Horner's rule. 32 measured faster on the Mac than 8 or 16 for items of up to 8 bytes. A 16-byte item, such as a `Complex<f64>`, keeps
+/// 16, because 32 fill every vector register, and a complex sum then took 1.7 times as long. In wasm, LLVM leaves 32 values of 8 bytes,
+/// or 16 of 16 bytes, in linear memory, where each step loads and stores them. It keeps half as many in locals.
+pub(crate) const fn running(size: usize) -> usize {
+    let wasm = cfg!(target_arch = "wasm32");
+    if size >= 16 { if wasm { 8 } else { 16 } } else if wasm && size == 8 { 16 } else { 32 }
+}
+
 /// One argument of a slice function: one item that every result pairs with, or one item for each result.
 #[derive(Clone, Copy, Debug)]
 pub enum Arg<'a, T> {
@@ -93,6 +102,21 @@ arities! {
     Ternary<3>(x, y, z);
 }
 
+/// `K` with its two arguments in the other order, as a [`Binary`] at each item type where `K` is one: `Flipped(k).one(x, y)` is
+/// `k.one(y, x)`, and likewise for `many` and `checked`.
+#[derive(Clone, Copy, Debug)]
+pub struct Flipped<K>(pub K);
+
+impl<E: Item, K: Forms<E, 2>> Forms<E, 2> for Flipped<K> {
+    type Out = K::Out;
+    #[inline]
+    fn scalar(&self, [x, y]: [E; 2]) -> K::Out { self.0.scalar([y, x]) }
+    #[inline]
+    fn checked_scalar(&self, [x, y]: [E; 2]) -> Option<K::Out> { self.0.checked_scalar([y, x]) }
+    #[inline]
+    fn slice(&self, [x, y]: [Arg<'_, E>; 2], n: usize, out: &mut Vec<K::Out>) -> bool { self.0.slice([y, x], n, out) }
+}
+
 /// Whether `r`, the result for arguments `args`, keeps the rule that a NaN result needs a NaN argument.
 #[inline(always)]
 pub(crate) fn kept<O: Item, E: Item, const N: usize>(r: O, args: [E; N]) -> bool { !r.has_nan() | args.iter().any(|a| a.has_nan()) }
@@ -132,8 +156,8 @@ impl<O: Item + Default> Outcome<O> for Option<O> {
     fn split(self) -> (O, bool) { (self.unwrap_or_default(), self.is_some()) }
 }
 
-/// The output of an item body that never gives NaN from arguments that aren't NaN, such as `exp`'s. Such an output never fails. The
-/// slice loop tests none of them.
+/// The output of an item body that never fails: one that never gives NaN from arguments that aren't NaN, such as `exp`'s, or one whose
+/// NaN is the function's value, such as that of `∞ - ∞`. The slice loop tests none of them.
 #[derive(Clone, Copy)]
 pub(crate) struct Total<O>(pub O);
 
@@ -466,8 +490,7 @@ mod tests {
     }
 
     /// `k.many` against `k.one` for each of `items`, and for each item as `Arg::One`, as for `binary`.
-    fn unary<F: Float + Debug, K: Unary<F, Out = F>>(k: K, name: &str) {
-        let items = items::<F>();
+    fn unary<F: Float + Debug, K: Unary<F, Out = F>>(k: K, name: &str, items: &[F]) {
         let check = |x: Arg<'_, F>, n: usize| {
             let at = |i| match x { Arg::One(v) => v, Arg::Many(s) => s[i] };
             let mut out = vec![F::one()];
@@ -477,8 +500,8 @@ mod tests {
             assert_eq!(ok, (0..n).all(|i| k.checked(at(i)).is_some()), "{name}");
             assert_eq!(ok, (0..n).all(|i| kept(out[i + 1], [at(i)])), "{name} breaks the NaN rule");
         };
-        check(Arg::Many(&items), items.len());
-        for &v in &items { check(Arg::One(v), 3) }
+        check(Arg::Many(items), items.len());
+        for &v in items { check(Arg::One(v), 3) }
     }
 
     /// `k.many` against `k.one` for every triple of `items`, as `Many` arguments and with each argument in turn as `One`, as for
@@ -508,7 +531,7 @@ mod tests {
     fn slice_forms_match_scalar_forms() {
         macro_rules! each_width {
             (unary: $($u:ident),+; binary: $($b:ident),+; ternary: $($t:ident),+) => {
-                $(unary::<f64, _>($u, stringify!($u)); unary::<f32, _>($u, stringify!($u)); unary::<f16, _>($u, stringify!($u));)+
+                $(unary::<f64, _>($u, stringify!($u), &items::<f64>()); unary::<f32, _>($u, stringify!($u), &items::<f32>()); unary::<f16, _>($u, stringify!($u), &items::<f16>());)+
                 $(binary::<f64, _>($b, stringify!($b)); binary::<f32, _>($b, stringify!($b)); binary::<f16, _>($b, stringify!($b));)+
                 $(ternary::<f64, _>($t, stringify!($t)); ternary::<f32, _>($t, stringify!($t)); ternary::<f16, _>($t, stringify!($t));)+
             };
@@ -519,6 +542,13 @@ mod tests {
             binary: Pow, Root, Hypot, Atan2, Gammainc, Gammaincc, Gammaincinv, Binom, Logb, Maximum, Minimum;
             ternary: Betainc, Betaincinv
         );
+        // `Erfinv`'s and `Erfcinv`'s f64 slice forms place each block's items by region. Several blocks of uniform items, in random
+        // order, reach every region.
+        use rand::{rngs::StdRng, RngExt, SeedableRng};
+        let mut rng = StdRng::seed_from_u64(1);
+        let q: Vec<f64> = (0..2000).map(|_| 2.0 * rng.random::<f64>()).collect();
+        unary(Erfcinv, "Erfcinv", &q);
+        unary(Erfinv, "Erfinv", &q.iter().map(|&q| q - 1.0).collect::<Vec<_>>());
     }
 
     #[derive(Clone, Copy)]

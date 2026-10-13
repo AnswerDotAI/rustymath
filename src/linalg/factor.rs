@@ -18,11 +18,11 @@
 //! QR and the SVD first scale a matrix by a power of two when its largest item lies where sums of squares would overflow or lose
 //! digits to underflow. Their factors are those of the scaled matrix, scaled back exactly. LU and Cholesky divide by a subnormal
 //! pivot, whose reciprocal would overflow.
-use super::{transpose_into, Scalar, Tiled};
+use super::{identity, transpose_into, Scalar, Tiled};
 use crate::{float::{sealed::Core, FUSED}, Native};
 use num_complex::Complex;
 use num_traits::{Float as _, One as _, ToPrimitive as _, Zero as _};
-use std::cmp::Ordering;
+use std::{borrow::Cow, cmp::Ordering};
 
 mod eigen;
 mod general;
@@ -38,6 +38,9 @@ fn lu_block(n: usize) -> usize { (n / 8).clamp(32, 128) }
 fn qr_block(p: usize) -> usize { (p / 16).clamp(32, 64) }
 /// Columns up to which `Reflections::q` applies one reflection at a time.
 const ONE_AT_A_TIME: usize = 64;
+/// Right-hand sides up to which `Reflections::apply_adjoint` applies one reflection at a time. For a 4096×16 `lstsq`, blocks measured
+/// as fast at 12 and faster from 16.
+const FEW_COLUMNS: usize = 12;
 /// Columns at which a block stops halving and factors one column at a time.
 const LEAF: usize = 16;
 /// Rows in each block of a solve with more than one right-hand side. A block's own rows substitute with vector operations, and the rows
@@ -150,8 +153,7 @@ fn odd(perm: &[usize]) -> bool {
 }
 
 /// The thin SVD of an `m`×`n` matrix: `a = U diag(s) Vᴴ`, where `p` is the smaller of `m` and `n`, U is `m`×`p` and V is `n`×`p`, both
-/// with orthonormal columns. `s` is real and in descending order. The largest component of each column of U is real and positive, or of
-/// V's where U's column is zero. Without singular vectors, `u` and `v` are empty.
+/// with orthonormal columns. `s` is real and in descending order. Without singular vectors, `u` and `v` are empty.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Svd<T: Scalar> {
     pub size: [usize; 2],
@@ -176,7 +178,7 @@ pub fn lu<T: Factor>(a: &[T], n: usize) -> Lu<T> { T::matrix_lu(a, n) }
 /// diagonal is real. It reads only `a`'s lower triangle.
 pub fn cholesky<T: Factor>(a: &[T], n: usize) -> Option<Vec<T>> { T::matrix_cholesky(a, n) }
 /// The thin QR factorization `(Q, R)` of the matrix `a` of `size` `[m, n]`. Where `p` is the smaller of `m` and `n`, Q is `m`×`p` with
-/// orthonormal columns, and R is `p`×`n` and upper triangular, with no negative item on its diagonal.
+/// orthonormal columns, and R is `p`×`n` and upper triangular, with a real diagonal.
 pub fn qr<T: Factor>(a: &[T], size: [usize; 2]) -> (Vec<T>, Vec<T>) { T::matrix_qr(a, size, false) }
 /// The complete QR factorization `(Q, R)` of the matrix `a` of `size` `[m, n]`: Q is `m`×`m` and unitary, and R is `m`×`n`. Q's first
 /// columns and R's first rows are `qr`'s, and R's other rows are zero.
@@ -270,18 +272,6 @@ fn largest<T: Scalar>(x: &[T]) -> usize {
     x.iter().position(|v| v.abs1() == top).unwrap_or(0)
 }
 
-/// The position of the item of `x` with the greatest modulus, the first of any equal ones, and the unit factor that makes that item real
-/// and positive, or 1 where every item is zero. For real items the factor is 1 or -1. After multiplying by the factor, callers set that
-/// item's imaginary part to 0, because rounding leaves a trace of one.
-fn lead<T: Scalar>(x: impl Iterator<Item = T>) -> (usize, T) {
-    let zero = T::Real::zero();
-    let (i, top, m) = x.enumerate().fold((0, T::zero(), zero), |(i, b, mb), (j, y)| {
-        let my = y.modulus();
-        if my > mb { (j, y, my) } else { (i, b, mb) }
-    });
-    (i, if m == zero { T::one() } else { top.conj().div_real(m) })
-}
-
 /// The power of two that brings the greatest `abs1` in `a` to between 1 and 2, when that magnitude lies outside the range where sums
 /// of squares neither overflow nor lose digits to underflow, from √(least normal)/ε to its reciprocal. `None` inside that range, and
 /// for a matrix of zeros or one holding an infinity. Scaling by a power of two is exact.
@@ -302,9 +292,6 @@ fn divide<T: Scalar>(x: &mut [T], d: T) {
         for v in x { *v = v.quotient(d) }
     }
 }
-
-/// The `n`×`n` identity matrix.
-fn identity<T: Scalar>(n: usize) -> Vec<T> { (0..n * n).map(|k| if k % (n + 1) == 0 { T::one() } else { T::zero() }).collect() }
 
 /// The transpose of the `m`×`n` matrix `a`, with each item converted by `f`.
 fn transpose_by<T: Copy>(a: &[T], m: usize, n: usize, f: impl Fn(T) -> T) -> Vec<T> {
@@ -576,17 +563,48 @@ fn triangular<T: Scalar>(panel: &[T], taus: &[T], rows: usize) -> Vec<T> {
     t
 }
 
-/// A Householder QR factorization of an `m`×`n` matrix, before Q forms: R on and above the diagonal of `f`, and for each block its first
-/// column, its width, its reflections transposed, and the T of their WY form.
-struct Reflections<T> {
-    size: [usize; 2],
-    f: Vec<T>,
-    blocks: Vec<(usize, usize, Vec<T>, Vec<T>)>,
+/// One block of a product of Householder reflections, `I - V T Vᴴ`, for reflections `k0` to `k0 + nb - 1`, acting on rows `k0` on.
+/// Column `c` of V is reflection `k0 + c`, which `householder` reads from row `c` of `panel`. T is `triangular`'s.
+struct Block<T> {
+    k0: usize,
+    nb: usize,
+    panel: Vec<T>,
+    t: Vec<T>,
 }
 
-/// The reflections of the QR factorization of `a`, by blocks of `qr_block(p)` columns. Each block's columns factor in a transposed copy, where
-/// each column is contiguous. The block's reflections then update the columns after it, in the WY form.
-fn reflect<T: Scalar + Tiled>(a: &[T], [m, n]: [usize; 2]) -> Reflections<T> {
+impl<T: Scalar + Tiled> Block<T> {
+    /// The block of reflections `k0` on, with the vectors in the rows of `panel` and the τs `taus`.
+    fn new(k0: usize, panel: Vec<T>, taus: &[T]) -> Self {
+        let nb = taus.len();
+        let t = triangular(&panel, taus, panel.len() / nb);
+        Self { k0, nb, panel, t }
+    }
+
+    /// Applies `I - V T Vᴴ`, or its adjoint `I - V Tᴴ Vᴴ` where `adjoint` is true, to the columns from `c0` on of the matrix `x`, whose
+    /// rows hold `ld` items.
+    fn apply(&self, x: &mut [T], ld: usize, c0: usize, adjoint: bool) {
+        let (k0, nb, rows, cols) = (self.k0, self.nb, self.panel.len() / self.nb, ld - c0);
+        // `triangular` stores T's zeros, so neither T nor Tᴴ needs a mask.
+        let t = if adjoint { Cow::Owned(transpose_by(&self.t, nb, nb, T::conj)) } else { Cow::Borrowed(&self.t[..]) };
+        let v = |r: usize, c: usize| householder(&self.panel, rows, c, r);
+        let mut w = vec![T::zero(); nb * cols];
+        T::add_product(&mut w, cols, |i, r| v(r, i).conj(), |r, j| x[(k0 + r) * ld + c0 + j], [nb, rows, cols]);
+        let mut tw = vec![T::zero(); nb * cols];
+        T::add_product(&mut tw, cols, |i, c| t[i * nb + c], |c, j| w[c * cols + j], [nb, nb, cols]);
+        T::add_product(&mut x[k0 * ld + c0..], ld, |r, c| -v(r, c), |c, j| tw[c * cols + j], [rows, nb, cols]);
+    }
+}
+
+/// Householder reflections of `m`-item columns, in blocks, as the `m`×`m` product Q of their matrices, first to last.
+struct Reflections<T> {
+    m: usize,
+    blocks: Vec<Block<T>>,
+}
+
+/// The QR factorization of `a`: its reflections, by blocks of `qr_block(p)` columns, and the `p`×`n` upper triangular R, where `p` is the
+/// smaller of `m` and `n`. Each block's columns factor in a transposed copy, where each column is contiguous. The block's reflections then
+/// update the columns after it, in the WY form.
+fn reflect<T: Scalar + Tiled>(a: &[T], [m, n]: [usize; 2]) -> (Reflections<T>, Vec<T>) {
     assert_eq!(a.len(), m * n, "`a` must hold `m`×`n` items");
     let p = m.min(n);
     let mut f = a.to_vec();
@@ -613,112 +631,75 @@ fn reflect<T: Scalar + Tiled>(a: &[T], [m, n]: [usize; 2]) -> Reflections<T> {
         for r in 0..nb {
             for c in r..nb { f[(k0 + r) * n + k0 + c] = panel[c * rows + r] }
         }
-        let t = triangular(&panel, &taus, rows);
-        if k1 < n {
-            // The columns after the block: A2 ← A2 - V (Tᴴ (Vᴴ A2)).
-            let cols = n - k1;
-            let v = |r: usize, c: usize| householder(&panel, rows, c, r);
-            let mut w = vec![T::zero(); nb * cols];
-            T::add_product(&mut w, cols, |i, r| v(r, i).conj(), |r, j| f[(k0 + r) * n + k1 + j], [nb, rows, cols]);
-            let mut tw = vec![T::zero(); nb * cols];
-            T::add_product(&mut tw, cols, |i, c| if c <= i { t[c * nb + i].conj() } else { T::zero() }, |c, j| w[c * cols + j], [nb, nb, cols]);
-            T::add_product(&mut f[k0 * n + k1..], n, |r, c| -v(r, c), |c, j| tw[c * cols + j], [rows, nb, cols]);
-        }
-        blocks.push((k0, nb, panel, t));
+        let block = Block::new(k0, panel, &taus);
+        // The columns after the block: A2 ← (I - V Tᴴ Vᴴ) A2.
+        if k1 < n { block.apply(&mut f, n, k1, true) }
+        blocks.push(block);
     }
-    // R, in the upper triangle, returns to `a`'s scale. The reflections don't depend on the scale.
-    if let Some(s) = scale { for r in 0..p { for x in &mut f[r * n + r..(r + 1) * n] { *x = x.div_real(s) } } }
-    Reflections { size: [m, n], f, blocks }
+    // R returns to `a`'s scale. The reflections don't depend on the scale.
+    let r = (0..p * n).map(|k| if k % n < k / n { T::zero() } else { scale.map_or(f[k], |s| f[k].div_real(s)) }).collect();
+    (Reflections { m, blocks }, r)
 }
 
 impl<T: Scalar + Tiled> Reflections<T> {
-    /// The `p`×`n` R, where `p` is the smaller of `m` and `n`.
-    fn r(&self) -> Vec<T> {
-        let [m, n] = self.size;
-        (0..m.min(n) * n).map(|k| if k % n >= k / n { self.f[k] } else { T::zero() }).collect()
+    /// Each reflection, first to last: the row it acts from, its τ, and its vector after the 1 at that row.
+    fn each(&self) -> impl DoubleEndedIterator<Item = (usize, T, &[T])> {
+        self.blocks.iter().flat_map(move |b| {
+            let rows = self.m - b.k0;
+            (0..b.nb).map(move |c| (b.k0 + c, b.t[c * b.nb + c], &b.panel[c * rows + c + 1..(c + 1) * rows]))
+        })
     }
 
-    /// Q's first `p` columns: the reflections applied, last block first, to those columns of the identity. Before a block starting at
-    /// k0, columns before k0 are still columns of the identity, which it leaves unchanged. Up to `ONE_AT_A_TIME` columns, each reflection
-    /// applies alone to the rows of Qᵀ, which avoids the products and their packed buffers that a block needs.
+    /// Q's first `p` columns, where `p` is the number of reflections: the reflections applied, last block first, to those columns of the
+    /// identity. Before a block starting at k0, columns before k0 are still columns of the identity, which it leaves unchanged. Up to
+    /// `ONE_AT_A_TIME` columns, each reflection applies alone to the rows of Qᵀ, which avoids the products and their packed buffers that a
+    /// block needs.
     fn q(&self) -> Vec<T> {
-        let [m, n] = self.size;
-        let p = m.min(n);
+        let (m, p) = (self.m, self.blocks.last().map_or(0, |b| b.k0 + b.nb));
         if p <= ONE_AT_A_TIME {
             let mut qt: Vec<T> = (0..p * m).map(|k| if k / m == k % m { T::one() } else { T::zero() }).collect();
-            for (k0, nb, panel, t) in self.blocks.iter().rev() {
-                let rows = m - k0;
-                for c in (0..*nb).rev() {
-                    let (row, tail) = (k0 + c, &panel[c * rows + c + 1..(c + 1) * rows]);
-                    // `apply_reflector` applies I - τ̄ v vᴴ, and Q's reflections are I - τ v vᴴ.
-                    let tau = t[c * nb + c].conj();
-                    if tau == T::zero() { continue }
-                    for column in qt[row * m..].chunks_exact_mut(m) { apply_reflector(&mut column[row..], tau, tail) }
-                }
+            for (row, tau, v) in self.each().rev() {
+                if tau == T::zero() { continue }
+                // `apply_reflector` applies I - τ̄ v vᴴ, and Q's reflections are I - τ v vᴴ.
+                for column in qt[row * m..].chunks_exact_mut(m) { apply_reflector(&mut column[row..], tau.conj(), v) }
             }
             return transpose(&qt, p, m);
         }
         let mut q: Vec<T> = (0..m * p).map(|k| if k / p == k % p { T::one() } else { T::zero() }).collect();
-        for block in self.blocks.iter().rev() { self.apply_block(block, &mut q, p, block.0) }
+        for block in self.blocks.iter().rev() { block.apply(&mut q, p, block.k0, false) }
         q
     }
 
     /// `Q x` for the `m`×`k` matrix `x`, in place.
     fn apply(&self, x: &mut [T], k: usize) {
-        for block in self.blocks.iter().rev() { self.apply_block(block, x, k, 0) }
+        for block in self.blocks.iter().rev() { block.apply(x, k, 0, false) }
     }
 
-    /// Applies one block's reflections, `I - V T Vᴴ`, to the columns from `c0` on of the matrix `x`, whose rows hold `ld` items.
-    fn apply_block(&self, (k0, nb, panel, t): &(usize, usize, Vec<T>, Vec<T>), x: &mut [T], ld: usize, c0: usize) {
-        let (k0, nb, rows, cols) = (*k0, *nb, self.size[0] - k0, ld - c0);
-        let v = |r: usize, c: usize| householder(panel, rows, c, r);
-        let mut w = vec![T::zero(); nb * cols];
-        T::add_product(&mut w, cols, |i, r| v(r, i).conj(), |r, j| x[(k0 + r) * ld + c0 + j], [nb, rows, cols]);
-        let mut tw = vec![T::zero(); nb * cols];
-        T::add_product(&mut tw, cols, |i, c| if c >= i { t[i * nb + c] } else { T::zero() }, |c, j| w[c * cols + j], [nb, nb, cols]);
-        T::add_product(&mut x[k0 * ld + c0..], ld, |r, c| -v(r, c), |c, j| tw[c * cols + j], [rows, nb, cols]);
-    }
-
-    /// `Qᴴ b` for the `m`×`k` matrix `b`: each reflection in turn applied to each column of `b`, in a transposed copy where each column
-    /// is contiguous.
-    fn apply_transpose(&self, b: &[T], k: usize) -> Vec<T> {
-        let m = self.size[0];
-        let mut bt = transpose(b, m, k);
-        for (k0, nb, panel, t) in &self.blocks {
-            let (nb, rows) = (*nb, m - k0);
-            for c in 0..nb {
-                let tau = t[c * nb + c];
-                if tau == T::zero() { continue }
-                let (row, v) = (k0 + c, &panel[c * rows + c + 1..(c + 1) * rows]);
-                for column in bt.chunks_exact_mut(m) {
-                    apply_reflector(&mut column[row..], tau, v);
-                }
-            }
+    /// `Qᴴ x` for the `m`×`k` matrix `x`, in place: the blocks' adjoints, first block first. Up to `FEW_COLUMNS` columns, each reflection
+    /// applies alone to each column of a transposed copy, where each column is contiguous.
+    fn apply_adjoint(&self, x: &mut [T], k: usize) {
+        if k > FEW_COLUMNS {
+            for block in &self.blocks { block.apply(x, k, 0, true) }
+            return;
         }
-        transpose(&bt, k, m)
+        let m = self.m;
+        let mut xt = transpose(x, m, k);
+        for (row, tau, v) in self.each() {
+            if tau == T::zero() { continue }
+            for column in xt.chunks_exact_mut(m) { apply_reflector(&mut column[row..], tau, v) }
+        }
+        transpose_into(&xt, m, x, k, [k, m], |x| x);
     }
 }
 
-/// `qr` and `qr_complete` for `T`: Q and R from the reflections, with each sign chosen to leave R's diagonal real and non-negative. A
-/// complete Q applies the reflections to the `m`×`m` identity, and R gains rows of zeros to be `m`×`n`.
+/// `qr` and `qr_complete` for `T`: Q and R from the reflections. A complete Q applies the reflections to the `m`×`m` identity, and R
+/// gains rows of zeros to be `m`×`n`.
 fn qr_factor<T: Scalar + Tiled>(a: &[T], [m, n]: [usize; 2], complete: bool) -> (Vec<T>, Vec<T>) {
-    let reflections = reflect(a, [m, n]);
-    let p = m.min(n);
-    let (mut q, columns) = if complete {
-        let mut q = identity(m);
-        reflections.apply(&mut q, m);
-        (q, m)
-    } else {
-        (reflections.q(), p)
-    };
-    let mut r = reflections.r();
-    r.resize(if complete { m } else { p } * n, T::zero());
-    for i in 0..p {
-        if r[i * n + i].re() < T::Real::zero() {
-            for x in &mut r[i * n + i..(i + 1) * n] { *x = -*x }
-            for row in 0..m { q[row * columns + i] = -q[row * columns + i] }
-        }
-    }
+    let (reflections, mut r) = reflect(a, [m, n]);
+    if !complete { return (reflections.q(), r) }
+    let mut q = identity(m);
+    reflections.apply(&mut q, m);
+    r.resize(m * n, T::zero());
     (q, r)
 }
 
@@ -768,9 +749,10 @@ where
         let svd = svd::svd_factor(a, [m, n], true);
         return (pseudo_solve(&svd, Some(b), k, n), svd.s);
     }
-    let reflections = reflect(a, [m, n]);
-    let y = reflections.apply_transpose(b, k);
-    let svd = svd::svd_factor(&reflections.r(), [n, n], true);
+    let (reflections, r) = reflect(a, [m, n]);
+    let mut y = b.to_vec();
+    reflections.apply_adjoint(&mut y, k);
+    let svd = svd::svd_factor(&r, [n, n], true);
     (pseudo_solve(&svd, Some(&y[..n * k]), k, m), svd.s)
 }
 
@@ -847,7 +829,7 @@ mod tests {
                 let (q, r) = (wide(&q), wide(&r));
                 assert!(distance(&product(&q, &r, [m, p, c]), &aw, scale) < bound, "qr at {m}×{c}");
                 assert!(orthogonality(&q, m, p) < bound, "qr's q at {m}×{c}");
-                assert!((0..p * c).all(|k| k % c >= k / c || r[k] == 0.0) && (0..p).all(|i| r[i * c + i] >= 0.0), "qr's r at {m}×{c}");
+                assert!((0..p * c).all(|k| k % c >= k / c || r[k] == 0.0), "qr's r at {m}×{c}");
                 let f = svd(&a, [m, c]);
                 let (u, s, v) = (wide(&f.u), wide(&f.s), wide(&f.v));
                 assert!(s.windows(2).all(|w| w[0] >= w[1]) && s.iter().all(|&x| x >= 0.0), "svd's s at {m}×{c}");
@@ -856,9 +838,6 @@ mod tests {
                 // The accumulated rotations' rounding errors add up over the sweeps, in V, or in U for a wide matrix.
                 let (ou, ov) = (orthogonality(&u, m, p), orthogonality(&v, c, p));
                 assert!(ou < 4.0 * bound && ov < 4.0 * bound, "svd's u and v at {m}×{c}: {ou:e} and {ov:e}, against {bound:e}");
-                for k in 0..p {
-                    assert!(real_positive_lead(&(0..m).map(|i| C64::from(u[i * p + k])).collect::<Vec<_>>(), 0.0), "svd's signs at {m}×{c}");
-                }
                 assert!(distance(&wide(&singular_values(&a, [m, c])), &wide(&f.s), scale) < bound, "singular values alone at {m}×{c}");
                 // A least-squares solution leaves a residual orthogonal to A's columns, and the pseudoinverse inverts A on its range.
                 if m >= c && c > 0 {
@@ -1034,15 +1013,20 @@ mod tests {
             assert!((0..n * n).all(|k| k % n <= k / n || l[k] == 0.0), "cholesky's upper triangle at {n}");
             assert!(distance(&times(&l, &times(&transpose(&l, n, n), &x)), &times(&sw, &x), norm(&sw) * norm(&x)) < bound, "cholesky at {n}");
             for rows in [n, n + 5] {
-                let (a, b) = (random::<T>(rows, n, rows as u64 + 7), random::<T>(rows, 2, 13));
-                let (aw, bw, reflections) = (wide(&a), wide(&b), reflect(&a, [rows, n]));
-                let (q, r) = (wide(&reflections.q()), wide(&reflections.r()));
+                let a = random::<T>(rows, n, rows as u64 + 7);
+                let (aw, (reflections, r)) = (wide(&a), reflect(&a, [rows, n]));
+                let (q, r) = (wide(&reflections.q()), wide(&r));
                 assert!(distance(&times(&q, &times(&r, &x)), &times(&aw, &x), norm(&aw) * norm(&x)) < bound, "qr at {rows}×{n}");
                 assert!((0..n * n).all(|k| k % n >= k / n || r[k] == 0.0), "qr's r at {rows}×{n}");
                 let (y, qt) = (wide(&random::<T>(n, 1, 9)), transpose(&q, rows, n));
                 assert!(distance(&times(&qt, &times(&q, &y)), &y, norm(&y)) < bound, "qr's q at {rows}×{n}");
-                let qtb = wide(&reflections.apply_transpose(&b, 2));
-                assert!(distance(&qtb[..n * 2], &product(&qt, &bw, [n, rows, 2]), norm(&bw)) < bound, "qr's reflections applied to b at {rows}×{n}");
+                for k in [2, FEW_COLUMNS + 1] {
+                    let b = random::<T>(rows, k, 13);
+                    let mut qtb = b.clone();
+                    reflections.apply_adjoint(&mut qtb, k);
+                    let bw = wide(&b);
+                    assert!(distance(&wide(&qtb)[..n * k], &product(&qt, &bw, [n, rows, k]), norm(&bw)) < bound, "qr's Qᴴ b at {rows}×{n}×{k}");
+                }
             }
         }
     }
@@ -1114,7 +1098,7 @@ mod tests {
                 assert!(complex_distance(&complex_product(&q, &r, [m, p, c]), &aw, complex_norm(&aw).max(1.0)) < bound, "complex qr at {m}×{c}");
                 assert!(complex_distance(&complex_product(&adjoint(&q, m, p), &q, [p, m, p]), &identity::<C64>(p), 1.0) < bound, "complex qr's q at {m}×{c}");
                 assert!((0..p * c).all(|k| k % c >= k / c || r[k] == zero), "complex qr's r at {m}×{c}");
-                assert!((0..p).all(|j| r[j * c + j].im == 0.0 && r[j * c + j].re >= 0.0), "complex qr's diagonal at {m}×{c}");
+                assert!((0..p).all(|j| r[j * c + j].im == 0.0), "complex qr's diagonal at {m}×{c}");
             }
         }
     }
@@ -1125,11 +1109,6 @@ mod tests {
         complex_decompositions::<f32>(4.0 * f32::EPSILON as f64);
     }
 
-    /// Checks that some item of `column` whose modulus is within `rel` of the greatest modulus is real and positive.
-    pub(super) fn real_positive_lead(column: &[C64], rel: f64) -> bool {
-        let top = column.iter().fold(0.0, |b: f64, z| b.max(z.norm()));
-        column.iter().any(|z| z.norm() >= top * (1.0 - rel) && z.im == 0.0 && z.re > 0.0)
-    }
 
     /// Checks the SVD and the Hermitian eigen decomposition at complex items with parts of type `R`, either side of each block width,
     /// where `tolerance` is a few times `R`'s epsilon.
@@ -1140,8 +1119,7 @@ mod tests {
         type C<R> = num_complex::Complex<R>;
         for n in [0, 1, 2, 5, 31, 64, 129] {
             let bound = tolerance * (n as f64).max(1.0);
-            // Square, tall, very tall and wide matrices: U Σ Vᴴ is A, U and V have orthonormal columns, the singular values descend,
-            // and each column of U has its largest component real and positive.
+            // Square, tall, very tall and wide matrices: U Σ Vᴴ is A, U and V have orthonormal columns, and the singular values descend.
             for (m, c) in [(n, n), (n + 5, n), (2 * n + 5, n), (n, n + 5)] {
                 let a = complex_random::<R>(m, c, (m * 37 + c) as u64);
                 let (aw, p) = (complex_wide(&a), m.min(c));
@@ -1153,12 +1131,8 @@ mod tests {
                 assert!(complex_distance(&complex_product(&adjoint(&u, m, p), &u, [p, m, p]), &identity::<C64>(p), 1.0) < bound, "complex svd's u at {m}×{c}");
                 assert!(complex_distance(&complex_product(&adjoint(&v, c, p), &v, [p, c, p]), &identity::<C64>(p), 1.0) < bound, "complex svd's v at {m}×{c}");
                 assert!(s.windows(2).all(|w| w[0] >= w[1]) && s.iter().all(|&x| x >= 0.0), "complex singular values descend at {m}×{c}");
-                for k in 0..p {
-                    assert!(real_positive_lead(&(0..m).map(|i| u[i * p + k]).collect::<Vec<_>>(), 1e-3), "column {k} of complex svd's u at {m}×{c}");
-                }
             }
-            // A Hermitian matrix, read from its lower triangle: H V is V Λ, V is unitary, the eigenvalues ascend, and each eigenvector's
-            // largest component is real and positive.
+            // A Hermitian matrix, read from its lower triangle: H V is V Λ, V is unitary, and the eigenvalues ascend.
             let b = complex_random::<R>(n, n, n as u64 + 7);
             let half = R::narrow(0.5);
             let h: Vec<C<R>> = (0..n * n).map(|k| (b[k] + b[k % n * n + k / n].conj()).mul_real(half)).collect();
@@ -1170,9 +1144,6 @@ mod tests {
             let vl: Vec<C64> = (0..n * n).map(|k| vectors[k] * values[k % n]).collect();
             assert!(complex_distance(&complex_product(&hw, &vectors, [n; 3]), &vl, complex_norm(&hw).max(1.0)) < bound, "complex hermitian eigen at {n}");
             assert!(complex_distance(&complex_product(&adjoint(&vectors, n, n), &vectors, [n; 3]), &identity::<C64>(n), 1.0) < bound, "unitary eigenvectors at {n}");
-            for j in 0..n {
-                assert!(real_positive_lead(&(0..n).map(|i| vectors[i * n + j]).collect::<Vec<_>>(), 1e-3), "complex eigenvector {j} at {n}");
-            }
             // A complex matrix with real items gives the real code's singular values and eigenvalues, within rounding.
             let re: Vec<R> = h.iter().map(|z| z.re).collect();
             let real: Vec<C<R>> = re.iter().map(|&x| C::new(x, R::zero())).collect();

@@ -5,7 +5,7 @@ build-backend = "fastws.build_backend"
 [project]
 name = "rustymath"
 dynamic = ["version"]
-description = "Fast maths functions for f16, f32 and f64 in plain Rust."
+description = "Maths in plain Rust, from fast f16, f32 and f64 functions to exact rationals."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}

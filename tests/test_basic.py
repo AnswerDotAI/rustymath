@@ -183,7 +183,7 @@ def test_linalg(kind):
     for x in rand(3, 4, 7), rand(3, 7, 4):
         q, r = la.qr(x)
         d = np.diagonal(r, axis1=-2, axis2=-1)
-        assert np.allclose(q @ r, x) and (d.real >= 0).all() and (d.imag == 0).all()
+        assert np.allclose(q @ r, x) and (d.imag == 0).all()
         q, r = la.qr(x, complete=True)
         assert np.allclose(q @ r, x) and np.allclose(H(q) @ q, np.eye(x.shape[-2]))
         u, s, v = la.svd(x)

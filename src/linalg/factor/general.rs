@@ -11,9 +11,8 @@ use std::ops::{Range, RangeInclusive};
 
 /// The eigen decomposition of an `n`×`n` matrix: `a V = V diag(values)`, with complex values and vectors whose parts have type `T`.
 /// The eigenvalues come in the order the Schur form holds them. Column `j` of the `n`×`n` matrix `vectors` is an eigenvector for
-/// `values[j]`, of unit length, with its largest component real and positive. For a real matrix, a real eigenvalue has an imaginary
-/// part of exactly 0, and a real eigenvector. A complex pair comes as the eigenvalue with the positive imaginary part, then its
-/// conjugate. Their eigenvectors are conjugates too.
+/// `values[j]`, of unit length. For a real matrix, a real eigenvalue has an imaginary part of exactly 0, and a real eigenvector. A complex
+/// pair comes as the eigenvalue with the positive imaginary part, then its conjugate. Their eigenvectors are conjugates too.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Eig<T> {
     pub values: Vec<Complex<T>>,
@@ -62,8 +61,7 @@ pub(super) trait Schur: Scalar + Tiled {
     /// The eigenvectors of the Schur form `t`, whose rows start `ld` items apart, as the columns of an `n`×`n` matrix, for the
     /// eigenvalues `values` that `schur` gave.
     fn schur_vectors(t: &[Self], ld: usize, n: usize, values: &[Complex<Self::Real>]) -> Vec<Self>;
-    /// The eigenvectors in the columns of the `n`×`n` matrix `v`, each scaled to unit length with its largest component real and
-    /// positive.
+    /// The eigenvectors in the columns of the `n`×`n` matrix `v`, each scaled to unit length.
     fn unit_vectors(v: &[Self], n: usize, values: &[Complex<Self::Real>]) -> Vec<Complex<Self::Real>>;
 }
 
@@ -84,10 +82,8 @@ impl<R: Native + Tiled> Schur for Complex<R> {
     fn unit_vectors(v: &[Self], n: usize, _: &[Self]) -> Vec<Self> {
         let mut vectors = v.to_vec();
         for j in 0..n {
-            let z: Vec<Self> = (0..n).map(|i| v[i * n + j]).collect();
-            let (lead, phase) = unit(&z);
-            for (i, &x) in z.iter().enumerate() { vectors[i * n + j] = x * phase }
-            vectors[lead * n + j].im = R::zero();
+            let scale = unit(&(0..n).map(|i| v[i * n + j]).collect::<Vec<_>>());
+            for i in 0..n { vectors[i * n + j] = vectors[i * n + j] * scale }
         }
         vectors
     }
@@ -459,7 +455,7 @@ fn quasi_vectors<T: Native>(t: &[T], ld: usize, n: usize, values: &[Complex<T>])
 }
 
 /// The eigenvectors that the columns of the real `n`×`n` matrix `v` give, as `quasi_vectors` lays them out for the eigenvalues `values`,
-/// each of unit length with its largest component real and positive.
+/// each of unit length.
 fn real_units<T: Native>(v: &[T], n: usize, values: &[Complex<T>]) -> Vec<Complex<T>> {
     let zero = T::zero();
     let mut vectors = vec![Complex::new(zero, zero); n * n];
@@ -467,27 +463,21 @@ fn real_units<T: Native>(v: &[T], n: usize, values: &[Complex<T>]) -> Vec<Comple
     while j < n {
         let pair = values[j].im != zero;
         let z: Vec<Complex<T>> = (0..n).map(|i| Complex::new(v[i * n + j], if pair { v[i * n + j + 1] } else { zero })).collect();
-        let (lead, phase) = unit(&z);
+        let scale = unit(&z);
         for (i, &x) in z.iter().enumerate() {
-            let u = if pair { x * phase } else { Complex::new(x.re * phase.re, zero) };
-            vectors[i * n + j] = u;
-            if pair { vectors[i * n + j + 1] = u.conj() }
+            vectors[i * n + j] = x * scale;
+            if pair { vectors[i * n + j + 1] = (x * scale).conj() }
         }
-        // The lead component's imaginary part is 0 in exact arithmetic.
-        vectors[lead * n + j].im = zero;
-        if pair { vectors[lead * n + j + 1].im = zero }
         j += if pair { 2 } else { 1 };
     }
     vectors
 }
 
-/// The position of the largest component of the vector `z`, the first of any equal ones, and the factor that scales `z` to unit length
-/// with that component real and positive. Dividing by the largest modulus before squaring keeps the sum of squares finite.
-fn unit<R: Native>(z: &[Complex<R>]) -> (usize, Complex<R>) {
-    let (lead, factor) = lead(z.iter().copied());
-    let largest = z[lead].norm();
-    let length = largest * z.iter().fold(R::zero(), |s, &x| s + (x / largest).norm_sqr()).sqrt();
-    (lead, factor / length)
+/// The factor that scales the vector `z` to unit length. Dividing by the largest modulus before squaring keeps the sum of squares
+/// finite.
+fn unit<R: Native>(z: &[Complex<R>]) -> R {
+    let largest = z.iter().fold(R::zero(), |m, x| m.max(x.norm()));
+    (largest * z.iter().fold(R::zero(), |s, &x| s + (x / largest).norm_sqr()).sqrt()).recip()
 }
 
 /// Reduces the complex upper Hessenberg matrix `h`, whose rows start `ld` items apart, to upper triangular Schur form by single-shift
@@ -671,14 +661,14 @@ fn triangular_vectors<R: Native>(t: &[Complex<R>], ld: usize, n: usize) -> Vec<C
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{complex_random, complex_wide, random, real_positive_lead, RealItem, wide};
+    use super::super::tests::{complex_random, complex_wide, random, RealItem, wide};
     use super::*;
 
     /// `a` with each item as a complex number.
     fn complex(a: &[f64]) -> Vec<Complex<f64>> { a.iter().map(|&x| Complex::new(x, 0.0)).collect() }
 
     /// Checks what `eig_factor` promises for any `n`×`n` matrix `a`: a relative residual `‖A V - V Λ‖ / ‖A‖` below `bound`, and each
-    /// eigenvector of unit length, to within `bound`, with its largest component real and positive.
+    /// eigenvector of unit length, to within `bound`.
     fn check_units(a: &[Complex<f64>], n: usize, f: &Eig<f64>, bound: f64, what: &str) {
         assert_eq!((f.values.len(), f.vectors.len()), (n, n * n), "sizes for {what}");
         let mut sum = 0.0;
@@ -694,7 +684,6 @@ mod tests {
             let column: Vec<Complex<f64>> = (0..n).map(|i| f.vectors[i * n + j]).collect();
             let length = column.iter().map(|z| z.norm_sqr()).sum::<f64>().sqrt();
             assert!((length - 1.0).abs() < bound, "vector {j} has unit length for {what}");
-            assert!(real_positive_lead(&column, 0.0), "the largest component of vector {j} is real and positive for {what}");
         }
     }
 

@@ -34,12 +34,19 @@ fn unturned<R: Native>(z: Complex<R>) -> Complex<R> { c(z.im, -z.re) }
 #[inline(always)]
 fn pi<R: Native>() -> R { let (hi, _) = arc::half_pi::<R>(); hi + hi }
 
+/// The whole number k nearest y/(π/2), and whether y is the float nearest kπ/2, with |k| up to 256.
+#[inline(always)]
+fn turns<R: Native>(y: R) -> (R, bool) {
+    let (q, _) = arc::half_pi::<R>();
+    let k = (y * R::narrow(std::f64::consts::FRAC_2_PI)).round();
+    (k, (k.abs() <= R::narrow(256.0)) & (k * q == y))
+}
+
 /// cos y and sin y as exactly 1, 0 or -1, where y is the float nearest kπ/2 for a whole number k of quarter turns, with |k| up to 256.
 #[inline(always)]
 fn quarter<R: Native>(y: R) -> Option<(R, R)> {
-    let (q, _) = arc::half_pi::<R>();
-    let k = (y * R::narrow(std::f64::consts::FRAC_2_PI)).round();
-    if !((k.abs() <= R::narrow(256.0)) & (k * q == y)) { return None }
+    let (k, exact) = turns(y);
+    if !exact { return None }
     let (zero, one, m) = (R::zero(), R::one(), k - R::narrow(4.0) * (k * R::narrow(0.25)).floor());
     Some(if m == zero { (one, zero) } else if m == one { (zero, one) } else if m == one + one { (-one, zero) } else { (zero, -one) })
 }
@@ -62,7 +69,7 @@ pub fn divide<R: Native>(x: Complex<R>, y: Complex<R>) -> Complex<R> {
 /// loses bits, and rounds the root once. That is within half an ulp, where `hypot` at f32's own width is within about one, and it
 /// costs less than `hypot`'s scaling.
 #[inline(always)]
-fn modulus<R: Native, const FUSED: bool>(x: R, y: R) -> R {
+pub(crate) fn modulus<R: Native, const FUSED: bool>(x: R, y: R) -> R {
     let (a, b) = (x.wide(), y.wide());
     if R::WIDE { p::hypot::<R, FUSED>(x, y) } else { R::narrow((a * a + b * b).sqrt()) }
 }
@@ -78,6 +85,14 @@ pub(crate) fn exp<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R> {
     let r = c(part(x, cy + cy, half), if y == R::zero() { y } else { part(x, sy + sy, half) });
     let lost = x.is_infinite() & !y.is_finite();
     if lost { if x > R::zero() { c(x, R::nan()) } else { c(R::zero(), R::zero().copysign(y)) } } else { r }
+}
+
+/// e^(iy) for a real y, from cos y and sin y as `trig` computes them, as `exp` gives it: exact at the quarter turns that `quarter`
+/// finds, and with a zero y, sign included, as its imaginary part.
+#[inline(always)]
+fn cis_parts<R: Native>(y: R, cy: R, sy: R) -> Complex<R> {
+    let (cy, sy) = quarter(y).unwrap_or((cy, sy));
+    c(cy, if y == R::zero() { y } else { sy })
 }
 
 /// z scaled up exactly by 2^(2p) where it is so small that its halves or its magnitude would lose bits, and p, or z itself and 0. p
@@ -177,10 +192,12 @@ pub(crate) fn tanh<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R> {
     let d = (b * s).mla::<FUSED>(s, R::one());
     let near = c(b * s * rho / d, t / d);
     let far = c(R::one().copysign(x), e::exp_times::<R, FUSED>(R::narrow(-2.0) * x.abs(), R::narrow(2.0)) * (sy * cy));
-    let limit = R::narrow(if R::WIDE { 22.0 } else { 10.0 });
-    let r = if x.abs() > limit { far } else { near };
+    let r = if x.abs() > tanh_limit::<R>() { far } else { near };
     if x.is_infinite() & !y.is_finite() { c(r.re, R::zero().copysign(y)) } else { r }
 }
+
+/// The `|x|` beyond which `tanh` takes its formula for a large `x`.
+fn tanh_limit<R: Native>() -> R { R::narrow(if R::WIDE { 22.0 } else { 10.0 }) }
 
 /// sin z = -i sinh(iz).
 #[inline]
@@ -272,10 +289,13 @@ pub(crate) fn atanh<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R> {
     let im = arc::atan2::<R, FUSED>(y + y, m.mla::<FUSED>(R::one() + x, -(y * y))) * half;
     let h = modulus::<R, FUSED>(x, y);
     let (right, _) = arc::half_pi::<R>();
-    let huge = h > R::narrow(if R::WIDE { 1e150 } else { 1e18 });
+    let huge = h > atanh_huge::<R>();
     let (re, im) = if x.is_infinite() | y.is_infinite() { (R::zero(), right.copysign(y)) } else if huge { (x / h / h, right.copysign(y)) } else { (re, im) };
     c(re * s, im * s)
 }
+
+/// The modulus beyond which `atanh` takes its formula for a huge `z`.
+fn atanh_huge<R: Native>() -> R { R::narrow(if R::WIDE { 1e150 } else { 1e18 }) }
 
 /// atan z = -i atanh(iz).
 #[inline]
@@ -454,6 +474,178 @@ where
     Atan2.many(Arg::Many(y), Arg::Many(x), n, im);
 }
 
+/// The moduli of `x + iy`, as `modulus` computes them: at f64 through `Hypot`'s slice form, at f32 from squares summed in f64.
+fn moduli<R: Native>(x: &[R], y: &[R], out: &mut Vec<R>)
+where
+    Hypot: Binary<R, Out = R>,
+{
+    if R::WIDE { Hypot.many(Arg::Many(x), Arg::Many(y), x.len(), out); } else { out.extend(x.iter().zip(y).map(|(&x, &y)| modulus::<R, { crate::FUSED }>(x, y))) }
+}
+
+/// The square roots of `x + iy` through real slice forms, as `sqrt` computes them where `rough_root` is false.
+fn sqrt_parts<R: Native>(x: &[R], y: &[R], re: &mut Vec<R>, im: &mut Vec<R>)
+where
+    Hypot: Binary<R, Out = R>,
+{
+    let (mut h, half, zero) = (Vec::new(), R::narrow(0.5), R::zero());
+    moduli(x, y, &mut h);
+    let t: Vec<R> = x.iter().zip(&h).map(|(&x, &h)| x.abs().mla::<{ crate::FUSED }>(half, h * half).sqrt()).collect();
+    // `sqrt` divides |y| or y by 2t, whichever its branch needs. |y|/2t is |y/2t| exactly, so one division serves both branches.
+    let q: Vec<R> = y.iter().zip(&t).map(|(&y, &t)| y / (t + t)).collect();
+    re.extend(x.iter().zip(&t).zip(&q).map(|((&x, &t), &q)| if x >= zero { t } else { q.abs() }));
+    im.extend(x.iter().zip(y).zip(t.iter().zip(&q)).map(|((&x, &y), (&t, &q))| if x >= zero { q } else { t.copysign(y) }));
+}
+
+/// Whether `sqrt` takes a path for `z` that `sqrt_parts` leaves out: a tiny `z`, which it scales first, an infinite imaginary part,
+/// or zero.
+fn rough_root<R: Native>(z: Complex<R>) -> bool { tiny(z) | z.im.is_infinite() | ((z.re == R::zero()) & (z.im == R::zero())) }
+
+/// The square roots of `a` and of `b`, each given and returned as its real and imaginary parts, through `sqrt_parts`.
+fn root_pair<R: Native>([ax, ay]: [&[R]; 2], [bx, by]: [&[R]; 2]) -> [(Vec<R>, Vec<R>); 2]
+where
+    Hypot: Binary<R, Out = R>,
+{
+    let mut roots = [(Vec::new(), Vec::new()), (Vec::new(), Vec::new())];
+    let [a, b] = &mut roots;
+    sqrt_parts(ax, ay, &mut a.0, &mut a.1);
+    sqrt_parts(bx, by, &mut b.0, &mut b.1);
+    roots
+}
+
+/// `roots`' square roots of `1 - z` and `1 + z`, for `z` = `x + iy`.
+fn roots_parts<R: Native>(x: &[R], y: &[R]) -> [(Vec<R>, Vec<R>); 2]
+where
+    Hypot: Binary<R, Out = R>,
+{
+    let one = R::one();
+    let below: Vec<R> = x.iter().map(|&x| one - x).collect();
+    let minus_y: Vec<R> = y.iter().map(|&y| -y).collect();
+    let above: Vec<R> = x.iter().map(|&x| one + x).collect();
+    root_pair([&below, &minus_y], [&above, y])
+}
+
+/// Whether `roots` takes a path for `z` that `roots_parts` leaves out.
+fn rough_roots<R: Native>(z: Complex<R>) -> bool { rough_root(c(R::one() - z.re, -z.im)) | rough_root(c(R::one() + z.re, z.im)) }
+
+/// `shifted_roots`' square roots of `z - 1` and `z + 1`, for `z` = `x + iy`.
+fn shifted_roots_parts<R: Native>(x: &[R], y: &[R]) -> [(Vec<R>, Vec<R>); 2]
+where
+    Hypot: Binary<R, Out = R>,
+{
+    let one = R::one();
+    let below: Vec<R> = x.iter().map(|&x| x - one).collect();
+    let above: Vec<R> = x.iter().map(|&x| x + one).collect();
+    root_pair([&below, y], [&above, y])
+}
+
+/// Whether `shifted_roots` takes a path for `z` that `shifted_roots_parts` leaves out.
+fn rough_shifted_roots<R: Native>(z: Complex<R>) -> bool { rough_root(c(z.re - R::one(), z.im)) | rough_root(c(z.re + R::one(), z.im)) }
+
+/// Appends the products `a × b`, computed as `Complex`'s multiplication computes them, of two complex slices given as their parts.
+fn times_parts<R: Native>((ar, ai): &(Vec<R>, Vec<R>), (br, bi): &(Vec<R>, Vec<R>), re: &mut Vec<R>, im: &mut Vec<R>) {
+    re.extend(ar.iter().zip(ai).zip(br.iter().zip(bi)).map(|((&ar, &ai), (&br, &bi))| ar * br - ai * bi));
+    im.extend(ar.iter().zip(ai).zip(br.iter().zip(bi)).map(|((&ar, &ai), (&br, &bi))| ar * bi + ai * br));
+}
+
+/// Appends `g` of `turned(z)`, turned back by `unturned`, for each `z` = `x + iy`, where `g` appends its results' parts.
+fn unturned_parts<R: Native>(x: &[R], y: &[R], g: impl Fn(&[R], &[R], &mut Vec<R>, &mut Vec<R>), re: &mut Vec<R>, im: &mut Vec<R>) {
+    let (minus_y, mut a, mut b): (Vec<R>, _, _) = (y.iter().map(|&v| -v).collect(), Vec::new(), Vec::new());
+    g(&minus_y, x, &mut a, &mut b);
+    re.extend(b);
+    im.extend(a.iter().map(|&v| -v));
+}
+
+/// `asin` of `x + iy` through real slice forms, where `rough_roots` is false.
+fn asin_parts<R: Native>(x: &[R], y: &[R], re: &mut Vec<R>, im: &mut Vec<R>)
+where
+    Hypot: Binary<R, Out = R>,
+    Atan2: Binary<R, Out = R>,
+    Asinh: Unary<R, Out = R>,
+{
+    let n = x.len();
+    let [(ar, ai), (br, bi)] = roots_parts(x, y);
+    let d: Vec<R> = ar.iter().zip(&ai).zip(br.iter().zip(&bi)).map(|((&ar, &ai), (&br, &bi))| ar.mla::<{ crate::FUSED }>(br, -(ai * bi))).collect();
+    let s: Vec<R> = ar.iter().zip(&ai).zip(br.iter().zip(&bi)).map(|((&ar, &ai), (&br, &bi))| ar.mla::<{ crate::FUSED }>(bi, -(ai * br))).collect();
+    Atan2.many(Arg::Many(x), Arg::Many(&d), n, re);
+    Asinh.many(Arg::Many(&s), n, im);
+}
+
+/// `acos` of `x + iy` through real slice forms, where `rough_roots` is false.
+fn acos_parts<R: Native>(x: &[R], y: &[R], re: &mut Vec<R>, im: &mut Vec<R>)
+where
+    Hypot: Binary<R, Out = R>,
+    Atan2: Binary<R, Out = R>,
+    Asinh: Unary<R, Out = R>,
+{
+    let (n, mut half) = (x.len(), Vec::new());
+    let [(ar, ai), (br, bi)] = roots_parts(x, y);
+    let s: Vec<R> = br.iter().zip(&bi).zip(ar.iter().zip(&ai)).map(|((&br, &bi), (&ar, &ai))| br.mla::<{ crate::FUSED }>(ai, -(bi * ar))).collect();
+    Atan2.many(Arg::Many(&ar), Arg::Many(&br), n, &mut half);
+    re.extend(half.iter().map(|&h| h + h));
+    Asinh.many(Arg::Many(&s), n, im);
+}
+
+/// `acosh` of `x + iy` through real slice forms, where `rough_shifted_roots` is false.
+fn acosh_parts<R: Native>(x: &[R], y: &[R], re: &mut Vec<R>, im: &mut Vec<R>)
+where
+    Hypot: Binary<R, Out = R>,
+    Atan2: Binary<R, Out = R>,
+    Asinh: Unary<R, Out = R>,
+{
+    let (n, mut half) = (x.len(), Vec::new());
+    let [(ar, ai), (br, bi)] = shifted_roots_parts(x, y);
+    let s: Vec<R> = ar.iter().zip(&ai).zip(br.iter().zip(&bi)).map(|((&ar, &ai), (&br, &bi))| ar.mla::<{ crate::FUSED }>(br, ai * bi)).collect();
+    Asinh.many(Arg::Many(&s), n, re);
+    Atan2.many(Arg::Many(&ai), Arg::Many(&br), n, &mut half);
+    im.extend(half.iter().map(|&h| h + h));
+}
+
+/// `tanh` of `x + iy` through real slice forms, where `rough_tanh` is false.
+fn tanh_parts<R: Native>(x: &[R], y: &[R], re: &mut Vec<R>, im: &mut Vec<R>)
+where
+    Sin: Unary<R, Out = R>,
+    Cos: Unary<R, Out = R>,
+    Sinh: Unary<R, Out = R>,
+{
+    let (n, one, mut sy, mut cy, mut s) = (x.len(), R::one(), Vec::new(), Vec::new(), Vec::new());
+    Sin.many(Arg::Many(y), n, &mut sy);
+    Cos.many(Arg::Many(y), n, &mut cy);
+    Sinh.many(Arg::Many(x), n, &mut s);
+    let t: Vec<R> = sy.iter().zip(&cy).map(|(&sy, &cy)| sy / cy).collect();
+    let b: Vec<R> = t.iter().map(|&t| t.mla::<{ crate::FUSED }>(t, one)).collect();
+    let d: Vec<R> = b.iter().zip(&s).map(|(&b, &s)| (b * s).mla::<{ crate::FUSED }>(s, one)).collect();
+    re.extend(b.iter().zip(&s).zip(&d).map(|((&b, &s), &d)| b * s * s.mla::<{ crate::FUSED }>(s, one).sqrt() / d));
+    im.extend(t.iter().zip(&d).map(|(&t, &d)| t / d));
+}
+
+/// Whether `tanh` takes a path for `z` that `tanh_parts` leaves out: `|x|` beyond `tanh_limit`, or a part that isn't finite.
+fn rough_tanh<R: Native>(z: Complex<R>) -> bool { !(z.re.abs() <= tanh_limit::<R>()) | !z.im.is_finite() }
+
+/// `atanh` of `x + iy` through real slice forms, where `rough_atanh` is false.
+fn atanh_parts<R: Native>(x: &[R], y: &[R], re: &mut Vec<R>, im: &mut Vec<R>)
+where
+    Log1p: Unary<R, Out = R>,
+    Atan2: Binary<R, Out = R>,
+{
+    let (n, one, mut lr, mut li) = (x.len(), R::one(), Vec::new(), Vec::new());
+    let s: Vec<R> = x.iter().map(|&x| one.copysign(x)).collect();
+    let ax: Vec<R> = x.iter().map(|&x| x.abs()).collect();
+    let ay: Vec<R> = y.iter().zip(&s).map(|(&y, &s)| y * s).collect();
+    let q: Vec<R> = ax.iter().zip(&ay).map(|(&x, &y)| R::narrow(4.0) * x / (one - x).mla::<{ crate::FUSED }>(one - x, y * y)).collect();
+    let u: Vec<R> = ay.iter().map(|&y| y + y).collect();
+    let v: Vec<R> = ax.iter().zip(&ay).map(|(&x, &y)| (one - x).mla::<{ crate::FUSED }>(one + x, -(y * y))).collect();
+    Log1p.many(Arg::Many(&q), n, &mut lr);
+    Atan2.many(Arg::Many(&u), Arg::Many(&v), n, &mut li);
+    re.extend(lr.iter().zip(&s).map(|(&r, &s)| r * R::narrow(0.25) * s));
+    im.extend(li.iter().zip(&s).map(|(&i, &s)| i * R::narrow(0.5) * s));
+}
+
+/// Whether `atanh` may take a path for `z` that `atanh_parts` leaves out. It tests for a part that isn't finite, or a part above half of
+/// `atanh_huge`. Every `z` with a modulus above `atanh_huge` has such a part.
+fn rough_atanh<R: Native>(z: Complex<R>) -> bool {
+    !z.re.is_finite() | !z.im.is_finite() | (z.re.abs().max(z.im.abs()) > atanh_huge::<R>() * R::narrow(0.5))
+}
+
 /// Attaches each function of one complex argument to its object, at both widths, with the slice form that runs it on each item.
 macro_rules! unary {
     ($($object:ident: $f:ident;)+) => {$(
@@ -461,29 +653,90 @@ macro_rules! unary {
     )+};
 }
 unary! {
-    Tan: tan; Tanh: tanh; Asin: asin; Acos: acos; Atan: atan; Asinh: asinh; Acosh: acosh; Atanh: atanh; Lgamma: lgamma; Gamma: gamma;
-    Factorial: factorial; Sqrt: sqrt; Sign: sign; Sqrt1mx2: sqrt1mx2; Sqrt1px2: sqrt1px2; Sqrtx2m1: sqrtx2m1;
+    Lgamma: lgamma; Gamma: gamma; Factorial: factorial; Sign: sign; Sqrt: sqrt;
 }
-// The functions below have slice forms computed through real slice forms, by `split!`. sin z is sinh of iz turned back, and cos z is
-// cosh of iz, as `sin` and `cos` compute them.
+// The functions below have slice forms computed through real slice forms, by `split!`. cis z is the exponential of iz, sin z and
+// tan z are sinh and tanh of iz turned back, and cos z is cosh of iz, as the scalar forms compute them.
 forms!(Exp at Complex<f32>, Complex<f64>: |_, [z]| exp::<_, { crate::FUSED }>(z),
     many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| exp_parts(x, y, re, im), |_, r| !finite(r), |[z]| exp::<_, { crate::FUSED }>(z)));
+/// e^(iz), the cis of z, as a function object, which is cos z + i sin z for a real z. It takes real and complex items. On reals, its
+/// slice form runs `Cos`'s and `Sin`'s.
+#[derive(Clone, Copy, Debug)]
+pub struct Cis;
+forms!(Cis at Complex<f32>, Complex<f64>: |_, [z]| exp::<_, { crate::FUSED }>(turned(z)),
+    many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| {
+        let minus_y: Vec<_> = y.iter().map(|&v| -v).collect();
+        exp_parts(&minus_y, x, re, im);
+    }, |_, r| !finite(r), |[z]| exp::<_, { crate::FUSED }>(turned(z))));
+forms!(Cis at f32 => Complex<f32>, f64 => Complex<f64>: |_, [y]| exp::<_, { crate::FUSED }>(c(0.0, y)),
+    many |_, [y], n, out| {
+        let (mut fill, mut cos, mut sin, mut ok) = (Vec::new(), Vec::new(), Vec::new(), true);
+        for from in (0..n).step_by(crate::CHUNK) {
+            let m = crate::CHUNK.min(n - from);
+            let ys = match y.part(from, m) {
+                Arg::One(v) => {
+                    fill.clear();
+                    fill.resize(m, v);
+                    &fill[..]
+                }
+                Arg::Many(ys) => ys,
+            };
+            cos.clear();
+            sin.clear();
+            ok &= Cos.many(Arg::Many(ys), m, &mut cos) & Sin.many(Arg::Many(ys), m, &mut sin);
+            // A zero y keeps its sign through `Sin`. Only quarter turns, which are rare, need `cis_parts`.
+            let base = out.len();
+            out.extend(cos.iter().zip(&sin).map(|(&cy, &sy)| c(cy, sy)));
+            if ys.iter().fold(false, |any, &y| any | turns(y).1) {
+                for (z, &y) in out[base..].iter_mut().zip(ys) { if turns(y).1 { *z = cis_parts(y, z.re, z.im) } }
+            }
+        }
+        ok
+    });
 forms!(Sinh at Complex<f32>, Complex<f64>: |_, [z]| sinh::<_, { crate::FUSED }>(z),
     many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| hyperbolic_parts(x, y, false, re, im), |_, _| false, |[z]| sinh::<_, { crate::FUSED }>(z)));
 forms!(Cosh at Complex<f32>, Complex<f64>: |_, [z]| cosh::<_, { crate::FUSED }>(z),
     many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| hyperbolic_parts(x, y, true, re, im), |_, _| false, |[z]| cosh::<_, { crate::FUSED }>(z)));
 forms!(Sin at Complex<f32>, Complex<f64>: |_, [z]| sin::<_, { crate::FUSED }>(z),
-    many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| {
-        let (minus_y, mut a, mut b): (Vec<_>, _, _) = (y.iter().map(|&v| -v).collect(), Vec::new(), Vec::new());
-        hyperbolic_parts(&minus_y, x, false, &mut a, &mut b);
-        re.extend(b);
-        im.extend(a.iter().map(|&v| -v));
-    }, |_, _| false, |[z]| sin::<_, { crate::FUSED }>(z)));
+    many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| unturned_parts(x, y, |x, y, re, im| hyperbolic_parts(x, y, false, re, im), re, im),
+        |_, _| false, |[z]| sin::<_, { crate::FUSED }>(z)));
 forms!(Cos at Complex<f32>, Complex<f64>: |_, [z]| cos::<_, { crate::FUSED }>(z),
     many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| {
         let minus_y: Vec<_> = y.iter().map(|&v| -v).collect();
         hyperbolic_parts(&minus_y, x, true, re, im);
     }, |_, _| false, |[z]| cos::<_, { crate::FUSED }>(z)));
+forms!(Tan at Complex<f32>, Complex<f64>: |_, [z]| tan::<_, { crate::FUSED }>(z),
+    many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| unturned_parts(x, y, tanh_parts, re, im), |[z], _| rough_tanh(turned(z)), |[z]| tan::<_, { crate::FUSED }>(z)));
+forms!(Tanh at Complex<f32>, Complex<f64>: |_, [z]| tanh::<_, { crate::FUSED }>(z),
+    many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| tanh_parts(x, y, re, im), |[z], _| rough_tanh(z), |[z]| tanh::<_, { crate::FUSED }>(z)));
+forms!(Asin at Complex<f32>, Complex<f64>: |_, [z]| asin::<_, { crate::FUSED }>(z),
+    many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| asin_parts(x, y, re, im), |[z], _| rough_roots(z), |[z]| asin::<_, { crate::FUSED }>(z)));
+forms!(Asinh at Complex<f32>, Complex<f64>: |_, [z]| asinh::<_, { crate::FUSED }>(z),
+    many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| unturned_parts(x, y, asin_parts, re, im), |[z], _| rough_roots(turned(z)), |[z]| asinh::<_, { crate::FUSED }>(z)));
+forms!(Acos at Complex<f32>, Complex<f64>: |_, [z]| acos::<_, { crate::FUSED }>(z),
+    many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| acos_parts(x, y, re, im), |[z], _| rough_roots(z), |[z]| acos::<_, { crate::FUSED }>(z)));
+forms!(Acosh at Complex<f32>, Complex<f64>: |_, [z]| acosh::<_, { crate::FUSED }>(z),
+    many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| acosh_parts(x, y, re, im), |[z], _| rough_shifted_roots(z), |[z]| acosh::<_, { crate::FUSED }>(z)));
+forms!(Atanh at Complex<f32>, Complex<f64>: |_, [z]| atanh::<_, { crate::FUSED }>(z),
+    many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| atanh_parts(x, y, re, im), |[z], _| rough_atanh(z), |[z]| atanh::<_, { crate::FUSED }>(z)));
+forms!(Atan at Complex<f32>, Complex<f64>: |_, [z]| atan::<_, { crate::FUSED }>(z),
+    many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| unturned_parts(x, y, atanh_parts, re, im), |[z], _| rough_atanh(turned(z)), |[z]| atan::<_, { crate::FUSED }>(z)));
+forms!(Sqrt1mx2 at Complex<f32>, Complex<f64>: |_, [z]| sqrt1mx2::<_, { crate::FUSED }>(z),
+    many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| {
+        let [a, b] = roots_parts(x, y);
+        times_parts(&a, &b, re, im);
+    }, |[z], _| rough_roots(z), |[z]| sqrt1mx2::<_, { crate::FUSED }>(z)));
+forms!(Sqrt1px2 at Complex<f32>, Complex<f64>: |_, [z]| sqrt1px2::<_, { crate::FUSED }>(z),
+    many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| {
+        let minus_x: Vec<_> = x.iter().map(|&v| -v).collect();
+        let [a, b] = roots_parts(y, &minus_x);
+        times_parts(&a, &b, re, im);
+    }, |[z], _| rough_roots(c(z.im, -z.re)), |[z]| sqrt1px2::<_, { crate::FUSED }>(z)));
+forms!(Sqrtx2m1 at Complex<f32>, Complex<f64>: |_, [z]| sqrtx2m1::<_, { crate::FUSED }>(z),
+    many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| {
+        let [a, b] = shifted_roots_parts(x, y);
+        times_parts(&a, &b, re, im);
+    }, |[z], _| rough_shifted_roots(z), |[z]| sqrtx2m1::<_, { crate::FUSED }>(z)));
 forms!(Ln at Complex<f32>, Complex<f64>: |_, [z]| ln::<_, { crate::FUSED }>(z),
     many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| ln_parts(x, y, re, im), |[z], r| tiny(z) | !finite(r), |[z]| ln::<_, { crate::FUSED }>(z)));
 forms!(Pow at Complex<f32>, Complex<f64>: |_, [z, w]| pow::<_, { crate::FUSED }>(z, w),
@@ -551,6 +804,17 @@ mod tests {
         Sinh: Unary<Complex<R>, Out = Complex<R>>,
         Cosh: Unary<Complex<R>, Out = Complex<R>>,
         Pow: Binary<Complex<R>, Out = Complex<R>>,
+        Tan: Unary<Complex<R>, Out = Complex<R>>,
+        Asin: Unary<Complex<R>, Out = Complex<R>>,
+        Atanh: Unary<Complex<R>, Out = Complex<R>>,
+        Sqrt1mx2: Unary<Complex<R>, Out = Complex<R>>,
+        Tanh: Unary<Complex<R>, Out = Complex<R>>,
+        Asinh: Unary<Complex<R>, Out = Complex<R>>,
+        Acos: Unary<Complex<R>, Out = Complex<R>>,
+        Acosh: Unary<Complex<R>, Out = Complex<R>>,
+        Atan: Unary<Complex<R>, Out = Complex<R>>,
+        Sqrt1px2: Unary<Complex<R>, Out = Complex<R>>,
+        Sqrtx2m1: Unary<Complex<R>, Out = Complex<R>>,
     {
         let (x, mut out) = (Arg::Many(&z[..1]), Vec::new());
         match name {
@@ -561,6 +825,17 @@ mod tests {
             "sinh" => Sinh.many(x, 1, &mut out),
             "cosh" => Cosh.many(x, 1, &mut out),
             "pow" => Pow.many(x, Arg::Many(&z[1..2]), 1, &mut out),
+            "tan" => Tan.many(x, 1, &mut out),
+            "asin" => Asin.many(x, 1, &mut out),
+            "atanh" => Atanh.many(x, 1, &mut out),
+            "sqrt1mx2" => Sqrt1mx2.many(x, 1, &mut out),
+            "tanh" => Tanh.many(x, 1, &mut out),
+            "asinh" => Asinh.many(x, 1, &mut out),
+            "acos" => Acos.many(x, 1, &mut out),
+            "acosh" => Acosh.many(x, 1, &mut out),
+            "atan" => Atan.many(x, 1, &mut out),
+            "sqrt1px2" => Sqrt1px2.many(x, 1, &mut out),
+            "sqrtx2m1" => Sqrtx2m1.many(x, 1, &mut out),
             _ => return None,
         };
         Some(out[0])

@@ -3,7 +3,7 @@
 //! [`Gcd`], [`Lcm`] and [`Residue`] from [`tolerant`](crate::tolerant), whose integer forms ignore the tolerance they hold, and
 //! [`Binom`] and [`Pow`]. A slice form appends results to a vector and reports whether every item fitted. [`Divisor`] divides many
 //! integers by one, with multiplications in place of division instructions. `Residue`'s slice form uses one where every item has
-//! the same divisor.
+//! the same divisor. For types of 16 bits or fewer it multiplies 32-bit integers instead, which vectorizes.
 //!
 //! `Gcd`, `Lcm`, `Pow` and `Residue` also take every narrower integer type, which they compute through these functions. Their `u64`
 //! forms have functions of their own, because a `u64` can exceed `i64::MAX`. A result that doesn't fit its type fails. The tolerant
@@ -88,7 +88,7 @@ pub fn residue(x: i64, y: i64) -> i64 { if x == 0 { y } else { floored(y.wrappin
 
 /// `r`, a remainder of a division by x with the dividend's sign, moved to x's sign.
 #[inline]
-fn floored(r: i64, x: i64) -> i64 { if r != 0 && (r < 0) != (x < 0) { r + x } else { r } }
+fn floored<T: num_traits::PrimInt + num_traits::Signed>(r: T, x: T) -> T { if !r.is_zero() && r.is_negative() != x.is_negative() { r + x } else { r } }
 
 /// A fixed nonzero divisor for dividing many integers. Each division multiplies and shifts, where a division instruction would take
 /// several times as long. Setting one up costs more than one division.
@@ -120,6 +120,52 @@ impl Divisor {
     }
 }
 
+/// A fixed divisor whose magnitude is from 2 to 2¹⁶ - 1, for dividends whose magnitude is below 2¹⁶. Each division multiplies two
+/// 32-bit integers to 64 bits and shifts, which vectorizes, where [`Divisor`]'s 64-bit high product doesn't. With m = ⌈2³²/d⌉,
+/// ⌊a·m/2³²⌋ is ⌊a/d⌋ for each such dividend a: a·m/2³² exceeds a/d by less than 2⁻¹⁶, and the fraction of a/d is at most 1 - 1/d.
+#[derive(Clone, Copy)]
+struct Short {
+    x: i32,
+    magnitude: u32,
+    multiplier: u32,
+}
+
+impl Short {
+    /// The divisor `x`, or `None` where its magnitude is outside 2 to 2¹⁶ - 1.
+    fn new(x: i64) -> Option<Self> {
+        let magnitude = u32::try_from(x.unsigned_abs()).ok().filter(|m| (2..1 << 16).contains(m))?;
+        Some(Self { x: x as i32, magnitude, multiplier: (1u64 << 32).div_ceil(u64::from(magnitude)) as u32 })
+    }
+
+    /// The residue of `y`, whose magnitude is below 2¹⁶, modulo the divisor, as [`residue`] gives it.
+    #[inline]
+    fn residue(self, y: i64) -> i64 {
+        let a = (y as i32).unsigned_abs();
+        let r = (a - ((u64::from(a) * u64::from(self.multiplier)) >> 32) as u32 * self.magnitude) as i32;
+        i64::from(floored(if y < 0 { -r } else { r }, self.x))
+    }
+}
+
+/// The digits of each of `values` in the mixed radix of `bases`, as APL's `⊤` gives them: each value's digits together, the most
+/// significant first. A base of 0 takes all of what remains as its digit. `None` where a quotient isn't an `i64`.
+pub fn encode(bases: &[i64], values: &[i64]) -> Option<Vec<i64>> {
+    let divisors: Vec<_> = bases.iter().map(|&b| Divisor::new(b)).collect();
+    let mut digits = vec![0; bases.len() * values.len()];
+    for (out, &value) in digits.chunks_mut(bases.len().max(1)).zip(values) {
+        let mut value = value;
+        for (digit, divisor) in out.iter_mut().zip(&divisors).rev() {
+            (value, *digit) = match divisor { Some(d) => d.div_mod(value)?, None => (0, value) };
+        }
+    }
+    Some(digits)
+}
+
+/// The value of each cell of `bases.len()` digits in `digits`, in the mixed radix of `bases`, as APL's `⊥` gives it. The first base
+/// is never used. `None` where a step isn't an `i64`.
+pub fn decode(bases: &[i64], digits: &[i64]) -> Option<Vec<i64>> {
+    digits.chunks(bases.len()).map(|d| (1..d.len()).try_fold(d[0], |v, k| v.checked_mul(bases[k])?.checked_add(d[k]))).collect()
+}
+
 forms!(Gcd at i64: |_, [x, y]| gcd(x, y));
 forms!(Lcm at i64: |_, [x, y]| lcm(x, y));
 forms!(Binom at i64: |_, [n, k]| binom(n, k));
@@ -144,7 +190,16 @@ macro_rules! narrower {
         forms!(Gcd at $t: |_, [x, y]| gcd(x.into(), y.into()).and_then(|r| <$t>::try_from(r).ok()));
         forms!(Lcm at $t: |_, [x, y]| lcm(x.into(), y.into()).and_then(|r| <$t>::try_from(r).ok()));
         forms!(Pow at $t: |_, [x, y]| power(x.into(), y.into()).and_then(|r| <$t>::try_from(r).ok()));
-        forms!(Residue at $t: |_, [x, y]| residue(x.into(), y.into()) as $t);
+        forms!(
+            Residue at $t: |_, [x, y]| residue(x.into(), y.into()) as $t,
+            many |_, [x, y], n, out| if let Arg::One(d) = x && <$t>::BITS <= 16 && let Some(s) = Short::new(d.into()) {
+                each!([y], n, out, |[y]| s.residue(y.into()) as $t)
+            } else if let Arg::One(d) = x && let Some(d) = Divisor::new(d.into()) {
+                each!([y], n, out, |[y]| d.residue(y.into()) as $t)
+            } else {
+                each!([x, y], n, out, |[x, y]| residue(x.into(), y.into()) as $t)
+            }
+        );
     )+};
 }
 narrower!(i8, i16, i32, u8, u16, u32);
@@ -180,6 +235,10 @@ mod tests {
 
     #[test]
     fn gcd_lcm_power_residue() {
+        // Hours, minutes and seconds; a base of 0 that takes what remains; and a quotient that leaves `i64`.
+        assert_eq!((encode(&[24, 60, 60], &[3661, 86399]), encode(&[0, 10], &[123])), (Some(vec![1, 1, 1, 23, 59, 59]), Some(vec![12, 3])));
+        assert_eq!((encode(&[-1], &[i64::MIN]), decode(&[24, 60, 60], &[1, 1, 1, 23, 59, 59])), (None, Some(vec![3661, 86399])));
+        assert_eq!(decode(&[1, 1 << 62], &[2, 0]), None);
         let fit = |v: i128| i64::try_from(v).ok();
         for &x in &samples() {
             for &y in &samples() {
@@ -240,6 +299,18 @@ mod tests {
             let mut out = Vec::new();
             assert!(Residue(t).many(Arg::One(d), Arg::Many(&ys), ys.len(), &mut out));
             assert_eq!(out, ys.iter().map(|&y| residue(d, y)).collect::<Vec<_>>());
+        }
+        let ys16: Vec<i16> = (i16::MIN..=i16::MAX).collect();
+        for d in [7i16, -12, 1, -1, 0, 3, i16::MAX, i16::MIN] {
+            let mut out = Vec::new();
+            assert!(Residue(t).many(Arg::One(d), Arg::Many(&ys16), ys16.len(), &mut out));
+            assert_eq!(out, ys16.iter().map(|&y| residue(d.into(), y.into()) as i16).collect::<Vec<_>>());
+        }
+        let ys16u: Vec<u16> = (0..=u16::MAX).collect();
+        for d in [2u16, 3, 1000, u16::MAX] {
+            let mut out = Vec::new();
+            assert!(Residue(t).many(Arg::One(d), Arg::Many(&ys16u), ys16u.len(), &mut out));
+            assert_eq!(out, ys16u.iter().map(|&y| y % d).collect::<Vec<_>>());
         }
         let mut out = vec![5];
         let ok = Gcd(t).many(Arg::Many(&xs), Arg::Many(&ys), xs.len(), &mut out);
