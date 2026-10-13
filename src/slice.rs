@@ -7,6 +7,7 @@ use crate::float::{
 };
 use num_complex::Complex;
 use half::f16;
+use std::mem::MaybeUninit;
 
 /// How many items a caller handles at a time where it converts or expands arguments into buffers for a slice form. Buffers of this
 /// many items stay in cache.
@@ -31,7 +32,10 @@ pub enum Arg<'a, T> {
 impl<T: Copy> Arg<'_, T> {
     /// Items `start..start + n` of this argument, each converted by `f`. A `Many` argument converts into `buf`.
     #[inline]
-    pub fn converted<'b, A>(self, start: usize, n: usize, buf: &'b mut Vec<A>, f: impl Fn(T) -> A) -> Arg<'b, A> {
+    pub fn converted<'b, A: Send>(self, start: usize, n: usize, buf: &'b mut Vec<A>, f: impl Fn(T) -> A + Sync) -> Arg<'b, A>
+    where
+        T: Sync,
+    {
         match self.part(start, n) {
             Arg::One(v) => Arg::One(f(v)),
             many => {
@@ -83,7 +87,11 @@ macro_rules! arities {
             #[inline]
             fn one(&self, $($x: $e),+) -> Self::Out { self.scalar([$($x),+]) }
             #[inline]
-            fn many(&self, $($x: Arg<'_, $e>,)+ n: usize, out: &mut Vec<Self::Out>) -> bool { self.slice([$($x),+], n, out) }
+            fn many(&self, $($x: Arg<'_, $e>,)+ n: usize, out: &mut Vec<Self::Out>) -> bool {
+                crate::slice::appended(out, n, |slots| crate::parallel::elementwise(slots, &|start, slots| {
+                    crate::parallel::in_chunks(start, slots, |at, part| self.slice([$($x.part(at, part.len())),+], part.len(), part))
+                }))
+            }
             #[inline]
             fn checked(&self, $($x: $e),+) -> Option<Self::Out> { self.checked_scalar([$($x),+]) }
         }
@@ -114,7 +122,7 @@ impl<E: Item, K: Forms<E, 2>> Forms<E, 2> for Flipped<K> {
     #[inline]
     fn checked_scalar(&self, [x, y]: [E; 2]) -> Option<K::Out> { self.0.checked_scalar([y, x]) }
     #[inline]
-    fn slice(&self, [x, y]: [Arg<'_, E>; 2], n: usize, out: &mut Vec<K::Out>) -> bool { self.0.slice([y, x], n, out) }
+    fn slice(&self, [x, y]: [Arg<'_, E>; 2], n: usize, out: &mut [MaybeUninit<K::Out>]) -> bool { self.0.slice([y, x], n, out) }
 }
 
 /// Whether `r`, the result for arguments `args`, keeps the rule that a NaN result needs a NaN argument.
@@ -173,35 +181,34 @@ impl<O: Item> Outcome<O> for Total<O> {
 #[inline(always)]
 fn items<E: Copy, const N: usize>(x: &[Arg<'_, E>; N], i: usize) -> [E; N] { std::array::from_fn(|k| match x[k] { Arg::One(v) => v, Arg::Many(s) => s[i] }) }
 
-/// Appends `f` for each of `n` results to `out`, for arguments `x`, and gives whether `f` said `true` for every result. One and two
-/// arguments run through [`pairs`], whose loops vectorize.
+/// Writes `f` for each of `n` results into `out`, for arguments `x`, and gives whether `f` said `true` for every result. One and two
+/// arguments run through [`pairs_into`], whose loops vectorize.
 #[inline(always)]
-fn mapped<E: Copy, O, const N: usize>(x: &[Arg<'_, E>; N], n: usize, out: &mut Vec<O>, f: impl Fn([E; N]) -> (O, bool)) -> bool {
+fn mapped<E: Copy, O, const N: usize>(x: &[Arg<'_, E>; N], n: usize, out: &mut [MaybeUninit<O>], f: impl Fn([E; N]) -> (O, bool)) -> bool {
     match x.as_slice() {
-        &[a] => pairs(a, Arg::One(()), n, out, #[inline(always)] |a, ()| f([a; N])),
-        &[a, b] => pairs(a, b, n, out, #[inline(always)] |a, b| f(std::array::from_fn(|k| if k == 0 { a } else { b }))),
+        &[a] => pairs_into(a, Arg::One(()), n, out, #[inline(always)] |a, ()| f([a; N])),
+        &[a, b] => pairs_into(a, b, n, out, #[inline(always)] |a, b| f(std::array::from_fn(|k| if k == 0 { a } else { b }))),
         _ => {
             let mut ok = true;
-            out.extend((0..n).map(|i| {
+            for (i, slot) in out[..n].iter_mut().enumerate() {
                 let (r, good) = f(items(x, i));
+                slot.write(r);
                 ok &= good;
-                r
-            }));
+            }
             ok
         }
     }
 }
 
-/// Appends `f` for each of `n` results to `out`, for arguments `x`, and gives whether every result succeeded, as [`Outcome`] says.
+/// Writes `f` for each of `n` results into `out`, for arguments `x`, and gives whether every result succeeded, as [`Outcome`] says.
 /// Slice forms call it through [`each!`]. The loop judges each output alone, and a [`Total`] output not at all. Only where some output
 /// is NaN does a second pass look at the arguments of the NaN outputs, which is rare.
 #[inline(always)]
 pub(crate) fn each<E: Item, O: Item, R: Outcome<O>, const N: usize>(
-    x: [Arg<'_, E>; N], n: usize, out: &mut Vec<O>, f: impl Fn([E; N]) -> R,
+    x: [Arg<'_, E>; N], n: usize, out: &mut [MaybeUninit<O>], f: impl Fn([E; N]) -> R,
 ) -> bool {
-    let start = out.len();
     mapped(&x, n, out, #[inline(always)] |a| f(a).split())
-        || (R::RESCUE && out[start..].iter().enumerate().all(|(i, &r)| kept(r, items(&x, i))))
+        || (R::RESCUE && written(&mut out[..n]).iter().enumerate().all(|(i, &r)| kept(r, items(&x, i))))
 }
 
 /// [`each`] with the item body marked `#[inline(always)]`. Every slice form runs its loop this way: `forms!`'s default slice form, and
@@ -218,7 +225,7 @@ macro_rules! each {
 /// output type `T` in place of the item type: for each listed type, or after `real` for every float type. The object is the first
 /// argument of the item body, and its items the bracketed ones. The body gives an output, an `Option` of one, or a [`Total`] output,
 /// as [`Outcome`] says. A `many` body replaces the default slice form, which runs the item body through [`each!`]. Its arguments are
-/// the object, the bracketed `Arg`s, the number of results, and the vector they append to.
+/// the object, the bracketed `Arg`s, the number of results, and the slots it writes them into.
 ///
 /// A function object is a concrete type, never a generic one, so that its forms compile here. Settings that choose a loop, such as
 /// whether a tolerance is 0, are read once per call inside `many`, which then runs `each!`.
@@ -259,13 +266,13 @@ macro_rules! forms {
         }
     };
     (@slice $e:ty => $o:ty, $k:pat_param, [$($x:ident),+], $body:expr, []) => {
-        fn slice(&self, args: [crate::Arg<'_, $e>; forms!(@n $($x),+)], n: usize, out: &mut Vec<$o>) -> bool {
+        fn slice(&self, args: [crate::Arg<'_, $e>; forms!(@n $($x),+)], n: usize, out: &mut [std::mem::MaybeUninit<$o>]) -> bool {
             let $k = self;
             each!(args, n, out, |[$($x),+]| $body)
         }
     };
     (@slice $e:ty => $o:ty, $k:pat_param, $args:tt, $body:expr, [(|$mk:pat_param, [$($mx:ident),+], $n:ident, $out:ident| $many:expr)]) => {
-        fn slice(&self, [$($mx),+]: [crate::Arg<'_, $e>; forms!(@n $($mx),+)], $n: usize, $out: &mut Vec<$o>) -> bool {
+        fn slice(&self, [$($mx),+]: [crate::Arg<'_, $e>; forms!(@n $($mx),+)], $n: usize, $out: &mut [std::mem::MaybeUninit<$o>]) -> bool {
             let $mk = self;
             $many
         }
@@ -279,7 +286,7 @@ macro_rules! forms {
             fn checked_scalar(&self, x: [half::f16; forms!(@n $($x),+)]) -> Option<$o> {
                 crate::float::sealed::Forms::<f32, { forms!(@n $($x),+) }>::checked_scalar(self, x.map(half::f16::to_f32)).map($narrow)
             }
-            fn slice(&self, x: [crate::Arg<'_, half::f16>; forms!(@n $($x),+)], n: usize, out: &mut Vec<$o>) -> bool {
+            fn slice(&self, x: [crate::Arg<'_, half::f16>; forms!(@n $($x),+)], n: usize, out: &mut [std::mem::MaybeUninit<$o>]) -> bool {
                 crate::slice::working(x, n, out, |x, m, o| crate::float::sealed::Forms::<f32, { forms!(@n $($x),+) }>::slice(self, x, m, o), $narrow)
             }
         }
@@ -317,24 +324,29 @@ macro_rules! each_pair {
 
 /// Appends `f` on each of `n` pairs of items to `out`, and gives whether `f` said `true` for every pair. An `Arg::One` pairs with
 /// every item of the other argument. The loops write straight into `out`'s spare capacity, which is never zeroed first. This is the
-/// loop that rustymath's slice forms run, and a caller's own kernels can run it too, as basedpl's arithmetic does.
+/// loop that rustymath's slice forms run, and a caller's own kernels can run it too, as basedpl's arithmetic does. A long call splits
+/// across threads, as [`parallel`](crate::parallel) describes.
+#[inline(never)]
+pub fn pairs<X: Copy + Sync, Y: Copy + Sync, B: Send>(x: Arg<'_, X>, y: Arg<'_, Y>, n: usize, out: &mut Vec<B>, f: impl Fn(X, Y) -> (B, bool) + Sync) -> bool {
+    appended(out, n, |slots| crate::parallel::elementwise(slots, &|start, slots| pairs_into(x.part(start, slots.len()), y.part(start, slots.len()), slots.len(), slots, |a, b| f(a, b))))
+}
+
+/// [`pairs`], writing into the `n` slots of `out` in place of appending to a vector.
 #[inline]
-pub fn pairs<X: Copy, Y: Copy, B>(x: Arg<'_, X>, y: Arg<'_, Y>, n: usize, out: &mut Vec<B>, f: impl Fn(X, Y) -> (B, bool)) -> bool {
-    appended(out, n, |slots| {
-        let mut ok = true;
-        each_pair!(x, y, n, |i, a, b| {
-            let (r, good) = f(a, b);
-            slots[i].write(r);
-            ok &= good;
-        });
-        ok
-    })
+pub(crate) fn pairs_into<X: Copy, Y: Copy, B>(x: Arg<'_, X>, y: Arg<'_, Y>, n: usize, out: &mut [MaybeUninit<B>], f: impl Fn(X, Y) -> (B, bool)) -> bool {
+    let (out, mut ok) = (&mut out[..n], true);
+    each_pair!(x, y, n, |i, a, b| {
+        let (r, good) = f(a, b);
+        out[i].write(r);
+        ok &= good;
+    });
+    ok
 }
 
 /// Appends `n` items to `out`, which `write` writes into its spare capacity, never zeroed first, and gives `write`'s result. `write`
 /// must write every slot it gets. Each caller's loop does, by its construction.
 #[inline(always)]
-pub(crate) fn appended<B, T>(out: &mut Vec<B>, n: usize, write: impl FnOnce(&mut [std::mem::MaybeUninit<B>]) -> T) -> T {
+pub(crate) fn appended<B, T>(out: &mut Vec<B>, n: usize, write: impl FnOnce(&mut [MaybeUninit<B>]) -> T) -> T {
     out.reserve(n);
     let result = write(&mut out.spare_capacity_mut()[..n]);
     // SAFETY: `write` wrote all `n` slots.
@@ -342,29 +354,33 @@ pub(crate) fn appended<B, T>(out: &mut Vec<B>, n: usize, write: impl FnOnce(&mut
     result
 }
 
-/// Appends `f` for each of `n` results, for arguments `x`, for a function `f` with a fast form that holds for all but rare items.
-/// `fast` computes every item with no branch, and gives `None` for the rare items. Each `CHUNK` of items runs in two passes. The first
-/// writes NaN for each rare item and judges each result alone, as [`each`] does. The second runs only if the chunk holds a NaN. It
-/// recomputes each NaN item with `f` and judges it by its arguments too. A rare item costs a scan of its own chunk only. Slice forms
-/// call it through [`two_pass!`].
+/// `out`'s slots as items. Each caller passes only slots that its loop has just written.
+#[inline(always)]
+pub(crate) fn written<B>(out: &mut [MaybeUninit<B>]) -> &mut [B] {
+    // SAFETY: the caller has written every slot.
+    unsafe { &mut *(std::ptr::from_mut(out) as *mut [B]) }
+}
+
+/// Writes `f` for each of `n` results into `out`, for arguments `x`, for a function `f` with a fast form that holds for all but rare items.
+/// `fast` computes every item with no branch, and gives `None` for the rare items. The items run in two passes. The first writes NaN
+/// for each rare item and judges each result alone, as [`each`] does. The second runs only if a result is NaN. It recomputes each NaN
+/// item with `f` and judges it by its arguments too. A rare item costs one more scan of at most one `CHUNK`, the most that
+/// `parallel::in_chunks` hands a slice form. Slice forms call it through [`two_pass!`].
 #[inline(always)]
 pub(crate) fn two_pass<R: crate::Float, const N: usize>(
-    x: [Arg<'_, R>; N], n: usize, out: &mut Vec<R>, fast: impl Fn([R; N]) -> Option<R>, f: impl Fn([R; N]) -> R,
+    x: [Arg<'_, R>; N], n: usize, out: &mut [MaybeUninit<R>], fast: impl Fn([R; N]) -> Option<R>, f: impl Fn([R; N]) -> R,
 ) -> bool {
+    let out = &mut out[..n];
+    let first = mapped(&x, n, out, #[inline(always)] |a| {
+        let r = fast(a).unwrap_or(R::nan());
+        (r, !r.is_nan())
+    });
+    if first { return true; }
     let mut ok = true;
-    for start in (0..n).step_by(CHUNK) {
-        let (m, from) = (CHUNK.min(n - start), out.len());
-        let x = x.map(|a| a.part(start, m));
-        let first = mapped(&x, m, out, #[inline(always)] |a| {
-            let r = fast(a).unwrap_or(R::nan());
-            (r, !r.is_nan())
-        });
-        if first { continue; }
-        for (i, r) in out[from..].iter_mut().enumerate().filter(|(_, r)| r.is_nan()) {
-            let a = items(&x, i);
-            *r = f(a);
-            ok &= kept(*r, a);
-        }
+    for (i, r) in written(out).iter_mut().enumerate().filter(|(_, r)| r.is_nan()) {
+        let a = items(&x, i);
+        *r = f(a);
+        ok &= kept(*r, a);
     }
     ok
 }
@@ -376,48 +392,43 @@ macro_rules! two_pass {
     };
 }
 
-/// Appends `f` for each of `n` results, for complex arguments `x`, through real slice forms. Each `CHUNK` of items splits into a slice
-/// of real parts and a slice of imaginary parts for each argument, with a `One` argument repeated. `fast` computes the results' real
+/// Writes `f` for each of `n` results into `out`, for complex arguments `x`, through real slice forms. The items split into a slice of
+/// real parts and a slice of imaginary parts for each argument, with a `One` argument repeated. `fast` computes the results' real
 /// and imaginary parts from those slices, through real slice forms, and appends them. Each result that `rare` picks, from its
 /// arguments and its fast value, then takes `f`, the scalar function, which handles what the fast formula doesn't, such as tiny or
 /// infinite parts. The results succeed as [`each`] judges them. Slice forms call it through [`split!`].
 pub(crate) fn split<R: crate::Native, const N: usize>(
-    x: [Arg<'_, Complex<R>>; N], n: usize, out: &mut Vec<Complex<R>>, fast: impl Fn([(&[R], &[R]); N], &mut Vec<R>, &mut Vec<R>),
+    x: [Arg<'_, Complex<R>>; N], n: usize, out: &mut [MaybeUninit<Complex<R>>], fast: impl Fn([(&[R], &[R]); N], &mut Vec<R>, &mut Vec<R>),
     rare: impl Fn([Complex<R>; N], Complex<R>) -> bool, f: impl Fn([Complex<R>; N]) -> Complex<R>,
 ) -> bool
 where
     Complex<R>: Item,
 {
-    let (start, mut parts, mut re, mut im) = (out.len(), [(); N].map(|()| (Vec::new(), Vec::new())), Vec::new(), Vec::new());
-    for from in (0..n).step_by(CHUNK) {
-        let (m, base) = (CHUNK.min(n - from), out.len());
-        let x = x.map(|a| a.part(from, m));
-        for ((xs, ys), a) in parts.iter_mut().zip(x) {
-            xs.clear();
-            ys.clear();
-            match a {
-                Arg::One(z) => {
-                    xs.resize(m, z.re);
-                    ys.resize(m, z.im);
-                }
-                Arg::Many(s) => {
-                    xs.extend(s.iter().map(|z| z.re));
-                    ys.extend(s.iter().map(|z| z.im));
-                }
+    let (mut parts, mut re, mut im) = ([(); N].map(|()| (Vec::new(), Vec::new())), Vec::new(), Vec::new());
+    let out = &mut out[..n];
+    for ((xs, ys), a) in parts.iter_mut().zip(x) {
+        match a {
+            Arg::One(z) => {
+                xs.resize(n, z.re);
+                ys.resize(n, z.im);
             }
-        }
-        re.clear();
-        im.clear();
-        fast(std::array::from_fn(|k| (&parts[k].0[..], &parts[k].1[..])), &mut re, &mut im);
-        out.extend(re.iter().zip(&im).map(|(&a, &b)| Complex::new(a, b)));
-        if (0..m).fold(false, |any, i| any | rare(items(&x, i), out[base + i])) {
-            for i in 0..m {
-                let a = items(&x, i);
-                if rare(a, out[base + i]) { out[base + i] = f(a); }
+            Arg::Many(s) => {
+                xs.extend(s[..n].iter().map(|z| z.re));
+                ys.extend(s[..n].iter().map(|z| z.im));
             }
         }
     }
-    out[start..].iter().all(|r| !r.has_nan()) || out[start..].iter().enumerate().all(|(i, &r)| kept(r, items(&x, i)))
+    fast(std::array::from_fn(|k| (&parts[k].0[..], &parts[k].1[..])), &mut re, &mut im);
+    assert!(re.len() == n && im.len() == n, "`fast` gives the parts of every result");
+    for ((slot, &a), &b) in out.iter_mut().zip(&re).zip(&im) { slot.write(Complex::new(a, b)); }
+    let zs = written(out);
+    if (0..n).fold(false, |any, i| any | rare(items(&x, i), zs[i])) {
+        for i in 0..n {
+            let a = items(&x, i);
+            if rare(a, zs[i]) { zs[i] = f(a); }
+        }
+    }
+    zs.iter().all(|r| !r.has_nan()) || zs.iter().enumerate().all(|(i, &r)| kept(r, items(&x, i)))
 }
 
 /// [`split`] with `rare` marked `#[inline(always)]`, as [`each!`] marks its body, because the scan for rare items runs on every item.
@@ -427,151 +438,16 @@ macro_rules! split {
     };
 }
 
-/// `f`, a slice form at `F`'s working type, for narrower floats, as `forms!`'s `f16` forms run it: each `CHUNK` items convert to the
-/// working type and run, and `narrow` turns each output into the output at `F`.
+/// `f`, a slice form at `F`'s working type, for narrower floats, as `forms!`'s `f16` forms run it: the items convert to the working
+/// type and run, and `narrow` turns each output into the output at `F`.
 pub(crate) fn working<F: Float, O: Copy, P, const N: usize>(
-    x: [Arg<'_, F>; N], n: usize, out: &mut Vec<P>, f: impl Fn([Arg<'_, F::Working>; N], usize, &mut Vec<O>) -> bool,
+    x: [Arg<'_, F>; N], n: usize, out: &mut [MaybeUninit<P>], f: impl Fn([Arg<'_, F::Working>; N], usize, &mut [MaybeUninit<O>]) -> bool,
     narrow: impl Fn(O) -> P,
 ) -> bool {
     let (mut bufs, mut rs) = ([(); N].map(|()| Vec::new()), Vec::new());
-    let mut ok = true;
-    for start in (0..n).step_by(CHUNK) {
-        let m = CHUNK.min(n - start);
-        let mut bufs = bufs.each_mut().into_iter();
-        rs.clear();
-        ok &= f(x.map(|a| a.converted(start, m, bufs.next().unwrap(), F::working)), m, &mut rs);
-        pairs(Arg::Many(&rs), Arg::One(()), m, out, |r, ()| (narrow(r), true));
-    }
+    let mut next = bufs.each_mut().into_iter();
+    let ok = appended(&mut rs, n, |o| f(x.map(|a| a.converted(0, n, next.next().unwrap(), F::working)), n, o));
+    pairs_into(Arg::Many(&rs), Arg::One(()), n, &mut out[..n], |r, ()| (narrow(r), true));
     ok
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{reduce::{Maximum, Minimum}, *};
-    use std::fmt::Debug;
-
-    /// Whether `a` and `b` agree: both NaN, the same value with the same sign, or finite and nonzero within 8 units in the last place
-    /// of each other. A scalar form and its slice form can round differently, as `Pow`'s do at f32, where only the scalar form reads
-    /// tables. Zeros, infinities and signs must match exactly.
-    fn same<F: Float>(a: F, b: F) -> bool {
-        if a.is_nan() || b.is_nan() { return a.is_nan() && b.is_nan(); }
-        if a == b { return a.is_sign_negative() == b.is_sign_negative(); }
-        let near = (a - b).abs() <= F::narrow(8.0) * F::epsilon() * a.abs().max(b.abs()).max(F::min_positive_value());
-        a.is_finite() && b.is_finite() && a != F::zero() && b != F::zero() && near
-    }
-
-    /// Items with every special value, both signs, a subnormal, and magnitudes beyond the trig functions' fast reduction.
-    fn items<F: Float>() -> Vec<F> {
-        let wide = [0.0, 1.0, 0.5, 2.0, 3.0, 0.1, 7.25, 1e-310, 1e-30, 30.0, 700.0, 2e6, 1e10, 3e8, f64::INFINITY, f64::NAN];
-        wide.iter().flat_map(|&x| [x, -x]).map(F::narrow).collect()
-    }
-
-    /// `k.many` against `k.one` for every pairing of `One` and `Many` among `items`. It must append after what `out` holds, and say
-    /// whether every item succeeded, as `checked` does item by item. The NaN rule must agree too. That catches a function marked total
-    /// that gives NaN from arguments that aren't NaN.
-    fn binary<F: Float + Debug, K: Binary<F, Out = F>>(k: K, name: &str) {
-        let items = items::<F>();
-        let check = |x: Arg<'_, F>, y: Arg<'_, F>, n: usize| {
-            let at = |a: Arg<'_, F>, i| match a { Arg::One(v) => v, Arg::Many(s) => s[i] };
-            let mut out = vec![F::one()];
-            let ok = k.many(x, y, n, &mut out);
-            assert_eq!((out.len(), out[0]), (n + 1, F::one()), "{name}");
-            for i in 0..n { assert!(same(out[i + 1], k.one(at(x, i), at(y, i))), "{name}({:?}, {:?})", at(x, i), at(y, i)) }
-            assert_eq!(ok, (0..n).all(|i| k.checked(at(x, i), at(y, i)).is_some()), "{name}");
-            assert_eq!(ok, (0..n).all(|i| kept(out[i + 1], [at(x, i), at(y, i)])), "{name} breaks the NaN rule");
-        };
-        let (xs, ys): (Vec<F>, Vec<F>) = items.iter().flat_map(|&x| items.iter().map(move |&y| (x, y))).unzip();
-        check(Arg::Many(&xs), Arg::Many(&ys), xs.len());
-        for &v in &items {
-            check(Arg::One(v), Arg::Many(&items), items.len());
-            check(Arg::Many(&items), Arg::One(v), items.len());
-        }
-    }
-
-    /// `k.many` against `k.one` for each of `items`, and for each item as `Arg::One`, as for `binary`.
-    fn unary<F: Float + Debug, K: Unary<F, Out = F>>(k: K, name: &str, items: &[F]) {
-        let check = |x: Arg<'_, F>, n: usize| {
-            let at = |i| match x { Arg::One(v) => v, Arg::Many(s) => s[i] };
-            let mut out = vec![F::one()];
-            let ok = k.many(x, n, &mut out);
-            assert_eq!((out.len(), out[0]), (n + 1, F::one()), "{name}");
-            for i in 0..n { assert!(same(out[i + 1], k.one(at(i))), "{name}({:?})", at(i)) }
-            assert_eq!(ok, (0..n).all(|i| k.checked(at(i)).is_some()), "{name}");
-            assert_eq!(ok, (0..n).all(|i| kept(out[i + 1], [at(i)])), "{name} breaks the NaN rule");
-        };
-        check(Arg::Many(items), items.len());
-        for &v in items { check(Arg::One(v), 3) }
-    }
-
-    /// `k.many` against `k.one` for every triple of `items`, as `Many` arguments and with each argument in turn as `One`, as for
-    /// `binary`.
-    fn ternary<F: Float + Debug, K: Ternary<F, Out = F>>(k: K, name: &str) {
-        let items = items::<F>();
-        let at = |a: Arg<'_, F>, i| match a { Arg::One(v) => v, Arg::Many(s) => s[i] };
-        let check = |[x, y, z]: [Arg<'_, F>; 3], n: usize| {
-            let mut out = vec![F::one()];
-            let ok = k.many(x, y, z, n, &mut out);
-            assert_eq!((out.len(), out[0]), (n + 1, F::one()), "{name}");
-            for i in 0..n { assert!(same(out[i + 1], k.one(at(x, i), at(y, i), at(z, i))), "{name}({:?}, {:?}, {:?})", at(x, i), at(y, i), at(z, i)) }
-            assert_eq!(ok, (0..n).all(|i| k.checked(at(x, i), at(y, i), at(z, i)).is_some()), "{name}");
-            assert_eq!(ok, (0..n).all(|i| kept(out[i + 1], [at(x, i), at(y, i), at(z, i)])), "{name} breaks the NaN rule");
-        };
-        let (mut xs, mut ys, mut zs) = (Vec::new(), Vec::new(), Vec::new());
-        for &x in &items { for &y in &items { for &z in &items { xs.push(x); ys.push(y); zs.push(z); } } }
-        check([Arg::Many(&xs), Arg::Many(&ys), Arg::Many(&zs)], xs.len());
-        for &v in &items {
-            check([Arg::One(v), Arg::Many(&items), Arg::Many(&items)], items.len());
-            check([Arg::Many(&items), Arg::One(v), Arg::Many(&items)], items.len());
-            check([Arg::Many(&items), Arg::Many(&items), Arg::One(v)], items.len());
-        }
-    }
-
-    #[test]
-    fn slice_forms_match_scalar_forms() {
-        macro_rules! each_width {
-            (unary: $($u:ident),+; binary: $($b:ident),+; ternary: $($t:ident),+) => {
-                $(unary::<f64, _>($u, stringify!($u), &items::<f64>()); unary::<f32, _>($u, stringify!($u), &items::<f32>()); unary::<f16, _>($u, stringify!($u), &items::<f16>());)+
-                $(binary::<f64, _>($b, stringify!($b)); binary::<f32, _>($b, stringify!($b)); binary::<f16, _>($b, stringify!($b));)+
-                $(ternary::<f64, _>($t, stringify!($t)); ternary::<f32, _>($t, stringify!($t)); ternary::<f16, _>($t, stringify!($t));)+
-            };
-        }
-        each_width!(
-            unary: Exp, Expm1, Ln, Log1p, Log2, Log10, Sin, Cos, Tan, Asin, Acos, Atan, Sinh, Cosh, Tanh, Asinh, Acosh, Atanh, Cbrt, Gamma,
-                Lgamma, Erf, Erfc, Erfinv, Erfcinv, LambertW, Sqrt, Sqrt1mx2, Sqrt1px2, Sqrtx2m1, Abs, Sign, Angle;
-            binary: Pow, Root, Hypot, Atan2, Gammainc, Gammaincc, Gammaincinv, Binom, Logb, Maximum, Minimum;
-            ternary: Betainc, Betaincinv
-        );
-        // `Erfinv`'s and `Erfcinv`'s f64 slice forms place each block's items by region. Several blocks of uniform items, in random
-        // order, reach every region.
-        use rand::{rngs::StdRng, RngExt, SeedableRng};
-        let mut rng = StdRng::seed_from_u64(1);
-        let q: Vec<f64> = (0..2000).map(|_| 2.0 * rng.random::<f64>()).collect();
-        unary(Erfcinv, "Erfcinv", &q);
-        unary(Erfinv, "Erfinv", &q.iter().map(|&q| q - 1.0).collect::<Vec<_>>());
-    }
-
-    #[derive(Clone, Copy)]
-    struct Positive;
-    forms!(Positive at real => bool: |_, [x]| x > 0.0);
-    #[derive(Clone, Copy)]
-    struct Norm;
-    forms!(Norm at Complex<f32> => f32, Complex<f64> => f64: |_, [z]| z.norm());
-
-    /// An output type other than the item type, at each float type, f16 included, and at concrete complex types. A `bool` output is
-    /// never NaN, so it never fails.
-    #[test]
-    fn outputs_can_differ_from_items() {
-        fn positive<F: Float>(x: &[F]) -> Vec<bool> where Positive: Unary<F, Out = bool> {
-            let mut out = Vec::new();
-            assert!(Positive.many(Arg::Many(x), x.len(), &mut out));
-            out
-        }
-        assert_eq!(positive(&[1.0f64, -1.0, f64::NAN]), [true, false, false]);
-        assert_eq!(positive(&[f16::from_f32(2.0), f16::NAN]), [true, false]);
-        assert_eq!(Positive.checked(f32::NAN), Some(false));
-        let mut out = Vec::new();
-        assert!(Norm.many(Arg::Many(&[Complex::new(3.0f32, 4.0), Complex::new(f32::INFINITY, f32::NAN)]), 2, &mut out));
-        assert_eq!(out, [5.0, f32::INFINITY]);
-    }
-}

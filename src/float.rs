@@ -46,18 +46,18 @@ pub(crate) mod sealed {
     use crate::slice::Arg;
     use num_complex::Complex;
     pub trait Sealed {}
-    /// A type that function objects take or give: a float, a complex number, an integer or a Boolean.
-    pub trait Item: Copy {
+    /// A type that function objects take or give: a float, a complex number, an integer or a Boolean. Pieces on several threads read and write items.
+    pub trait Item: Copy + Send + Sync {
         /// Whether this item is NaN, or for a complex number has a NaN part. An integer or Boolean never is.
         fn has_nan(self) -> bool;
     }
     /// A function object of `N` arguments at item type `E`, compiled inside rustymath and never inlined into a caller. `forms!` writes
-    /// the impls, and [`Unary`](crate::Unary), [`Binary`](crate::Binary) and [`Ternary`](crate::Ternary) call them.
-    pub trait Forms<E: Item, const N: usize> {
+    /// the impls, and [`Unary`](crate::Unary), [`Binary`](crate::Binary) and [`Ternary`](crate::Ternary) call them. A call can split its slice across threads.
+    pub trait Forms<E: Item, const N: usize>: Sync {
         type Out: Item;
         fn scalar(&self, x: [E; N]) -> Self::Out;
         fn checked_scalar(&self, x: [E; N]) -> Option<Self::Out>;
-        fn slice(&self, x: [Arg<'_, E>; N], n: usize, out: &mut Vec<Self::Out>) -> bool;
+        fn slice(&self, x: [Arg<'_, E>; N], n: usize, out: &mut [std::mem::MaybeUninit<Self::Out>]) -> bool;
     }
     macro_rules! nan_items { ($($t:ty),+) => {$( impl Item for $t { #[inline(always)] fn has_nan(self) -> bool { self.is_nan() } } )+} }
     nan_items!(f32, f64, half::f16, Complex<f32>, Complex<f64>);
@@ -110,10 +110,12 @@ pub(crate) mod sealed {
         fn fold_max(x: &[Self]) -> Self { crate::reduce::folded(x, Self::neg_infinity(), Self::maximum, Self::maximum) }
         fn fold_min(x: &[Self]) -> Self { crate::reduce::folded(x, Self::infinity(), Self::minimum, Self::minimum) }
         fn scan_max(x: &[Self], start: Option<Self>, out: &mut Vec<Self>) {
-            crate::reduce::until_nan(x, start, out, #[inline(always)] |t, v| if t > v { t } else { v })
+            use crate::reduce::{below, records, until_nan};
+            until_nan(x, start, out, |x, start, out| records(x, start, out, #[inline(always)] |t, v| if t > v { t } else { v }, below))
         }
         fn scan_min(x: &[Self], start: Option<Self>, out: &mut Vec<Self>) {
-            crate::reduce::until_nan(x, start, out, #[inline(always)] |t, v| if t < v { t } else { v })
+            use crate::reduce::{above, records, until_nan};
+            until_nan(x, start, out, |x, start, out| records(x, start, out, #[inline(always)] |t, v| if t < v { t } else { v }, above))
         }
     }
 }

@@ -58,25 +58,3 @@ pub fn binom<T: Clone + Integer + Signed + ToPrimitive + From<i64>>(n: &Ratio<T>
     let Ok(c) = binom_with(n, k, ok);
     c
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use num_rational::BigRational;
-
-    fn q(n: i64, d: i64) -> BigRational { BigRational::new(n.into(), d.into()) }
-
-    #[test]
-    fn exact_functions() {
-        assert_eq!((residue(&q(3, 1), &q(-7, 1)), residue(&q(1, 2), &q(5, 3)), residue(&q(0, 1), &q(5, 3))), (q(2, 1), q(1, 6), q(5, 3)));
-        assert_eq!((gcd(&q(1, 2), &q(1, 3)), gcd(&q(-4, 1), &q(6, 1)), gcd(&q(0, 1), &q(0, 1))), (q(1, 6), q(2, 1), q(0, 1)));
-        assert_eq!((lcm(&q(1, 2), &q(1, 3)), lcm(&q(-4, 1), &q(6, 1)), lcm(&q(0, 1), &q(5, 1))), (q(1, 1), q(-12, 1), q(0, 1)));
-        // C(5, 2), C(5, 7), C(1/2, 2) = -1/8, C(-1, 2) = 1, C(-3, -5) = (-1)^2 C(4, 2) = 6, C(-3, -1) = 0 and C(1/2, -1) = 0.
-        let c: Vec<BigRational> = [(q(5, 1), 2), (q(5, 1), 7), (q(1, 2), 2), (q(-1, 1), 2), (q(-3, 1), -5), (q(-3, 1), -1), (q(1, 2), -1)]
-            .iter()
-            .map(|(n, k)| binom(n, *k))
-            .collect();
-        assert_eq!(c, [q(10, 1), q(0, 1), q(-1, 8), q(1, 1), q(6, 1), q(0, 1), q(0, 1)]);
-    }
-}
-

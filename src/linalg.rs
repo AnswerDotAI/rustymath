@@ -65,7 +65,11 @@ pub trait Inner<T> {
 }
 
 /// `+.×`, the matrix product, at `i64`, `f32` and `f64`, and complex numbers with parts of either type. Each float step is a fused
-/// multiply-add where the target has one. A complex product sums four real products of the parts.
+/// multiply-add where the target has one. A complex product sums three real products of the parts, as the 3M method does. Its real
+/// parts are as accurate as four real products make them. Its normwise error is about 4 units of roundoff, against about 2.5 for four
+/// real products. An imaginary part's error scales with the size of the whole product. An imaginary part a millionth the size of its
+/// real part keeps about 10 of f64's 16 digits and about 1 of f32's 7. A result whose 3M imaginary part isn't finite takes four real
+/// products instead.
 pub struct PlusTimes;
 /// `⌈.+`, the max-plus product of longest-path problems, at `i64`, `f32` and `f64`. Its maximum is NaN beside NaN, as
 /// [`reduce::maximum`](crate::reduce::maximum) is.
@@ -222,11 +226,14 @@ macro_rules! counts {
 counts!(i64 => i64, i32 => i32, i16 => i16, f64 => i64, f32 => i32);
 
 /// Steps of `p` in each packed block.
-const KC: usize = 256;
+#[doc(hidden)]
+pub const KC: usize = 256;
 /// Rows of `a` in each packed block.
-const MC: usize = 128;
+#[doc(hidden)]
+pub const MC: usize = 128;
 /// Columns of `b` in each packed block.
-const NC: usize = 2048;
+#[doc(hidden)]
+pub const NC: usize = 2048;
 
 /// The tile shapes, `[MR, NR]`, and the bytes in a vector. A tile holds the rows and columns of the result that a micro-kernel keeps in
 /// registers. AArch64 has 32 vector registers of 16 bytes, and AVX2 has 16 registers of 32 bytes. wasm has 16-byte vectors, and V8
@@ -418,22 +425,38 @@ tiled! {
     f64: TIMES64, times64;
     f32: TIMES32, times32;
 }
-/// A complex product sums four real products of the parts into `c`, each on the real kernels. The real part of `c` gains
-/// `aᵣ bᵣ - aᵢ bᵢ`, and the imaginary part gains `aᵣ bᵢ + aᵢ bᵣ`. `$method` names the real product. With `$lower`, only the items
-/// on and below the diagonal gain the sums.
+/// A complex product sums real products of the parts into `c`, each on the real kernels. With `p = aᵣ bᵣ`, `q = aᵢ bᵢ` and
+/// `s = (aᵣ + aᵢ)(bᵣ + bᵢ)`, the real part of `c` gains `p - q` and the imaginary part gains `s - p - q`, as the 3M method forms them
+/// from three real products. Where a result's `s - p - q` isn't finite, through an overflow or a non-finite item, its imaginary part
+/// gains `aᵣ bᵢ + aᵢ bᵣ` instead, from two more real products, as four real products give it. `$method` names the real product. With
+/// `$lower`, only the items on and below the diagonal gain the sums.
 macro_rules! parts {
     ($c:ident, $ldc:ident, $a:ident, $b:ident, $size:ident, $method:ident, $lower:expr) => {{
         let [m, k, n] = $size;
         if m == 0 || k == 0 || n == 0 { return }
-        let (mut re, mut im) = (vec![R::zero(); m * n], vec![R::zero(); m * n]);
-        R::$method(&mut re, n, |i, p| $a(i, p).re, |p, j| $b(p, j).re, $size);
-        R::$method(&mut re, n, |i, p| -$a(i, p).im, |p, j| $b(p, j).im, $size);
-        R::$method(&mut im, n, |i, p| $a(i, p).re, |p, j| $b(p, j).im, $size);
-        R::$method(&mut im, n, |i, p| $a(i, p).im, |p, j| $b(p, j).re, $size);
+        let width = |i: usize| if $lower { (i + 1).min(n) } else { n };
+        let (mut p, mut q, mut s) = (vec![R::zero(); m * n], vec![R::zero(); m * n], vec![R::zero(); m * n]);
+        R::$method(&mut p, n, |i, l| $a(i, l).re, |l, j| $b(l, j).re, $size);
+        R::$method(&mut q, n, |i, l| $a(i, l).im, |l, j| $b(l, j).im, $size);
+        R::$method(&mut s, n, |i, l| { let x = $a(i, l); x.re + x.im }, |l, j| { let y = $b(l, j); y.re + y.im }, $size);
+        let mut finite = true;
         for i in 0..m {
-            for j in 0..if $lower { (i + 1).min(n) } else { n } {
-                let x = &mut $c[i * $ldc + j];
-                *x = Complex::new(x.re + re[i * n + j], x.im + im[i * n + j]);
+            for j in 0..width(i) {
+                let (t, x) = (i * n + j, &mut $c[i * $ldc + j]);
+                let im = s[t] - p[t] - q[t];
+                finite &= im.is_finite();
+                *x = Complex::new(x.re + (p[t] - q[t]), if im.is_finite() { x.im + im } else { x.im });
+            }
+        }
+        if !finite {
+            let mut four = vec![R::zero(); m * n];
+            R::$method(&mut four, n, |i, l| $a(i, l).re, |l, j| $b(l, j).im, $size);
+            R::$method(&mut four, n, |i, l| $a(i, l).im, |l, j| $b(l, j).re, $size);
+            for i in 0..m {
+                for j in 0..width(i) {
+                    let (t, x) = (i * n + j, &mut $c[i * $ldc + j]);
+                    if !(s[t] - p[t] - q[t]).is_finite() { x.im = x.im + four[t] }
+                }
             }
         }
     }};
@@ -446,7 +469,7 @@ impl<R: Native + Tiled> Tiled for Complex<R> {
         parts!(c, ldc, a, b, size, add_lower_product, true)
     }
 }
-/// `+.×` on complex matrices, through `Tiled`'s four real products. Each item type has its own impl, so the loops compile in rustymath.
+/// `+.×` on complex matrices, through `Tiled`'s three real products. Each item type has its own impl, so the loops compile in rustymath.
 macro_rules! complex_inner {
     ($($r:ty),+) => {$(
         impl Inner<Complex<$r>> for PlusTimes {
@@ -722,99 +745,3 @@ fn micro<T: Copy, P: Pair<T>, const MR: usize, const NR: usize>(a: &[T], b: &[T]
     *t = acc;
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The fold of `P` taken in order, item by item.
-    fn folded<T: Copy, P: Pair<T>>(a: &[T], b: &[T], [m, k, n]: [usize; 3]) -> Vec<P::Out> {
-        (0..m * n).map(|ij| (0..k).fold(P::UNIT, |acc, p| P::f(acc, P::g(a[ij / n * k + p], b[p * n + ij % n])))).collect()
-    }
-
-    /// The number of steps where the items differ, for each result.
-    fn differing<T: Copy + PartialEq>(a: &[T], b: &[T], [m, k, n]: [usize; 3]) -> Vec<i64> {
-        (0..m * n).map(|ij| (0..k).filter(|&p| a[ij / n * k + p] != b[p * n + ij % n]).count() as i64).collect()
-    }
-
-    #[test]
-    fn products_match_folds_in_order() {
-        // The sizes leave partial tiles, give no steps or a single one, and cross each block size. Small whole numbers keep every
-        // float sum exact, in any order.
-        let sizes = [[0, 3, 4], [3, 0, 4], [3, 4, 0], [1, 1, 1], [5, 7, 9], [MC + 3, KC + 5, 37], [17, 3, NC + 5]];
-        for size @ [m, k, n] in sizes {
-            let a64: Vec<f64> = (0..m * k).map(|i| (i * 7 % 17) as f64 - 8.0).collect();
-            let b64: Vec<f64> = (0..k * n).map(|i| (i * 5 % 13) as f64 - 6.0).collect();
-            let (a32, b32): (Vec<f32>, Vec<f32>) = (a64.iter().map(|&x| x as f32).collect(), b64.iter().map(|&x| x as f32).collect());
-            assert_eq!(PlusTimes.inner(&a64, &b64, size), folded::<f64, PlusTimes>(&a64, &b64, size));
-            assert_eq!(PlusTimes.inner(&a32, &b32, size), folded::<f32, PlusTimes>(&a32, &b32, size));
-            assert_eq!(MaxPlus.inner(&a64, &b64, size), folded::<f64, MaxPlus>(&a64, &b64, size));
-            assert_eq!(MaxPlus.inner(&a32, &b32, size), folded::<f32, MaxPlus>(&a32, &b32, size));
-            assert_eq!(MinPlus.inner(&a64, &b64, size), folded::<f64, MinPlus>(&a64, &b64, size));
-            assert_eq!(MinPlus.inner(&a32, &b32, size), folded::<f32, MinPlus>(&a32, &b32, size));
-            let (ab, bb): (Vec<bool>, Vec<bool>) = (a64.iter().map(|&x| x > 4.0).collect(), b64.iter().map(|&x| x > 4.0).collect());
-            assert_eq!(OrAnd.inner(&ab, &bb, size), folded::<bool, OrAnd>(&ab, &bb, size));
-            assert_eq!(AndOr.inner(&ab, &bb, size), folded::<bool, AndOr>(&ab, &bb, size));
-            let (ai, bi): (Vec<i64>, Vec<i64>) = (a64.iter().map(|&x| x as i64).collect(), b64.iter().map(|&x| x as i64).collect());
-            // Items too large for 32 bits take `+.=`'s 64-bit kernel. Items that fit 32 bits but no window of 2^16 values take its 32-bit
-            // kernel. Small items, and items in a narrow window far from 0, take its 16-bit kernel.
-            let (wa, wb): (Vec<i64>, Vec<i64>) = (ai.iter().map(|&x| x << 40).collect(), bi.iter().map(|&x| x << 40).collect());
-            let (ma, mb): (Vec<i64>, Vec<i64>) = (ai.iter().map(|&x| x << 20).collect(), bi.iter().map(|&x| x << 20).collect());
-            let (fa, fb): (Vec<i64>, Vec<i64>) = (ai.iter().map(|&x| x - (1 << 50)).collect(), bi.iter().map(|&x| x - (1 << 50)).collect());
-            let (a3, b3): (Vec<i32>, Vec<i32>) = (ai.iter().map(|&x| x as i32).collect(), bi.iter().map(|&x| x as i32).collect());
-            assert_eq!(PlusEqual.inner(&ai, &bi, size), folded::<i64, PlusEqual>(&ai, &bi, size));
-            assert_eq!(PlusEqual.inner(&wa, &wb, size), folded::<i64, PlusEqual>(&wa, &wb, size));
-            assert_eq!(PlusEqual.inner(&ma, &mb, size), folded::<i64, PlusEqual>(&ma, &mb, size));
-            assert_eq!(PlusEqual.inner(&fa, &fb, size), folded::<i64, PlusEqual>(&fa, &fb, size));
-            assert_eq!(PlusEqual.inner(&a3, &b3, size), folded::<i32, PlusEqual>(&a3, &b3, size));
-            assert_eq!(PlusEqual.inner(&a64, &b64, size), folded::<f64, PlusEqual>(&a64, &b64, size));
-            assert_eq!(PlusEqual.inner(&a32, &b32, size), folded::<f32, PlusEqual>(&a32, &b32, size));
-            let wide = |counts: Vec<i32>| counts.into_iter().map(i64::from).collect::<Vec<_>>();
-            assert_eq!(PlusNotEqual.inner(&ai, &bi, size), differing(&ai, &bi, size));
-            assert_eq!(PlusNotEqual.inner(&wa, &wb, size), differing(&wa, &wb, size));
-            assert_eq!(wide(PlusNotEqual.inner(&a3, &b3, size)), differing(&a3, &b3, size));
-            assert_eq!(PlusNotEqual.inner(&a64, &b64, size), differing(&a64, &b64, size));
-            assert_eq!(wide(PlusNotEqual.inner(&a32, &b32, size)), differing(&a32, &b32, size));
-        }
-    }
-
-    #[test]
-    fn integer_products_match_wrapping_folds() {
-        // Each pair of scales for `a` and `b` reaches one path. `+.×` runs at f32, f64, then i64 twice, the last time overflowing.
-        // `⌈.+` and `⌊.+` run at f32 twice, then f64, then i64, overflowing. Odd scales give products that a narrower path would
-        // round, where a power of two would keep them exact.
-        let scales = [(1, 1), (4097, 4093), ((1 << 22) + 1, (1 << 22) + 3), ((1 << 59) + 1, (1 << 60) + 1)];
-        for (sa, sb) in scales {
-            for size @ [m, k, n] in [[0, 3, 4], [3, 0, 4], [3, 4, 0], [5, 7, 9], [MC + 3, KC + 5, 37]] {
-                let a: Vec<i64> = (0..m * k).map(|i| ((i * 7 % 17) as i64 - 8) * sa).collect();
-                let b: Vec<i64> = (0..k * n).map(|i| ((i * 5 % 13) as i64 - 6) * sb).collect();
-                let overflows = sa > 1 << 59 && !a.is_empty() && !b.is_empty();
-                let products = folded::<i64, PlusTimes>(&a, &b, size);
-                assert_eq!(PlusTimes.inner(&a, &b, size), products);
-                assert_eq!(PlusTimes.checked(&a, &b, size), (!overflows).then_some(products));
-                let maxima = folded::<i64, MaxPlus>(&a, &b, size);
-                assert_eq!(MaxPlus.inner(&a, &b, size), maxima);
-                assert_eq!(MaxPlus.checked(&a, &b, size), (!overflows).then_some(maxima));
-                let minima = folded::<i64, MinPlus>(&a, &b, size);
-                assert_eq!(MinPlus.inner(&a, &b, size), minima);
-                assert_eq!(MinPlus.checked(&a, &b, size), (!overflows).then_some(minima));
-            }
-        }
-    }
-
-    #[test]
-    fn extremes_give_nan_beside_nan() {
-        // A NaN in the first step, and one in a later step, each turn their whole row of results to NaN.
-        let size @ [m, k, n] = [9, 300, 11];
-        let mut a: Vec<f64> = (0..m * k).map(|i| (i % 23) as f64).collect();
-        let b: Vec<f64> = (0..k * n).map(|i| (i % 19) as f64).collect();
-        (a[0], a[3 * k + 280]) = (f64::NAN, f64::NAN);
-        for c in [MaxPlus.inner(&a, &b, size), MinPlus.inner(&a, &b, size)] {
-            for (i, row) in c.chunks(n).enumerate() { assert!(row.iter().all(|x| x.is_nan() == (i == 0 || i == 3)), "row {i}: {row:?}") }
-        }
-        let a32: Vec<f32> = a.iter().map(|&x| x as f32).collect();
-        let b32: Vec<f32> = b.iter().map(|&x| x as f32).collect();
-        for c in [MaxPlus.inner(&a32, &b32, size), MinPlus.inner(&a32, &b32, size)] {
-            for (i, row) in c.chunks(n).enumerate() { assert!(row.iter().all(|x| x.is_nan() == (i == 0 || i == 3)), "row {i}: {row:?}") }
-        }
-    }
-}

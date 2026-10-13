@@ -134,10 +134,10 @@ forms!(Logb at real: |_, [b, x]| logb::<_, { crate::FUSED }>(b, x),
             // A base of exactly 2 or 10 takes `log2` or `log10` of c. A second pass writes those items, because a select in the main
             // loop stops it vectorizing. At those bases either result is NaN only where c is negative or NaN. The main loop's outcome
             // holds.
-            let (start, l) = (out.len(), ln::<_, { crate::FUSED }>(c));
+            let l = ln::<_, { crate::FUSED }>(c);
             let ok = each!([b, x], n, out, |[b, _]| l / ln::<_, { crate::FUSED }>(b));
             let exact = [log2::<_, { crate::FUSED }>(c), log10::<_, { crate::FUSED }>(c)];
-            for (r, &b) in out[start..].iter_mut().zip(bs) { *r = by_base(b, [exact[0], exact[1], *r]) }
+            for (r, &b) in crate::slice::written(out).iter_mut().zip(bs) { *r = by_base(b, [exact[0], exact[1], *r]) }
             ok
         }
         _ => each!([b, x], n, out, |[b, x]| logb::<_, { crate::FUSED }>(b, x)),

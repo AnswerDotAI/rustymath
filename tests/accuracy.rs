@@ -1,10 +1,12 @@
-//! The accuracy tests. Each function, with `mla` fused and unfused, must be within `BOUND` of the right result at every f16 input, at
+//! The accuracy tests. Each real function, with `mla` fused and unfused, must be within `BOUND` of the right result at every f16 input, at
 //! samples of f32 and f64 inputs, and at published test cases. Each check prints its worst error.
 //!
 //! The elementary functions are checked against the platform's libm at f64, through Rust's standard library. Rounded to f32 or f16,
 //! its result is correctly rounded at those widths, apart from rare double rounding. At f64 the libm has errors of its own, which
 //! `LIBM` allows for. The hard cases in `testdata/core-math.txt`, and the special functions in `testdata/mpmath.txt`, carry correctly
 //! rounded results that `testdata/references.py` computes with mpmath.
+pub mod support;
+use crate::support::random;
 use half::f16;
 use std::fmt::Debug;
 
@@ -94,13 +96,6 @@ fn within<A: Debug>(name: &str, bound: u64, (e, x): (u64, A)) {
     assert!(e <= bound, "{name} is {e} out at {x:?}, beyond the bound of {bound}");
 }
 
-/// A random 64-bit number for each `i`: splitmix64's output.
-pub(crate) fn random(i: u64) -> u64 {
-    let z = i.wrapping_add(1).wrapping_mul(0x9e3779b97f4a7c15);
-    let z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    let z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
-    z ^ (z >> 31)
-}
 /// A random f64 from `lo` to `hi`.
 fn uniform(i: u64, (lo, hi): (f64, f64)) -> f64 { lo + (hi - lo) * (random(i) >> 11) as f64 / (1u64 << 53) as f64 }
 /// A random f64 of either sign whose bits are random, so that small magnitudes are as likely as large ones. It includes the
@@ -139,24 +134,24 @@ type Variants<W, N> = [Variant<W, N>; 2];
 /// `Pow`'s and `Root`'s scalar forms, which take fast paths of their own, as a variant beside the free functions' `fused` and
 /// `unfused`.
 const POW_ONE: Variant<fn((f64, f64)) -> f64, fn((f32, f32)) -> f32> =
-    (|(x, y)| crate::Binary::one(&crate::Pow, x, y), |(x, y)| crate::Binary::one(&crate::Pow, x, y), "object");
+    (|(x, y)| rustymath::Binary::one(&rustymath::Pow, x, y), |(x, y)| rustymath::Binary::one(&rustymath::Pow, x, y), "object");
 const ROOT_ONE: Variant<fn((f64, f64)) -> f64, fn((f32, f32)) -> f32> =
-    (|(n, y)| crate::Binary::one(&crate::Root, n, y), |(n, y)| crate::Binary::one(&crate::Root, n, y), "object");
+    (|(n, y)| rustymath::Binary::one(&rustymath::Root, n, y), |(n, y)| rustymath::Binary::one(&rustymath::Root, n, y), "object");
 macro_rules! variants {
     ($f:ident) => {
         [
-            (crate::fused::$f::<f64> as fn(f64) -> f64, crate::fused::$f::<f32> as fn(f32) -> f32, "fused"),
-            (crate::unfused::$f::<f64>, crate::unfused::$f::<f32>, "unfused"),
+            (rustymath::fused::$f::<f64> as fn(f64) -> f64, rustymath::fused::$f::<f32> as fn(f32) -> f32, "fused"),
+            (rustymath::unfused::$f::<f64>, rustymath::unfused::$f::<f32>, "unfused"),
         ]
     };
     ($f:ident, 2) => {
         [
             (
-                (|(x, y)| crate::fused::$f::<f64>(x, y)) as fn((f64, f64)) -> f64,
-                (|(x, y)| crate::fused::$f::<f32>(x, y)) as fn((f32, f32)) -> f32,
+                (|(x, y)| rustymath::fused::$f::<f64>(x, y)) as fn((f64, f64)) -> f64,
+                (|(x, y)| rustymath::fused::$f::<f32>(x, y)) as fn((f32, f32)) -> f32,
                 "fused",
             ),
-            (|(x, y)| crate::unfused::$f::<f64>(x, y), |(x, y)| crate::unfused::$f::<f32>(x, y), "unfused"),
+            (|(x, y)| rustymath::unfused::$f::<f64>(x, y), |(x, y)| rustymath::unfused::$f::<f32>(x, y), "unfused"),
         ]
     };
 }
@@ -247,24 +242,18 @@ fn reduction() -> Vec<f64> {
 const TRIG: &[(f64, f64)] = &[(-8388608.0, 8388608.0), (-10.0, 10.0)];
 
 #[test]
-fn exp_accuracy() { unary("exp", variants!(exp), crate::exp, f64::exp, &[(-760.0, 720.0)], &[]); }
+fn exponentials_accuracy() {
+    unary("exp", variants!(exp), rustymath::exp, f64::exp, &[(-760.0, 720.0)], &[]);
+    unary("expm1", variants!(expm1), rustymath::expm1, f64::exp_m1, &[(-50.0, 720.0), (-1.0, 1.0)], &[]);
+}
 
 #[test]
-fn expm1_accuracy() { unary("expm1", variants!(expm1), crate::expm1, f64::exp_m1, &[(-50.0, 720.0), (-1.0, 1.0)], &[]); }
-
-#[test]
-fn ln_accuracy() { unary("log", variants!(ln), crate::ln, f64::ln, &[(0.5, 2.0)], &[]); }
-
-#[test]
-fn log1p_accuracy() { unary("log1p", variants!(log1p), crate::log1p, f64::ln_1p, &[(-1.0, 1.0), (-1e-6, 1e-6)], &[]); }
-
-#[test]
-fn log2_accuracy() { unary("log2", variants!(log2), crate::log2, f64::log2, &[(0.5, 2.0)], &[]); }
-
-#[test]
-fn log10_accuracy() {
+fn logarithms_accuracy() {
+    unary("log", variants!(ln), rustymath::ln, f64::ln, &[(0.5, 2.0)], &[]);
+    unary("log1p", variants!(log1p), rustymath::log1p, f64::ln_1p, &[(-1.0, 1.0), (-1e-6, 1e-6)], &[]);
+    unary("log2", variants!(log2), rustymath::log2, f64::log2, &[(0.5, 2.0)], &[]);
     let powers: Vec<f64> = (-22..=22).map(|k| format!("1e{k}").parse().unwrap()).collect();
-    unary("log10", variants!(log10), crate::log10, f64::log10, &[(0.5, 2.0)], &powers);
+    unary("log10", variants!(log10), rustymath::log10, f64::log10, &[(0.5, 2.0)], &powers);
 }
 
 /// `log2` gives k exactly at 2^k, and `log10` gives k at 10^k, or at the float nearest 10^k where 10^k isn't a float. Each does at
@@ -272,7 +261,7 @@ fn log10_accuracy() {
 /// constant, the argument constant or neither.
 #[test]
 fn logarithms_exact() {
-    use crate::{Arg, Binary, Float, Logb};
+    use rustymath::{Arg, Binary, Float, Logb};
     use std::ops::RangeInclusive;
     fn exact<F: Float + Debug>(twos: RangeInclusive<i32>, tens: RangeInclusive<i32>)
     where
@@ -282,7 +271,7 @@ fn logarithms_exact() {
         let cases = twos.map(|k| (2.0, 2f64.powi(k / 2) * 2f64.powi(k - k / 2), k)).chain(tens.map(|k| (10.0, 10f64.powi(k), k)));
         for (b, x, k) in cases {
             let (b, x, k) = (F::narrow(b), F::narrow(x), F::narrow(k.into()));
-            let alone = if b == F::narrow(2.0) { [crate::fused::log2(x), crate::unfused::log2(x)] } else { [crate::fused::log10(x), crate::unfused::log10(x)] };
+            let alone = if b == F::narrow(2.0) { [rustymath::fused::log2(x), rustymath::unfused::log2(x)] } else { [rustymath::fused::log10(x), rustymath::unfused::log10(x)] };
             let mut out = Vec::new();
             assert!(Logb.many(Arg::One(b), Arg::Many(&[x]), 1, &mut out) & Logb.many(Arg::Many(&[b, F::narrow(3.0)]), Arg::One(x), 2, &mut out));
             assert!(Logb.many(Arg::Many(&[b]), Arg::Many(&[x]), 1, &mut out));
@@ -295,45 +284,38 @@ fn logarithms_exact() {
 }
 
 #[test]
-fn sin_accuracy() { unary("sin", variants!(sin), crate::sin, f64::sin, TRIG, &reduction()); }
+fn trig_accuracy() {
+    let extra = reduction();
+    unary("sin", variants!(sin), rustymath::sin, f64::sin, TRIG, &extra);
+    unary("cos", variants!(cos), rustymath::cos, f64::cos, TRIG, &extra);
+    unary("tan", variants!(tan), rustymath::tan, f64::tan, TRIG, &extra);
+}
 
 #[test]
-fn cos_accuracy() { unary("cos", variants!(cos), crate::cos, f64::cos, TRIG, &reduction()); }
+fn inverse_trig_accuracy() {
+    unary("asin", variants!(asin), rustymath::asin, f64::asin, &[(-1.0, 1.0)], &[]);
+    unary("acos", variants!(acos), rustymath::acos, f64::acos, &[(-1.0, 1.0)], &[]);
+    unary("atan", variants!(atan), rustymath::atan, f64::atan, &[(-4.0, 4.0)], &[]);
+}
 
 #[test]
-fn tan_accuracy() { unary("tan", variants!(tan), crate::tan, f64::tan, TRIG, &reduction()); }
+fn hyperbolic_accuracy() {
+    unary("sinh", variants!(sinh), rustymath::sinh, f64::sinh, &[(-1.0, 1.0), (-711.0, 711.0)], &[]);
+    unary("cosh", variants!(cosh), rustymath::cosh, f64::cosh, &[(-1.0, 1.0), (-711.0, 711.0)], &[]);
+    unary("tanh", variants!(tanh), rustymath::tanh, f64::tanh, &[(-1.0, 1.0), (-25.0, 25.0)], &[]);
+}
 
 #[test]
-fn asin_accuracy() { unary("asin", variants!(asin), crate::asin, f64::asin, &[(-1.0, 1.0)], &[]); }
-
-#[test]
-fn acos_accuracy() { unary("acos", variants!(acos), crate::acos, f64::acos, &[(-1.0, 1.0)], &[]); }
-
-#[test]
-fn atan_accuracy() { unary("atan", variants!(atan), crate::atan, f64::atan, &[(-4.0, 4.0)], &[]); }
-
-#[test]
-fn sinh_accuracy() { unary("sinh", variants!(sinh), crate::sinh, f64::sinh, &[(-1.0, 1.0), (-711.0, 711.0)], &[]); }
-
-#[test]
-fn cosh_accuracy() { unary("cosh", variants!(cosh), crate::cosh, f64::cosh, &[(-1.0, 1.0), (-711.0, 711.0)], &[]); }
-
-#[test]
-fn tanh_accuracy() { unary("tanh", variants!(tanh), crate::tanh, f64::tanh, &[(-1.0, 1.0), (-25.0, 25.0)], &[]); }
-
-#[test]
-fn asinh_accuracy() { unary("asinh", variants!(asinh), crate::asinh, |x| libm::asinh(x), &[(-1.0, 1.0), (-1e20, 1e20)], &[]); }
-
-#[test]
-fn acosh_accuracy() { unary("acosh", variants!(acosh), crate::acosh, |x| libm::acosh(x), &[(1.0, 2.0), (1.0, 1e20)], &[]); }
-
-#[test]
-fn atanh_accuracy() { unary("atanh", variants!(atanh), crate::atanh, |x| libm::atanh(x), &[(-1.0, 1.0)], &[]); }
+fn inverse_hyperbolic_accuracy() {
+    unary("asinh", variants!(asinh), rustymath::asinh, |x| libm::asinh(x), &[(-1.0, 1.0), (-1e20, 1e20)], &[]);
+    unary("acosh", variants!(acosh), rustymath::acosh, |x| libm::acosh(x), &[(1.0, 2.0), (1.0, 1e20)], &[]);
+    unary("atanh", variants!(atanh), rustymath::atanh, |x| libm::atanh(x), &[(-1.0, 1.0)], &[]);
+}
 
 #[test]
 fn cbrt_accuracy() {
     let cubes: Vec<f64> = (-1000..=1000).map(|k: i32| (k as f64).powi(3)).collect();
-    unary("cbrt", variants!(cbrt), crate::cbrt, f64::cbrt, &[(-1e300, 1e300), (-8.0, 8.0)], &cubes);
+    unary("cbrt", variants!(cbrt), rustymath::cbrt, f64::cbrt, &[(-1e300, 1e300), (-8.0, 8.0)], &cubes);
 }
 
 #[test]
@@ -341,19 +323,14 @@ fn pow_accuracy() {
     // Powers that are floats, and powers near overflow and underflow of a base near 1, where the error of ln |x| grows most.
     let exact: Vec<(f64, f64)> = (2..=12).flat_map(|b| (-30..=60).map(move |k| (b as f64, k as f64))).collect();
     let near = [((0.5, 2.0), (-1000.0, 1000.0)), ((1.2, 1.5), (1500.0, 2700.0)), ((0.0, 4.0), (-30.0, 30.0)), ((-8.0, 0.0), (-20.0, 20.0))];
-    binary("pow", variants!(pow, 2).into_iter().chain([POW_ONE]), crate::pow, f64::powf, &near, &exact);
+    binary("pow", variants!(pow, 2).into_iter().chain([POW_ONE]), rustymath::pow, f64::powf, &near, &exact);
 }
 
 #[test]
-fn hypot_accuracy() {
+fn polar_accuracy() {
     let ranges = [((-1e300, 1e300), (-1e300, 1e300)), ((-1e-300, 1e-300), (-1e-300, 1e-300)), ((-4.0, 4.0), (-4.0, 4.0))];
-    binary("hypot", variants!(hypot, 2), crate::hypot, f64::hypot, &ranges, &[]);
-}
-
-#[test]
-fn atan2_accuracy() {
-    let ranges = [((-1e300, 1e300), (-1e300, 1e300)), ((-1e-300, 1e-300), (-1e-300, 1e-300)), ((-4.0, 4.0), (-4.0, 4.0))];
-    binary("atan2", variants!(atan2, 2), crate::atan2, f64::atan2, &ranges, &[]);
+    binary("hypot", variants!(hypot, 2), rustymath::hypot, f64::hypot, &ranges, &[]);
+    binary("atan2", variants!(atan2, 2), rustymath::atan2, f64::atan2, &ranges, &[]);
 }
 
 #[test]
@@ -425,28 +402,41 @@ fn special(name: &str, variants: Variants<fn(f64) -> f64, fn(f32) -> f32>, f16: 
 }
 
 #[test]
-fn erf_accuracy() { special("erf", variants!(erf), crate::erf, crate::erf::<f64>); }
+fn error_functions_accuracy() {
+    special("erf", variants!(erf), rustymath::erf, rustymath::erf::<f64>);
+    special("erfc", variants!(erfc), rustymath::erfc, rustymath::erfc::<f64>);
+    special("erfinv", variants!(erfinv), rustymath::erfinv, rustymath::erfinv::<f64>);
+    special("erfcinv", variants!(erfcinv), rustymath::erfcinv, rustymath::erfcinv::<f64>);
+}
+
+/// `Erfc`'s slice form gives `erfc`'s bits at both widths. Its blocks of 256 items lie wholly below 0.84375 (with NaN), wholly from it
+/// up (with -∞ and magnitudes past 28), on both sides, and in a short block of zeros and ∞.
+#[test]
+fn erfc_blocks() {
+    use rustymath::{Arg, Erfc, Unary};
+    let mut xs = vec![f64::NAN];
+    xs.extend((1..256).map(|i| -0.84 + 1.68 * f64::from(i) / 256.0));
+    xs.push(f64::NEG_INFINITY);
+    xs.extend((1..256).map(|i| (0.85 + f64::from(i) / 8.0) * if i % 2 == 0 { 1.0 } else { -1.0 }));
+    xs.extend((0..256).map(|i| if i % 2 == 0 { f64::from(i) / 1024.0 } else { -0.9 - f64::from(i) / 16.0 }));
+    xs.extend([0.0, -0.0, f64::INFINITY]);
+    let xs32: Vec<f32> = xs.iter().map(|&x| x as f32).collect();
+    let (mut out, mut out32) = (Vec::new(), Vec::new());
+    assert!(Erfc.many(Arg::Many(&xs), xs.len(), &mut out) & Erfc.many(Arg::Many(&xs32), xs32.len(), &mut out32));
+    let same = |a: f64, b: f64| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan());
+    assert!(out.iter().zip(&xs).all(|(&r, &x)| same(r, rustymath::erfc(x))), "{out:?}");
+    assert!(out32.iter().zip(&xs32).all(|(&r, &x)| same(r.into(), rustymath::erfc(x).into())), "{out32:?}");
+}
 
 #[test]
-fn erfc_accuracy() { special("erfc", variants!(erfc), crate::erfc, crate::erfc::<f64>); }
+fn lambertw_accuracy() { special("lambertw", variants!(lambertw), rustymath::lambertw, rustymath::lambertw::<f64>); }
 
 #[test]
-fn erfinv_accuracy() { special("erfinv", variants!(erfinv), crate::erfinv, crate::erfinv::<f64>); }
-
-#[test]
-fn erfcinv_accuracy() { special("erfcinv", variants!(erfcinv), crate::erfcinv, crate::erfcinv::<f64>); }
-
-#[test]
-fn lambertw_accuracy() { special("lambertw", variants!(lambertw), crate::lambertw, crate::lambertw::<f64>); }
-
-#[test]
-fn sqrt1mx2_accuracy() { special("sqrt1mx2", variants!(sqrt1mx2), crate::sqrt1mx2, crate::sqrt1mx2::<f64>); }
-
-#[test]
-fn sqrt1px2_accuracy() { special("sqrt1px2", variants!(sqrt1px2), crate::sqrt1px2, crate::sqrt1px2::<f64>); }
-
-#[test]
-fn sqrtx2m1_accuracy() { special("sqrtx2m1", variants!(sqrtx2m1), crate::sqrtx2m1, crate::sqrtx2m1::<f64>); }
+fn circle_roots_accuracy() {
+    special("sqrt1mx2", variants!(sqrt1mx2), rustymath::sqrt1mx2, rustymath::sqrt1mx2::<f64>);
+    special("sqrt1px2", variants!(sqrt1px2), rustymath::sqrt1px2, rustymath::sqrt1px2::<f64>);
+    special("sqrtx2m1", variants!(sqrtx2m1), rustymath::sqrtx2m1, rustymath::sqrtx2m1::<f64>);
+}
 
 /// The worst error of `f` at `cases` of inputs and reference results, in units of `eps` times the larger of |reference| and `floor`,
 /// with the input that gives it. Infinities and NaN must match exactly.
@@ -467,7 +457,7 @@ fn gamma_accuracy() {
         check(&format!("f64 tgamma, {how}"), scaled(cases.iter().copied(), wide, f64::EPSILON, 1e-300));
         check(&format!("f32 tgamma, {how}"), scaled(at32(&cases).into_iter().map(|(x, y)| (x, y.into())), |x| narrow(x).into(), f32::EPSILON.into(), f32::MIN_POSITIVE.into()));
     }
-    check("f16 tgamma", worst(1 << 16, |i| f16::from_bits(i as u16), crate::gamma, |x| f16::from_f64(crate::gamma::<f64>(x.into()))));
+    check("f16 tgamma", worst(1 << 16, |i| f16::from_bits(i as u16), rustymath::gamma, |x| f16::from_f64(rustymath::gamma::<f64>(x.into()))));
 }
 
 /// `lgamma`'s checks, with each error in units of epsilon times the larger of the result and 2, because its relative error near its
@@ -503,21 +493,269 @@ fn central(p: f64) -> bool { (0.001..0.999).contains(&p) }
 
 #[test]
 fn incomplete_gamma_accuracy() {
-    let cases = incomplete("gammainc", |(a, x)| crate::gammainc(a, x), |(a, x): (f64, f64)| crate::gammainc(a as f32, x as f32).into());
-    incomplete("gammaincc", |(a, x)| crate::gammaincc(a, x), |(a, x): (f64, f64)| crate::gammaincc(a as f32, x as f32).into());
+    let cases = incomplete("gammainc", |(a, x)| rustymath::gammainc(a, x), |(a, x): (f64, f64)| rustymath::gammainc(a as f32, x as f32).into());
+    incomplete("gammaincc", |(a, x)| rustymath::gammaincc(a, x), |(a, x): (f64, f64)| rustymath::gammaincc(a as f32, x as f32).into());
     // The inverse recovers x from a and P(a, x). At f32 it's checked against its own f64 result at the same inputs.
     let inverse: Vec<_> = cases.iter().filter(|&&(_, p)| central(p)).map(|&((a, x), p)| ((a, p), x)).collect();
-    iterative("gammaincinv", scaled(inverse.iter().copied(), |(a, p)| crate::gammaincinv(a, p), f64::EPSILON, 1e-280));
-    let narrow = inverse.iter().map(|&((a, p), _)| { let p = p as f32 as f64; ((a, p), crate::gammaincinv(a, p) as f32 as f64) });
-    check("f32 gammaincinv", scaled(narrow, |(a, p)| crate::gammaincinv(a as f32, p as f32).into(), f32::EPSILON.into(), 1e-30));
+    iterative("gammaincinv", scaled(inverse.iter().copied(), |(a, p)| rustymath::gammaincinv(a, p), f64::EPSILON, 1e-280));
+    let narrow = inverse.iter().map(|&((a, p), _)| { let p = p as f32 as f64; ((a, p), rustymath::gammaincinv(a, p) as f32 as f64) });
+    check("f32 gammaincinv", scaled(narrow, |(a, p)| rustymath::gammaincinv(a as f32, p as f32).into(), f32::EPSILON.into(), 1e-30));
 }
 
 #[test]
 fn incomplete_beta_accuracy() {
-    let cases = incomplete("betainc", |(a, b, x)| crate::betainc(a, b, x), |(a, b, x): (f64, f64, f64)| crate::betainc(a as f32, b as f32, x as f32).into());
+    let cases = incomplete("betainc", |(a, b, x)| rustymath::betainc(a, b, x), |(a, b, x): (f64, f64, f64)| rustymath::betainc(a as f32, b as f32, x as f32).into());
     // The inverse recovers x from a, b and I(a, b, x). At f32 it's checked against its own f64 result at the same inputs.
     let inverse: Vec<_> = cases.iter().filter(|&&(_, p)| central(p)).map(|&((a, b, x), p)| ((a, b, p), x)).collect();
-    iterative("betaincinv", scaled(inverse.iter().copied(), |(a, b, p)| crate::betaincinv(a, b, p), f64::EPSILON, 1e-280));
-    let narrow = inverse.iter().map(|&((a, b, p), _)| { let p = p as f32 as f64; ((a, b, p), crate::betaincinv(a, b, p) as f32 as f64) });
-    check("f32 betaincinv", scaled(narrow, |(a, b, p)| crate::betaincinv(a as f32, b as f32, p as f32).into(), f32::EPSILON.into(), 1e-30));
+    iterative("betaincinv", scaled(inverse.iter().copied(), |(a, b, p)| rustymath::betaincinv(a, b, p), f64::EPSILON, 1e-280));
+    let narrow = inverse.iter().map(|&((a, b, p), _)| { let p = p as f32 as f64; ((a, b, p), rustymath::betaincinv(a, b, p) as f32 as f64) });
+    check("f32 betaincinv", scaled(narrow, |(a, b, p)| rustymath::betaincinv(a as f32, b as f32, p as f32).into(), f32::EPSILON.into(), 1e-30));
+}
+
+mod complex {
+    use num_complex::Complex;
+    use rustymath::{
+        divide, Acos, Acosh, Arg, Asin, Asinh, Atan, Atanh, Binary, Binom, Cos, Cosh, Exp, Gamma, LambertW, Lgamma, Ln,
+        Native, Pow, Sign, Sin, Sinh, Sqrt, Sqrt1mx2, Sqrt1px2, Sqrtx2m1, Tan, Tanh, Unary,
+    };
+    use std::f64::consts::{FRAC_PI_2, PI};
+
+    fn c<R>(re: R, im: R) -> Complex<R> { Complex::new(re, im) }
+
+    /// The bound on each function's error, in ulps of the result's magnitude.
+    const BOUND: f64 = 4.0;
+
+    // Concrete widths keep the object bounds out of the test helpers.
+    macro_rules! at_width {
+        ($name:ident, $r:ty) => {
+            mod $name {
+                use super::*;
+                type R = $r;
+
+                pub(super) fn apply(name: &str, z: &[Complex<R>], sliced: bool) -> Option<Complex<R>> {
+                    fn unary<O: Unary<Complex<R>, Out = Complex<R>>>(object: O, z: &[Complex<R>], sliced: bool) -> Complex<R> {
+                        if !sliced { return object.one(z[0]) }
+                        let mut out = Vec::new();
+                        object.many(Arg::Many(&z[..1]), 1, &mut out);
+                        out[0]
+                    }
+                    fn binary<O: Binary<Complex<R>, Out = Complex<R>>>(object: O, z: &[Complex<R>], sliced: bool) -> Complex<R> {
+                        if !sliced { return object.one(z[0], z[1]) }
+                        let mut out = Vec::new();
+                        object.many(Arg::Many(&z[..1]), Arg::Many(&z[1..2]), 1, &mut out);
+                        out[0]
+                    }
+                    Some(match name {
+                        "exp" => unary(Exp, z, sliced),
+                        "log" => unary(Ln, z, sliced),
+                        "sqrt" => unary(Sqrt, z, sliced),
+                        "sin" => unary(Sin, z, sliced),
+                        "cos" => unary(Cos, z, sliced),
+                        "tan" => unary(Tan, z, sliced),
+                        "sinh" => unary(Sinh, z, sliced),
+                        "cosh" => unary(Cosh, z, sliced),
+                        "tanh" => unary(Tanh, z, sliced),
+                        "asin" => unary(Asin, z, sliced),
+                        "acos" => unary(Acos, z, sliced),
+                        "atan" => unary(Atan, z, sliced),
+                        "asinh" => unary(Asinh, z, sliced),
+                        "acosh" => unary(Acosh, z, sliced),
+                        "atanh" => unary(Atanh, z, sliced),
+                        "lgamma" => unary(Lgamma, z, sliced),
+                        "gamma" => unary(Gamma, z, sliced),
+                        "pow" => binary(Pow, z, sliced),
+                        "binom" => binary(Binom, z, sliced),
+                        "lambertw" => unary(LambertW, z, sliced),
+                        "sqrt1mx2" => unary(Sqrt1mx2, z, sliced),
+                        "sqrtx2m1" => unary(Sqrtx2m1, z, sliced),
+                        "sqrt1px2" => unary(Sqrt1px2, z, sliced),
+                        _ => return None,
+                    })
+                }
+            }
+        };
+    }
+    at_width!(single, f32);
+    at_width!(double, f64);
+
+    /// Each line of `complex.txt` as its function's name, its arguments and the correctly rounded result.
+    fn cases() -> Vec<(String, Vec<Complex<f64>>, Complex<f64>)> {
+        include_str!("../testdata/complex.txt").lines().filter(|l| !l.starts_with('#')).map(|l| {
+            let mut fields = l.split_whitespace();
+            let name = fields.next().unwrap().to_string();
+            let v: Vec<f64> = fields.map(|f| f.parse().unwrap()).collect();
+            let z = v.chunks(2).map(|p| c(p[0], p[1])).collect::<Vec<_>>();
+            let (args, want) = z.split_at(z.len() - 1);
+            (name, args.to_vec(), want[0])
+        }).collect()
+    }
+
+    /// The magnitude that a function's error counts in ulps of, as the module doc gives it.
+    fn scale(name: &str, args: &[Complex<f64>], want: Complex<f64>) -> f64 {
+        let size = |z: Complex<f64>| z.re.hypot(z.im);
+        let lg = |z: Complex<f64>| size(Lgamma.one(z));
+        let exponentiated = |exponent: f64| size(want) * (exponent.max(2.0) + 1.0);
+        let one = c(1.0, 0.0);
+        match name {
+            "lgamma" => size(want).max(2.0),
+            "gamma" => exponentiated(lg(args[0])),
+            "binom" => exponentiated(lg(args[0] + one) + lg(args[1] + one) + lg(args[0] - args[1] + one)),
+            "pow" => exponentiated(size(args[1] * Ln.one(args[0]))),
+            _ => size(want),
+        }
+    }
+
+    /// The worst error of each function that `f` computes, in ulps of its scale, over the cases whose arguments and result are finite
+    /// and normal at `R`.
+    fn worst<R: Native>(
+        eps: f64, narrow: impl Fn(f64) -> R, f: impl Fn(&str, &[Complex<R>]) -> Option<Complex<R>>,
+    ) -> Vec<(String, f64, Vec<Complex<f64>>)> {
+        let mut out: Vec<(String, f64, Vec<Complex<f64>>)> = Vec::new();
+        let fits = |v: f64| v.is_finite() && narrow(v).wide() == v;
+        let normal = |v: f64| v == 0.0 || (v.abs() >= R::min_positive_value().wide() && v.abs() <= R::max_value().wide());
+        for (name, args, want) in cases() {
+            if !args.iter().all(|z| fits(z.re) && fits(z.im)) || !(normal(want.re) && normal(want.im)) || !(want.re.is_finite() && want.im.is_finite()) { continue; }
+            let Some(got) = f(&name, &args.iter().map(|z| c(narrow(z.re), narrow(z.im))).collect::<Vec<_>>()) else { continue };
+            let d = (got.re.wide() - want.re).hypot(got.im.wide() - want.im);
+            let s = scale(&name, &args, want);
+            let err = if s == 0.0 { if d == 0.0 { 0.0 } else { f64::INFINITY } } else { d / (s * eps) };
+            let err = if err.is_nan() { f64::INFINITY } else { err };
+            match out.iter_mut().find(|(n, _, _)| *n == name) {
+                Some(row) => if err > row.1 { *row = (name, err, args) },
+                None => out.push((name, err, args)),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn accuracy() {
+        let rows = [
+            ("f64 scalar", worst::<f64>(f64::EPSILON, |v| v, |name, z| double::apply(name, z, false))),
+            ("f64 sliced", worst::<f64>(f64::EPSILON, |v| v, |name, z| double::apply(name, z, true))),
+            ("f32 scalar", worst::<f32>(f32::EPSILON.into(), |v| v as f32, |name, z| single::apply(name, z, false))),
+            ("f32 sliced", worst::<f32>(f32::EPSILON.into(), |v| v as f32, |name, z| single::apply(name, z, true))),
+        ];
+        let over: Vec<_> =
+            rows.iter().flat_map(|(how, r)| r.iter().filter(|(_, e, _)| *e > BOUND).map(move |(n, e, a)| (*how, n, *e, a))).collect();
+        if std::env::var("RUSTYMATH_COMPLEX").is_ok() { for (how, r) in &rows { for (n, e, a) in r { println!("{how} {n} {e:.2} {a:?}"); } } }
+        assert!(over.is_empty(), "{over:#?}");
+    }
+
+    /// C99's values on the branch cuts, where the sign of a zero part chooses the side, and exact real or imaginary results on the axes.
+    #[test]
+    fn cuts_and_axes() {
+        let k = |re: f64, im: f64| c(re, im);
+        let (a, b) = (1.3169578969248166, 0.5493061443340549);
+        let cases = [
+            ("sqrt", k(-4.0, 0.0), k(0.0, 2.0)), ("sqrt", k(-4.0, -0.0), k(0.0, -2.0)),
+            ("log", k(-1.0, 0.0), k(0.0, PI)), ("log", k(-1.0, -0.0), k(0.0, -PI)),
+            ("asin", k(2.0, 0.0), k(FRAC_PI_2, a)), ("asin", k(2.0, -0.0), k(FRAC_PI_2, -a)),
+            ("acos", k(2.0, 0.0), k(0.0, -a)), ("acos", k(2.0, -0.0), k(0.0, a)),
+            ("acosh", k(-2.0, 0.0), k(a, PI)), ("acosh", k(-2.0, -0.0), k(a, -PI)),
+            ("atanh", k(2.0, 0.0), k(b, FRAC_PI_2)), ("atanh", k(2.0, -0.0), k(b, -FRAC_PI_2)),
+            ("asinh", k(0.0, 2.0), k(a, FRAC_PI_2)), ("asinh", k(-0.0, 2.0), k(-a, FRAC_PI_2)),
+            ("atan", k(0.0, 2.0), k(FRAC_PI_2, b)), ("atan", k(-0.0, 2.0), k(-FRAC_PI_2, b)),
+        ];
+        for (name, z, want) in cases {
+            let got = double::apply(name, &[z], false).unwrap();
+            let close = |g: f64, w: f64| (g - w).abs() <= 4.0 * f64::EPSILON * w.abs().max(1.0) && g.is_sign_negative() == w.is_sign_negative();
+            assert!(close(got.re, want.re) && close(got.im, want.im), "{name}({z}) gave {got}, not {want}");
+        }
+        for x in [0.5, 3.0, -2.0, 700.0, 1e-300] {
+            for name in ["exp", "sin", "cos", "sinh", "cosh", "tanh", "tan"] { assert_eq!(double::apply(name, &[k(x, 0.0)], false).unwrap().im, 0.0, "{name}({x})"); }
+            if x > 0.0 { for name in ["log", "sqrt"] { assert_eq!(double::apply(name, &[k(x, 0.0)], false).unwrap().im, 0.0, "{name}({x})"); } }
+            for name in ["sin", "sinh", "tan", "tanh"] { assert_eq!(double::apply(name, &[k(0.0, x)], false).unwrap().re, 0.0, "{name}({x}i)"); }
+        }
+        assert_eq!(Pow.one(k(1.0, 1.0), k(0.0, 0.0)), k(1.0, 0.0));
+        assert_eq!(Pow.one(k(-8.0, 0.0), k(3.0, 0.0)), k(-512.0, 0.0));
+        assert_eq!(Pow.one(k(0.0, 0.0), k(2.0, 5.0)), k(0.0, 0.0));
+        assert_eq!(Sign.one(k(f64::INFINITY, 3.0)), k(1.0, 0.0));
+        assert_eq!(Sign.one(k(-0.0, 0.0)), k(-0.0, 0.0));
+        assert!(Lgamma.one(k(-3.0, 0.0)).re.is_nan());
+        assert_eq!(Binom.one(k(2.0, 0.0), k(3.0, 0.0)), k(0.0, 0.0));
+    }
+
+    /// Division divides two reals as reals, so a real zero divisor gives ∞ with an imaginary part of 0. Any other zero divisor gives NaN.
+    #[test]
+    fn division() {
+        let k = |re: f64, im: f64| c(re, im);
+        let q = divide(k(3.0, 4.0), k(1.0, 2.0));
+        assert!((q - k(2.2, -0.4)).norm() <= 4.0 * f64::EPSILON * 2.3, "{q}");
+        assert_eq!(divide(k(5.0, 0.0), k(2.0, 0.0)), k(2.5, 0.0));
+        assert_eq!(divide(k(1.0, 0.0), k(0.0, 0.0)), k(f64::INFINITY, 0.0));
+        let z = divide(k(1.0, -2.0), k(0.0, 0.0));
+        assert!(z.re.is_nan() && z.im.is_nan(), "{z}");
+    }
+
+    /// e^(iy) at the float nearest kπ/2 is exactly i^k, through the scalar and slice forms of `Exp` and of the `Pow`s that compute
+    /// through it. A part the quarter turn makes 0 stays 0 where e^x overflows, and NaN in x still gives NaN.
+    #[test]
+    fn quarter_turns() {
+        fn check<R: Native + std::fmt::Debug>(big: f64)
+        where
+            Exp: Unary<Complex<R>, Out = Complex<R>>,
+            Pow: Binary<Complex<R>, Out = Complex<R>>,
+        {
+            let q = R::narrow(FRAC_PI_2);
+            let (zero, one) = (R::zero(), R::one());
+            let turns = [c(one, zero), c(zero, one), c(-one, zero), c(zero, -one)];
+            let sliced = |z: Complex<R>| {
+                let mut out = Vec::new();
+                Exp.many(Arg::Many(&[z]), 1, &mut out);
+                out[0]
+            };
+            for k in -8i32..=8 {
+                let (z, want) = (c(zero, R::narrow(k as f64) * q), turns[k.rem_euclid(4) as usize]);
+                assert_eq!((Exp.one(z), sliced(z)), (want, want), "k = {k}");
+            }
+            let (above, nan) = (c(R::narrow(big), q), c(R::nan(), q));
+            assert_eq!((Exp.one(above), sliced(above)), (c(zero, R::infinity()), c(zero, R::infinity())));
+            assert!(Exp.one(nan).re.is_nan() && sliced(nan).re.is_nan());
+            let (minus, half, three) = (c(-one, zero), c(R::narrow(0.5), zero), c(R::narrow(1.5), zero));
+            for (z, w, want) in [(minus, half, turns[1]), (minus, three, turns[3]), (turns[1], c(one + one, zero), turns[2])] {
+                let mut out = Vec::new();
+                Pow.many(Arg::Many(&[z]), Arg::Many(&[w]), 1, &mut out);
+                assert_eq!((Pow.one(z, w), out[0]), (want, want), "{z:?}^{w:?}");
+            }
+        }
+        check::<f64>(800.0);
+        check::<f32>(100.0);
+    }
+}
+
+mod lambert {
+    use num_complex::Complex;
+    use rustymath::{lambertw, LambertW, Unary};
+
+    #[test]
+    fn special_values() {
+        assert!(lambertw(0.0f64).to_bits() == 0 && lambertw(-0.0f64).to_bits() == (-0.0f64).to_bits());
+        assert_eq!(lambertw(f64::INFINITY), f64::INFINITY);
+        assert!([f64::NEG_INFINITY, f64::NAN, -1.0, -0.3678794411714425].iter().all(|&x| lambertw(x).is_nan()));
+        // The floats nearest -1/e lie below it, within half an ulp.
+        assert_eq!((lambertw(-0.36787944117144233f64), lambertw(-0.36787945f32)), (-1.0, -1.0));
+        assert_eq!(lambertw(1.0f64), 0.5671432904097838);
+        let c = |re: f64, im: f64| Complex::new(re, im);
+        assert_eq!(LambertW.one(c(0.0, -0.0)).im.to_bits(), (-0.0f64).to_bits());
+        // Each side of the cut along the real axis below -1/e, by the sign of the imaginary part's zero.
+        let (above, below) = (LambertW.one(c(-2.0, 0.0)), LambertW.one(c(-2.0, -0.0)));
+        assert!(above.im > 0.0 && below == above.conj());
+        assert!(LambertW.one(c(f64::NAN, 1.0)).re.is_nan());
+        assert_eq!(LambertW.one(c(f64::NEG_INFINITY, 0.0)), c(f64::INFINITY, std::f64::consts::PI));
+    }
+}
+
+mod pow {
+    use rustymath::{Binary, Pow};
+
+    /// IEEE 754's special values for `pow`, through the free function and through `Pow`'s scalar form, which has its own fast path.
+    #[test]
+    fn special_values() {
+        for p in [rustymath::pow::<f64> as fn(f64, f64) -> f64, |x, y| Pow.one(x, y)] {
+            assert_eq!((p(f64::NAN, 0.0), p(1.0, f64::NAN), p(-2.0, 3.0), p(0.0, -1.0)), (1.0, 1.0, -8.0, f64::INFINITY));
+            assert!(p(-2.0, 0.5).is_nan() && (p(2.0, 0.5) - std::f64::consts::SQRT_2).abs() < 1e-15);
+        }
+        assert!(rustymath::pow(-2.0f32, 3.0) == -8.0 && Pow.one(-2.0f32, 0.5).is_nan());
+    }
 }

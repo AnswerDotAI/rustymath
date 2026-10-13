@@ -21,7 +21,7 @@
 use super::{identity, transpose_into, Scalar, Tiled};
 use crate::{float::{sealed::Core, FUSED}, Native};
 use num_complex::Complex;
-use num_traits::{Float as _, One as _, ToPrimitive as _, Zero as _};
+use num_traits::{Float as _, One as _, Zero as _};
 use std::{borrow::Cow, cmp::Ordering};
 
 mod eigen;
@@ -30,17 +30,23 @@ mod secular;
 mod svd;
 pub use eigen::{eigh, hermitian_eigenvalues, Eigh};
 pub use general::{eig, eigenvalues, Eig};
+#[doc(hidden)]
+pub use eigen::CONQUER as EIGH_CONQUER;
+#[doc(hidden)]
+pub use svd::SPLIT as SVD_SPLIT;
 
 /// Columns in each block of a blocked LU or Cholesky factorization of an `n`×`n` matrix. A larger matrix takes wider blocks, whose
 /// trailing updates are longer matrix products. On the Mac this measured fastest from 256 to 1024 rows.
-fn lu_block(n: usize) -> usize { (n / 8).clamp(32, 128) }
+#[doc(hidden)]
+pub fn lu_block(n: usize) -> usize { (n / 8).clamp(32, 128) }
 /// Columns in each block of a blocked QR factorization with `p` reflections. QR measured fastest with narrower blocks than LU's.
 fn qr_block(p: usize) -> usize { (p / 16).clamp(32, 64) }
 /// Columns up to which `Reflections::q` applies one reflection at a time.
 const ONE_AT_A_TIME: usize = 64;
 /// Right-hand sides up to which `Reflections::apply_adjoint` applies one reflection at a time. For a 4096×16 `lstsq`, blocks measured
 /// as fast at 12 and faster from 16.
-const FEW_COLUMNS: usize = 12;
+#[doc(hidden)]
+pub const FEW_COLUMNS: usize = 12;
 /// Columns at which a block stops halving and factors one column at a time.
 const LEAF: usize = 16;
 /// Rows in each block of a solve with more than one right-hand side. A block's own rows substitute with vector operations, and the rows
@@ -191,23 +197,29 @@ pub fn singular_values<T: Factor>(a: &[T], size: [usize; 2]) -> Vec<T::Real> { T
 /// `size` `[m, n]` and the `m`×`k` matrix `b`. `x` is `n`×`k`. Singular values below `ε` times the larger of `m` and `n` times the
 /// largest count as zero, as in NumPy's `lstsq`.
 pub fn lstsq<T: Factor>(a: &[T], b: &[T], size: [usize; 2], k: usize) -> (Vec<T>, Vec<T::Real>) { T::matrix_lstsq(a, b, size, k) }
-/// The solution `x` of `a x = b` for the matrix `a` of `size` `[m, n]` and the `m`×`k` matrix `b`, as an `n`×`k` matrix: `lstsq`'s
-/// least-squares solution with the least norm. A square `a` with no negligible pivot solves through its LU factorization.
+/// The solution `x` of `a x = b` for the matrix `a` of `size` `[m, n]` and the `m`×`k` matrix `b`, as an `n`×`k` matrix. A square `a`
+/// whose LU pivots all exceed `ε` times `n` times its largest magnitude solves through its LU factorization, with no cutoff,
+/// as `inv` and `solve` do in NumPy. Any other `a` gives `lstsq`'s least-squares solution with the least norm.
 pub fn solve<T: Factor>(a: &[T], b: &[T], size: [usize; 2], k: usize) -> Vec<T> {
     match regular(a, size) {
         Some(lu) => lu.solve(b, k),
         None => lstsq(a, b, size, k).0,
     }
 }
-/// The `n`×`m` pseudoinverse of the matrix `a` of `size` `[m, n]`, with `lstsq`'s cutoff. A square `a` with no negligible pivot gives
-/// its inverse through its LU factorization.
+/// The `n`×`m` pseudoinverse of the matrix `a` of `size` `[m, n]`, under [`solve`]'s rule. A square `a` with no negligible pivot gives
+/// its inverse through its LU factorization, with no cutoff. Any other `a` gives the pseudoinverse with `lstsq`'s cutoff.
 pub fn pinv<T: Factor>(a: &[T], size: [usize; 2]) -> Vec<T> {
     match regular(a, size) {
         Some(lu) => lu.inverse(),
         None => svd(a, size).pseudoinverse(),
     }
 }
-/// The rank of the matrix `a` of `size` `[m, n]`: how many of its singular values exceed `lstsq`'s cutoff.
+/// √(least normal)/ε, the bottom of the range where sums of squares neither overflow nor lose digits to underflow. Its reciprocal is the
+/// top.
+fn safe_low<R: Native>() -> R { R::min_positive_value().sqrt() / R::epsilon() }
+/// The rank of the matrix `a` of `size` `[m, n]`: how many of its singular values exceed `lstsq`'s cutoff. A square matrix that
+/// [`solve`] and [`pinv`] treat as regular can still have a lower rank. `[1 1e8; 0 1]` at f64 has no negligible pivot, but its smaller
+/// singular value, about 1e-8, falls below the cutoff of about 4.4e-8.
 pub fn rank<T: Factor>(a: &[T], size: [usize; 2]) -> usize {
     let s = singular_values(a, size);
     let floor = cutoff(&s, size[0].max(size[1]));
@@ -217,7 +229,7 @@ pub fn rank<T: Factor>(a: &[T], size: [usize; 2]) -> usize {
 /// doesn't count as negligible, so NaN reaches the results.
 fn regular<T: Factor>(a: &[T], [m, n]: [usize; 2]) -> Option<Lu<T>> {
     if m != n || n == 0 { return None }
-    let largest = a.iter().fold(T::Real::zero(), |s, x| s.max(x.modulus()));
+    let largest = greatest(a, T::modulus);
     let negligible = T::Real::epsilon() * <T::Real as crate::Float>::narrow(n as f64) * largest;
     let lu = lu(a, n);
     let regular = lu.diagonal().all(|d| !(d.modulus() <= negligible));
@@ -260,27 +272,38 @@ fn sum_of_products<T: Scalar>(x: &[T], y: &[T], f: impl Fn(T) -> T) -> T {
     xr.iter().zip(yr).fold(s.iter().fold(T::zero(), |t, &v| t + v), |t, (&a, &b)| f(a).mul_acc(b, t))
 }
 
-/// The position of the item of `x` with the greatest `abs1`, the first of any equal ones, or 0 where every item is NaN. Eight running
-/// maximums find the greatest, which vectorizes, then a scan finds its position.
+/// The position of the item of `x` with the greatest `abs1`, the first of any equal ones, or 0 where every item is NaN. `greatest` finds
+/// that `abs1`, then a scan finds its position.
 fn largest<T: Scalar>(x: &[T]) -> usize {
-    let mut m = [T::Real::zero(); 8];
-    let (chunks, rest) = x.as_chunks::<8>();
-    for c in chunks {
-        for k in 0..8 { m[k] = m[k].max(c[k].abs1()) }
-    }
-    let top = rest.iter().fold(m.iter().fold(T::Real::zero(), |a, &b| a.max(b)), |a, &b| a.max(b.abs1()));
+    let top = greatest(x, T::abs1);
     x.iter().position(|v| v.abs1() == top).unwrap_or(0)
 }
 
-/// The power of two that brings the greatest `abs1` in `a` to between 1 and 2, when that magnitude lies outside the range where sums
-/// of squares neither overflow nor lose digits to underflow, from √(least normal)/ε to its reciprocal. `None` inside that range, and
-/// for a matrix of zeros or one holding an infinity. Scaling by a power of two is exact.
+/// The greatest `f(v)` over the items `v` of `x`, ignoring NaN, or 0 for an empty `x`. Eight running maximums find it, which vectorizes.
+fn greatest<T: Copy, R: Native>(x: &[T], f: impl Fn(T) -> R) -> R {
+    let mut m = [R::zero(); 8];
+    let (chunks, rest) = x.as_chunks::<8>();
+    for c in chunks {
+        for k in 0..8 { m[k] = m[k].max(f(c[k])) }
+    }
+    rest.iter().fold(m.iter().fold(R::zero(), |a, &b| a.max(b)), |a, &b| a.max(f(b)))
+}
+
+/// The power of two that brings the greatest `abs1` in `a` to between 1 and 2, when that magnitude lies outside the range from
+/// `safe_low` to its reciprocal. `None` inside that range, for a matrix of zeros, and where that item has an infinite part. Scaling by
+/// a power of two is exact. Where `abs1` overflows, the item's larger part, at least half the largest float, gives the same power of two.
 fn safe_scale<T: Scalar>(a: &[T]) -> Option<T::Real> {
-    let top = a.get(largest(a))?.abs1();
-    let low = T::Real::min_positive_value().sqrt() / T::Real::epsilon();
+    let x = *a.get(largest(a))?;
+    let top = Some(x.abs1()).filter(|t| t.is_finite()).unwrap_or(x.re().abs().max(x.im().abs()));
+    let low = safe_low::<T::Real>();
     if !top.is_finite() || top == T::Real::zero() || (low..=low.recip()).contains(&top) { return None }
-    let limit = T::Real::max_value().log2().floor();
-    Some((T::Real::one() + T::Real::one()).powi((-top.log2().floor()).max(-limit).min(limit).to_i32()?))
+    unit_scale(top)
+}
+
+/// The power of two that brings the positive, finite `top` to between 1 and 2, within the range of the type's exponents.
+fn unit_scale<R: Native>(top: R) -> Option<R> {
+    let limit = R::max_value().log2().floor();
+    Some((R::one() + R::one()).powi((-top.log2().floor()).max(-limit).min(limit).to_i32()?))
 }
 
 /// Divides each item of `x` by `d`. It multiplies by the reciprocal, except for a subnormal `d`, whose reciprocal overflows.
@@ -756,413 +779,3 @@ where
     (pseudo_solve(&svd, Some(&y[..n * k]), k, m), svd.s)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A real item type of the tests: `f32` or `f64`, whose real quantities, such as singular values, have its own type.
-    pub(super) trait RealItem: Factor + Native + Scalar<Real = Self> + Tiled + std::fmt::Debug {}
-    impl<T: Factor + Native + Scalar<Real = T> + Tiled + std::fmt::Debug> RealItem for T {}
-
-    /// An `m`×`n` matrix of numbers from -1 to 1, from a linear congruential generator.
-    pub(super) fn random<T: RealItem>(m: usize, n: usize, seed: u64) -> Vec<T> {
-        let mut x = seed;
-        (0..m * n)
-            .map(|_| {
-                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                T::narrow((x >> 11) as f64 / (1u64 << 52) as f64 - 1.0)
-            })
-            .collect()
-    }
-
-    pub(super) fn wide<T: RealItem>(x: &[T]) -> Vec<f64> { x.iter().map(|v| v.wide()).collect() }
-
-    /// The product of the `m`×`k` matrix `a` and the `k`×`n` matrix `b`, in f64, item by item.
-    pub(super) fn product(a: &[f64], b: &[f64], [m, k, n]: [usize; 3]) -> Vec<f64> {
-        (0..m * n).map(|ij| (0..k).map(|p| a[ij / n * k + p] * b[p * n + ij % n]).sum()).collect()
-    }
-
-    pub(super) fn norm(x: &[f64]) -> f64 { x.iter().map(|v| v * v).sum::<f64>().sqrt() }
-
-    /// The norm of `x - y`, relative to `scale`.
-    pub(super) fn distance(x: &[f64], y: &[f64], scale: f64) -> f64 { norm(&x.iter().zip(y).map(|(a, b)| a - b).collect::<Vec<_>>()) / scale }
-
-    /// How far the `rows`×`cols` matrix `q` is from having orthonormal columns.
-    pub(super) fn orthogonality(q: &[f64], rows: usize, cols: usize) -> f64 {
-        let qt = transpose(q, rows, cols);
-        distance(&product(&qt, q, [cols, rows, cols]), &identity(cols), 1.0)
-    }
-
-    /// Checks each decomposition at `T` on matrices either side of the block width, where `tolerance` is a few times `T`'s epsilon.
-    fn decompositions<T: RealItem>(tolerance: f64) {
-        let nb = lu_block(0);
-        for n in [0, 1, 2, 5, nb - 1, nb, nb + 1, 2 * nb + 7] {
-            let bound = tolerance * (n as f64).max(1.0);
-            let a = random::<T>(n, n, n as u64 + 1);
-            let aw = wide(&a);
-            // L U is A with its rows permuted.
-            let f = lu(&a, n);
-            let factors = wide(&f.factors);
-            let l: Vec<f64> = (0..n * n).map(|k| match (k / n).cmp(&(k % n)) { Ordering::Greater => factors[k], Ordering::Equal => 1.0, Ordering::Less => 0.0 }).collect();
-            let u: Vec<f64> = (0..n * n).map(|k| if k % n >= k / n { factors[k] } else { 0.0 }).collect();
-            let pa: Vec<f64> = f.perm.iter().flat_map(|&p| aw[p * n..(p + 1) * n].to_vec()).collect();
-            assert!(distance(&product(&l, &u, [n; 3]), &pa, norm(&aw).max(1.0)) < bound, "lu at {n}");
-            // Solutions have small residuals for their size.
-            for k in [1, 3] {
-                let b = random::<T>(n, k, 99);
-                let x = wide(&f.solve(&b, k));
-                assert!(distance(&product(&aw, &x, [n, n, k]), &wide(&b), (norm(&aw) * norm(&x)).max(1.0)) < bound, "solve at {n}, {k}");
-            }
-            let inverse = wide(&f.inverse());
-            assert!(distance(&product(&aw, &inverse, [n; 3]), &identity(n), (norm(&aw) * norm(&inverse)).max(1.0)) < bound, "inverse at {n}");
-            // Cholesky of a positive definite matrix, and none of one that isn't.
-            let spd: Vec<T> = product(&aw, &transpose(&aw, n, n), [n; 3]).iter().enumerate().map(|(k, &v)| T::narrow(v + if k % (n + 1) == 0 { n as f64 } else { 0.0 })).collect();
-            let l = wide(&cholesky(&spd, n).expect("a positive definite matrix"));
-            assert!((0..n * n).all(|k| k % n <= k / n || l[k] == 0.0), "cholesky's upper triangle at {n}");
-            assert!(distance(&product(&l, &transpose(&l, n, n), [n; 3]), &wide(&spd), norm(&wide(&spd)).max(1.0)) < bound, "cholesky at {n}");
-            if n > 0 { assert_eq!(cholesky(&spd.iter().map(|&v| -v).collect::<Vec<_>>(), n), None, "cholesky of a negative definite matrix") }
-            // QR and the SVD, of square, tall and wide matrices.
-            for (m, c) in [(n, n), (n + 5, n), (n, n + 5)] {
-                let a = random::<T>(m, c, (m * 31 + c) as u64);
-                let (aw, p, scale) = (wide(&a), m.min(c), norm(&wide(&a)).max(1.0));
-                let (q, r) = qr(&a, [m, c]);
-                let (q, r) = (wide(&q), wide(&r));
-                assert!(distance(&product(&q, &r, [m, p, c]), &aw, scale) < bound, "qr at {m}×{c}");
-                assert!(orthogonality(&q, m, p) < bound, "qr's q at {m}×{c}");
-                assert!((0..p * c).all(|k| k % c >= k / c || r[k] == 0.0), "qr's r at {m}×{c}");
-                let f = svd(&a, [m, c]);
-                let (u, s, v) = (wide(&f.u), wide(&f.s), wide(&f.v));
-                assert!(s.windows(2).all(|w| w[0] >= w[1]) && s.iter().all(|&x| x >= 0.0), "svd's s at {m}×{c}");
-                let us: Vec<f64> = (0..m * p).map(|k| u[k] * s[k % p]).collect();
-                assert!(distance(&product(&us, &transpose(&v, c, p), [m, p, c]), &aw, scale) < bound, "svd at {m}×{c}");
-                // The accumulated rotations' rounding errors add up over the sweeps, in V, or in U for a wide matrix.
-                let (ou, ov) = (orthogonality(&u, m, p), orthogonality(&v, c, p));
-                assert!(ou < 4.0 * bound && ov < 4.0 * bound, "svd's u and v at {m}×{c}: {ou:e} and {ov:e}, against {bound:e}");
-                assert!(distance(&wide(&singular_values(&a, [m, c])), &wide(&f.s), scale) < bound, "singular values alone at {m}×{c}");
-                // A least-squares solution leaves a residual orthogonal to A's columns, and the pseudoinverse inverts A on its range.
-                if m >= c && c > 0 {
-                    let b = random::<T>(m, 2, 7);
-                    let x = wide(&f.solve(&b, 2));
-                    let residual: Vec<f64> = product(&aw, &x, [m, c, 2]).iter().zip(wide(&b)).map(|(ax, b)| ax - b).collect();
-                    let normal = product(&transpose(&aw, m, c), &residual, [c, m, 2]);
-                    assert!(norm(&normal) / (scale * (scale * norm(&x) + norm(&wide(&b)))) < bound, "svd's solve at {m}×{c}");
-                }
-                // `lstsq` leaves its residual orthogonal to A's columns too, and gives the SVD's singular values.
-                if m > 0 && c > 0 {
-                    let b = random::<T>(m, 2, 11);
-                    let (x, s2) = lstsq(&a, &b, [m, c], 2);
-                    let x = wide(&x);
-                    let residual: Vec<f64> = product(&aw, &x, [m, c, 2]).iter().zip(wide(&b)).map(|(ax, b)| ax - b).collect();
-                    let normal = product(&transpose(&aw, m, c), &residual, [c, m, 2]);
-                    assert!(norm(&normal) / (scale * (scale * norm(&x) + norm(&wide(&b)))) < bound, "lstsq at {m}×{c}");
-                    assert!(distance(&wide(&s2), &s, s[0]) < bound, "lstsq's singular values at {m}×{c}");
-                }
-                let pinv = wide(&f.pseudoinverse());
-                assert!(distance(&product(&product(&aw, &pinv, [m, c, m]), &aw, [m, m, c]), &aw, scale) < bound, "pseudoinverse at {m}×{c}");
-            }
-        }
-        // A zero column gives a singular value within rounding of zero, and U stays orthonormal.
-        let n = 9;
-        let a: Vec<T> = random::<T>(n, n, 5).iter().enumerate().map(|(k, &v)| if k % n == 3 { T::zero() } else { v }).collect();
-        let f = svd(&a, [n, n]);
-        assert!(f.s[n - 1].wide() <= tolerance * f.s[0].wide(), "a zero column's singular value");
-        assert!(orthogonality(&wide(&f.u), n, n) < tolerance * n as f64, "u with a zero column");
-        // A bidiagonal matrix with a zero on its diagonal reaches the QR algorithm unchanged, which rotates that row's superdiagonal
-        // item away before it iterates.
-        let (d, e) = ([3.0, 0.0, 2.0, 0.5, 1.0], [1.0, 1.0, 0.25, 2.0]);
-        let b: Vec<T> = (0..25).map(|k| T::narrow(match (k / 5, k % 5) { (i, j) if i == j => d[i], (i, j) if j == i + 1 => e[i], _ => 0.0 })).collect();
-        let f = svd(&b, [5, 5]);
-        let us: Vec<f64> = (0..25).map(|k| wide(&f.u)[k] * wide(&f.s)[k % 5]).collect();
-        assert!(distance(&product(&us, &transpose(&wide(&f.v), 5, 5), [5; 3]), &wide(&b), norm(&wide(&b))) < 8.0 * tolerance, "svd of a bidiagonal with a zero");
-        assert!(orthogonality(&wide(&f.u), 5, 5) < 8.0 * tolerance, "u of a bidiagonal with a zero");
-    }
-
-    #[test]
-    fn decompositions_have_small_residuals() {
-        decompositions::<f64>(4.0 * f64::EPSILON);
-        decompositions::<f32>(4.0 * f32::EPSILON as f64);
-    }
-
-    /// Checks the decompositions at `T` on LAPACK's hard matrix types, where `tolerance` is a few times `T`'s epsilon. A matrix scaled
-    /// by a power of two near underflow or overflow gives factors scaled exactly in step. A zero column gives finite LU factors with a
-    /// zero pivot. A subnormal pivot gives finite multipliers.
-    fn hard_matrices<T: RealItem>(tolerance: f64) {
-        let n = 40;
-        let tiny = T::min_positive_value() / T::epsilon();
-        let (a, b) = (random::<T>(n, n, 17), random::<T>(n, 3, 19));
-        let aw = wide(&a);
-        let spd: Vec<T> = product(&aw, &transpose(&aw, n, n), [n; 3]).iter().enumerate().map(|(k, &v)| T::narrow(v + if k % (n + 1) == 0 { n as f64 } else { 0.0 })).collect();
-        for s in [tiny, tiny.recip()] {
-            let times = |x: &[T], c: T| x.iter().map(|&v| v * c).collect::<Vec<T>>();
-            let (f, g) = (lu(&a, n), lu(&times(&a, s), n));
-            assert_eq!(g.perm, f.perm, "lu's permutation scaled by {s:?}");
-            assert_eq!(g.factors, f.factors.iter().enumerate().map(|(k, &v)| if k % n >= k / n { v * s } else { v }).collect::<Vec<T>>(), "lu scaled by {s:?}");
-            assert_eq!(g.solve(&times(&b, s), 3), f.solve(&b, 3), "lu's solve scaled by {s:?}");
-            assert_eq!(times(&g.inverse(), s), f.inverse(), "lu's inverse scaled by {s:?}");
-            // An even power of two has an exact square root.
-            let c = if s.sqrt() * s.sqrt() == s { s } else { s + s };
-            assert_eq!(cholesky(&times(&spd, c), n), cholesky(&spd, n).map(|l| times(&l, c.sqrt())), "cholesky scaled by {c:?}");
-            for (rows, cols) in [(n, n), (n + 5, n), (n, n + 5)] {
-                let a = random::<T>(rows, cols, (rows * 31 + cols) as u64);
-                let b = random::<T>(rows, 2, 23);
-                let ((q, r), (qs, rs)) = (qr(&a, [rows, cols]), qr(&times(&a, s), [rows, cols]));
-                assert_eq!((qs, rs), (q, times(&r, s)), "qr scaled by {s:?} at {rows}×{cols}");
-                let (f, g) = (svd(&a, [rows, cols]), svd(&times(&a, s), [rows, cols]));
-                assert_eq!((g.u, g.s, g.v), (f.u, times(&f.s, s), f.v), "svd scaled by {s:?} at {rows}×{cols}");
-                let ((x, sv), (xs, svs)) = (lstsq(&a, &b, [rows, cols], 2), lstsq(&times(&a, s), &times(&b, s), [rows, cols], 2));
-                assert_eq!((xs, svs), (x, times(&sv, s)), "lstsq scaled by {s:?} at {rows}×{cols}");
-            }
-        }
-        let n = 2 * lu_block(0) + 7;
-        for zero in [0, n / 2, n - 1] {
-            let a: Vec<T> = random::<T>(n, n, 29).iter().enumerate().map(|(k, &v)| if k % n == zero { T::zero() } else { v }).collect();
-            let (aw, f) = (wide(&a), lu(&a, n));
-            let factors = wide(&f.factors);
-            assert!(factors.iter().all(|v| v.is_finite()) && f.diagonal().any(|d| d == T::zero()), "lu with zero column {zero}");
-            let l: Vec<f64> = (0..n * n).map(|k| match (k / n).cmp(&(k % n)) { Ordering::Greater => factors[k], Ordering::Equal => 1.0, Ordering::Less => 0.0 }).collect();
-            let u: Vec<f64> = (0..n * n).map(|k| if k % n >= k / n { factors[k] } else { 0.0 }).collect();
-            let pa: Vec<f64> = f.perm.iter().flat_map(|&p| aw[p * n..(p + 1) * n].to_vec()).collect();
-            assert!(distance(&product(&l, &u, [n; 3]), &pa, norm(&aw)) < tolerance * n as f64, "lu's residual with zero column {zero}");
-        }
-        let (p, q) = (T::min_positive_value() / T::narrow(1024.0), T::min_positive_value() / T::narrow(1048576.0));
-        assert_eq!(lu(&[p, T::one(), q, T::one()], 2).factors, [p, T::one(), q / p, T::one() - q / p], "lu with a subnormal pivot");
-    }
-
-    #[test]
-    fn decompositions_survive_hard_matrices() {
-        hard_matrices::<f64>(4.0 * f64::EPSILON);
-        hard_matrices::<f32>(4.0 * f32::EPSILON as f64);
-    }
-
-    /// Checks `solve`, `pinv`, `qr_complete`, the determinants and `hermitian_eigenvalues` at `T`, where `tolerance` is a few times
-    /// `T`'s epsilon. The singular matrices repeat columns, so their rank is exact.
-    fn solves_and_determinants<T: RealItem>(tolerance: f64) {
-        let bound = 64.0 * tolerance;
-        let base = random::<T>(9, 4, 7);
-        // Columns 4 to 6 repeat columns 0 to 2, so each matrix has rank 4: tall, square, wide, and a regular square one.
-        let repeat = |rows: usize| -> Vec<T> { (0..rows * 7).map(|k| base[k / 7 * 4 + k % 7 % 4]).collect() };
-        let regular = random::<T>(6, 6, 11);
-        for (a, [m, n], r) in [(repeat(9), [9, 7], 4), (repeat(7), [7, 7], 4), (transpose(&repeat(9), 9, 7), [7, 9], 4), (regular.clone(), [6, 6], 6)] {
-            let (aw, scale) = (wide(&a), norm(&wide(&a)));
-            assert_eq!(rank(&a, [m, n]), r, "rank at {m}×{n}");
-            // The pseudoinverse meets the Moore-Penrose conditions A A⁺ A = A and A⁺ A A⁺ = A⁺.
-            let p = wide(&pinv(&a, [m, n]));
-            let ap = product(&aw, &p, [m, n, m]);
-            assert!(distance(&product(&ap, &aw, [m, m, n]), &aw, scale) < bound, "A A⁺ A at {m}×{n}");
-            assert!(distance(&product(&p, &ap, [n, m, m]), &p, norm(&p)) < bound, "A⁺ A A⁺ at {m}×{n}");
-            // `solve` gives the least-norm least-squares solution, A⁺ b.
-            let b = random::<T>(m, 2, 13);
-            let x = wide(&solve(&a, &b, [m, n], 2));
-            let expected = product(&p, &wide(&b), [n, m, 2]);
-            assert!(distance(&x, &expected, norm(&expected)) < bound, "solve at {m}×{n}");
-            // The complete QR: Q is square and orthogonal, R's rows below the thin ones are zero, and Q R is A.
-            let (q, r) = qr_complete(&a, [m, n]);
-            let (q, r, thin) = (wide(&q), wide(&r), m.min(n));
-            assert!(orthogonality(&q, m, m) < bound, "complete Q at {m}×{n}");
-            assert!(r[thin * n..].iter().all(|&v| v == 0.0), "complete R's lower rows at {m}×{n}");
-            assert!(distance(&product(&q, &r, [m, m, n]), &aw, scale) < bound, "complete Q R at {m}×{n}");
-        }
-        // A regular matrix's determinant times its inverse's is 1, and the log-determinant agrees with it.
-        let det = |a: &[T], n: usize| lu(a, n).determinant().wide();
-        let inverse = pinv(&regular, [6, 6]);
-        assert!((det(&regular, 6) * det(&inverse, 6) - 1.0).abs() < bound, "determinants of a matrix and its inverse");
-        let (sign, log) = lu(&regular, 6).log_determinant();
-        assert!((sign.wide() * log.wide().exp() / det(&regular, 6) - 1.0).abs() < bound, "log-determinant");
-        // diag(1, 2, 3, 4) with two rows swapped has determinant -24, and with a zero column, 0 and a logarithm of -∞.
-        let swapped: Vec<T> = [0., 2., 0., 0., 1., 0., 0., 0., 0., 0., 3., 0., 0., 0., 0., 4.].map(T::narrow).to_vec();
-        assert_eq!(det(&swapped, 4), -24.0, "an odd permutation's sign");
-        let singular: Vec<T> = [1., 0., 3., 0.].map(T::narrow).to_vec();
-        let (sign, log) = lu(&singular, 2).log_determinant();
-        assert_eq!((det(&singular, 2), sign.wide(), log.wide()), (0.0, 0.0, f64::NEG_INFINITY), "a singular matrix");
-        // Eigenvalues alone match `eigh`'s, either side of the size where `eigh` switches to divide and conquer.
-        for n in [6, 70] {
-            let a = random::<T>(n, n, n as u64);
-            let s: Vec<T> = (0..n * n).map(|k| a[k] + a[k % n * n + k / n]).collect();
-            let (values, expected) = (wide(&hermitian_eigenvalues(&s, n).unwrap()), wide(&eigh(&s, n).unwrap().values));
-            assert!(distance(&values, &expected, norm(&expected)) < bound, "eigenvalues alone at {n}");
-        }
-    }
-
-    #[test]
-    fn solves_and_determinants_never_fail() {
-        solves_and_determinants::<f64>(4.0 * f64::EPSILON);
-        solves_and_determinants::<f32>(4.0 * f32::EPSILON as f64);
-    }
-
-    /// Checks LU, Cholesky and QR at `T` on matrices large enough for the wider blocks, each leaving a partial last block, where
-    /// `tolerance` is a few times `T`'s epsilon. Products with random vectors keep each check to O(n²) time.
-    fn blocked<T: RealItem>(tolerance: f64) {
-        let times = |a: &[f64], v: &[f64]| product(a, v, [a.len() / v.len(), v.len(), 1]);
-        for n in [530, 1030] {
-            let bound = tolerance * n as f64;
-            let a = random::<T>(n, n, n as u64);
-            let (aw, x) = (wide(&a), wide(&random::<T>(n, 1, 3)));
-            let f = lu(&a, n);
-            let (l, u) = (wide(&f.lower()), wide(&f.upper()));
-            let ax = times(&aw, &x);
-            let pax: Vec<f64> = f.perm.iter().map(|&p| ax[p]).collect();
-            assert!(distance(&times(&l, &times(&u, &x)), &pax, norm(&aw) * norm(&x)) < bound, "lu at {n}");
-            let b = random::<T>(n, 3, 5);
-            let solved = wide(&f.solve(&b, 3));
-            assert!(distance(&product(&aw, &solved, [n, n, 3]), &wide(&b), norm(&aw) * norm(&solved)) < bound, "solve at {n}");
-            let inverse = wide(&f.inverse());
-            assert!(distance(&times(&aw, &times(&inverse, &x)), &x, norm(&aw) * norm(&inverse) * norm(&x)) < bound, "inverse at {n}");
-            // (A + Aᵀ)/2 + n I is diagonally dominant with a positive diagonal, so it's positive definite.
-            let spd: Vec<T> = (0..n * n).map(|k| T::narrow((aw[k] + aw[k % n * n + k / n]) / 2.0 + if k % (n + 1) == 0 { n as f64 } else { 0.0 })).collect();
-            let (sw, l) = (wide(&spd), wide(&cholesky(&spd, n).expect("a positive definite matrix")));
-            assert!((0..n * n).all(|k| k % n <= k / n || l[k] == 0.0), "cholesky's upper triangle at {n}");
-            assert!(distance(&times(&l, &times(&transpose(&l, n, n), &x)), &times(&sw, &x), norm(&sw) * norm(&x)) < bound, "cholesky at {n}");
-            for rows in [n, n + 5] {
-                let a = random::<T>(rows, n, rows as u64 + 7);
-                let (aw, (reflections, r)) = (wide(&a), reflect(&a, [rows, n]));
-                let (q, r) = (wide(&reflections.q()), wide(&r));
-                assert!(distance(&times(&q, &times(&r, &x)), &times(&aw, &x), norm(&aw) * norm(&x)) < bound, "qr at {rows}×{n}");
-                assert!((0..n * n).all(|k| k % n >= k / n || r[k] == 0.0), "qr's r at {rows}×{n}");
-                let (y, qt) = (wide(&random::<T>(n, 1, 9)), transpose(&q, rows, n));
-                assert!(distance(&times(&qt, &times(&q, &y)), &y, norm(&y)) < bound, "qr's q at {rows}×{n}");
-                for k in [2, FEW_COLUMNS + 1] {
-                    let b = random::<T>(rows, k, 13);
-                    let mut qtb = b.clone();
-                    reflections.apply_adjoint(&mut qtb, k);
-                    let bw = wide(&b);
-                    assert!(distance(&wide(&qtb)[..n * k], &product(&qt, &bw, [n, rows, k]), norm(&bw)) < bound, "qr's Qᴴ b at {rows}×{n}×{k}");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn blocked_decompositions_have_small_residuals() {
-        blocked::<f64>(4.0 * f64::EPSILON);
-        blocked::<f32>(4.0 * f32::EPSILON as f64);
-    }
-
-    type C64 = num_complex::Complex<f64>;
-
-    /// An `m`×`n` matrix of complex numbers whose parts lie between -1 and 1.
-    pub(super) fn complex_random<R: RealItem>(m: usize, n: usize, seed: u64) -> Vec<num_complex::Complex<R>> {
-        random::<R>(m, n, seed).into_iter().zip(random::<R>(m, n, seed + 1000)).map(|(re, im)| num_complex::Complex::new(re, im)).collect()
-    }
-
-    pub(super) fn complex_wide<R: RealItem>(x: &[num_complex::Complex<R>]) -> Vec<C64> { x.iter().map(|z| C64::new(z.re.wide(), z.im.wide())).collect() }
-
-    /// The product of the `m`×`k` matrix `a` and the `k`×`n` matrix `b`, item by item.
-    fn complex_product(a: &[C64], b: &[C64], [m, k, n]: [usize; 3]) -> Vec<C64> {
-        (0..m * n).map(|ij| (0..k).map(|p| a[ij / n * k + p] * b[p * n + ij % n]).sum()).collect()
-    }
-
-    fn complex_norm(x: &[C64]) -> f64 { x.iter().map(|z| z.norm_sqr()).sum::<f64>().sqrt() }
-
-    /// The norm of `x - y`, relative to `scale`.
-    fn complex_distance(x: &[C64], y: &[C64], scale: f64) -> f64 { x.iter().zip(y).map(|(a, b)| (a - b).norm_sqr()).sum::<f64>().sqrt() / scale }
-
-    /// Checks LU with its solves and inverse, Cholesky and QR at complex items with parts of type `R`, on the matrices `decompositions`
-    /// takes, where `tolerance` is a few times `R`'s epsilon.
-    fn complex_decompositions<R: RealItem>(tolerance: f64) {
-        let (zero, one) = (C64::new(0.0, 0.0), C64::new(1.0, 0.0));
-        let nb = lu_block(0);
-        for n in [0, 1, 2, 5, nb - 1, nb, nb + 1, 2 * nb + 7] {
-            let bound = tolerance * (n as f64).max(1.0);
-            let a = complex_random::<R>(n, n, n as u64 + 1);
-            let (aw, i) = (complex_wide(&a), identity::<C64>(n));
-            let scale = complex_norm(&aw).max(1.0);
-            // L U is A with its rows permuted.
-            let f = lu_factor(&a, n);
-            let factors = complex_wide(&f.factors);
-            let l: Vec<C64> = (0..n * n).map(|k| match (k / n).cmp(&(k % n)) { Ordering::Greater => factors[k], Ordering::Equal => one, Ordering::Less => zero }).collect();
-            let u: Vec<C64> = (0..n * n).map(|k| if k % n >= k / n { factors[k] } else { zero }).collect();
-            let pa: Vec<C64> = f.perm.iter().flat_map(|&p| aw[p * n..(p + 1) * n].to_vec()).collect();
-            assert!(complex_distance(&complex_product(&l, &u, [n; 3]), &pa, scale) < bound, "complex lu at {n}");
-            for k in [1, 3] {
-                let b = complex_random::<R>(n, k, 99);
-                let x = complex_wide(&lu_solve(&f, &b, k));
-                assert!(complex_distance(&complex_product(&aw, &x, [n, n, k]), &complex_wide(&b), (scale * complex_norm(&x)).max(1.0)) < bound, "complex solve at {n}, {k}");
-            }
-            let inverse = complex_wide(&lu_inverse(&f));
-            assert!(complex_distance(&complex_product(&aw, &inverse, [n; 3]), &i, (scale * complex_norm(&inverse)).max(1.0)) < bound, "complex inverse at {n}");
-            // Cholesky of a Hermitian positive definite matrix gives L with a real, positive diagonal. A negative definite one has none.
-            let hermitian: Vec<C64> = complex_product(&aw, &adjoint(&aw, n, n), [n; 3]).iter().zip(&i).map(|(&v, &d)| v + d * n as f64).collect();
-            let hpd: Vec<num_complex::Complex<R>> = hermitian.iter().map(|v| num_complex::Complex::new(R::narrow(v.re), R::narrow(v.im))).collect();
-            let hw = complex_wide(&hpd);
-            let l = complex_wide(&cholesky_factor(&hpd, n).expect("a Hermitian positive definite matrix"));
-            assert!((0..n * n).all(|k| k % n <= k / n || l[k] == zero), "complex cholesky's upper triangle at {n}");
-            assert!((0..n).all(|j| l[j * (n + 1)].im == 0.0 && l[j * (n + 1)].re > 0.0), "complex cholesky's diagonal at {n}");
-            assert!(complex_distance(&complex_product(&l, &adjoint(&l, n, n), [n; 3]), &hw, complex_norm(&hw).max(1.0)) < bound, "complex cholesky at {n}");
-            if n > 0 { assert!(cholesky_factor(&hpd.iter().map(|&v| -v).collect::<Vec<_>>(), n).is_none(), "complex cholesky of a negative definite matrix") }
-            // QR of square, tall and wide matrices gives orthonormal columns of Q, and R with a real, non-negative diagonal.
-            for (m, c) in [(n, n), (n + 5, n), (n, n + 5)] {
-                let a = complex_random::<R>(m, c, (m * 31 + c) as u64);
-                let (aw, p) = (complex_wide(&a), m.min(c));
-                let (q, r) = qr_factor(&a, [m, c], false);
-                let (q, r) = (complex_wide(&q), complex_wide(&r));
-                assert!(complex_distance(&complex_product(&q, &r, [m, p, c]), &aw, complex_norm(&aw).max(1.0)) < bound, "complex qr at {m}×{c}");
-                assert!(complex_distance(&complex_product(&adjoint(&q, m, p), &q, [p, m, p]), &identity::<C64>(p), 1.0) < bound, "complex qr's q at {m}×{c}");
-                assert!((0..p * c).all(|k| k % c >= k / c || r[k] == zero), "complex qr's r at {m}×{c}");
-                assert!((0..p).all(|j| r[j * c + j].im == 0.0), "complex qr's diagonal at {m}×{c}");
-            }
-        }
-    }
-
-    #[test]
-    fn complex_decompositions_have_small_residuals() {
-        complex_decompositions::<f64>(4.0 * f64::EPSILON);
-        complex_decompositions::<f32>(4.0 * f32::EPSILON as f64);
-    }
-
-
-    /// Checks the SVD and the Hermitian eigen decomposition at complex items with parts of type `R`, either side of each block width,
-    /// where `tolerance` is a few times `R`'s epsilon.
-    fn complex_svd_and_eigen<R: RealItem>(tolerance: f64)
-    where
-        Complex<R>: Factor + Scalar<Real = R>,
-    {
-        type C<R> = num_complex::Complex<R>;
-        for n in [0, 1, 2, 5, 31, 64, 129] {
-            let bound = tolerance * (n as f64).max(1.0);
-            // Square, tall, very tall and wide matrices: U Σ Vᴴ is A, U and V have orthonormal columns, and the singular values descend.
-            for (m, c) in [(n, n), (n + 5, n), (2 * n + 5, n), (n, n + 5)] {
-                let a = complex_random::<R>(m, c, (m * 37 + c) as u64);
-                let (aw, p) = (complex_wide(&a), m.min(c));
-                let Svd { u, s, v, .. } = svd(&a, [m, c]);
-                assert!(distance(&wide(&singular_values(&a, [m, c])), &wide(&s), complex_norm(&aw).max(1.0)) < bound, "complex singular values alone at {m}×{c}");
-                let (u, v, s) = (complex_wide(&u), complex_wide(&v), wide(&s));
-                let us: Vec<C64> = (0..m * p).map(|k| u[k] * s[k % p]).collect();
-                assert!(complex_distance(&complex_product(&us, &adjoint(&v, c, p), [m, p, c]), &aw, complex_norm(&aw).max(1.0)) < bound, "complex svd at {m}×{c}");
-                assert!(complex_distance(&complex_product(&adjoint(&u, m, p), &u, [p, m, p]), &identity::<C64>(p), 1.0) < bound, "complex svd's u at {m}×{c}");
-                assert!(complex_distance(&complex_product(&adjoint(&v, c, p), &v, [p, c, p]), &identity::<C64>(p), 1.0) < bound, "complex svd's v at {m}×{c}");
-                assert!(s.windows(2).all(|w| w[0] >= w[1]) && s.iter().all(|&x| x >= 0.0), "complex singular values descend at {m}×{c}");
-            }
-            // A Hermitian matrix, read from its lower triangle: H V is V Λ, V is unitary, and the eigenvalues ascend.
-            let b = complex_random::<R>(n, n, n as u64 + 7);
-            let half = R::narrow(0.5);
-            let h: Vec<C<R>> = (0..n * n).map(|k| (b[k] + b[k % n * n + k / n].conj()).mul_real(half)).collect();
-            let junk = C::new(R::narrow(9.0), R::narrow(-9.0));
-            let lower: Vec<C<R>> = (0..n * n).map(|k| if k % n > k / n { junk } else { h[k] }).collect();
-            let Eigh { values, vectors } = eigh(&lower, n).expect("a Hermitian matrix converges");
-            let (hw, vectors, values) = (complex_wide(&h), complex_wide(&vectors), wide(&values));
-            assert!(values.windows(2).all(|w| w[0] <= w[1]), "complex eigenvalues ascend at {n}");
-            let vl: Vec<C64> = (0..n * n).map(|k| vectors[k] * values[k % n]).collect();
-            assert!(complex_distance(&complex_product(&hw, &vectors, [n; 3]), &vl, complex_norm(&hw).max(1.0)) < bound, "complex hermitian eigen at {n}");
-            assert!(complex_distance(&complex_product(&adjoint(&vectors, n, n), &vectors, [n; 3]), &identity::<C64>(n), 1.0) < bound, "unitary eigenvectors at {n}");
-            // A complex matrix with real items gives the real code's singular values and eigenvalues, within rounding.
-            let re: Vec<R> = h.iter().map(|z| z.re).collect();
-            let real: Vec<C<R>> = re.iter().map(|&x| C::new(x, R::zero())).collect();
-            let close = |x: &[f64], y: &[f64]| x.iter().zip(y).all(|(a, b)| (a - b).abs() <= bound * x.iter().fold(1.0, |m: f64, v| m.max(v.abs())));
-            assert!(close(&wide(&singular_values(&real, [n, n])), &wide(&singular_values(&re, [n, n]))), "real singular values at {n}");
-            assert!(close(&wide(&eigh(&real, n).unwrap().values), &wide(&eigh(&re, n).unwrap().values)), "real eigenvalues at {n}");
-            if n > 1 {
-                // A NaN gives NaN for every singular value and no eigen decomposition.
-                let mut nan = h.clone();
-                nan[n] = C::new(R::nan(), R::zero());
-                assert!(svd(&nan, [n, n]).s.iter().all(|x| x.is_nan()), "complex svd of a matrix holding NaN at {n}");
-                assert!(eigh(&nan, n).is_none(), "complex hermitian eigen of a matrix holding NaN at {n}");
-            }
-        }
-    }
-
-    #[test]
-    fn complex_svd_and_eigen_have_small_residuals() {
-        complex_svd_and_eigen::<f64>(4.0 * f64::EPSILON);
-        complex_svd_and_eigen::<f32>(4.0 * f32::EPSILON as f64);
-    }
-}

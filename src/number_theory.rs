@@ -469,9 +469,11 @@ const BIT: [u8; 30] = {
 /// The primes whose multiples each segment starts without, copied from a pattern instead of sieved.
 const PRESIEVED: [u64; 1] = [7];
 /// The bytes of a full segment. 32 KiB fits the L1 data cache of most CPUs.
-const BYTES: usize = 32768;
+#[doc(hidden)]
+pub const BYTES: usize = 32768;
 /// The bytes of the first segment. Segments double from it up to `BYTES`, so finding a few primes takes little sieving.
-const FIRST: usize = 128;
+#[doc(hidden)]
+pub const FIRST: usize = 128;
 /// The bytes after which the pattern of `PRESIEVED`'s multiples repeats.
 const PERIOD: u64 = product(&PRESIEVED);
 
@@ -654,97 +656,4 @@ fn odd_primes_below(limit: u64) -> Vec<u64> {
         for j in (i * i..limit as usize).step_by(2 * i) { composite[j] = true; }
     }
     primes
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const M61: u64 = (1 << 61) - 1;
-    const M89: u128 = (1 << 89) - 1;
-    const M127: u128 = (1 << 127) - 1;
-    /// The largest prime below 2^64.
-    const TOP: u64 = u64::MAX - 58;
-
-    #[test]
-    fn primality() {
-        let mut primes = Primes::new(0).peekable();
-        for n in 0..1u64 << 17 {
-            let prime = primes.next_if_eq(&n).is_some();
-            assert!(is_prime(&n) == prime && is_prime(&(n as u128)) == prime && is_prime(&BigUint::from(n)) == prime, "{n}");
-        }
-        assert!(is_prime(&M61) && is_prime(&TOP) && is_prime(&M89) && is_prime(&M127));
-        assert!(is_prime(&((BigUint::from(1u8) << 521) - 1u8)));
-        // Strong pseudoprimes to every prime base up to 23, 37 and 41.
-        assert!(!is_prime(&3825123056546413051u64));
-        assert!(!is_prime(&318665857834031151167461u128));
-        assert!(!is_prime(&3317044064679887385961981u128));
-        assert!(!is_prime(&(BigUint::from(M89) * BigUint::from(M127))));
-    }
-
-    #[test]
-    fn halves() {
-        // Each half of Baillie–PSW rejects composites that pass the other half.
-        let ring = Montgomery64::new(3825123056546413051);
-        let (d, s) = odd_part(3825123056546413050u64);
-        assert!(strong_probable_prime(&ring, &d, s, &ring.elem(2)) && !strong_lucas(&ring));
-        // Strong Lucas pseudoprimes with Selfridge's parameters, from OEIS A217255.
-        for n in [5459u64, 5777, 10877, 16109, 18971, 22499, 24569, 25199, 40309, 58519] {
-            let ring = Montgomery64::new(n);
-            let (d, s) = odd_part(n - 1);
-            assert!(strong_lucas(&ring) && !strong_probable_prime(&ring, &d, s, &ring.elem(2)), "{n}");
-        }
-    }
-
-    #[test]
-    fn factors() {
-        assert!(factor(&1u64).is_empty());
-        assert_eq!(factor(&u64::MAX), [(3, 1), (5, 1), (17, 1), (257, 1), (641, 1), (65537, 1), (6700417, 1)]);
-        assert_eq!(factor(&((1u128 << 64) + 1)), [(274177, 1), (67280421310721, 1)]);
-        assert_eq!(factor(&(((1u128 << 31) - 1) * M61 as u128)), [((1 << 31) - 1, 1), (M61 as u128, 1)]);
-        let big = BigUint::from(1000003u64).pow(2) * 1000033u64 * BigUint::from(M127);
-        assert_eq!(factor(&big), [(1000003u64.into(), 2), (1000033u64.into(), 1), (M127.into(), 1)]);
-        assert_eq!(totient(&36u64), 12);
-        assert_eq!(totient(&u64::MAX), 2 * 4 * 16 * 256 * 640 * 65536 * 6700416);
-    }
-
-    #[test]
-    fn neighbours() {
-        assert_eq!([next_prime(&0u64), next_prime(&2), next_prime(&13)], [Some(2), Some(3), Some(17)]);
-        assert_eq!([prev_prime(&2u64), prev_prime(&3), prev_prime(&100)], [None, Some(2), Some(97)]);
-        assert_eq!(next_prime(&(u64::MAX - 70)), Some(TOP));
-        assert_eq!(next_prime(&TOP), None);
-        assert_eq!(next_prime(&(TOP as u128)), Some((1 << 64) + 13));
-        assert_eq!(prev_prime(&(1u128 << 64)), Some(TOP as u128));
-    }
-
-    #[test]
-    fn counting() {
-        let mut n = 1;
-        for expected in [4, 25, 168, 1229, 9592, 78498, 664579] {
-            n *= 10;
-            assert_eq!(prime_count(n), expected);
-        }
-        // Counting and enumeration agree on each side of a segment boundary.
-        // Counting and enumeration agree on each side of the first segments' ends.
-        let (mut end, mut size) = (0, FIRST as u64);
-        for _ in 0..4 {
-            end += 30 * size;
-            size = (2 * size).min(BYTES as u64);
-            for n in [end - 1, end, end + 1] { assert_eq!(prime_count(n), Primes::new(0).take_while(|&p| p < n).count() as u64); }
-        }
-        let starts = [0, 3, 4, 6, 7, 29, 30, 98].map(|n| Primes::new(n).next().unwrap());
-        assert_eq!(starts, [2, 3, 5, 7, 7, 29, 31, 101]);
-        assert_eq!(Primes::new(0).nth(999_999), Some(15_485_863));
-        let mut primes = Primes::new(0);
-        assert_eq!([primes.nth(3), primes.nth(0), primes.nth(2)], [Some(7), Some(11), Some(19)]);
-    }
-
-    #[test]
-    fn cancellation() {
-        let stop = || Err("stopped");
-        assert_eq!(factor_with(&((1u128 << 64) + 1), stop), Err("stopped"));
-        assert_eq!(prime_count_with(1 << 20, stop), Err("stopped"));
-        assert_eq!(Primes::new(0).nth_with(0, stop), Ok(Some(2)));
-    }
 }

@@ -17,6 +17,7 @@ repository = "https://github.com/AnswerDotAI/rustymath"
 
 [lib]
 name = "rustymath"
+test = false
 
 [dependencies]
 half = { version = ">=2.7.1, <3", features = ["num-traits"] }
@@ -29,9 +30,9 @@ num-traits = ">=0.2.19, <1"
 rand = { version = ">=0.10.2, <1", default-features = false, features = ["alloc"] }
 strength_reduce = ">=0.2.4, <1"
 
-[dev-dependencies]
-# A seeded generator for the distributions' sampling tests.
-rand = { version = ">=0.10.2, <1", features = ["std_rng"] }
+# The browser build has no threads. There `parallel` runs its pieces in turn on the calling thread.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = ">=1.12.0, <2"
 
 [target.'cfg(target_vendor = "apple")'.dev-dependencies]
 # The speed test's QoS call, which keeps its timings on the performance cores.

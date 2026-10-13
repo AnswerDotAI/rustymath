@@ -103,26 +103,3 @@ fn complex_wide(z: Complex<f64>) -> Complex<f64> {
 }
 
 forms!(LambertW at Complex<f32>, Complex<f64>: |_, [z]| complex(z));
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{lambertw, LambertW, Unary};
-
-    #[test]
-    fn special_values() {
-        assert!(lambertw(0.0f64).to_bits() == 0 && lambertw(-0.0f64).to_bits() == (-0.0f64).to_bits());
-        assert_eq!(lambertw(f64::INFINITY), f64::INFINITY);
-        assert!([f64::NEG_INFINITY, f64::NAN, -1.0, -0.3678794411714425].iter().all(|&x| lambertw(x).is_nan()));
-        // The floats nearest -1/e lie below it, within half an ulp.
-        assert_eq!((lambertw(-0.36787944117144233f64), lambertw(-0.36787945f32)), (-1.0, -1.0));
-        assert_eq!(lambertw(1.0f64), 0.5671432904097838);
-        let c = |re: f64, im: f64| Complex::new(re, im);
-        assert_eq!(LambertW.one(c(0.0, -0.0)).im.to_bits(), (-0.0f64).to_bits());
-        // Each side of the cut along the real axis below -1/e, by the sign of the imaginary part's zero.
-        let (above, below) = (LambertW.one(c(-2.0, 0.0)), LambertW.one(c(-2.0, -0.0)));
-        assert!(above.im > 0.0 && below == above.conj());
-        assert!(LambertW.one(c(f64::NAN, 1.0)).re.is_nan());
-        assert_eq!(LambertW.one(c(f64::NEG_INFINITY, 0.0)), c(f64::INFINITY, std::f64::consts::PI));
-    }
-}

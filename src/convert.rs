@@ -2,7 +2,8 @@
 //! converting between `f64` and a 64-bit integer. AArch64 converts bytes to floats two lanes at a time. A loop that converts such
 //! types with `as` runs one item at a time on those targets. [`int`] and [`float`] convert them through a float's bits. They use the
 //! conversion instruction for types that every target converts in vector form, and for 64-bit integers where the target can.
-//! [`count`] writes runs of whole numbers as floats, and in wasm it converts none of them.
+//! [`count`] writes runs of whole numbers as floats. Where the target can't convert 64-bit integers in vector form, it converts one
+//! item in 8.
 use crate::float::{sealed::{Core, Sealed}, Float};
 
 /// An integer type that [`int`] and [`float`] convert: `i8`, `i16`, `i32`, `i64`, `u8`, `u16` or `u32`.
@@ -34,11 +35,11 @@ pub fn float<F: Float, I: Int>(i: I) -> F {
 }
 
 /// Appends the `n` floats `start`, `start + 1`, `start + 2` and so on to `out`, or `start`, `start - 1` and so on where `down` is
-/// true, each exact while it stays below 2^53 in magnitude. Most targets convert each item from an integer, as [`float`] does. Wasm
-/// has no vector instruction for that, so there each block of 8 items adds 0 to 7 steps to the block's first item, which comes from the
-/// block's position.
+/// true, each exact while it stays below 2^53 in magnitude. A target with `NATIVE_64` converts each item from an integer, as [`float`]
+/// does. Wasm and x86-64 without AVX-512 have no vector instruction for that, so there each block of 8 items adds 0 to 7 steps to the
+/// block's first item, which comes from the block's position.
 pub fn count(out: &mut Vec<f64>, start: i64, down: bool, n: usize) {
-    if !cfg!(target_arch = "wasm32") {
+    if NATIVE_64 {
         return if down { out.extend((0..n).map(move |i| wide_float(start - i as i64))) } else { out.extend((0..n).map(move |i| wide_float(start + i as i64))) };
     }
     let step = if down { -1 } else { 1 };
@@ -126,29 +127,4 @@ ints! {
     u16: narrow, |i| f32::from_low(i.into(), 0.0), f32::from_low(i.into(), 0.0).into();
     u32: wide, |i| f64::from_low(i.into(), 0.0) as f32, f64::from_low(i.into(), 0.0);
     i64: wide, |i| wide_float(i) as f32, wide_float(i);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use half::f16;
-
-    /// Each conversion against `as` and exact arithmetic, at the edges of each type's range and of the wide limit.
-    #[test]
-    fn conversions() {
-        assert_eq!((int::<i32, f64>(-2147483648.0), int::<i32, f32>(-2147483648.0), int::<i32, f32>(2147483648.0)), (Some(i32::MIN), None, None));
-        assert_eq!((int::<u8, f64>(255.0), int::<u8, f64>(256.0), int::<u8, f32>(-1.0), int::<u16, f32>(65535.0)), (Some(255), None, None, Some(65535)));
-        assert_eq!((int::<i16, f16>(f16::from_f32(-300.0)), int::<i8, f64>(f64::NAN), int::<i8, f32>(f32::INFINITY)), (Some(-300), None, None));
-        assert_eq!((int::<i64, f64>(-2251799813685247.0), int::<i64, f64>(2251799813685248.0)), (Some(-2251799813685247), None));
-        assert_eq!((int::<i64, f32>(-1e15), int::<u32, f64>(4294967295.0), int::<u32, f64>(4294967296.0)), (Some(-999999986991104), Some(u32::MAX), None));
-        for x in [0.0, -1.0, 2251799813685247.0, -2251799813685247.0, 1e15] { assert_eq!(shifted(x), x as i64, "{x}"); }
-        for i in [0, 1, -1, 255, 1 << 31, -(1 << 31) - 1, (1 << 53) + 1, (1 << 53) + 3, i64::MAX, i64::MIN, 0x7fff_ffff_ffff_fdff] {
-            assert_eq!((float::<f64, i64>(i), halves(i), float::<f32, i64>(i)), (i as f64, i as f64, i as f64 as f32), "{i}");
-        }
-        assert_eq!((float::<f64, u8>(255), float::<f32, u16>(65535), float::<f64, u32>(u32::MAX), float::<f16, i32>(-3)), (255.0, 65535.0, 4294967295.0, f16::from_f32(-3.0)));
-        let mut counts = Vec::new();
-        count(&mut counts, 0, false, 21);
-        count(&mut counts, 20, true, 21);
-        assert_eq!(counts, (0..21).chain((0..21).rev()).map(|i| i as f64).collect::<Vec<_>>());
-    }
 }

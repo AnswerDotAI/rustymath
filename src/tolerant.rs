@@ -17,8 +17,9 @@
 use crate::{
     convert::{float, int},
     float::{Float, Native},
-    ok, pairs, Arg, BETWEEN_CHECKS,
+    ok, Arg, BETWEEN_CHECKS,
     search::{self, Chains, Key, Links},
+    slice::pairs_into,
 };
 use num_bigint::BigInt;
 use num_complex::Complex;
@@ -305,10 +306,10 @@ enum Band { Inside, Outside, Below, NotAbove, Above, NotBelow }
 
 /// Compares each item of the `Many` argument with the `One` argument `c`, through the range of floats equal to `c`, worked out once.
 /// Each item then takes one or two plain comparisons, in a loop that vectorizes. `left` is the band an item on the left of `c` must
-/// lie in, and `right` the band for an item on its right. `None`, appending nothing, unless exactly one argument is `One` and `c`
+/// lie in, and `right` the band for an item on its right. `None`, writing nothing, unless exactly one argument is `One` and `c`
 /// isn't NaN.
 #[inline(always)]
-fn against<F: Float>(t: Tolerance, x: Arg<'_, F>, y: Arg<'_, F>, n: usize, out: &mut Vec<bool>, left: Band, right: Band) -> Option<bool> {
+fn against<F: Float>(t: Tolerance, x: Arg<'_, F>, y: Arg<'_, F>, n: usize, out: &mut [std::mem::MaybeUninit<bool>], left: Band, right: Band) -> Option<bool> {
     let (items, (lo, hi), band) = match (x, y) {
         (Arg::Many(_), Arg::One(c)) => (x, t.range(c)?, left),
         (Arg::One(c), Arg::Many(_)) => (y, t.range(c)?, right),
@@ -324,10 +325,10 @@ fn against<F: Float>(t: Tolerance, x: Arg<'_, F>, y: Arg<'_, F>, n: usize, out: 
     })
 }
 
-/// Appends `f` on each of `n` items of `items` to `out`, through `pairs`.
+/// Writes `f` on each of `n` items of `items` into `out`, through `pairs_into`.
 #[inline(always)]
-fn mask<F: Copy>(items: Arg<'_, F>, n: usize, out: &mut Vec<bool>, f: impl Fn(F) -> bool) -> bool {
-    pairs(items, Arg::One(()), n, out, #[inline(always)] |v, ()| (f(v), true))
+fn mask<F: Copy>(items: Arg<'_, F>, n: usize, out: &mut [std::mem::MaybeUninit<bool>], f: impl Fn(F) -> bool) -> bool {
+    pairs_into(items, Arg::One(()), n, out, #[inline(always)] |v, ()| (f(v), true))
 }
 
 /// [`Tolerant::equal`], or [`TolerantComplex::complex_equal`] for complex items, at the tolerance it holds, as a function object.
@@ -348,13 +349,13 @@ forms!(NotEqual at Complex<f32> => bool, Complex<f64> => bool: |k, [x, y]| with_
 /// imaginary parts, as in `slice::split`, so `squared_equal` runs over plain slices with no branch and vectorizes. `scaled_equal` then
 /// takes the pairs it leaves undecided, one at a time. No result fails.
 #[inline(always)]
-fn complex_equals<T: TolerantComplex, R: Native>(t: T, [x, y]: [Arg<'_, Complex<R>>; 2], n: usize, out: &mut Vec<bool>, negate: bool) -> bool {
-    let start = out.len();
-    if pairs(x, y, n, out, #[inline(always)] |a, b| { let (equal, decided) = t.squared_equal(a, b); (equal != negate, decided) }) { return true; }
+fn complex_equals<T: TolerantComplex, R: Native>(t: T, [x, y]: [Arg<'_, Complex<R>>; 2], n: usize, out: &mut [std::mem::MaybeUninit<bool>], negate: bool) -> bool {
+    if pairs_into(x, y, n, out, #[inline(always)] |a, b| { let (equal, decided) = t.squared_equal(a, b); (equal != negate, decided) }) { return true; }
+    let out = crate::slice::written(out);
     let at = |a: Arg<'_, Complex<R>>, i: usize| match a { Arg::One(v) => v, Arg::Many(s) => s[i] };
     for i in 0..n {
         let (a, b) = (at(x, i), at(y, i));
-        if !t.squared_equal(a, b).1 { out[start + i] = t.scaled_equal(a, b) != negate }
+        if !t.squared_equal(a, b).1 { out[i] = t.scaled_equal(a, b) != negate }
     }
     true
 }
@@ -597,245 +598,3 @@ fn scan<F: Float>(t: impl Tolerant, x: &[F], v: F) -> usize {
     found.unwrap_or(x.len())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{Arg, Binary, Unary};
-    use half::f16;
-    use num_complex::Complex64;
-
-    const T: Tolerance = Tolerance::DEFAULT;
-    fn c(re: f64, im: f64) -> Complex64 { Complex64::new(re, im) }
-
-    #[test]
-    fn equal_and_match() {
-        // The rounded pair 0.3 and 0.1+0.2 lies inside the default tolerance, and 1 and 1+3e-14 outside it.
-        assert!(T.equal(0.3, 0.1 + 0.2) && T.equal(-0.3, -(0.1 + 0.2)) && !Exactly.equal(0.3, 0.1 + 0.2));
-        assert!(!T.equal(1.0, 1.0 + 3e-14));
-        assert_eq!([3.1, 3.0, -2.0, -3.0].map(|x| T.equal(3.0, x)), [false, true, false, false]);
-        let wide = Tolerance::new(1e-10).unwrap();
-        assert!(wide.equal(1.0, 1.000000000001) && !wide.equal(1.0, 1.0000001));
-        // A tolerance has no effect beside zero.
-        assert!(!T.equal(0.0, 1e-300) && T.equal(0.0, -0.0));
-        assert!(T.equal(f64::INFINITY, f64::INFINITY) && !T.equal(f64::INFINITY, f64::MAX) && !T.equal(f64::NAN, f64::NAN));
-        assert!(T.matches(f64::NAN, f64::NAN) && !T.matches(f64::NAN, 1.0));
-        assert_eq!((T.compare(0.3, 0.1 + 0.2), T.compare(1.0, 2.0), T.compare(f64::NAN, 1.0)), (Some(Ordering::Equal), Some(Ordering::Less), None));
-        // Below and above leave out what's equal within the tolerance, and comparisons with NaN are false.
-        assert!(!T.less(0.3, 0.1 + 0.2) && T.less_equal(0.1 + 0.2, 0.3) && Exactly.less(0.3, 0.1 + 0.2) && !Exactly.greater(0.3, 0.1 + 0.2));
-        assert!(!T.less(f64::NAN, 1.0) && !T.less_equal(f64::NAN, f64::NAN) && !T.greater_equal(1.0, f64::NAN));
-        // At f32, a tolerance of 4 units in the last place.
-        let t32 = Tolerance::new(4.0 * f32::EPSILON as f64).unwrap();
-        assert!(t32.equal(1.0f32, 1.0 + 4.0 * f32::EPSILON) && !t32.equal(1.0f32, 1.0 + 5.0 * f32::EPSILON));
-        assert_eq!((Tolerance::new(-1e-14), Tolerance::new(1.0), Tolerance::new(f64::NAN)), (None, None, None));
-        // `with_tolerance!` runs its body at `Exactly` for a tolerance of 0.
-        let count = |t: Tolerance| with_tolerance!(t, |t| [0.3, 0.1 + 0.2, 0.31].iter().filter(|&&x| t.equal(x, 0.3)).count());
-        assert_eq!((count(T), count(Tolerance::EXACT)), (2, 1));
-    }
-
-    #[test]
-    fn floor_ceil_and_whole() {
-        assert_eq!([-2.3, 0.1, 100.0, 3.3, 0.5 + 0.4, 0.5 + 0.5, 0.5 + 0.6].map(|y| T.floor(y)), [-3.0, 0.0, 100.0, 3.0, 0.0, 1.0, 1.0]);
-        assert_eq!((T.floor(2.9999999999999996), Exactly.floor(2.9999999999999996)), (3.0, 2.0));
-        assert_eq!((T.ceil(1.0000000000000002), Exactly.ceil(1.0000000000000002)), (1.0, 2.0));
-        assert_eq!((T.floor(-0.9999999999999999), T.floor(-0.999999999999)), (-1.0, -1.0));
-        assert_eq!((T.floor(0.999999999999), T.floor(f64::INFINITY)), (0.0, f64::INFINITY));
-        assert!(T.floor(f64::NAN).is_nan());
-        assert_eq!((T.floor(f16::from_f32(2.5)), T.ceil(2.5f32)), (f16::from_f32(2.0), 3.0));
-        assert_eq!((T.whole(2.9999999999999996), T.whole(2.5), T.whole(f64::INFINITY), Exactly.whole(4.0)), (Some(3.0), None, None, Some(4.0)));
-    }
-
-    #[test]
-    fn residue() {
-        assert_eq!([(3.0, -5.0), (3.0, 5.0), (-3.0, -4.0), (-3.0, 4.0)].map(|(x, y)| T.residue(x, y)), [1.0, 2.0, -1.0, -2.0]);
-        let r = [3.12, -1.0, -0.6].map(|y| T.residue(0.5, y));
-        assert!((r[0] - 0.12).abs() < 1e-15 && r[1] == 0.0 && (r[2] - 0.4).abs() < 1e-15);
-        let r = [(-1.0, -5.25), (0.0, 0.0), (1.0, 2.41)].map(|(x, y)| T.residue(x, y));
-        assert!(r[0] == -0.25 && r[1] == 0.0 && (r[2] - 0.41).abs() < 1e-15);
-        // A quotient within tolerance of a whole number leaves no remainder, where exact comparison leaves a whole divisor.
-        assert_eq!((T.residue(0.1, 0.3), T.residue(0.0, 2.5)), (0.0, 2.5));
-        assert!((Exactly.residue(0.1, 0.3) - 0.1).abs() < 1e-15);
-    }
-
-    #[test]
-    fn complex() {
-        let a = c(2.0, 1e-14);
-        assert!(T.complex_equal(a, c(2.0, 0.00000000000001)) && !T.complex_equal(a, c(2.0, 0.0000000000001)));
-        assert!(T.complex_equal(c(0.3, 0.0), c(0.1 + 0.2, 0.0)) && !T.complex_equal(c(f64::NAN, 1.0), c(f64::NAN, 1.0)));
-        assert_eq!([c(1.0, 3.2), c(3.3, 2.5), c(-3.3, -2.5)].map(|y| T.complex_floor(y)), [c(1.0, 3.0), c(3.0, 2.0), c(-3.0, -3.0)]);
-        assert_eq!(T.complex_ceil(c(1.0, 3.2)), c(1.0, 4.0));
-        let r = [c(2.0, 3.0), c(3.0, 4.0), c(5.0, 6.0)].map(|y| T.complex_residue(c(1.0, 2.0), y));
-        assert_eq!(r, [c(1.0, 1.0), c(-1.0, 1.0), c(0.0, 1.0)]);
-        assert_eq!(T.complex_residue(c(0.0, 0.0), c(2.0, 1.0)), c(2.0, 1.0));
-        // 5 = (2+i)(2-i) and 3+4i = (2+i)², so their gcd is 2+i, the associate in the first quadrant. Halving both halves it.
-        assert_eq!((T.complex_gcd(c(5.0, 0.0), c(3.0, 4.0)), T.complex_gcd(c(2.5, 0.0), c(1.5, 2.0))), (c(2.0, 1.0), c(1.0, 0.5)));
-        assert_eq!((T.complex_gcd(c(0.0, 0.0), c(-4.0, 3.0)), T.complex_gcd(c(12.0, 0.0), c(18.0, 0.0))), (c(3.0, 4.0), c(6.0, 0.0)));
-        assert!(T.complex_gcd(c(f64::INFINITY, 1.0), c(2.0, 1.0)).re.is_nan());
-        // Squared magnitudes would overflow at ±1e300 and lose the tolerance at 1e-300, so those pairs compare magnitudes themselves.
-        let (huge, tiny) = (c(1e300, 1e300), c(1e-300, 1e-300));
-        assert!(T.complex_equal(huge, huge * (1.0 + 1e-15)) && !T.complex_equal(c(1e300, 0.0), c(-1e300, 0.0)));
-        assert!(T.complex_equal(tiny, tiny * (1.0 + 1e-15)) && !T.complex_equal(tiny, tiny * 2.0));
-        // The slice forms decide most pairs from squared magnitudes, in a loop with no branch, then redo the rest.
-        let zs = [c(2.0, 1.0), huge, tiny, c(0.0, 0.0), c(f64::INFINITY, 1.0), c(f64::NAN, 0.0), c(-1e300, 0.0)];
-        let (xs, ys): (Vec<_>, Vec<_>) = zs.iter().flat_map(|&x| zs.iter().map(move |&y| (x, y * (1.0 + 1e-15)))).unzip();
-        let (mut equal, mut unequal) = (Vec::new(), Vec::new());
-        assert!(Equal(T).many(Arg::Many(&xs), Arg::Many(&ys), xs.len(), &mut equal));
-        assert!(NotEqual(T).many(Arg::Many(&xs), Arg::Many(&ys), xs.len(), &mut unequal));
-        for i in 0..xs.len() { assert!(equal[i] == T.complex_equal(xs[i], ys[i]) && unequal[i] != equal[i], "{:?} {:?}", xs[i], ys[i]) }
-    }
-
-    /// `range(c)` gives the last floats equal to `c` on each side.
-    fn check_range<F: Float + std::fmt::Debug>(t: impl Tolerant, c: F) {
-        let (lo, hi) = t.range(c).unwrap();
-        assert!(lo <= c && c <= hi, "{c:?}");
-        assert!(t.equal(lo, c) && t.equal(hi, c) && !t.equal(lo.next_down(), c) && !t.equal(hi.next_up(), c), "{c:?}: {lo:?} {hi:?}");
-    }
-
-    #[test]
-    fn range() {
-        let specials = [0.3, -0.3, 1.0, 1e-5, 5e-324, 2.2250738585072014e-308, 8796093022208.0, -1e20, f64::MAX, -f64::MAX];
-        for c in specials { check_range(T, c); check_range(Exactly, c); }
-        for c in (0..100_000).map(|i| f64::from_bits(crate::accuracy::random(i))).filter(|c| !c.is_nan()) { check_range(T, c); }
-        let t32 = Tolerance::new(4.0 * f32::EPSILON as f64).unwrap();
-        for c in [0.3f32, -7.5, 1e-40, f32::MAX] { check_range(t32, c); }
-        let t16 = Tolerance::new(4.0 * f16::EPSILON.to_f64()).unwrap();
-        for c in [0.3, -7.5, 65504.0, 1e-7].map(f16::from_f64) { check_range(t16, c); }
-        assert_eq!((T.range(f64::NAN), T.range(0.0), T.range(f64::NEG_INFINITY)), (None, Some((0.0, 0.0)), Some((f64::NEG_INFINITY, f64::NEG_INFINITY))));
-        // At f16 the default tolerance rounds to 0, so every float equals only itself.
-        assert_eq!(T.range(f16::from_f32(0.3)), Some((f16::from_f32(0.3), f16::from_f32(0.3))));
-    }
-
-    /// Below a magnitude of 1/(8t), where no float equals two whole numbers, the tolerant floor of `y` is the ordinary floor of the
-    /// greatest float equal to `y`. The test steps up to 60 floats either side of whole numbers.
-    #[test]
-    fn floor_is_the_floor_of_the_range() {
-        for n in [1.0f64, 3.0, -3.0, 1e6, -1e6, 1e12, 4e12, -4e12] {
-            let (mut down, mut up) = (n, n);
-            for _ in 0..60 {
-                for y in [down, up] { assert_eq!(T.floor(y), T.range(y).unwrap().1.floor(), "{y}"); }
-                (down, up) = (down.next_down(), up.next_up());
-            }
-        }
-    }
-
-    #[test]
-    fn gcd() {
-        assert!((T.gcd(0.6, 0.4) - 0.2).abs() < 1e-15 && Exactly.gcd(0.6, 0.4) < 1e-15);
-        assert_eq!((T.gcd(12.0, 18.0), T.gcd(-12.0, 18.0), T.gcd(0.0, 2.5), T.gcd(0.0, 0.0), T.gcd(12.0f32, 18.0)), (6.0, 6.0, 2.5, 0.0, 6.0));
-        assert!(T.gcd(f64::NAN, 1.0).is_nan() && T.gcd(f64::NAN, f64::NAN).is_nan() && T.gcd(f64::INFINITY, 1.0).is_nan());
-    }
-
-    /// Checks each real comparison's slice form against its scalar form for many items against one number, in either order, with each
-    /// item of `items` as the number.
-    fn against_one<F: Float + std::fmt::Debug>(t: Tolerance, items: &[f64])
-    where
-        Equal: Binary<F, Out = bool>,
-        NotEqual: Binary<F, Out = bool>,
-        Less: Binary<F, Out = bool>,
-        LessEqual: Binary<F, Out = bool>,
-        Greater: Binary<F, Out = bool>,
-        GreaterEqual: Binary<F, Out = bool>,
-        Matches: Binary<F, Out = bool>,
-    {
-        fn check<F: Copy + std::fmt::Debug, K: Binary<F, Out = bool> + std::fmt::Debug>(k: K, x: &[F]) {
-            for &c in x {
-                let (mut left, mut right) = (Vec::new(), Vec::new());
-                assert!(k.many(Arg::Many(x), Arg::One(c), x.len(), &mut left) & k.many(Arg::One(c), Arg::Many(x), x.len(), &mut right));
-                assert_eq!(left, x.iter().map(|&v| k.one(v, c)).collect::<Vec<_>>(), "{k:?} with {c:?} on the right");
-                assert_eq!(right, x.iter().map(|&v| k.one(c, v)).collect::<Vec<_>>(), "{k:?} with {c:?} on the left");
-            }
-        }
-        let x: Vec<F> = items.iter().map(|&v| F::narrow(v)).collect();
-        check(Equal(t), &x);
-        check(NotEqual(t), &x);
-        check(Less(t), &x);
-        check(LessEqual(t), &x);
-        check(Greater(t), &x);
-        check(GreaterEqual(t), &x);
-        check(Matches(t), &x);
-    }
-    /// Each tolerant object gives its method's result for each item, at the default tolerance and at 0, for slices beside slices and
-    /// one item beside a slice, at f32, f64 and complex items. Only `Gcd`'s infinite argument fails.
-    #[test]
-    fn objects() {
-        let (xs, ys) = (&[3.0, -3.0, 0.3, 0.0, f64::NAN, 2.0][..], &[-5.0, 5.0, 0.1 + 0.2, 7.0, 1.0, 2.9999999999999996][..]);
-        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-        for t in [T, Tolerance::EXACT] {
-            let (mut floors, mut residues, mut equal, mut order) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-            assert!(Floor(t).many(Arg::Many(ys), 6, &mut floors) & Ceil(t).many(Arg::Many(ys), 6, &mut floors));
-            assert!(Residue(t).many(Arg::Many(xs), Arg::Many(ys), 6, &mut residues) & Residue(t).many(Arg::One(3.0), Arg::Many(ys), 6, &mut residues));
-            assert!(Equal(t).many(Arg::Many(xs), Arg::Many(ys), 6, &mut equal) & Matches(t).many(Arg::Many(xs), Arg::One(f64::NAN), 6, &mut equal));
-            assert!(Compare(t).many(Arg::Many(xs), Arg::Many(ys), 6, &mut order));
-            let floor: Vec<f64> = ys.iter().map(|&y| t.floor(y)).chain(ys.iter().map(|&y| t.ceil(y))).collect();
-            let residue: Vec<f64> = (0..6).map(|i| t.residue(xs[i], ys[i])).chain(ys.iter().map(|&y| t.residue(3.0, y))).collect();
-            let eq: Vec<bool> = (0..6).map(|i| t.equal(xs[i], ys[i])).chain(xs.iter().map(|&x| t.matches(x, f64::NAN))).collect();
-            assert_eq!((bits(&floors), bits(&residues), equal), (bits(&floor), bits(&residue), eq));
-            assert_eq!(order, (0..6).map(|i| t.compare(xs[i], ys[i]).unwrap_or(Ordering::Greater)).collect::<Vec<_>>());
-            let check = |many: &dyn Fn(&mut Vec<bool>) -> bool, one: &dyn Fn(f64, f64) -> bool| {
-                let mut got = Vec::new();
-                assert!(many(&mut got));
-                assert_eq!(got, (0..6).map(|i| one(xs[i], ys[i])).collect::<Vec<_>>());
-            };
-            check(&|o| NotEqual(t).many(Arg::Many(xs), Arg::Many(ys), 6, o), &|x, y| !t.equal(x, y));
-            check(&|o| Less(t).many(Arg::Many(xs), Arg::Many(ys), 6, o), &|x, y| t.less(x, y));
-            check(&|o| LessEqual(t).many(Arg::Many(xs), Arg::Many(ys), 6, o), &|x, y| t.less_equal(x, y));
-            check(&|o| Greater(t).many(Arg::Many(xs), Arg::Many(ys), 6, o), &|x, y| t.greater(x, y));
-            check(&|o| GreaterEqual(t).many(Arg::Many(xs), Arg::Many(ys), 6, o), &|x, y| t.greater_equal(x, y));
-            let (ys32, mut floors32) = (ys.iter().map(|&y| y as f32).collect::<Vec<_>>(), Vec::new());
-            assert!(Floor(t).many(Arg::Many(&ys32), 6, &mut floors32));
-            assert_eq!(floors32, ys32.iter().map(|&y| t.floor(y)).collect::<Vec<_>>());
-            let (zs, mut complex) = (&[c(2.3, -1.7), c(0.5, 0.5), c(-1.0, 2.0)][..], Vec::new());
-            assert!(Floor(t).many(Arg::Many(zs), 3, &mut complex) & Residue(t).many(Arg::One(c(1.0, 1.0)), Arg::Many(zs), 3, &mut complex));
-            let want: Vec<Complex64> = zs.iter().map(|&z| t.complex_floor(z)).chain(zs.iter().map(|&z| t.complex_residue(c(1.0, 1.0), z))).collect();
-            assert_eq!(complex, want);
-        }
-        // Many items against one number take the range of floats equal to it, in either order. Each test item serves as the number.
-        let items = [3.0, -3.0, 0.3, 0.1 + 0.2, 0.0, -0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 2.0, 2.9999999999999996, 1e-310, 1.0 + 3e-14];
-        for t in [T, Tolerance::EXACT] {
-            against_one::<f64>(t, &items);
-            against_one::<f32>(t, &items);
-            against_one::<f16>(t, &items);
-        }
-        assert_eq!(Gcd(T).one(12.0, 18.0), 6.0);
-        assert!(!Gcd(T).many(Arg::One(f64::INFINITY), Arg::Many(&[2.0][..]), 1, &mut Vec::new()));
-        // Lcm has the sign of x y, gives 0 where the gcd is 0, and divides at the tolerance's gcd.
-        assert_eq!([Lcm(T).one(-4.0, 6.0), Lcm(T).one(0.0, 5.0), Lcm(T).one(0.6, 0.4)], [-12.0, 0.0, 1.2000000000000002]);
-        assert_eq!(Lcm(T).one(c(2.0, 0.0), c(0.0, 3.0)), c(0.0, 6.0));
-    }
-
-    /// Tolerant search finds the first match that a brute-force search finds, at every width and at small and large tolerances, among
-    /// floats crowded near a few values, and among zeros, infinities and NaN, whether it scans for a few items or indexes many.
-    #[test]
-    fn slice_search() {
-        fn check<F: Float + std::fmt::Debug>(t: Tolerance) {
-            let base = [1.0, -1.0, 3.0, 1e-3, 0.0, 1000.0];
-            let x: Vec<F> = (0..400u64)
-                .map(|i| {
-                    let r = crate::accuracy::random(i);
-                    F::narrow(base[(r % 6) as usize] * (1.0 + (((r >> 8) % 9) as f64 - 4.0) * t.value() / 2.0))
-                })
-                .chain([F::nan(), F::infinity(), F::neg_infinity(), F::neg_zero()])
-                .collect();
-            let y: Vec<F> = x.iter().rev().copied().chain([F::narrow(7.0)]).collect();
-            let brute: Vec<u32> = y.iter().map(|&v| x.iter().position(|&h| t.matches(h, v)).unwrap_or(x.len()) as u32).collect();
-            assert_eq!(index_of(t, &x, &y), brute, "{t:?}");
-            assert_eq!(index_of(t, &x, &y[..5]), brute[..5], "{t:?}, scanning");
-        }
-        for t in [T, Tolerance::new(1e-3).unwrap(), Tolerance::new(0.3).unwrap()] { check::<f64>(t); check::<f32>(t); check::<f16>(t); }
-        let x = [0.3, 1.0, 0.1 + 0.2];
-        assert_eq!((index_of(T, &x, &[0.1 + 0.2, 2.0]), index_of(Exactly, &x, &[0.1 + 0.2, 2.0])), (vec![0, 3], vec![2, 3]));
-        // Floats that each equal a whole number index as integers. At a tolerance of 0.3, which makes 3 equal 4, `whole_limit` lets only
-        // 0 qualify, so the search falls back to buckets.
-        let wx: Vec<f64> = (0..300u64).map(|i| (crate::accuracy::random(i) % 50) as f64 - 25.0).collect();
-        let wy: Vec<f64> = (0..40).map(|i| i as f64 - 30.0).collect();
-        for t in [T, Tolerance::EXACT, Tolerance::new(0.3).unwrap()] {
-            let brute: Vec<u32> = wy.iter().map(|&v| wx.iter().position(|&h| t.matches(h, v)).unwrap_or(wx.len()) as u32).collect();
-            assert_eq!(index_of(t, &wx, &wy), brute, "{t:?}");
-        }
-        // Floats near one whole number each equal it, but needn't equal each other. An indexed search finds only true matches, as a
-        // scan of 16 or fewer does.
-        let near = [1.0 - 8e-15, 1.0, 1.0 + 8e-15];
-        assert_eq!((index_of(T, &near[..1], &[near[2]; 17]), index_of(T, &near[..2], &[near[2]; 17])), (vec![1; 17], vec![1; 17]));
-        let ints: Vec<i64> = wx.iter().map(|&v| v as i64).collect();
-        assert_eq!((classes(T, &wx), firsts(T, &wx)), (search::classes(&ints), search::firsts(&ints)));
-    }
-}

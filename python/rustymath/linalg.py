@@ -3,8 +3,9 @@ of its arguments, and broadcasts the axes before them as NumPy's generalized ufu
 matrices compute at their own width. float16 matrices compute in float32, with each result rounded to float16. Integers and Booleans
 compute as float64, except in `matmul` and `semiring`, where integers compute in int64.
 
-`solve` and `pinv` give a result for every matrix: the least-squares solution with the least norm, and the pseudoinverse, through LU
-where a matrix is square and regular. A matrix that `cholesky` can't factor, or whose eigenvalues don't converge, gives NaN results and
+`solve` and `pinv` give a result for every matrix. A square matrix with no negligible LU pivot solves and inverts through LU, with no
+cutoff, as NumPy's `solve` and `inv` do. Any other matrix gets `lstsq`'s least-squares solution with the least norm, or the pseudoinverse
+with `lstsq`'s cutoff. A matrix that `cholesky` can't factor, or whose eigenvalues don't converge, gives NaN results and
 NumPy's "invalid value" warning, as a failing item of any rustymath ufunc does. R in a QR factorization has a real diagonal. `matmul`
 and `semiring` multiply matrices, including through APL's inner products, such as the min-plus product of shortest paths."""
 from typing import NamedTuple
@@ -77,7 +78,7 @@ def solve(
     a, # Matrices
     b, # Right-hand sides: one vector, or matrices whose columns are right-hand sides
 ):
-    "The solution `x` of `a @ x == b` for each matrix in `a`: the least-squares solution with the least norm, through LU where `a` is square and regular"
+    "The solution `x` of `a @ x == b` for each matrix in `a`, through LU with no cutoff where `a` is square with no negligible pivot. Any other `a` gives the least-squares solution with the least norm"
     a, b = _inexact(a, b)
     return _g.solve(a, b[:, None])[..., 0] if b.ndim == 1 else _g.solve(a, b)
 
@@ -94,7 +95,7 @@ def lstsq(
 def pinv(
     a, # Matrices
 ):
-    "The pseudoinverse of each matrix in `a`, which is its inverse, through LU, where it's square and regular"
+    "The pseudoinverse of each matrix in `a`. A square matrix with no negligible LU pivot gives its inverse through LU, with no cutoff. Any other gives the pseudoinverse with `lstsq`'s cutoff"
     [a] = _inexact(a)
     return _g.pinv(a)
 

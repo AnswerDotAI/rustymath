@@ -13,7 +13,7 @@ use std::{hash::Hash, ops::Not};
 
 /// An item as a whole number: a Boolean's 0 or 1, an integer, a character's code point, or an order key. Two items match exactly when
 /// their keys are equal. A 64-bit unsigned key wraps to a negative number, which keeps keys distinct.
-pub trait Key: Copy + Eq + Ord + Hash {
+pub trait Key: Copy + Send + Sync + Eq + Ord + Hash {
     fn key(self) -> i64;
     /// The item whose key is `key`, if there is one.
     fn from_key(key: i64) -> Option<Self>;
@@ -64,7 +64,7 @@ impl Key for char {
 }
 
 /// An unsigned key that `sort_rows` sorts one byte at a time.
-pub trait RadixKey: Copy + Ord + Default + Not<Output = Self> {
+pub trait RadixKey: Copy + Send + Sync + Ord + Default + Not<Output = Self> {
     const BYTES: usize;
     fn byte(self, b: usize) -> usize;
     /// The key as a number.
@@ -228,13 +228,20 @@ pub fn bins<K: Key>(boundaries: &[K], values: &[K]) -> Vec<u32> {
         let mut len = n;
         while len > 1 {
             let half = len / 2;
-            for (b, &x) in base.iter_mut().zip(v) { *b = if boundaries[*b + half] <= x { *b + half } else { *b } }
+            // On x86-64, LLVM can turn a select that feeds a load in a loop into a branch. Random values mispredict that branch at
+            // half the levels. `select_unpredictable` keeps a conditional move.
+            for (b, &x) in base.iter_mut().zip(v) { *b = core::hint::select_unpredictable(boundaries[*b + half] <= x, *b + half, *b) }
             len -= half;
         }
         for ((o, &b), &x) in out.iter_mut().zip(&base).zip(v) { *o = (b + usize::from(boundaries[b] <= x)) as u32 }
     };
     let mut out = vec![0; values.len()];
-    for (o, v) in out.chunks_mut(LANES).zip(values.chunks(LANES)) { search(v, o) }
+    let mut start = 0;
+    while start < values.len() {
+        let end = values.len().min(start + LANES);
+        search(&values[start..end], &mut out[start..end]);
+        start = end;
+    }
     out
 }
 
@@ -347,7 +354,7 @@ pub fn grouped_keys<K: Key>(x: &[K]) -> Option<Grouped> {
 
 /// `grouped` for the positions of `items`, each in the group that `group` gives its item.
 #[inline(always)]
-fn grouped_by<T: Copy>(items: &[T], n: usize, group: impl Fn(T) -> usize) -> (Vec<u32>, Vec<usize>) {
+fn grouped_by<T: Copy + Sync>(items: &[T], n: usize, group: impl Fn(T) -> usize + Sync) -> (Vec<u32>, Vec<usize>) {
     let len = items.len();
     if n <= 1 { return ((0..len as u32).collect(), vec![len; n]) }
     if n == 2 { return two_groups(items, group) }
@@ -380,7 +387,7 @@ const SET: [[u8; 8]; 256] = {
 /// place, of which the first are its own, then moves on by its count: group 0 from the front, group 1 from where group 0 ends. No
 /// write depends on a group.
 #[inline(always)]
-fn two_groups<T: Copy>(items: &[T], group: impl Fn(T) -> usize) -> (Vec<u32>, Vec<usize>) {
+fn two_groups<T: Copy + Sync>(items: &[T], group: impl Fn(T) -> usize + Sync) -> (Vec<u32>, Vec<usize>) {
     let len = items.len();
     let mut groups = Vec::with_capacity(len);
     crate::pairs(crate::Arg::Many(items), crate::Arg::One(()), len, &mut groups, |k, ()| (group(k) as u8, true));
@@ -590,70 +597,3 @@ impl Iterator for Links<'_> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn search_and_sort() {
-        let x = [30, 10, 20, 10];
-        assert_eq!(index_of(&x, &[10, 40]), [1, 4]);
-        // More than `SCANNED` needles build the index in place of scanning.
-        let many: Vec<i32> = (0..20).map(|i| [10, 40, 30][i % 3]).collect();
-        assert_eq!(index_of(&x, &many), (0..20).map(|i| [1, 4, 0][i % 3]).collect::<Vec<_>>());
-        assert_eq!(numbered(&classes(&x)), Numbered { firsts: vec![0, 1, 2], numbers: vec![0, 1, 2, 1], counts: vec![1, 2, 1] });
-        assert_eq!(classes(&x), [0, 1, 2, 1]);
-        assert_eq!(sort_rows(x.len(), vec![x.iter().map(|&v| v as u32).collect()]), [1, 3, 2, 0]);
-        // 300 rows take the counting sort. Equal keys keep their order of position, also under complemented keys, which reverse it.
-        let y: Vec<u32> = (0..300).map(|i| i * 7 % 5).collect();
-        let mut stable: Vec<u32> = (0..300).collect();
-        stable.sort_by_key(|&r| y[r as usize]);
-        assert_eq!(sort_rows(y.len(), vec![y.clone()]), stable);
-        stable.sort_by_key(|&r| !y[r as usize]);
-        assert_eq!(sort_rows(y.len(), vec![y.iter().map(|&v| !v).collect()]), stable);
-        // Two keys take the pass by masks of 8 items. Here group 0's block writes past its end, onto group 1's first places. In the
-        // second, group 1's only item follows the last block.
-        assert_eq!(grouped(&[1, 0, 0, 0, 0, 0, 1, 1], 2), (vec![1, 2, 3, 4, 5, 0, 6, 7], vec![5, 3]));
-        assert_eq!(grouped(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 2), ((0..10).collect(), vec![9, 1]));
-        let b: Vec<u16> = (0..300).map(|i| u16::from(i % 3 == 0)).collect();
-        let mut two: Vec<u32> = (0..300).collect();
-        two.sort_by_key(|&r| b[r as usize]);
-        assert_eq!(sort_rows(b.len(), vec![b.clone()]), two);
-        // Keys too wide for a table take the radix sort, one column at a time from the last. Rows that tie on the first column follow
-        // the second, and rows that tie on both keep their order of position.
-        let wide: Vec<u64> = (0..300u64).map(|i| (i % 7).wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
-        let second: Vec<u64> = (0..300u64).map(|i| (i % 11) << 40).collect();
-        let mut rows: Vec<u32> = (0..300).collect();
-        rows.sort_by_key(|&r| wide[r as usize]);
-        assert_eq!(sort_rows(300, vec![wide.clone()]), rows);
-        rows.sort_by_key(|&r| (wide[r as usize], second[r as usize]));
-        assert_eq!(sort_rows(300, vec![wide, second]), rows);
-        assert_eq!((grouped(&[1, 0, 1, 1], 2), grouped(&[0, 0], 1)), ((vec![1, 0, 2, 3], vec![1, 3]), (vec![0, 1], vec![2])));
-        // `grouped_keys` gives the classes that `classes`, `numbered` and `grouped` give together. The five keys first appear out of
-        // their order, and a range of 2^20 + 1 is too wide for a table.
-        let together = |k: &[i32]| {
-            let n = numbered(&classes(k));
-            let (positions, sizes) = grouped(&n.numbers, n.firsts.len());
-            assert_eq!(grouped_keys(k), Some(Grouped { firsts: n.firsts, positions, sizes }));
-        };
-        together(&(0..300).map(|i| i32::from(i % 3 == 0)).collect::<Vec<_>>());
-        together(&(0..300).map(|i| 3 + (i * 7 + 2) % 5).collect::<Vec<_>>());
-        assert_eq!(grouped_keys(&[0, 1 << 20]), None);
-        // Keys 0, 2 and 4 fill the first 595 places, and key 6 first appears at 595, after four blocks of 64 with no new key make
-        // `write_first` count the keys `x` holds.
-        let late: Vec<i32> = (0..600).map(|i| if i == 595 { 6 } else { i % 3 * 2 }).collect();
-        assert_eq!((index_of(&late, &[6; 20]), classes(&late)[595]), (vec![595; 20], 595));
-        // 299 items of 5 keys go to four tables, with 3 left over. A range of 2^20 + 1 is too wide for a table.
-        let z = &y[..299];
-        assert_eq!(counts(z), Some((0, (0..5).map(|k| z.iter().filter(|&&v| v == k).count()).collect())));
-        assert_eq!((counts(&[3, 1, 3, 2]), counts(&[0, 1 << 20])), (Some((1, vec![1, 1, 2])), None));
-        // Repeated boundaries, values beyond both ends, and no boundaries at all.
-        let (bounds, values) = ([1, 3, 3, 3, 7, 9], (0..12).collect::<Vec<i32>>());
-        assert_eq!(bins(&bounds, &values), values.iter().map(|&v| bounds.partition_point(|&b| b <= v) as u32).collect::<Vec<_>>());
-        assert_eq!(bins::<i32>(&[], &[5]), [0]);
-        // Boundaries too wide for a table take the binary search.
-        let wide = [-70000, 5, 5, 90000];
-        let values = [-80000, -70000, 0, 5, 6, 90000, 95000];
-        assert_eq!(bins(&wide, &values), values.iter().map(|&v| wide.partition_point(|&b| b <= v) as u32).collect::<Vec<_>>());
-    }
-}

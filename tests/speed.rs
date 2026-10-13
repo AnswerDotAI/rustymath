@@ -13,7 +13,8 @@
 //! The test holds the machine's timing lock while it runs, as `timing_lock` describes.
 use rustymath::*;
 use std::{collections::HashMap, hint::black_box, ops::Neg, time::Instant};
-use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
+use rand::seq::SliceRandom;
+pub mod support;
 
 const N: usize = 65_536;
 /// A function's name, its times in ns per item (its own at f64, the standard library's at f64, its own at f32, and the standard
@@ -85,7 +86,7 @@ fn horner<F: Float>(c: &[F], x: F) -> F { c.iter().rev().fold(F::zero(), |y, &k|
 /// seed. Every call shuffles with the same seed, so inputs made together keep their pairs.
 fn inputs(lo: f64, hi: f64, step: f64, len: usize) -> Vec<f64> {
     let mut x: Vec<f64> = (0..RUNS * len).map(|i| lo + (hi - lo) * (i as f64 * step).fract()).collect();
-    x.shuffle(&mut StdRng::seed_from_u64(1));
+    x.shuffle(&mut support::seeded(1));
     x
 }
 const GOLDEN: f64 = 0.618_033_988_749_894_9;
@@ -396,12 +397,15 @@ const TIMING_LOCK: &str = "/tmp/aai-ws-timing.lock";
 
 /// Takes the timing lock exclusively, and returns the file that holds it until dropped. It waits up to 5 minutes while a build or
 /// another timing holds the lock. The operating system releases the lock when the test ends, even by a crash. On macOS it also sets
-/// the calling thread's QoS class to user-interactive. macOS then keeps the thread, which runs the timing, on the performance cores.
+/// the calling thread's QoS class to user-interactive. macOS then keeps the thread, which runs the timing, on the performance cores. The
+/// thread's calls also run on it alone, because the budgets are for one thread.
+/// After waiting 30 seconds it prints, once, the other processes that have the lock's file open.
 fn timing_lock() -> std::fs::File {
     #[cfg(target_vendor = "apple")]
     unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
+    rustymath::parallel::set_threads(1);
     let file = std::fs::File::options().create(true).append(true).open(TIMING_LOCK).expect("the timing lock's file opens");
-    let (start, mut waiting) = (Instant::now(), false);
+    let (start, mut waiting, mut reported) = (Instant::now(), false, false);
     loop {
         match file.try_lock() {
             Ok(()) => return file,
@@ -410,9 +414,29 @@ fn timing_lock() -> std::fs::File {
         }
         assert!(start.elapsed().as_secs() < 300, "a build or another timing has held {TIMING_LOCK} for 5 minutes");
         if !waiting { eprintln!("waiting for a build or another timing to release {TIMING_LOCK}"); }
+        if !reported && start.elapsed().as_secs() >= 30 {
+            eprintln!("{TIMING_LOCK} is still taken after 30 seconds. Processes with it open: {}", lock_users());
+            reported = true;
+        }
         waiting = true;
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
+}
+
+/// The processes other than this one that have the timing lock's file open, as `pid command` pairs from `lsof`. On macOS, where
+/// `lsof` doesn't show `flock` holds, the list also includes any other process waiting for the lock.
+fn lock_users() -> String {
+    let Ok(out) = std::process::Command::new("lsof").args(["+c", "0", "-F", "pc", TIMING_LOCK]).output() else { return "unknown, because lsof didn't run".into() };
+    let (text, me) = (String::from_utf8_lossy(&out.stdout), std::process::id().to_string());
+    let (mut users, mut pid) = (Vec::new(), "");
+    for line in text.lines() {
+        match line.split_at_checked(1) {
+            Some(("p", p)) => pid = p,
+            Some(("c", c)) if pid != me => users.push(format!("{pid} {c}")),
+            _ => {}
+        }
+    }
+    if users.is_empty() { "none".into() } else { users.join(", ") }
 }
 #[test]
 fn speed() {

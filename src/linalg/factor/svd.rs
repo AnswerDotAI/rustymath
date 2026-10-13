@@ -55,7 +55,12 @@ where
     let scale = safe_scale(a);
     if let Some(c) = scale { for x in &mut w { *x = x.mul_real(c) } }
     let (mut d, mut e, left, right) = bidiagonalize(&mut w, [m, n]);
-    let unscaled = |d: &[T::Real]| d.iter().map(|&x| scale.map_or(x, |c| x / c)).collect();
+    // The Wilkinson shift and the rotations that chase it form fourth powers of `d` and `e`. Those overflow or underflow where
+    // `safe_scale` leaves the matrix alone, unless the largest of `d` and `e` lies between 1 and 2.
+    let top = greatest(&d, |x: T::Real| x.abs()).max(greatest(&e, |x: T::Real| x.abs()));
+    let unit = if top > T::Real::zero() && top.is_finite() { unit_scale(top) } else { None };
+    if let Some(u) = unit { for x in d.iter_mut().chain(&mut e) { *x = *x * u } }
+    let unscaled = |d: &[T::Real]| d.iter().map(|&x| [scale, unit].iter().flatten().fold(x, |x, &c| x / c)).collect();
     if vectors && n > SPLIT {
         // [Bᵀ; 0] = U' [Σ; 0] V'ᵀ, so B's left singular vectors are the columns of V', and its right ones the first n items of the
         // columns of U'.
@@ -233,7 +238,8 @@ fn golub_kahan<T: Scalar>(d: &mut [T::Real], e: &mut [T::Real], ut: &mut [T], vt
 }
 
 /// Above this many columns, divide and conquer splits a bidiagonal matrix's SVD in two. The QR algorithm solves smaller ones.
-const SPLIT: usize = 64;
+#[doc(hidden)]
+pub const SPLIT: usize = 64;
 
 /// The plane rotation `(c, s)` that takes `(p, q)` to `(r, 0)`, with `c p - s q = r` and `s p + c q = 0`. `rotate` applies it to two
 /// rows.
@@ -514,43 +520,3 @@ fn arrow<R: Native>(d: &mut [R], z: &[R], outer: &[usize]) -> (Vec<R>, Vec<R>) {
     (ut, vt)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::super::tests::{distance, norm, orthogonality, product, random};
-    use super::*;
-
-    /// The (n+1)×n lower bidiagonal matrix with diagonal `d` and subdiagonal `sub`.
-    fn lower(d: &[f64], sub: &[f64]) -> Vec<f64> {
-        let n = d.len();
-        (0..(n + 1) * n).map(|k| match (k / n, k % n) { (i, j) if i == j => d[j], (i, j) if i == j + 1 => sub[j], _ => 0.0 }).collect()
-    }
-
-    #[test]
-    fn divide_and_conquer_survives_hard_bidiagonals() {
-        // Leaves of 2 and 4 columns make every merge path run: zero singular values, negligible items of z, runs of equal singular
-        // values, and total deflation.
-        let n = 40;
-        let ramp = |f: fn(usize) -> f64| (0..n).map(f).collect::<Vec<f64>>();
-        let cases = [
-            (random::<f64>(n, 1, 3), random::<f64>(n, 1, 5)),
-            (ramp(|_| 1.0), ramp(|_| 0.0)),
-            (ramp(|_| 0.0), ramp(|_| 0.0)),
-            (ramp(|i| if i % 3 == 0 { 0.0 } else { 1.0 + i as f64 }), ramp(|i| (i % 2) as f64)),
-            (ramp(|i| 10f64.powf(-(i as f64) / 4.0)), ramp(|i| 10f64.powf(-(i as f64) / 4.0 - 1.0))),
-            (ramp(|i| 1.0 + 1e-15 * i as f64), ramp(|_| 1e-12)),
-            (ramp(|i| (i % 5) as f64), ramp(|i| 1.0 / (1.0 + i as f64))),
-        ];
-        for leaf in [2, 4, 64] {
-            for (d, sub) in &cases {
-                let b = lower(d, sub);
-                let (mut s, mut work) = (d.clone(), sub.clone());
-                let (ut, vt) = conquer(&mut s, &mut work, leaf).expect("conquer converges");
-                assert!(s.iter().all(|&x| x >= 0.0) && s.windows(2).all(|w| w[0] >= w[1]), "singular values descend, leaf {leaf}: {s:?}");
-                let us: Vec<f64> = (0..(n + 1) * n).map(|k| ut[k % n * (n + 1) + k / n] * s[k % n]).collect();
-                let bound = 64.0 * f64::EPSILON * n as f64;
-                assert!(distance(&product(&us, &vt, [n + 1, n, n]), &b, norm(&b).max(1.0)) < bound, "U Σ Vᵀ is B, leaf {leaf}");
-                assert!(orthogonality(&ut, n + 1, n + 1) < bound && orthogonality(&vt, n, n) < bound, "U and V are orthogonal, leaf {leaf}");
-            }
-        }
-    }
-}

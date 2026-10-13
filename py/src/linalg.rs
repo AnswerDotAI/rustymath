@@ -390,8 +390,8 @@ const PRODUCT: &str = "(n?,k),(k,m?)->(n?,m?)";
 /// Adds the generalized ufuncs to the submodule `m`.
 pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
     gufuncs! { m;
-        "solve" "(m,n),(m,k)->(n,k)": 2 => [E, E, E] = solve, "x with a x = b for each matrix a and matrix b: the least-squares solution with the least norm.";
-        "pinv" "(m,n)->(n,m)": 1 => [E, E] = pinv, "The pseudoinverse of each matrix, which is its inverse where it's square and regular.";
+        "solve" "(m,n),(m,k)->(n,k)": 2 => [E, E, E] = solve, "x with a x = b for each matrix a and matrix b, through LU with no cutoff where a is square with no negligible pivot, and otherwise the least-squares solution with the least norm.";
+        "pinv" "(m,n)->(n,m)": 1 => [E, E] = pinv, "The pseudoinverse of each matrix. A square matrix with no negligible LU pivot gives its inverse through LU, with no cutoff.";
         "det" "(m,m)->()": 1 => [E, E] = det, "The determinant of each square matrix.";
         "slogdet" "(m,m)->(),()": 1 => [E, E, R] = slogdet, "The sign of each square matrix's determinant, and the logarithm of its magnitude.";
         "lu" "(m,m)->(m,m),(m,m),(m)": 1 => [E, E, E, I] = lu, "L, U and the row positions of each square matrix's LU factorization.";

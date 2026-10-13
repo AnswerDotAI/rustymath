@@ -28,7 +28,8 @@ pub trait Scalar:
     /// `self × b + c`, each multiply-add rounding once where `FUSED` is true, as `Core::mla` does.
     fn mul_acc(self, b: Self, c: Self) -> Self;
     fn reciprocal(self) -> Self;
-    /// `self / d`. A complex quotient follows Smith's algorithm, which overflows or underflows only where the quotient itself does.
+    /// `self / d`. A complex quotient halves operands near overflow and scales up operands near underflow, by powers of two, as Baudin
+    /// and Smith's form of Smith's algorithm does. It then applies Smith's formula.
     fn quotient(self, d: Self) -> Self;
 }
 
@@ -85,14 +86,23 @@ impl<T: Native> Scalar for Complex<T> {
     fn reciprocal(self) -> Self { Self::one().quotient(self) }
     #[inline(always)]
     fn quotient(self, d: Self) -> Self {
-        if d.re.abs() >= d.im.abs() {
-            let r = d.im / d.re;
-            let s = d.re + d.im * r;
-            Complex::new((self.re + self.im * r) / s, (self.im - self.re * r) / s)
-        } else {
-            let r = d.re / d.im;
-            let s = d.re * r + d.im;
-            Complex::new((self.re * r + self.im) / s, (self.im * r - self.re) / s)
-        }
+        let (two, eps) = (T::one() + T::one(), T::epsilon());
+        let (big, small, up) = (T::max_value() / two, T::min_positive_value() * two / eps, two / (eps * eps));
+        let size = |z: Self| z.re.abs().max(z.im.abs());
+        let (xs, ys) = (size(self), size(d));
+        let (mut x, mut y, mut scale) = (self, d, T::one());
+        if xs >= big { (x, scale) = (x.div_real(two), scale * two) }
+        if ys >= big { (y, scale) = (y.div_real(two), scale / two) }
+        if xs <= small { (x, scale) = (x.mul_real(up), scale / up) }
+        if ys <= small { (y, scale) = (y.mul_real(up), scale * up) }
+        // (a + bi) / (c + di) for |d| ≤ |c|, as its real and imaginary parts. Where `d / c` underflows to 0, the parts use `b / c` and
+        // `a / c` instead.
+        let smith = |a: T, b: T, c: T, d: T| {
+            let r = d / c;
+            let s = c + d * r;
+            if r != T::zero() { ((a + b * r) / s, (b - a * r) / s) } else { ((a + d * (b / c)) / s, (b - d * (a / c)) / s) }
+        };
+        let (re, im) = if y.re.abs() >= y.im.abs() { smith(x.re, x.im, y.re, y.im) } else { let (re, im) = smith(x.im, x.re, y.im, y.re); (re, -im) };
+        Complex::new(re, im).mul_real(scale)
     }
 }

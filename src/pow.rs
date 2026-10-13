@@ -184,18 +184,3 @@ pub(crate) fn hypot<R: Native, const FUSED: bool>(x: R, y: R) -> R {
     let r = sa.mla::<FUSED>(sa, sb * sb).sqrt() * back;
     if a.is_infinite() | b.is_infinite() { R::infinity() } else { r }
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::{Binary, Pow};
-
-    /// IEEE 754's special values for `pow`, through the free function and through `Pow`'s scalar form, which has its own fast path.
-    #[test]
-    fn special_values() {
-        for p in [crate::pow::<f64> as fn(f64, f64) -> f64, |x, y| Pow.one(x, y)] {
-            assert_eq!((p(f64::NAN, 0.0), p(1.0, f64::NAN), p(-2.0, 3.0), p(0.0, -1.0)), (1.0, 1.0, -8.0, f64::INFINITY));
-            assert!(p(-2.0, 0.5).is_nan() && (p(2.0, 0.5) - std::f64::consts::SQRT_2).abs() < 1e-15);
-        }
-        assert!(crate::pow(-2.0f32, 3.0) == -8.0 && Pow.one(-2.0f32, 0.5).is_nan());
-    }
-}

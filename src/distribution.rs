@@ -1,8 +1,9 @@
 //! Probability distributions. Each has a density, a cumulative distribution, a quantile function and a sampler. The first three are
 //! also function objects, `Pdf`, `Cdf` and `Quantile`, which hold the distribution. Their slice forms choose the distribution's
-//! formulas once, outside the loop, so the loops of the closed-form distributions vectorize. A discrete distribution's density is its
-//! mass at a whole x, and its quantile function and sampler give whole numbers.
-use crate::{atan, betainc, betaincinv, cos, erfc, erfcinv, exp, expm1, gammainc, gammaincc, gammaincinv, lgamma, ln, log1p, pow, sin, tan, Arg, Erfcinv, Float, Unary, CHUNK};
+//! formulas once, outside the loop, so the loops of the closed-form distributions vectorize. An item of a slice form fails where its
+//! result is NaN and its argument isn't, as for a quantile of p outside 0 to 1. A discrete distribution's density is its mass at a
+//! whole x, and its quantile function and sampler give whole numbers.
+use crate::{atan, betainc, betaincinv, cos, erfc, erfcinv, exp, expm1, gammainc, gammaincc, gammaincinv, lgamma, ln, log1p, pow, sin, tan, Arg, Erfc, Erfcinv, Float, Unary};
 use rand::{
     distr::{Distribution as _, Open01, StandardUniform},
     Rng,
@@ -86,25 +87,24 @@ fn quantile_of(d: &impl Formulas, p: f64) -> f64 { if (0.0..=1.0).contains(&p) {
 #[inline(always)]
 fn narrowed<F: Float>(x: F, f: impl Fn(f64) -> f64) -> F { F::narrow(f(x.wide())) }
 
-/// Writes function objects that each hold a distribution and give one of its functions at every float type, computed in `f64`. A
-/// slice form picks the distribution's formulas once, outside its loop. An item fails where its result is NaN and its argument isn't,
-/// as for a quantile of p outside 0 to 1.
-macro_rules! law_objects {
-    ($($(#[$doc:meta])* $object:ident = |$d:ident, $x:ident| $formula:expr;)+) => {$(
-        $(#[$doc])*
-        #[derive(Clone, Copy, Debug, PartialEq)]
-        pub struct $object(pub Distribution);
-        forms!($object at real: |k, [$x]| narrowed($x, |$x| each_law!(&k.0 .0, $d => $formula)),
-            many |k, [$x], n, out| each_law!(&k.0 .0, $d => each!([$x], n, out, |[$x]| narrowed($x, |$x| $formula))));
-    )+};
-}
+/// [`Distribution::pdf`] as a function object.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pdf(pub Distribution);
+forms!(Pdf at real: |k, [x]| narrowed(x, |x| each_law!(&k.0 .0, d => d.pdf(x))),
+    many |k, [x], n, out| each_law!(&k.0 .0, d => each!([x], n, out, |[x]| narrowed(x, |x| d.pdf(x)))));
 
-law_objects! {
-    /// [`Distribution::pdf`] as a function object.
-    Pdf = |d, x| d.pdf(x);
-    /// [`Distribution::cdf`] as a function object.
-    Cdf = |d, x| d.cdf(x);
-}
+/// [`Distribution::cdf`] as a function object. The normal and log-normal distributions' slice forms take erfc from [`Erfc`]'s slice
+/// form, which computes only the formulas that each block of arguments needs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Cdf(pub Distribution);
+forms!(Cdf at real: |k, [x]| narrowed(x, |x| each_law!(&k.0 .0, d => d.cdf(x))),
+    many |k, [x], n, out| match (&k.0 .0, x) {
+        (Law::Normal(d), Arg::Many(x)) => composed(&x[..n], out, #[inline(always)] |x| (d.mean - x) / d.sd * FRAC_1_SQRT_2, Erfc,
+            #[inline(always)] |_, e| 0.5 * e),
+        (Law::LogNormal(d), Arg::Many(x)) => composed(&x[..n], out, #[inline(always)] |x| (d.location - ln(x)) / d.scale * FRAC_1_SQRT_2,
+            Erfc, #[inline(always)] |x, e| if x <= 0.0 { 0.0 } else { 0.5 * e }),
+        (law, x) => each_law!(law, d => each!([x], n, out, |[x]| narrowed(x, |x| d.cdf(x)))),
+    });
 
 /// [`Distribution::quantile`] as a function object. The normal and log-normal distributions' slice forms take erfcinv(2p) from
 /// [`Erfcinv`]'s slice form, whose loops don't branch on each item's region.
@@ -112,23 +112,22 @@ law_objects! {
 pub struct Quantile(pub Distribution);
 forms!(Quantile at real: |k, [p]| narrowed(p, |p| each_law!(&k.0 .0, d => quantile_of(d, p))),
     many |k, [p], n, out| match (&k.0 .0, p) {
-        (Law::Normal(d), Arg::Many(p)) => normal_quantiles(&p[..n], out, #[inline(always)] |e| d.mean - d.sd * SQRT_2 * e),
-        (Law::LogNormal(d), Arg::Many(p)) => normal_quantiles(&p[..n], out, #[inline(always)] |e| exp(d.location - d.scale * SQRT_2 * e)),
+        (Law::Normal(d), Arg::Many(p)) => composed(&p[..n], out, #[inline(always)] |p| 2.0 * p, Erfcinv,
+            #[inline(always)] |_, e| d.mean - d.sd * SQRT_2 * e),
+        (Law::LogNormal(d), Arg::Many(p)) => composed(&p[..n], out, #[inline(always)] |p| 2.0 * p, Erfcinv,
+            #[inline(always)] |_, e| exp(d.location - d.scale * SQRT_2 * e)),
         (law, p) => each_law!(law, d => each!([p], n, out, |[p]| narrowed(p, |p| quantile_of(d, p)))),
     });
 
-/// `from(erfcinv(2p))` for each item of `p`, appended to `out`, with erfcinv from [`Erfcinv`]'s f64 slice form on each block of
-/// `CHUNK` items. Gives `false` where a result is NaN and its item isn't.
-fn normal_quantiles<F: Float>(p: &[F], out: &mut Vec<F>, from: impl Fn(f64) -> f64) -> bool {
-    let (mut q, mut e) = (Vec::with_capacity(p.len().min(CHUNK)), Vec::with_capacity(p.len().min(CHUNK)));
-    let mut ok = true;
-    for p in p.chunks(CHUNK) {
-        q.clear();
-        e.clear();
-        q.extend(p.iter().map(|&v| 2.0 * v.wide()));
-        ok &= Erfcinv.many(Arg::Many(&q), q.len(), &mut e);
-        out.extend(e.iter().map(|&v| F::narrow(from(v))));
-    }
+/// `finish(x, g(inner(x)))` for each item of `x`, written into `out`, with `g` from its f64 slice form. Gives whether `g` succeeded on
+/// every item.
+fn composed<F: Float, G: Unary<f64, Out = f64>>(
+    x: &[F], out: &mut [std::mem::MaybeUninit<F>], inner: impl Fn(f64) -> f64, g: G, finish: impl Fn(f64, f64) -> f64,
+) -> bool {
+    let args: Vec<f64> = x.iter().map(|&v| inner(v.wide())).collect();
+    let mut values = Vec::with_capacity(x.len());
+    let ok = g.many(Arg::Many(&args), args.len(), &mut values);
+    for (slot, (&v, &e)) in out.iter_mut().zip(x.iter().zip(&values)) { slot.write(F::narrow(finish(v.wide(), e))); }
     ok
 }
 
@@ -747,110 +746,6 @@ impl Formulas for Poisson {
             if us >= 0.07 && v <= vr { return k; }
             if k < 0.0 || (us < 0.013 && v > us) { continue; }
             if ln(v) + ln_alpha - ln(a / (us * us) + b) <= -rate + k * ln_rate - lgamma(k + 1.0) { return k; }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::Arg;
-    use rand::{rngs::StdRng, RngExt, SeedableRng};
-
-    /// One of each distribution, with each sampling method's case: binomials that draw by inversion, by BTRD and reflected, and
-    /// Poisson distributions that draw by multiplying and by PTRS.
-    fn cases() -> Vec<Distribution> {
-        let d = Distribution::binomial;
-        [
-            Distribution::normal(1.0, 2.0), Distribution::uniform(-1.0, 3.0), Distribution::beta(0.5, 2.0), Distribution::beta(3.0, 4.0),
-            Distribution::cauchy(0.0, 1.0), Distribution::chi_squared(3.0), Distribution::exponential(2.0), Distribution::fisher(4.0, 7.0),
-            Distribution::gamma(0.5, 2.0), Distribution::gamma(5.0, 1.0), Distribution::inverse_gamma(3.0, 2.0), Distribution::laplace(1.0, 2.0),
-            Distribution::logistic(0.0, 1.0), Distribution::log_normal(0.0, 0.5), Distribution::student_t(3.0), Distribution::weibull(1.5, 2.0),
-            d(10, 0.3), d(1000, 0.4), d(100, 0.9), Distribution::poisson(3.0), Distribution::poisson(50.0),
-        ]
-        .into_iter()
-        .map(Result::unwrap)
-        .collect()
-    }
-
-    #[test]
-    fn quantiles_invert_cdfs() {
-        for d in cases() {
-            for p in [0.001, 0.1, 0.5, 0.9, 0.999] {
-                let x = d.quantile(p);
-                if d.is_discrete() {
-                    assert!(d.cdf(x) >= p * (1.0 - 1e-14) && d.cdf(x - 1.0) < p, "{d:?} at {p}: {x}");
-                } else {
-                    assert!((d.cdf(x) - p).abs() < 1e-12, "{d:?} at {p}: cdf({x}) is {}", d.cdf(x));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn pdfs_match_cdfs() {
-        for d in cases() {
-            for p in [0.1, 0.5, 0.9] {
-                let x = d.quantile(p);
-                if d.is_discrete() {
-                    let sum: f64 = (0..=x as u64).map(|k| d.pdf(k as f64)).sum();
-                    assert!((sum - d.cdf(x)).abs() < 1e-12, "{d:?} at {x}: masses sum to {sum}, cdf is {}", d.cdf(x));
-                } else {
-                    let h = 1e-5 * x.abs().max(1e-3);
-                    let slope = (d.cdf(x + h) - d.cdf(x - h)) / (2.0 * h);
-                    assert!((slope - d.pdf(x)).abs() < 1e-5 * d.pdf(x), "{d:?} at {x}: pdf {} against slope {slope}", d.pdf(x));
-                }
-            }
-        }
-    }
-
-    /// The fraction of draws at or below each of three quantiles matches the cdf there, within five standard errors.
-    #[test]
-    fn samples_follow_cdfs() {
-        const N: usize = 20_000;
-        let mut rng = StdRng::seed_from_u64(1);
-        let mut out = vec![0.0; N];
-        for d in cases() {
-            d.samples(&mut rng, &mut out);
-            for p in [0.1, 0.5, 0.9] {
-                let x = d.quantile(p);
-                let c = d.cdf(x);
-                let below = out.iter().filter(|&&v| v <= x).count() as f64 / N as f64;
-                assert!((below - c).abs() < 5.0 * (c * (1.0 - c) / N as f64).sqrt(), "{d:?}: {below} of draws at most {x}, where the cdf is {c}");
-            }
-        }
-        let mut one = [0.0; 1];
-        Distribution::poisson(0.0).unwrap().samples(&mut rng, &mut one);
-        assert_eq!(one[0], 0.0);
-    }
-
-    /// `f`'s slice form against `scalar` for each item of `xs`, at f64 and at f32. Gives whether the slice form reported every item
-    /// as succeeding.
-    fn matches_scalar(f: impl Unary<f64, Out = f64> + Unary<f32, Out = f32>, scalar: impl Fn(f64) -> f64, xs: &[f64]) -> bool {
-        let same = |a: f64, b: f64| a == b || (a.is_nan() && b.is_nan());
-        let (mut out, mut out32) = (Vec::new(), Vec::new());
-        let ok = f.many(Arg::Many(xs), xs.len(), &mut out);
-        let xs32: Vec<f32> = xs.iter().map(|&x| x as f32).collect();
-        assert_eq!(f.many(Arg::Many(&xs32), xs32.len(), &mut out32), ok);
-        assert!(out.iter().zip(xs).all(|(&r, &x)| same(r, scalar(x))), "{out:?}");
-        assert!(out32.iter().zip(&xs32).all(|(&r, &x)| same(r.into(), scalar(x.into()) as f32 as f64)), "{out32:?}");
-        ok
-    }
-
-    /// Each distribution's function objects give their scalar functions' results. A quantile fails where p lies outside 0 to 1.
-    #[test]
-    fn objects_match_scalars() {
-        let (xs, ps) = ([-1.0, 0.0, 0.25, 0.5, 1.0, 3.0, f64::NAN], [0.001, 0.25, 0.5, 0.999, f64::NAN]);
-        for d in cases() {
-            assert!(matches_scalar(Pdf(d), |x| d.pdf(x), &xs) && matches_scalar(Cdf(d), |x| d.cdf(x), &xs), "{d:?}");
-            assert!(matches_scalar(Quantile(d), |p| d.quantile(p), &ps), "{d:?}");
-            assert!(!matches_scalar(Quantile(d), |p| d.quantile(p), &xs), "{d:?}");
-        }
-        // Several blocks of uniform p reach every region of the inverse error function, in random order.
-        let mut rng = StdRng::seed_from_u64(1);
-        let uniform: Vec<f64> = (0..5000).map(|_| rng.random()).collect();
-        for d in [Distribution::normal(1.0, 2.0).unwrap(), Distribution::log_normal(0.0, 0.5).unwrap()] {
-            assert!(matches_scalar(Quantile(d), |p| d.quantile(p), &uniform), "{d:?}");
         }
     }
 }

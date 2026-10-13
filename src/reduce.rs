@@ -140,14 +140,21 @@ pub trait Reduction<T> {
     type Total: Copy;
     /// The fold of no items: 0, 1, -∞ or ∞, the integer type's least or greatest value, or false or true.
     fn unit() -> Self::Total;
+    /// The exact identity of `step`, which leaves every total unchanged. For float sums it's -0.0, because adding `unit()`, 0.0,
+    /// turns a total of -0.0 into 0.0. For every other reduction it's `unit()`.
+    #[inline(always)]
+    fn identity() -> Self::Total { Self::unit() }
     /// `acc` combined with one more item.
     fn step(acc: Self::Total, x: T) -> Self::Total;
     /// `step`, and whether its result fits. An integer sum or product wraps where it doesn't.
     #[inline(always)]
     fn checked(acc: Self::Total, x: T) -> (Self::Total, bool) { (Self::step(acc, x), true) }
+    /// The fold of the one item `x`, `checked(identity(), x)`, and whether it fits.
+    #[inline(always)]
+    fn one(x: T) -> (Self::Total, bool) { Self::checked(Self::identity(), x) }
     /// The folds of two neighbouring runs of items combined into the fold of both, and whether it fits.
     fn merge(a: Self::Total, b: Self::Total) -> (Self::Total, bool);
-    /// The fold of `x` from `unit()`, and whether it fits.
+    /// The fold of `x`, which is `unit()` where `x` is empty, and whether it fits.
     fn slice(x: &[T]) -> (Self::Total, bool);
     /// Appends the running folds of `x` to `out`, the first combining `start` where it is given, and gives whether every one fits.
     fn scan(x: &[T], start: Option<Self::Total>, out: &mut Vec<Self::Total>) -> bool;
@@ -228,13 +235,13 @@ fn grouped<A: Copy, S: Copy, O>(x: &[A], start: Option<S>, out: &mut Vec<O>, fro
     })
 }
 
-/// Appends the running totals of `x` by `f` to `out`, the first combining `start` where it is given, for an `f` that ignores NaN.
-/// Every total from the first NaN on, in `start` or in `x`, is NaN. A first pass finds that NaN, 64 items at a time, so that `f`
-/// needs no NaN test.
+/// Appends the running totals of `x` by `scan` to `out`, the first combining `start` where it is given, for a `scan` whose step
+/// ignores NaN. Every total from the first NaN on, in `start` or in `x`, is NaN. A first pass finds that NaN, 64 items at a time,
+/// so that the step needs no NaN test.
 #[inline]
-pub(crate) fn until_nan<F: num_traits::Float>(x: &[F], start: Option<F>, out: &mut Vec<F>, f: impl Fn(F, F) -> F) {
+pub(crate) fn until_nan<F: num_traits::Float>(x: &[F], start: Option<F>, out: &mut Vec<F>, scan: impl FnOnce(&[F], Option<F>, &mut Vec<F>)) {
     let nan = if start.is_some_and(|s| s.is_nan()) { 0 } else { first_where(x, |v: F| v.is_nan()) };
-    grouped(&x[..nan], start, out, |v| v, f, |t| t);
+    scan(&x[..nan], start, out);
     out.resize(out.len() + x.len() - nan, F::nan());
 }
 
@@ -247,9 +254,10 @@ fn first_where<T: Copy>(x: &[T], test: impl Fn(T) -> bool) -> usize {
     x[from..].iter().position(|&v| test(v)).map_or(x.len(), |i| from + i)
 }
 
-/// Each float reduction at `f32` and `f64`: its unit, its step, its fold of a slice, and its scan.
+/// Each float reduction at `f32` and `f64`: its unit, its identity where that isn't its unit, its step, its fold of a slice, and its
+/// scan.
 macro_rules! floats {
-    ($($r:ident: $unit:ident, |$a:ident, $b:ident| $step:expr, $fold:expr, $scan:expr;)+) => {$(
+    ($($r:ident: $unit:ident, $(identity: $identity:expr,)? |$a:ident, $b:ident| $step:expr, $fold:expr, $scan:expr;)+) => {$(
         impl<F: Native> Reduction<F> for $r {
             type Total = F;
             #[inline(always)]
@@ -258,6 +266,8 @@ macro_rules! floats {
             fn step($a: F, $b: F) -> F { $step }
             #[inline(always)]
             fn merge(a: F, b: F) -> (F, bool) { (Self::step(a, b), true) }
+            $(#[inline(always)]
+            fn identity() -> F { $identity })?
             #[inline]
             fn slice(x: &[F]) -> (F, bool) { (($fold)(x), true) }
             #[inline]
@@ -269,7 +279,7 @@ macro_rules! floats {
     )+};
 }
 floats! {
-    Sum: zero, |a, b| a.algebraic_add(b), |x| folded(x, F::zero(), Self::step, Self::step), |x, start, out| grouped(x, start, out, |v| v, |a: F, b: F| a + b, |t| t);
+    Sum: zero, identity: -F::zero(), |a, b| a.algebraic_add(b), |x: &[F]| if x.is_empty() { <Self as Reduction<F>>::unit() } else { folded(x, <Self as Reduction<F>>::identity(), Self::step, Self::step) }, |x, start, out| grouped(x, start, out, |v| v, |a: F, b: F| a + b, |t| t);
     Product: one, |a, b| a.algebraic_mul(b), |x| folded(x, F::one(), Self::step, Self::step), |x, start, out| grouped(x, start, out, |v| v, |a: F, b: F| a * b, |t| t);
     Max: neg_infinity, |a, b| a.maximum(b), F::fold_max, F::scan_max;
     Min: infinity, |a, b| a.minimum(b), F::fold_min, F::scan_min;
@@ -284,8 +294,13 @@ impl<R: Reduction<f32, Total = f32>> Reduction<f16> for R {
     fn step(acc: f16, x: f16) -> f16 { f16::from_f32(R::step(acc.to_f32(), x.to_f32())) }
     #[inline(always)]
     fn merge(a: f16, b: f16) -> (f16, bool) { (f16::from_f32(R::merge(a.to_f32(), b.to_f32()).0), true) }
+    #[inline(always)]
+    fn identity() -> f16 { f16::from_f32(R::identity()) }
     #[inline]
-    fn slice(x: &[f16]) -> (f16, bool) { (f16::from_f32(folded(x, R::unit(), |s, v| R::step(s, v.to_f32()), R::step)), true) }
+    fn slice(x: &[f16]) -> (f16, bool) {
+        let total = if x.is_empty() { R::unit() } else { folded(x, R::identity(), |s, v| R::step(s, v.to_f32()), R::step) };
+        (f16::from_f32(total), true)
+    }
     #[inline]
     fn scan(x: &[f16], start: Option<f16>, out: &mut Vec<f16>) -> bool {
         grouped(x, start.map(f16::to_f32), out, f16::to_f32, R::step, f16::from_f32);
@@ -302,8 +317,13 @@ impl<F: Native> Reduction<Complex<F>> for Sum {
     fn step(acc: Complex<F>, x: Complex<F>) -> Complex<F> { Complex::new(acc.re.algebraic_add(x.re), acc.im.algebraic_add(x.im)) }
     #[inline(always)]
     fn merge(a: Complex<F>, b: Complex<F>) -> (Complex<F>, bool) { (<Self as Reduction<Complex<F>>>::step(a, b), true) }
+    #[inline(always)]
+    fn identity() -> Complex<F> { Complex::new(-F::zero(), -F::zero()) }
     #[inline]
-    fn slice(x: &[Complex<F>]) -> (Complex<F>, bool) { (folded(x, Complex::new(F::zero(), F::zero()), <Self as Reduction<Complex<F>>>::step, <Self as Reduction<Complex<F>>>::step), true) }
+    fn slice(x: &[Complex<F>]) -> (Complex<F>, bool) {
+        let step = <Self as Reduction<Complex<F>>>::step;
+        (if x.is_empty() { <Self as Reduction<Complex<F>>>::unit() } else { folded(x, <Self as Reduction<Complex<F>>>::identity(), step, step) }, true)
+    }
     #[inline]
     fn scan(x: &[Complex<F>], start: Option<Complex<F>>, out: &mut Vec<Complex<F>>) -> bool {
         grouped(x, start, out, |v| v, |a: Complex<F>, b| a + b, |t| t);
@@ -315,7 +335,10 @@ impl<F: Native> Reduction<Complex<F>> for Sum {
 /// `Core::maximum` takes four. A fold runs their vector forms on `PARTS` running vectors. Each step of a scan depends on the step
 /// before. It runs the scalar instruction. In wasm, the step takes lane 0 of the vector instruction on two splats, which the
 /// compiler turns into the scalar instruction. The same code on AArch64 keeps a `dup` before each `fmax` at `f32`, which has no
-/// one-lane vector type. The step there is inline assembly.
+/// one-lane vector type. The step there is inline assembly. Each type's entry names its scan. AArch64's `f64` scan is `grouped`, at
+/// the speed of memory. Skipping blocks gained it nothing. Each block with a new maximum paid for a test it didn't use. The others
+/// skip blocks through `records`. AArch64's `f32` tests a block by comparing each item, as `below` does. Wasm tests it by its fold,
+/// then one comparison. In wasm, comparing each item took five instructions for two items.
 #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
 mod lanes {
     use super::*;
@@ -326,15 +349,19 @@ mod lanes {
     /// How many running vectors a fold keeps.
     const PARTS: usize = 8;
     macro_rules! lanes {
-        ($($t:ty: $lanes:literal, $splat:ident, $load:ident, $max:ident, $min:ident, $step:ident($arg:tt);)+) => {$(
+        ($($t:ty: $lanes:literal, $splat:ident, $load:ident, $max:ident, $min:ident, $step:ident($arg:tt), $scan:ident;)+) => {$(
             impl Extremes for $t {
                 fn fold_max(x: &[$t]) -> $t { lanes!(@fold x, $t, $lanes, NEG_INFINITY, $splat, $load, $max, |a, b| lanes!(@$step $arg, "fmax", $splat, $max, a, b)) }
                 fn fold_min(x: &[$t]) -> $t { lanes!(@fold x, $t, $lanes, INFINITY, $splat, $load, $min, |a, b| lanes!(@$step $arg, "fmin", $splat, $min, a, b)) }
                 fn scan_max(x: &[$t], start: Option<$t>, out: &mut Vec<$t>) {
-                    grouped(x, start, out, |v| v, #[inline(always)] |a, b| lanes!(@$step $arg, "fmax", $splat, $max, a, b), |t| t)
+                    #[inline(always)]
+                    fn step(a: $t, b: $t) -> $t { lanes!(@$step $arg, "fmax", $splat, $max, a, b) }
+                    lanes!(@scan $scan, x, start, out, step, below, |b: &[$t], t: $t| Self::fold_max(b) < t)
                 }
                 fn scan_min(x: &[$t], start: Option<$t>, out: &mut Vec<$t>) {
-                    grouped(x, start, out, |v| v, #[inline(always)] |a, b| lanes!(@$step $arg, "fmin", $splat, $min, a, b), |t| t)
+                    #[inline(always)]
+                    fn step(a: $t, b: $t) -> $t { lanes!(@$step $arg, "fmin", $splat, $min, a, b) }
+                    lanes!(@scan $scan, x, start, out, step, above, |b: &[$t], t: $t| Self::fold_min(b) > t)
                 }
             }
         )+};
@@ -356,16 +383,19 @@ mod lanes {
             r
         }};
         (@lane $lane:ident, $ins:literal, $splat:ident, $op:ident, $x:ident, $y:ident) => { $lane::<0>($op($splat($x), $splat($y))) };
+        (@scan grouped, $x:ident, $start:ident, $out:ident, $step:ident, $compare:expr, $fold:expr) => { grouped($x, $start, $out, |v| v, $step, |t| t) };
+        (@scan compare, $x:ident, $start:ident, $out:ident, $step:ident, $compare:expr, $fold:expr) => { records($x, $start, $out, $step, $compare) };
+        (@scan fold, $x:ident, $start:ident, $out:ident, $step:ident, $compare:expr, $fold:expr) => { records($x, $start, $out, $step, $fold) };
     }
     #[cfg(target_arch = "aarch64")]
     lanes! {
-        f64: 2, vdupq_n_f64, vld1q_f64, vmaxq_f64, vminq_f64, asm("d");
-        f32: 4, vdupq_n_f32, vld1q_f32, vmaxq_f32, vminq_f32, asm("s");
+        f64: 2, vdupq_n_f64, vld1q_f64, vmaxq_f64, vminq_f64, asm("d"), grouped;
+        f32: 4, vdupq_n_f32, vld1q_f32, vmaxq_f32, vminq_f32, asm("s"), compare;
     }
     #[cfg(target_arch = "wasm32")]
     lanes! {
-        f64: 2, f64x2_splat, v128_load, f64x2_max, f64x2_min, lane(f64x2_extract_lane);
-        f32: 4, f32x4_splat, v128_load, f32x4_max, f32x4_min, lane(f32x4_extract_lane);
+        f64: 2, f64x2_splat, v128_load, f64x2_max, f64x2_min, lane(f64x2_extract_lane), fold;
+        f32: 4, f32x4_splat, v128_load, f32x4_max, f32x4_min, lane(f32x4_extract_lane), fold;
     }
 }
 
@@ -508,7 +538,7 @@ macro_rules! extremes {
             fn slice(x: &[$t]) -> ($t, bool) { (folded(x, $unit, $step, $step), true) }
             #[inline]
             fn scan(x: &[$t], start: Option<$t>, out: &mut Vec<$t>) -> bool {
-                records(x, start, out, $step);
+                records(x, start, out, $step, |b: &[$t], t: $t| b.iter().fold(t, |m, &v| ($step)(m, v)) == t);
                 true
             }
         }
@@ -549,22 +579,39 @@ booleans! {
     Xnor: true, |a, b| a == b, [[true, false], [false, true]];
 }
 
-/// The running folds of `x` from `start` by `step`, a maximum or minimum. A block of 256 items whose fold leaves the running result
-/// unchanged repeats it, with no step for each item. Other blocks scan as `grouped` does. On random items, almost every block repeats
-/// the running result. The compiler vectorizes each block's fold because the block's length isn't fixed. A loop of a fixed length
-/// unrolls into one item at a time.
-fn records<T: Copy + PartialEq>(x: &[T], start: Option<T>, out: &mut Vec<T>, step: impl Fn(T, T) -> T + Copy) {
+/// The running folds of `x` from `start` by `step`, a maximum or minimum. A block of 256 items that `keeps(block, total)` passes
+/// repeats the running result, with no step for each item. Other blocks scan as `grouped` does. On random items, almost every block
+/// repeats the running result. After four blocks in a row change the running result, blocks scan with no test until one leaves it
+/// unchanged. Their lengths start at 256 items and double up to 16,384. Items that rise steadily then pay for four tests and a few
+/// calls of `grouped`. A call for every 256 items added a third to their scan. Random items start such a run about one time in 25.
+/// After two blocks, they started one about half the time. The compiler vectorizes each block's test because the block's length
+/// isn't fixed. A loop of a fixed length unrolls into one item at a time.
+pub(crate) fn records<T: Copy + PartialEq>(x: &[T], start: Option<T>, out: &mut Vec<T>, step: impl Fn(T, T) -> T + Copy, keeps: impl Fn(&[T], T) -> bool) {
     let Some(&first) = x.first() else { return };
-    let mut total = start.map_or(first, |s| step(s, first));
-    for block in x.chunks(256) {
-        if block.iter().fold(total, |m, &v| step(m, v)) == total {
+    let (mut total, mut at, mut changes) = (start.map_or(first, |s| step(s, first)), 0, 0);
+    while at < x.len() {
+        let test = changes < 4;
+        let block = &x[at..x.len().min(at + if test { 256 } else { 256 << (changes - 4).min(6) })];
+        at += block.len();
+        if test && keeps(block, total) {
             out.resize(out.len() + block.len(), total);
+            changes = 0;
         } else {
             grouped(block, Some(total), out, |v| v, step, |t| t);
-            total = out[out.len() - 1];
+            let last = out[out.len() - 1];
+            (total, changes) = (last, if last == total { 0 } else { changes + 1 });
         }
     }
 }
+
+/// Whether every item of `block` is less than `total`. Only such a block repeats a float maximum's running result. A tie, a signed
+/// zero or a NaN always goes through the step.
+#[inline(always)]
+pub(crate) fn below<F: PartialOrd + Copy>(block: &[F], total: F) -> bool { block.iter().fold(true, |k, &v| k & (v < total)) }
+
+/// Whether every item of `block` is greater than `total`. Only such a block repeats a float minimum's running result.
+#[inline(always)]
+pub(crate) fn above<F: PartialOrd + Copy>(block: &[F], total: F) -> bool { block.iter().fold(true, |k, &v| k & (v > total)) }
 
 /// The folds by `R` of the lanes along the middle axis of `data`, an array of shape `[outer, len, inner]` held row by row: one fold
 /// for each of the `outer × inner` lanes, and whether every one fits.
@@ -605,10 +652,9 @@ pub fn fold_into<T: Copy, R: Reduction<T>>(totals: &mut [R::Total], [_, len, inn
         let (mut i, mut j, mut k) = (row / len, row % len, start % inner);
         while !rest.is_empty() {
             let (piece, after) = rest.split_at((inner - k).min(rest.len()));
-            for (s, &x) in totals[i * inner + k..].iter_mut().zip(piece) {
-                let (t, f) = R::checked(*s, x);
-                (*s, fits) = (t, fits & f);
-            }
+            let row = totals[i * inner + k..].iter_mut().zip(piece);
+            fits &= if j == 0 { row.fold(true, |ok, (s, &x)| { let (t, f) = R::one(x); *s = t; ok & f }) }
+                else { row.fold(true, |ok, (s, &x)| { let (t, f) = R::checked(*s, x); *s = t; ok & f }) };
             (rest, k) = (after, k + piece.len());
             if k == inner { (j, k) = (j + 1, 0); }
             if j == len { (i, j) = (i + 1, 0); }
@@ -627,7 +673,7 @@ fn fold_rows<T: Copy, R: Reduction<T>>(data: &[T], columns: usize, out: &mut [R:
     fn each<const K: usize, T: Copy, R: Reduction<T>>(data: &[T], out: &mut [R::Total]) -> bool {
         let mut fits = true;
         for (o, row) in out.iter_mut().zip(data.as_chunks::<K>().0) {
-            let (t, f) = row.iter().fold((R::unit(), true), |(s, ok), &x| { let (t, f) = R::checked(s, x); (t, ok & f) });
+            let (t, f) = row[1..].iter().fold(R::one(row[0]), |(s, ok), &x| { let (t, f) = R::checked(s, x); (t, ok & f) });
             (*o, fits) = (t, fits & f);
         }
         fits
@@ -647,8 +693,7 @@ fn fold_rows<T: Copy, R: Reduction<T>>(data: &[T], columns: usize, out: &mut [R:
 /// `out`, in the same layout. Each lane's first fold combines `start` where it is given. Gives whether every fold fits. A lane of
 /// consecutive items scans by `scan`. Along any other axis, each row's folds step the row before's by `checked`.
 pub fn scan_along<T: Copy, R: Reduction<T>>(data: &[T], dims: [usize; 3], start: Option<R::Total>, out: &mut Vec<R::Total>) -> bool {
-    let first = start.unwrap_or_else(R::unit);
-    rows_scan(data, dims, out, |lane, o| R::scan(lane, start, o), |x| R::checked(first, x), R::checked)
+    rows_scan(data, dims, out, |lane, o| R::scan(lane, start, o), |x| start.map_or_else(|| R::one(x), |s| R::checked(s, x)), R::checked)
 }
 
 /// An item that sums into any [`Tally`]: a Boolean, as 0 or 1, or an integer.
@@ -886,23 +931,7 @@ impl Logical {
         let word = |b: bool| if b { u64::MAX } else { 0 };
         let ((t0, s0), (t1, s1)) = ((word(maps[0][0]), word(maps[0][0] != maps[0][1])), (word(maps[1][0]), word(maps[1][0] != maps[1][1])));
         let affine = move |bits: u64| ((bits & s1) | (!bits & s0), (bits & t1) | (!bits & t0));
-        let mut carry = first;
-        appended(out, rest.len(), |slots| {
-            let ((blocks, tail), (outs, last)) = (rest.as_chunks::<64>(), slots.as_chunks_mut::<64>());
-            for (o, block) in outs.iter_mut().zip(blocks) {
-                let (s, t) = affine(pack(block));
-                let r = composed(s, t, carry);
-                for (k, slot) in o.iter_mut().enumerate() { slot.write(r >> k & 1 != 0); }
-                carry = r >> 63 != 0;
-            }
-            if !tail.is_empty() {
-                let mut block = [false; 64];
-                block[..tail.len()].copy_from_slice(tail);
-                let (s, t) = affine(pack(&block));
-                let r = composed(s, t, carry);
-                for (k, slot) in last.iter_mut().enumerate() { slot.write(r >> k & 1 != 0); }
-            }
-        });
+        mapped(rest.len(), first, |start| affine(packed(rest, start)), out);
     }
 
     /// Appends the running results along the middle axis of `data`, an array of shape `[outer, len, inner]` held row by row, to `out`,
@@ -924,6 +953,18 @@ fn pack(block: &[bool; 64]) -> u64 {
     bits
 }
 
+/// Writes the 64 bits of `r` to `out` as Booleans, the lowest bit first. Each byte of `r` becomes 8 bytes of 0 or 1, bit `j` in byte `j`,
+/// through one multiplication, two masks, an add and a shift that's the same for every byte. LLVM compiles a test of bit `j` in byte `j`
+/// to a different shift for each byte, which wasm's SIMD can only emulate.
+#[inline(always)]
+fn unpack(r: u64, out: &mut [std::mem::MaybeUninit<bool>; 64]) {
+    for (k, lanes) in out.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+        let bits = (r >> (8 * k) & 0xff).wrapping_mul(0x0101_0101_0101_0101) & 0x8040_2010_0804_0201;
+        let bytes = ((bits + 0x7f7f_7f7f_7f7f_7f7f) >> 7 & 0x0101_0101_0101_0101).to_le_bytes();
+        *lanes = std::array::from_fn(|j| std::mem::MaybeUninit::new(bytes[j] != 0));
+    }
+}
+
 /// The results of 64 items, bit by bit, from the running result `carry`, where item `k`'s map is `r ↦ (s ∧ r) ≠ t` for bit `k` of `s`
 /// and `t`. Each step composes each bit's map with the map it holds from the bits before it. A bit with none before it takes the identity
 /// map, whose `s` is 1 and whose `t` is 0.
@@ -936,210 +977,47 @@ fn composed(mut s: u64, mut t: u64, carry: bool) -> u64 {
     (s & if carry { u64::MAX } else { 0 }) ^ t
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Each reduction and scan against the same taken item by item, in order: sums and running sums of `sums`, and the product of
-    /// `prods`. Their items keep every sum and product exact at every width, so any grouping gives the same result.
-    fn exact<T: Copy + PartialEq + std::fmt::Debug, S: Copy + PartialEq + std::fmt::Debug>(
-        sums: &[T], prods: &[T], add: impl Fn(S, T) -> Option<S>, mul: impl Fn(S, T) -> Option<S>, zero: S, one: S,
-    ) where
-        Sum: Reduction<T, Total = S>,
-        Product: Reduction<T, Total = S>,
-    {
-        let mut total = Some(zero);
-        let running: Vec<_> = sums.iter().map(|&v| { total = total.and_then(|t| add(t, v)); total.unwrap() }).collect();
-        assert_eq!(sum(sums), (total.unwrap(), true));
-        let mut out = Vec::new();
-        assert!(cumsum(sums, None, &mut out));
-        assert_eq!(out, running);
-        assert_eq!(prod(prods), (prods.iter().try_fold(one, |t, &v| mul(t, v)).unwrap(), true));
-    }
-
-    #[test]
-    fn folds_match_item_by_item() {
-        // 101 items cover the running results, the remainder, and the scan's groups of four and its tail. Ten 2s keep the product
-        // within f16.
-        let sums: Vec<i64> = (0..101).map(|i| (i * 7919) % 23 - 11).collect();
-        let prods: Vec<i64> = (0..101).map(|i| if i % 10 == 3 { 2 } else if i % 3 == 0 { -1 } else { 1 }).collect();
-        let at = |f: fn(i64) -> f64| (sums.iter().map(|&v| f(v)).collect::<Vec<_>>(), prods.iter().map(|&v| f(v)).collect::<Vec<_>>());
-        exact(&sums, &prods, |t, v| t.checked_add(v), |t, v| t.checked_mul(v), 0, 1);
-        let (s, p): (Vec<i8>, Vec<i8>) = (sums.iter().map(|&v| v as i8).collect(), prods.iter().map(|&v| v as i8).collect());
-        exact(&s, &p, |t, v| t.checked_add(v.into()), |t, v| t.checked_mul(v.into()), 0, 1);
-        let (s, p) = at(|v| v as f64);
-        exact(&s, &p, |t, v| Some(t + v), |t, v| Some(t * v), 0.0, 1.0);
-        let (s, p): (Vec<f32>, Vec<f32>) = (s.iter().map(|&v| v as f32).collect(), p.iter().map(|&v| v as f32).collect());
-        exact(&s, &p, |t, v| Some(t + v), |t, v| Some(t * v), 0.0, 1.0);
-        let (s, p): (Vec<f16>, Vec<f16>) = (s.iter().map(|&v| f16::from_f32(v)).collect(), p.iter().map(|&v| f16::from_f32(v)).collect());
-        let narrow = |f: fn(f32, f32) -> f32| move |t: f16, v: f16| Some(f16::from_f32(f(t.to_f32(), v.to_f32())));
-        exact(&s, &p, narrow(|t, v| t + v), narrow(|t, v| t * v), f16::ZERO, f16::ONE);
-        assert_eq!(extremes(&sums), (*sums.iter().min().unwrap(), *sums.iter().max().unwrap()));
-        let mut maxima = Vec::new();
-        cummax(&sums, Some(-5), &mut maxima);
-        assert_eq!(maxima, sums.iter().scan(-5, |m, &v| { *m = (*m).max(v); Some(*m) }).collect::<Vec<_>>());
-        assert_eq!((max(&sums), min(&sums)), (*sums.iter().max().unwrap(), *sums.iter().min().unwrap()));
-        // Complex sums of whole numbers are exact in any order.
-        let z: Vec<Complex<f64>> = (0..101).map(|k| Complex::new(k as f64, -(k as f64) / 2.0)).collect();
-        assert_eq!(sum(&z), (z.iter().fold(Complex::new(0.0, 0.0), |s, &v| s + v), true));
-        let mut out = Vec::new();
-        assert!(cumsum(&z, Some(Complex::new(1.0, 1.0)), &mut out));
-        assert_eq!(out, z.iter().scan(Complex::new(1.0, 1.0), |s, &v| { *s += v; Some(*s) }).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn edges() {
-        assert_eq!((sum::<f64>(&[]), prod::<i32>(&[]), max::<f32>(&[]), min::<i16>(&[])), ((0.0, true), (1, true), f32::NEG_INFINITY, i16::MAX));
-        // NaN at item 40 of 101 lies inside a fold's running results, which vectorize, and not in the remainder.
-        let mut v = vec![1.0f64; 101];
-        v[40] = f64::NAN;
-        let v32: Vec<f32> = v.iter().map(|&x| x as f32).collect();
-        assert_eq!((max(&v).is_nan(), min(&v32).is_nan(), max(&[f16::ONE, f16::NAN]).is_nan()), (true, true, true));
-        assert_eq!((maximum(1.0, f64::NAN).is_nan(), minimum(f32::NAN, 1.0).is_nan(), maximum(-1.0, 2.0), minimum(f16::ONE, f16::ZERO)), (true, true, 2.0, f16::ZERO));
-        // With a shared `x`, the slice forms test the other argument for NaN. They still give `maximum`'s and `minimum`'s results.
-        let e = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -0.0, 1.5, -2.0];
-        let same = |a: f64, b: f64| a.to_bits() == b.to_bits() || a.is_nan() && b.is_nan();
-        for &c in &e {
-            let (mut most, mut least) = (Vec::new(), Vec::new());
-            assert!(crate::Binary::many(&Maximum, crate::Arg::One(c), crate::Arg::Many(&e), e.len(), &mut most));
-            assert!(crate::Binary::many(&Minimum, crate::Arg::One(c), crate::Arg::Many(&e), e.len(), &mut least));
-            for (k, &y) in e.iter().enumerate() { assert!(same(most[k], maximum(c, y)) && same(least[k], minimum(c, y)), "{c} and {y}"); }
+/// The Booleans of `x` from `start`, at most 64, as the bits of a word, the first in the lowest bit. Bits past the end of `x` are 0.
+#[inline(always)]
+fn packed(x: &[bool], start: usize) -> u64 {
+    match x[start..].first_chunk::<64>() {
+        Some(block) => pack(block),
+        None => {
+            let mut block = [false; 64];
+            block[..x.len() - start].copy_from_slice(&x[start..]);
+            pack(&block)
         }
-        let mut out = Vec::new();
-        cummax(&[1.0, 3.0, f64::NAN, 5.0, 2.0, 1.0], None, &mut out);
-        assert_eq!(out.iter().map(|v| v.is_nan()).collect::<Vec<_>>(), [false, false, true, true, true, true]);
-        assert_eq!((sum(&[i64::MAX, 1]), sum(&[i64::MAX, 1, -2]), prod(&[i64::MAX, 2])), ((i64::MIN, false), (i64::MAX - 1, true), (-2, false)));
-        assert_eq!((sum(&[u64::MAX, 1]), prod(&[1u64 << 32, 1 << 32]), sum(&[u64::MAX, 0])), ((0, false), (0, false), (u64::MAX, true)));
-        let mut out = Vec::new();
-        assert!(!cumsum(&[u64::MAX, 1, 5], None, &mut out));
-        assert_eq!(out, [u64::MAX, 0, 5]);
-        assert!(!cumsum(&[i64::MAX, 1], None, &mut Vec::new()));
-        assert!(!cumprod(&[i32::MAX, i32::MAX, i32::MAX], None, &mut Vec::new()));
-        let mut out = vec![7.0];
-        assert!(cumsum(&[1.0f64, 2.0], Some(10.0), &mut out));
-        assert_eq!(out, [7.0, 11.0, 13.0]);
-    }
-
-    /// The scan that x86-64 runs, which every target can call: NaN from the first NaN on, in `start` or in the items, wherever it falls
-    /// in the blocks of 64 that the first pass reads, and the running maximum before it.
-    #[test]
-    fn scans_until_the_first_nan() {
-        let x: Vec<f64> = (0..200).map(|i| (i * 37 % 101) as f64 - 50.0).collect();
-        for nan in [None, Some(0), Some(3), Some(63), Some(64), Some(130), Some(199)] {
-            for start in [None, Some(10.0), Some(f64::NAN)] {
-                let mut y = x.clone();
-                if let Some(k) = nan { y[k] = f64::NAN }
-                let mut out = Vec::new();
-                until_nan(&y, start, &mut out, |t, v| if t > v { t } else { v });
-                let mut total = start;
-                let want = y.iter().map(|&v| { let t = total.map_or(v, |t| maximum(t, v)); total = Some(t); t });
-                assert!(out.len() == y.len() && out.iter().zip(want).all(|(&a, b)| a == b || a.is_nan() && b.is_nan()), "{nan:?} {start:?}");
-            }
-        }
-    }
-
-    /// Every lane of an array of shape `[outer, len, inner]`, its items in order.
-    fn lanes_of<T: Copy>(x: &[T], [outer, len, inner]: [usize; 3]) -> Vec<Vec<T>> {
-        (0..outer).flat_map(|i| (0..inner).map(move |k| (0..len).map(|j| x[(i * len + j) * inner + k]).collect())).collect()
-    }
-
-    /// Folds and scans along the middle axis against the same taken lane by lane, item by item, for lanes of consecutive items and
-    /// otherwise, short and long, and empty. Folding in blocks of 13 splits lanes at many offsets. Booleans fold by each of their
-    /// reductions, and an `i64` sum that wraps reports it, along a lane and down the rows.
-    #[test]
-    fn axes_match_lane_by_lane() {
-        for shape in [[3, 37, 5], [15, 37, 1], [4, 3, 2], [2, 0, 3], [2, 200, 1]] {
-            let [outer, len, inner] = shape;
-            let x: Vec<i64> = (0..outer * len * inner).map(|i| (i * 37 % 101) as i64 - 50).collect();
-            let sums: Vec<i64> = lanes_of(&x, shape).iter().map(|l| l.iter().sum()).collect();
-            assert_eq!(along::<i64, Sum>(&x, shape), (sums.clone(), true));
-            let mut totals = vec![0; sums.len()];
-            for (b, block) in x.chunks(13).enumerate() { assert!(fold_into::<i64, Sum>(&mut totals, shape, b * 13, block)) }
-            assert_eq!(totals, sums, "{shape:?}");
-            let mut want = vec![0; x.len()];
-            for i in 0..outer {
-                for k in 0..inner {
-                    (0..len).fold(10, |t, j| { let p = (i * len + j) * inner + k; want[p] = t + x[p]; want[p] });
-                }
-            }
-            let mut out = Vec::new();
-            assert!(scan_along::<i64, Sum>(&x, shape, Some(10), &mut out));
-            assert_eq!(out, want, "{shape:?}");
-            // `SumAs`'s running sums of Booleans and of narrow integers match `Sum`'s, which run at 64 bits.
-            let wide = |items: Vec<i64>, start: Option<i64>| { let mut out = Vec::new(); scan_along::<i64, Sum>(&items, shape, start, &mut out); out.into_iter().map(|v| v as i32).collect::<Vec<_>>() };
-            let mut counts = Vec::new();
-            scan_along::<bool, SumAs<i32>>(&x.iter().map(|v| v % 3 == 0).collect::<Vec<_>>(), shape, Some(3), &mut counts);
-            assert_eq!(counts, wide(x.iter().map(|v| i64::from(v % 3 == 0)).collect(), Some(3)), "{shape:?}");
-            let mut sums = Vec::new();
-            scan_along::<i16, SumAs<i32>>(&x.iter().map(|&v| v as i16).collect::<Vec<_>>(), shape, None, &mut sums);
-            assert_eq!(sums, wide(x.clone(), None), "{shape:?}");
-            let b: Vec<bool> = x.iter().map(|v| v % 3 == 0).collect();
-            let lanes = lanes_of(&b, shape);
-            let ones = |l: &Vec<bool>| l.iter().filter(|&&v| v).count();
-            assert_eq!(along::<bool, Max>(&b, shape).0, lanes.iter().map(|l| l.contains(&true)).collect::<Vec<_>>());
-            assert_eq!(along::<bool, Min>(&b, shape).0, lanes.iter().map(|l| !l.contains(&false)).collect::<Vec<_>>());
-            assert_eq!(along::<bool, Xor>(&b, shape).0, lanes.iter().map(|l| ones(l) % 2 == 1).collect::<Vec<_>>());
-            assert_eq!(along::<bool, Xnor>(&b, shape).0, lanes.iter().map(|l| (l.len() - ones(l)) % 2 == 0).collect::<Vec<_>>());
-            assert_eq!(along::<bool, SumAs<u8>>(&b, shape).0, lanes.iter().map(|l| ones(l) as u8).collect::<Vec<_>>());
-            for start in [None, Some(false), Some(true)] {
-                for code in 0..16 {
-                    let table = Logical([[code & 1 != 0, code & 2 != 0], [code & 4 != 0, code & 8 != 0]]);
-                    let mut want = b.clone();
-                    for i in 0..outer {
-                        for k in 0..inner {
-                            (0..len).fold(start, |t, j| {
-                                let p = (i * len + j) * inner + k;
-                                want[p] = t.map_or(b[p], |t| table.0[usize::from(t)][usize::from(b[p])]);
-                                Some(want[p])
-                            });
-                        }
-                    }
-                    let mut out = Vec::new();
-                    table.scan_along(&b, shape, start, &mut out);
-                    assert_eq!(out, want, "{shape:?} {start:?} {code}");
-                    // The Boolean reductions scan by their tables: `or` is 14, `and` 8, `!=` 6 and `==` 9.
-                    let mut reduced = Vec::new();
-                    match code {
-                        14 => scan_along::<bool, Max>(&b, shape, start, &mut reduced),
-                        8 => scan_along::<bool, Min>(&b, shape, start, &mut reduced),
-                        6 => scan_along::<bool, Xor>(&b, shape, start, &mut reduced),
-                        9 => scan_along::<bool, Xnor>(&b, shape, start, &mut reduced),
-                        _ => continue,
-                    };
-                    assert_eq!(reduced, want, "{shape:?} {start:?} {code}");
-                }
-            }
-        }
-        assert!(!along::<i64, Sum>(&[i64::MAX, 1], [1, 2, 1]).1);
-        assert!(!along::<i64, Sum>(&[i64::MAX, 0, 1, 0], [1, 2, 2]).1);
-        assert!(!scan_along::<i64, Sum>(&[i64::MAX, 0, 1, 0], [1, 2, 2], None, &mut Vec::new()));
-    }
-
-    #[test]
-    fn alternating_folds_match_the_right_fold() {
-        fn right<T: Copy>(x: &[T], unit: T, f: impl Fn(T, T) -> T) -> T { x.iter().rev().copied().reduce(|t, v| f(v, t)).unwrap_or(unit) }
-        for n in [0, 1, 2, 3, 64, 101] {
-            let x: Vec<i64> = (0..n).map(|i| (i * 7919) % 23 - 11).collect();
-            let want = right(&x, 0, |a, b| a - b);
-            assert_eq!(<Sum as Alternating<i64>>::alternating(&x), (want, true));
-            assert_eq!(<Sum as Alternating<i16>>::alternating(&x.iter().map(|&v| v as i16).collect::<Vec<_>>()), (want, true));
-            // Whole numbers, and powers of 2, keep every sum and quotient exact in any order.
-            let f: Vec<f64> = x.iter().map(|&v| v as f64).collect();
-            assert_eq!(<Sum as Alternating<f64>>::alternating(&f), (want as f64, true));
-            let z: Vec<Complex<f64>> = f.iter().map(|&v| Complex::new(v, -v)).collect();
-            assert_eq!(<Sum as Alternating<Complex<f64>>>::alternating(&z), (Complex::new(want as f64, -want as f64), true));
-            let p: Vec<f64> = x.iter().map(|&v| 2f64.powi(v as i32 % 5)).collect();
-            let q = right(&p, 1.0, |a, b| a / b);
-            assert_eq!(<Product as Alternating<f64>>::alternating(&p), (q, true));
-            let pz: Vec<Complex<f64>> = p.iter().map(|&v| Complex::new(v, 0.0)).collect();
-            assert_eq!(<Product as Alternating<Complex<f64>>>::alternating(&pz), (Complex::new(q, 0.0), true));
-        }
-        assert!(!<Sum as Alternating<i64>>::alternating(&[i64::MAX, -1]).1);
-        // The pairs' ratios alternate between 1e200 and 1e-200, so the right fold is 1. Each running product takes every 16th ratio, or
-        // every 8th in wasm, so half of them overflow and half underflow.
-        let x: Vec<f64> = (0..256).map(|i| if (i % 4 == 0) | (i % 4 == 3) { 1e200 } else { 1.0 }).collect();
-        assert_eq!(right(&x, 1.0, |a, b| a / b), 1.0);
-        assert!(!<Product as Alternating<f64>>::alternating(&x).1);
-        assert!(!<Product as Alternating<f64>>::alternating(&[1.0, 0.0]).1);
     }
 }
+
+/// Appends the running results of `n` items to `out`, from the running result `carry` before the first. `maps(start)` gives the maps of
+/// the 64 items from `start` as two words of bits `(s, t)`: item `start + k` maps `r` to `(s ∧ r) ≠ t` for bit `k` of each. Bits past the
+/// last item are ignored.
+#[inline(always)]
+fn mapped(n: usize, mut carry: bool, maps: impl Fn(usize) -> (u64, u64), out: &mut Vec<bool>) {
+    appended(out, n, |slots| {
+        let (outs, last) = slots.as_chunks_mut::<64>();
+        for (i, o) in outs.iter_mut().enumerate() {
+            let (s, t) = maps(64 * i);
+            let r = composed(s, t, carry);
+            unpack(r, o);
+            carry = r >> 63 != 0;
+        }
+        if !last.is_empty() {
+            let (s, t) = maps(n - last.len());
+            let r = composed(s, t, carry);
+            for (k, slot) in last.iter_mut().enumerate() { slot.write(r >> k & 1 != 0); }
+        }
+    });
+}
+
+/// Appends the running results of a scan whose running result is a Boolean, from `carry` before the first item. Item `k`'s result is
+/// `high[k]` where the result before it is true, and `low[k]` where it's false. `low` and `high` have the same length. The results
+/// compose 64 at a time, with no branch for each item, as [`Logical::scan`]'s do.
+pub fn chosen(carry: bool, low: &[bool], high: &[bool], out: &mut Vec<bool>) {
+    mapped(low.len(), carry, |start| {
+        let (l, h) = (packed(low, start), packed(high, start));
+        (l ^ h, l)
+    }, out);
+}
+

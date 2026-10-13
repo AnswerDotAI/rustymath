@@ -27,13 +27,12 @@ pub mod exact;
 pub mod integer;
 pub mod linalg;
 pub mod number_theory;
+pub mod parallel;
 pub mod polynomial;
 pub mod reduce;
 pub mod random;
 pub mod search;
 pub mod tolerant;
-#[cfg(test)]
-mod accuracy;
 
 pub use float::{Float, Native, FUSED};
 pub use slice::{pairs, Arg, Binary, Flipped, Ternary, Unary, CHUNK};
@@ -42,7 +41,7 @@ pub use sqrts::Sqrt;
 pub use ln::Logb;
 pub use pow::{Pow, Root};
 pub use trig::{Cos, Sin, Tan};
-pub use special::{Erfcinv, Erfinv};
+pub use special::{Erfc, Erfcinv, Erfinv};
 pub use complex::{divide, Cis};
 pub use arith::{Add, Multiply, Overflowing, Subtract};
 
@@ -175,7 +174,7 @@ functions! {
     /// The error function, 2/√π times the integral of e^-t² from 0 to x.
     erf(x) in special as Erf: total;
     /// 1 - erf(x), without the loss of digits for large x that `1 - erf(x)` has.
-    erfc(x) in special as Erfc: total;
+    erfc(x) in special;
     /// The x with erf(x) = p. ±1 gives ±∞, and a magnitude beyond 1 gives NaN.
     erfinv(p) in special;
     /// The x with erfc(x) = q. 0 gives ∞, 2 gives -∞, and q outside 0 to 2 gives NaN.

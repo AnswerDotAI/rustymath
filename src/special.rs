@@ -7,7 +7,6 @@ use crate::{
     exp::{exp, exp_narrow, exp_plus},
     float::{horner, sealed::Core},
     ln::{ln, ln_narrow, ln_double, ln_split, log1p},
-    slice::appended,
     Arg, Native,
 };
 use num_complex::Complex;
@@ -373,7 +372,7 @@ fn erf_small<R: Native, const FUSED: bool>(x: R) -> R {
     horner::<R, FUSED, 5>(z, t.pp) / horner::<R, FUSED, 6>(z, t.qq)
 }
 
-/// erfc(a) for a from 0.84375 up.
+/// erfc(a) for a from `ERFC_SPLIT` up.
 #[inline(always)]
 fn erfc_tail<R: Native, const FUSED: bool>(a: R) -> R {
     let t = erf_table::<R>();
@@ -449,18 +448,31 @@ pub(crate) fn erf<R: Native, const FUSED: bool>(x: R) -> R {
 /// 1 - erf(x), computed at the argument's own width.
 #[inline(always)]
 pub(crate) fn erfc<R: Native, const FUSED: bool>(x: R) -> R {
-    let (a, one, half, two) = (x.abs(), R::one(), R::narrow(0.5), R::narrow(2.0));
-    let r = either(
-        a < R::narrow(0.84375),
-        #[inline(always)]
-        || {
-            let y = erf_small::<R, FUSED>(x);
-            if x < R::narrow(0.25) { one - (x + x * y) } else { half - (x - half + x * y) }
-        },
-        #[inline(always)]
-        || { let t = erfc_tail::<R, FUSED>(a); if x < R::zero() { two - t } else { t } },
-    );
-    if x.is_nan() { x } else if a < R::narrow(28.0) { r } else if x < R::zero() { two } else { R::zero() }
+    erfc_ends(x, either(x.abs() < R::narrow(ERFC_SPLIT), #[inline(always)] || erfc_near::<R, FUSED>(x), #[inline(always)] || erfc_far::<R, FUSED>(x)))
+}
+
+/// The |x| below which `erfc_near` holds, and from which `erfc_far` does.
+const ERFC_SPLIT: f64 = 0.84375;
+
+/// erfc(x) for |x| below `ERFC_SPLIT`.
+#[inline(always)]
+fn erfc_near<R: Native, const FUSED: bool>(x: R) -> R {
+    let (one, half) = (R::one(), R::narrow(0.5));
+    let y = erf_small::<R, FUSED>(x);
+    if x < R::narrow(0.25) { one - (x + x * y) } else { half - (x - half + x * y) }
+}
+
+/// erfc(x) for |x| from `ERFC_SPLIT` up.
+#[inline(always)]
+fn erfc_far<R: Native, const FUSED: bool>(x: R) -> R {
+    let t = erfc_tail::<R, FUSED>(x.abs());
+    if x < R::zero() { R::narrow(2.0) - t } else { t }
+}
+
+/// erfc(x) from `r`, a formula's value, except that NaN gives NaN and a magnitude from 28 up gives 0 or 2.
+#[inline(always)]
+fn erfc_ends<R: Native>(x: R, r: R) -> R {
+    if x.is_nan() { x } else if x.abs() < R::narrow(28.0) { r } else if x < R::zero() { R::narrow(2.0) } else { R::zero() }
 }
 
 /// Giles's single-precision approximation of erfinv(p)/p, as polynomials highest degree first: `GILES` in w - 2.5 for w =
@@ -518,6 +530,35 @@ fn erfcinv64<const FUSED: bool>(q: f64) -> f64 {
     maddock::<FUSED>((q - 1.0).abs(), q.min(2.0 - q)).copysign(1.0 - q)
 }
 
+/// [`erfc`](crate::erfc) as a function object, with the slice form `many`, which runs `erfc_blocks` on a slice.
+#[derive(Clone, Copy, Debug)]
+pub struct Erfc;
+forms!(Erfc at real: |_, [x]| crate::slice::Total(erfc::<_, { crate::FUSED }>(x)),
+    many |_, [x], n, out| match x {
+        Arg::Many(x) => erfc_blocks::<_, { crate::FUSED }>(&x[..n], out),
+        x => each!([x], n, out, |[x]| crate::slice::Total(erfc::<_, { crate::FUSED }>(x))),
+    });
+
+/// `erfc` on each item of `x`, written into `out`, a block of `BLOCK` items at a time. A block whose magnitudes all lie below
+/// `ERFC_SPLIT` computes only `erfc_near`, and one whose magnitudes all reach it computes only `erfc_far`. A mixed block runs `erfc`,
+/// which computes both on f32 and on x86-64 f64.
+fn erfc_blocks<R: Native, const FUSED: bool>(x: &[R], out: &mut [MaybeUninit<R>]) -> bool {
+    const BLOCK: usize = 256;
+    #[inline(always)]
+    fn fill<R: Native>(xs: &[R], os: &mut [MaybeUninit<R>], f: impl Fn(R) -> R) { for (o, &v) in os.iter_mut().zip(xs) { o.write(f(v)); } }
+    let split = R::narrow(ERFC_SPLIT);
+    for (xs, os) in x.chunks(BLOCK).zip(out.chunks_mut(BLOCK)) {
+        let (low, high) = xs.iter().fold((R::infinity(), R::zero()), |(low, high), &v| (low.min(v.abs()), high.max(v.abs())));
+        if high < split {
+            fill(xs, os, #[inline(always)] |v| erfc_ends(v, erfc_near::<R, FUSED>(v)));
+        } else if low >= split {
+            fill(xs, os, #[inline(always)] |v| erfc_ends(v, erfc_far::<R, FUSED>(v)));
+        } else {
+            fill(xs, os, erfc::<R, FUSED>);
+        }
+    }
+    true
+}
 /// [`erfinv`](crate::erfinv) as a function object, with the slice form `many`, which runs `regions` on a slice of f64s.
 #[derive(Clone, Copy, Debug)]
 pub struct Erfinv;
@@ -532,57 +573,55 @@ forms!(Erfcinv at real: |_, [q]| erfcinv::<_, { crate::FUSED }>(q),
 
 /// The slice form of [`Erfinv`] and [`Erfcinv`]: `regions` on a slice of f64s, and `f` on each item otherwise. `parts` gives an f64
 /// item's `maddock` arguments and the value whose sign its result takes.
-fn inverses<R: Native>(x: Arg<'_, R>, n: usize, out: &mut Vec<R>, f: impl Fn(R) -> R, parts: impl Fn(f64) -> (f64, f64, f64)) -> bool {
+fn inverses<R: Native>(x: Arg<'_, R>, n: usize, out: &mut [MaybeUninit<R>], f: impl Fn(R) -> R, parts: impl Fn(f64) -> (f64, f64, f64)) -> bool {
     match x {
         Arg::Many(x) if R::WIDE => regions::<R, { crate::FUSED }>(&x[..n], out, f, parts),
         x => each!([x], n, out, |[x]| f(x)),
     }
 }
 
-/// `maddock` on each item of `x`, appended to `out`, with no branch on an item's region. In each block of `BLOCK` items, one pass
+/// `maddock` on each item of `x`, written into `out`, with no branch on an item's region. In each block of `BLOCK` items, one pass
 /// places the central items' positions from the front and the others' from the back, and a second pass splits the others the same
 /// way by whether q is at least 1/4. Each region's formula then runs on its items' arguments, gathered into one buffer. On uniform
 /// arguments, `maddock`'s branches were mispredicted about three times in four, which took half its time. Items outside the domain,
 /// and NaN, take `f`. Gives `false` where an output is NaN and its item isn't.
-fn regions<R: Native, const FUSED: bool>(x: &[R], out: &mut Vec<R>, f: impl Fn(R) -> R, parts: impl Fn(f64) -> (f64, f64, f64)) -> bool {
+fn regions<R: Native, const FUSED: bool>(x: &[R], out: &mut [MaybeUninit<R>], f: impl Fn(R) -> R, parts: impl Fn(f64) -> (f64, f64, f64)) -> bool {
     const BLOCK: usize = 512;
     let (mut place, mut split, mut t) = ([0u16; BLOCK], [0u16; BLOCK], [0.0; BLOCK]);
-    appended(out, x.len(), |slots| {
-        let mut ok = true;
-        for (xs, os) in x.chunks(BLOCK).zip(slots.chunks_mut(BLOCK)) {
-            let item = |i: u16| parts(xs[usize::from(i)].wide());
-            let (mut lo, mut hi) = (0, xs.len());
-            for i in 0..xs.len() as u16 {
-                let central = item(i).0 <= 0.5;
-                (place[lo], place[hi - 1]) = (i, i);
-                lo += usize::from(central);
-                hi -= usize::from(!central);
-            }
-            let (central, others) = place[..xs.len()].split_at(lo);
-            let (mut up, mut down) = (0, others.len());
-            for &i in others {
-                let upper = item(i).1 >= 0.25;
-                (split[up], split[down - 1]) = (i, i);
-                up += usize::from(upper);
-                down -= usize::from(!upper);
-            }
-            let (upper, below) = split[..others.len()].split_at(up);
-            gathered(central, &mut t, os, &item, #[inline(always)] |(p, _, _)| p, #[inline(always)] |t| for v in t { *v = maddock_central::<FUSED>(*v) });
-            gathered(upper, &mut t, os, &item, #[inline(always)] |(_, q, _)| q, #[inline(always)] |t| for v in t { *v = maddock_upper::<FUSED>(*v) });
-            gathered(below, &mut t, os, &item, #[inline(always)] |(_, q, _)| q, #[inline(always)] |t| {
-                for v in t.iter_mut() { *v = maddock_g::<FUSED>(*v) }
-                for v in t { *v = maddock_below::<FUSED>(*v) }
-            });
-            for (i, (&v, o)) in xs.iter().zip(os.iter_mut()).enumerate() {
-                if !(item(i as u16).0 < 1.0) {
-                    let r = f(v);
-                    o.write(r);
-                    ok &= !r.is_nan() | v.is_nan();
-                }
+    let mut ok = true;
+    for (xs, os) in x.chunks(BLOCK).zip(out.chunks_mut(BLOCK)) {
+        let item = |i: u16| parts(xs[usize::from(i)].wide());
+        let (mut lo, mut hi) = (0, xs.len());
+        for i in 0..xs.len() as u16 {
+            let central = item(i).0 <= 0.5;
+            (place[lo], place[hi - 1]) = (i, i);
+            lo += usize::from(central);
+            hi -= usize::from(!central);
+        }
+        let (central, others) = place[..xs.len()].split_at(lo);
+        let (mut up, mut down) = (0, others.len());
+        for &i in others {
+            let upper = item(i).1 >= 0.25;
+            (split[up], split[down - 1]) = (i, i);
+            up += usize::from(upper);
+            down -= usize::from(!upper);
+        }
+        let (upper, below) = split[..others.len()].split_at(up);
+        gathered(central, &mut t, os, &item, #[inline(always)] |(p, _, _)| p, #[inline(always)] |t| for v in t { *v = maddock_central::<FUSED>(*v) });
+        gathered(upper, &mut t, os, &item, #[inline(always)] |(_, q, _)| q, #[inline(always)] |t| for v in t { *v = maddock_upper::<FUSED>(*v) });
+        gathered(below, &mut t, os, &item, #[inline(always)] |(_, q, _)| q, #[inline(always)] |t| {
+            for v in t.iter_mut() { *v = maddock_g::<FUSED>(*v) }
+            for v in t { *v = maddock_below::<FUSED>(*v) }
+        });
+        for (i, (&v, o)) in xs.iter().zip(os.iter_mut()).enumerate() {
+            if !(item(i as u16).0 < 1.0) {
+                let r = f(v);
+                o.write(r);
+                ok &= !r.is_nan() | v.is_nan();
             }
         }
-        ok
-    })
+    }
+    ok
 }
 
 /// `formula` on the argument that `read` takes from each item at `positions`, gathered into `t`. Each result goes to its item's place

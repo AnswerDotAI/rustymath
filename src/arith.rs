@@ -110,31 +110,3 @@ macro_rules! integer_forms {
     )+};
 }
 integer_forms!(i8, i16, i32, i64, u8, u16, u32, u64);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Each operation at type `$t`, on every pair of edge values, against the exact result in `i128`: the wrapped result, and whether
-    /// it fits.
-    macro_rules! check {
-        ($($t:ty),+) => {$({
-            let edges: Vec<$t> = [<$t>::MIN, <$t>::MAX, 0, 1, 2, 3, 7].into_iter().chain([-1i128, -2, -3].map(|v| v as $t))
-                .chain([<$t>::MIN / 2, <$t>::MAX / 2, <$t>::MAX - 1, <$t>::MIN.wrapping_add(1)]).collect();
-            let exact = |r: i128| (r as $t, <$t>::try_from(r).is_ok());
-            for &x in &edges {
-                for &y in &edges {
-                    let (a, b) = (x as i128, y as i128);
-                    assert_eq!(x.plus(y), exact(a + b), "{x} + {y}");
-                    assert_eq!(x.minus(y), exact(a - b), "{x} - {y}");
-                    assert_eq!(x.times(y), exact(a * b), "{x} × {y}");
-                }
-                assert_eq!(x.magnitude(), exact((x as i128).abs()), "|{x}|");
-                assert_eq!(x.sign() as i128, (x as i128).signum(), "sign {x}");
-            }
-        })+};
-    }
-
-    #[test]
-    fn overflowing_matches_exact_arithmetic() { check!(i8, i16, i32, i64, u8, u16, u32, u64); }
-}
