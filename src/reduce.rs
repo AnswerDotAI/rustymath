@@ -342,8 +342,9 @@ impl<F: Native> Reduction<Complex<F>> for Product {
 }
 
 /// AArch64's `fmax` and `fmin`, and wasm's `max` and `min`, give NaN where either argument is NaN. On AArch64 each is one
-/// instruction. In a browser on an Arm host, such as a Mac, wasm's `max` and `min` run faster than `pmax` and `pmin`, which skip
-/// NaN. On x86-64 hosts they take about eight instructions each. A fold runs the vector forms on `PARTS` running vectors. Each step
+/// instruction. In a browser on an Arm host, such as a Mac, wasm's `max` and `min` run faster than `pmax` and `pmin`, which give
+/// their first argument where either is NaN. On x86-64 hosts, wasm's `max` and `min` take about eight instructions each. A fold
+/// runs the vector forms on `PARTS` running vectors. Each step
 /// of a scan depends on the step before. In wasm, the step takes lane 0 of the vector instruction on two splats. On AArch64 that
 /// code keeps a `dup` before each `fmax` at `f32`, which has no one-lane vector type, so the step there is inline assembly. Each
 /// type's entry names its scan. AArch64's `f64` scan is `grouped`, at the speed of memory. Skipping blocks gained it nothing. Each

@@ -60,11 +60,12 @@ fn register(m: &Bound<'_, PyModule>, name: &str, doc: &str, counts: [usize; 2], 
             if let Some(i) = dimensions.iter().position(|&v| v == d) { i } else { dimensions.push(d); dimensions.len() - 1 }
         }).collect()
     }).collect();
-    let widths = [(f16::CODE, 2), (f32::CODE, 4), (f64::CODE, 8), (Complex::<f32>::CODE, 8), (Complex::<f64>::CODE, 16), (bool::CODE, 1), (i64::CODE, 8)];
+    fn code_width<T: Code>() -> (c_char, usize) { (T::CODE as c_char, size_of::<T>()) }
+    let widths = [code_width::<f16>(), code_width::<f32>(), code_width::<f64>(), code_width::<Complex<f32>>(), code_width::<Complex<f64>>(), code_width::<bool>(), code_width::<i64>()];
     let data = loops.iter().map(|(_, codes)| {
         let mut at = 0;
         let args = codes.iter().zip(&shapes).map(|(&code, shape)| {
-            let width = widths.iter().find(|&&(t, _)| t as c_char == code).unwrap().1;
+            let width = widths.iter().find(|&&(t, _)| t == code).unwrap().1;
             at += shape.len();
             Arg { code, width, shape: shape.clone(), at: at - shape.len() }
         }).collect();
@@ -276,7 +277,7 @@ gufunc_types! {
         c.write(2, f.perm, |i| i as i64);
         true
     }
-    /// Reusing an LU factorization: solve, inverse, determinant and log-determinant.
+    /// `lu_solve`: `x` with `a x = b`, from the packed LU factors and row positions of an `m`×`m` matrix `a`.
     LuSolve(c, _: ()) {
         let [n, k] = c.dims();
         let x = with_lu::<E, _>(c, n, |lu| lu.solve(&c.read::<E>(2), k));
@@ -284,6 +285,7 @@ gufunc_types! {
         c.write(3, &x.unwrap_or_else(|| nans(n * k)), E::store);
         ok
     }
+    /// `lu_inverse`: the inverse of an `m`×`m` matrix, from its packed LU factors and row positions.
     LuInverse(c, _: ()) {
         let [n] = c.dims();
         let x = with_lu::<E, _>(c, n, |lu| lu.inverse());
@@ -291,6 +293,8 @@ gufunc_types! {
         c.write(2, &x.unwrap_or_else(|| nans(n * n)), E::store);
         ok
     }
+    /// `lu_slogdet`: the sign of an `m`×`m` matrix's determinant and the natural logarithm of its magnitude, from its packed LU
+    /// factors and row positions.
     LuSlogdet(c, _: ()) {
         let [n] = c.dims();
         let r = with_lu::<E, _>(c, n, |lu| lu.log_determinant());
@@ -299,6 +303,7 @@ gufunc_types! {
         c.write(3, &[log], E::Real::store);
         r.is_some()
     }
+    /// `lu_det`: the determinant of an `m`×`m` matrix, from its packed LU factors and row positions.
     LuDet(c, _: ()) {
         let [n] = c.dims();
         let det = with_lu::<E, _>(c, n, |lu| lu.determinant());
@@ -353,12 +358,13 @@ gufunc_types! {
         c.write(3, &v, E::store);
         ok
     }
-    /// Least-norm solves and pseudoinverses from existing thin SVD factors.
+    /// `svd_solve`: the least-norm `x` with `a x = b`, from the thin SVD factors of an `m`×`n` matrix `a`.
     SvdSolve(c, _: ()) {
         let [m, _, n, k] = c.dims();
         c.write(4, &with_svd::<E, _>(c, [m, n], |svd| svd.solve(&c.read::<E>(3), k)), E::store);
         true
     }
+    /// `svd_pinv`: the pseudoinverse of an `m`×`n` matrix, from its thin SVD factors.
     SvdPinv(c, _: ()) {
         let [m, _, n] = c.dims();
         c.write(3, &with_svd::<E, _>(c, [m, n], |svd| svd.pseudoinverse()), E::store);
