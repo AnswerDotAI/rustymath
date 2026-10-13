@@ -1,85 +1,85 @@
 # The budgets that `tests/speed.rs` checks. Each section starts with a float width in brackets. Each line under it holds a function's name and its budget at that width, separated by a tab. A budget counts copies of as many items as the function's inputs hold.
 # A budget is twice the most the function has cost on a Mac and on CI's runner, and at least 0.5. `basedpl.bpltests.set_budgets` rewrites the budgets under this rule.
-# The CI figures come from `Speed` run 38333871940. Its CPU was the AMD Ryzen 9 7950X3D 16-Core Processor.
+# The CI figures come from `Speed` run 38345248975. Its CPU was the AMD Ryzen 9 7950X3D 16-Core Processor.
 [f64]
 Exp	15
 Expm1	18
-Ln	23
-Log1p	30
+Ln	22
+Log1p	35
 Log2	23
 Log10	23
-Sin	14
+Sin	15
 Cos	16
-Tan	19
+Tan	21
 Asin	16
 Acos	18
-Atan	15
-Sinh	22
-Cosh	16
-Tanh	21
-Asinh	25
-Acosh	27
-Atanh	24
+Atan	17
+Sinh	26
+Cosh	17
+Tanh	25
+Asinh	28
+Acosh	34
+Atanh	28
 Cbrt	19
-Pow	51
-Pow.one	71
-Hypot	9.1
-Root	54
-Root.one	71
-Maximum	3.2
+Pow	48
+Pow.one	83
+Hypot	9.2
+Root	58
+Root.one	87
+Maximum	3.1
 reduce::sum	1.1
-reduce::max	1
-reduce::cumsum	2.5
-reduce::cummax	6
-polynomial::evaluate	8.5
+reduce::max	1.6
+reduce::cumsum	3.5
+reduce::cummax	3.4
+polynomial::evaluate	8.6
 Gamma	320
-Lgamma	170
-Erf	55
-Erfc	250
-Erfinv	62
-Erfcinv	59
+Lgamma	160
+Erf	56
+Erfc	120
+Erfinv	65
+Erfcinv	67
 Gammainc	1700
 Gammaincc	1700
 Gammaincinv	5300
-Betainc	4000
-Betaincinv	12000
-complex Exp	44
-complex Ln	62
-complex Sqrt	18
-complex Sin	49
-complex Tan	57
-complex Asin	78
-complex Atanh	56
-complex Lgamma	300
-complex Gamma	290
-complex Abs	5.1
-complex Sqrt1mx2	44
-complex Pow	110
+Betainc	4200
+Betaincinv	13000
+complex Exp	43
+complex Ln	61
+complex Sqrt	21
+complex Sin	52
+complex Tan	61
+complex Asin	94
+complex Atanh	66
+complex Lgamma	350
+complex Gamma	480
+complex Abs	5
+complex Sqrt1mx2	62
+complex Pow	130
 linalg::PlusTimes	140
-linalg::MaxPlus	610
-linalg::MinPlus	610
-linalg::PlusEqual	290
-linalg::PlusTimes at i64	150
-linalg::PlusEqual at i64	290
-linalg::Lu::solve	97
-linalg::Lu::inverse	280
-linalg::cholesky	52
-linalg::qr	440
-linalg::svd	2100
-linalg::eigh	1200
-linalg::eig	4900
-linalg::eigenvalues	2600
+linalg::MaxPlus	290
+linalg::MinPlus	300
+linalg::PlusEqual	280
+linalg::PlusTimes at i64	160
+linalg::PlusEqual at i64	280
+linalg::Lu::solve	110
+linalg::Lu::inverse	300
+linalg::cholesky	56
+linalg::qr	490
+linalg::svd	2000
+linalg::eigh	1300
+linalg::eig	5100
+linalg::eigenvalues	2700
 linalg::lstsq	68
-complex linalg::Lu::solve	240
-complex linalg::qr	1300
-complex linalg::svd	4400
-complex linalg::eigh	2000
-complex linalg::eig	10000
+complex linalg::Lu::solve	100
+complex linalg::qr	510
+complex linalg::svd	1600
+complex linalg::eigh	880
+complex linalg::eig	4800
 [f32]
 Exp	12
-Expm1	16
+Expm1	15
 Ln	20
-Log1p	27
+Log1p	28
 Log2	20
 Log10	20
 Sin	12
@@ -87,65 +87,65 @@ Cos	14
 Tan	16
 Asin	11
 Acos	13
-Atan	12
-Sinh	18
+Atan	13
+Sinh	19
 Cosh	14
-Tanh	19
-Asinh	22
-Acosh	23
+Tanh	18
+Asinh	23
+Acosh	26
 Atanh	20
 Cbrt	28
-Pow	53
-Pow.one	75
-Hypot	9.6
-Root	56
-Root.one	74
-Maximum	3.6
+Pow	55
+Pow.one	76
+Hypot	9.2
+Root	62
+Root.one	110
+Maximum	3.3
 reduce::sum	1.2
-reduce::max	1.6
-reduce::cumsum	5.2
-reduce::cummax	14
-polynomial::evaluate	7.3
+reduce::max	1.5
+reduce::cumsum	6.3
+reduce::cummax	3.8
+polynomial::evaluate	7.2
 Gamma	170
 Lgamma	140
 Erf	31
-Erfc	130
-Erfinv	59
-Erfcinv	60
-Gammainc	1300
+Erfc	110
+Erfinv	61
+Erfcinv	62
+Gammainc	1400
 Gammaincc	1400
 Gammaincinv	11000
-Betainc	7100
-Betaincinv	21000
-complex Exp	53
-complex Ln	64
-complex Sqrt	17
-complex Sin	50
-complex Tan	59
-complex Asin	75
-complex Atanh	58
-complex Lgamma	330
-complex Gamma	470
+Betainc	8300
+Betaincinv	26000
+complex Exp	52
+complex Ln	62
+complex Sqrt	23
+complex Sin	47
+complex Tan	70
+complex Asin	120
+complex Atanh	74
+complex Lgamma	640
+complex Gamma	810
 complex Abs	5.1
-complex Sqrt1mx2	51
-complex Pow	120
+complex Sqrt1mx2	92
+complex Pow	130
 linalg::PlusTimes	160
-linalg::MaxPlus	660
-linalg::MinPlus	660
-linalg::PlusEqual	300
-linalg::PlusTimes at i64	85
-linalg::PlusEqual at i64	85
-linalg::Lu::solve	130
-linalg::Lu::inverse	340
-linalg::cholesky	65
-linalg::qr	610
-linalg::svd	2900
+linalg::MaxPlus	300
+linalg::MinPlus	300
+linalg::PlusEqual	290
+linalg::PlusTimes at i64	82
+linalg::PlusEqual at i64	83
+linalg::Lu::solve	140
+linalg::Lu::inverse	420
+linalg::cholesky	81
+linalg::qr	660
+linalg::svd	2800
 linalg::eigh	1500
-linalg::eig	5900
-linalg::eigenvalues	3500
-linalg::lstsq	110
-complex linalg::Lu::solve	330
-complex linalg::qr	1800
-complex linalg::svd	5400
-complex linalg::eigh	2700
-complex linalg::eig	12000
+linalg::eig	5600
+linalg::eigenvalues	3400
+linalg::lstsq	100
+complex linalg::Lu::solve	150
+complex linalg::qr	720
+complex linalg::svd	2400
+complex linalg::eigh	1200
+complex linalg::eig	5300

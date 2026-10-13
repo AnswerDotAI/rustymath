@@ -320,8 +320,10 @@ fn cbrt_accuracy() {
 
 #[test]
 fn pow_accuracy() {
-    // Powers that are floats, and powers near overflow and underflow of a base near 1, where the error of ln |x| grows most.
-    let exact: Vec<(f64, f64)> = (2..=12).flat_map(|b| (-30..=60).map(move |k| (b as f64, k as f64))).collect();
+    // Three kinds of points: powers that are floats, whole powers from 2 to 8 of bases that aren't whole, and powers near overflow and
+    // underflow of a base near 1. The second kind squares and multiplies. The third is where the error of ln |x| grows most.
+    let wholes = [0.3, 1.7, 3.14159, 123.456, -2.71828, 1e10, 1e-10].into_iter().flat_map(|x| (2..=8).flat_map(move |k| [(x, k as f64), (x, -k as f64)]));
+    let exact: Vec<(f64, f64)> = (2..=12).flat_map(|b| (-30..=60).map(move |k| (b as f64, k as f64))).chain(wholes).collect();
     let near = [((0.5, 2.0), (-1000.0, 1000.0)), ((1.2, 1.5), (1500.0, 2700.0)), ((0.0, 4.0), (-30.0, 30.0)), ((-8.0, 0.0), (-20.0, 20.0))];
     binary("pow", variants!(pow, 2).into_iter().chain([POW_ONE]), rustymath::pow, f64::powf, &near, &exact);
 }
@@ -536,7 +538,7 @@ mod complex {
                     fn unary<O: Unary<Complex<R>, Out = Complex<R>>>(object: O, z: &[Complex<R>], sliced: bool) -> Complex<R> {
                         if !sliced { return object.one(z[0]) }
                         let mut out = Vec::new();
-                        object.many(Arg::Many(&z[..1]), 1, &mut out);
+                        object.many(Arg::Many(z), z.len(), &mut out);
                         out[0]
                     }
                     fn binary<O: Binary<Complex<R>, Out = Complex<R>>>(object: O, z: &[Complex<R>], sliced: bool) -> Complex<R> {
@@ -643,24 +645,34 @@ mod complex {
     }
 
     /// C99's values on the branch cuts, where the sign of a zero part chooses the side, and exact real or imaginary results on the axes.
+    /// The composite square roots take the side that a zero's sign points to too. Slice forms run on several copies, so they reach
+    /// their vector loops.
     #[test]
     fn cuts_and_axes() {
         let k = |re: f64, im: f64| c(re, im);
-        let (a, b) = (1.3169578969248166, 0.5493061443340549);
+        let (a, b, s, h) = (1.3169578969248166, 0.5493061443340549, 3f64.sqrt(), 0.75f64.sqrt());
         let cases = [
             ("sqrt", k(-4.0, 0.0), k(0.0, 2.0)), ("sqrt", k(-4.0, -0.0), k(0.0, -2.0)),
             ("log", k(-1.0, 0.0), k(0.0, PI)), ("log", k(-1.0, -0.0), k(0.0, -PI)),
             ("asin", k(2.0, 0.0), k(FRAC_PI_2, a)), ("asin", k(2.0, -0.0), k(FRAC_PI_2, -a)),
             ("acos", k(2.0, 0.0), k(0.0, -a)), ("acos", k(2.0, -0.0), k(0.0, a)),
             ("acosh", k(-2.0, 0.0), k(a, PI)), ("acosh", k(-2.0, -0.0), k(a, -PI)),
-            ("atanh", k(2.0, 0.0), k(b, FRAC_PI_2)), ("atanh", k(2.0, -0.0), k(b, -FRAC_PI_2)),
+            ("atanh", k(2.0, 0.0), k(b, FRAC_PI_2)), ("atanh", k(-2.0, 0.0), k(-b, FRAC_PI_2)),
             ("asinh", k(0.0, 2.0), k(a, FRAC_PI_2)), ("asinh", k(-0.0, 2.0), k(-a, FRAC_PI_2)),
             ("atan", k(0.0, 2.0), k(FRAC_PI_2, b)), ("atan", k(-0.0, 2.0), k(-FRAC_PI_2, b)),
+            ("sqrt1mx2", k(2.0, 0.0), k(0.0, -s)), ("sqrt1mx2", k(-2.0, 0.0), k(0.0, s)), ("sqrt1mx2", k(2.0, -0.0), k(0.0, s)),
+            ("sqrtx2m1", k(0.5, 0.0), k(0.0, h)), ("sqrtx2m1", k(-0.5, 0.0), k(0.0, h)), ("sqrtx2m1", k(0.5, -0.0), k(0.0, -h)),
+            ("sqrt1px2", k(0.0, 2.0), k(0.0, s)), ("sqrt1px2", k(-0.0, 2.0), k(0.0, -s)),
         ];
+        let close = |g: f64, w: f64, e: f64| (g - w).abs() <= 4.0 * e * w.abs().max(1.0) && g.is_sign_negative() == w.is_sign_negative();
         for (name, z, want) in cases {
-            let got = double::apply(name, &[z], false).unwrap();
-            let close = |g: f64, w: f64| (g - w).abs() <= 4.0 * f64::EPSILON * w.abs().max(1.0) && g.is_sign_negative() == w.is_sign_negative();
-            assert!(close(got.re, want.re) && close(got.im, want.im), "{name}({z}) gave {got}, not {want}");
+            for sliced in [false, true] {
+                let got = double::apply(name, &[z; 17], sliced).unwrap();
+                assert!(close(got.re, want.re, f64::EPSILON) && close(got.im, want.im, f64::EPSILON), "{name}({z}) gave {got}, not {want}");
+                let got = single::apply(name, &[c(z.re as f32, z.im as f32); 17], sliced).unwrap();
+                let e = f32::EPSILON.into();
+                assert!(close(got.re.into(), want.re, e) && close(got.im.into(), want.im, e), "f32 {name}({z}) gave {got}, not {want}");
+            }
         }
         for x in [0.5, 3.0, -2.0, 700.0, 1e-300] {
             for name in ["exp", "sin", "cos", "sinh", "cosh", "tanh", "tan"] { assert_eq!(double::apply(name, &[k(x, 0.0)], false).unwrap().im, 0.0, "{name}({x})"); }

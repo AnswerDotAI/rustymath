@@ -50,16 +50,21 @@ pub fn binom(n: i64, k: i64) -> Option<i64> {
     // For a negative n, C(k - n - 1, k) is C(k + m, k) with m = -n - 1, which is never negative. k + m fits a u64.
     let (top, negative) = if n >= 0 { (n as u64, false) } else { (k + (n.unsigned_abs() - 1), k % 2 == 1) };
     if top < k { return Some(0) }
-    let c = choose(top, k.min(top - k))? as i128;
+    let c = choose(top, k.min(top - k), 1 << 63)? as i128;
     i64::try_from(if negative { -c } else { c }).ok()
 }
 
+/// The unsigned binomial coefficient, with the full range of `u64` results.
+fn unsigned_binom(n: u64, k: u64) -> Option<u64> {
+    if k > n { Some(0) } else { choose(n, k.min(n - k), u64::MAX) }
+}
+
 /// C(n, k) for 0 ≤ k ≤ n, through C(n, i + 1) = C(n, i) (n - i) / (i + 1), whose division is exact. Each step's product fits a
-/// `u128`. A coefficient beyond 2^63, the largest magnitude an `i64` holds, stops the steps.
-fn choose(n: u64, k: u64) -> Option<u64> {
+/// `u128`. A coefficient beyond the caller's largest representable magnitude stops the steps.
+fn choose(n: u64, k: u64, limit: u64) -> Option<u64> {
     (0..k).try_fold(1u64, |c, i| {
         let c = c as u128 * (n - i) as u128 / (i + 1) as u128;
-        (c <= 1 << 63).then_some(c as u64)
+        (c <= limit as u128).then_some(c as u64)
     })
 }
 
@@ -180,15 +185,17 @@ forms!(
 );
 forms!(Gcd at u64: |_, [x, y]| unsigned_gcd(x, y));
 forms!(Lcm at u64: |_, [x, y]| unsigned_lcm(x, y));
+forms!(Binom at u64: |_, [n, k]| unsigned_binom(n, k));
 forms!(Pow at u64: |_, [x, y]| unsigned_power(x, y));
 forms!(Residue at u64: |_, [x, y]| if x == 0 { y } else { y % x });
 
-/// The narrower types' forms of `Gcd`, `Lcm`, `Pow` and `Residue`, which compute at `i64`. A result that doesn't fit the type fails,
+/// The narrower types' forms of `Gcd`, `Lcm`, `Binom`, `Pow` and `Residue`, which compute at `i64`. A result that doesn't fit the type fails,
 /// as one beyond `i64` does. Every residue fits.
 macro_rules! narrower {
     ($($t:ty),+) => {$(
         forms!(Gcd at $t: |_, [x, y]| gcd(x.into(), y.into()).and_then(|r| <$t>::try_from(r).ok()));
         forms!(Lcm at $t: |_, [x, y]| lcm(x.into(), y.into()).and_then(|r| <$t>::try_from(r).ok()));
+        forms!(Binom at $t: |_, [n, k]| binom(n.into(), k.into()).and_then(|r| <$t>::try_from(r).ok()));
         forms!(Pow at $t: |_, [x, y]| power(x.into(), y.into()).and_then(|r| <$t>::try_from(r).ok()));
         forms!(
             Residue at $t: |_, [x, y]| residue(x.into(), y.into()) as $t,

@@ -1,6 +1,6 @@
 # rustymath
 
-> Fast maths functions for f16, f32 and f64 in plain Rust.
+> Maths in plain Rust, from fast f16, f32 and f64 functions to exact rationals.
 
 ## Modules
 

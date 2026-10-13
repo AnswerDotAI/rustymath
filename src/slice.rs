@@ -71,6 +71,8 @@ macro_rules! arities {
             /// argument is, because rustymath gives NaN for an argument outside a function's domain. An integer result fails where it
             /// doesn't fit its type.
             fn many(&self, $($x: Arg<'_, T>,)+ n: usize, out: &mut Vec<Self::Out>) -> bool;
+            /// `many`, writing the `n` results after the items already written to `out`, on this thread.
+            fn many_into(&self, $($x: Arg<'_, T>,)+ n: usize, out: &mut crate::parallel::Slots<'_, Self::Out>) -> bool;
             /// `one`, or `None` where the item fails, as `many` reports.
             fn checked(&self, $($x: T),+) -> Option<Self::Out>;
         }
@@ -88,9 +90,13 @@ macro_rules! arities {
             fn one(&self, $($x: $e),+) -> Self::Out { self.scalar([$($x),+]) }
             #[inline]
             fn many(&self, $($x: Arg<'_, $e>,)+ n: usize, out: &mut Vec<Self::Out>) -> bool {
-                crate::slice::appended(out, n, |slots| crate::parallel::elementwise(slots, &|start, slots| {
+                crate::slice::appended(out, n, |slots| crate::parallel::split(slots, crate::slice::CHUNK, &|start, slots| {
                     crate::parallel::in_chunks(start, slots, |at, part| self.slice([$($x.part(at, part.len())),+], part.len(), part))
                 }))
+            }
+            #[inline]
+            fn many_into(&self, $($x: Arg<'_, $e>,)+ n: usize, out: &mut crate::parallel::Slots<'_, Self::Out>) -> bool {
+                out.fill(n, |slots| crate::parallel::in_chunks(0, slots, |at, part| self.slice([$($x.part(at, part.len())),+], part.len(), part)))
             }
             #[inline]
             fn checked(&self, $($x: $e),+) -> Option<Self::Out> { self.checked_scalar([$($x),+]) }
@@ -328,7 +334,7 @@ macro_rules! each_pair {
 /// across threads, as [`parallel`](crate::parallel) describes.
 #[inline(never)]
 pub fn pairs<X: Copy + Sync, Y: Copy + Sync, B: Send>(x: Arg<'_, X>, y: Arg<'_, Y>, n: usize, out: &mut Vec<B>, f: impl Fn(X, Y) -> (B, bool) + Sync) -> bool {
-    appended(out, n, |slots| crate::parallel::elementwise(slots, &|start, slots| pairs_into(x.part(start, slots.len()), y.part(start, slots.len()), slots.len(), slots, |a, b| f(a, b))))
+    appended(out, n, |slots| crate::parallel::split(slots, CHUNK, &|start, slots| pairs_into(x.part(start, slots.len()), y.part(start, slots.len()), slots.len(), slots, |a, b| f(a, b))))
 }
 
 /// [`pairs`], writing into the `n` slots of `out` in place of appending to a vector.

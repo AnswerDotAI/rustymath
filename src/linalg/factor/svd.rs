@@ -3,8 +3,8 @@
 //! rotation of two columns of the bidiagonal matrix also rotates two rows of Vᵀ, and each rotation of two rows rotates two rows of Uᵀ, so
 //! the rotations read contiguous memory, as `eigen`'s do. Each right reflection of a complex matrix maps the conjugate of its row, as in
 //! LAPACK's `zgebrd`. The same sweeps then diagonalise its real bidiagonal matrix, rotating complex rows by real rotations. A matrix
-//! more than 11/6 times as tall as it is wide first reduces to the R of its QR factorization. A wider one is replaced by its conjugate
-//! transpose.
+//! more than 11/6 times as tall as it is wide first reduces to the R of its QR factorization, through CholeskyQR2 where `qr` or `lstsq`
+//! would use it. A wider one is replaced by its conjugate transpose.
 //!
 //! Above `SPLIT` columns, divide and conquer gives the bidiagonal matrix's singular vectors, and the reflections apply to them without
 //! forming Q, as LAPACK's `dbdsdc` and `dormbr` do. The recursion, the deflation and the arrow matrix's SVD follow faer's
@@ -21,9 +21,9 @@ where
     if m < n {
         // The conjugate transpose's SVD is V Σ Uᴴ.
         let Svd { u, s, v, .. } = svd_factor(&adjoint(a, m, n), [n, m], vectors);
-        return Svd { size: [m, n], u: v, s, v: u };
+        return Svd::new([m, n], v, s, u);
     }
-    let svd = |(u, s, v)| Svd { size: [m, n], u, s, v };
+    let svd = |(u, s, v)| Svd::new([m, n], u, s, v);
     let undefined = || {
         let nan = T::Real::nan();
         let filled = |len| if vectors { vec![T::from_real(nan); len] } else { Vec::new() };
@@ -31,16 +31,97 @@ where
     };
     if a.iter().any(|x| !(x.re().is_finite() && x.im().is_finite())) { return undefined() }
     if 6 * m < 11 * n { return bidiagonal_svd(a, [m, n], vectors).map_or_else(undefined, svd) }
-    // A tall matrix's SVD is the SVD of its R, with U multiplied by Q.
+    // A tall matrix's SVD is the SVD of its R, with U multiplied by Q. CholeskyQR2 gives Q and R where `qr` would use it, or only R
+    // for singular values where `lstsq` would. Householder reflections give them otherwise.
+    let cholesky = if vectors { tall_for_qr([m, n]) } else { tall_for_lstsq([m, n]) };
+    if cholesky && let Some((r, q)) = tall_qr(a, [m, n], if vectors { Tall::Q } else { Tall::R }) {
+        let Some((ur, s, v)) = bidiagonal_svd(&r, [n, n], vectors) else { return undefined() };
+        let mut u = Vec::new();
+        if vectors {
+            u = filled(m * n, T::zero());
+            T::add_product(&mut u, n, |i, j| q[i * n + j], Rows(&ur, n), [m, n, n]);
+        }
+        return svd((u, s, v));
+    }
     let (reflections, r) = reflect(a, [m, n]);
     let Some((ur, s, v)) = bidiagonal_svd(&r, [n, n], vectors) else { return undefined() };
     let mut u = Vec::new();
     if vectors {
-        u = vec![T::zero(); m * n];
+        u = filled(m * n, T::zero());
         u[..n * n].copy_from_slice(&ur);
         reflections.apply(&mut u, n);
     }
     svd((u, s, v))
+}
+
+/// Columns beyond `k` in `truncated_factor`'s test matrix. Halko, Martinsson and Tropp suggest about 10.
+const OVERSAMPLE: usize = 10;
+/// Power iterations in `truncated_factor`. Each multiplies by `aᴴ` and `a` once more, which separates slowly decaying singular values.
+const POWERS: usize = 2;
+
+/// `truncated_svd` for `T`: an approximation to the `k` largest singular values of the `m`×`n` matrix `a` and their singular vectors,
+/// by Halko, Martinsson and Tropp's randomized range finder. `a` times `k + OVERSAMPLE` pseudorandom columns spans a space close to
+/// that of the leading left singular vectors. `POWERS` power iterations refine it, with a thin QR factorization after each product.
+/// The SVD of `a` projected onto that space gives the result. Where
+/// `k + OVERSAMPLE` reaches `a`'s smaller side, the result is the thin SVD's first `k` columns. A matrix holding a NaN or an infinity
+/// gives NaN for every result.
+pub(super) fn truncated_factor<T: Scalar + Tiled>(a: &[T], [m, n]: [usize; 2], k: usize) -> Svd<T>
+where
+    T::Real: Tiled,
+{
+    assert_eq!(a.len(), m * n, "`a` must hold `m`×`n` items");
+    let p = m.min(n);
+    let (k, l) = (k.min(p), (k + OVERSAMPLE).min(p));
+    if l == p { return leading(svd_factor(a, [m, n], true), k) }
+    if m < n {
+        // The conjugate transpose's SVD is V Σ Uᴴ.
+        let Svd { u, s, v, .. } = truncated_factor(&adjoint(a, m, n), [n, m], k);
+        return Svd::new([m, n], v, s, u);
+    }
+    let times = |x: &[T]| {
+        let mut y = filled(m * l, T::zero());
+        T::add_product(&mut y, l, |i, r| a[i * n + r], Rows(x, l), [m, n, l]);
+        y
+    };
+    let adjoint_times = |x: &[T]| {
+        let mut y = filled(n * l, T::zero());
+        T::add_product(&mut y, l, |i, r| a[r * n + i].conj(), Rows(x, l), [n, m, l]);
+        y
+    };
+    let basis = |y: Vec<T>, rows: usize| qr_factor(&y, [rows, l], false).0;
+    let mut q = basis(times(&test_matrix(n * l)), m);
+    for _ in 0..POWERS { q = basis(times(&basis(adjoint_times(&q), n)), m) }
+    // B = Qᴴ a is `l`×`n`, and its SVD B = U_B Σ Vᴴ gives a ≈ (Q U_B) Σ Vᴴ.
+    let mut b = filled(l * n, T::zero());
+    T::add_product(&mut b, n, |i, r| q[r * l + i].conj(), Rows(a, n), [l, m, n]);
+    let Svd { u: ub, s, v, .. } = svd_factor(&b, [l, n], true);
+    let mut u = filled(m * l, T::zero());
+    T::add_product(&mut u, l, |i, r| q[i * l + r], Rows(&ub, l), [m, l, l]);
+    leading(Svd::new([m, n], u, s, v), k)
+}
+
+/// The first `k` singular values of `svd`, with their singular vectors.
+fn leading<T: Scalar>(Svd { size: [m, n], u, s, v, .. }: Svd<T>, k: usize) -> Svd<T> {
+    let p = s.len();
+    let first = |x: Vec<T>, rows: usize| {
+        if k == p { return x }
+        let mut y = Vec::with_capacity(rows * k);
+        for i in 0..rows { y.extend_from_slice(&x[i * p..i * p + k]) }
+        y
+    };
+    Svd::new([m, n], first(u, m), s[..k].to_vec(), first(v, n))
+}
+
+/// `len` numbers uniform from -1 to 1, from SplitMix64 with a fixed seed.
+fn test_matrix<T: Scalar>(len: usize) -> Vec<T> {
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    (0..len).map(|_| {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let z = (state ^ (state >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        let z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        let z = z ^ (z >> 31);
+        T::from_real(<T::Real as crate::Float>::narrow((z >> 11) as f64 * 2f64.powi(-52) - 1.0))
+    }).collect()
 }
 
 /// The SVD of the finite `m`×`n` matrix `a`, where `m` is at least `n`, through its bidiagonal form B, as `svd_factor` gives it. Singular
@@ -98,8 +179,8 @@ where
 /// transpose and maps a column. Each right reflection maps the conjugate of a row, then applies from the right. Each left reflection's
 /// vector stays below the diagonal in its column, and each right reflection's beyond the superdiagonal in its row, each with its leading
 /// 1 left out. Each step makes one pass over the rows below its own. The pass applies both of its reflections to each row, then adds
-/// the row's part of the next step's `vᴴ A`.
-fn bidiagonalize<T: Scalar>(w: &mut [T], [m, n]: [usize; 2]) -> (Vec<T::Real>, Vec<T::Real>, Vec<T>, Vec<T>) {
+/// the row's part of the next step's `vᴴ A`. `eigen::summed_rows` splits each pass's rows across threads.
+fn bidiagonalize<T: Scalar + Tiled>(w: &mut [T], [m, n]: [usize; 2]) -> (Vec<T::Real>, Vec<T::Real>, Vec<T>, Vec<T>) {
     let zero = T::Real::zero();
     let (mut d, mut left) = (vec![zero; n], vec![T::zero(); n]);
     let (mut e, mut right) = (vec![zero; n.saturating_sub(1)], vec![T::zero(); n.saturating_sub(1)]);
@@ -108,8 +189,9 @@ fn bidiagonalize<T: Scalar>(w: &mut [T], [m, n]: [usize; 2]) -> (Vec<T::Real>, V
     // column k, times the conjugate of its item in column k.
     let (mut column, mut next) = (vec![T::zero(); m], vec![T::zero(); m]);
     let (mut y, mut next_y, mut z) = (vec![T::zero(); n], vec![T::zero(); n], vec![T::zero(); n]);
+    let mut parts = Vec::new();
     for i in 0..m { column[i] = w[i * n] }
-    for i in 1..m { axpy(&mut y[..n - 1], column[i].conj(), &w[i * n + 1..(i + 1) * n]) }
+    eigen::summed_rows(&mut w[n..], n, m - 1, &mut y[..n - 1], &mut parts, |i, row, sums| axpy(sums, column[i + 1].conj(), &row[1..]));
     for k in 0..n {
         let width = n - k - 1;
         let x = &mut column[..m - k];
@@ -132,9 +214,10 @@ fn bidiagonalize<T: Scalar>(w: &mut [T], [m, n]: [usize; 2]) -> (Vec<T::Real>, V
         if width > 0 { (right[k], e[k]) = (tau_r, pivot[0].re()) }
         let sums = &mut next_y[..width.saturating_sub(1)];
         sums.fill(T::zero());
-        for (j, row) in rest.chunks_exact_mut(n).enumerate() {
+        let (x, z, pivot) = (&*x, &*z, &*pivot);
+        eigen::summed_rows(rest, n, m - k - 1, sums, &mut parts, |j, row, sums| {
             row[k] = x[j + 1];
-            if width == 0 { continue }
+            if width == 0 { return }
             let r = &mut row[k + 1..];
             if tau != T::zero() { axpy(r, -(tau.conj() * x[j + 1]), z) }
             if tau_r != T::zero() {
@@ -143,9 +226,9 @@ fn bidiagonalize<T: Scalar>(w: &mut [T], [m, n]: [usize; 2]) -> (Vec<T::Real>, V
                 r[0] = r[0] - s;
                 axpyc(&mut r[1..], -s, &pivot[1..]);
             }
-            next[j] = r[0];
             if j > 0 { axpy(sums, r[0].conj(), &r[1..]) }
-        }
+        });
+        if width > 0 { for (j, row) in rest.chunks_exact(n).enumerate() { next[j] = row[k + 1] } }
         std::mem::swap(&mut column, &mut next);
         std::mem::swap(&mut y, &mut next_y);
     }
@@ -167,10 +250,9 @@ fn golub_kahan<T: Scalar>(d: &mut [T::Real], e: &mut [T::Real], ut: &mut [T], vt
     if n < 2 { return Some(()) }
     let (m, w, vectors) = (ut.len() / n, vt.len() / n, !vt.is_empty());
     let (zero, eps) = (T::Real::zero(), T::Real::epsilon());
-    let hypot = |x: T::Real, y: T::Real| x.mla::<FUSED>(x, y * y).sqrt();
     // The rotation that takes (y, z) to (r, 0), as (c, s, r).
     let givens = |y: T::Real, z: T::Real| {
-        let r = hypot(y, z);
+        let r = plain_hypot(y, z);
         if r == zero { (T::Real::one(), zero, zero) } else { (y / r, z / r, r) }
     };
     let tiny = eps * d.iter().chain(e.iter()).fold(zero, |b, &x| b.max(x.abs()));
@@ -208,7 +290,7 @@ fn golub_kahan<T: Scalar>(d: &mut [T::Real], e: &mut [T::Real], ut: &mut [T], vt
         let t00 = d[a] * d[a] + if a > start { e[a - 1] * e[a - 1] } else { zero };
         let (t11, t01) = (d[b] * d[b] + e[a] * e[a], d[a] * e[a]);
         let half = (t00 - t11) / (T::Real::one() + T::Real::one());
-        let delta = hypot(half, t01);
+        let delta = plain_hypot(half, t01);
         let denominator = half + if half < zero { -delta } else { delta };
         let mu = if denominator == zero { t11 } else { t11 - t01 * t01 / denominator };
         let (mut y, mut z) = (d[start] * d[start] - mu, d[start] * e[start]);
@@ -302,8 +384,11 @@ fn conquer<R: Native + Tiled>(d: &mut [R], sub: &mut [R], leaf: usize) -> Option
     // The whole matrix's left singular vectors are M's, times the halves' put together. U's column 0 is c0 q1 over s0 q2, its column n
     // is -s0 q1 over c0 q2, and its other columns are the halves' vectors.
     let mut ut = vec![zero; (n + 1) * (n + 1)];
-    R::add_product(&mut ut, n + 1, |j, p| um[j * (n + 1) + p], |p, i| if p == 0 { c0 * q1[i] } else { u1[(p - 1) * w1 + i] }, [n + 1, w1, w1]);
-    R::add_product(&mut ut[w1..], n + 1, |j, p| um[j * (n + 1) + w1 + p], |p, i| if p == rem { c0 * q2[i] } else { u2[p * w2 + i] }, [n + 1, w2, w2]);
+    let b1: Vec<R> = q1.iter().map(|&q| c0 * q).chain(u1[..k * w1].iter().copied()).collect();
+    let mut b2 = u2.clone();
+    for x in &mut b2[rem * w2..] { *x = c0 * *x }
+    R::add_product(&mut ut, n + 1, |j, p| um[j * (n + 1) + p], Rows(&b1, w1), [n + 1, w1, w1]);
+    R::add_product(&mut ut[w1..], n + 1, |j, p| um[j * (n + 1) + w1 + p], Rows(&b2, w2), [n + 1, w2, w2]);
     for (row, m) in ut.chunks_exact_mut(n + 1).zip(um.chunks_exact(n + 1)) {
         let (top, bottom) = row.split_at_mut(w1);
         axpy(top, -s0 * m[n], q1);
@@ -311,8 +396,8 @@ fn conquer<R: Native + Tiled>(d: &mut [R], sub: &mut [R], leaf: usize) -> Option
     }
     // V's column 0 is the unit vector at row k, and its other columns are the halves' vectors.
     let mut vt = vec![zero; n * n];
-    R::add_product(&mut vt, n, |j, p| vm[j * n + 1 + p], |p, i| v1[p * k + i], [n, k, k]);
-    R::add_product(&mut vt[w1..], n, |j, p| vm[j * n + w1 + p], |p, i| v2[p * rem + i], [n, rem, rem]);
+    R::add_product(&mut vt, n, |j, p| vm[j * n + 1 + p], Rows(&v1, k), [n, k, k]);
+    R::add_product(&mut vt[w1..], n, |j, p| vm[j * n + w1 + p], Rows(&v2, rem), [n, rem, rem]);
     for (row, m) in vt.chunks_exact_mut(n).zip(vm.chunks_exact(n)) { row[k] = m[0] }
     for x in d.iter_mut() { *x = *x * largest }
     Some((ut, vt))
@@ -438,7 +523,7 @@ fn deflate<R: Native>(d: &mut [R], z: &mut [R], k: usize) -> (Vec<usize>, Vec<(u
 /// The SVD of the deflated n×n arrow matrix M with diagonal `d` and first column `z`, where `d[0]` equals `z[0]`. Its singular values
 /// replace `d`, in descending order. It gives the rows of Uᵀ, (n+1)×(n+1), whose last
 /// row is the unit vector at item n, and of Vᵀ, n×n, with their items in the order of M's rows before `deflate` permuted them by `outer`.
-fn arrow<R: Native>(d: &mut [R], z: &[R], outer: &[usize]) -> (Vec<R>, Vec<R>) {
+fn arrow<R: Native + Tiled>(d: &mut [R], z: &[R], outer: &[usize]) -> (Vec<R>, Vec<R>) {
     let (n, zero, one) = (d.len(), R::zero(), R::one());
     d[0] = zero;
     let mut actual = n;
@@ -458,34 +543,46 @@ fn arrow<R: Native>(d: &mut [R], z: &[R], outer: &[usize]) -> (Vec<R>, Vec<R>) {
     let mut last = n;
     while last > 1 && z[last - 1] == zero { last -= 1 }
     let norm = z.iter().fold(zero, |s, &x| x.mla::<FUSED>(x, s)).sqrt();
-    let (mut s, mut shifts, mut mus) = (vec![zero; n], vec![zero; n], vec![zero; n]);
-    for k in 0..n {
-        if z[k] == zero || last == 1 {
-            s[k] = if k == 0 { z[0] } else { d[k] };
-            shifts[k] = s[k];
-            continue;
+    let mut roots = vec![(zero, zero, zero); n];
+    crate::parallel::split(&mut roots, 1, &|first, out| {
+        for (j, root) in out.iter_mut().enumerate() {
+            let k = first + j;
+            *root = if z[k] == zero || last == 1 {
+                let s = if k == 0 { z[0] } else { d[k] };
+                (s, s, zero)
+            } else {
+                let end = k == last - 1;
+                let right = if end { d[last - 1] + norm } else { d[(k + 1..n).find(|&l| z[l] != zero).expect("a later item of z is nonzero")] };
+                let (shift, mu) = secular::root(&f, &four, d[k], right, end);
+                (shift + mu, shift, mu)
+            };
         }
-        let end = k == last - 1;
-        let right = if end { d[last - 1] + norm } else { d[(k + 1..n).find(|&l| z[l] != zero).expect("a later item of z is nonzero")] };
-        let (shift, mu) = secular::root(&f, &four, d[k], right, end);
-        (s[k], shifts[k], mus[k]) = (shift + mu, shift, mu);
-    }
+        true
+    });
+    let mut s: Vec<R> = roots.iter().map(|r| r.0).collect();
+    let shifts: Vec<R> = roots.iter().map(|r| r.1).collect();
+    let mus: Vec<R> = roots.iter().map(|r| r.2).collect();
     // Gu and Eisenstat's z: the vector for which the computed singular values are exact. Its singular vectors come out orthogonal.
     let mut zhat = vec![zero; n];
     if let Some(&tail) = perm.last() {
-        for k in (0..n).filter(|&k| z[k] != zero) {
-            let dk = d[k];
-            let mut product = (s[tail] + dk) * (mus[tail] + (shifts[tail] - dk));
-            for (l, &i) in perm.iter().enumerate().filter(|&(_, &i)| i != k) {
-                if i >= k && l == 0 {
-                    product = zero;
-                    break;
+        crate::parallel::split(&mut zhat, 1, &|first, out| {
+            for (j, zk) in out.iter_mut().enumerate() {
+                let k = first + j;
+                if z[k] == zero { continue }
+                let dk = d[k];
+                let mut product = (s[tail] + dk) * (mus[tail] + (shifts[tail] - dk));
+                for (l, &i) in perm.iter().enumerate().filter(|&(_, &i)| i != k) {
+                    if i >= k && l == 0 {
+                        product = zero;
+                        break;
+                    }
+                    let j = if i < k || l == 0 { i } else { perm[l - 1] };
+                    product = product * (((s[j] + dk) / (d[i] + dk)) * ((mus[j] + (shifts[j] - dk)) / (d[i] - dk)));
                 }
-                let j = if i < k || l == 0 { i } else { perm[l - 1] };
-                product = product * (((s[j] + dk) / (d[i] + dk)) * ((mus[j] + (shifts[j] - dk)) / (d[i] - dk)));
+                *zk = if z[k] > zero { product.sqrt() } else { -product.sqrt() };
             }
-            zhat[k] = if z[k] > zero { product.sqrt() } else { -product.sqrt() };
-        }
+            true
+        });
     }
     let mut order: Vec<usize> = (0..actual).collect();
     for i in 1..actual {
@@ -496,24 +593,31 @@ fn arrow<R: Native>(d: &mut [R], z: &[R], outer: &[usize]) -> (Vec<R>, Vec<R>) {
     }
     let mut rank = vec![0; actual];
     for (i, &k) in order.iter().enumerate() { rank[k] = i }
+    let mut from = vec![0; n];
+    for k in 0..n { from[if k < actual { actual - rank[k] - 1 } else { k }] = k }
     let (mut ut, mut vt) = (vec![zero; (n + 1) * (n + 1)], vec![zero; n * n]);
     let unit = |x: &mut [R]| {
         let norm = x.iter().fold(zero, |s, &v| v.mla::<FUSED>(v, s)).sqrt();
         for v in x.iter_mut() { *v = *v / norm }
     };
-    for k in 0..n {
-        let row = if k < actual { actual - rank[k] - 1 } else { k };
-        let (u, v) = (&mut ut[row * (n + 1)..row * (n + 1) + n], &mut vt[row * n..(row + 1) * n]);
-        if zhat[k] == zero {
-            (u[outer[k]], v[outer[k]]) = (one, one);
-            continue;
-        }
-        let (shift, mu) = (shifts[k], mus[k]);
-        for &i in &perm { u[outer[i]] = zhat[i] / ((d[i] - shift) - mu) / (d[i] + (shift + mu)) }
-        unit(u);
-        v[outer[0]] = -one;
-        for &i in &perm[1..] { v[outer[i]] = d[i] * zhat[i] / ((d[i] - shift) - mu) / (d[i] + (shift + mu)) }
-        unit(v);
+    {
+        let mut rows: Vec<(&mut [R], &mut [R])> = ut.chunks_exact_mut(n + 1).zip(vt.chunks_exact_mut(n)).collect();
+        crate::parallel::split(&mut rows, 1, &|start, pairs| {
+            for (row, (u, v)) in (start..).zip(pairs.iter_mut()) {
+                let (u, k) = (&mut u[..n], from[row]);
+                if zhat[k] == zero {
+                    (u[outer[k]], v[outer[k]]) = (one, one);
+                    continue;
+                }
+                let (shift, mu) = (shifts[k], mus[k]);
+                for &i in &perm { u[outer[i]] = zhat[i] / ((d[i] - shift) - mu) / (d[i] + (shift + mu)) }
+                unit(u);
+                v[outer[0]] = -one;
+                for &i in &perm[1..] { v[outer[i]] = d[i] * zhat[i] / ((d[i] - shift) - mu) / (d[i] + (shift + mu)) }
+                unit(v);
+            }
+            true
+        });
     }
     ut[n * (n + 1) + n] = one;
     for i in 0..n { d[i] = if i < actual { s[actual - i - 1] } else { s[i] } }

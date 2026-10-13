@@ -11,7 +11,7 @@ use std::ops::{Add, Mul, Neg, Sub};
 /// algorithms give the same real results as algorithms written for reals alone. The trait has no `/`. Quotients go through `quotient`
 /// and `reciprocal`, which keep a complex quotient from overflowing where its result fits.
 pub trait Scalar:
-    Sealed + Copy + PartialEq + Zero + One + Add<Output = Self> + Sub<Output = Self> + Mul<Output = Self> + Neg<Output = Self>
+    Sealed + Copy + PartialEq + Zero + One + Add<Output = Self> + Sub<Output = Self> + Mul<Output = Self> + Neg<Output = Self> + Send + Sync
 {
     /// The type of the real and imaginary parts.
     type Real: Native;

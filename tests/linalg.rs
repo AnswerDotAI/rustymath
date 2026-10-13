@@ -162,8 +162,7 @@ mod factor {
 
     /// Checks each decomposition at `T` on matrices either side of the block width, where `tolerance` is a few times `T`'s epsilon.
     fn decompositions<T: RealItem>(tolerance: f64) {
-        let nb = lu_block(0);
-        for n in [0, 1, 2, 5, nb - 1, nb, nb + 1, 2 * nb + 7] {
+        for n in [0, 1, 2, 5, 31, 32, 33, 71] {
             let bound = tolerance * (n as f64).max(1.0);
             let a = random::<T>(n, n, n as u64 + 1);
             let aw = wide(&a);
@@ -284,7 +283,7 @@ mod factor {
                 assert_eq!((xs, svs), (x, times(&sv, s)), "lstsq scaled by {s:?} at {rows}×{cols}");
             }
         }
-        let n = 2 * lu_block(0) + 7;
+        let n = 71;
         for zero in [0, n / 2, n - 1] {
             let a: Vec<T> = random::<T>(n, n, 29).iter().enumerate().map(|(k, &v)| if k % n == zero { T::zero() } else { v }).collect();
             let (aw, f) = (wide(&a), lu(&a, n));
@@ -381,7 +380,7 @@ mod factor {
             }
         }
         // Least squares applies Qᴴ to both few and many right-hand sides, without exposing the stored reflections.
-        let n = 2 * lu_block(0) + 7;
+        let n = 71;
         let rows = n + 5;
         let a = random::<T>(rows, n, rows as u64 + 7);
         let (q, r) = qr(&a, [rows, n]);
@@ -398,6 +397,127 @@ mod factor {
     fn blocked_decompositions_have_small_residuals() {
         blocked::<f64>(4.0 * f64::EPSILON);
         blocked::<f32>(4.0 * f32::EPSILON as f64);
+    }
+
+    /// The `m`×`n` matrix U diag(s) Vᵀ, with orthonormal U and V from fixed seeds and the singular values `s`.
+    pub(super) fn with_spectrum(m: usize, n: usize, s: &[f64]) -> Vec<f64> {
+        let (u, v) = (qr(&random::<f64>(m, n, 3), [m, n]).0, qr(&random::<f64>(n, n, 5), [n, n]).0);
+        let us: Vec<f64> = (0..m * n).map(|k| u[k] * s[k % n]).collect();
+        PlusTimes.inner(&us, &transpose(&v, n, n), [m, n, n])
+    }
+
+    /// QR, least squares and the SVD of tall matrices, with condition numbers from 1 to `worst`, which Cholesky QR factors, and 1e12,
+    /// which falls back to Householder QR. Each matrix's singular values run from 1 down to 1/condition. Its first item is positive, so
+    /// R's first item is positive on the Cholesky path and negative on Householder's.
+    fn tall<T: RealItem>(tolerance: f64, worst: f64) {
+        let tiny = T::min_positive_value() / T::epsilon();
+        let quartic = T::narrow(2f64.powi((T::max_value().log2().wide() / 4.0) as i32 + 6));
+        let times = |x: &[T], c: T| x.iter().map(|&v| v * c).collect::<Vec<T>>();
+        for (m, n) in [(4000, 20), (8000, 60)] {
+            let bound = tolerance * n as f64;
+            for condition in [1.0, worst.sqrt(), worst, 1e12] {
+                let s: Vec<f64> = (0..n).map(|j| condition.powf(-(j as f64) / (n - 1) as f64)).collect();
+                let mut aw = with_spectrum(m, n, &s);
+                if aw[0] < 0.0 { aw[..n].iter_mut().for_each(|x| *x = -*x) }
+                let a: Vec<T> = aw.iter().map(|&x| T::narrow(x)).collect();
+                let (aw, at) = (wide(&a), format!("{m}×{n}, condition {condition:e}"));
+                let (q, r) = qr(&a, [m, n]);
+                let (qw, rw) = (wide(&q), wide(&r));
+                assert_eq!(rw[0] > 0.0, condition < 1e12, "qr's path at {at}");
+                assert!(distance(&product(&qw, &rw, [m, n, n]), &aw, norm(&aw)) < bound, "tall qr at {at}");
+                assert!(orthogonality(&qw, m, n) < bound, "tall qr's q at {at}");
+                assert!((0..n * n).all(|k| k % n >= k / n || rw[k] == 0.0), "tall qr's r at {at}");
+                // `lstsq` leaves its residual orthogonal to A's columns, and gives A's singular values.
+                let b = random::<T>(m, 2, 11);
+                let (x, sv) = lstsq(&a, &b, [m, n], 2);
+                let xw = wide(&x);
+                let residual: Vec<f64> = product(&aw, &xw, [m, n, 2]).iter().zip(wide(&b)).map(|(ax, b)| ax - b).collect();
+                let normal = product(&transpose(&aw, m, n), &residual, [n, m, 2]);
+                let scale = norm(&aw);
+                assert!(norm(&normal) / (scale * (scale * norm(&xw) + norm(&wide(&b)))) < bound, "tall lstsq at {at}");
+                let svd_s = wide(&singular_values(&a, [m, n]));
+                assert!(distance(&wide(&sv), &svd_s, svd_s[0]) < bound, "tall lstsq's singular values at {at}");
+                // The SVD reduces to R by `qr`'s path, and gives the singular values A was built with.
+                let f = svd(&a, [m, n]);
+                let (uw, sw, vw) = (wide(&f.u), wide(&f.s), wide(&f.v));
+                let usw: Vec<f64> = (0..m * n).map(|k| uw[k] * sw[k % n]).collect();
+                assert!(distance(&product(&usw, &transpose(&vw, n, n), [m, n, n]), &aw, norm(&aw)) < bound, "tall svd at {at}");
+                assert!(orthogonality(&uw, m, n) < 4.0 * bound, "tall svd's u at {at}");
+                assert!(distance(&sw, &s, 1.0) < bound, "tall svd's singular values at {at}");
+            }
+            // Scaling by a power of two scales R and the singular values exactly. Unlike R of a matrix with orthonormal columns, a random
+            // matrix's R has no items small enough to lose bits as subnormals when scaled down.
+            let (a, b) = (random::<T>(m, n, 7), random::<T>(m, 2, 13));
+            let ((q, r), (x, sv)) = (qr(&a, [m, n]), lstsq(&a, &b, [m, n], 2));
+            for c in [tiny, tiny.recip(), quartic] {
+                assert_eq!(qr(&times(&a, c), [m, n]), (q.clone(), times(&r, c)), "tall qr scaled by {c:?} at {m}×{n}");
+                assert_eq!(lstsq(&times(&a, c), &times(&b, c), [m, n], 2), (x.clone(), times(&sv, c)), "tall lstsq scaled by {c:?} at {m}×{n}");
+            }
+        }
+    }
+
+    #[test]
+    fn tall_matrices() {
+        tall::<f64>(4.0 * f64::EPSILON, 1e7);
+        tall::<f32>(4.0 * f32::EPSILON as f64, 1e2);
+    }
+
+    /// A tall matrix 520 columns wide takes the Cholesky path, with the same accuracy as the narrow ones in `tall_matrices`.
+    #[test]
+    fn tall_wide_matrices() {
+        let (m, n) = (8320, 520);
+        let bound = 4.0 * f64::EPSILON * n as f64;
+        let s: Vec<f64> = (0..n).map(|j| 1e3f64.powf(-(j as f64) / (n - 1) as f64)).collect();
+        let mut a = with_spectrum(m, n, &s);
+        if a[0] < 0.0 { a[..n].iter_mut().for_each(|x| *x = -*x) }
+        let (q, r) = qr(&a, [m, n]);
+        assert!(r[0] > 0.0, "wide tall qr takes the Cholesky path");
+        assert!(distance(&PlusTimes.inner(&q, &r, [m, n, n]), &a, norm(&a)) < bound, "wide tall qr");
+        assert!(distance(&PlusTimes.inner(&transpose(&q, m, n), &q, [n, m, n]), &identity::<f64>(n), 1.0) < bound, "wide tall qr's q");
+        let b = random::<f64>(m, 2, 11);
+        let (x, sv) = lstsq(&a, &b, [m, n], 2);
+        let residual: Vec<f64> = product(&a, &x, [m, n, 2]).iter().zip(&b).map(|(ax, b)| ax - b).collect();
+        let scale = norm(&a);
+        assert!(norm(&product(&transpose(&a, m, n), &residual, [n, m, 2])) / (scale * (scale * norm(&x) + norm(&b))) < bound, "wide tall lstsq");
+        assert!(distance(&sv, &s, 1.0) < bound, "wide tall lstsq's singular values");
+    }
+
+    /// The truncated SVD of matrices whose singular values decay fast and slowly: its values at or just below the ones they estimate, its
+    /// vectors orthonormal, and its error within 10% of the best rank-`k` approximation's.
+    fn truncated<T: RealItem>(tolerance: f64) {
+        let (m, n, k) = (2000, 300, 10);
+        let bound = tolerance * n as f64;
+        let fast: Vec<f64> = (0..n).map(|j| 0.5f64.powi(j as i32)).collect();
+        let slow: Vec<f64> = (0..n).map(|j| 1.0 / (1 + j) as f64).collect();
+        for (decay, s) in [("fast", fast), ("slow", slow)] {
+            let a: Vec<T> = with_spectrum(m, n, &s).iter().map(|&x| T::narrow(x)).collect();
+            let f = truncated_svd(&a, [m, n], k);
+            assert_eq!((f.u.len(), f.s.len(), f.v.len()), (m * k, k, n * k), "truncated svd's sizes, {decay} decay");
+            let (uw, sw, vw) = (wide(&f.u), wide(&f.s), wide(&f.v));
+            assert!(orthogonality(&uw, m, k) < bound && orthogonality(&vw, n, k) < bound, "truncated svd's vectors, {decay} decay");
+            assert!(sw.iter().zip(&s).all(|(&e, &t)| e <= t * (1.0 + bound) && e >= 0.9 * t), "truncated svd's values, {decay} decay");
+            let usw: Vec<f64> = (0..m * k).map(|i| uw[i] * sw[i % k]).collect();
+            let error = distance(&product(&usw, &transpose(&vw, n, k), [m, k, n]), &wide(&a), 1.0);
+            assert!(error <= 1.1 * norm(&s[k..]) + bound, "truncated svd's error, {decay} decay");
+        }
+        // A test matrix as wide as the smaller side gives the thin SVD's leading values, for a tall matrix and for its transpose.
+        let small = random::<T>(40, 30, 19);
+        let leading = svd(&small, [40, 30]).s[..25].to_vec();
+        assert_eq!(truncated_svd(&small, [40, 30], 25).s, leading, "truncated svd of a small tall matrix");
+        assert_eq!(truncated_svd(&transpose(&small, 40, 30), [30, 40], 25).s, leading, "truncated svd of a small wide matrix");
+        // A matrix holding a NaN or an infinity gives NaN for every result.
+        for bad in [T::nan(), T::infinity()] {
+            let mut a = random::<T>(100, 60, 23);
+            a[61] = bad;
+            let f = truncated_svd(&a, [100, 60], 5);
+            assert!(f.u.iter().chain(&f.s).chain(&f.v).all(|x| x.is_nan()), "truncated svd of a matrix holding {bad:?}");
+        }
+    }
+
+    #[test]
+    fn truncated_svds() {
+        truncated::<f64>(4.0 * f64::EPSILON);
+        truncated::<f32>(4.0 * f32::EPSILON as f64);
     }
 
     type C64 = num_complex::Complex<f64>;
@@ -426,8 +546,7 @@ mod factor {
         Complex<R>: Factor + Scalar<Real = R>,
     {
         let zero = C64::new(0.0, 0.0);
-        let nb = lu_block(0);
-        for n in [0, 1, 2, 5, nb - 1, nb, nb + 1, 2 * nb + 7] {
+        for n in [0, 1, 2, 5, 31, 32, 33, 71] {
             let bound = tolerance * (n as f64).max(1.0);
             let a = complex_random::<R>(n, n, n as u64 + 1);
             let (aw, i) = (complex_wide(&a), identity::<C64>(n));
@@ -473,6 +592,31 @@ mod factor {
         complex_decompositions::<f32>(4.0 * f32::EPSILON as f64);
         complex_svd_and_eigen::<f64>(4.0 * f64::EPSILON);
         complex_svd_and_eigen::<f32>(4.0 * f32::EPSILON as f64);
+        complex_tall::<f64>(4.0 * f64::EPSILON);
+        complex_tall::<f32>(4.0 * f32::EPSILON as f64);
+    }
+
+    /// QR and least squares of a tall, well-conditioned complex matrix, which Cholesky QR factors, giving R a real, positive diagonal.
+    /// The matrix's first item has a positive real part, which Householder QR would turn into a negative item of R.
+    fn complex_tall<R: RealItem>(tolerance: f64)
+    where
+        Complex<R>: Factor + Scalar<Real = R>,
+    {
+        let (m, n) = (2000, 24);
+        let bound = tolerance * n as f64;
+        let mut a = complex_random::<R>(m, n, 41);
+        if a[0].re < R::zero() { a[..n].iter_mut().for_each(|z| *z = -*z) }
+        let (q, r) = qr(&a, [m, n]);
+        let (aw, q, r) = (complex_wide(&a), complex_wide(&q), complex_wide(&r));
+        assert!(complex_distance(&complex_product(&q, &r, [m, n, n]), &aw, complex_norm(&aw)) < bound, "tall complex qr");
+        assert!(complex_distance(&complex_product(&adjoint(&q, m, n), &q, [n, m, n]), &identity::<C64>(n), 1.0) < bound, "tall complex qr's q");
+        assert!((0..n).all(|j| r[j * n + j].im == 0.0 && r[j * n + j].re > 0.0), "tall complex qr's diagonal");
+        let b = complex_random::<R>(m, 2, 43);
+        let x = complex_wide(&lstsq(&a, &b, [m, n], 2).0);
+        let residual: Vec<C64> = complex_product(&aw, &x, [m, n, 2]).iter().zip(complex_wide(&b)).map(|(ax, b)| ax - b).collect();
+        let normal = complex_product(&adjoint(&aw, m, n), &residual, [n, m, 2]);
+        let scale = complex_norm(&aw);
+        assert!(complex_norm(&normal) / (scale * (scale * complex_norm(&x) + complex_norm(&complex_wide(&b)))) < bound, "tall complex lstsq");
     }
 
 
@@ -608,6 +752,14 @@ mod eigen {
         // A 2×2 block whose subdiagonal is barely above the negligible size.
         let a = tridiagonal_matrix(&[1.0000000000000002, 1.0000000000000002], &[7.216449660063518e-16]);
         check(&a, 2, &eigh(&a, 2).unwrap(), bound, "a nearly diagonal 2×2 matrix");
+        // In a matrix of rank 4, Householder reduction leaves only rounding noise below the leading rows. The iterations must count that
+        // noise as negligible against the matrix's norm. The 50-row case runs QL. The 300-row case runs divide and conquer.
+        for n in [50, 300] {
+            let p: Vec<f64> = (0..n * n).map(|k| (k as f64).sin()).collect();
+            let a: Vec<f64> = (0..n * n).map(|k| p[k] + p[k % n * n + k / n]).collect();
+            check(&a, n, &eigh(&a, n).expect("a matrix of rank 4 converges"), 64.0 * f64::EPSILON * n as f64, "a matrix of rank 4");
+            assert!(hermitian_eigenvalues(&a, n).is_some(), "eigenvalues alone of a matrix of rank 4 at {n}");
+        }
     }
 
     #[test]

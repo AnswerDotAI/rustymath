@@ -6,16 +6,19 @@
 //! The loops follow GotoBLAS and BLIS. Packing copies a block of each argument into a contiguous buffer sized for a cache level. The
 //! blocking reuses each buffer while it is in cache. A micro-kernel computes a small tile of the result in registers, one step of `p`
 //! at a time. A micro-kernel in plain Rust vectorizes through LLVM's SLP vectorizer, which the builds of rustymath and basedpl turn on
-//! at opt-level 2. It vectorizes only tiles of up to 32 items, too few to keep the multiply-add units busy. Plain Rust also
-//! takes four operations for a maximum or minimum that gives NaN beside NaN, where AArch64's `fmax` and wasm's `max` take one. On
-//! AArch64, in wasm and on x86-64 with AVX2 and FMA, the float pairs run micro-kernels on explicit vectors instead. AVX2's extremes
-//! compare and select, because its own maximum and minimum skip NaN. Other targets run the plain kernels.
+//! at opt-level 2. It vectorizes only tiles of up to 32 items, too few to keep the multiply-add units busy. On AArch64, in wasm
+//! and on x86-64 with AVX2 and FMA, the float pairs run micro-kernels on explicit vectors instead. Their maximum and minimum are each
+//! target's own instruction: `fmax` on AArch64, `max` in wasm and `maxpd` on x86-64. On AArch64 and in wasm a NaN term makes a
+//! result NaN. On x86-64 a NaN term is skipped. Targets without these vectors run the plain kernels.
+//!
+//! A product large enough splits its rows across the threads that [`crate::parallel::set_threads`] sets.
 //!
 //! The private module `factor` holds decompositions of real and complex matrices, whose blocked updates run on these loops. This module
 //! re-exports its public items, and [`Scalar`], the trait of the item types they take. [`transpose_into`] transposes a matrix through 8×8
 //! tiles.
-use crate::{convert, float::{sealed::Core, FUSED}, Float, Native};
+use crate::{convert, float::{sealed::Core, FUSED}, parallel, slice, Float, Native};
 use num_complex::Complex;
+use std::mem::MaybeUninit;
 
 mod factor;
 mod scalar;
@@ -25,7 +28,16 @@ pub use scalar::Scalar;
 
 /// The `n`×`n` identity matrix.
 pub(crate) fn identity<T: num_traits::Zero + num_traits::One>(n: usize) -> Vec<T> {
-    (0..n * n).map(|k| if k % (n + 1) == 0 { T::one() } else { T::zero() }).collect()
+    let mut x = Vec::new();
+    identity_into(&mut x, n);
+    x
+}
+
+/// [`identity`], written into `x` in place of its old items.
+pub(crate) fn identity_into<T: num_traits::Zero + num_traits::One>(x: &mut Vec<T>, n: usize) {
+    x.clear();
+    x.extend(std::iter::repeat_with(T::zero).take(n * n));
+    for i in 0..n { x[i * (n + 1)] = T::one() }
 }
 
 /// Writes the transpose of the `rows`×`cols` matrix in `src`, whose rows start `ls` items apart, into `dst`, whose rows start `ld`
@@ -55,13 +67,15 @@ pub fn transpose_into<S: Copy, D>(src: &[S], ls: usize, dst: &mut [D], ld: usize
 /// rustymath, as slice forms do.
 pub trait Inner<T> {
     /// The type of each result.
-    type Out;
+    type Out: Copy;
     /// The `m`×`n` inner product of `a`, an `m`×`k` matrix, and `b`, a `k`×`n` matrix, both row-major, as a row-major matrix. `size`
     /// is `[m, k, n]`. Where `k` is 0, each result is the identity of `f`. Integer arithmetic wraps, as NumPy's does.
     fn inner(&self, a: &[T], b: &[T], size: [usize; 3]) -> Vec<Self::Out>;
     /// `inner`, or `None` where an integer result could overflow, for callers that keep integers exact. A result it gives is the exact
     /// value. Floats never give `None`.
     fn checked(&self, a: &[T], b: &[T], size: [usize; 3]) -> Option<Vec<Self::Out>> { Some(self.inner(a, b, size)) }
+    /// `inner`, written into `out`, which holds `m`×`n` items.
+    fn inner_into(&self, a: &[T], b: &[T], size: [usize; 3], out: &mut [Self::Out]) { out.copy_from_slice(&self.inner(a, b, size)) }
 }
 
 /// `+.×`, the matrix product, at `i64`, `f32` and `f64`, and complex numbers with parts of either type. Each float step is a fused
@@ -71,10 +85,10 @@ pub trait Inner<T> {
 /// real part keeps about 10 of f64's 16 digits and about 1 of f32's 7. A result whose 3M imaginary part isn't finite takes four real
 /// products instead.
 pub struct PlusTimes;
-/// `⌈.+`, the max-plus product of longest-path problems, at `i64`, `f32` and `f64`. Its maximum is NaN beside NaN, as
-/// [`reduce::maximum`](crate::reduce::maximum) is.
+/// `⌈.+`, the max-plus product of longest-path problems, at `i64`, `f32` and `f64`. On AArch64 a NaN term makes its result NaN.
+/// Other targets skip NaN terms.
 pub struct MaxPlus;
-/// `⌊.+`, the min-plus product of shortest-path problems, at `i64`, `f32` and `f64`. Its minimum is NaN beside NaN.
+/// `⌊.+`, the min-plus product of shortest-path problems, at `i64`, `f32` and `f64`. Its minimum treats NaN as `MaxPlus`'s maximum does.
 pub struct MinPlus;
 /// `∨.∧` on Booleans: whether some `p` has both `a[i][p]` and `b[p][j]`.
 pub struct OrAnd;
@@ -89,7 +103,7 @@ pub struct PlusNotEqual;
 
 /// The scalar operations of a pair at item type `T`.
 trait Pair<T> {
-    type Out: Copy;
+    type Out: Copy + Send;
     /// The identity of `f`: the result of folding no steps.
     const UNIT: Self::Out;
     fn g(a: T, b: T) -> Self::Out;
@@ -117,7 +131,7 @@ macro_rules! floats {
             #[inline(always)]
             fn g(a: $t, b: $t) -> $t { a + b }
             #[inline(always)]
-            fn f(x: $t, y: $t) -> $t { Core::maximum(x, y) }
+            fn f(acc: $t, term: $t) -> $t { Core::maximum(term, acc) }
         }
         impl Pair<$t> for MinPlus {
             type Out = $t;
@@ -125,7 +139,7 @@ macro_rules! floats {
             #[inline(always)]
             fn g(a: $t, b: $t) -> $t { a + b }
             #[inline(always)]
-            fn f(x: $t, y: $t) -> $t { Core::minimum(x, y) }
+            fn f(acc: $t, term: $t) -> $t { Core::minimum(term, acc) }
         }
     )+};
 }
@@ -276,25 +290,48 @@ macro_rules! inner {
         impl Inner<$t> for $object {
             type Out = $out;
             fn inner(&self, a: &[$t], b: &[$t], size: [usize; 3]) -> Vec<Self::Out> {
+                let mut c = filled(size[0] * size[2], <$object as Pair<$t>>::UNIT);
+                self.inner_into(a, b, size, &mut c);
+                c
+            }
+            fn inner_into(&self, a: &[$t], b: &[$t], size: [usize; 3], out: &mut [Self::Out]) {
                 const MR: usize = $tile[0];
                 const NR: usize = $tile[1];
-                tiled_inner::<$t, $object, MR, NR>(a, b, size, $kernel::<MR, NR, { NR * size_of::<$t>() / tiles::BYTES }>)
+                tiled_into::<$t, $object, MR, NR>(a, b, size, out, $kernel::<MR, NR, { NR * size_of::<$t>() / tiles::BYTES }>)
             }
         }
     )+};
 }
+/// `n` copies of `x`. `vec!` of zeros allocates through calloc, whose `madvise` on a large block costs more than writing its items.
+fn filled<T: Clone>(n: usize, x: T) -> Vec<T> {
+    let mut v = Vec::with_capacity(n);
+    v.resize(n, x);
+    v
+}
 /// `P`'s inner product of `a` and `b`, as `Inner::inner` gives it, through `kernel` on tiles of `MR`×`NR`.
 #[inline(always)]
-fn tiled_inner<T: Copy + Default, P: Pair<T>, const MR: usize, const NR: usize>(
+fn tiled_inner<T: Copy + Default + Send + Sync, P: Pair<T>, const MR: usize, const NR: usize>(
+    a: &[T],
+    b: &[T],
+    size: [usize; 3],
+    kernel: impl Fn(&[T], &[T], &mut [[P::Out; NR]; MR], bool) + Sync,
+) -> Vec<P::Out> {
+    let mut c = filled(size[0] * size[2], P::UNIT);
+    tiled_into::<T, P, MR, NR>(a, b, size, &mut c, kernel);
+    c
+}
+/// `tiled_inner`, written into `c`, which holds `m`×`n` items.
+#[inline(always)]
+fn tiled_into<T: Copy + Default + Send + Sync, P: Pair<T>, const MR: usize, const NR: usize>(
     a: &[T],
     b: &[T],
     [m, k, n]: [usize; 3],
-    kernel: impl Fn(&[T], &[T], &mut [[P::Out; NR]; MR], bool),
-) -> Vec<P::Out> {
-    assert!(a.len() == m * k && b.len() == k * n, "`a` must hold `m`×`k` items and `b` `k`×`n`");
-    let mut c = vec![P::UNIT; m * n];
-    product::<T, P, MR, NR>(&mut c, n, |i, p| a[i * k + p], |p, j| b[p * n + j], [m, k, n], true, false, kernel);
-    c
+    c: &mut [P::Out],
+    kernel: impl Fn(&[T], &[T], &mut [[P::Out; NR]; MR], bool) + Sync,
+) {
+    assert!(a.len() == m * k && b.len() == k * n && c.len() == m * n, "`a` must hold `m`×`k` items, `b` `k`×`n` and `c` `m`×`n`");
+    if k == 0 { c.fill(P::UNIT) }
+    product::<T, P, MR, NR>(c, n, |i, p| a[i * k + p], Rows(b, n), [m, k, n], true, Part::Whole, kernel);
 }
 inner! {
     PlusTimes at f64 => f64: tiles::TIMES64, times64;
@@ -394,29 +431,53 @@ fn exactly<F: Float, P: Inner<F, Out = F>>(pair: &P, a: &[i64], b: &[i64], size:
     pair.inner(&floats(a), &floats(b), size).into_iter().map(|x| convert::shifted(x.wide())).collect()
 }
 
+/// A matrix whose rows start `ld` items apart in a slice, as `Rows(items, ld)`. `product` copies each run of a row from one checked
+/// slice.
+pub(crate) struct Rows<'a, T>(pub &'a [T], pub usize);
+impl<T: Copy> Rows<'_, T> {
+    /// Writes `out.len()` items of row `p` into `out`, from column `j` on.
+    #[inline(always)]
+    fn run(&self, p: usize, j: usize, out: &mut [MaybeUninit<T>]) {
+        let items = &self.0[p * self.1 + j..][..out.len()];
+        for l in 0..out.len() { out[l] = MaybeUninit::new(items[l]) }
+    }
+}
 /// Item types whose matrix products run on the tiled `+.×` kernels: `f32` and `f64`, and complex numbers with parts of either type.
 /// The decompositions in `factor` build on them.
-pub(crate) trait Tiled: Copy + Default {
-    /// `c += a b`, where `c` is an `m`×`n` matrix whose rows start `ldc` items apart, and `a(i, p)` and `b(p, j)` give the items of
-    /// the `m`×`k` matrix `a` and the `k`×`n` matrix `b`. `size` is `[m, k, n]`.
-    fn add_product(c: &mut [Self], ldc: usize, a: impl Fn(usize, usize) -> Self, b: impl Fn(usize, usize) -> Self, size: [usize; 3]);
-    /// `add_product` for the items of `c` on and below its diagonal. Items above it change too, where their tile reaches the diagonal.
-    fn add_lower_product(c: &mut [Self], ldc: usize, a: impl Fn(usize, usize) -> Self, b: impl Fn(usize, usize) -> Self, size: [usize; 3]);
+pub(crate) trait Tiled: Copy + Default + Send + Sync {
+    /// `c += a b` for the items of `c` in `part`, where `c` is an `m`×`n` matrix whose rows start `ldc` items apart, `a(i, p)` gives the
+    /// items of the `m`×`k` matrix `a`, and `b` holds the `k`×`n` matrix `b`. `size` is `[m, k, n]`. Items outside `part` change too,
+    /// where their tile reaches the diagonal.
+    fn add_part_product(c: &mut [Self], ldc: usize, a: impl Fn(usize, usize) -> Self + Sync, b: Rows<'_, Self>, size: [usize; 3], part: Part);
+    /// `add_part_product` for all of `c`.
+    #[inline]
+    fn add_product(c: &mut [Self], ldc: usize, a: impl Fn(usize, usize) -> Self + Sync, b: Rows<'_, Self>, size: [usize; 3]) {
+        Self::add_part_product(c, ldc, a, b, size, Part::Whole)
+    }
+    /// `add_part_product` for the items of `c` on and below its diagonal.
+    #[inline]
+    fn add_lower_product(c: &mut [Self], ldc: usize, a: impl Fn(usize, usize) -> Self + Sync, b: Rows<'_, Self>, size: [usize; 3]) {
+        Self::add_part_product(c, ldc, a, b, size, Part::Lower)
+    }
+}
+/// The items of a product's result that it must fold: all of them, or those on and below its diagonal.
+#[derive(Clone, Copy)]
+pub(crate) enum Part { Whole, Lower }
+impl Part {
+    /// The columns of row `i` that this part holds, in a row of `n` items.
+    #[inline(always)]
+    fn columns(self, i: usize, n: usize) -> std::ops::Range<usize> {
+        match self { Part::Whole => 0..n, Part::Lower => 0..(i + 1).min(n) }
+    }
 }
 macro_rules! tiled {
     ($($t:ty: $tile:ident, $kernel:ident;)+) => {$(
         impl Tiled for $t {
             #[inline]
-            fn add_product(c: &mut [$t], ldc: usize, a: impl Fn(usize, usize) -> $t, b: impl Fn(usize, usize) -> $t, size: [usize; 3]) {
+            fn add_part_product(c: &mut [$t], ldc: usize, a: impl Fn(usize, usize) -> $t + Sync, b: Rows<'_, $t>, size: [usize; 3], part: Part) {
                 const MR: usize = tiles::$tile[0];
                 const NR: usize = tiles::$tile[1];
-                product::<$t, PlusTimes, MR, NR>(c, ldc, a, b, size, false, false, $kernel::<MR, NR, { NR * size_of::<$t>() / tiles::BYTES }>)
-            }
-            #[inline]
-            fn add_lower_product(c: &mut [$t], ldc: usize, a: impl Fn(usize, usize) -> $t, b: impl Fn(usize, usize) -> $t, size: [usize; 3]) {
-                const MR: usize = tiles::$tile[0];
-                const NR: usize = tiles::$tile[1];
-                product::<$t, PlusTimes, MR, NR>(c, ldc, a, b, size, false, true, $kernel::<MR, NR, { NR * size_of::<$t>() / tiles::BYTES }>)
+                product::<$t, PlusTimes, MR, NR>(c, ldc, a, b, size, false, part, $kernel::<MR, NR, { NR * size_of::<$t>() / tiles::BYTES }>)
             }
         }
     )+};
@@ -425,48 +486,43 @@ tiled! {
     f64: TIMES64, times64;
     f32: TIMES32, times32;
 }
-/// A complex product sums real products of the parts into `c`, each on the real kernels. With `p = aᵣ bᵣ`, `q = aᵢ bᵢ` and
-/// `s = (aᵣ + aᵢ)(bᵣ + bᵢ)`, the real part of `c` gains `p - q` and the imaginary part gains `s - p - q`, as the 3M method forms them
-/// from three real products. Where a result's `s - p - q` isn't finite, through an overflow or a non-finite item, its imaginary part
-/// gains `aᵣ bᵢ + aᵢ bᵣ` instead, from two more real products, as four real products give it. `$method` names the real product. With
-/// `$lower`, only the items on and below the diagonal gain the sums.
-macro_rules! parts {
-    ($c:ident, $ldc:ident, $a:ident, $b:ident, $size:ident, $method:ident, $lower:expr) => {{
-        let [m, k, n] = $size;
+impl<R: Native + Tiled> Tiled for Complex<R> {
+    /// Sums real products of the parts into `c`, each on the real kernels. With `p = aᵣ bᵣ`, `q = aᵢ bᵢ` and `s = (aᵣ + aᵢ)(bᵣ + bᵢ)`,
+    /// the real part of `c` gains `p - q` and the imaginary part gains `s - p - q`, as the 3M method forms them from three real products.
+    /// Where a result's `s - p - q` isn't finite, through an overflow or a non-finite item, its imaginary part gains `aᵣ bᵢ + aᵢ bᵣ`
+    /// instead, from two more real products, as four real products give it. Only the items in `part` gain the sums.
+    fn add_part_product(c: &mut [Self], ldc: usize, a: impl Fn(usize, usize) -> Self + Sync, b: Rows<'_, Self>, size: [usize; 3], part: Part) {
+        let [m, k, n] = size;
         if m == 0 || k == 0 || n == 0 { return }
-        let width = |i: usize| if $lower { (i + 1).min(n) } else { n };
-        let (mut p, mut q, mut s) = (vec![R::zero(); m * n], vec![R::zero(); m * n], vec![R::zero(); m * n]);
-        R::$method(&mut p, n, |i, l| $a(i, l).re, |l, j| $b(l, j).re, $size);
-        R::$method(&mut q, n, |i, l| $a(i, l).im, |l, j| $b(l, j).im, $size);
-        R::$method(&mut s, n, |i, l| { let x = $a(i, l); x.re + x.im }, |l, j| { let y = $b(l, j); y.re + y.im }, $size);
+        let (mut p, mut q, mut s) = (filled(m * n, R::zero()), filled(m * n, R::zero()), filled(m * n, R::zero()));
+        let (mut br, mut bi, mut bs) = (filled(k * n, R::zero()), filled(k * n, R::zero()), filled(k * n, R::zero()));
+        for l in 0..k {
+            let (row, re, im, sum) = (&b.0[l * b.1..][..n], &mut br[l * n..][..n], &mut bi[l * n..][..n], &mut bs[l * n..][..n]);
+            for j in 0..n { (re[j], im[j], sum[j]) = (row[j].re, row[j].im, row[j].re + row[j].im) }
+        }
+        R::add_part_product(&mut p, n, |i, l| a(i, l).re, Rows(&br, n), size, part);
+        R::add_part_product(&mut q, n, |i, l| a(i, l).im, Rows(&bi, n), size, part);
+        R::add_part_product(&mut s, n, |i, l| { let x = a(i, l); x.re + x.im }, Rows(&bs, n), size, part);
         let mut finite = true;
         for i in 0..m {
-            for j in 0..width(i) {
-                let (t, x) = (i * n + j, &mut $c[i * $ldc + j]);
+            for j in part.columns(i, n) {
+                let (t, x) = (i * n + j, &mut c[i * ldc + j]);
                 let im = s[t] - p[t] - q[t];
                 finite &= im.is_finite();
                 *x = Complex::new(x.re + (p[t] - q[t]), if im.is_finite() { x.im + im } else { x.im });
             }
         }
         if !finite {
-            let mut four = vec![R::zero(); m * n];
-            R::$method(&mut four, n, |i, l| $a(i, l).re, |l, j| $b(l, j).im, $size);
-            R::$method(&mut four, n, |i, l| $a(i, l).im, |l, j| $b(l, j).re, $size);
+            let mut four = filled(m * n, R::zero());
+            R::add_part_product(&mut four, n, |i, l| a(i, l).re, Rows(&bi, n), size, part);
+            R::add_part_product(&mut four, n, |i, l| a(i, l).im, Rows(&br, n), size, part);
             for i in 0..m {
-                for j in 0..width(i) {
-                    let (t, x) = (i * n + j, &mut $c[i * $ldc + j]);
+                for j in part.columns(i, n) {
+                    let (t, x) = (i * n + j, &mut c[i * ldc + j]);
                     if !(s[t] - p[t] - q[t]).is_finite() { x.im = x.im + four[t] }
                 }
             }
         }
-    }};
-}
-impl<R: Native + Tiled> Tiled for Complex<R> {
-    fn add_product(c: &mut [Self], ldc: usize, a: impl Fn(usize, usize) -> Self, b: impl Fn(usize, usize) -> Self, size: [usize; 3]) {
-        parts!(c, ldc, a, b, size, add_product, false)
-    }
-    fn add_lower_product(c: &mut [Self], ldc: usize, a: impl Fn(usize, usize) -> Self, b: impl Fn(usize, usize) -> Self, size: [usize; 3]) {
-        parts!(c, ldc, a, b, size, add_lower_product, true)
     }
 }
 /// `+.×` on complex matrices, through `Tiled`'s three real products. Each item type has its own impl, so the loops compile in rustymath.
@@ -476,8 +532,8 @@ macro_rules! complex_inner {
             type Out = Complex<$r>;
             fn inner(&self, a: &[Complex<$r>], b: &[Complex<$r>], [m, k, n]: [usize; 3]) -> Vec<Self::Out> {
                 assert!(a.len() == m * k && b.len() == k * n, "`a` must hold `m`×`k` items and `b` `k`×`n`");
-                let mut c = vec![Complex::default(); m * n];
-                Complex::<$r>::add_product(&mut c, n, |i, p| a[i * k + p], |p, j| b[p * n + j], [m, k, n]);
+                let mut c = filled(m * n, Complex::default());
+                Complex::<$r>::add_product(&mut c, n, |i, p| a[i * k + p], Rows(b, n), [m, k, n]);
                 c
             }
         }
@@ -584,27 +640,15 @@ mod lanes {
         min_plus64: f64, 2, f64x2_splat, v128_load, v128_store, |a, b| f64x2_add(a, b), |c| f64x2_min(c, f64x2_add(a, b));
         min_plus32: f32, 4, f32x4_splat, v128_load, v128_store, |a, b| f32x4_add(a, b), |c| f32x4_min(c, f32x4_add(a, b));
     }
-    // AVX2's `maxpd` and `minpd` give their second argument beside NaN. These steps compare and select as `Core::maximum` does.
+    // AVX2's `maxpd` and `minpd` give their second argument beside NaN.
     #[cfg(target_arch = "x86_64")]
     lanes! {
         times64: f64, 4, _mm256_set1_pd, _mm256_loadu_pd, _mm256_storeu_pd, |a, b| _mm256_mul_pd(a, b), |c| _mm256_fmadd_pd(a, b, c);
         times32: f32, 8, _mm256_set1_ps, _mm256_loadu_ps, _mm256_storeu_ps, |a, b| _mm256_mul_ps(a, b), |c| _mm256_fmadd_ps(a, b, c);
-        max_plus64: f64, 4, _mm256_set1_pd, _mm256_loadu_pd, _mm256_storeu_pd, |a, b| _mm256_add_pd(a, b), |c| {
-            let s = _mm256_add_pd(a, b);
-            _mm256_blendv_pd(s, c, _mm256_or_pd(_mm256_cmp_pd::<_CMP_GT_OQ>(c, s), _mm256_cmp_pd::<_CMP_UNORD_Q>(c, c)))
-        };
-        max_plus32: f32, 8, _mm256_set1_ps, _mm256_loadu_ps, _mm256_storeu_ps, |a, b| _mm256_add_ps(a, b), |c| {
-            let s = _mm256_add_ps(a, b);
-            _mm256_blendv_ps(s, c, _mm256_or_ps(_mm256_cmp_ps::<_CMP_GT_OQ>(c, s), _mm256_cmp_ps::<_CMP_UNORD_Q>(c, c)))
-        };
-        min_plus64: f64, 4, _mm256_set1_pd, _mm256_loadu_pd, _mm256_storeu_pd, |a, b| _mm256_add_pd(a, b), |c| {
-            let s = _mm256_add_pd(a, b);
-            _mm256_blendv_pd(s, c, _mm256_or_pd(_mm256_cmp_pd::<_CMP_LT_OQ>(c, s), _mm256_cmp_pd::<_CMP_UNORD_Q>(c, c)))
-        };
-        min_plus32: f32, 8, _mm256_set1_ps, _mm256_loadu_ps, _mm256_storeu_ps, |a, b| _mm256_add_ps(a, b), |c| {
-            let s = _mm256_add_ps(a, b);
-            _mm256_blendv_ps(s, c, _mm256_or_ps(_mm256_cmp_ps::<_CMP_LT_OQ>(c, s), _mm256_cmp_ps::<_CMP_UNORD_Q>(c, c)))
-        };
+        max_plus64: f64, 4, _mm256_set1_pd, _mm256_loadu_pd, _mm256_storeu_pd, |a, b| _mm256_add_pd(a, b), |c| _mm256_max_pd(_mm256_add_pd(a, b), c);
+        max_plus32: f32, 8, _mm256_set1_ps, _mm256_loadu_ps, _mm256_storeu_ps, |a, b| _mm256_add_ps(a, b), |c| _mm256_max_ps(_mm256_add_ps(a, b), c);
+        min_plus64: f64, 4, _mm256_set1_pd, _mm256_loadu_pd, _mm256_storeu_pd, |a, b| _mm256_add_pd(a, b), |c| _mm256_min_pd(_mm256_add_pd(a, b), c);
+        min_plus32: f32, 8, _mm256_set1_ps, _mm256_loadu_ps, _mm256_storeu_ps, |a, b| _mm256_add_ps(a, b), |c| _mm256_min_ps(_mm256_add_ps(a, b), c);
     }
     /// Micro-kernels whose tile starts at zero, for `PlusEqual`, as `super::micro` on vectors of `$lanes` items, with each row of the tile
     /// `V` vectors. Where items are equal, a comparison gives a lane of all ones, which is -1 as an integer. Subtracting it adds 1 to the
@@ -670,64 +714,118 @@ mod lanes {
 #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"), all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")))]
 use lanes::*;
 
+/// The multiply-adds in each band of rows that `product` hands to a thread. On an M5 Max, 2^19 made 512×512 QR and inverses
+/// 5 to 13% faster on 4 threads than 2^20 did. 2^18 made `+.×`, Cholesky and QR 10 to 40% slower on 18 threads than 2^19.
+const BAND_WORK: usize = 1 << 19;
+
+/// The multiply-adds that waking one more thread costs a product. A panel of `w` multiply-adds splits across at most √(w / `THREAD_WORK`)
+/// threads, the count that minimises w / t + t × `THREAD_WORK`. On an M5 Max, `+.×` of two 256×256 matrices took 21.6 copies on 8
+/// threads and 28.8 on 18, and larger products were fastest on all 18.
+const THREAD_WORK: usize = 1 << 17;
+
+/// The most items of `b` that `product` packs into one panel. It splits each panel's bands across threads in one call, however many
+/// steps of `KC` the panel holds.
+const PANEL: usize = 1 << 22;
+/// The most bytes of `b` that `product` packs into one panel when this thread's calls run serially, as on a pool thread. Larger panels
+/// outgrow the cache: on an M5 Max, a one-thread Gram product of a 16384×256 f64 matrix took 3% longer with 8 MB panels and 10% longer
+/// with 32 MB ones, and a threaded tall QR whose threads each ran one such product was 2% slower with 4 MB panels than with 2 MB ones.
+const SERIAL_PANEL: usize = 2 << 20;
 /// Folds the inner product of `P` into `c`, an `m`×`n` matrix whose rows start `ldc` items apart, with `kernel` folding each `MR`×`NR`
-/// tile as `micro` does. `a(i, p)` and `b(p, j)` give the items of the `m`×`k` matrix `a` and the `k`×`n` matrix `b`. With `start`, the
-/// product replaces `c`, which must then hold `f`'s identity where `k` is 0. Otherwise each result folds into `c`'s item with `f`. With
-/// `lower`, only tiles that reach the diagonal or below it fold, which leaves `c`'s upper triangle partly folded.
+/// tile as `micro` does. `a(i, p)` gives the items of the `m`×`k` matrix `a`, and `b` holds the `k`×`n` matrix `b`. With `start`, the
+/// product replaces `c`, which must then hold `f`'s identity where `k` is 0. Otherwise each result folds into `c`'s item with `f`. Only
+/// tiles that hold items of `part` fold. Items outside `part` in those tiles fold too. Each block of `NC`
+/// columns packs `b` in panels of at most [`PANEL`] items, or [`SERIAL_PANEL`] bytes on one thread, across threads as [`parallel::split`] chooses. Then it runs bands of rows
+/// across at most √(w / [`THREAD_WORK`]) of this thread's [`parallel::threads`], for a panel of `w` multiply-adds: about one band for each
+/// [`BAND_WORK`] multiply-adds, up to four bands for each thread, each at most `MC` rows. Each band runs the panel's steps of `KC` in
+/// turn, packing its own block of `a` for each.
 #[inline(always)]
-fn product<T: Copy + Default, P: Pair<T>, const MR: usize, const NR: usize>(
+fn product<T: Copy + Default + Send + Sync, P: Pair<T>, const MR: usize, const NR: usize>(
     c: &mut [P::Out],
     ldc: usize,
-    a: impl Fn(usize, usize) -> T,
-    b: impl Fn(usize, usize) -> T,
+    a: impl Fn(usize, usize) -> T + Sync,
+    b: Rows<'_, T>,
     [m, k, n]: [usize; 3],
     start: bool,
-    lower: bool,
-    kernel: impl Fn(&[T], &[T], &mut [[P::Out; NR]; MR], bool),
+    part: Part,
+    kernel: impl Fn(&[T], &[T], &mut [[P::Out; NR]; MR], bool) + Sync,
 ) {
     if m == 0 || k == 0 || n == 0 { return; }
     assert!(ldc >= n && c.len() >= (m - 1) * ldc + n, "`c` must hold `m` rows of `n` items, `ldc` apart");
-    let mut ap = vec![T::default(); MC.min(m).next_multiple_of(MR) * KC.min(k)];
-    let mut bp = vec![T::default(); NC.min(n).next_multiple_of(NR) * KC.min(k)];
+    let c = &mut c[..(m - 1) * ldc + n];
+    let width = NC.min(n).next_multiple_of(NR);
+    let panel = if parallel::threads() == 1 { SERIAL_PANEL / size_of::<T>() } else { PANEL };
+    let depth = (panel / (width * KC)).clamp(1, k.div_ceil(KC)) * KC;
+    let mut bp = Vec::with_capacity(width * depth.min(k));
     for jc in (0..n).step_by(NC) {
         let nc = NC.min(n - jc);
-        for pc in (0..k).step_by(KC) {
-            let kc = KC.min(k - pc);
-            let load = pc > 0 || !start;
-            pack::<_, NR>(&mut bp, kc, nc, |p, j| b(pc + p, jc + j));
-            for ic in (0..m).step_by(MC) {
-                let mc = MC.min(m - ic);
-                if lower && ic + mc <= jc { continue }
-                pack::<_, MR>(&mut ap, kc, mc, |p, i| a(ic + i, pc + p));
-                for jr in (0..nc).step_by(NR) {
-                    for ir in (0..mc).step_by(MR) {
-                        if lower && ic + ir + MR.min(mc - ir) <= jc + jr { continue }
-                        let (rows, cols) = (MR.min(mc - ir), NR.min(nc - jr));
-                        let at = |r: usize, s: usize| (ic + ir + r) * ldc + jc + jr + s;
-                        let mut t = [[P::UNIT; NR]; MR];
-                        if load { for r in 0..rows { for s in 0..cols { t[r][s] = c[at(r, s)] } } }
-                        kernel(&ap[ir * kc..(ir + MR) * kc], &bp[jr * kc..(jr + NR) * kc], &mut t, !load);
-                        for r in 0..rows { for s in 0..cols { c[at(r, s)] = t[r][s] } }
+        for pp in (0..k).step_by(depth) {
+            let kp = depth.min(k - pp);
+            let unit = NR * kp;
+            let work = m * kp * nc;
+            let threads = if work < 2 * BAND_WORK { 1 } else { parallel::threads().min((work / THREAD_WORK).isqrt()) };
+            let band_rows = if threads == 1 { m } else { m.div_ceil((work / BAND_WORK).min(4 * threads)).next_multiple_of(MR).min(MC) };
+            let pack_b = |at: usize, units: &mut [MaybeUninit<T>]| {
+                for (u, strip) in units.chunks_exact_mut(unit).enumerate() {
+                    let s = at / unit + u;
+                    let (j, lines) = (jc + s * NR, NR.min(nc - s * NR));
+                    for (step, part) in strip.chunks_mut(NR * KC).enumerate() {
+                        let pc = pp + step * KC;
+                        pack::<_, NR>(part, part.len() / NR, lines, |p, l, out| b.run(pc + p, j + l, out));
                     }
                 }
-            }
+                true
+            };
+            bp.clear();
+            slice::appended(&mut bp, nc.div_ceil(NR) * unit, |slots| if threads == 1 { pack_b(0, slots) } else { parallel::split(slots, unit, &pack_b) });
+            let (a, bp, kernel) = (&a, &bp[..], &kernel);
+            let lower = matches!(part, Part::Lower);
+            parallel::pieces_of(c, band_rows * ldc, threads, &move |first, band| {
+                let (i0, i1) = (first / ldc, (first / ldc + band_rows).min(m));
+                let mut slots = Box::<[T]>::new_uninit_slice(MC.min(i1 - i0).next_multiple_of(MR) * KC.min(kp));
+                for step in 0..kp.div_ceil(KC) {
+                    let pc = pp + step * KC;
+                    let (kc, load) = (KC.min(k - pc), pc > 0 || !start);
+                    for ic in (i0..i1).step_by(MC) {
+                        let mc = MC.min(i1 - ic);
+                        if lower && ic + mc <= jc { continue }
+                        let ap = pack::<_, MR>(&mut slots, kc, mc, |p, i, out| for l in 0..out.len() { out[l] = MaybeUninit::new(a(ic + i + l, pc + p)) });
+                        for jr in (0..nc).step_by(NR) {
+                            let bj = &bp[jr / NR * unit + step * NR * KC..][..NR * kc];
+                            for ir in (0..mc).step_by(MR) {
+                                if lower && ic + ir + MR.min(mc - ir) <= jc + jr { continue }
+                                let (rows, cols) = (MR.min(mc - ir), NR.min(nc - jr));
+                                let at = |r: usize, s: usize| (ic - i0 + ir + r) * ldc + jc + jr + s;
+                                let mut t = [[P::UNIT; NR]; MR];
+                                if load { for r in 0..rows { for s in 0..cols { t[r][s] = band[at(r, s)] } } }
+                                kernel(&ap[ir * kc..(ir + MR) * kc], bj, &mut t, !load);
+                                for r in 0..rows { for s in 0..cols { band[at(r, s)] = t[r][s] } }
+                            }
+                        }
+                    }
+                }
+                true
+            });
         }
     }
 }
 
-/// Packs `len` lines of `kc` steps into strips of `W` lines. Each strip holds its `W` items for step 0, then those for step 1, and so
-/// on. `item(p, l)` gives line `l` at step `p`. Lines past `len` hold the default, and the results computed from them are never stored.
-fn pack<T: Copy + Default, const W: usize>(buffer: &mut [T], kc: usize, len: usize, item: impl Fn(usize, usize) -> T) {
-    for (s, strip) in buffer.chunks_exact_mut(W * kc).take(len.div_ceil(W)).enumerate() {
+/// Packs `len` lines of `kc` steps into strips of `W` lines at the start of `buffer`, and gives the items it wrote. Each strip holds its
+/// `W` items for step 0, then those for step 1, and so on. `run(p, l, out)` writes `out.len()` items of step `p` into `out`, from line
+/// `l` on. Lines past `len` hold the default, and the results computed from them are never stored.
+fn pack<T: Copy + Default, const W: usize>(buffer: &mut [MaybeUninit<T>], kc: usize, len: usize, run: impl Fn(usize, usize, &mut [MaybeUninit<T>])) -> &[T] {
+    let strips = len.div_ceil(W);
+    for (s, strip) in buffer.chunks_exact_mut(W * kc).take(strips).enumerate() {
         let (first, lines) = (s * W, W.min(len - s * W));
         for (p, step) in strip.as_chunks_mut::<W>().0.iter_mut().enumerate() {
             if lines == W {
-                for l in 0..W { step[l] = item(p, first + l) }
+                run(p, first, step)
             } else {
-                for l in 0..W { step[l] = if l < lines { item(p, first + l) } else { T::default() } }
+                run(p, first, &mut step[..lines]);
+                for slot in &mut step[lines..] { *slot = MaybeUninit::new(T::default()) }
             }
         }
     }
+    slice::written(&mut buffer[..strips * W * kc])
 }
 
 /// Folds the steps of the strips `a` and `b`, which `pack` wrote, into the tile `t`. With `first`, the first step starts the tile.

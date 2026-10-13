@@ -124,8 +124,8 @@ forms!(Quantile at real: |k, [p]| narrowed(p, |p| each_law!(&k.0 .0, d => quanti
 fn composed<F: Float, G: Unary<f64, Out = f64>>(
     x: &[F], out: &mut [std::mem::MaybeUninit<F>], inner: impl Fn(f64) -> f64, g: G, finish: impl Fn(f64, f64) -> f64,
 ) -> bool {
-    let args: Vec<f64> = x.iter().map(|&v| inner(v.wide())).collect();
-    let mut values = Vec::with_capacity(x.len());
+    let (mut args, mut values) = (Vec::with_capacity(x.len()), Vec::with_capacity(x.len()));
+    args.extend(x.iter().map(|&v| inner(v.wide())));
     let ok = g.many(Arg::Many(&args), args.len(), &mut values);
     for (slot, (&v, &e)) in out.iter_mut().zip(x.iter().zip(&values)) { slot.write(F::narrow(finish(v.wide(), e))); }
     ok

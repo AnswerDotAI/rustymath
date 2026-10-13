@@ -45,7 +45,7 @@ impl Tolerance {
 }
 
 /// Comparison within a tolerance. `Exactly` and `Tolerance` implement it.
-pub trait Tolerant: Copy {
+pub trait Tolerant: Copy + Send + Sync {
     /// The tolerance: 0 for `Exactly`.
     fn value(self) -> f64;
     /// Whether `x` equals `y`. NaN equals nothing, as in IEEE, and an infinity equals only itself.
@@ -304,31 +304,124 @@ macro_rules! compared {
 #[derive(Clone, Copy)]
 enum Band { Inside, Outside, Below, NotAbove, Above, NotBelow }
 
-/// Compares each item of the `Many` argument with the `One` argument `c`, through the range of floats equal to `c`, worked out once.
-/// Each item then takes one or two plain comparisons, in a loop that vectorizes. `left` is the band an item on the left of `c` must
-/// lie in, and `right` the band for an item on its right. `None`, writing nothing, unless exactly one argument is `One` and `c`
-/// isn't NaN.
-#[inline(always)]
-fn against<F: Float>(t: Tolerance, x: Arg<'_, F>, y: Arg<'_, F>, n: usize, out: &mut [std::mem::MaybeUninit<bool>], left: Band, right: Band) -> Option<bool> {
-    let (items, (lo, hi), band) = match (x, y) {
-        (Arg::Many(_), Arg::One(c)) => (x, t.range(c)?, left),
-        (Arg::One(c), Arg::Many(_)) => (y, t.range(c)?, right),
-        _ => return None,
-    };
-    Some(match band {
-        Band::Inside => mask(items, n, out, #[inline(always)] |v| (lo <= v) & (v <= hi)),
-        Band::Outside => mask(items, n, out, #[inline(always)] |v| !((lo <= v) & (v <= hi))),
-        Band::Below => mask(items, n, out, #[inline(always)] |v| v < lo),
-        Band::NotAbove => mask(items, n, out, #[inline(always)] |v| v <= hi),
-        Band::Above => mask(items, n, out, #[inline(always)] |v| v > hi),
-        Band::NotBelow => mask(items, n, out, #[inline(always)] |v| v >= lo),
-    })
+impl Band {
+    /// Whether `v` lies in this band against the range `lo` to `hi`.
+    #[inline(always)]
+    fn holds<F: PartialOrd>(self, lo: F, hi: F, v: F) -> bool {
+        match self {
+            Band::Inside => (lo <= v) & (v <= hi),
+            Band::Outside => !((lo <= v) & (v <= hi)),
+            Band::Below => v < lo,
+            Band::NotAbove => v <= hi,
+            Band::Above => v > hi,
+            Band::NotBelow => v >= lo,
+        }
+    }
 }
 
-/// Writes `f` on each of `n` items of `items` into `out`, through `pairs_into`.
+/// Runs `$body` with `$b` naming the band `$band` holds, as a constant item in each arm. A closure in `$body` then compiles with the
+/// band folded in. It doesn't capture a variable, which would leave each item to test the band.
+macro_rules! with_band {
+    ($band:expr, |$b:ident| $body:expr) => {
+        match $band {
+            Band::Inside => { const $b: Band = Band::Inside; $body }
+            Band::Outside => { const $b: Band = Band::Outside; $body }
+            Band::Below => { const $b: Band = Band::Below; $body }
+            Band::NotAbove => { const $b: Band = Band::NotAbove; $body }
+            Band::Above => { const $b: Band = Band::Above; $body }
+            Band::NotBelow => { const $b: Band = Band::NotBelow; $body }
+        }
+    };
+}
+
+/// The float types that `against` compares with one number. The default writes each result through `pairs_into`, whose loop
+/// vectorizes. Wasm's `f64` and `f32` override it in `narrowed`.
+trait Banded: Copy + PartialOrd {
+    /// Writes into `out` whether each item of `xs` lies in `band` against the range `lo` to `hi`.
+    #[inline(always)]
+    fn banded(xs: &[Self], lo: Self, hi: Self, band: Band, out: &mut [std::mem::MaybeUninit<bool>]) {
+        with_band!(band, |B| pairs_into(Arg::Many(xs), Arg::One(()), xs.len(), out, #[inline(always)] |v, ()| (B.holds(lo, hi, v), true)));
+    }
+}
+#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+impl Banded for f32 {}
+#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+impl Banded for f64 {}
+
+/// Compares each item of the `Many` argument with the `One` argument `c`, through the range of floats equal to `c`, worked out once.
+/// Each item then takes one or two plain comparisons, through `Banded`. `left` is the band an item on the left of `c` must lie in,
+/// and `right` the band for an item on its right. `None`, writing nothing, unless exactly one argument is `One` and `c` isn't NaN.
 #[inline(always)]
-fn mask<F: Copy>(items: Arg<'_, F>, n: usize, out: &mut [std::mem::MaybeUninit<bool>], f: impl Fn(F) -> bool) -> bool {
-    pairs_into(items, Arg::One(()), n, out, #[inline(always)] |v, ()| (f(v), true))
+fn against<F: Float + Banded>(t: Tolerance, x: Arg<'_, F>, y: Arg<'_, F>, n: usize, out: &mut [std::mem::MaybeUninit<bool>], left: Band, right: Band) -> Option<bool> {
+    let (items, (lo, hi), band) = match (x, y) {
+        (Arg::Many(xs), Arg::One(c)) => (xs, t.range(c)?, left),
+        (Arg::One(c), Arg::Many(ys)) => (ys, t.range(c)?, right),
+        _ => return None,
+    };
+    F::banded(&items[..n], lo, hi, band, &mut out[..n]);
+    Some(true)
+}
+
+/// Wasm has no instruction that narrows a 64-bit lane to a byte. LLVM writes a float comparison's results two items at a time, in
+/// about ten instructions for each item. Where it can prove that lanes hold masks, it also replaces wasm's narrowing instructions
+/// with slower code. Here each block of 16 items compares with vector instructions, then shuffles the first byte of each mask into
+/// place: 7 shuffles for `f64`'s 8 vectors, and 3 for `f32`'s 4.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+mod narrowed {
+    use super::{Band, Banded};
+    use core::arch::wasm32::*;
+    use std::mem::MaybeUninit;
+
+    /// Each type's vector instructions. `$join` gathers the first byte of each lane's mask, in order.
+    macro_rules! narrowed {
+        ($($t:ty: $lanes:literal, $splat:ident, $lt:ident, $le:ident, $gt:ident, $ge:ident, $join:ident;)+) => {$(
+            impl Banded for $t {
+                fn banded(xs: &[$t], lo: $t, hi: $t, band: Band, out: &mut [MaybeUninit<bool>]) {
+                    let (l, h) = ($splat(lo), $splat(hi));
+                    with_band!(band, |B| blocks::<$t, $lanes, { 16 / $lanes }>(xs, out, $join, #[inline(always)] |v| match B {
+                        Band::Inside => v128_and($le(l, v), $le(v, h)),
+                        Band::Outside => v128_not(v128_and($le(l, v), $le(v, h))),
+                        Band::Below => $lt(v, l),
+                        Band::NotAbove => $le(v, h),
+                        Band::Above => $gt(v, h),
+                        Band::NotBelow => $ge(v, l),
+                    }, #[inline(always)] |v| B.holds(lo, hi, v)))
+                }
+            }
+        )+};
+    }
+    narrowed! {
+        f64: 2, f64x2_splat, f64x2_lt, f64x2_le, f64x2_gt, f64x2_ge, join64;
+        f32: 4, f32x4_splat, f32x4_lt, f32x4_le, f32x4_gt, f32x4_ge, join32;
+    }
+
+    /// Writes `mask` on each block of 16 items of `xs` into `out` through `join`, and `holds` on each item left over.
+    #[inline(always)]
+    fn blocks<T: Copy, const LANES: usize, const N: usize>(xs: &[T], out: &mut [MaybeUninit<bool>], join: impl Fn([v128; N]) -> v128, mask: impl Fn(v128) -> v128, holds: impl Fn(T) -> bool) {
+        let (blocks, rest) = out.as_chunks_mut::<16>();
+        let (whole, tail) = xs.as_chunks::<16>();
+        for (block, x) in blocks.iter_mut().zip(whole) {
+            // SAFETY: each load reads `LANES` of the block's 16 items.
+            let masks = std::array::from_fn(|k| mask(unsafe { v128_load(x.as_ptr().add(LANES * k).cast()) }));
+            // SAFETY: the store writes the block's 16 slots, each a byte of 0 or 1.
+            unsafe { v128_store(block.as_mut_ptr().cast(), v128_and(join(masks), u8x16_splat(1))) }
+        }
+        for (slot, &x) in rest.iter_mut().zip(tail) { slot.write(holds(x)); }
+    }
+
+    #[inline(always)]
+    fn join64(m: [v128; 8]) -> v128 {
+        let four = |a, b| i8x16_shuffle::<0, 8, 16, 24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0>(a, b);
+        let eight = |a, b| i8x16_shuffle::<0, 1, 2, 3, 16, 17, 18, 19, 0, 0, 0, 0, 0, 0, 0, 0>(a, b);
+        let (low, high) = (eight(four(m[0], m[1]), four(m[2], m[3])), eight(four(m[4], m[5]), four(m[6], m[7])));
+        i8x16_shuffle::<0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23>(low, high)
+    }
+
+    #[inline(always)]
+    fn join32(m: [v128; 4]) -> v128 {
+        let eight = |a, b| i8x16_shuffle::<0, 4, 8, 12, 16, 20, 24, 28, 0, 0, 0, 0, 0, 0, 0, 0>(a, b);
+        i8x16_shuffle::<0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23>(eight(m[0], m[1]), eight(m[2], m[3]))
+    }
 }
 
 /// [`Tolerant::equal`], or [`TolerantComplex::complex_equal`] for complex items, at the tolerance it holds, as a function object.
@@ -437,13 +530,19 @@ tolerant!(Lcm at Complex<f32>, Complex<f64>: |t, [x, y]| {
 /// (`search::index_of`), then checks that each item of `y` matches the first item of `x` with its whole number. When one doesn't, as two
 /// floats on either side of one whole number may not, the search takes the buckets below. Otherwise, with `Exactly`, the search indexes order
 /// keys. With a `Tolerance`, it files the items of `x` in buckets of neighbouring floats (`Near`), and compares each item of `y` with
-/// the items in the two buckets nearest it.
+/// the items in the two buckets nearest it. The lookups in the index or the buckets split across threads.
 pub fn index_of<F: Float>(t: impl Tolerant, x: &[F], y: &[F]) -> Vec<u32> {
     let Ok(found) = index_of_with(t, x, y, ok);
     found
 }
 
-/// `index_of`, calling `check` before each block of `BETWEEN_CHECKS` items of `y`, and returning `check`'s error at once.
+/// The units of `BETWEEN_CHECKS` needles that each thread looks up in one round of `index_of_with`. A round much shorter than this
+/// leaves too little for the other threads after `parallel::split` times its first unit: with 1 unit each, `v⍳w` on a million floats
+/// took as long on 4 threads as on one.
+const ROUND_UNITS: usize = 16;
+
+/// `index_of`, calling `check` on this thread before each round of `ROUND_UNITS` × `BETWEEN_CHECKS` items of `y` for each of
+/// `parallel::threads`, and returning `check`'s error at once. A round's lookups split across threads.
 #[inline(never)]
 pub fn index_of_with<F: Float, E>(t: impl Tolerant, x: &[F], y: &[F], mut check: impl FnMut() -> Result<(), E>) -> Result<Vec<u32>, E> {
     if y.len() <= search::SCANNED { return Ok(y.iter().map(|&v| scan(t, x, v) as u32).collect()); }
@@ -457,13 +556,13 @@ pub fn index_of_with<F: Float, E>(t: impl Tolerant, x: &[F], y: &[F], mut check:
     if t.value() == 0.0 { return Ok(search::index_of(&order_keys(x), &order_keys(y))); }
     let near = Near::new(t, x, |j, i| x[j].order_key() == x[i].order_key());
     let mut found = Vec::with_capacity(y.len());
-    for block in y.chunks(BETWEEN_CHECKS) {
+    for round in y.chunks(ROUND_UNITS * BETWEEN_CHECKS * crate::parallel::threads()) {
         check()?;
-        for &v in block {
+        search::look_up(&mut found, round, |v| {
             let mut first = x.len();
             for i in near.near(v) { if i < first && t.matches(x[i], v) { first = i; } }
-            found.push(first as u32);
-        }
+            first as u32
+        });
     }
     Ok(found)
 }

@@ -1,39 +1,47 @@
-"""Fast maths functions for f16, f32 and f64 in plain Rust.
+"""Maths in plain Rust, from fast f16, f32 and f64 functions to exact rationals.
 
 Modules:
 
-- `rustymath.linalg`: rustymath's linear algebra, under the names of NumPy's similar functions. Each function takes a stack of matrices in the last two axes of its arguments, and broadcasts the axes before them as NumPy's generalized ufuncs do. float32, float64, complex64 and complex128 matrices compute at their own width. float16 matrices compute in float32, with each result rounded to float16. Integers and Booleans compute as float64, except in `matmul` and `semiring`, where integers compute in int64."""
+- `rustymath.linalg`: linear algebra on stacks of matrices, under the names of NumPy's similar functions. Its docstring gives the width each dtype computes at.
+- `rustymath.polynomial`: polynomials of one variable, under the names of NumPy's functions in `numpy.polynomial.polynomial`.
+- `rustymath.exact`: exact rational arithmetic on integers and `fractions.Fraction`.
+- `rustymath.integer`: checked int64 mixed-radix conversions.
+- `rustymath.search`: numeric search, stable sorting and grouping. The package also exports its functions directly.
+- `rustymath.number_theory`: primes, factors, totients, prime counts and factorials of Python integers of any size.
+- `rustymath.distribution`: probability distributions, whose methods take a number or an array of any shape."""
 
 import sys
-from typing import NamedTuple
 import numpy as np
-from . import _core, linalg, polynomial
+from . import _core, linalg, polynomial, exact, integer, search
 from .linalg import matmul
-from .polynomial import _dtype
+from .integer import encode, decode
+from .search import Unique, unique, index, isin, argsort, lexsort, searchsorted, bins, bincount, counts, group_indices
+from ._checks import _check, _named
 from ._core import (__version__, CT, absolute, add, angle, arccos, arccosh, arcsin, arcsinh, arctan, arctan2, arctanh, betainc, betaincinv, binom,
-    cbrt, cos, cosh, distribution, erf, erfc, erfcinv, erfinv, exp, expm1, gamma, gammainc, gammaincc, gammaincinv, gammaln, hypot,
-    lambertw, log, log10, log1p, log2, loggamma, maximum, minimum, multiply, number_theory, power, root, sign, sin, sinh, sqrt, sqrt1mx2,
-    sqrt1px2, sqrtx2m1, tan, tanh)
-
-abs = absolute
+    cbrt, cis, cos, cosh, distribution, divide, erf, erfc, erfcinv, erfinv, exp, expm1, factorial, gamma, gammainc, gammaincc, gammaincinv, gammaln, hypot,
+    lambertw, log, log10, log1p, log2, logb, loggamma, logical_and, logical_or, logical_xor, logical_xnor, maximum, minimum, minmax, multiply,
+    number_theory, power, root, set_threads, sign, sin, sinh, sqrt, sqrt1mx2, sqrt1px2, sqrtx2m1, subtract, tan, tanh, threads, thread_setting)
 
 for _m in (distribution, number_theory): sys.modules[f'{__name__}.{_m.__name__}'] = _m
 
-def _check(ct):
-    if not 0 <= ct < 1: raise ValueError(f"ct must be at least 0 and below 1, not {ct}")
-    return ct
-
-def _comparison(name, relation):
-    "A wrapper for the tolerant comparison ufunc `name` that checks `ct`"
+def _tolerant(name, doc):
+    "A wrapper that checks `ct` and passes it to the tolerant ufunc `name` after the other arguments"
     ufunc = getattr(_core, name)
-    def compare(
-        x1, x2, # Arrays to compare
-        ct=CT, # Relative tolerance: two items are equal when `|x1-x2|` is at most `ct` times the larger magnitude
+    def unary(
+        x, # Array
+        ct=CT, # Relative tolerance, at least 0 and below 1
+        **kwargs # Passed to the ufunc, such as `out=`
+    ): return ufunc(x, _check(ct), **kwargs)
+    def binary(
+        x1, x2, # Arrays
+        ct=CT, # Relative tolerance, at least 0 and below 1
         **kwargs # Passed to the ufunc, such as `out=`
     ): return ufunc(x1, x2, _check(ct), **kwargs)
-    compare.__name__ = compare.__qualname__ = name
-    compare.__doc__ = f"Whether `x1` {relation} `x2`, with floats equal within tolerance `ct` as APL compares them, and integers compared exactly"
-    return compare
+    return _named(unary if ufunc.nin == 2 else binary, name, doc)
+
+def _comparison(name, relation):
+    "A `_tolerant` wrapper for the comparison ufunc `name`. Its docstring says it tests whether `x1` `relation` `x2`"
+    return _tolerant(name, f"Whether `x1` {relation} `x2`. Floats are equal when `|x1-x2|` is at most `ct` times the larger magnitude, as APL compares them. Integers compare exactly")
 
 equal = _comparison('equal', "equals")
 not_equal = _comparison('not_equal', "doesn't equal")
@@ -42,84 +50,13 @@ less_equal = _comparison('less_equal', "is below or equals")
 greater = _comparison('greater', "is above and doesn't equal")
 greater_equal = _comparison('greater_equal', "is above or equals")
 
-def floor(
-    x, # Array to round down
-    ct=CT, # Relative tolerance: an item within `ct` of the next whole number rounds to it
-    **kwargs # Passed to the ufunc, such as `out=`
-):
-    "The largest whole number at most `x`, within tolerance `ct`"
-    return _core.floor(x, _check(ct), **kwargs)
+floor = _tolerant('floor', "The largest whole number at most `x`. An item within relative tolerance `ct` of the next whole number rounds to it")
+ceil = _tolerant('ceil', "The smallest whole number at least `x`. An item within relative tolerance `ct` of the whole number below rounds to it")
+remainder = _tolerant('remainder', "The remainder of `x1` divided by `x2`, with the sign of `x2`, as `numpy.remainder` gives it. For floats, a quotient within relative tolerance `ct` of a whole number counts as whole, giving 0. A zero `x2` gives `x1`, by APL's rule.")
+gcd = _tolerant('gcd', "The greatest common divisor of integers, floats or complex numbers `x1` and `x2`, never negative for integers and floats. Each remainder step of floats and complex numbers uses relative tolerance `ct`")
+lcm = _tolerant('lcm', "The least common multiple of integers or floats `x1` and `x2`, with the sign of `x1 x2`. Each remainder step of floats uses relative tolerance `ct`")
 
-def ceil(
-    x, # Array to round up
-    ct=CT, # Relative tolerance: an item within `ct` of the whole number below rounds to it
-    **kwargs # Passed to the ufunc, such as `out=`
-):
-    "The smallest whole number at least `x`, within tolerance `ct`"
-    return _core.ceil(x, _check(ct), **kwargs)
+def logical_scan(x, table, axis=-1, start=None):
+    "The running results along an axis of the Boolean function given by table[running_result][next_item]"
+    return _core.logical_scan(np.asarray(x, dtype=bool), np.asarray(table, dtype=bool).tolist(), axis, start)
 
-def remainder(
-    x1, x2, # Dividends and divisors
-    ct=CT, # Relative tolerance for floats: a quotient within `ct` of a whole number counts as whole, giving 0
-    **kwargs # Passed to the ufunc, such as `out=`
-):
-    "The remainder of `x1` divided by `x2`, with the sign of `x2`, as `numpy.remainder` gives it, within tolerance `ct`. A zero `x2` gives `x1`, by APL's rule."
-    return _core.remainder(x1, x2, _check(ct), **kwargs)
-
-mod = remainder
-
-def gcd(
-    x1, x2, # Arrays of integers, floats or complex numbers
-    ct=CT, # Relative tolerance for each remainder step of floats and complex numbers
-    **kwargs # Passed to the ufunc, such as `out=`
-):
-    "The greatest common divisor of `x1` and `x2`, never negative for integers and floats, within tolerance `ct`"
-    return _core.gcd(x1, x2, _check(ct), **kwargs)
-
-def lcm(
-    x1, x2, # Arrays of integers or floats
-    ct=CT, # Relative tolerance for each remainder step of floats
-    **kwargs # Passed to the ufunc, such as `out=`
-):
-    "The least common multiple of `x1` and `x2`, with the sign of `x1 x2`, within tolerance `ct`"
-    return _core.lcm(x1, x2, _check(ct), **kwargs)
-
-def _searched(*arrays):
-    "`arrays` as flat contiguous vectors of one dtype: the Boolean or integer dtype that NumPy would compute them in, or else its float dtype, at least float16"
-    dt = np.result_type(*(a if isinstance(a, (bool, int, float)) else np.asarray(a) for a in arrays))
-    if dt.kind not in 'biu': dt = _dtype(*arrays)
-    if dt.kind not in 'biuf': raise TypeError(f"searches take Booleans, integers or real numbers, not {dt}")
-    return [np.ascontiguousarray(np.ravel(a), dt) for a in arrays]
-
-class Unique(NamedTuple):
-    values: np.ndarray
-    firsts: np.ndarray
-    numbers: np.ndarray
-    counts: np.ndarray
-
-def unique(
-    ar, # Array of any shape, flattened first
-    *, ct=CT, # Relative tolerance: each run of floats that match within `ct` counts as one value. Booleans and integers match exactly
-):
-    "The unique values of `ar` in order of first occurrence, each the first item of its class, with each value's first position, each item's class number and each class's size"
-    ar = np.ravel(ar)
-    [x] = _searched(ar)
-    firsts, numbers, counts = _core.unique(x, _check(ct))
-    return Unique(ar[firsts], firsts, numbers, counts)
-
-def index(
-    x, # Array to search, flattened first
-    y, # A number, or an array of any shape, of values to find
-    *, ct=CT, # Relative tolerance for floats: an item matches a value when they differ by at most `ct` times the larger magnitude
-):
-    "Where in the flattened `x` each item of `y` first matches, or the size of `x` where nothing does, shaped like `y`. Booleans and integers match exactly"
-    fx, fy = _searched(x, y)
-    return _core.index_of(fx, fy, _check(ct)).reshape(np.shape(y))[()]
-
-def isin(
-    element, # A number, or an array of any shape
-    test_elements, # Values to test against, flattened first
-    *, ct=CT, # Relative tolerance, as for `index`
-):
-    "Whether each item of `element` matches an item of `test_elements` within tolerance `ct`, shaped like `element`"
-    return np.asarray(index(test_elements, element, ct=ct) < np.size(test_elements))

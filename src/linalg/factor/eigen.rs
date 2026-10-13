@@ -66,18 +66,19 @@ where
 /// after it, to a real multiple of its first unit vector. Its vector is 1 at column `k + 1`, and `w` keeps the rest of it in row `k`, from
 /// column `k + 2`. Each reflection then updates the upper triangle below its row from both sides, as a rank-two update. That update needs
 /// `τ B v`, where B is the matrix below and to the right of row `k`. One pass over B's rows applies reflection `k`'s update and accumulates
-/// the next reflection's `τ B v`. B is then read once for each reflection.
-fn tridiagonal<T: Scalar>(w: &mut [T], n: usize) -> (Vec<T::Real>, Vec<T::Real>, Vec<T>) {
+/// the next reflection's `τ B v`. B is then read once for each reflection. `summed_rows` splits each pass's rows across threads.
+fn tridiagonal<T: Scalar + Tiled>(w: &mut [T], n: usize) -> (Vec<T::Real>, Vec<T::Real>, Vec<T>) {
     let zero = T::Real::zero();
     let (mut d, mut e, mut taus) = (vec![zero; n], vec![zero; n], vec![T::zero(); n.saturating_sub(1)]);
     if n == 0 { return (d, e, taus) }
     let (mut v, mut y, mut v2, mut y2) = (vec![T::zero(); n], vec![T::zero(); n], vec![T::zero(); n], vec![T::zero(); n]);
+    let mut parts = Vec::new();
     if n > 1 {
         // Reflection 0 takes a pass of its own for its τ B v.
         let (head, rest) = w.split_at_mut(n);
         taus[0] = householder_row(&mut head[1..], &mut e[0], &mut v[..n - 1]);
         if taus[0] != T::zero() {
-            for i in 0..n - 1 { symmetric_row(&mut y[..n - 1], &v[..n - 1], &rest[i * n + 1 + i..(i + 1) * n], i) }
+            summed_rows(&mut rest[..(n - 1) * n], n, n - 1, &mut y[..n - 1], &mut parts, |i, items, sums| symmetric_row(sums, &v[..n - 1], &items[1 + i..], i));
             for t in &mut y[..n - 1] { *t = taus[0] * *t }
         }
     }
@@ -96,15 +97,15 @@ fn tridiagonal<T: Scalar>(w: &mut [T], n: usize) -> (Vec<T::Real>, Vec<T::Real>,
         let tau2 = if m > 1 { householder_row(&mut rest[k + 2..n], &mut e[k + 1], &mut v2[..m - 1]) } else { T::zero() };
         if m > 1 { taus[k + 1] = tau2 }
         if tau2 != T::zero() { y2[..m - 1].fill(T::zero()) }
-        for i in 1..m {
-            let row = &mut rest[i * n + k + 1 + i..(i + 1) * n];
+        // B's row i + 1 is row i of the next reflection's B.
+        summed_rows(&mut rest[n..m * n], n, m - 1, &mut y2[..m - 1], &mut parts, |i, items, sums| {
+            let row = &mut items[k + 2 + i..];
             if tau != T::zero() {
-                axpyc(row, -v[i], &y[i..m]);
-                axpyc(row, -y[i], &v[i..m]);
+                axpyc(row, -v[i + 1], &y[i + 1..m]);
+                axpyc(row, -y[i + 1], &v[i + 1..m]);
             }
-            // B's row i is row i - 1 of the next reflection's B.
-            if tau2 != T::zero() { symmetric_row(&mut y2[..m - 1], &v2[..m - 1], row, i - 1) }
-        }
+            if tau2 != T::zero() { symmetric_row(sums, &v2[..m - 1], row, i) }
+        });
         if tau2 != T::zero() { for t in &mut y2[..m - 1] { *t = tau2 * *t } }
         std::mem::swap(&mut v, &mut v2);
         std::mem::swap(&mut y, &mut y2);
@@ -130,6 +131,40 @@ fn householder_row<T: Scalar>(x: &mut [T], e: &mut T::Real, v: &mut [T]) -> T {
 fn symmetric_row<T: Scalar>(y: &mut [T], v: &[T], row: &[T], i: usize) {
     y[i] = y[i] + dot(row, &v[i..]);
     axpyc(&mut y[i + 1..], v[i], &row[1..]);
+}
+
+/// The fewest rows in each piece of a reduction's pass. At 64, values-only SVD and eigen at 1024 ran 1.65 to 2 times faster on 18
+/// threads than as one piece.
+const ROW_PIECE: usize = 64;
+
+/// Runs `row(i, items, sums)` on each of rows `0..count` of a reduction's pass, where row `i`'s items are
+/// `rows[i * stride..(i + 1) * stride]`, and adds the sums each row gives into `sums`. The rows split into one piece of at least
+/// `ROW_PIECE` rows for each of this thread's [`crate::parallel::threads`]. On one thread they run as one loop. The first piece adds
+/// into `sums` and each later one into its own part of `parts`, which then add into `sums`.
+pub(super) fn summed_rows<T: Scalar + Tiled, F: Fn(usize, &mut [T], &mut [T]) + Sync>(
+    rows: &mut [T], stride: usize, count: usize, sums: &mut [T], parts: &mut Vec<T>, row: F,
+) {
+    let pieces = (count / ROW_PIECE).min(crate::parallel::threads());
+    if pieces <= 1 {
+        for (i, items) in rows.chunks_mut(stride).take(count).enumerate() { row(i, items, sums) }
+        return;
+    }
+    let per = count.div_ceil(pieces);
+    let (len, width) = (sums.len(), sums.len().max(1));
+    parts.clear();
+    parts.resize((count.div_ceil(per) - 1) * width, T::zero());
+    {
+        let (first, rest) = rows[..count * stride].split_at_mut(per * stride);
+        let mut pieces: Vec<(&mut [T], &mut [T])> = std::iter::once((first, &mut *sums))
+            .chain(rest.chunks_mut(per * stride).zip(parts.chunks_mut(width).map(|part| &mut part[..len])))
+            .collect();
+        crate::parallel::pieces_of(&mut pieces, 1, usize::MAX, &|p, piece| {
+            let (rows, part) = &mut piece[0];
+            for (j, items) in rows.chunks_mut(stride).enumerate() { row(p * per + j, items, part) }
+            true
+        });
+    }
+    for part in parts.chunks(width) { for (s, &x) in sums.iter_mut().zip(part) { *s = *s + x } }
 }
 
 /// Rows at or below which `reflections` applies each reflection on its own, where building the WY form's blocks costs more than
@@ -185,26 +220,29 @@ pub(super) fn blocked<T: Scalar + Tiled>(w: &[T], taus: &[T], n: usize) -> Refle
 /// ends as the eigenvalues, in no particular order. `None` where an eigenvalue takes more than 30 iterations.
 fn implicit_ql<T: Scalar>(d: &mut [T::Real], e: &mut [T::Real], vt: &mut [T], n: usize) -> Option<()> {
     let (zero, one) = (T::Real::zero(), T::Real::one());
-    let hypot = |x: T::Real, y: T::Real| x.mla::<FUSED>(x, y * y).sqrt();
+    // The reduction to tridiagonal form makes errors as large as ε times the matrix's norm. Any subdiagonal item below that size is
+    // negligible. A test against the item's two neighbours alone never splits off the rounding noise that a low-rank matrix leaves.
+    let norm = d.iter().zip(e.iter()).map(|(x, y)| x.abs() + y.abs()).fold(zero, |m, r| if r.is_nan() || r > m { r } else { m });
+    let small = T::Real::epsilon() * norm;
     for l in 0..n {
         let mut iterations = 0;
         loop {
             // The first negligible subdiagonal item at or after l splits off the block that holds d[l].
             let mut m = l;
-            // A NaN never counts as negligible, so a matrix holding one runs out of iterations.
-            while m + 1 < n && !(e[m].abs() <= T::Real::epsilon() * (d[m].abs() + d[m + 1].abs())) { m += 1 }
+            // A NaN anywhere makes `small` NaN. A matrix holding one then runs out of iterations.
+            while m + 1 < n && !(e[m].abs() <= small) { m += 1 }
             if m == l { break }
             iterations += 1;
             if iterations > 30 { return None }
             // The Wilkinson shift: the eigenvalue of the leading 2×2 block nearer d[l].
             let g = (d[l + 1] - d[l]) / (e[l] + e[l]);
-            let r = hypot(g, one);
+            let r = plain_hypot(g, one);
             let mut g = d[m] - d[l] + e[l] / (g + if g < zero { -r } else { r });
             let (mut s, mut c, mut p) = (one, one, zero);
             let mut split = false;
             for i in (l..m).rev() {
                 let (f, b) = (s * e[i], c * e[i]);
-                let r = hypot(f, g);
+                let r = plain_hypot(f, g);
                 e[i + 1] = r;
                 if r == zero {
                     // An exact zero splits the block: d[i + 1] has converged.
@@ -334,7 +372,7 @@ fn merge<R: Native + Tiled>(d: &mut [R], z: &[R], rho: R, s0: &[R], s1: &[R], n1
             v[last] = v[last] - beta;
             x.fill(zero);
             x[last] = beta;
-            runs.push((start, v));
+            runs.push((start, (one + one) / dot(&v, &v), v));
         }
         start = end;
     }
@@ -352,49 +390,56 @@ fn merge<R: Native + Tiled>(d: &mut [R], z: &[R], rho: R, s0: &[R], s1: &[R], n1
         s
     };
     let norm2 = zk.iter().fold(zero, |s, &v| v.mla::<FUSED>(v, s));
-    let roots: Vec<(R, R)> = (0..k)
-        .map(|t| {
+    let mut roots = vec![(zero, zero); k];
+    crate::parallel::split(&mut roots, 1, &|first, out| {
+        for (j, root) in out.iter_mut().enumerate() {
+            let t = first + j;
             let last = t + 1 == k;
-            secular::root(&f, &four, dk[t], if last { dk[t] + rho * norm2 } else { dk[t + 1] }, last)
-        })
-        .collect();
+            *root = secular::root(&f, &four, dk[t], if last { dk[t] + rho * norm2 } else { dk[t + 1] }, last);
+        }
+        true
+    });
     // Gu and Eisenstat's z: the vector for which the computed roots are exact eigenvalues. Its eigenvectors come out orthogonal.
-    for t in 0..k {
-        let di = dk[t];
-        let mut product = roots[t].1 + (roots[t].0 - di);
-        for s in (0..k).filter(|&s| s != t) { product = product * ((roots[s].1 + (roots[s].0 - di)) / (dk[s] - di)) }
-        zk[t] = if zk[t] < zero { -product.abs().sqrt() } else { product.abs().sqrt() };
-    }
+    crate::parallel::split(&mut zk, 1, &|first, out| {
+        for (j, z) in out.iter_mut().enumerate() {
+            let t = first + j;
+            let di = dk[t];
+            let mut product = roots[t].1 + (roots[t].0 - di);
+            for s in (0..k).filter(|&s| s != t) { product = product * ((roots[s].1 + (roots[s].0 - di)) / (dk[s] - di)) }
+            *z = if *z < zero { -product.abs().sqrt() } else { product.abs().sqrt() };
+        }
+        true
+    });
     let mut values: Vec<(R, Source)> = roots.iter().enumerate().map(|(t, &(shift, mu))| (shift + mu, Source::Root(t))).collect();
     values.extend((0..n).filter(|&i| pz[i] == zero).map(|i| (pd[i], Source::Deflated(i))));
     values.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
     // The rows of `rt` are the update's unit eigenvectors, with their components in the order of `p`.
     let mut rt = vec![zero; n * n];
-    for (row, (_, source)) in rt.chunks_exact_mut(n).zip(&values) {
-        match *source {
-            Source::Deflated(i) => row[i] = one,
-            Source::Root(t) => {
-                let (shift, mu) = roots[t];
-                for (s, &i) in kept.iter().enumerate() { row[i] = zk[s] / ((dk[s] - shift) - mu) }
-                let norm = row.iter().fold(zero, |s, &v| v.mla::<FUSED>(v, s)).sqrt();
-                for v in row.iter_mut() { *v = *v / norm }
+    crate::parallel::split(&mut rt, n, &|first, rows| {
+        for (j, row) in rows.chunks_exact_mut(n).enumerate() {
+            match values[first / n + j].1 {
+                Source::Deflated(i) => row[i] = one,
+                Source::Root(t) => {
+                    let (shift, mu) = roots[t];
+                    for (s, &i) in kept.iter().enumerate() { row[i] = zk[s] / ((dk[s] - shift) - mu) }
+                    let norm = row.iter().fold(zero, |s, &v| v.mla::<FUSED>(v, s)).sqrt();
+                    for v in row.iter_mut() { *v = *v / norm }
+                }
+            }
+            for (start, c, v) in &runs {
+                let segment = &mut row[*start..*start + v.len()];
+                let s = *c * dot(v, segment);
+                axpy(segment, -s, v);
             }
         }
-    }
-    for (start, v) in &runs {
-        let c = (one + one) / dot(v, v);
-        for row in rt.chunks_exact_mut(n) {
-            let segment = &mut row[*start..*start + v.len()];
-            let s = c * dot(v, segment);
-            axpy(segment, -s, v);
-        }
-    }
+        true
+    });
     for (x, &(value, _)) in d.iter_mut().zip(&values) { *x = value }
     // The whole matrix's eigenvectors: each row of `rt`, with its components back in the halves' order, times diag(S₀ᵀ, S₁ᵀ).
     let mut q = vec![0; n];
     for (i, &k) in p.iter().enumerate() { q[k] = i }
-    R::add_product(&mut st, n, |j, c| rt[j * n + q[c]], |c, x| s0[c * n1 + x], [n, n1, n1]);
-    R::add_product(&mut st[n1..], n, |j, c| rt[j * n + q[n1 + c]], |c, x| s1[c * n2 + x], [n, n2, n2]);
+    R::add_product(&mut st, n, |j, c| rt[j * n + q[c]], Rows(&s0, n1), [n, n1, n1]);
+    R::add_product(&mut st[n1..], n, |j, c| rt[j * n + q[n1 + c]], Rows(&s1, n2), [n, n2, n2]);
     st
 }
 

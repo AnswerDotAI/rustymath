@@ -5,11 +5,12 @@
 //! `index_of`, `classes` and `firsts` index the first position of each key. `index_of` passes over `x` once for each item of `y` when
 //! `y` has at most `SCANNED` items. The index is a table when the keys span at most twice the slice's length, or 1024, and a hash map
 //! otherwise. `numbered` numbers the classes in order of first position, with each one's size. `grouped_keys` numbers them the same
-//! way from a table of keys, with each one's positions. `counts` counts the items with each key in such a table. `sort_rows` sorts
-//! keys that span such a table by counting them. It sorts other keys with an LSD radix sort that skips any byte that is the same in
-//! every key.
+//! way from a table of keys, with each one's positions, and `class_counts` gives only their sizes. `counts` counts the items with
+//! each key in such a table. `sort_rows` sorts keys that span such a table by counting them. It sorts other keys with an LSD radix
+//! sort that skips any byte that is the same in every key. With several threads, the sort splits each pass of more than `RADIX_PIECE`
+//! keys across them, and `index_of` splits its lookups.
 use hashbrown::{HashMap, hash_map::Entry};
-use std::{hash::Hash, ops::Not};
+use std::{hash::Hash, mem::MaybeUninit, ops::Not};
 
 /// An item as a whole number: a Boolean's 0 or 1, an integer, a character's code point, or an order key. Two items match exactly when
 /// their keys are equal. A 64-bit unsigned key wraps to a negative number, which keeps keys distinct.
@@ -87,6 +88,33 @@ macro_rules! radix_keys {
 }
 radix_keys!(u16, u32, u64);
 
+/// An unsigned key in an integer's numeric order. An unsigned integer is its own key. A signed integer's key is its bits with the
+/// sign bit flipped.
+pub trait OrderKey: Copy {
+    type Key: Copy + Into<u64>;
+    fn order_key(self) -> Self::Key;
+}
+macro_rules! order_keys {
+    ($($s:ty => $u:ty),+) => {$(
+        impl OrderKey for $s {
+            type Key = $u;
+            #[inline]
+            fn order_key(self) -> $u { self as $u ^ 1 << (<$u>::BITS - 1) }
+        }
+        impl OrderKey for $u {
+            type Key = $u;
+            #[inline]
+            fn order_key(self) -> $u { self }
+        }
+    )+};
+}
+order_keys!(i8 => u8, i16 => u16, i32 => u32, i64 => u64);
+impl OrderKey for bool {
+    type Key = u8;
+    #[inline]
+    fn order_key(self) -> u8 { self as u8 }
+}
+
 /// The number of items of `y` up to which `index_of` and `tolerant::index_of` pass over `x` once for each, in place of building an
 /// index.
 pub const SCANNED: usize = 16;
@@ -97,21 +125,35 @@ pub const SCANNED: usize = 16;
 pub fn index_of<K: Key>(x: &[K], y: &[K]) -> Vec<u32> {
     let miss = x.len() as u32;
     if y.len() <= SCANNED { return y.iter().map(|n| x.iter().position(|h| h == n).map_or(miss, |p| p as u32)).collect(); }
+    let mut found = Vec::with_capacity(y.len());
     if let Some((min, mut table)) = table(x, usize::MAX) {
-        let first = write_first(x, min, &mut table);
+        let first = write_first(x, min, &mut table, None);
         // `move` keeps `min`, `first` and `miss` in registers. Captured by reference, they would load again for every item.
         let at = move |n: K| usize::try_from(n.key().wrapping_sub(min)).ok().and_then(|i| first.get(i));
-        return y.iter().map(move |&n| at(n).map_or(miss, |&f| f.min(miss as usize) as u32)).collect();
+        look_up(&mut found, y, move |n| at(n).map_or(miss, |&f| f.min(miss as usize) as u32));
+    } else {
+        let first = first_positions(x);
+        look_up(&mut found, y, |n| first.get(&n).map_or(miss, |&f| f as u32));
     }
-    let first = first_positions(x);
-    y.iter().map(|n| first.get(n).map_or(miss, |&f| f as u32)).collect()
+    found
+}
+
+/// Appends `look(n)` to `found` for each needle `n` of `y`, in order. The lookups split across threads in units of `BETWEEN_CHECKS`
+/// needles, as `parallel::split` splits a call, so `look` must read only what no lookup changes.
+pub(crate) fn look_up<K: Copy + Sync>(found: &mut Vec<u32>, y: &[K], look: impl Fn(K) -> u32 + Sync) {
+    crate::parallel::extended(found, y.len(), crate::BETWEEN_CHECKS, &|r, slots| slots.fill(r.len(), |slots| {
+        let needles = &y[r];
+        let slots = &mut slots[..needles.len()];
+        for i in 0..needles.len() { slots[i].write(look(needles[i])); }
+        true
+    }));
 }
 
 /// The first position of each item's key in `x`, which represents the item's class.
 #[inline(never)]
 pub fn classes<K: Key>(x: &[K]) -> Vec<u32> {
     if let Some((min, mut table)) = table(x, usize::MAX) {
-        let first = write_first(x, min, &mut table);
+        let first = write_first(x, min, &mut table, None);
         return x.iter().map(move |&n| first[n.key().wrapping_sub(min) as usize] as u32).collect();
     }
     let first = first_positions(x);
@@ -124,7 +166,7 @@ pub fn classes<K: Key>(x: &[K]) -> Vec<u32> {
 pub fn firsts<K: Key>(x: &[K]) -> Vec<bool> {
     let mut mask = vec![false; x.len()];
     if let Some((min, mut table)) = table(x, usize::MAX) {
-        for &f in write_first(x, min, &mut table) { if let Some(m) = mask.get_mut(f) { *m = true } }
+        for &f in write_first(x, min, &mut table, None) { if let Some(m) = mask.get_mut(f) { *m = true } }
         return mask;
     }
     for &f in first_positions(x).values() { mask[f as usize] = true }
@@ -202,6 +244,19 @@ pub fn numbered(classes: &[u32]) -> Numbered {
     Numbered { firsts, numbers, counts }
 }
 
+/// The number of items in each class of `x`, in order of the classes' first positions, as `numbered` counts them. Keys that span a
+/// table take `counts`, then a pass for first positions that stops once it has found every key `x` holds, with nothing written for
+/// each item.
+#[inline(never)]
+pub fn class_counts<K: Key>(x: &[K]) -> Vec<usize> {
+    let Some((min, counts)) = counts(x) else { return numbered(&classes(x)).counts };
+    let mut first = vec![usize::MAX; counts.len()];
+    write_first(x, min, &mut first, Some(counts.iter().filter(|&&c| c > 0).count()));
+    let mut keys: Vec<usize> = (0..counts.len()).filter(|&g| counts[g] > 0).collect();
+    keys.sort_unstable_by_key(|&g| first[g]);
+    keys.into_iter().map(|g| counts[g]).collect()
+}
+
 /// For each of `values`, the number of `boundaries` at or below it, as BQN's dyadic `⍋` and NumPy's `searchsorted` with `side='right'`
 /// give it. `boundaries` must be in ascending order. When they are, and they span few enough keys for a table, a table of the count of
 /// boundaries at or below each key answers each value with one read. Otherwise each value takes a binary search, which halves its
@@ -259,11 +314,12 @@ fn table_size(span: u64, len: usize) -> Option<usize> { usize::try_from(span).ok
 /// Writes the first position of each key in `x` to its entry in `first`, whose entries start at key `min` and hold `usize::MAX` until
 /// written. The pass runs forward and stops after the first block of 64 positions that fills the entry of the last key `x` holds. Keys
 /// that fill their range, such as Booleans, soon do. Keys that leave gaps in their range, as the characters of text do, never fill it.
-/// So where the keys span at most 128 values, after `STALL` blocks in a row with no new key, the pass counts the keys `x` holds once,
-/// and stops when it has found them all. Each entry takes its new position by a select, not a branch. The table is a slice, not a
+/// A caller that knows how many keys `x` holds passes that number as `present`. Otherwise, where the keys span at most 128 values, the
+/// pass counts them once after `STALL` blocks in a row with no new key. It stops when it has found them all. Each entry takes its new
+/// position by a select, not a branch. The table is a slice, not a
 /// `Vec`, so that the compiler keeps its bounds in registers.
-fn write_first<'t, K: Key>(x: &[K], min: i64, first: &'t mut [usize]) -> &'t [usize] {
-    let (mut empty, mut stall, mut counted) = (first.len(), 0, first.len() > 128);
+fn write_first<'t, K: Key>(x: &[K], min: i64, first: &'t mut [usize], present: Option<usize>) -> &'t [usize] {
+    let (mut empty, mut stall, mut counted) = match present { Some(h) => (h, 0, true), None => (first.len(), 0, first.len() > 128) };
     for (b, block) in x.chunks(64).enumerate() {
         let before = empty;
         for (j, &n) in block.iter().enumerate() {
@@ -315,21 +371,32 @@ pub fn grouped(groups: &[usize], n: usize) -> (Vec<u32>, Vec<usize>) { grouped_b
 pub struct Grouped {
     /// The first position of each class, in ascending order.
     pub firsts: Vec<usize>,
-    /// The positions of each class in turn, ascending within each class. A slice holds at most `u32::MAX` items.
-    pub positions: Vec<u32>,
     /// The number of items in each class.
     pub sizes: Vec<usize>,
+    /// The positions of the classes, class by class, ascending within each. Each buffer holds whole classes. Two classes take a buffer
+    /// each, which `into_classes` hands over without a copy. More classes share one buffer. A slice holds at most `u32::MAX` items.
+    buffers: Vec<Vec<u32>>,
 }
 
 impl Grouped {
+    /// The classes that `groups` numbers, giving each item's class, whose first positions are `firsts`.
+    pub fn new(firsts: Vec<usize>, groups: &[usize]) -> Grouped { grouped_classes(groups, firsts, |g| g) }
+
     /// The positions of each class, one slice for each class in turn.
     pub fn each(&self) -> impl Iterator<Item = &[u32]> {
-        let mut rest = &self.positions[..];
+        let (mut buffers, mut rest) = (self.buffers.iter(), &[][..]);
         self.sizes.iter().map(move |&n| {
+            if rest.is_empty() { rest = buffers.next().expect("a buffer holds each class") }
             let (these, more) = rest.split_at(n);
             rest = more;
             these
         })
+    }
+
+    /// The positions of each class in a buffer of its own. Two classes already have theirs. More are copied from the buffer they share.
+    pub fn into_classes(self) -> Vec<Vec<u32>> {
+        if self.buffers.len() == self.sizes.len() { return self.buffers }
+        self.each().map(<[u32]>::to_vec).collect()
     }
 }
 
@@ -338,18 +405,17 @@ impl Grouped {
 #[inline(never)]
 pub fn grouped_keys<K: Key>(x: &[K]) -> Option<Grouped> {
     let (min, mut table) = table(x, usize::MAX)?;
-    write_first(x, min, &mut table);
+    write_first(x, min, &mut table, None);
     let mut firsts: Vec<usize> = table.iter().copied().filter(|&f| f != usize::MAX).collect();
     firsts.sort_unstable();
     for (g, &f) in firsts.iter().enumerate() { table[x[f].key().wrapping_sub(min) as usize] = g; }
     let table = &table[..];
     // With two keys, each item's class is its offset from the lower key, flipped when the higher key comes first.
-    let (positions, sizes) = if let [lower, _] = *table {
-        grouped_by(x, 2, |k| k.key().wrapping_sub(min) as usize ^ lower)
+    Some(if let [lower, _] = *table {
+        grouped_classes(x, firsts, move |k| k.key().wrapping_sub(min) as usize ^ lower)
     } else {
-        grouped_by(x, firsts.len(), |k| table[k.key().wrapping_sub(min) as usize])
-    };
-    Some(Grouped { firsts, positions, sizes })
+        grouped_classes(x, firsts, move |k| table[k.key().wrapping_sub(min) as usize])
+    })
 }
 
 /// `grouped` for the positions of `items`, each in the group that `group` gives its item.
@@ -364,69 +430,55 @@ fn grouped_by<T: Copy + Sync>(items: &[T], n: usize, group: impl Fn(T) -> usize 
     if n <= 256 && n * 16 <= len { parted::<4, T>(items, n, group) } else { parted::<1, T>(items, n, group) }
 }
 
-/// For each mask of 8 bits, the positions of its set bits in ascending order, then zeros.
-const SET: [[u8; 8]; 256] = {
-    let mut set = [[0; 8]; 256];
-    let mut mask = 0;
-    while mask < 256 {
-        let (mut bit, mut k) = (0, 0);
-        while bit < 8 {
-            if mask >> bit & 1 == 1 {
-                set[mask][k] = bit as u8;
-                k += 1;
-            }
-            bit += 1;
-        }
-        mask += 1;
-    }
-    set
-};
-
-/// `grouped_by` for two groups. One pass writes each item's group as a byte, which vectorizes. A multiplication turns each block of 8
-/// bytes into a mask, and `SET` gives the offsets of each group's items in the block. Each group writes 8 positions from its next
-/// place, of which the first are its own, then moves on by its count: group 0 from the front, group 1 from where group 0 ends. No
-/// write depends on a group.
+/// [`Grouped`] for the classes of `items`, each in the class that `class` gives its item, whose first positions are `firsts`. Two
+/// classes write a buffer each. More share one, as `grouped_by` writes it.
 #[inline(always)]
+fn grouped_classes<T: Copy + Sync>(items: &[T], firsts: Vec<usize>, class: impl Fn(T) -> usize + Sync) -> Grouped {
+    if firsts.len() == 2 {
+        let (groups, ones) = group_bytes(items, class);
+        let (mut zeros, mut found) = (Vec::new(), Vec::new());
+        crate::slice::appended(&mut zeros, groups.len() - ones, |d0| crate::slice::appended(&mut found, ones, |d1| split2(&groups, d0, d1)));
+        return Grouped { firsts, sizes: vec![zeros.len(), ones], buffers: vec![zeros, found] };
+    }
+    let (positions, sizes) = grouped_by(items, firsts.len(), class);
+    Grouped { firsts, sizes, buffers: vec![positions] }
+}
+
+/// Each item's group, 0 or 1, as a byte, written in a pass that vectorizes, and the number of items in group 1.
+fn group_bytes<T: Copy + Sync>(items: &[T], group: impl Fn(T) -> usize + Sync) -> (Vec<u8>, usize) {
+    let mut groups = Vec::with_capacity(items.len());
+    crate::pairs(crate::Arg::Many(items), crate::Arg::One(()), items.len(), &mut groups, |k, ()| (group(k) as u8, true));
+    let ones = count_eq(&groups, 1);
+    (groups, ones)
+}
+
+/// `grouped_by` for two groups. Group 0's positions fill the front of one buffer, and group 1's the rest.
 fn two_groups<T: Copy + Sync>(items: &[T], group: impl Fn(T) -> usize + Sync) -> (Vec<u32>, Vec<usize>) {
-    let len = items.len();
-    let mut groups = Vec::with_capacity(len);
-    crate::pairs(crate::Arg::Many(items), crate::Arg::One(()), len, &mut groups, |k, ()| (group(k) as u8, true));
-    let mut ones = 0;
-    for &g in &groups { ones += usize::from(g) }
-    let zeros = len - ones;
-    // Group 0's last writes can reach group 1's first 8 places, so `head` keeps those to write again after the loop. Eight spare places
-    // at the end take group 1's last writes.
-    let (mut d, mut head) = (vec![0u32; len + 8], [0u32; 8]);
-    let (mut k0, mut k1) = (0, zeros);
-    let (blocks, rest) = groups.as_chunks::<8>();
-    for (b, block) in blocks.iter().enumerate() {
-        // The multiplication gathers the low bit of each byte into the top byte.
-        let mask = (u64::from_le_bytes(*block).wrapping_mul(0x0102_0408_1020_4080) >> 56) as usize;
-        let start = (b * 8) as u32;
-        *d[k1..].first_chunk_mut().expect("8 places") = offsets(start, &SET[mask]);
-        let found = mask.count_ones() as usize;
-        if k1 < zeros + 8 { for i in k1..(k1 + found).min(zeros + 8) { head[i - zeros] = d[i] } }
-        *d[k0..].first_chunk_mut().expect("8 places") = offsets(start, &SET[mask ^ 255]);
-        (k0, k1) = (k0 + 8 - found, k1 + found);
-    }
-    for (j, &g) in rest.iter().enumerate() {
-        let (one, i) = (usize::from(g), (blocks.len() * 8 + j) as u32);
-        if one == 1 && k1 < zeros + 8 { head[k1 - zeros] = i }
-        d[if one == 1 { k1 } else { k0 }] = i;
-        (k0, k1) = (k0 + 1 - one, k1 + one);
-    }
-    let h = ones.min(8);
-    d[zeros..zeros + h].copy_from_slice(&head[..h]);
-    d.truncate(len);
+    let (groups, ones) = group_bytes(items, group);
+    let zeros = groups.len() - ones;
+    let mut d = Vec::new();
+    crate::slice::appended(&mut d, groups.len(), |d| {
+        let (d0, d1) = d.split_at_mut(zeros);
+        split2(&groups, d0, d1)
+    });
     (d, vec![zeros, ones])
 }
 
-/// The 8 positions from `start` at the offsets `set`, built in a fixed array so that the loop needs no call or check.
-#[inline(always)]
-fn offsets(start: u32, set: &[u8; 8]) -> [u32; 8] {
-    let mut positions = [0; 8];
-    for i in 0..8 { positions[i] = start + u32::from(set[i]) }
-    positions
+/// Writes the positions of the items whose byte in `groups` is 0 into `d0`, and of those whose byte is 1 into `d1`, each in order. Each
+/// block of 8 bytes becomes a mask of the items in group 1. `gather::selected` writes group 1's positions from the mask and group 0's
+/// from its complement. No write depends on a group. Each buffer holds exactly its group's positions.
+fn split2(groups: &[u8], d0: &mut [MaybeUninit<u32>], d1: &mut [MaybeUninit<u32>]) {
+    let (blocks, rest) = groups.as_chunks::<8>();
+    let (mut k0, mut k1) = (0, 0);
+    for (b, block) in blocks.iter().enumerate() {
+        let (ones, start) = (crate::gather::mask_bits(block), (8 * b) as u32);
+        k1 = crate::gather::selected(d1, k1, ones, |i| start + u32::from(i));
+        k0 = crate::gather::selected(d0, k0, !ones, |i| start + u32::from(i));
+    }
+    let (start, ones) = ((8 * blocks.len()) as u32, crate::gather::mask_bits(rest));
+    k1 = crate::gather::selected(d1, k1, ones, |i| start + u32::from(i));
+    k0 = crate::gather::selected(d0, k0, !ones & ((1u16 << rest.len()) - 1) as u8, |i| start + u32::from(i));
+    assert_eq!((k0, k1), (d0.len(), d1.len()), "each group must be 0 or 1");
 }
 
 /// `grouped_by` for more than two groups, with the positions split into `P` parts. The number of parts is a constant, so each loop over
@@ -437,6 +489,8 @@ fn parted<const P: usize, T: Copy>(items: &[T], n: usize, group: impl Fn(T) -> u
     let rest = &items[P * part..];
     let (mut positions, mut sizes) = (vec![0u32; len], vec![0; n]);
     let mut next = vec![[0u32; P]; n];
+    // Slices in locals, with each place read once, keep the loops from reloading them from memory after every write.
+    let (slots, next) = (&mut positions[..], &mut next[..]);
     for j in 0..part { for q in 0..P { next[group(parts[q][j])][q] += 1; } }
     for &item in rest { next[group(item)][P - 1] += 1; }
     // Each group's places start after the earlier groups', with part 0 first, as its positions come first.
@@ -447,10 +501,11 @@ fn parted<const P: usize, T: Copy>(items: &[T], n: usize, group: impl Fn(T) -> u
             (*place, start) = (start, start + *place);
         }
     }
-    let mut place = |i: usize, item: T, q: usize| {
+    let mut place = move |i: usize, item: T, q: usize| {
         let p = &mut next[group(item)][q];
-        positions[*p as usize] = i as u32;
-        *p += 1;
+        let at = *p;
+        slots[at as usize] = i as u32;
+        *p = at + 1;
     };
     for j in 0..part { for q in 0..P { place(q * part + j, parts[q][j], q); } }
     for (i, &item) in rest.iter().enumerate() { place(P * part + i, item, P - 1); }
@@ -511,6 +566,7 @@ pub(crate) fn sorted<K: RadixKey>(mut keys: Vec<K>) -> (Vec<K>, Vec<u32>) {
 /// A key no wider than its float keeps each pass's bytes in proportion to the float's width.
 fn radix<K: RadixKey>(keys: &mut Vec<K>, order: &mut Vec<u32>, spare: &mut (Vec<K>, Vec<u32>)) {
     let n = keys.len();
+    if n > RADIX_PIECE && crate::parallel::threads() > 1 { return radix_pieces(keys, order, spare); }
     let mut counts = [[0usize; 256]; 8];
     let counts = &mut counts[..K::BYTES];
     for &k in keys.iter() { for (b, count) in counts.iter_mut().enumerate() { count[k.byte(b)] += 1; } }
@@ -526,6 +582,69 @@ fn radix<K: RadixKey>(keys: &mut Vec<K>, order: &mut Vec<u32>, spare: &mut (Vec<
         }
         std::mem::swap(keys, &mut spare.0);
         std::mem::swap(order, &mut spare.1);
+    }
+}
+
+/// The fewest keys in a `radix_pieces` piece. A pass cuts one piece for each thread, or fewer where the keys run short.
+const RADIX_PIECE: usize = 1 << 16;
+
+/// `radix` across threads, for more than one `RADIX_PIECE` of keys. Each pass counts the byte's values in each piece, gives each piece
+/// its own run of every bucket, after the runs of the pieces before it, and moves each piece's keys into its runs in order. The sort
+/// stays stable, so it gives `radix`'s result. A pass splits the unwritten part of `spare` into its runs, so each piece writes only its
+/// own.
+fn radix_pieces<K: RadixKey>(keys: &mut Vec<K>, order: &mut Vec<u32>, spare: &mut (Vec<K>, Vec<u32>)) {
+    use crate::parallel::pieces_of;
+    /// One piece's run in each bucket, for keys and for positions.
+    struct Runs<'a, K> { keys: Vec<std::slice::IterMut<'a, K>>, places: Vec<std::slice::IterMut<'a, u32>> }
+    let n = keys.len();
+    let count = (n / RADIX_PIECE).min(crate::parallel::threads());
+    let size = n.div_ceil(count);
+    let piece = move |p: usize| p * size..n.min((p + 1) * size);
+    let mut every = vec![[[0u32; 256]; 8]; count];
+    pieces_of(&mut every, 1, usize::MAX, &|p, c| {
+        for &k in &keys[piece(p)] { for b in 0..K::BYTES { c[0][b][k.byte(b)] += 1; } }
+        true
+    });
+    let mut moved = false;
+    for b in 0..K::BYTES {
+        let total = (0..256).map(|d| every.iter().map(|c| c[b][d] as usize).sum::<usize>());
+        if total.into_iter().any(|t| t == n) { continue; }
+        let mut counts: Vec<[u32; 256]> = every.iter().map(|c| c[b]).collect();
+        if moved {
+            pieces_of(&mut counts, 1, usize::MAX, &|p, c| {
+                c[0] = [0; 256];
+                for &k in &keys[piece(p)] { c[0][k.byte(b)] += 1; }
+                true
+            });
+        }
+        {
+            let (mut to, mut places) = (&mut spare.0[..n], &mut spare.1[..n]);
+            let mut runs: Vec<Runs<'_, K>> = (0..count).map(|_| Runs { keys: Vec::with_capacity(256), places: Vec::with_capacity(256) }).collect();
+            for d in 0..256 {
+                for (run, c) in runs.iter_mut().zip(&counts) {
+                    let (k, rest) = std::mem::take(&mut to).split_at_mut(c[d] as usize);
+                    let (o, others) = std::mem::take(&mut places).split_at_mut(c[d] as usize);
+                    (to, places) = (rest, others);
+                    run.keys.push(k.iter_mut());
+                    run.places.push(o.iter_mut());
+                }
+            }
+            let (from, positions) = (&keys[..n], &order[..n]);
+            pieces_of(&mut runs, 1, usize::MAX, &|p, run| {
+                let run = &mut run[0];
+                let range = piece(p);
+                let (from, positions) = (&from[range.clone()], &positions[range]);
+                for j in 0..from.len() {
+                    let d = from[j].byte(b);
+                    *run.keys[d].next().expect("a run holds each key that the counts gave its piece") = from[j];
+                    *run.places[d].next().expect("a run holds each key that the counts gave its piece") = positions[j];
+                }
+                true
+            });
+        }
+        std::mem::swap(keys, &mut spare.0);
+        std::mem::swap(order, &mut spare.1);
+        moved = true;
     }
 }
 

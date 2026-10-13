@@ -47,7 +47,7 @@ pub(super) fn eig_factor<T: Schur>(a: &[T], n: usize, vectors: bool) -> Option<E
     if !vectors { return Some(Eig { values, vectors: Vec::new() }) }
     let x = T::schur_vectors(&h, ld, n, &schur);
     let mut v = vec![T::zero(); n * n];
-    T::add_product(&mut v, n, |i, p| zt[p * n + i], |p, j| x[p * n + j], [n; 3]);
+    T::add_product(&mut v, n, |i, p| zt[p * n + i], Rows(&x, n), [n; 3]);
     Some(Eig { values, vectors: T::unit_vectors(&v, n, &schur) })
 }
 

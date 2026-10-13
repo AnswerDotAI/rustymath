@@ -42,6 +42,10 @@ pub fn totient(py: Python<'_>, n: BigUint) -> PyResult<BigUint> {
 #[pyfunction]
 pub fn prime_count(py: Python<'_>, n: u64) -> PyResult<u64> { nt::prime_count_with(n, || py.check_signals()) }
 
+/// The exact factorial of the nonnegative integer `n`, as a Python integer.
+#[pyfunction]
+pub fn factorial(py: Python<'_>, n: u64) -> PyResult<BigUint> { nt::factorial_with(n, || py.check_signals()) }
+
 /// The primes from `start` up to but not including `stop`, as an array of uint64. With one argument, the primes below it, as `range`
 /// counts.
 #[pyfunction]
@@ -58,7 +62,7 @@ pub fn primes(py: Python<'_>, start: u64, stop: Option<u64>) -> PyResult<Bound<'
 pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
     for f in [
         wrap_pyfunction!(is_prime, m)?, wrap_pyfunction!(factor, m)?, wrap_pyfunction!(next_prime, m)?, wrap_pyfunction!(prev_prime, m)?,
-        wrap_pyfunction!(totient, m)?, wrap_pyfunction!(prime_count, m)?, wrap_pyfunction!(primes, m)?,
+        wrap_pyfunction!(totient, m)?, wrap_pyfunction!(prime_count, m)?, wrap_pyfunction!(primes, m)?, wrap_pyfunction!(factorial, m)?,
     ] {
         m.add_function(f)?;
     }

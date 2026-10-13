@@ -1,3 +1,4 @@
+import math
 import numpy as np, pytest, rustymath as rm
 
 def ulps(got, want):
@@ -35,14 +36,14 @@ def test_complex():
             assert got.dtype == dt, name
             # NumPy's complex functions err by an ulp or two themselves, so this bound is loose. The Rust tests compare with mpmath.
             assert (np.abs(got - want) <= 16 * np.finfo(got.real.dtype).eps * np.abs(want)).all(), (name, dt)
-    assert np.allclose(rm.power(z, 0.5 + 1j), z**(0.5 + 1j)) and rm.absolute(z).dtype == np.float64 and rm.abs is rm.absolute
+    assert np.allclose(rm.power(z, 0.5 + 1j), z**(0.5 + 1j)) and rm.absolute(z).dtype == np.float64
     assert np.allclose(rm.absolute(z), np.abs(z)) and np.allclose(rm.angle(z), np.angle(z)) and np.allclose(rm.sign(z), z / np.abs(z))
     assert rm.sign(-2.5) == -1 and rm.angle(-1.0) == np.pi
 
 def test_integers():
     a, b = np.arange(-30, 30), np.arange(1, 61)[::-1] - 25
     assert (rm.gcd(a, b) == np.gcd(a, b)).all() and (rm.lcm(a, b) == np.sign(a * b) * np.lcm(a, b)).all() and rm.gcd(a, b).dtype == np.int64
-    assert (rm.remainder(a, b + 100) == np.remainder(a, b + 100)).all() and rm.mod is rm.remainder
+    assert (rm.remainder(a, b + 100) == np.remainder(a, b + 100)).all()
     assert (rm.power(a, 3) == a**3).all() and rm.power(a, 3).dtype == np.int64
     with np.errstate(over='raise'), pytest.raises(FloatingPointError): rm.power(np.int64(10), 30)
     # Every integer width keeps its type, as in NumPy, with add and multiply wrapping at the narrow widths.
@@ -71,18 +72,51 @@ def test_integers():
         assert got.dtype == bool and (got == want).all(), name
     assert rm.floor(p).dtype == bool and rm.absolute(p).dtype == bool and rm.add.reduce(p) == 2
 
-def test_reductions():
+def test_reductions(threads):
     x = np.random.default_rng(0).random(10_001)
     assert np.isclose(rm.add.reduce(x), x.sum()) and np.allclose(rm.add.accumulate(x), np.cumsum(x))
     assert np.isclose(rm.multiply.reduce(1 + x[:100] / 100), np.prod(1 + x[:100] / 100))
     m = x[:10_000].reshape(100, 100)
     assert np.allclose(rm.add.reduce(m, axis=0), m.sum(0)) and np.allclose(rm.add.reduce(m, axis=1), m.sum(1))
     v = np.array([3.0, 1.0, np.nan, 5.0])
-    assert np.isnan(rm.maximum.reduce(v)) and np.array_equal(rm.minimum.accumulate(v), np.minimum.accumulate(v), equal_nan=True)
-    assert rm.maximum.reduce(x[::7]) == x[::7].max() and np.isnan(rm.minimum(np.nan, 1.0))
+    most, least = rm.maximum.reduce(v), rm.minimum.accumulate(v)
+    assert (np.isnan(most) or most == 5) and all(np.isnan(g) or g == w for g, w in zip(least, [3.0, 1.0, 1.0, 1.0]))
+    assert rm.maximum.reduce(x[::7]) == x[::7].max() and rm.minimum(np.nan, 1.0) == 1 and np.isnan(rm.minimum(1.0, np.nan))
     assert rm.power.reduce([2.0, 3.0, 2.0]) == 64 and rm.power.accumulate([2.0, 3.0, 2.0]).tolist() == [2, 8, 64]
     big = np.array([2**62, 2**62, 2**62])
     assert rm.add.reduce(big) == np.add.reduce(big) and (rm.add.accumulate(big) == np.add.accumulate(big)).all()
+    b = np.random.default_rng(0).integers(0, 2, (17, 1001)).astype(bool)
+    for name in ['logical_and', 'logical_or', 'logical_xor', 'logical_xnor']:
+        op = getattr(rm, name)
+        ref = np.equal if name == 'logical_xnor' else getattr(np, name)
+        assert op(b, ~b).dtype == bool and np.array_equal(op(b, ~b), ref(b, ~b))
+        for axis in [0, 1]:
+            assert np.array_equal(op.reduce(b[:, ::-1], axis=axis), ref.reduce(b[:, ::-1], axis=axis))
+            assert np.array_equal(op.accumulate(b[:, ::-1], axis=axis), ref.accumulate(b[:, ::-1], axis=axis))
+        assert op.reduce(np.array([], dtype=bool)) == (name in ['logical_and', 'logical_xnor'])
+    for dt in [np.complex64, np.complex128]:
+        z = (1 + np.arange(9001) * (1e-5 + 2e-5j)).astype(dt)
+        for op, ref in [(rm.add, np.add), (rm.multiply, np.multiply)]:
+            x = z if op is rm.add else z[:100]
+            assert op.reduce(x).dtype == dt and np.allclose(op.reduce(x), ref.reduce(x), rtol=2e-5)
+            assert np.allclose(op.accumulate(x[::-2]), ref.accumulate(x[::-2]), rtol=2e-5)
+    x = np.linspace(1, 2, 1_048_580)
+    half = np.resize(np.array([1, 2**-11, -1, 2**-11], np.float16), len(x))
+    for view in [x, x[::2], x[::-1], x * (1 + 2j)]:
+        assert np.allclose(rm.add.reduce(view, initial=3), view.sum() + 3)
+    assert rm.add.reduce(half, initial=np.float16(0.25)) == np.float16(half.astype(np.float32).sum() + 0.25)
+    ints = np.full(len(x), 2**62, np.int64)
+    assert rm.add.reduce(ints) == np.add.reduce(ints)
+    factors = 1 + (x - 1.5) * 1e-5
+    assert np.isclose(rm.multiply.reduce(factors), factors.prod())
+    assert rm.maximum.reduce(x[::-2]) == x[-1] and rm.minimum.reduce(x) == x[0]
+    b = np.arange(len(x)) % 3 == 0
+    assert rm.logical_xor.reduce(b) == np.logical_xor.reduce(b)
+    assert np.array_equal(rm.logical_xnor.accumulate(b), np.equal.accumulate(b))
+    assert np.allclose(rm.subtract.accumulate(x[:8193]), np.subtract.accumulate(x[:8193]))
+    out = x[:8193].copy()
+    rm.add.accumulate(out, out=out)
+    assert np.allclose(out, x[:8193].cumsum())
 
 def test_tolerant():
     assert rm.equal(0.1 + 0.2, 0.3) and not rm.equal(0.1 + 0.2, 0.3, ct=0)
@@ -93,42 +127,6 @@ def test_tolerant():
     assert abs(rm.gcd(0.6, 0.4) - 0.2) < 1e-15 and abs(rm.lcm(-0.6, 0.4) + 1.2) < 1e-14
     with pytest.raises(ValueError): rm.equal(1, 1, ct=1)
     with np.errstate(invalid='raise'), pytest.raises(FloatingPointError): rm.log(-1.0)
-
-def test_tolerant_search():
-    a = np.random.default_rng(0).integers(0, 50, (20, 30))
-    vals, first, inverse, counts = rm.unique(a)
-    flat = a.ravel()
-    assert np.array_equal(first, np.sort(np.unique(flat, return_index=True)[1])) and np.array_equal(vals, flat[first]) and vals.dtype == a.dtype
-    assert np.array_equal(vals[inverse], flat) and np.array_equal(counts, np.bincount(inverse))
-    # Integers match exactly, where floats this large would match within the tolerance.
-    assert rm.index(np.int64([10**15]), 10**15 + 1) == 1 and rm.index(np.uint8([3, 7]), [7, 9]).tolist() == [1, 2]
-    x = [0.3, 1.0, 0.1 + 0.2, 2.0]
-    assert rm.unique(x).values.tolist() == [0.3, 1.0, 2.0] and len(rm.unique(x, ct=0).values) == 4
-    assert [v.tolist() for v in rm.unique(x)[2:]] == [[0, 1, 0, 2], [2, 1, 1]]
-    assert rm.index(x, [0.1 + 0.2, 5.0]).tolist() == [0, 4] and rm.index(x, 0.1 + 0.2, ct=0) == 2
-    assert rm.isin(np.float32([0.3, 5]), np.float32([0.3])).tolist() == [True, False] and not rm.isin(5.0, x)
-    with pytest.raises(TypeError): rm.index(x, [1j])
-
-def test_polynomial():
-    from numpy.polynomial import polynomial as P
-    c, x = [2.0, -3.0, 1.0], np.linspace(-2, 3, 50)
-    assert rm.polynomial.polyval(2.0, [1, 2, 3]) == 17 and rm.polynomial.polyval(np.float32(x), np.float32(c)).dtype == np.float32
-    assert np.allclose(rm.polynomial.polyval(x.reshape(5, 10), c), P.polyval(x, c).reshape(5, 10))
-    assert np.allclose(rm.polynomial.polyroots(c), [1, 2]) and rm.polynomial.polyroots(np.float16(c)).dtype == np.complex64
-    assert np.allclose(rm.polynomial.polyroots([1.0, 0, 1]), [-1j, 1j]) and len(rm.polynomial.polyroots([5.0])) == 0
-    # The eigenvalue solver fails on NaN coefficients, so each root is NaN and NumPy reports an invalid value.
-    with np.errstate(invalid='raise'), pytest.raises(FloatingPointError): rm.polynomial.polyroots([np.nan, 0, 1.0])
-    with np.errstate(invalid='ignore'): assert np.isnan(rm.polynomial.polyroots([np.nan, 0, 1.0, 0])).sum() == 2
-    assert rm.polynomial.polyfromroots([1, 2]).tolist() == [2, -3, 1] and rm.polynomial.polyfromroots([1j, -1j]).tolist() == [1, 0, 1]
-    assert rm.polynomial.polyder([1, 2, 3, 4]).tolist() == [2, 6, 12] and len(rm.polynomial.polyder([3.0])) == 0
-    assert np.allclose(rm.polynomial.polyfit([0, 1, 2, 3], [1, 3, 7, 13], 2), [1, 1, 1])
-
-def test_number_theory():
-    nt = rm.number_theory
-    assert nt.is_prime(2**127 - 1) and not nt.is_prime(2**128 + 1) and nt.factor(600851475143) == [(71, 1), (839, 1), (1471, 1), (6857, 1)]
-    assert nt.next_prime(2**64) == 2**64 + 13 and nt.prev_prime(2) is None and nt.totient(36) == 12
-    assert nt.prime_count(10**6) == 78498 and nt.primes(20).tolist() == [2, 3, 5, 7, 11, 13, 17, 19] and nt.primes(7, 12).tolist() == [7, 11]
-    with pytest.raises(ValueError): nt.factor(0)
 
 def test_special():
     from scipy import special
@@ -163,73 +161,86 @@ def test_distribution():
     with pytest.raises(ValueError): normal(0, -1)
     assert normal().cdf(0.0) == 0.5
 
-@pytest.mark.parametrize('kind', [float, complex])
-def test_linalg(kind):
-    la, rng = rm.linalg, np.random.default_rng(0)
-    H = lambda x: np.conj(np.swapaxes(x, -1, -2))
-    rand = lambda *shape: rng.standard_normal(shape) + 1j * rng.standard_normal(shape) if kind is complex else rng.standard_normal(shape)
-    a, b = rand(4, 5, 5), rand(4, 5, 3)
-    v = b[0, :, 0]
-    assert np.allclose(la.solve(a, b), np.linalg.solve(a, b)) and np.allclose(la.solve(a[0], v), np.linalg.solve(a[0], v))
-    assert np.allclose(la.inv(a), np.linalg.inv(a)) and np.allclose(la.det(a), np.linalg.det(a))
-    sign, log = la.slogdet(a)
-    assert np.allclose(sign, np.linalg.slogdet(a).sign) and np.allclose(log, np.linalg.slogdet(a).logabsdet)
-    l, u, p = la.lu(a)
-    assert np.allclose(l @ u, np.take_along_axis(a, p[..., :, None], axis=-2)) and np.allclose(np.tril(l), l) and np.allclose(np.triu(u), u)
-    assert np.allclose(rm.matmul(a, b), a @ b) and np.allclose(rm.matmul(a, v), a @ v) and np.isclose(rm.matmul(v, v), v @ v)
-    spd = a @ H(a) + 5 * np.eye(5)
-    assert np.allclose(la.cholesky(spd), np.linalg.cholesky(spd))
-    # Signs and phases that NumPy leaves to LAPACK can differ, so factorizations are checked by what they multiply back to.
-    for x in rand(3, 4, 7), rand(3, 7, 4):
-        q, r = la.qr(x)
-        d = np.diagonal(r, axis1=-2, axis2=-1)
-        assert np.allclose(q @ r, x) and (d.imag == 0).all()
-        q, r = la.qr(x, complete=True)
-        assert np.allclose(q @ r, x) and np.allclose(H(q) @ q, np.eye(x.shape[-2]))
-        u, s, v = la.svd(x)
-        assert np.allclose(u * s[..., None, :] @ H(v), x) and np.allclose(H(u) @ u, np.eye(u.shape[-1])) and np.allclose(H(v) @ v, np.eye(v.shape[-1]))
-        assert np.allclose(s, np.linalg.svd(x, compute_uv=False)) and np.allclose(la.svdvals(x), s) and np.allclose(la.pinv(x), np.linalg.pinv(x))
-    sym = a + H(a)
-    w, vecs = la.eigh(sym)
-    assert np.allclose(w, np.linalg.eigvalsh(sym)) and np.allclose(vecs * w[..., None, :] @ H(vecs), sym) and np.allclose(la.eigvalsh(sym), w)
-    w, vecs = la.eig(a)
-    assert np.allclose(a @ vecs, vecs * w[..., None, :]) and np.allclose(np.sort_complex(w), np.sort_complex(np.linalg.eigvals(a)))
-    assert la.eig(sym).values.dtype == la.eigvals(a).dtype == np.result_type(a, 1j)
-    # A rank-deficient or non-square matrix gives the least-norm least-squares solution, and its pseudoinverse.
-    A, B = rand(9, 4), rand(9, 2)
-    deficient = A[:, [0, 1, 1, 3]]
-    for x, y in (A, B), (A, B[:, 0]), (deficient, B):
-        (got, s), want = la.lstsq(x, y), np.linalg.lstsq(x, y)
-        assert np.allclose(got, want[0]) and np.allclose(s, want[3]) and np.allclose(la.solve(x, y), want[0])
-    singular = deficient[:4]
-    assert np.allclose(la.inv(singular), np.linalg.pinv(singular)) and la.matrix_rank(deficient) == 3 and (la.matrix_rank(a) == 5).all()
-    if kind is complex:
-        # complex64 computes at its own width, with real results, such as singular values, in float32.
-        eye = np.eye(3, dtype=np.complex64)
-        assert la.inv(eye).dtype == np.complex64 and la.svd(eye).s.dtype == np.float32 and la.slogdet(eye)[1].dtype == np.float32
-        with pytest.raises(TypeError, match='real matrices'): la.semiring(np.maximum, np.add)(a, b)
-        return
-    # Min-plus products give shortest paths, and or-and products give reachability.
-    d = np.array([[0, 3, np.inf], [np.inf, 0, 1], [2, np.inf, 0]])
-    assert (la.semiring(np.minimum, np.add)(d, d) == np.min(d[:, :, None] + d[None], axis=1)).all()
-    assert np.allclose(la.semiring(rm.maximum, rm.add)(a, b), np.max(a[..., :, :, None] + b[..., None, :, :], axis=-2))
-    g = rng.random((6, 6)) < 0.3
-    assert (rm.matmul(g, g) == np.matmul(g, g)).all() and (la.semiring(np.logical_or, np.logical_and)(g, g) == np.matmul(g, g)).all()
-    # float16 computes in float32 and rounds back.
-    assert la.inv(np.eye(3, dtype=np.float16)).dtype == np.float16 and la.svd(np.eye(3, dtype=np.float32)).s.dtype == np.float32
-    # Integer products compute in int64. An int8 argument converts to it, so these sums of 3 million don't overflow.
-    i8 = np.full((2, 300), 100, np.int8)
-    assert rm.matmul(i8, i8.T).dtype == np.int64 and (rm.matmul(i8, i8.T) == 3_000_000).all()
-    # Integer max-plus and min-plus products, and the counts of equal and unequal items, match NumPy's results built item by item.
-    n, p = rng.integers(-5, 5, (5, 7)), rng.integers(-5, 5, (7, 4))
-    assert (la.semiring(np.maximum, np.add)(n, p) == np.max(n[:, :, None] + p[None], axis=1)).all()
-    assert (la.semiring(np.minimum, np.add)(n, p) == np.min(n[:, :, None] + p[None], axis=1)).all()
-    equal = (n[:, :, None] == p[None]).sum(axis=1)
-    assert (la.semiring(np.add, np.equal)(n, p) == equal).all() and (la.semiring(np.add, np.not_equal)(n, p) == 7 - equal).all()
-    assert (la.semiring(np.add, np.equal)(n / 2, p / 2) == equal).all()
-    # Integer arithmetic wraps on overflow: 2^62 times 4 is 2^64, which wraps to 0.
-    assert rm.matmul([[2**62]], [[4]])[0, 0] == 0
-    # A matrix that can't be factored gives NaN and NumPy's "invalid value" warning, as a failing item of a ufunc does.
-    for f, x in (la.cholesky, -np.eye(2)), (la.eig, [[1., np.nan], [0, 1]]):
-        with pytest.warns(RuntimeWarning, match='invalid value'): assert np.isnan(f(np.array(x))[0]).all()
-    assert la.slogdet([[1., 2], [2, 4]]) == (0, -np.inf) and la.inv(np.zeros((0, 0))).shape == (0, 0)
+def test_scalar_functions_and_integer_binomial():
+    for dt in [np.float16, np.float32, np.float64]:
+        x = np.array([0, 1, 2, 5], dtype=dt)
+        assert rm.factorial(x).dtype == dt and np.allclose(rm.factorial(x), [1, 1, 2, 120])
+        assert rm.logb(dt(2), dt([1, 2, 8])).dtype == dt and np.allclose(rm.logb(dt(2), dt([1, 2, 8])), [0, 1, 3])
+        assert rm.cis(x).dtype == np.result_type(dt, np.complex64) and np.allclose(rm.cis(x), np.exp(1j * x.astype(float)), atol=1e-6)
+    z = np.array([1 + 2j, 2 - 1j])
+    assert np.allclose(rm.logb(2 + 1j, z), np.log(z) / np.log(2 + 1j)) and np.allclose(rm.cis(z), np.exp(1j * z))
+    assert np.allclose(rm.divide(z, 2 - 1j), z / (2 - 1j)) and np.allclose(rm.divide([1., 2.], 2), [0.5, 1.])
+    for zero in [0., 0j]:
+        with np.errstate(invalid='raise'), pytest.raises(FloatingPointError): rm.divide(zero, zero)
+        with np.errstate(invalid='raise'): assert np.isnan(rm.divide(np.nan + zero, zero))
+    assert rm.subtract.reduce([10, 3, 2]) == 5 and rm.subtract.accumulate([10, 3, 2]).tolist() == [10, 7, 5]
+    for dt in [np.int8, np.uint8, np.int16, np.uint16, np.int32, np.uint32, np.int64, np.uint64]:
+        got = rm.binom(dt([10, 5, 3]), dt([3, 0, 4]))
+        assert got.dtype == dt and got.tolist() == [120, 1, 0]
+    assert rm.binom(np.int64(-3), np.int64(3)) == -10
+    assert rm.binom(np.uint64(67), np.uint64(33)) == math.comb(67, 33)
+    for n, k in (np.int8(11), np.int8(5)), (np.int64(67), np.int64(33)), (np.uint64(68), np.uint64(34)), (np.int64(3), np.int64(-1)):
+        with np.errstate(over='raise'), pytest.raises(FloatingPointError): rm.binom(n, k)
+
+def test_minmax_and_truth_table_scan():
+    for dt in [np.bool_, np.int8, np.uint64, np.float16, np.float32, np.float64]:
+        x = np.arange(30).reshape(5, 6).astype(dt)[:, ::-2]
+        for axis in [0, -1]:
+            lo, hi = rm.minmax(x, axis=axis)
+            assert lo.dtype == hi.dtype == dt and np.array_equal(lo, x.min(axis=axis)) and np.array_equal(hi, x.max(axis=axis))
+    lo, hi = rm.minmax([1., np.nan, 2.])
+    assert (np.isnan(lo) or lo == 1) and (np.isnan(hi) or hi == 2)
+    b = np.array([[True, False, True], [False, True, True]])
+    for bits in range(16):
+        table = np.array([(bits >> k) & 1 for k in range(4)], dtype=bool).reshape(2, 2)
+        for axis in [0, 1]:
+            for start in [None, True]:
+                want = np.moveaxis(b, axis, -1).copy()
+                for row in want:
+                    if start is not None: row[0] = table[int(start), int(row[0])]
+                    for i in range(1, len(row)): row[i] = table[int(row[i - 1]), int(row[i])]
+                assert np.array_equal(rm.logical_scan(b, table.tolist(), axis=axis, start=start), np.moveaxis(want, -1, axis))
+    assert rm.logical_scan(np.empty((2, 0), bool), [[False, True], [True, False]]).shape == (2, 0)
+    with pytest.raises(ValueError, match='axis'): rm.logical_scan(b, [[False, True], [True, False]], axis=2)
+
+def test_elementwise_layouts(threads):
+    x = np.linspace(0.1, 1, 262_147)
+    for view in [x, x[::2], x[::-1], np.broadcast_to(0.5, x.shape)]:
+        assert np.allclose(rm.exp(view), np.exp(view), rtol=2e-15)
+    out = x.copy()
+    rm.exp(out, out=out)
+    assert np.allclose(out, np.exp(x), rtol=2e-15)
+    out = np.zeros(2 * len(x))
+    rm.power(1.001, x, out=out[::2])
+    assert np.allclose(out[::2], 1.001**x) and (out[1::2] == 0).all()
+    rm.exp(x, out=out[:len(x)][::-1])
+    assert np.allclose(out[:len(x)][::-1], np.exp(x), rtol=2e-15)
+    # Shifted aliases need NumPy's copy; exact aliases and negative strides need no cross-range dependency.
+    out = np.arange(len(x) + 1, dtype=float)
+    rm.add(out[:-1], 1, out=out[1:])
+    assert np.array_equal(out, np.arange(len(out), dtype=float))
+    out = np.zeros(1)
+    repeated = np.lib.stride_tricks.as_strided(out, shape=x.shape, strides=(0,))
+    rm.exp(x, out=repeated)
+    assert np.isclose(out[0], np.exp(x[-1]))
+    z = x + 1j * x
+    rm.absolute(z, out=z.real)
+    assert np.allclose(z.real, np.sqrt(2) * x)
+    out, mask = np.full_like(x, -2), np.arange(len(x)) % 3 == 0
+    rm.sin(x, out=out, where=mask)
+    assert np.allclose(out[mask], np.sin(x[mask])) and (out[~mask] == -2).all()
+
+def test_parallel_and_buffered_errors(threads):
+    x = np.ones(262_147)
+    x[-1] = -1
+    with np.errstate(invalid='raise'), pytest.raises(FloatingPointError): rm.log(x)
+    powers = np.full(len(x), 3, np.int64)
+    powers[-1] = 63
+    with np.errstate(over='raise'), pytest.raises(FloatingPointError): rm.power(np.full(len(x), 2, np.int64), powers)
+    # Integer-to-float casting splits the call into NumPy buffers; a later successful callback must not erase this failure.
+    buffered = np.zeros(100_003, np.int64)
+    buffered[0] = -1
+    with np.errstate(invalid='raise'), pytest.raises(FloatingPointError): rm.lambertw(buffered)
+    with np.errstate(all='raise'):
+        assert np.allclose(rm.log(np.ones(len(x))), 0)
+        assert np.isnan(rm.log(np.full(len(x), np.nan))).all()

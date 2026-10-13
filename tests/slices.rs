@@ -1,5 +1,46 @@
 pub mod support;
 
+mod parallel {
+    use rustymath::parallel::{ranges, set_threads, split, threads};
+    use std::{sync::{Mutex, atomic::{AtomicBool, Ordering}}, thread, time::Duration};
+
+    #[test]
+    fn ranges_and_outputs() {
+        let empty = Mutex::new(Vec::new());
+        assert!(!ranges(0, 8, &|range| { empty.lock().unwrap().push(range); false }));
+        assert_eq!(empty.into_inner().unwrap(), [0..0]);
+        assert!(std::panic::catch_unwind(|| ranges(0, 0, &|_| true)).is_err());
+        for limit in [1, 4] {
+            let previous = set_threads(limit);
+            let (caller, worker, calls) = (thread::current().id(), AtomicBool::new(false), Mutex::new(Vec::new()));
+            let mut out = vec![usize::MAX; 129];
+            let ok = split(&mut out, 8, &|start, items| {
+                calls.lock().unwrap().push(start..start + items.len());
+                // Give the first unit enough work to select pieces, without asserting an elapsed time.
+                if start == 0 && limit > 1 { thread::sleep(Duration::from_millis(1)); }
+                if thread::current().id() != caller {
+                    worker.store(true, Ordering::Relaxed);
+                    assert_eq!(threads(), 1);
+                    assert!(ranges(17, 1, &|range| range == (0..17)));
+                }
+                for (i, item) in items.iter_mut().enumerate() { *item = start + i; }
+                start != 0
+            });
+            set_threads(previous);
+            assert!(!ok);
+            assert_eq!(out, (0..129).collect::<Vec<_>>());
+            let mut calls = calls.into_inner().unwrap();
+            calls.sort_by_key(|range| range.start);
+            let mut end = 0;
+            for range in &calls { assert_eq!(range.start, end); end = range.end; }
+            assert_eq!(end, 129);
+            if limit == 1 { assert_eq!(calls, [0..129]); }
+            #[cfg(not(target_arch = "wasm32"))]
+            if limit > 1 { assert!(worker.load(Ordering::Relaxed)); }
+        }
+    }
+}
+
 mod forms {
     use rustymath::{reduce::{Maximum, Minimum}, *};
     use half::f16;
@@ -162,8 +203,7 @@ mod reductions {
         let (s, p): (Vec<f32>, Vec<f32>) = (s.iter().map(|&v| v as f32).collect(), p.iter().map(|&v| v as f32).collect());
         exact(&s, &p, |t, v| Some(t + v), |t, v| Some(t * v), 0.0, 1.0);
         let (s, p): (Vec<f16>, Vec<f16>) = (s.iter().map(|&v| f16::from_f32(v)).collect(), p.iter().map(|&v| f16::from_f32(v)).collect());
-        let narrow = |f: fn(f32, f32) -> f32| move |t: f16, v: f16| Some(f16::from_f32(f(t.to_f32(), v.to_f32())));
-        exact(&s, &p, narrow(|t, v| t + v), narrow(|t, v| t * v), f16::ZERO, f16::ONE);
+        exact(&s, &p, |t, v| Some(t + v.to_f32()), |t, v| Some(t * v.to_f32()), 0.0, 1.0);
         assert_eq!(extremes(&sums), (*sums.iter().min().unwrap(), *sums.iter().max().unwrap()));
         let mut maxima = Vec::new();
         cummax(&sums, Some(-5), &mut maxima);
@@ -180,24 +220,17 @@ mod reductions {
     #[test]
     fn edges() {
         assert_eq!((sum::<f64>(&[]), prod::<i32>(&[]), max::<f32>(&[]), min::<i16>(&[])), ((0.0, true), (1, true), f32::NEG_INFINITY, i16::MAX));
-        // NaN at item 40 of 101 lies inside a fold's running results, which vectorize, and not in the remainder.
+        // NaN at item 40 of 101 lies inside a fold's running results, which vectorize, and not in the remainder. AArch64's `fmax`
+        // gives NaN there, and other targets skip it.
         let mut v = vec![1.0f64; 101];
         v[40] = f64::NAN;
         let v32: Vec<f32> = v.iter().map(|&x| x as f32).collect();
-        assert_eq!((max(&v).is_nan(), min(&v32).is_nan(), max(&[f16::ONE, f16::NAN]).is_nan()), (true, true, true));
-        assert_eq!((maximum(1.0, f64::NAN).is_nan(), minimum(f32::NAN, 1.0).is_nan(), maximum(-1.0, 2.0), minimum(f16::ONE, f16::ZERO)), (true, true, 2.0, f16::ZERO));
-        // With a shared `x`, the slice forms test the other argument for NaN. They still give `maximum`'s and `minimum`'s results.
-        let e = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -0.0, 1.5, -2.0];
-        let same = |a: f64, b: f64| a.to_bits() == b.to_bits() || a.is_nan() && b.is_nan();
-        for &c in &e {
-            let (mut most, mut least) = (Vec::new(), Vec::new());
-            assert!(rustymath::Binary::many(&Maximum, rustymath::Arg::One(c), rustymath::Arg::Many(&e), e.len(), &mut most));
-            assert!(rustymath::Binary::many(&Minimum, rustymath::Arg::One(c), rustymath::Arg::Many(&e), e.len(), &mut least));
-            for (k, &y) in e.iter().enumerate() { assert!(same(most[k], maximum(c, y)) && same(least[k], minimum(c, y)), "{c} and {y}"); }
-        }
+        let (most, least, half) = (max(&v), min(&v32), max(&[f16::ONE, f16::NAN]));
+        assert!((most.is_nan() || most == 1.0) && (least.is_nan() || least == 1.0) && (half.is_nan() || half == f16::ONE));
+        assert_eq!((maximum(1.0, f64::NAN).is_nan(), minimum(f32::NAN, 1.0), maximum(-1.0, 2.0), minimum(f16::ONE, f16::ZERO)), (true, 1.0, 2.0, f16::ZERO));
         let mut out = Vec::new();
         cummax(&[1.0, 3.0, f64::NAN, 5.0, 2.0, 1.0], None, &mut out);
-        assert_eq!(out.iter().map(|v| v.is_nan()).collect::<Vec<_>>(), [false, false, true, true, true, true]);
+        assert!(out.iter().zip([1.0, 3.0, 3.0, 5.0, 5.0, 5.0]).all(|(&got, want)| got.is_nan() || got == want), "{out:?}");
         assert_eq!((sum(&[i64::MAX, 1]), sum(&[i64::MAX, 1, -2]), prod(&[i64::MAX, 2])), ((i64::MIN, false), (i64::MAX - 1, true), (-2, false)));
         assert_eq!((sum(&[u64::MAX, 1]), prod(&[1u64 << 32, 1 << 32]), sum(&[u64::MAX, 0])), ((0, false), (0, false), (u64::MAX, true)));
         let mut out = Vec::new();
@@ -210,9 +243,9 @@ mod reductions {
         assert_eq!(out, [7.0, 11.0, 13.0]);
     }
 
-    /// Running maxima are NaN from the first NaN in `start` or the items, including either side of the scan's block boundaries.
+    /// Each running maximum is NaN or `maximum`'s result with the running result as `y`, either side of the scan's block boundaries.
     #[test]
-    fn scans_until_the_first_nan() {
+    fn scans_beside_nan() {
         let x: Vec<f64> = (0..200).map(|i| (i * 37 % 101) as f64 - 50.0).collect();
         for nan in [None, Some(0), Some(3), Some(63), Some(64), Some(130), Some(199)] {
             for start in [None, Some(10.0), Some(f64::NAN)] {
@@ -221,8 +254,8 @@ mod reductions {
                 let mut out = Vec::new();
                 cummax(&y, start, &mut out);
                 let mut total = start;
-                let want = y.iter().map(|&v| { let t = total.map_or(v, |t| maximum(t, v)); total = Some(t); t });
-                assert!(out.len() == y.len() && out.iter().zip(want).all(|(&a, b)| a == b || a.is_nan() && b.is_nan()), "{nan:?} {start:?}");
+                let want = y.iter().map(|&v| { let t = total.map_or(v, |t| maximum(v, t)); total = Some(t); t });
+                assert!(out.len() == y.len() && out.iter().zip(want).all(|(&a, b)| a == b || a.is_nan()), "{nan:?} {start:?}");
             }
         }
     }
@@ -237,7 +270,7 @@ mod reductions {
     /// reductions, and an `i64` sum that wraps reports it, along a lane and down the rows.
     #[test]
     fn axes_match_lane_by_lane() {
-        for shape in [[3, 37, 5], [15, 37, 1], [4, 3, 2], [2, 0, 3], [2, 200, 1]] {
+        for shape in [[3, 37, 5], [15, 37, 1], [4, 3, 2], [2, 0, 3], [2, 200, 1], [70, 3, 1], [5, 64, 1], [65, 1, 1]] {
             let [outer, len, inner] = shape;
             let x: Vec<i64> = (0..outer * len * inner).map(|i| (i * 37 % 101) as i64 - 50).collect();
             let sums: Vec<i64> = lanes_of(&x, shape).iter().map(|l| l.iter().sum()).collect();
@@ -298,18 +331,47 @@ mod reductions {
                     assert_eq!(reduced, want, "{shape:?} {start:?} {code}");
                 }
             }
-            // `chosen` picks each item's result from `low` or `high` by the result before it, from either carry.
+            // `chosen` picks each item's result from `low` or `high` by the result before it, from either carry. Item `first + i·len`
+            // takes `fixed[i]` whatever the result before it.
             let high: Vec<bool> = x.iter().map(|v| v % 5 != 0).collect();
-            for carry in [false, true] {
-                let want: Vec<bool> = b.iter().zip(&high).scan(carry, |t, (&l, &h)| { *t = if *t { h } else { l }; Some(*t) }).collect();
+            for (carry, len, first, restarts) in [(false, 1, 0, false), (true, 1, 0, false), (true, 3, 2, true), (false, 4, 1, true), (true, 70, 5, true)] {
+                let fixed: Vec<bool> = if restarts { (first..b.len()).step_by(len).map(|p| x[p] % 3 == 0).collect() } else { Vec::new() };
+                let mut t = carry;
+                let want: Vec<bool> = (0..b.len()).map(|k| {
+                    let restart = (k >= first && (k - first) % len == 0).then(|| fixed.get((k - first) / len)).flatten();
+                    t = restart.copied().unwrap_or(if t { high[k] } else { b[k] });
+                    t
+                }).collect();
                 let mut out = Vec::new();
-                chosen(carry, &b, &high, &mut out);
-                assert_eq!(out, want, "{shape:?} {carry}");
+                chosen(carry, &b, &high, len, first, &fixed, &mut out);
+                assert_eq!(out, want, "{shape:?} {carry} {len} {first}");
             }
         }
         assert!(!along::<i64, Sum>(&[i64::MAX, 1], [1, 2, 1]).1);
         assert!(!along::<i64, Sum>(&[i64::MAX, 0, 1, 0], [1, 2, 2]).1);
         assert!(!scan_along::<i64, Sum>(&[i64::MAX, 0, 1, 0], [1, 2, 2], None, &mut Vec::new()));
+    }
+
+    /// Folds that run in pieces, of long lanes and of single matrices down their columns, and folds of many short lanes or groups,
+    /// which split across threads, match the sums taken lane by lane, on one thread and on four.
+    #[test]
+    fn long_and_many_lanes() {
+        for shape in [[1, (3 << 18) + 5, 1], [2, (1 << 18) + 7, 3], [5000, 200, 1], [300, 50, 70], [1, 2000, 300], [1, 600, 2000]] {
+            let x: Vec<i64> = (0..shape.iter().product::<usize>()).map(|i| (i * 37 % 101) as i64 - 50).collect();
+            let lanes = lanes_of(&x, shape);
+            let sums: Vec<i64> = lanes.iter().map(|l| l.iter().sum()).collect();
+            let sizes: Vec<f64> = lanes.iter().map(|l| l.iter().map(|&v| v.abs() as f64 / 7.0).sum()).collect();
+            let f: Vec<f64> = x.iter().map(|&v| v as f64 / 7.0).collect();
+            for threads in [1, 4] {
+                rustymath::parallel::set_threads(threads);
+                assert_eq!(along::<i64, Sum>(&x, shape), (sums.clone(), true), "{shape:?} {threads}");
+                let floats = along::<f64, Sum>(&f, shape).0;
+                for ((&got, &sum), &size) in floats.iter().zip(&sums).zip(&sizes) {
+                    assert!((got - sum as f64 / 7.0).abs() <= 1e-10 * size, "{shape:?} {threads}: {got} against {}", sum as f64 / 7.0);
+                }
+            }
+            rustymath::parallel::set_threads(0);
+        }
     }
 
     #[test]
@@ -379,12 +441,15 @@ mod search {
         rows.sort_by_key(|&r| (wide[r as usize], second[r as usize]));
         assert_eq!(sort_rows(300, vec![wide, second]), rows);
         assert_eq!((grouped(&[1, 0, 1, 1], 2), grouped(&[0, 0], 1)), ((vec![1, 0, 2, 3], vec![1, 3]), (vec![0, 1], vec![2])));
-        // `grouped_keys` gives the classes that `classes`, `numbered` and `grouped` give together. The five keys first appear out of
+        // `grouped_keys` gives the classes that `classes` and `numbered` give, each with its positions. The five keys first appear out of
         // their order, and a range of 2^20 + 1 is too wide for a table.
         let together = |k: &[i32]| {
             let n = numbered(&classes(k));
-            let (positions, sizes) = grouped(&n.numbers, n.firsts.len());
-            assert_eq!(grouped_keys(k), Some(Grouped { firsts: n.firsts, positions, sizes }));
+            let mut each = vec![Vec::new(); n.firsts.len()];
+            for (i, &g) in n.numbers.iter().enumerate() { each[g].push(i as u32) }
+            let g = grouped_keys(k).expect("a table holds the keys");
+            assert_eq!((&g.firsts, g.each().collect::<Vec<_>>()), (&n.firsts, each.iter().map(Vec::as_slice).collect()));
+            assert_eq!(g.into_classes(), each);
         };
         together(&(0..300).map(|i| i32::from(i % 3 == 0)).collect::<Vec<_>>());
         together(&(0..300).map(|i| 3 + (i * 7 + 2) % 5).collect::<Vec<_>>());
@@ -405,6 +470,39 @@ mod search {
         let wide = [-70000, 5, 5, 90000];
         let values = [-80000, -70000, 0, 5, 6, 90000, 95000];
         assert_eq!(bins(&wide, &values), values.iter().map(|&v| wide.partition_point(|&b| b <= v) as u32).collect::<Vec<_>>());
+    }
+
+    /// Over more than one 65,536-key piece, the radix sort's passes and the lookups split across threads and give one thread's
+    /// results. Equal keys keep their order of position.
+    #[test]
+    fn pieces_across_threads() {
+        use rustymath::tolerant::{self, Tolerance};
+        let n = 200_000;
+        // 5,000 keys, about 40 of each, spread too wide for a table, so the sort takes the radix passes.
+        let keys: Vec<u64> = (0..n as u64).map(|i| (i * 2_654_435_761 % 5_000) << 40).collect();
+        let second: Vec<u64> = (0..n as u64).map(|i| i % 7).collect();
+        let mut stable: Vec<u32> = (0..n as u32).collect();
+        stable.sort_by_key(|&r| keys[r as usize]);
+        let mut rows = stable.clone();
+        rows.sort_by_key(|&r| (keys[r as usize], second[r as usize]));
+        let haystack: Vec<i64> = keys.iter().map(|&k| (k >> 40) as i64).collect();
+        let needles: Vec<i64> = (0..n as i64).map(|i| i * 7 % 6_000).collect();
+        let mut first = std::collections::HashMap::new();
+        for (i, &k) in haystack.iter().enumerate() { first.entry(k).or_insert(i as u32); }
+        let found: Vec<u32> = needles.iter().map(|k| first.get(k).copied().unwrap_or(n as u32)).collect();
+        // Sevenths that aren't whole numbers take the buckets, in more than one round of lookups.
+        let floats: Vec<f64> = haystack.iter().map(|&k| k as f64 / 7.0).collect();
+        let near: Vec<f64> = needles.iter().map(|&k| k as f64 / 7.0 + 1e-15).collect();
+        let mut by_threads = Vec::new();
+        for threads in [1, 4] {
+            rustymath::parallel::set_threads(threads);
+            assert_eq!(sort_rows(n, vec![keys.clone()]), stable, "{threads}");
+            assert_eq!(sort_rows(n, vec![keys.clone(), second.clone()]), rows, "{threads}");
+            assert_eq!(index_of(&haystack, &needles), found, "{threads}");
+            by_threads.push(tolerant::index_of(Tolerance::DEFAULT, &floats, &near));
+        }
+        rustymath::parallel::set_threads(0);
+        assert_eq!(by_threads[0], by_threads[1]);
     }
 }
 
