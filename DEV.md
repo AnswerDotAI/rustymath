@@ -56,6 +56,7 @@ The speed test and basedpl's timing tools take `/tmp/aai-ws-timing.lock` exclusi
 | `number_theory.rs` | Primality, factorization, prime enumeration/counting and factorial. |
 | `field.rs`, `exact.rs`, `linalg/exact.rs`, `polynomial.rs` | Generic field algorithms, rational functions, exact matrices and polynomials. |
 | `search.rs`, `tolerant.rs`, `gather.rs` | Exact/tolerant search and classification, stable sorting, comparisons and copying through conversions. |
+| `optimize.rs` | Minimization by five methods behind one `Objective` trait, and Brent's bracketed root finder. |
 | `linalg.rs`, `linalg/scalar.rs`, `linalg/factor/` | Packed products, scalar operations and decompositions. |
 | `py/src/`, `python/rustymath/` | NumPy adapters and Python wrappers. |
 
@@ -146,6 +147,16 @@ Complex errors are measured against a magnitude-based scale, with function-speci
 
 `gather` copies through a caller's conversion for cycle, repeat, compress, indexed take and scatter. Mask compression skips empty blocks and copies full blocks. In a mixed block, `compress` uses a branch-free loop that reads every item, which suits items loaded from a slice. `positions`, and the split into two classes in `search`, write only the selected items through the 8-bit `SET` table, which suits computed positions. The table loop measured 13% slower for items loaded from a slice. `walk` copies the items that one `Steps` per axis reaches: strides, clipped ranges, rotations and offset tables. Positions outside the source take the caller's fill. It merges neighbouring runs, copies long runs whole, transposes through `linalg::transpose_into`'s tiles and writes short windows through `windows`. Basedpl reuses these paths for structural operations. Measure search/gather changes there as well.
 
+### Optimization
+
+`optimize` minimizes through one `Objective` trait and one front, `minimize`. An objective gives a value, a batch of values through `values`, which by default calls `value` on each row, and a gradient where `has_gradient` says it has one. A closure that returns a `Result` is an objective, and `Differentiable` pairs a value closure with a gradient closure. The objective's error type is `minimize`'s error. A caller's interrupt or failed call therefore stops the search without a separate check, which matters because basedpl's and Python's objectives can fail on any evaluation.
+
+Every method runs on a private `Search`. It counts evaluations against the limit, moves each point inside the bounds, in the method's own buffer, before evaluating it, reads NaN as +∞ and keeps the best point. A method returns whether its stopping test passed. Running out of evaluations unwinds through `Halt::Spent`, and `minimize` then returns the best point with `converged` false. Bounds, the limit, NaN and the result therefore live in one place, and a new method should run on a `Search` too.
+
+One line search serves Brent's method and Powell's. `least_along` brackets a minimum with golden-ratio steps, which stop at the bounds' limits along the line, and `brent` searches the bracket. Brent's method is one such line search along its variable. Every Nelder–Mead move puts the worst vertex at a point on the line from the centroid of the others through it, with Gao and Han's coefficients for the number of variables. L-BFGS uses `linalg`'s `axpy` and `dot`. Differential evolution evaluates each generation through one `values` call, which lets basedpl evaluate a generation as one array, and then polishes its best point with Powell's method. Its generator is `random::SplitMix64`, seeded from `Options::seed`, which the truncated SVD's test matrix also uses.
+
+basedpl's `•minimize` and the Python binding share three things: `Method::choose`'s default policy, `Options::check`'s rules for options that `minimize` rejects, and `Method::NAMES`, the methods' names. Every tolerance is relative, with an absolute floor near the tolerance squared. On Rosenbrock's function from (-1.2, 1), Nelder–Mead took 364 evaluations, Powell's method 423, differential evolution 1767 including its polish, and L-BFGS 53, each ending within 10⁻⁸ of the minimum.
+
 ## Linear algebra
 
 `Inner<T>` objects compile matrix products in rustymath. On macOS 15+, Accelerate computes float and complex plus-times products. Elsewhere the native `product` blocks for caches and calls register micro-kernels, with explicit vectors on supported AArch64, AVX2/FMA and wasm SIMD targets. `tiles` owns target tile sizes. Integer products select a narrower exact kernel when their bounds permit it; `Inner::checked` rejects possible overflow. Boolean products use packed bits, and equality-count products use kernels appropriate to their item width.
@@ -180,13 +191,15 @@ Each gufunc is a unit type whose `Gufunc::each` reads and writes one matrix thro
 
 The remaining binding files match their Python modules. Polynomial wrappers prepare contiguous real or complex arrays; generic f16 operations widen to f32. Integer mixed-radix conversion checks int64 overflow. Number theory takes Python integers through BigUint and polls for Ctrl-C. `search.py` supplies sorting, insertion searches, classification and grouping, with the existing search functions reexported at the package root. Sorts compare exactly, equate signed zeros and put NaNs last. Distribution constructors live in a submodule to avoid collisions with ufunc names.
 
+`py/src/optimize.rs` runs `rustymath::optimize` on Python functions, and `python/rustymath/optimize.py` gives it SciPy's names: `minimize` and `root_scalar`, which return the named tuples `OptimizeResult` and `RootResults`. The module stays out of the package root, where `root` is the nth-root ufunc. A float32 or float16 start searches in float32, and any other start in float64. Each evaluation checks for Ctrl-C, then calls the Python function with a NumPy array. An exception from the function stops the search. The wrapper turns SciPy's `bounds` pairs and its `maxfev`, `popsize` and `seed` options into the binding's arguments. `Options::check` and `Method`'s `FromStr` give the argument errors, so the binding repeats none of the core's rules. With `vectorized`, the function gets points as the columns of a 2-D array, as SciPy's `differential_evolution` passes them.
+
 Complex sums/products and Boolean logical reductions use the shared Rust folds and scans. `minmax` is a gufunc over one axis; `logical_scan` takes a 2×2 truth table. Python exposes `set_threads`, `thread_setting` and `threads`. NumPy controls the one-dimensional runs supplied to legacy callbacks; buffered calls can be too short to split even when the whole array is large.
 
 ## Tests and documentation
 
 Rust tests use the public API in `tests/accuracy.rs`, `slices.rs`, `linalg.rs`, `numeric.rs` and `speed.rs`. The library sets `test = false` to avoid a separate `cfg(test)` build. Shared `support::random` and `seeded` use SplitMix64 without additional rand features. Other helpers stay local. Combine related checks into readable tests rather than splitting every assertion into a test.
 
-Python tests are grouped by topic in `tests/test_ufuncs.py`, `test_linalg.py`, `test_search.py` and `test_exact.py`. A test that checks threaded paths takes the `threads` fixture from `tests/conftest.py`, which runs it on one thread and on four.
+Python tests are grouped by topic in `tests/test_ufuncs.py`, `test_linalg.py`, `test_search.py`, `test_exact.py` and `test_optimize.py`. A test that checks threaded paths takes the `threads` fixture from `tests/conftest.py`, which runs it on one thread and on four.
 
 Elementary real accuracy checks use a four-ulp bound with an additional allowance for f64 libm references. Gamma and incomplete functions use scaled errors and function-specific bounds; f64 iterative checks have a wider allowance. `tests/accuracy.rs` defines those bounds. Real checks cover fused/unfused arithmetic, f16 inputs, sampled wider inputs and reference files. Complex checks exercise public scalar/slice forms at the build's FMA mode, including branch cuts. `testdata/references.py` generates the mpmath references; preserve their notices and `THIRD-PARTY.md`.
 

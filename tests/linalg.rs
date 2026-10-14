@@ -438,16 +438,16 @@ mod factor {
         PlusTimes.inner(&us, &transpose(&v, n, n), [m, n, n])
     }
 
-    /// QR, least squares and the SVD of tall matrices, with condition numbers from 1 to `worst`, which Cholesky QR factors, and 1e12,
+    /// QR, least squares and the SVD of tall matrices, with condition numbers from 1 to `worst`, which Cholesky QR factors, and `beyond`,
     /// which falls back to Householder QR. Each matrix's singular values run from 1 down to 1/condition. Its first item is positive, so
     /// R's first item is positive on the Cholesky path and negative on Householder's.
-    fn tall<T: RealItem>(tolerance: f64, worst: f64) {
+    fn tall<T: RealItem>(tolerance: f64, worst: f64, beyond: f64) {
         let tiny = T::min_positive_value() / T::epsilon();
         let quartic = T::narrow(2f64.powi((T::max_value().log2().wide() / 4.0) as i32 + 6));
         let times = |x: &[T], c: T| x.iter().map(|&v| v * c).collect::<Vec<T>>();
         for (m, n) in [(4000, 20), (8000, 60)] {
             let bound = tolerance * n as f64;
-            for condition in [1.0, worst.sqrt(), worst, 1e12] {
+            for condition in [1.0, worst.sqrt(), worst, beyond] {
                 let s: Vec<f64> = (0..n).map(|j| condition.powf(-(j as f64) / (n - 1) as f64)).collect();
                 let mut aw = with_spectrum(m, n, &s);
                 if aw[0] < 0.0 { aw[..n].iter_mut().for_each(|x| *x = -*x) }
@@ -455,9 +455,9 @@ mod factor {
                 let (aw, at) = (wide(&a), format!("{m}×{n}, condition {condition:e}"));
                 let (q, r) = qr(&a, [m, n]);
                 let (qw, rw) = (wide(&q), wide(&r));
-                assert_eq!(rw[0] > 0.0, condition < 1e12, "qr's path at {at}");
-                assert!(distance(&product(&qw, &rw, [m, n, n]), &aw, norm(&aw)) < bound, "tall qr at {at}");
-                assert!(orthogonality(&qw, m, n) < bound, "tall qr's q at {at}");
+                assert_eq!(rw[0] > 0.0, condition < beyond, "qr's path at {at}");
+                assert!(distance(&product(&qw, &rw, [m, n, n]), &aw, norm(&aw)) < bound, "tall qr at {at}: {:e} of {bound:e}", distance(&product(&qw, &rw, [m, n, n]), &aw, norm(&aw)));
+                assert!(orthogonality(&qw, m, n) < bound, "tall qr's q at {at}: {:e} of {bound:e}", orthogonality(&qw, m, n));
                 assert!((0..n * n).all(|k| k % n >= k / n || rw[k] == 0.0), "tall qr's r at {at}");
                 // `lstsq` leaves its residual orthogonal to A's columns, and gives A's singular values.
                 let b = random::<T>(m, 2, 11);
@@ -491,8 +491,8 @@ mod factor {
 
     #[test]
     fn tall_matrices() {
-        tall::<f64>(4.0 * f64::EPSILON, 1e7);
-        tall::<f32>(4.0 * f32::EPSILON as f64, 1e2);
+        tall::<f64>(4.0 * f64::EPSILON, 1e7, 1e12);
+        tall::<f32>(4.0 * f32::EPSILON as f64, 1e2, 1e12);
     }
 
     /// A tall matrix 520 columns wide takes the Cholesky path, with the same accuracy as the narrow ones in `tall_matrices`.

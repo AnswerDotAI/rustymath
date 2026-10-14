@@ -2,7 +2,7 @@
 
 import sys
 import numpy as np
-from . import _core, linalg, polynomial, exact, integer, search
+from . import _core, linalg, polynomial, exact, integer, search, optimize
 from .linalg import matmul
 from .integer import encode, decode
 from .search import Unique, unique, index, isin, argsort, lexsort, searchsorted, bins, bincount, counts, group_indices

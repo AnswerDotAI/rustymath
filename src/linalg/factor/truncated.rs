@@ -49,12 +49,6 @@ fn leading<T: Scalar>(Svd { size: [m, n], mut u, mut s, mut v, .. }: Svd<T>, k: 
 
 /// `len` numbers uniform from -1 to 1, from SplitMix64 with a fixed seed.
 fn test_matrix<T: Scalar>(len: usize) -> Vec<T> {
-    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
-    (0..len).map(|_| {
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let z = (state ^ (state >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        let z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        let z = z ^ (z >> 31);
-        T::from_real(<T::Real as crate::Float>::narrow((z >> 11) as f64 * 2f64.powi(-52) - 1.0))
-    }).collect()
+    let mut rng = crate::random::SplitMix64(0x9E37_79B9_7F4A_7C15);
+    (0..len).map(|_| T::from_real(<T::Real as crate::Float>::narrow((rand::Rng::next_u64(&mut rng) >> 11) as f64 * 2f64.powi(-52) - 1.0))).collect()
 }

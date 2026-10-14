@@ -430,7 +430,7 @@ fn eig_factor<T: Tiled>(a: &[T], n: usize, vectors: bool) -> Option<Eig<T::Real>
 /// `y += a x`, item by item. `axpy`, `axpyc` and `rotate` loop by index over equal lengths. A `zip` in them leaves a call to `Zip::new`
 /// in large callers, such as the SVD's, which LLVM doesn't inline.
 #[inline(always)]
-fn axpy<T: Scalar>(y: &mut [T], a: T, x: &[T]) {
+pub(crate) fn axpy<T: Scalar>(y: &mut [T], a: T, x: &[T]) {
     let n = y.len().min(x.len());
     let (y, x) = (&mut y[..n], &x[..n]);
     for i in 0..n { y[i] = x[i].mul_acc(a, y[i]) }
@@ -446,7 +446,7 @@ fn axpyc<T: Scalar>(y: &mut [T], a: T, x: &[T]) {
 
 /// The sum of `x[i] y[i]`.
 #[inline(always)]
-fn dot<T: Scalar>(x: &[T], y: &[T]) -> T { sum_of_products(x, y, |a| a) }
+pub(crate) fn dot<T: Scalar>(x: &[T], y: &[T]) -> T { sum_of_products(x, y, |a| a) }
 
 /// The sum of `conj(x[i]) y[i]`, the inner product of two complex vectors. For real items it is `dot`.
 #[inline(always)]

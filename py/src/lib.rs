@@ -30,6 +30,7 @@ mod exact;
 mod integer;
 mod linalg;
 mod number_theory;
+mod optimize;
 mod parallel;
 mod polynomial;
 mod search;
@@ -639,7 +640,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     polynomial::add(m)?;
     search::add(m)?;
     integer::add(m)?;
-    for (name, add) in [("number_theory", number_theory::add as fn(&Bound<'_, PyModule>) -> PyResult<()>), ("distribution", distribution::add), ("linalg", linalg::add), ("exact", exact::add)] {
+    for (name, add) in [("number_theory", number_theory::add as fn(&Bound<'_, PyModule>) -> PyResult<()>), ("distribution", distribution::add), ("linalg", linalg::add), ("exact", exact::add), ("optimize", optimize::add)] {
         let sub = PyModule::new(m.py(), name)?;
         add(&sub)?;
         m.add_submodule(&sub)?;

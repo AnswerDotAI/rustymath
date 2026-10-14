@@ -389,6 +389,127 @@ mod number_theory {
     }
 }
 
+mod optimize {
+    use rustymath::optimize::*;
+    use std::convert::Infallible;
+
+    /// Rosenbrock's function, whose curved valley has its minimum of 0 at (1, 1).
+    fn rosenbrock(x: &[f64]) -> Result<f64, Infallible> { Ok((1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0] * x[0]).powi(2)) }
+
+    fn rosenbrock_gradient(x: &[f64], g: &mut [f64]) -> Result<(), Infallible> {
+        (g[0], g[1]) = (-2.0 * (1.0 - x[0]) - 400.0 * x[0] * (x[1] - x[0] * x[0]), 200.0 * (x[1] - x[0] * x[0]));
+        Ok(())
+    }
+
+    /// The largest distance of `x` from `to` in any variable.
+    fn off(x: &[f64], to: &[f64]) -> f64 { x.iter().zip(to).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max) }
+
+    #[test]
+    fn methods_find_minimums() {
+        let (lower, upper) = ([-2.0, -2.0], [2.0, 2.0]);
+        let boxed = Some(Bounds { lower: &lower, upper: &upper });
+        for (method, bounds) in [(Method::NelderMead, None), (Method::NelderMead, boxed), (Method::Powell, None), (Method::Powell, boxed), (Method::Evolution, boxed)] {
+            let found = minimize(&mut rosenbrock, &[-1.2, 1.0], &Options { method: Some(method), bounds, ..Default::default() }).unwrap();
+            assert!(found.converged && off(&found.x, &[1.0, 1.0]) < 1e-6, "{method:?} {bounds:?}: {found:?}");
+        }
+        // With a gradient and no bounds, `minimize` runs L-BFGS.
+        let found = minimize(&mut Differentiable { value: rosenbrock, gradient: rosenbrock_gradient }, &[-1.2, 1.0], &Options::default()).unwrap();
+        assert!(found.converged && off(&found.x, &[1.0, 1.0]) < 1e-6, "L-BFGS: {found:?}");
+        // One variable runs Brent's method, which brackets the minimum or stops at a bound.
+        let mut parabola = |x: &[f64]| Ok::<_, Infallible>((x[0] - 2.0).powi(2) + 1.0);
+        let found = minimize(&mut parabola, &[10.0], &Options::default()).unwrap();
+        assert!(found.converged && off(&found.x, &[2.0]) < 1e-6 && found.evaluations < 40, "{found:?}");
+        let found = minimize(&mut parabola, &[0.0], &Options { bounds: Some(Bounds { lower: &[-1.0], upper: &[1.5] }), ..Default::default() }).unwrap();
+        assert!(found.converged && found.x == [1.5] && found.value == 1.25, "{found:?}");
+        // A minimum outside the bounds gives the nearest bound, and f32 works at its own precision.
+        let mut bowl = |x: &[f32]| Ok::<_, Infallible>((x[0] - 3.0).powi(2) + (x[1] + 1.0).powi(2));
+        let corner = Some(Bounds { lower: &[0.0, 0.0], upper: &[2.0, 2.0] });
+        for method in [Method::Powell, Method::NelderMead] {
+            let found = minimize(&mut bowl, &[0.0f32, 0.0], &Options { method: Some(method), bounds: corner, ..Default::default() }).unwrap();
+            assert!(found.converged && found.x[0] == 2.0 && found.x[1].abs() < 1e-3, "{method:?}: {found:?}");
+        }
+        // A start at a bound, in a range narrower than the first step, still moves away from that bound.
+        let narrow = Some(Bounds { lower: &[0.0, 0.0], upper: &[0.05, 0.05] });
+        let found = minimize(&mut bowl, &[0.0f32, 0.0], &Options { method: Some(Method::NelderMead), bounds: narrow, ..Default::default() }).unwrap();
+        assert!(found.converged && found.x == [0.05, 0.0], "narrow: {found:?}");
+        // Powell's replaced directions can point out of an active bound, so a stalled round restarts from the coordinate directions.
+        let (lower, upper) = ([f64::NEG_INFINITY, 0.0], [0.8, f64::INFINITY]);
+        for method in [Method::Powell, Method::NelderMead] {
+            let bounds = Some(Bounds { lower: &lower, upper: &upper });
+            let found = minimize(&mut rosenbrock, &[0.5, 0.5], &Options { method: Some(method), bounds, ..Default::default() }).unwrap();
+            assert!(found.converged && off(&found.x, &[0.8, 0.64]) < 1e-6, "{method:?}: {found:?}");
+        }
+        let found = minimize(&mut bowl, &[0.0f32, 0.0], &Options::default()).unwrap();
+        assert!(found.converged && (found.x[0] - 3.0).abs() < 1e-3 && (found.x[1] + 1.0).abs() < 1e-3, "{found:?}");
+    }
+
+    #[test]
+    fn defaults_limits_and_failures() {
+        use Method::*;
+        let choices = [(1, true, false), (2, true, false), (2, true, true), (2, false, true), (2, false, false)].map(|(n, g, b)| Method::choose(n, g, b));
+        assert_eq!(choices, [Brent, Lbfgs, Powell, Powell, NelderMead]);
+        // A search that runs out of evaluations returns its best point so far, unconverged.
+        let found = minimize(&mut rosenbrock, &[-1.2, 1.0], &Options { evaluations: Some(25), ..Default::default() }).unwrap();
+        assert!(!found.converged && found.evaluations == 25 && found.value < rosenbrock(&[-1.2, 1.0]).unwrap(), "{found:?}");
+        // An error from the objective ends the search.
+        let mut calls = 0;
+        let mut failing = |x: &[f64]| { calls += 1; if calls > 10 { Err("stopped") } else { Ok(x[0] * x[0] + x[1] * x[1]) } };
+        assert_eq!(minimize(&mut failing, &[3.0, 1.0], &Options::default()), Err("stopped"));
+        // NaN counts as +∞, so the search stays where the objective is defined.
+        let mut holed = |x: &[f64]| Ok::<_, Infallible>(if x[0] < 0.5 { f64::NAN } else { x[0] * x[0] + x[1] * x[1] });
+        let found = minimize(&mut holed, &[2.0, 2.0], &Options::default()).unwrap();
+        assert!(found.converged && off(&found.x, &[0.5, 0.0]) < 1e-6, "{found:?}");
+        // Reversed bounds, and a tolerance that isn't a positive number, are errors that a binding reports.
+        let reversed = Options { bounds: Some(Bounds { lower: &[1.0], upper: &[0.0] }), ..Default::default() };
+        assert_eq!(reversed.check(1, false), Err("each lower limit must be at most its upper limit"));
+        assert_eq!(Options { tolerance: Some(0.0), ..Default::default() }.check(1, false), Err("the tolerance must be a positive number"));
+    }
+
+    /// The sum of squares, as an objective that records how many points each call evaluates.
+    struct Recorded(Vec<usize>);
+
+    impl Objective<f64> for Recorded {
+        type Error = Infallible;
+        fn value(&mut self, x: &[f64]) -> Result<f64, Infallible> {
+            self.0.push(1);
+            Ok(x.iter().map(|v| v * v).sum())
+        }
+        fn values(&mut self, xs: &[f64], out: &mut [f64]) -> Result<(), Infallible> {
+            self.0.push(out.len());
+            let n = xs.len() / out.len();
+            for (y, x) in out.iter_mut().zip(xs.chunks_exact(n)) { *y = x.iter().map(|v| v * v).sum() }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn batches() {
+        // Nelder–Mead evaluates its first simplex in one call, and differential evolution each generation.
+        let mut simplex = Recorded(Vec::new());
+        minimize(&mut simplex, &[1.0, 2.0, 3.0], &Options::default()).unwrap();
+        assert_eq!(simplex.0[0], 4);
+        let (lower, upper) = ([-5.0; 3], [5.0; 3]);
+        let mut evolving = Recorded(Vec::new());
+        let options = Options { method: Some(Method::Evolution), bounds: Some(Bounds { lower: &lower, upper: &upper }), population: Some(12), ..Default::default() };
+        let found = minimize(&mut evolving, &[1.0, 2.0, 3.0], &options).unwrap();
+        assert!(found.converged && off(&found.x, &[0.0; 3]) < 1e-6 && evolving.0.iter().filter(|&&k| k == 12).count() > 2, "{found:?}");
+    }
+
+    #[test]
+    fn roots() {
+        let found = root(|x: f64| Ok::<_, Infallible>(x.cos() - x), [0.0, 1.0], None, None).unwrap();
+        assert!(found.converged && (found.x - 0.739_085_133_215_160_6).abs() < 1e-8 && found.evaluations < 12, "{found:?}");
+        let found = root(|x: f32| Ok::<_, Infallible>(x * x * x - 2.0), [0.0, 2.0], None, None).unwrap();
+        assert!(found.converged && (found.x - 2f32.cbrt()).abs() < 1e-3, "{found:?}");
+        // A root at zero, and ends whose signs agree, which give the end nearer zero.
+        let found = root(|x: f64| Ok::<_, Infallible>(x.sinh()), [-1.0, 3.0], None, None).unwrap();
+        assert!(found.converged && found.x.abs() < 1e-15, "{found:?}");
+        let found = root(|x: f64| Ok::<_, Infallible>(x * x + 1.0), [-1.0, 2.0], None, None).unwrap();
+        assert!(!found.converged && found.x == -1.0, "{found:?}");
+        assert_eq!(root(|_: f64| Err::<f64, _>("stopped"), [0.0, 1.0], None, None), Err("stopped"));
+    }
+}
+
 mod polynomial {
     use rustymath::polynomial::*;
     use half::f16;

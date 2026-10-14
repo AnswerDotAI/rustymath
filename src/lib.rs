@@ -29,6 +29,7 @@ pub mod exact;
 pub mod integer;
 pub mod linalg;
 pub mod number_theory;
+pub mod optimize;
 pub mod parallel;
 pub mod polynomial;
 pub mod reduce;
