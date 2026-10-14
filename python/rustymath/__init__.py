@@ -1,4 +1,8 @@
-"""Maths in plain Rust, from fast f16, f32 and f64 functions to exact rationals."""
+"""Maths in plain Rust, from fast f16, f32 and f64 functions to exact rationals.
+
+Modules:
+
+- `rustymath.optimize`: Minimizing a function of several variables, and solving equations, nonlinear or linear, with SciPy's names. The searches run in Rust and call the Python functions at each point."""
 
 import sys
 import numpy as np
