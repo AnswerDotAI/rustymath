@@ -1,7 +1,8 @@
 //! Decompositions of real and complex matrices held row-major in slices: LU with partial pivoting, Cholesky, Householder QR and the
 //! SVD, with the solves, inverses and least-squares solutions built from them, at `f32`, `f64` and complex numbers with parts of either
-//! type. The child module `svd` computes the SVD, `eigen` the Hermitian eigen decomposition, and `general` the eigen decomposition of
-//! any square matrix.
+//! type. On macOS, Accelerate's LAPACK computes the SVD, the Hermitian eigen decomposition and a real matrix's general one. Elsewhere
+//! the child module `svd` computes the SVD and `eigen` the Hermitian eigen decomposition. The child module `general` computes a complex
+//! matrix's eigen decomposition on every target, and a real one's off macOS.
 //!
 //! Each decomposition is written once, generic over [`Scalar`]. A complex factorization conjugates where the real one transposes.
 //! Cholesky gives L Lᴴ, and QR's reflections take the form `I - τ v vᴴ`, leaving R with a real diagonal. Singular values and the
@@ -9,8 +10,8 @@
 //! place of a real one's double-shift iterations.
 //!
 //! LU, Cholesky and QR work in blocks of columns, wider for a larger matrix. Each block's own columns factor with the unblocked
-//! algorithm, along rows, so every inner loop reads contiguous memory. The rest of the matrix then updates through the tiled `+.×`
-//! kernels of `linalg.rs`, where most of a large factorization's time goes. QR keeps each block's reflections in the compact WY
+//! algorithm, along rows, so every inner loop reads contiguous memory. The rest of the matrix then updates through `Tiled`'s matrix
+//! products, where most of a large factorization's time goes. QR keeps each block's reflections in the compact WY
 //! form `I - V T Vᴴ`, so that applying them takes three matrix products. Dot
 //! products keep eight running sums, and each multiply-add is fused where the target has an instruction for it, so results can
 //! differ from LAPACK's in their last bits.
@@ -20,49 +21,99 @@
 //! pieces of rows. A matrix too ill-conditioned for that to match Householder QR's accuracy falls back to the reflections. R's diagonal is
 //! positive on the CholeskyQR2 path, and of either sign from the reflections.
 //!
-//! QR and the SVD first scale a matrix by a power of two when its largest item lies where sums of squares would overflow or lose
+//! QR and the native SVD first scale a matrix by a power of two when its largest item lies where sums of squares would overflow or lose
 //! digits to underflow. Their factors are those of the scaled matrix, scaled back exactly. LU and Cholesky divide by a subnormal
 //! pivot, whose reciprocal would overflow.
-use super::{filled, identity, identity_into, transpose_into, Rows, Scalar, Tiled};
+use super::{filled, identity, transpose_into, Matrix, Scalar, Side, Tiled, Triangle};
 use crate::{float::{sealed::Core, FUSED}, parallel, slice::appended, Native};
 use num_complex::Complex;
 use num_traits::{Float as _, One as _, Zero as _};
 use std::{borrow::Cow, cmp::Ordering, marker::PhantomData, mem::MaybeUninit};
 
-mod eigen;
-mod general;
+#[cfg(native)]
+pub(super) mod eigen;
+pub(super) mod general;
+#[cfg(native)]
 mod secular;
-mod svd;
-pub use eigen::{eigh, hermitian_eigenvalues, Eigh};
-pub use general::{eig, eigenvalues, Eig};
+#[cfg(native)]
+pub(super) mod svd;
+mod truncated;
+/// Above this many rows, the native Hermitian eigensolver's divide and conquer splits a tridiagonal matrix's eigen problem in two.
+/// Implicit QL solves smaller ones. Tests size their matrices around it.
 #[doc(hidden)]
-pub use eigen::CONQUER as EIGH_CONQUER;
+pub const EIGH_CONQUER: usize = 64;
+/// Above this many columns, the native SVD's divide and conquer splits a bidiagonal matrix's SVD in two. The QR algorithm solves
+/// smaller ones. Tests size their matrices around it.
 #[doc(hidden)]
-pub use svd::SPLIT as SVD_SPLIT;
+pub const SVD_SPLIT: usize = 64;
 
 /// Columns in each block of a blocked Cholesky factorization of an `n`×`n` matrix. A larger matrix takes wider blocks, whose trailing
 /// updates are longer matrix products. On the Mac this measured fastest from 256 to 1024 rows.
 fn cholesky_block(n: usize) -> usize { (n / 8).clamp(32, 128) }
 
-/// Columns in each block of the reflections that the Hermitian eigensolver and the SVD group into `Block`s.
+/// Columns in each block of the reflections that the eigensolvers and the SVD group into `Block`s.
 fn qr_block(p: usize) -> usize { (p / 16).clamp(32, 64) }
+
+/// Rows at or below which `reflections` applies each reflection on its own, where building the WY form's blocks costs more than
+/// its products save.
+const SMALL: usize = 96;
+
+/// Qᵀ, the transpose without conjugation, for the reflections that `tridiagonal` or `hessenberg` leaves in `w` and `taus`. Reflection `k` acts on rows
+/// and columns from `k + 1` on, as reflection `k` of a QR factorization acts on a matrix without the first row and column.
+/// `Reflections::q` therefore forms Q's last `n - 1` rows and columns, by blocks of reflections in the WY form, through the tiled `+.×`
+/// kernels.
+fn reflections<T: Tiled>(w: &[T], taus: &[T], n: usize) -> Vec<T> {
+    let mut qt = identity(n);
+    if n < 2 { return qt }
+    if n <= SMALL {
+        // A small matrix applies each reflection's transpose, `I - τ v̄ vᵀ`, from the right on its own. Before reflection `k`, Qᵀ
+        // differs from the identity only in rows and columns after `k + 1`.
+        let mut v = filled(n, T::zero());
+        for (k, &tau) in taus.iter().enumerate().rev() {
+            if tau == T::zero() { continue }
+            let v = &mut v[..n - k - 1];
+            v[0] = T::one();
+            v[1..].copy_from_slice(&w[k * n + k + 2..(k + 1) * n]);
+            for row in qt[(k + 1) * n..].chunks_exact_mut(n) {
+                let row = &mut row[k + 1..];
+                let s = tau * dotc(v, row);
+                axpy(row, -s, v);
+            }
+        }
+        return qt;
+    }
+    let p = n - 1;
+    transpose_into(&blocked(w, taus, n).q(), p, &mut qt[n + 1..], n, [p, p], |x| x);
+    qt
+}
+
+/// The reflections that `reflections` multiplies, in blocks, for a matrix of at least 2 rows. They act on rows and columns 1 to `n - 1`.
+/// Row `c` of a block's panel holds reflection `k0 + c` from column `k0 + 1` of `w`.
+fn blocked<T: Tiled>(w: &[T], taus: &[T], n: usize) -> Reflections<T> {
+    let p = n - 1;
+    let blocks = blocks_of(&taus[..p], qr_block(p), |k0, k1| (k0..k1).flat_map(|k| w[k * n + k0 + 1..(k + 1) * n].iter().copied()).collect());
+    Reflections { m: p, blocks }
+}
+
 /// Columns in each block of the QR factorization in `reflect`, with `p` reflections. On an M5 Max, 128-column blocks made QR of a
 /// 2048×2048 matrix 10% faster on one thread and 21% faster on 18 threads than 64-column blocks. 256 columns made a 1024×1024 QR 15%
 /// slower on one thread.
 fn qr_width(p: usize) -> usize { (p / 8).clamp(32, 128) }
 /// The row length of a working copy of a matrix with `n` columns. A multiple of 128 items puts the rows of a product's tiles in the same
 /// cache sets. On an M5 Max, eight more items made QR of a 2048×2048 matrix 10% faster on one thread.
-fn stride(n: usize) -> usize { if n > 0 && n % 128 == 0 { n + 8 } else { n } }
+pub(super) fn stride(n: usize) -> usize { if n > 0 && n % 128 == 0 { n + 8 } else { n } }
 /// Columns up to which `Reflections::q` applies one reflection at a time.
 const ONE_AT_A_TIME: usize = 64;
 /// Right-hand sides up to which `Reflections::apply_adjoint` applies one reflection at a time. For a 4096×16 `lstsq`, blocks measured
 /// as fast at 12 and faster from 16.
 #[doc(hidden)]
 pub const FEW_COLUMNS: usize = 12;
-/// Columns at which a block stops halving and factors one column at a time.
+/// Columns at which a block stops halving and factors one column at a time. A native lower triangular solve whose right-hand side is at
+/// least as wide as the matrix also stops halving at this many rows.
 const LEAF: usize = 16;
-/// Rows in each block of a solve with more than one right-hand side. A block's own rows substitute with vector operations, and the rows
-/// below it update through a matrix product.
+/// Rows at which other native triangular solves stop halving. A leaf's own rows substitute with vector operations, and the rows below
+/// it update through a matrix product.
+#[cfg(native)]
 const NS: usize = 32;
 
 /// An item type whose matrices rustymath factors: `f32`, `f64`, or a complex number with parts of either type. Only rustymath implements
@@ -103,20 +154,20 @@ macro_rules! factor {
             fn matrix_lu_inverse_into(lu: LuRef<'_, $t>, x: &mut Vec<$t>, out: &mut [$t]) { lu_inverse(lu, x, out) }
             fn matrix_cholesky(a: &[$t], n: usize) -> Option<Vec<$t>> { cholesky_factor(a, n) }
             fn matrix_qr(a: &[$t], size: [usize; 2], complete: bool) -> (Vec<$t>, Vec<$t>) { qr_factor(a, size, complete) }
-            fn matrix_svd(a: &[$t], size: [usize; 2], vectors: bool) -> Svd<$t> { svd::svd_factor(a, size, vectors) }
-            fn matrix_truncated_svd(a: &[$t], size: [usize; 2], k: usize) -> Svd<$t> { svd::truncated_factor(a, size, k) }
+            fn matrix_svd(a: &[$t], size: [usize; 2], vectors: bool) -> Svd<$t> { svd_factor(a, size, vectors) }
+            fn matrix_truncated_svd(a: &[$t], size: [usize; 2], k: usize) -> Svd<$t> { truncated::truncated_factor(a, size, k) }
             fn matrix_svd_solve(svd: SvdRef<'_, $t>, b: Option<&[$t]>, k: usize) -> Vec<$t> { svd_solve(svd, b, k) }
             fn matrix_lstsq(a: &[$t], b: &[$t], size: [usize; 2], k: usize) -> (Vec<$t>, Vec<<$t as Scalar>::Real>) { lstsq_solve(a, b, size, k) }
-            fn matrix_eigh(a: &[$t], n: usize, vectors: bool) -> Option<Eigh<$t>> { eigen::eigh_factor(a, n, vectors) }
-            fn matrix_eig(a: &[$t], n: usize, vectors: bool) -> Option<Eig<<$t as Scalar>::Real>> { general::eig_factor(a, n, vectors) }
+            fn matrix_eigh(a: &[$t], n: usize, vectors: bool) -> Option<Eigh<$t>> { eigh_factor(a, n, vectors) }
+            fn matrix_eig(a: &[$t], n: usize, vectors: bool) -> Option<Eig<<$t as Scalar>::Real>> { eig_factor(a, n, vectors) }
         }
     )+};
 }
 factor!(f32, f64, Complex<f32>, Complex<f64>);
 
-/// An LU factorization with partial pivoting of an `n`×`n` matrix. `factors` holds L below its diagonal, whose own diagonal is 1 and
-/// isn't stored, and U on and above it. Row `i` of L U is row `perm[i]` of the factored matrix. [`lu`] returns one that owns its
-/// factors. [`LuRef`] borrows them.
+/// An LU factorization with partial pivoting of an `n`×`n` matrix. `factors` packs L below the diagonal and U on and above it. L's
+/// diagonal is 1 and isn't stored. Unlike the crate's other matrices, `factors` is column-major: item `(i, j)` is `factors[j * n + i]`.
+/// Row `i` of L U is row `perm[i]` of the factored matrix. [`lu`] returns one that owns its factors. [`LuRef`] borrows them.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Lu<T, F = Vec<T>, P = Vec<usize>> {
     pub n: usize,
@@ -140,7 +191,7 @@ impl<T: Factor, F: AsRef<[T]>, P: AsRef<[usize]>> Lu<T, F, P> {
     pub fn solve(&self, b: &[T], k: usize) -> Vec<T> { T::matrix_lu_solve(self.as_ref(), b, k) }
     /// The inverse of the factored matrix.
     pub fn inverse(&self) -> Vec<T> {
-        let mut out = vec![T::zero(); self.n * self.n];
+        let mut out = filled(self.n * self.n, T::zero());
         T::matrix_lu_inverse_into(self.as_ref(), &mut Vec::new(), &mut out);
         out
     }
@@ -152,12 +203,15 @@ impl<T: Factor, F: AsRef<[T]>, P: AsRef<[usize]>> Lu<T, F, P> {
     /// L as an `n`×`n` matrix, with ones on its diagonal and zeros above it.
     pub fn lower(&self) -> Vec<T> {
         let (n, factors) = (self.n, self.factors.as_ref());
-        (0..n * n).map(|k| match (k / n).cmp(&(k % n)) { Ordering::Greater => factors[k], Ordering::Equal => T::one(), Ordering::Less => T::zero() }).collect()
+        (0..n * n).map(|k| {
+            let (i, j) = (k / n, k % n);
+            match i.cmp(&j) { Ordering::Greater => factors[j * n + i], Ordering::Equal => T::one(), Ordering::Less => T::zero() }
+        }).collect()
     }
     /// U as an `n`×`n` matrix, with zeros below its diagonal.
     pub fn upper(&self) -> Vec<T> {
         let (n, factors) = (self.n, self.factors.as_ref());
-        (0..n * n).map(|k| if k % n >= k / n { factors[k] } else { T::zero() }).collect()
+        (0..n * n).map(|k| { let (i, j) = (k / n, k % n); if j >= i { factors[j * n + i] } else { T::zero() } }).collect()
     }
     /// The factored matrix's determinant: the product of U's diagonal, negated where `perm` is odd.
     pub fn determinant(&self) -> T {
@@ -293,7 +347,7 @@ pub fn solve<T: Factor>(a: &[T], b: &[T], size: [usize; 2], k: usize) -> Vec<T> 
 /// The `n`×`m` pseudoinverse of the matrix `a` of `size` `[m, n]`, under [`solve`]'s rule. A square `a` with no negligible pivot gives
 /// its inverse through its LU factorization, with no cutoff. Any other `a` gives the pseudoinverse with `lstsq`'s cutoff.
 pub fn pinv<T: Factor>(a: &[T], [m, n]: [usize; 2]) -> Vec<T> {
-    let mut out = vec![T::zero(); m * n];
+    let mut out = filled(m * n, T::zero());
     LuWork::default().pinv_into(a, [m, n], &mut out);
     out
 }
@@ -307,6 +361,70 @@ pub fn rank<T: Factor>(a: &[T], size: [usize; 2]) -> usize {
     let s = singular_values(a, size);
     let floor = cutoff(&s, size[0].max(size[1]));
     s.iter().filter(|&&x| x > floor).count()
+}
+
+/// The eigen decomposition of a Hermitian `n`×`n` matrix: `a = V diag(values) Vᴴ`. `values` is real and in ascending order. Column
+/// `j` of the `n`×`n` matrix `vectors` is a unit eigenvector for `values[j]`. Without eigenvectors, `vectors` is empty.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Eigh<T: Scalar> {
+    pub values: Vec<T::Real>,
+    pub vectors: Vec<T>,
+}
+
+/// The eigen decomposition of the Hermitian `n`×`n` matrix `a`, reading only its lower triangle. `None` where the iterations don't
+/// converge, as for a matrix holding NaN or an infinity.
+pub fn eigh<T: Factor>(a: &[T], n: usize) -> Option<Eigh<T>> { T::matrix_eigh(a, n, true) }
+/// The eigenvalues of the Hermitian `n`×`n` matrix `a`, in ascending order, reading only its lower triangle. `None` where `eigh` gives
+/// `None`.
+pub fn hermitian_eigenvalues<T: Factor>(a: &[T], n: usize) -> Option<Vec<T::Real>> { T::matrix_eigh(a, n, false).map(|f| f.values) }
+
+/// The eigen decomposition of an `n`×`n` matrix: `a V = V diag(values)`, with complex values and vectors whose parts have type `T`.
+/// The eigenvalues come in the order the Schur form holds them. Column `j` of the `n`×`n` matrix `vectors` is an eigenvector for
+/// `values[j]`, of unit length. For a real matrix, a real eigenvalue has an imaginary part of exactly 0, and a real eigenvector. A complex
+/// pair comes as the eigenvalue with the positive imaginary part, then its conjugate. Their eigenvectors are conjugates too.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Eig<T> {
+    pub values: Vec<Complex<T>>,
+    pub vectors: Vec<Complex<T>>,
+}
+
+/// The eigen decomposition of the real or complex `n`×`n` matrix `a`. `None` where the iterations don't converge, as for a matrix
+/// holding NaN or an infinity.
+pub fn eig<T: Factor>(a: &[T], n: usize) -> Option<Eig<T::Real>> { T::matrix_eig(a, n, true) }
+
+/// The eigenvalues of the `n`×`n` matrix `a`, as `eig` gives them. Without eigenvectors to build, each iteration transforms only the
+/// rows and columns it still acts on.
+pub fn eigenvalues<T: Factor>(a: &[T], n: usize) -> Option<Vec<Complex<T::Real>>> { T::matrix_eig(a, n, false).map(|f| f.values) }
+
+/// Whether every item of `x` is finite, in both parts where it's complex.
+fn finite<T: Scalar>(x: &[T]) -> bool { x.iter().all(|x| x.re().is_finite() && x.im().is_finite()) }
+
+/// `svd` and `singular_values` for `T`, through `Tiled::svd`. A matrix holding a NaN or an infinity, or one whose iterations don't
+/// converge, gives NaN for every result.
+fn svd_factor<T: Tiled>(a: &[T], [m, n]: [usize; 2], vectors: bool) -> Svd<T> {
+    assert_eq!(a.len(), m * n, "`a` must hold `m`×`n` items");
+    let p = m.min(n);
+    if p == 0 { return Svd::new([m, n], Vec::new(), Vec::new(), Vec::new()) }
+    let (u, s, v) = finite(a).then(|| T::svd(a, [m, n], vectors)).flatten().unwrap_or_else(|| {
+        let nan = T::Real::nan();
+        let filled = |len| if vectors { vec![T::from_real(nan); len] } else { Vec::new() };
+        (filled(m * p), vec![nan; p], filled(n * p))
+    });
+    Svd::new([m, n], u, s, v)
+}
+
+/// `eigh` and `hermitian_eigenvalues` for `T`, through `Tiled::eigh`. A NaN or an infinity in `a`'s lower triangle gives `None`.
+fn eigh_factor<T: Tiled>(a: &[T], n: usize, vectors: bool) -> Option<Eigh<T>> {
+    assert_eq!(a.len(), n * n, "`a` must hold `n`×`n` items");
+    if n == 0 { return Some(Eigh { values: Vec::new(), vectors: Vec::new() }) }
+    (0..n).all(|i| finite(&a[i * n..=i * n + i])).then(|| T::eigh(a, n, vectors)).flatten()
+}
+
+/// `eig` and `eigenvalues` for `T`, through `Tiled::eig`. A matrix holding a NaN or an infinity gives `None`.
+fn eig_factor<T: Tiled>(a: &[T], n: usize, vectors: bool) -> Option<Eig<T::Real>> {
+    assert_eq!(a.len(), n * n, "`a` must hold `n`×`n` items");
+    if n == 0 { return Some(Eig { values: Vec::new(), vectors: Vec::new() }) }
+    finite(a).then(|| T::eig(a, n, vectors)).flatten()
 }
 
 /// `y += a x`, item by item. `axpy`, `axpyc` and `rotate` loop by index over equal lengths. A `zip` in them leaves a call to `Zip::new`
@@ -353,6 +471,7 @@ fn largest<T: Scalar>(x: &[T]) -> usize {
 }
 
 /// `√(x² + y²)` with no scaling, for the rotations of the tridiagonal and bidiagonal iterations. It overflows where `x²` or `y²` does.
+#[cfg(native)]
 fn plain_hypot<R: Native>(x: R, y: R) -> R { x.mla::<FUSED>(x, y * y).sqrt() }
 
 /// The greatest `f(v)` over the items `v` of `x`, ignoring NaN, or 0 for an empty `x`. Eight running maximums find it, which vectorizes.
@@ -395,23 +514,42 @@ fn divide<T: Scalar>(x: &mut [T], d: T) {
 
 /// The transpose of the `rows`×`cols` matrix whose rows start `ls` items apart in `a`, with each item converted by `f`. It writes each item
 /// once, into the new vector's spare capacity.
-fn transpose_by<T: Copy + Send + Sync>(a: &[T], ls: usize, size: [usize; 2], f: impl Fn(T) -> T + Sync) -> Vec<T> {
+pub(super) fn transpose_by<T: Copy + num_traits::Zero + Send + Sync>(a: &[T], ls: usize, size: [usize; 2], f: impl Fn(T) -> T + Sync) -> Vec<T> {
     let mut t = Vec::new();
-    transpose_by_into(a, ls, size, f, &mut t);
+    transpose_by_into(a, [ls, size[0]], size, f, &mut t);
     t
 }
-/// [`transpose_by`], written into `t` in place of its old items. Rows of the transpose split across threads.
-fn transpose_by_into<T: Copy + Send + Sync>(a: &[T], ls: usize, [rows, cols]: [usize; 2], f: impl Fn(T) -> T + Sync, t: &mut Vec<T>) {
+/// [`transpose_by`], written into `t` in place of its old items, with the transpose's rows `lt` items apart. Zeros fill each row past its
+/// `rows` items. Rows of the transpose split across threads.
+pub(super) fn transpose_by_into<T: Copy + num_traits::Zero + Send + Sync>(a: &[T], [ls, lt]: [usize; 2], [rows, cols]: [usize; 2], f: impl Fn(T) -> T + Sync, t: &mut Vec<T>) {
     t.clear();
     if rows * cols == 0 { return }
-    appended(t, rows * cols, |slots| parallel::split(slots, rows, &|start, part| {
-        transpose_into(&a[start / rows..], ls, part, rows, [rows, part.len() / rows], |x| MaybeUninit::new(f(x)));
+    appended(t, lt * cols, |slots| parallel::split(slots, lt, &|start, part| {
+        transpose_into(&a[start / lt..], ls, part, lt, [rows, part.len() / lt], |x| MaybeUninit::new(f(x)));
+        for row in part.chunks_exact_mut(lt) { row[rows..].fill(MaybeUninit::new(T::zero())) }
         true
     }));
 }
 
 /// The transpose of the `m`×`n` matrix `a`.
-fn transpose<T: Copy + Send + Sync>(a: &[T], m: usize, n: usize) -> Vec<T> { transpose_by(a, n, [m, n], |x| x) }
+fn transpose<T: Copy + num_traits::Zero + Send + Sync>(a: &[T], m: usize, n: usize) -> Vec<T> { transpose_by(a, n, [m, n], |x| x) }
+
+/// The `rows`×`cols` matrix `a`, copied with its rows `ld` items apart and zeros after each row's `cols` items.
+pub(super) fn spaced<T: Copy + num_traits::Zero>(a: &[T], [rows, cols]: [usize; 2], ld: usize) -> Vec<T> {
+    if ld == cols { return a[..rows * cols].to_vec() }
+    let mut x = Vec::with_capacity(rows * ld);
+    for row in a[..rows * cols].chunks_exact(cols) {
+        x.extend_from_slice(row);
+        x.resize(x.len() + ld - cols, T::zero());
+    }
+    x
+}
+
+/// Closes up the `rows` runs of `cols` items that start `ld` items apart in `x`, as [`spaced`] leaves them, so that they're contiguous.
+pub(super) fn compact<T: Copy>(x: &mut Vec<T>, [rows, cols]: [usize; 2], ld: usize) {
+    if ld != cols { for i in 1..rows { x.copy_within(i * ld..i * ld + cols, i * cols) } }
+    x.truncate(rows * cols);
+}
 
 /// The conjugate transpose of the `m`×`n` matrix `a`, which for real items is its transpose.
 fn adjoint<T: Scalar>(a: &[T], m: usize, n: usize) -> Vec<T> { transpose_by(a, n, [m, n], T::conj) }
@@ -436,217 +574,253 @@ fn transposed<T: Scalar>(f: &[T], n: usize, k0: usize, k1: usize) -> Vec<T> {
     transpose_by(&f[k0 * n + k0..], n, [f.len() / n - k0, k1 - k0], |x| x)
 }
 
-/// Swaps rows `first + i` and `pivots[i]` of each column of `columns`, in turn for each `i`. Each column holds `n` items. The columns
-/// split across threads.
-fn swap_rows<T: Send>(columns: &mut [T], n: usize, pivots: &[usize], first: usize) {
-    parallel::split(columns, n, &|_, columns| {
-        for column in columns.chunks_exact_mut(n) {
+/// Swaps rows `first + i` and `pivots[i]` of each column of `columns`, in turn for each `i`. The columns start `ld` items apart and split
+/// across threads.
+fn swap_rows<T: Send>(columns: &mut [T], ld: usize, pivots: &[usize], first: usize) {
+    parallel::split(columns, ld, &|_, columns| {
+        for column in columns.chunks_exact_mut(ld) {
             for i in 0..pivots.len() { column.swap(first + i, pivots[i]) }
         }
         true
     });
 }
 
-/// Transposes the `n`×`n` matrix `a` in place. It swaps each pair of 16×16 tiles across the diagonal through two buffers, reading and
-/// writing runs of adjacent items.
-fn transpose_square<T: Copy + Default>(a: &mut [T], n: usize) {
-    const B: usize = 16;
-    let (mut p, mut q) = ([[T::default(); B]; B], [[T::default(); B]; B]);
-    for i0 in (0..n).step_by(B) {
-        let h = B.min(n - i0);
-        for j0 in (i0..n).step_by(B) {
-            let w = B.min(n - j0);
-            for r in 0..h { p[r][..w].copy_from_slice(&a[(i0 + r) * n + j0..][..w]) }
-            for r in 0..w { q[r][..h].copy_from_slice(&a[(j0 + r) * n + i0..][..h]) }
-            for r in 0..h {
-                let row = &mut a[(i0 + r) * n + j0..][..w];
-                for c in 0..w { row[c] = q[c][r] }
-            }
-            for r in 0..w {
-                let row = &mut a[(j0 + r) * n + i0..][..h];
-                for c in 0..h { row[c] = p[c][r] }
-            }
-        }
-    }
-}
-
-/// Factors columns `c0..c1` of the matrix that `f` holds column by column, with columns of `n` items, from row `c0` down. It halves the
-/// columns until `LEAF` or fewer remain. The left half factors first, and its row swaps apply to the right half. The right half's rows
-/// of U come from substitution with the left half's L, on a row-major copy in `scratch`, and a matrix product updates the rows below
-/// them. The right half factors last, and its row swaps apply to the left half. A leaf's row swaps apply to its own columns. Column
-/// `c`'s pivot comes from row `pivots[c]`.
-fn lu_panel<T: Scalar + Tiled>(f: &mut [T], n: usize, [c0, c1]: [usize; 2], pivots: &mut [usize], scratch: &mut Vec<T>) {
+/// Factors columns `c0..c1` of the `n`-row matrix that `f` holds column by column, with columns `ld` items apart, from row `c0` down. It
+/// halves the columns until `LEAF` or fewer remain. The left half factors first, and its row swaps apply to the right half. The right
+/// half's rows of U come from substitution with the left half's L, on a row-major copy in `scratch` with rows `stride(w)` items apart, and
+/// a matrix product updates the rows below them. The right half factors last, and its row swaps apply to the left half. A leaf's row
+/// swaps apply to its own columns. Column `c`'s pivot comes from row `pivots[c]`.
+fn lu_panel<T: Tiled>(f: &mut [T], [n, ld]: [usize; 2], [c0, c1]: [usize; 2], pivots: &mut [usize], scratch: &mut Vec<T>) {
     if c1 - c0 > LEAF {
         let mid = (c0 + c1) / 2;
-        lu_panel(f, n, [c0, mid], pivots, scratch);
-        let (left, right) = f.split_at_mut(mid * n);
+        lu_panel(f, [n, ld], [c0, mid], pivots, scratch);
+        let (left, right) = f.split_at_mut(mid * ld);
         let (left, k, w) = (&*left, mid - c0, c1 - mid);
-        let half = &mut right[..w * n];
-        swap_rows(half, n, &pivots[c0..mid], c0);
-        transpose_by_into(&half[c0..], n, [w, k], |x| x, scratch);
-        forward(move |i, j| left[(c0 + j) * n + c0 + i], [0, k], scratch, [w, w], LEAF, false);
+        let lw = stride(w);
+        let half = &mut right[..w * ld];
+        swap_rows(half, ld, &pivots[c0..mid], c0);
+        transpose_by_into(&half[c0..], [ld, lw], [w, k], |x| x, scratch);
+        T::triangular(scratch, lw, Matrix::rows(&left[c0 * ld + c0..], ld).transpose(), [k, w], Side::Left, Triangle::UnitUpper);
         let u12 = &scratch[..];
-        parallel::split(half, n, &|start, columns| {
-            let count = columns.len() / n;
-            transpose_into(&u12[start / n..], w, &mut columns[c0..], n, [k, count], |x| x);
+        parallel::split(half, ld, &|start, columns| {
+            let count = columns.len() / ld;
+            transpose_into(&u12[start / ld..], lw, &mut columns[c0..], ld, [k, count], |x| x);
             true
         });
-        T::add_product(&mut half[mid..], n, move |j, s| -u12[s * w + j], Rows(&left[c0 * n + mid..], n), [w, k, n - mid]);
-        lu_panel(f, n, [mid, c1], pivots, scratch);
-        return swap_rows(&mut f[c0 * n..mid * n], n, &pivots[mid..c1], mid);
+        T::gemm(&mut half[mid..], ld, Matrix::rows(u12, lw).transpose(), Matrix::rows(&left[c0 * ld + mid..], ld), [w, k, n - mid], -T::one(), T::one());
+        lu_panel(f, [n, ld], [mid, c1], pivots, scratch);
+        return swap_rows(&mut f[c0 * ld..mid * ld], ld, &pivots[mid..c1], mid);
     }
     for c in c0..c1 {
-        let p = c + largest(&f[c * n + c..(c + 1) * n]);
+        let p = c + largest(&f[c * ld + c..c * ld + n]);
         pivots[c] = p;
         if p != c {
-            for j in c0..c1 { f.swap(j * n + c, j * n + p) }
+            for j in c0..c1 { f.swap(j * ld + c, j * ld + p) }
         }
-        let pivot = f[c * n + c];
+        let pivot = f[c * ld + c];
         if pivot == T::zero() { continue }
-        let (left, right) = f.split_at_mut((c + 1) * n);
-        let l = &mut left[c * n + c + 1..];
+        let (left, right) = f.split_at_mut((c + 1) * ld);
+        let l = &mut left[c * ld + c + 1..c * ld + n];
         divide(l, pivot);
-        for column in right[..(c1 - c - 1) * n].chunks_exact_mut(n) {
+        for column in right[..(c1 - c - 1) * ld].chunks_exact_mut(ld) {
             let u = column[c];
-            axpy(&mut column[c + 1..], -u, l);
+            axpy(&mut column[c + 1..n], -u, l);
         }
     }
 }
-/// `lu` for `T`, into `work`'s buffers. It factors a transposed copy of `a`, where each column is contiguous, then transposes the
-/// factors back in place.
-fn lu_factor<T: Scalar + Tiled>(a: &[T], n: usize, work: &mut LuWork<T>) {
+/// `lu` for `T`, into `work`'s buffers. It factors a column-by-column copy of `a` in place, with columns `stride(n)` items apart so that
+/// a power-of-two `n` doesn't map every column to the same cache sets. It then closes the columns up to `n` items apart.
+fn lu_factor<T: Tiled>(a: &[T], n: usize, work: &mut LuWork<T>) {
     assert_eq!(a.len(), n * n, "`a` must hold `n`×`n` items");
     let LuWork { lu, scratch, pivots, .. } = work;
+    let ld = stride(n);
     lu.n = n;
-    transpose_by_into(a, n, [n, n], |x| x, &mut lu.factors);
+    transpose_by_into(a, [n, ld], [n, n], |x| x, &mut lu.factors);
     pivots.clear();
     pivots.resize(n, 0);
-    lu_panel(&mut lu.factors, n, [0, n], pivots, scratch);
-    transpose_square(&mut lu.factors, n);
+    lu_panel(&mut lu.factors, [n, ld], [0, n], pivots, scratch);
+    compact(&mut lu.factors, [n, n], ld);
     lu.perm.clear();
     lu.perm.extend(0..n);
     for c in 0..n { lu.perm.swap(c, pivots[c]) }
 }
 
-/// `Lu::solve` for `T`. One right-hand side substitutes with dot products along L's and U's rows. More substitute a block of rows at a
-/// time, after one matrix product subtracts the rows already solved.
-fn lu_solve<T: Scalar + Tiled>(lu: LuRef<'_, T>, b: &[T], k: usize) -> Vec<T> {
+/// `Lu::solve` for `T`: a solve with L, then one with U.
+fn lu_solve<T: Tiled>(lu: LuRef<'_, T>, b: &[T], k: usize) -> Vec<T> {
     let (n, f) = (lu.n, lu.factors);
     assert_eq!(b.len(), n * k, "`b` must hold `n`×`k` items");
     let mut x: Vec<T> = lu.perm.iter().flat_map(|&p| b[p * k..(p + 1) * k].iter().copied()).collect();
-    if k == 1 {
-        for i in 0..n { x[i] = x[i] - dot(&f[i * n..i * n + i], &x[..i]) }
-        for i in (0..n).rev() { x[i] = (x[i] - dot(&f[i * n + i + 1..(i + 1) * n], &x[i + 1..])).quotient(f[i * n + i]) }
-    } else {
-        forward(|i, j| f[i * n + j], [0, n], &mut x, [k, k], NS, false);
-        backward(f, n, &mut x, k);
-    }
+    let p = Matrix::rows(f, n).transpose();
+    T::triangular(&mut x, k, p, [n, k], Side::Left, Triangle::UnitUpper);
+    T::triangular(&mut x, k, p, [n, k], Side::Left, Triangle::Lower);
     x
 }
 
-/// `Lu::inverse` for `T`, into `out`: `U⁻¹ L⁻¹`, with its columns permuted to undo the row swaps. It works in `x`. Its substitution with L
-/// skips the zeros above the diagonal of `L⁻¹`.
-fn lu_inverse<T: Scalar + Tiled>(lu: LuRef<'_, T>, x: &mut Vec<T>, out: &mut [T]) {
-    let n = lu.n;
-    identity_into(x, n);
-    forward(|i, j| lu.factors[i * n + j], [0, n], x, [n, n], NS, true);
-    backward(lu.factors, n, x, n);
-    for r in 0..n {
-        for (c, &p) in lu.perm.iter().enumerate() { out[r * n + p] = x[r * n + c] }
+/// `Lu::inverse` for `T`, into `out`: `U⁻¹ L⁻¹ P`, where `P` undoes the row swaps. Accelerate solves from `P` in `out` itself. Rustymath's
+/// own kernels solve from the identity in `x`, with rows `stride(n)` items apart, skipping the zeros above the diagonal of `L⁻¹`, then
+/// permute the result's columns into `out`.
+#[cfg_attr(not(native), allow(unused_variables))]
+fn lu_inverse<T: Tiled>(lu: LuRef<'_, T>, x: &mut Vec<T>, out: &mut [T]) {
+    let (n, p) = (lu.n, Matrix::rows(lu.factors, lu.n).transpose());
+    #[cfg(accelerate)]
+    if super::accelerated() {
+        out.fill(T::zero());
+        for (c, &r) in lu.perm.iter().enumerate() { out[c * n + r] = T::one() }
+        T::triangular(out, n, p, [n, n], Side::Left, Triangle::UnitUpper);
+        return T::triangular(out, n, p, [n, n], Side::Left, Triangle::Lower);
+    }
+    #[cfg(native)]
+    {
+        let ld = stride(n);
+        x.clear();
+        x.resize(n * ld, T::zero());
+        for i in 0..n { x[i * ld + i] = T::one() }
+        forward(p, [0, n], x, [ld, n], NS, true, true);
+        T::triangular(x, ld, p, [n, n], Side::Left, Triangle::Lower);
+        for r in 0..n {
+            for (c, &q) in lu.perm.iter().enumerate() { out[r * n + q] = x[r * ld + c] }
+        }
     }
 }
 
-/// Solves `L y = x` in place for rows `r0..r1`, where L is the unit lower triangular matrix whose items below its diagonal `l(i, j)`
-/// gives, rows `0..r0` of y are solved and already removed from these rows, and `x` holds rows `r0..r1` of `k` items, which start `ldx`
+/// Solves `L y = x` in place for rows `r0..r1`, where L is lower triangular, rows `0..r0` of y are solved and already removed
+/// from these rows, and `x` holds rows `r0..r1` of `k` items, which start `ldx`
 /// items apart. Above `block` rows, the top half solves first, one matrix product removes it from the bottom half, and the bottom half
 /// solves last. With `lower`, `x` starts as the identity, only the columns up to each row's own can be nonzero, and it solves a block of
 /// `block` rows at a time instead, with a matrix product removing each block from every row below. A block's rows substitute with
-/// vector operations.
-fn forward<T: Scalar + Tiled>(l: impl Fn(usize, usize) -> T + Sync + Copy, [r0, r1]: [usize; 2], x: &mut [T], [ldx, k]: [usize; 2], block: usize, lower: bool) {
+/// vector operations. With `unit`, L's diagonal is implicitly one.
+#[cfg(native)]
+fn forward<T: Tiled>(l: Matrix<'_, T>, [r0, r1]: [usize; 2], x: &mut [T], [ldx, k]: [usize; 2], block: usize, lower: bool, unit: bool) {
     if !lower && r1 - r0 > block {
         let mid = (r0 + r1) / 2;
         let (top, bottom) = x.split_at_mut((mid - r0) * ldx);
-        forward(l, [r0, mid], top, [ldx, k], block, false);
-        T::add_product(bottom, ldx, move |i, p| -l(mid + i, r0 + p), Rows(top, ldx), [r1 - mid, mid - r0, k]);
-        return forward(l, [mid, r1], bottom, [ldx, k], block, false);
+        forward(l, [r0, mid], top, [ldx, k], block, false, unit);
+        T::gemm(bottom, ldx, l.offset(mid, r0), Matrix::rows(top, ldx), [r1 - mid, mid - r0, k], -T::one(), T::one());
+        return forward(l, [mid, r1], bottom, [ldx, k], block, false, unit);
     }
     for i0 in (r0..r1).step_by(block) {
         let i1 = (i0 + block).min(r1);
         let width = if lower { i1 } else { k };
-        let (done, rest) = x.split_at_mut((i1 - r0) * ldx);
+        let (done, rest) = x.split_at_mut(((i1 - r0) * ldx).min(x.len()));
         let rows = &mut done[(i0 - r0) * ldx..];
-        for i in i0 + 1..i1 {
+        for i in i0..i1 {
             let (head, tail) = rows.split_at_mut((i - i0) * ldx);
-            for j in i0..i { axpy(&mut tail[..width], -l(i, j), &head[(j - i0) * ldx..(j - i0) * ldx + width]) }
+            for j in i0..i { axpy(&mut tail[..width], -l.at(i, j), &head[(j - i0) * ldx..(j - i0) * ldx + width]) }
+            if !unit { divide(&mut tail[..width], l.at(i, i)) }
         }
         let rows = &*rows;
-        T::add_product(rest, ldx, move |i, p| -l(i1 + i, i0 + p), Rows(rows, ldx), [r1 - i1, i1 - i0, width]);
+        if i1 < r1 { T::gemm(rest, ldx, l.offset(i1, i0), Matrix::rows(rows, ldx), [r1 - i1, i1 - i0, width], -T::one(), T::one()) }
     }
 }
 
-/// Solves `U x = y` in place for the `n`×`k` matrix `x`, where U is the upper triangle of `f`, from the last block of rows up. Each
-/// block's rows substitute with vector operations, then one matrix product removes them from every row above.
-fn backward<T: Scalar + Tiled>(f: &[T], n: usize, x: &mut [T], k: usize) {
-    for i0 in (0..n.div_ceil(NS)).rev().map(|block| block * NS) {
-        let i1 = (i0 + NS).min(n);
-        let (above, rows) = x.split_at_mut(i0 * k);
-        let rows = &mut rows[..(i1 - i0) * k];
-        for i in (i0..i1).rev() {
-            let (mid, below) = rows.split_at_mut((i - i0 + 1) * k);
-            let xi = &mut mid[(i - i0) * k..];
-            for j in i + 1..i1 { axpy(xi, -f[i * n + j], &below[(j - i - 1) * k..(j - i) * k]) }
-            divide(xi, f[i * n + i]);
-        }
-        let rows = &*rows;
-        T::add_product(above, k, |i, p| -f[i * n + i0 + p], Rows(rows, k), [i0, i1 - i0, k]);
+/// Solves `U x = y` in place for rows `r0..r1` of the upper triangular U. `x` holds those rows, `k` items each, starting `ldx` items
+/// apart, with the solved rows from `r1` on already removed. Above `NS` rows, the bottom half solves first, one matrix product removes
+/// it from the top half, and the top half solves last. Up to `NS` rows substitute with vector operations, from the last row up. With
+/// `unit`, U's diagonal is implicitly one.
+#[cfg(native)]
+fn backward<T: Tiled>(u: Matrix<'_, T>, [r0, r1]: [usize; 2], x: &mut [T], [ldx, k]: [usize; 2], unit: bool) {
+    if r1 - r0 > NS {
+        let mid = (r0 + r1) / 2;
+        let (top, bottom) = x.split_at_mut((mid - r0) * ldx);
+        backward(u, [mid, r1], bottom, [ldx, k], unit);
+        T::gemm(top, ldx, u.offset(r0, mid), Matrix::rows(bottom, ldx), [mid - r0, r1 - mid, k], -T::one(), T::one());
+        return backward(u, [r0, mid], top, [ldx, k], unit);
+    }
+    for i in (r0..r1).rev() {
+        let (done, below) = x.split_at_mut(((i - r0 + 1) * ldx).min(x.len()));
+        let xi = &mut done[(i - r0) * ldx..][..k];
+        for j in i + 1..r1 { axpy(xi, -u.at(i, j), &below[(j - i - 1) * ldx..][..k]) }
+        if !unit { divide(xi, u.at(i, i)) }
     }
 }
 
-/// Factors columns `c0..c1` of the Cholesky block that `panel` holds transposed, with rows of `rows` items, halving the columns as
-/// `lu_panel` does. It gives false where the matrix isn't positive definite.
-fn cholesky_panel<T: Scalar + Tiled>(panel: &mut [T], rows: usize, [c0, c1]: [usize; 2]) -> bool {
+/// Native triangular solves share the substitutions above. A right solve adjoints its right-hand side once to reuse the left solve. One
+/// contiguous right-hand side goes through `single`. A lower solve whose right-hand side is at least as wide as the matrix, such as an
+/// LU panel's, stops halving at `LEAF` rows, and a narrower one at `NS`.
+#[cfg(native)]
+pub(super) fn triangular_native<T: Tiled>(x: &mut [T], ldx: usize, a: Matrix<'_, T>, [m, n]: [usize; 2], side: Side, triangle: Triangle) {
+    if m == 0 || n == 0 { return }
+    if matches!(side, Side::Right) {
+        let mut xt = transpose_by(x, ldx, [m, n], T::conj);
+        triangular_native(&mut xt, m, a.adjoint(), [n, m], Side::Left, triangle);
+        return transpose_into(&xt, m, x, ldx, [n, m], T::conj);
+    }
+    let (lower, unit) = (matches!(triangle, Triangle::Lower) != a.op.transposed(), matches!(triangle, Triangle::UnitUpper));
+    if n == 1 && ldx == 1 && single(x, a, m, lower, unit) { return }
+    if lower { forward(a, [0, m], x, [ldx, n], if n >= m { LEAF } else { NS }, false, unit) } else { backward(a, [0, m], x, [ldx, n], unit) }
+}
+
+/// Solves for one contiguous right-hand side `x`, along the lines that `a` stores contiguously. Where its view transposes, those are its
+/// logical columns, and each solved item leaves the rest through `axpy`. Otherwise they're its rows, and each item takes a `dot`. A
+/// conjugating view solves nothing and gives false.
+#[cfg(native)]
+fn single<T: Scalar>(x: &mut [T], a: Matrix<'_, T>, m: usize, lower: bool, unit: bool) -> bool {
+    let (d, ld) = (a.data, a.ld);
+    let solved = |v: T, i: usize| if unit { v } else { v.quotient(d[i * ld + i]) };
+    match a.op {
+        super::Op::Transpose if lower => for j in 0..m {
+            x[j] = solved(x[j], j);
+            let xj = x[j];
+            axpy(&mut x[j + 1..], -xj, &d[j * ld + j + 1..j * ld + m]);
+        },
+        super::Op::Transpose => for j in (0..m).rev() {
+            x[j] = solved(x[j], j);
+            let xj = x[j];
+            axpy(&mut x[..j], -xj, &d[j * ld..j * ld + j]);
+        },
+        super::Op::Normal if lower => for i in 0..m { x[i] = solved(x[i] - dot(&d[i * ld..i * ld + i], &x[..i]), i) },
+        super::Op::Normal => for i in (0..m).rev() { x[i] = solved(x[i] - dot(&d[i * ld + i + 1..i * ld + m], &x[i + 1..]), i) },
+        _ => return false,
+    }
+    true
+}
+
+/// Factors columns `c0..c1` of the `rows`-row Cholesky block that `panel` holds column by column, with columns `ld` items apart, halving
+/// the columns as `lu_panel` does. It gives false where the matrix isn't positive definite.
+fn cholesky_panel<T: Tiled>(panel: &mut [T], [rows, ld]: [usize; 2], [c0, c1]: [usize; 2]) -> bool {
     if c1 - c0 > LEAF {
         let mid = (c0 + c1) / 2;
-        if !cholesky_panel(panel, rows, [c0, mid]) { return false }
-        let (left, right) = panel.split_at_mut(mid * rows);
-        let l = |r: usize, p: usize| left[(c0 + p) * rows + mid + r];
-        T::add_product(&mut right[mid..], rows, |j, p| -l(j, p).conj(), Rows(&left[c0 * rows + mid..], rows), [c1 - mid, mid - c0, rows - mid]);
-        return cholesky_panel(panel, rows, [mid, c1]);
+        if !cholesky_panel(panel, [rows, ld], [c0, mid]) { return false }
+        let (left, right) = panel.split_at_mut(mid * ld);
+        let l = Matrix::rows(&left[c0 * ld + mid..], ld);
+        T::gemm(&mut right[mid..], ld, l.adjoint(), l, [c1 - mid, mid - c0, rows - mid], -T::one(), T::one());
+        return cholesky_panel(panel, [rows, ld], [mid, c1]);
     }
     for c in c0..c1 {
-        let d = panel[c * rows + c];
+        let d = panel[c * ld + c];
         if !(d.re() > T::Real::zero()) { return false }
-        let (left, right) = panel.split_at_mut((c + 1) * rows);
+        let (left, right) = panel.split_at_mut((c + 1) * ld);
         let d = T::from_real(d.re().sqrt());
-        left[c * rows + c] = d;
-        let lc = &mut left[c * rows + c + 1..];
+        left[c * ld + c] = d;
+        let lc = &mut left[c * ld + c + 1..c * ld + rows];
         divide(lc, d);
         // Each later column j loses conj(L[j][c]) times column c, from row j down.
-        for (j, column) in right[..(c1 - c - 1) * rows].chunks_exact_mut(rows).enumerate() {
+        for (j, column) in right[..(c1 - c - 1) * ld].chunks_exact_mut(ld).enumerate() {
             let below = &lc[j..];
-            axpy(&mut column[c + 1 + j..], -below[0].conj(), below);
+            axpy(&mut column[c + 1 + j..rows], -below[0].conj(), below);
         }
     }
     true
 }
-/// `cholesky` for `T`, by blocks of `cholesky_block(n)` columns. Each block's columns factor in a transposed copy, where each column is
-/// contiguous. One matrix product for each later block of columns then updates the lower triangle of the rest.
-fn cholesky_factor<T: Scalar + Tiled>(a: &[T], n: usize) -> Option<Vec<T>> {
+/// `cholesky` for `T`, by blocks of `cholesky_block(n)` columns, in a copy of `a` with rows `stride(n)` items apart. Each block's columns
+/// factor in a transposed copy, with columns `stride(rows)` items apart. One matrix product for each later block of columns then updates
+/// the lower triangle of the rest. It then closes the rows up to `n` items apart.
+fn cholesky_factor<T: Tiled>(a: &[T], n: usize) -> Option<Vec<T>> {
     assert_eq!(a.len(), n * n, "`a` must hold `n`×`n` items");
-    let mut l = a.to_vec();
-    let width = cholesky_block(n);
+    let ld = stride(n);
+    let mut l = spaced(a, [n, n], ld);
+    let (width, mut panel) = (cholesky_block(n), Vec::new());
     for k0 in (0..n).step_by(width) {
         let k1 = (k0 + width).min(n);
         let (nb, rows, w) = (k1 - k0, n - k0, n - k1);
-        let mut panel = transposed(&l, n, k0, k1);
-        if !cholesky_panel(&mut panel, rows, [0, nb]) { return None }
-        transpose_into(&panel, rows, &mut l[k0 * n + k0..], n, [nb, rows], |x| x);
+        let pl = stride(rows);
+        transpose_by_into(&l[k0 * ld + k0..], [ld, pl], [rows, nb], |x| x, &mut panel);
+        if !cholesky_panel(&mut panel, [rows, pl], [0, nb]) { return None }
+        transpose_into(&panel, pl, &mut l[k0 * ld + k0..], ld, [nb, rows], |x| x);
         if w == 0 { break }
-        let l21 = |i: usize, p: usize| panel[p * rows + nb + i];
-        let mut l21_conj = filled(nb * w, T::zero());
-        for (column, conj) in panel.chunks_exact(rows).zip(l21_conj.chunks_exact_mut(w)) { for j in 0..w { conj[j] = column[nb + j].conj() } }
-        T::add_lower_product(&mut l[k1 * n + k1..], n, |i, p| -l21(i, p), Rows(&l21_conj, w), [w, nb, w]);
+        T::gram(&mut l[k1 * ld + k1..], ld, Matrix::rows(&panel[nb..], pl).transpose(), [w, nb], -T::Real::one(), T::Real::one());
     }
+    compact(&mut l, [n, n], ld);
     for i in 0..n { l[i * n + i + 1..(i + 1) * n].fill(T::zero()) }
     Some(l)
 }
@@ -676,22 +850,11 @@ fn apply_reflector<T: Scalar>(x: &mut [T], tau: T, tail: &[T]) {
     axpy(&mut x[1..], -tw, tail);
 }
 
-/// Row `r` of the Householder vector in column `c` of a QR block that `panel` holds transposed, with rows of `rows` items: 1 at row `c`,
-/// the panel's items below it, and 0 above it.
-#[inline]
-fn householder<T: Scalar>(panel: &[T], rows: usize, c: usize, r: usize) -> T {
-    match r.cmp(&c) {
-        Ordering::Less => T::zero(),
-        Ordering::Equal => T::one(),
-        Ordering::Greater => panel[c * rows + r],
-    }
-}
-
 /// Fills the diagonal block of rows and columns `c0..c1` of T, the upper triangular factor of the compact WY form `I - V T Vᴴ` of a QR
 /// block's reflections, applied first to last, as LAPACK's `zlarft` gives it. That block is the T of reflections `c0` to `c1 - 1` alone.
 /// `panel` holds the block transposed, with rows of `rows` items. `t` holds T, `nb`×`nb`, with each reflection's `τ` already on its
 /// diagonal and zeros below it. It halves the columns until `LEAF` or fewer remain, and `joined` fills the block between the halves.
-fn triangular<T: Scalar + Tiled>(panel: &[T], rows: usize, [c0, c1]: [usize; 2], t: &mut [T]) {
+fn triangular<T: Tiled>(panel: &[T], rows: usize, [c0, c1]: [usize; 2], t: &mut [T]) {
     if c1 - c0 > LEAF {
         let mid = (c0 + c1) / 2;
         triangular(panel, rows, [c0, mid], t);
@@ -711,27 +874,31 @@ fn triangular<T: Scalar + Tiled>(panel: &[T], rows: usize, [c0, c1]: [usize; 2],
 
 /// Fills T's block for rows `c0..mid` and columns `mid..c1` as `-T₁ S T₂`, from T's diagonal blocks `T₁` and `T₂` for the two halves,
 /// where `S = V₁ᴴ V₂`. V₂ is zero above row `mid`, so S sums over the rows from `mid`.
-fn joined<T: Scalar + Tiled>(panel: &[T], rows: usize, [c0, mid, c1]: [usize; 3], t: &mut [T]) {
+fn joined<T: Tiled>(panel: &[T], rows: usize, [c0, mid, c1]: [usize; 3], t: &mut [T]) {
     let ([k1, k2], nb, below) = ([mid - c0, c1 - mid], panel.len() / rows, rows - mid);
-    let v1 = transpose_by(&panel[c0 * rows + mid..], rows, [k1, below], T::conj);
-    let mut st = vec![T::zero(); k2 * k1];
-    T::add_product(&mut st, k1, |j, q| householder(panel, rows, mid + j, mid + q), Rows(&v1, k1), [k2, below, k1]);
-    let mut s2 = vec![T::zero(); k1 * k2];
-    T::add_product(&mut s2, k2, |i, l| st[l * k1 + i], Rows(&t[mid * nb + mid..], nb), [k1, k2, k2]);
-    let mut t12 = vec![T::zero(); k1 * k2];
-    T::add_product(&mut t12, k2, |i, l| -t[(c0 + i) * nb + c0 + l], Rows(&s2, k2), [k1, k1, k2]);
-    for i in 0..k1 { t[(c0 + i) * nb + mid..][..k2].copy_from_slice(&t12[i * k2..][..k2]) }
+    let v2 = vectors(panel, rows, [mid, c1]);
+    let s = T::multiply(Matrix::rows(&panel[c0 * rows + mid..], rows).conjugate(), Matrix::rows(&v2, below).transpose(), [k1, below, k2]);
+    let s2 = T::multiply(Matrix::rows(&s, k2), Matrix::rows(&t[mid * nb + mid..], nb), [k1, k2, k2]);
+    let t12 = T::multiply(Matrix::rows(&t[c0 * nb + c0..], nb), Matrix::rows(&s2, k2), [k1, k1, k2]);
+    for i in 0..k1 {
+        for j in 0..k2 { t[(c0 + i) * nb + mid + j] = -t12[i * k2 + j] }
+    }
+}
+
+/// Writes out the zeros and unit diagonal of transposed Householder vectors, replacing the panel's R entries.
+fn explicit_vectors<T: Scalar>(panel: &mut [T], rows: usize) {
+    for (c, v) in panel.chunks_exact_mut(rows).enumerate() {
+        v[..c].fill(T::zero());
+        v[c] = T::one();
+    }
 }
 
 /// The vectors of reflections `c0..c1` in a QR block that `panel` holds transposed, with rows of `rows` items: one vector to a row, each
 /// from row `c0` on, with its zeros and its 1 written out.
 fn vectors<T: Scalar>(panel: &[T], rows: usize, [c0, c1]: [usize; 2]) -> Vec<T> {
     let mut v = Vec::with_capacity((c1 - c0) * (rows - c0));
-    for c in c0..c1 {
-        v.resize(v.len() + c - c0, T::zero());
-        v.push(T::one());
-        v.extend_from_slice(&panel[c * rows + c + 1..(c + 1) * rows]);
-    }
+    for column in panel[c0 * rows..c1 * rows].chunks_exact(rows) { v.extend_from_slice(&column[c0..]) }
+    explicit_vectors(&mut v, rows - c0);
     v
 }
 
@@ -739,7 +906,7 @@ fn vectors<T: Scalar>(panel: &[T], rows: usize, [c0, c1]: [usize; 2]) -> Vec<T> 
 /// replaces it below the diagonal, and R replaces it on and above. Its τ goes on the diagonal of `t`, which holds T, `nb`×`nb`, and the
 /// rest of T's rows and columns `c0..c1` above it. It halves the columns until `LEAF` or fewer remain. The left half's reflections reach
 /// the right half through three products, and `joined` fills T's block between the halves.
-fn panel_qr<T: Scalar + Tiled>(panel: &mut [T], rows: usize, [c0, c1]: [usize; 2], t: &mut [T]) {
+fn panel_qr<T: Tiled>(panel: &mut [T], rows: usize, [c0, c1]: [usize; 2], t: &mut [T]) {
     let nb = panel.len() / rows;
     if c1 - c0 <= LEAF {
         for c in c0..c1 {
@@ -757,51 +924,60 @@ fn panel_qr<T: Scalar + Tiled>(panel: &mut [T], rows: usize, [c0, c1]: [usize; 2
     let ([k1, k2], r) = ([mid - c0, c1 - mid], rows - c0);
     panel_qr(panel, rows, [c0, mid], t);
     let vt = vectors(panel, rows, [c0, mid]);
-    let vc = transpose_by(&vt, r, [k1, r], T::conj);
-    let t1: Vec<T> = (0..k1 * k1).map(|q| t[(c0 + q / k1) * nb + c0 + q % k1].conj()).collect();
     // The right half, X ← (I - V₁ T₁ᴴ V₁ᴴ) X, as Xᵀ ← Xᵀ - Xᵀ conj(V₁) conj(T₁) V₁ᵀ in the transposed layout.
     let x = &mut panel[mid * rows..c1 * rows];
-    let mut w = vec![T::zero(); k2 * k1];
-    T::add_product(&mut w, k1, |i, q| x[i * rows + c0 + q], Rows(&vc, k1), [k2, r, k1]);
-    let mut z = vec![T::zero(); k2 * k1];
-    T::add_product(&mut z, k1, |i, q| w[i * k1 + q], Rows(&t1, k1), [k2, k1, k1]);
-    T::add_product(&mut x[c0..], rows, |i, q| -z[i * k1 + q], Rows(&vt, r), [k2, k1, r]);
+    let w = T::multiply(Matrix::rows(&x[c0..], rows), Matrix::rows(&vt, r).adjoint(), [k2, r, k1]);
+    let z = T::multiply(Matrix::rows(&w, k1), Matrix::rows(&t[c0 * nb + c0..], nb).conjugate(), [k2, k1, k1]);
+    T::gemm(&mut x[c0..], rows, Matrix::rows(&z, k1), Matrix::rows(&vt, r), [k2, k1, r], -T::one(), T::one());
     panel_qr(panel, rows, [mid, c1], t);
     joined(panel, rows, [c0, mid, c1], t)
 }
 
 /// One block of a product of Householder reflections, `I - V T Vᴴ`, for reflections `k0` to `k0 + nb - 1`, acting on rows `k0` on.
-/// Column `c` of V is reflection `k0 + c`, which `householder` reads from row `c` of `panel`. T is `triangular`'s.
+/// Row `c` of `vt` holds column `c` of V, reflection `k0 + c`, with its zeros and unit diagonal explicit. T is `triangular`'s.
 struct Block<T> {
     k0: usize,
     nb: usize,
-    panel: Vec<T>,
+    vt: Vec<T>,
     t: Vec<T>,
 }
 
-impl<T: Scalar + Tiled> Block<T> {
+impl<T: Tiled> Block<T> {
     /// The block of reflections `k0` on, with the vectors in the rows of `panel` and the τs `taus`.
     fn new(k0: usize, panel: Vec<T>, taus: &[T]) -> Self {
         let nb = taus.len();
-        let mut t = vec![T::zero(); nb * nb];
+        let mut t = filled(nb * nb, T::zero());
         for (c, &tau) in taus.iter().enumerate() { t[c * nb + c] = tau }
         triangular(&panel, panel.len() / nb, [0, nb], &mut t);
-        Self { k0, nb, panel, t }
+        Self::from_panel(k0, nb, panel, t)
+    }
+
+    /// Reuses a finished panel as Vᵀ. Its R entries are no longer needed after T and R have been read.
+    fn from_panel(k0: usize, nb: usize, mut panel: Vec<T>, t: Vec<T>) -> Self {
+        let rows = panel.len() / nb;
+        explicit_vectors(&mut panel, rows);
+        Self { k0, nb, vt: panel, t }
     }
 
     /// Applies `I - V T Vᴴ`, or its adjoint `I - V Tᴴ Vᴴ` where `adjoint` is true, to columns `c0..c1` of the matrix `x`, whose rows start
     /// `ld` items apart.
     fn apply(&self, x: &mut [T], ld: usize, [c0, c1]: [usize; 2], adjoint: bool) {
-        let (k0, nb, rows, cols) = (self.k0, self.nb, self.panel.len() / self.nb, c1 - c0);
-        // T is stored with its zeros, so neither T nor Tᴴ needs a mask.
-        let t = if adjoint { Cow::Owned(transpose_by(&self.t, nb, [nb, nb], T::conj)) } else { Cow::Borrowed(&self.t[..]) };
-        let v = |r: usize, c: usize| householder(&self.panel, rows, c, r);
-        let mut w = vec![T::zero(); nb * cols];
-        T::add_product(&mut w, cols, |i, r| v(r, i).conj(), Rows(&x[k0 * ld + c0..], ld), [nb, rows, cols]);
-        let mut tw = vec![T::zero(); nb * cols];
-        T::add_product(&mut tw, cols, |i, c| t[i * nb + c], Rows(&w, cols), [nb, nb, cols]);
-        T::add_product(&mut x[k0 * ld + c0..], ld, |r, c| -v(r, c), Rows(&tw, cols), [rows, nb, cols]);
+        let (k0, nb, rows, cols) = (self.k0, self.nb, self.vt.len() / self.nb, c1 - c0);
+        // Keep both intermediates adjointed: Xᴴ V, then Xᴴ V Tᴴ (or T). This needs no conjugate-only view of the large V.
+        let t = Matrix::rows(&self.t, nb);
+        let t = if adjoint { t } else { t.adjoint() };
+        let v = Matrix::rows(&self.vt, rows).transpose();
+        let wt = T::multiply(Matrix::rows(&x[k0 * ld + c0..], ld).adjoint(), v, [cols, rows, nb]);
+        let twt = T::multiply(Matrix::rows(&wt, nb), t, [cols, nb, nb]);
+        T::gemm(&mut x[k0 * ld + c0..], ld, v, Matrix::rows(&twt, nb).adjoint(), [rows, nb, cols], -T::one(), T::one());
     }
+}
+
+/// The blocks of `width` reflections that `taus` holds. `panel(k0, k1)` gives reflections `k0..k1` as the rows of a transposed panel,
+/// which `Block::new` takes.
+fn blocks_of<T: Tiled>(taus: &[T], width: usize, panel: impl Fn(usize, usize) -> Vec<T>) -> Vec<Block<T>> {
+    let p = taus.len();
+    (0..p).step_by(width).map(|k0| { let k1 = (k0 + width).min(p); Block::new(k0, panel(k0, k1), &taus[k0..k1]) }).collect()
 }
 
 /// Householder reflections of `m`-item columns, in blocks, as the `m`×`m` product Q of their matrices, first to last.
@@ -813,27 +989,24 @@ struct Reflections<T> {
 /// The QR factorization of `a`: its reflections, by blocks of `qr_width(p)` columns, and the `p`×`n` upper triangular R, where `p` is the
 /// smaller of `m` and `n`. Each block's columns factor through `panel_qr` in a transposed copy, where each column is contiguous. The block's
 /// reflections then update the columns after it, in the WY form.
-fn reflect<T: Scalar + Tiled>(a: &[T], [m, n]: [usize; 2]) -> (Reflections<T>, Vec<T>) {
+fn reflect<T: Tiled>(a: &[T], [m, n]: [usize; 2]) -> (Reflections<T>, Vec<T>) {
     assert_eq!(a.len(), m * n, "`a` must hold `m`×`n` items");
     let p = m.min(n);
     let (ld, scale) = (stride(n), safe_scale(a));
-    let mut f = Vec::with_capacity(m * ld);
-    for i in 0..m {
-        f.extend(a[i * n..(i + 1) * n].iter().map(|&x| scale.map_or(x, |s| x.mul_real(s))));
-        f.resize((i + 1) * ld, T::zero());
-    }
+    let mut f = spaced(a, [m, n], ld);
+    if let Some(s) = scale { for x in &mut f { *x = x.mul_real(s) } }
     let mut blocks = Vec::new();
     let width = qr_width(p);
     for k0 in (0..p).step_by(width) {
         let k1 = (k0 + width).min(p);
         let (nb, rows) = (k1 - k0, m - k0);
         let mut panel = transposed(&f, ld, k0, k1);
-        let mut t = vec![T::zero(); nb * nb];
+        let mut t = filled(nb * nb, T::zero());
         panel_qr(&mut panel, rows, [0, nb], &mut t);
         for r in 0..nb {
             for c in r..nb { f[(k0 + r) * ld + k0 + c] = panel[c * rows + r] }
         }
-        let block = Block { k0, nb, panel, t };
+        let block = Block::from_panel(k0, nb, panel, t);
         // The columns after the block: A2 ← (I - V Tᴴ Vᴴ) A2.
         if k1 < n { block.apply(&mut f, ld, [k1, n], true) }
         blocks.push(block);
@@ -846,12 +1019,12 @@ fn reflect<T: Scalar + Tiled>(a: &[T], [m, n]: [usize; 2]) -> (Reflections<T>, V
     (Reflections { m, blocks }, r)
 }
 
-impl<T: Scalar + Tiled> Reflections<T> {
+impl<T: Tiled> Reflections<T> {
     /// Each reflection, first to last: the row it acts from, its τ, and its vector after the 1 at that row.
     fn each(&self) -> impl DoubleEndedIterator<Item = (usize, T, &[T])> {
         self.blocks.iter().flat_map(move |b| {
             let rows = self.m - b.k0;
-            (0..b.nb).map(move |c| (b.k0 + c, b.t[c * b.nb + c], &b.panel[c * rows + c + 1..(c + 1) * rows]))
+            (0..b.nb).map(move |c| (b.k0 + c, b.t[c * b.nb + c], &b.vt[c * rows + c + 1..(c + 1) * rows]))
         })
     }
 
@@ -874,10 +1047,8 @@ impl<T: Scalar + Tiled> Reflections<T> {
         let mut q = filled(m * ld, T::zero());
         for i in 0..p { q[i * ld + i] = T::one() }
         for block in self.blocks.iter().rev() { block.apply(&mut q, ld, [block.k0, p], false) }
-        if ld == p { return q }
-        let mut out = Vec::with_capacity(m * p);
-        for row in q.chunks_exact(ld) { out.extend_from_slice(&row[..p]) }
-        out
+        compact(&mut q, [m, p], ld);
+        q
     }
 
     /// `Q x` for the `m`×`k` matrix `x`, in place.
@@ -904,7 +1075,7 @@ impl<T: Scalar + Tiled> Reflections<T> {
 
 /// `qr` and `qr_complete` for `T`. A thin factorization of a tall matrix comes from `tall_qr` where that succeeds. Otherwise Q and R come
 /// from the reflections. A complete Q applies the reflections to the `m`×`m` identity, and R gains rows of zeros to be `m`×`n`.
-fn qr_factor<T: Scalar + Tiled>(a: &[T], [m, n]: [usize; 2], complete: bool) -> (Vec<T>, Vec<T>) {
+fn qr_factor<T: Tiled>(a: &[T], [m, n]: [usize; 2], complete: bool) -> (Vec<T>, Vec<T>) {
     if !complete && tall_for_qr([m, n]) && let Some((r, q)) = tall_qr(a, [m, n], Tall::Q) { return (q, r) }
     let (reflections, mut r) = reflect(a, [m, n]);
     if !complete { return (reflections.q(), r) }
@@ -915,7 +1086,7 @@ fn qr_factor<T: Scalar + Tiled>(a: &[T], [m, n]: [usize; 2], complete: bool) -> 
 }
 
 /// `Svd::solve` and `Svd::pseudoinverse` for `T`.
-fn svd_solve<T: Scalar + Tiled>(svd: SvdRef<'_, T>, b: Option<&[T]>, k: usize) -> Vec<T> {
+fn svd_solve<T: Tiled>(svd: SvdRef<'_, T>, b: Option<&[T]>, k: usize) -> Vec<T> {
     let ([m, n], p) = (svd.size, svd.s.len());
     if let Some(b) = b { assert_eq!(b.len(), m * k, "`b` must hold `m`×`k` items") }
     assert!(svd.u.len() == m * p && svd.v.len() == n * p, "the SVD must hold its singular vectors");
@@ -924,25 +1095,19 @@ fn svd_solve<T: Scalar + Tiled>(svd: SvdRef<'_, T>, b: Option<&[T]>, k: usize) -
 
 /// `V diag(1/s) Uᴴ b` for the factors that `svd` holds and a `b` of `k` columns, or `V diag(1/s) Uᴴ` without `b`, where `1/s` is zero
 /// for each singular value no greater than `ε` times `scale` times the largest.
-fn pseudo_solve<T: Scalar + Tiled>(svd: SvdRef<'_, T>, b: Option<&[T]>, k: usize, scale: usize) -> Vec<T> {
+fn pseudo_solve<T: Tiled>(svd: SvdRef<'_, T>, b: Option<&[T]>, k: usize, scale: usize) -> Vec<T> {
     let ([m, n], p) = (svd.size, svd.s.len());
     if k == 0 { return Vec::new() }
     let floor = cutoff(&svd.s, scale);
     let mut y = match b {
-        Some(b) => {
-            let mut y = vec![T::zero(); p * k];
-            T::add_product(&mut y, k, |i, r| svd.u[r * p + i].conj(), Rows(b, k), [p, m, k]);
-            y
-        }
+        Some(b) => T::multiply(Matrix::rows(svd.u, p).adjoint(), Matrix::rows(b, k), [p, m, k]),
         None => adjoint(&svd.u, m, p),
     };
     for (row, &s) in y.chunks_exact_mut(k).zip(svd.s) {
         let d = if s > floor { s.recip() } else { T::Real::zero() };
         for x in row { *x = x.mul_real(d) }
     }
-    let mut x = vec![T::zero(); n * k];
-    T::add_product(&mut x, k, |i, r| svd.v[i * p + r], Rows(&y, k), [n, p, k]);
-    x
+    T::multiply(Matrix::rows(svd.v, p), Matrix::rows(&y, k), [n, p, k])
 }
 
 /// The size below which a singular value counts as zero, for a matrix whose singular values `s` descend and whose larger side has `scale`
@@ -951,13 +1116,10 @@ fn cutoff<R: crate::Float>(s: &[R], scale: usize) -> R { R::epsilon() * R::narro
 
 /// `lstsq` for `T`. A matrix with at least as many rows as columns reduces to the R of its QR factorization, and `b` to `Qᴴ b`, without
 /// forming Q: through `tall_qr` where that succeeds, and otherwise through the reflections. A wider matrix solves through its own SVD.
-fn lstsq_solve<T: Scalar + Tiled>(a: &[T], b: &[T], [m, n]: [usize; 2], k: usize) -> (Vec<T>, Vec<T::Real>)
-where
-    T::Real: Tiled,
-{
+fn lstsq_solve<T: Tiled>(a: &[T], b: &[T], [m, n]: [usize; 2], k: usize) -> (Vec<T>, Vec<T::Real>) {
     assert_eq!(b.len(), m * k, "`b` must hold `m`×`k` items");
     if m < n {
-        let svd = svd::svd_factor(a, [m, n], true);
+        let svd = svd_factor(a, [m, n], true);
         return (pseudo_solve(svd.as_ref(), Some(b), k, n), svd.s);
     }
     let reduced = tall_for_lstsq([m, n]).then(|| tall_qr(a, [m, n], Tall::Project(b, k))).flatten();
@@ -968,7 +1130,7 @@ where
         y.truncate(n * k);
         (r, y)
     });
-    let svd = svd::svd_factor(&r, [n, n], true);
+    let svd = svd_factor(&r, [n, n], true);
     (pseudo_solve(svd.as_ref(), Some(&y), k, m), svd.s)
 }
 
@@ -985,13 +1147,16 @@ fn tall_for_qr([m, n]: [usize; 2]) -> bool { (n >= 16 && m >= (4 * n).max(n * n 
 /// forms no Q. CholeskyQR2 therefore needs taller matrices than for `qr` before it's faster.
 fn tall_for_lstsq([m, n]: [usize; 2]) -> bool { (n >= 20 && m >= 2 * n * n) || threaded_work(m, n, 1 << 23) }
 
-/// Whether a matrix of `size` `[m, n]` holds enough work for CholeskyQR2's threaded passes to be faster than Householder on the Mac's
-/// default 18 threads: at least 16 rows per column, and `m n²` of at least `work`. Narrow matrices such as 1000000×10 pass. On one thread
-/// they take up to 1.7 times as long as Householder.
-fn threaded_work(m: usize, n: usize, work: usize) -> bool { m >= 16 * n && m.saturating_mul(n.saturating_mul(n)) >= work }
+/// Whether a matrix of `size` `[m, n]` holds enough work for CholeskyQR2's threaded passes to be faster than Householder: at least 16
+/// rows per column, and `m n²` of at least `work`. Narrow matrices such as 1000000×10 pass. Where Accelerate runs the products, CholeskyQR2
+/// is faster for them on one thread too. Elsewhere the call must be able to split across threads: in wasm and on one thread, Householder is
+/// faster for them.
+fn threaded_work(m: usize, n: usize, work: usize) -> bool {
+    (super::accelerated() || !parallel::serial()) && m >= 16 * n && m.saturating_mul(n.saturating_mul(n)) >= work
+}
 
 /// What `tall_qr` gives beside R: Q, nothing, or `Qᴴ b` for the `m`×`k` matrix `b`.
-enum Tall<'a, T> { Q, R, Project(&'a [T], usize) }
+enum Tall<'a, T> { Q, #[cfg(native)] R, Project(&'a [T], usize) }
 
 /// The thin QR factorization of a tall `a` by CholeskyQR2: R, with Q or `Qᴴ b` as `want` asks. It scales
 /// `a` as `reflect` does. `None` where `a` is too ill-conditioned for the result to be as accurate as Householder QR's: where `AᴴA` has no
@@ -1000,7 +1165,7 @@ enum Tall<'a, T> { Q, R, Project(&'a [T], usize) }
 /// Pass one factors `AᴴA = L₁ L₁ᴴ`. Pass two solves `Q₁ L₁ᴴ = A` and factors `Q₁ᴴQ₁ = L₂ L₂ᴴ`. Then `Q = Q₁ L₂⁻ᴴ`, `Qᴴ b = L₂⁻¹ Q₁ᴴ b` and
 /// `R = (L₁ L₂)ᴴ`, whose diagonal is real and positive. Each pass gives every thread a contiguous range of `a`'s rows and its own partial
 /// Gram matrix, and works through the range in blocks of `TALL_BLOCK` items. Pass two stores Q₁ only for `Tall::Q`.
-fn tall_qr<T: Scalar + Tiled>(a: &[T], [m, n]: [usize; 2], want: Tall<'_, T>) -> Option<(Vec<T>, Vec<T>)> {
+fn tall_qr<T: Tiled>(a: &[T], [m, n]: [usize; 2], want: Tall<'_, T>) -> Option<(Vec<T>, Vec<T>)> {
     let scale = safe_scale(a);
     let scaled = match scale {
         Some(s) => Cow::Owned(a.iter().map(|x| x.mul_real(s)).collect()),
@@ -1013,33 +1178,38 @@ fn tall_qr<T: Scalar + Tiled>(a: &[T], [m, n]: [usize; 2], want: Tall<'_, T>) ->
     parallel::pieces_of(&mut grams, 1, usize::MAX, &|p, g| {
         let (start, end) = (range(p).start, range(p).end);
         for x in (start..end).step_by(rows).map(|s| &a[s * n..end.min(s + rows) * n]) {
-            T::add_lower_product(&mut g[0], n, |i, j| x[j * n + i].conj(), Rows(x, n), [n, x.len() / n, n]);
+            T::gram(&mut g[0], n, Matrix::rows(x, n).adjoint(), [n, x.len() / n], T::Real::one(), T::Real::one());
         }
         true
     });
     let l1 = cholesky_factor(&summed(grams.iter()), n)?;
-    let (u1, d1) = unit_lower(&l1, n);
-    let mut q = if matches!(want, Tall::Q) { filled(m * n, T::zero()) } else { Vec::new() };
+    let mut q = if matches!(want, Tall::Q) { a.to_vec() } else { Vec::new() };
     let mut rest = &mut q[..];
     let outs: Vec<&mut [T]> = (0..count).map(|p| {
         let (out, tail) = std::mem::take(&mut rest).split_at_mut(if matches!(want, Tall::Q) { range(p).len() * n } else { 0 });
         rest = tail;
         out
     }).collect();
-    let mut parts: Vec<_> = outs.into_iter().map(|out| (out, filled(n * n, T::zero()), filled(n * k, T::zero()))).collect();
+    let mut parts: Vec<_> = outs.into_iter().map(|out| (out, filled(n * n, T::zero()), filled(n * k, T::zero()), Vec::new())).collect();
     parallel::pieces_of(&mut parts, 1, usize::MAX, &|p, part| {
-        let (out, gram, y) = &mut part[0];
+        let (out, gram, y, scratch) = &mut part[0];
         let (start, end) = (range(p).start, range(p).end);
         for r in (start..end).step_by(rows).map(|s| s..end.min(s + rows)) {
             let h = r.len();
-            let qt = solved(&a[r.start * n..r.end * n], n, &u1, &d1);
-            let q1: Cow<[T]> = if out.is_empty() { Cow::Owned(adjoint(&qt, n, h)) } else {
-                let band = &mut out[(r.start - start) * n..(r.end - start) * n];
-                transpose_into(&qt, h, band, n, [n, h], T::conj);
-                Cow::Borrowed(&*band)
+            let src = &a[r.start * n..r.end * n];
+            let q1 = if out.is_empty() {
+                scratch.clear();
+                scratch.extend_from_slice(src);
+                &mut scratch[..]
+            } else {
+                &mut out[(r.start - start) * n..(r.end - start) * n]
             };
-            T::add_lower_product(gram, n, |i, j| qt[i * h + j], Rows(&q1, n), [n, h, n]);
-            if let Tall::Project(b, k) = want { T::add_product(y, k, |i, j| qt[i * h + j], Rows(&b[r.start * k..r.end * k], k), [n, h, k]) }
+            T::triangular(q1, n, Matrix::rows(&l1, n).adjoint(), [h, n], Side::Right, Triangle::Lower);
+            let qt = Matrix::rows(q1, n).adjoint();
+            T::gram(gram, n, qt, [n, h], T::Real::one(), T::Real::one());
+            if let Tall::Project(b, k) = want {
+                T::gemm(y, k, qt, Matrix::rows(&b[r.start * k..r.end * k], k), [n, h, k], T::one(), T::one());
+            }
         }
         true
     });
@@ -1051,19 +1221,16 @@ fn tall_qr<T: Scalar + Tiled>(a: &[T], [m, n]: [usize; 2], want: Tall<'_, T>) ->
     });
     if !(far.sqrt() <= <T::Real as crate::Float>::narrow(NEARLY_ORTHONORMAL)) { return None }
     let l2 = cholesky_factor(&g2, n)?;
-    let (u2, d2) = unit_lower(&l2, n);
-    let mut l = vec![T::zero(); n * n];
-    T::add_product(&mut l, n, |i, j| l1[i * n + j], Rows(&l2, n), [n, n, n]);
+    let l = T::multiply(Matrix::rows(&l1, n), Matrix::rows(&l2, n), [n, n, n]);
     let mut r = adjoint(&l, n, n);
     if let Some(s) = scale { for v in &mut r { *v = v.div_real(s) } }
     if !matches!(want, Tall::Q) {
-        lower_solve(&u2, &d2, n, &mut y, k);
+        T::triangular(&mut y, k, Matrix::rows(&l2, n), [n, k], Side::Left, Triangle::Lower);
         return Some((r, y));
     }
     parallel::pieces_of(&mut q, rows * n, usize::MAX, &|_, band| {
         let h = band.len() / n;
-        let qt = solved(band, n, &u2, &d2);
-        transpose_into(&qt, h, band, n, [n, h], T::conj);
+        T::triangular(band, n, Matrix::rows(&l2, n).adjoint(), [h, n], Side::Right, Triangle::Lower);
         true
     });
     Some((r, q))
@@ -1076,28 +1243,5 @@ fn summed<'a, T: Scalar + 'a>(mut parts: impl Iterator<Item = &'a Vec<T>>) -> Ve
         for (s, &v) in sum.iter_mut().zip(part) { *s = *s + v }
     }
     sum
-}
-
-/// The lower triangular `n`×`n` matrix `l`, which has a real, positive diagonal, as `L̃ D`: the unit lower triangular L̃, of which only the
-/// items below the diagonal are set, and the diagonal D.
-fn unit_lower<T: Scalar>(l: &[T], n: usize) -> (Vec<T>, Vec<T::Real>) {
-    let d: Vec<T::Real> = (0..n).map(|j| l[j * n + j].re()).collect();
-    (l.iter().enumerate().map(|(c, &v)| v.div_real(d[c % n])).collect(), d)
-}
-
-/// Solves `L̃ D x = y` in place for the `n`×`k` matrix `x`, where `unit_lower` gives L̃ as `u` and D as `d`.
-fn lower_solve<T: Scalar + Tiled>(u: &[T], d: &[T::Real], n: usize, x: &mut [T], k: usize) {
-    if k == 0 { return }
-    forward(|i, j| u[i * n + j], [0, n], x, [k, k], NS, false);
-    for (row, &di) in x.chunks_exact_mut(k).zip(d) { divide(row, T::from_real(di)) }
-}
-
-/// `(x L⁻ᴴ)ᴴ` for the `h`×`n` matrix `x`, as an `n`×`h` matrix, where `unit_lower` gives L as `u` and `d`: the conjugate transpose of the
-/// solution of `X Lᴴ = x`, from substitution along the rows of `xᴴ`.
-fn solved<T: Scalar + Tiled>(x: &[T], n: usize, u: &[T], d: &[T::Real]) -> Vec<T> {
-    let h = x.len() / n;
-    let mut xt = adjoint(x, h, n);
-    lower_solve(u, d, n, &mut xt, h);
-    xt
 }
 

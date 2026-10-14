@@ -125,16 +125,12 @@ pub const SCANNED: usize = 16;
 pub fn index_of<K: Key>(x: &[K], y: &[K]) -> Vec<u32> {
     let miss = x.len() as u32;
     if y.len() <= SCANNED { return y.iter().map(|n| x.iter().position(|h| h == n).map_or(miss, |p| p as u32)).collect(); }
+    let Some((min, mut table)) = table(x, usize::MAX) else { return first_matches(x, y) };
+    let first = write_first(x, min, &mut table, None);
+    // `move` keeps `min`, `first` and `miss` in registers. Captured by reference, they would load again for every item.
+    let at = move |n: K| usize::try_from(n.key().wrapping_sub(min)).ok().and_then(|i| first.get(i));
     let mut found = Vec::with_capacity(y.len());
-    if let Some((min, mut table)) = table(x, usize::MAX) {
-        let first = write_first(x, min, &mut table, None);
-        // `move` keeps `min`, `first` and `miss` in registers. Captured by reference, they would load again for every item.
-        let at = move |n: K| usize::try_from(n.key().wrapping_sub(min)).ok().and_then(|i| first.get(i));
-        look_up(&mut found, y, move |n| at(n).map_or(miss, |&f| f.min(miss as usize) as u32));
-    } else {
-        let first = first_positions(x);
-        look_up(&mut found, y, |n| first.get(&n).map_or(miss, |&f| f as u32));
-    }
+    look_up(&mut found, y, move |n| at(n).map_or(miss, |&f| f.min(miss as usize) as u32));
     found
 }
 
@@ -152,24 +148,18 @@ pub(crate) fn look_up<K: Copy + Sync>(found: &mut Vec<u32>, y: &[K], look: impl 
 /// The first position of each item's key in `x`, which represents the item's class.
 #[inline(never)]
 pub fn classes<K: Key>(x: &[K]) -> Vec<u32> {
-    if let Some((min, mut table)) = table(x, usize::MAX) {
-        let first = write_first(x, min, &mut table, None);
-        return x.iter().map(move |&n| first[n.key().wrapping_sub(min) as usize] as u32).collect();
-    }
-    let first = first_positions(x);
-    x.iter().map(|n| first[n]).collect()
+    let Some((min, mut table)) = table(x, usize::MAX) else { return first_classes(x, |n| n) };
+    let first = write_first(x, min, &mut table, None);
+    x.iter().map(move |&n| first[n.key().wrapping_sub(min) as usize] as u32).collect()
 }
 
-/// Whether each item of `x` is the first with its key. Once the index holds the first position of each key, marking those positions
-/// gives the result, with no second pass over `x`.
+/// Whether each item of `x` is the first with its key. Once a table holds the first position of each key, marking those positions gives
+/// the result, with no second pass over `x`. Wider keys mark the items that are their own class.
 #[inline(never)]
 pub fn firsts<K: Key>(x: &[K]) -> Vec<bool> {
+    let Some((min, mut table)) = table(x, usize::MAX) else { return first_mask(&first_classes(x, |n| n)) };
     let mut mask = vec![false; x.len()];
-    if let Some((min, mut table)) = table(x, usize::MAX) {
-        for &f in write_first(x, min, &mut table, None) { if let Some(m) = mask.get_mut(f) { *m = true } }
-        return mask;
-    }
-    for &f in first_positions(x).values() { mask[f as usize] = true }
+    for &f in write_first(x, min, &mut table, None) { if let Some(m) = mask.get_mut(f) { *m = true } }
     mask
 }
 
@@ -354,12 +344,25 @@ fn held<K: Key>(x: &[K], min: i64) -> usize {
     seen.iter().map(|mask| mask.count_ones() as usize).sum()
 }
 
-/// A map from each key of `x` to its first position. The map holds the items themselves, so an entry takes their width.
-fn first_positions<K: Key>(x: &[K]) -> HashMap<K, u32> {
-    let mut first = HashMap::with_capacity(x.len());
+/// For each item of `y`, the position of the first item of `x` with its key, or the length of `x` where none has it, from a hash map.
+#[inline(never)]
+fn first_matches<K: Key>(x: &[K], y: &[K]) -> Vec<u32> {
+    let (miss, mut first) = (x.len() as u32, HashMap::with_capacity(x.len()));
     for (i, &n) in x.iter().enumerate().rev() { first.insert(n, i as u32); }
-    first
+    let (first, mut found) = (&first, Vec::with_capacity(y.len()));
+    look_up(&mut found, y, move |n| first.get(&n).map_or(miss, |&f| f));
+    found
 }
+
+/// The first position of each item's `key` in `x`, from one pass that records and reads each key together. Two items' keys are equal
+/// exactly when the items match.
+pub(crate) fn first_classes<T: Copy, K: Eq + Hash>(x: &[T], key: impl Fn(T) -> K) -> Vec<u32> {
+    let mut first = HashMap::with_capacity(x.len());
+    x.iter().enumerate().map(|(i, &v)| *first.entry(key(v)).or_insert(i as u32)).collect()
+}
+
+/// Whether each position of `classes` is its own class, which makes its item the first with its key.
+pub(crate) fn first_mask(classes: &[u32]) -> Vec<bool> { classes.iter().enumerate().map(|(i, &c)| c as usize == i).collect() }
 
 /// The positions of `groups` in order of group, keeping their order within each group, and the number of positions in each of the
 /// `n` groups.

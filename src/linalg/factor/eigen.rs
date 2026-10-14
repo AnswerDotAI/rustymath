@@ -1,5 +1,5 @@
 //! The symmetric and Hermitian eigen problems, as LAPACK's `dsytrd`/`zhetrd`, `dorgtr`/`zungtr`, `dsteqr` and `dstedc` solve them.
-//! Householder reflections reduce the matrix to a real symmetric tridiagonal one. Up to `CONQUER` rows, implicit QL iterations with
+//! Householder reflections reduce the matrix to a real symmetric tridiagonal one. Up to `EIGH_CONQUER` rows, implicit QL iterations with
 //! Wilkinson shifts diagonalise the tridiagonal matrix, rotating the rows of Qᵀ into the rows of Vᵀ. Larger tridiagonal matrices go to
 //! divide and conquer, which builds their eigenvectors through matrix products. The reflections then turn those eigenvectors into V. Eigenvalues alone take implicit QL without rotations, at any size.
 //! Every reflection and rotation acts on contiguous rows. The reduction works on the upper triangle. A Hermitian matrix's reduction
@@ -8,28 +8,13 @@
 //! Divide and conquer's deflation and merge follow faer's `divide_and_conquer_recurse` in `tridiag_evd.rs`. See `THIRD-PARTY.md`.
 use super::*;
 
-/// The eigen decomposition of a Hermitian `n`×`n` matrix: `a = V diag(values) Vᴴ`. `values` is real and in ascending order. Column
-/// `j` of the `n`×`n` matrix `vectors` is a unit eigenvector for `values[j]`. Without eigenvectors, `vectors` is empty.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Eigh<T: Scalar> {
-    pub values: Vec<T::Real>,
-    pub vectors: Vec<T>,
-}
-
-/// The eigen decomposition of the Hermitian `n`×`n` matrix `a`, reading only its lower triangle. `None` where the iterations don't
-/// converge, as for a matrix holding NaN or an infinity.
-pub fn eigh<T: Factor>(a: &[T], n: usize) -> Option<Eigh<T>> { T::matrix_eigh(a, n, true) }
-/// The eigenvalues of the Hermitian `n`×`n` matrix `a`, in ascending order, reading only its lower triangle. `None` where `eigh` gives
-/// `None`.
-pub fn hermitian_eigenvalues<T: Factor>(a: &[T], n: usize) -> Option<Vec<T::Real>> { T::matrix_eigh(a, n, false).map(|f| f.values) }
-
-/// `eigh` and `hermitian_eigenvalues` for `T`, with eigenvectors only where `vectors` is true. A matrix whose largest item lies outside
-/// the safe range first scales by a power of two. Its eigenvalues then scale back exactly.
-pub(super) fn eigh_factor<T: Scalar + Tiled>(a: &[T], n: usize, vectors: bool) -> Option<Eigh<T>>
+/// The native eigen decomposition of the nonempty Hermitian `n`×`n` matrix whose finite lower triangle `a` holds, which `Tiled::eigh`
+/// uses off macOS. A matrix whose largest item lies outside the safe range first scales by a power of two. Its eigenvalues then scale
+/// back exactly.
+pub(in crate::linalg) fn native<T: Tiled>(a: &[T], n: usize, vectors: bool) -> Option<Eigh<T>>
 where
-    T::Real: Tiled,
+    T::Real: Tiled<Real = T::Real>,
 {
-    assert_eq!(a.len(), n * n, "`a` must hold `n`×`n` items");
     // Row i of `w` holds the conjugate of column i of `a`'s lower triangle, from the diagonal on: row i of the matrix's upper triangle.
     // The rest of `w` is zero.
     let mut w = adjoint(a, n, n);
@@ -41,10 +26,10 @@ where
         // Values alone need no rotations, so QL takes O(n²) time after the reduction, at any size.
         implicit_ql::<T>(&mut d, &mut e, &mut [], n)?;
         Vec::new()
-    } else if n > CONQUER {
+    } else if n > EIGH_CONQUER {
         // Divide and conquer gives the tridiagonal matrix's eigenvectors as the rows of Sᵀ. The reflections then turn S into V = Q S
         // in place, acting on its rows 1 to n - 1.
-        let st = conquer(&mut d, &e[..n - 1], CONQUER)?;
+        let st = conquer(&mut d, &e[..n - 1], EIGH_CONQUER)?;
         let s: Vec<T> = st.into_iter().map(T::from_real).collect();
         let mut v = transpose(&s, n, n);
         blocked(&w, &taus, n).apply(&mut v[n..], n);
@@ -67,7 +52,7 @@ where
 /// column `k + 2`. Each reflection then updates the upper triangle below its row from both sides, as a rank-two update. That update needs
 /// `τ B v`, where B is the matrix below and to the right of row `k`. One pass over B's rows applies reflection `k`'s update and accumulates
 /// the next reflection's `τ B v`. B is then read once for each reflection. `summed_rows` splits each pass's rows across threads.
-fn tridiagonal<T: Scalar + Tiled>(w: &mut [T], n: usize) -> (Vec<T::Real>, Vec<T::Real>, Vec<T>) {
+fn tridiagonal<T: Tiled>(w: &mut [T], n: usize) -> (Vec<T::Real>, Vec<T::Real>, Vec<T>) {
     let zero = T::Real::zero();
     let (mut d, mut e, mut taus) = (vec![zero; n], vec![zero; n], vec![T::zero(); n.saturating_sub(1)]);
     if n == 0 { return (d, e, taus) }
@@ -141,7 +126,7 @@ const ROW_PIECE: usize = 64;
 /// `rows[i * stride..(i + 1) * stride]`, and adds the sums each row gives into `sums`. The rows split into one piece of at least
 /// `ROW_PIECE` rows for each of this thread's [`crate::parallel::threads`]. On one thread they run as one loop. The first piece adds
 /// into `sums` and each later one into its own part of `parts`, which then add into `sums`.
-pub(super) fn summed_rows<T: Scalar + Tiled, F: Fn(usize, &mut [T], &mut [T]) + Sync>(
+pub(super) fn summed_rows<T: Tiled, F: Fn(usize, &mut [T], &mut [T]) + Sync>(
     rows: &mut [T], stride: usize, count: usize, sums: &mut [T], parts: &mut Vec<T>, row: F,
 ) {
     let pieces = (count / ROW_PIECE).min(crate::parallel::threads());
@@ -165,54 +150,6 @@ pub(super) fn summed_rows<T: Scalar + Tiled, F: Fn(usize, &mut [T], &mut [T]) + 
         });
     }
     for part in parts.chunks(width) { for (s, &x) in sums.iter_mut().zip(part) { *s = *s + x } }
-}
-
-/// Rows at or below which `reflections` applies each reflection on its own, where building the WY form's blocks costs more than
-/// its products save.
-const SMALL: usize = 96;
-
-/// Qᵀ, the transpose without conjugation, for the reflections that `tridiagonal` leaves in `w` and `taus`. Reflection `k` acts on rows
-/// and columns from `k + 1` on, as reflection `k` of a QR factorization acts on a matrix without the first row and column.
-/// `Reflections::q` therefore forms Q's last `n - 1` rows and columns, by blocks of reflections in the WY form, through the tiled `+.×`
-/// kernels.
-pub(super) fn reflections<T: Scalar + Tiled>(w: &[T], taus: &[T], n: usize) -> Vec<T> {
-    let mut qt = identity(n);
-    if n < 2 { return qt }
-    if n <= SMALL {
-        // A small matrix applies each reflection's transpose, `I - τ v̄ vᵀ`, from the right on its own. Before reflection `k`, Qᵀ
-        // differs from the identity only in rows and columns after `k + 1`.
-        let mut v = vec![T::zero(); n];
-        for (k, &tau) in taus.iter().enumerate().rev() {
-            if tau == T::zero() { continue }
-            let v = &mut v[..n - k - 1];
-            v[0] = T::one();
-            v[1..].copy_from_slice(&w[k * n + k + 2..(k + 1) * n]);
-            for row in qt[(k + 1) * n..].chunks_exact_mut(n) {
-                let row = &mut row[k + 1..];
-                let s = tau * dotc(v, row);
-                axpy(row, -s, v);
-            }
-        }
-        return qt;
-    }
-    let p = n - 1;
-    transpose_into(&blocked(w, taus, n).q(), p, &mut qt[n + 1..], n, [p, p], |x| x);
-    qt
-}
-
-/// The reflections that `reflections` multiplies, in blocks, for a matrix of at least 2 rows. They act on rows and columns 1 to `n - 1`.
-pub(super) fn blocked<T: Scalar + Tiled>(w: &[T], taus: &[T], n: usize) -> Reflections<T> {
-    let (p, width) = (n - 1, qr_block(n - 1));
-    let blocks = (0..p)
-        .step_by(width)
-        .map(|k0| {
-            let nb = (k0 + width).min(p) - k0;
-            // Row c of the panel holds reflection k0 + c from column k0 + 1 of `w`, where `householder` reads it.
-            let panel = (0..nb).flat_map(|c| w[(k0 + c) * n + k0 + 1..(k0 + c + 1) * n].to_vec()).collect();
-            Block::new(k0, panel, &taus[k0..k0 + nb])
-        })
-        .collect();
-    Reflections { m: p, blocks }
 }
 
 /// Diagonalises the real symmetric tridiagonal matrix with diagonal `d` and subdiagonal `e` by implicit QL iterations, as EISPACK's
@@ -271,16 +208,11 @@ fn implicit_ql<T: Scalar>(d: &mut [T::Real], e: &mut [T::Real], vt: &mut [T], n:
     Some(())
 }
 
-
-/// Above this many rows, divide and conquer splits a tridiagonal matrix's eigen problem in two. Implicit QL solves smaller ones.
-#[doc(hidden)]
-pub const CONQUER: usize = 64;
-
 /// The eigen decomposition of the real symmetric tridiagonal matrix with diagonal `d` and subdiagonal `e`, by Cuppen's divide and
 /// conquer with Gu and Eisenstat's eigenvectors, as LAPACK's `dstedc` computes it. `d` ends
 /// holding the eigenvalues in ascending order. The rows of the `n`×`n` result are unit eigenvectors for them. Problems of at most `leaf`
 /// rows go to implicit QL. A matrix holding NaN or an infinity gives `None`.
-fn conquer<R: Native + Tiled>(d: &mut [R], e: &[R], leaf: usize) -> Option<Vec<R>> {
+fn conquer<R: Native + Tiled<Real = R>>(d: &mut [R], e: &[R], leaf: usize) -> Option<Vec<R>> {
     let n = d.len();
     if n <= leaf.max(1) {
         let mut st = identity(n);
@@ -320,7 +252,7 @@ enum Source { Root(usize), Deflated(usize) }
 /// The eigen decomposition of `diag(d) + rho z zᵀ`, turned into the whole tridiagonal matrix's. The first `n1` items of `d` are the
 /// first half's eigenvalues, and the rest the second half's, each in ascending order. The rows of `s0` and `s1` hold the halves' unit
 /// eigenvectors. Gives the whole matrix's unit eigenvectors as rows, and leaves its eigenvalues in ascending order in `d`.
-fn merge<R: Native + Tiled>(d: &mut [R], z: &[R], rho: R, s0: &[R], s1: &[R], n1: usize) -> Vec<R> {
+fn merge<R: Native + Tiled<Real = R>>(d: &mut [R], z: &[R], rho: R, s0: &[R], s1: &[R], n1: usize) -> Vec<R> {
     let (n, zero, one) = (d.len(), R::zero(), R::one());
     let n2 = n - n1;
     // `p` lists the positions of `d` in ascending order of their values.
@@ -413,10 +345,12 @@ fn merge<R: Native + Tiled>(d: &mut [R], z: &[R], rho: R, s0: &[R], s1: &[R], n1
     let mut values: Vec<(R, Source)> = roots.iter().enumerate().map(|(t, &(shift, mu))| (shift + mu, Source::Root(t))).collect();
     values.extend((0..n).filter(|&i| pz[i] == zero).map(|i| (pd[i], Source::Deflated(i))));
     values.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
-    // The rows of `rt` are the update's unit eigenvectors, with their components in the order of `p`.
+    // Build each update eigenvector in `p`'s order, then store it in the halves' original order for the products below.
     let mut rt = vec![zero; n * n];
     crate::parallel::split(&mut rt, n, &|first, rows| {
-        for (j, row) in rows.chunks_exact_mut(n).enumerate() {
+        let mut row = filled(n, zero);
+        for (j, out) in rows.chunks_exact_mut(n).enumerate() {
+            row.fill(zero);
             match values[first / n + j].1 {
                 Source::Deflated(i) => row[i] = one,
                 Source::Root(t) => {
@@ -431,15 +365,15 @@ fn merge<R: Native + Tiled>(d: &mut [R], z: &[R], rho: R, s0: &[R], s1: &[R], n1
                 let s = *c * dot(v, segment);
                 axpy(segment, -s, v);
             }
+            for (i, &k) in p.iter().enumerate() { out[k] = row[i] }
         }
         true
     });
     for (x, &(value, _)) in d.iter_mut().zip(&values) { *x = value }
-    // The whole matrix's eigenvectors: each row of `rt`, with its components back in the halves' order, times diag(S₀ᵀ, S₁ᵀ).
-    let mut q = vec![0; n];
-    for (i, &k) in p.iter().enumerate() { q[k] = i }
-    R::add_product(&mut st, n, |j, c| rt[j * n + q[c]], Rows(&s0, n1), [n, n1, n1]);
-    R::add_product(&mut st[n1..], n, |j, c| rt[j * n + q[n1 + c]], Rows(&s1, n2), [n, n2, n2]);
+    // The whole matrix's eigenvectors: `rt` times diag(S₀ᵀ, S₁ᵀ).
+    let rt = Matrix::rows(&rt, n);
+    R::gemm(&mut st, n, rt, Matrix::rows(s0, n1), [n, n1, n1], one, zero);
+    R::gemm(&mut st[n1..], n, rt.offset(0, n1), Matrix::rows(s1, n2), [n, n2, n2], one, zero);
     st
 }
 

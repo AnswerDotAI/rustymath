@@ -13,8 +13,9 @@ class Svd(NamedTuple):
     v: np.ndarray
 
     def solve(self, b):
-        "The least-norm least-squares solution for `b`, using these factors and `lstsq`'s cutoff"
-        return _solve(_g.svd_solve, *_inexact(*self, b))
+        "The least-norm least-squares solution for `b`, using these factors and `lstsq`'s cutoff, at the factors' width"
+        b = np.asarray(b)
+        return _solve(_g.svd_solve, *self, b.astype(np.result_type(self.u, np.complex64) if np.iscomplexobj(b) else self.u.dtype))
 
     def pseudoinverse(self):
         "The pseudoinverse, using these factors and `lstsq`'s cutoff"
@@ -29,6 +30,16 @@ class Lu(NamedTuple):
     factors: np.ndarray
     p: np.ndarray
 
+    @classmethod
+    def _from_stored(cls, factors, p):
+        "Build from the `lu` gufunc's outputs, whose factors arrive transposed because rustymath stores them column by column"
+        return cls(np.swapaxes(factors, -1, -2), p)
+
+    @property
+    def _stored(self):
+        "The factors, transposed back to rustymath's column-major layout, and the row positions, as the gufuncs take them"
+        return np.swapaxes(self.factors, -1, -2), self.p
+
     @property
     def l(self): return np.tril(self.factors, -1) + np.eye(self.factors.shape[-1], dtype=self.factors.dtype)
 
@@ -37,20 +48,21 @@ class Lu(NamedTuple):
 
     def solve(self, b):
         "Solve for `b` using these factors, without refactoring or applying a singular-value cutoff"
-        f, b = _inexact(self.factors, b)
-        return _solve(_g.lu_solve, f, self.p, b)
+        f, p = self._stored
+        f, b = _inexact(f, b)
+        return _solve(_g.lu_solve, f, p, b)
 
     def inverse(self):
         "The inverse from these factors, without refactoring"
-        return _g.lu_inverse(*self)
+        return _g.lu_inverse(*self._stored)
 
     def determinant(self):
         "The determinant from these factors"
-        return _g.lu_det(*self)
+        return _g.lu_det(*self._stored)
 
     def log_determinant(self):
         "The determinant's sign and natural log magnitude, from these factors"
-        return _g.lu_slogdet(*self)
+        return _g.lu_slogdet(*self._stored)
 
 class Echelon(NamedTuple):
     rows: np.ndarray
@@ -76,7 +88,7 @@ def _matrices(
     name, # The function's name
     gufunc, # The generalized ufunc, or the `(wide, tall)` pair that `_shaped` chooses between
     doc, # The function's docstring
-    result=None, # A type to build from the gufunc's outputs, such as `Lu`
+    result=None, # Builds the result from the gufunc's outputs, such as the type `Eigen`
 ):
     "A function of one stack of matrices that calls `gufunc`, with integers and Booleans as float64"
     def f(
@@ -145,7 +157,7 @@ def lstsq(
 pinv = _matrices('pinv', _g.pinv, "The pseudoinverse of each matrix in `a`. A square matrix with no negligible LU pivot gives its inverse through LU, with no cutoff. Any other gives the pseudoinverse with `lstsq`'s cutoff")
 det = _matrices('det', _g.det, "The determinant of each square matrix in `a`, from its LU factorization")
 slogdet = _matrices('slogdet', _g.slogdet, "The sign of each square matrix's determinant, and the natural logarithm of its magnitude, which can't overflow. A singular matrix gives sign 0 and logarithm -inf")
-lu = _matrices('lu', _g.lu, "Reusable packed LU factors of each square matrix in `a`, with partial pivoting. Row `i` of `f.l @ f.u` is row `f.p[i]` of `a`; `f.solve(b)` reuses the packed factors", Lu)
+lu = _matrices('lu', _g.lu, "Reusable packed LU factors of each square matrix in `a`, with partial pivoting. Row `i` of `f.l @ f.u` is row `f.p[i]` of `a`; `f.solve(b)` reuses the packed factors", Lu._from_stored)
 
 def permanent(a):
     "The permanent of each square matrix, by Ryser's exponential-time formula (fewer than 64 rows)"

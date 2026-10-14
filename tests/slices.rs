@@ -190,8 +190,8 @@ mod reductions {
 
     #[test]
     fn folds_match_item_by_item() {
-        // 101 items cover the running results, the remainder, and the scan's groups of four and its tail. Ten 2s keep the product
-        // within f16.
+        // 101 items cover the running results, the remainder, and the scans' groups of four or sixteen and their tails. Ten 2s keep
+        // the product within f16.
         let sums: Vec<i64> = (0..101).map(|i| (i * 7919) % 23 - 11).collect();
         let prods: Vec<i64> = (0..101).map(|i| if i % 10 == 3 { 2 } else if i % 3 == 0 { -1 } else { 1 }).collect();
         let at = |f: fn(i64) -> f64| (sums.iter().map(|&v| f(v)).collect::<Vec<_>>(), prods.iter().map(|&v| f(v)).collect::<Vec<_>>());
@@ -270,7 +270,7 @@ mod reductions {
     /// reductions, and an `i64` sum that wraps reports it, along a lane and down the rows.
     #[test]
     fn axes_match_lane_by_lane() {
-        for shape in [[3, 37, 5], [15, 37, 1], [4, 3, 2], [2, 0, 3], [2, 200, 1], [70, 3, 1], [5, 64, 1], [65, 1, 1]] {
+        for shape in [[3, 37, 5], [15, 37, 1], [4, 3, 2], [2, 0, 3], [2, 200, 1], [70, 3, 1], [5, 64, 1], [65, 1, 1], [3, 50, 2]] {
             let [outer, len, inner] = shape;
             let x: Vec<i64> = (0..outer * len * inner).map(|i| (i * 37 % 101) as i64 - 50).collect();
             let sums: Vec<i64> = lanes_of(&x, shape).iter().map(|l| l.iter().sum()).collect();

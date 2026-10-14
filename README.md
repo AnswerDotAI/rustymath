@@ -151,7 +151,7 @@ rm.exact.solve([[2, 1], [1, 2]], [Fraction(1, 2), 0]), rm.exact.binom(Fraction(3
 
 ### Tolerant comparison
 
-APL compares floats within a relative tolerance. Two floats are equal when their difference is at most the tolerance times the larger magnitude. With the usual tolerance, `0.1 + 0.2` equals `0.3`. `rm.equal`, `not_equal`, `less`, `less_equal`, `greater` and `greater_equal` compare this way. Their tolerance `ct` defaults to `rm.CT`, 1e-14. Pass `ct=0` to compare exactly:
+APL compares floats within a relative tolerance. Two floats are equal when their difference is less than the tolerance times the larger magnitude. With the usual tolerance, `0.1 + 0.2` equals `0.3`. `rm.equal`, `not_equal`, `less`, `less_equal`, `greater` and `greater_equal` compare this way. Their tolerance `ct` defaults to `rm.CT`, 1e-14. Pass `ct=0` to compare exactly:
 
 ``` python
 rm.equal(0.1 + 0.2, 0.3), rm.equal(0.1 + 0.2, 0.3, ct=0)
@@ -224,13 +224,13 @@ Use the slice forms of `Sin`, `Cos` and `Tan` for arrays. They reduce each item 
 
 `atan2(y, x)` and its object `Atan2` give the angle of the point (x, y), from -π to π. `y` comes first, as in `f64::atan2`.
 
-The complex slice forms of `Exp`, `Ln`, `Pow`, `Sin`, `Cos`, `Sinh` and `Cosh` vectorize too. Each one splits a chunk of complex items into their real and imaginary parts and computes the results from the real slice forms. It then redoes the rare items with the scalar complex function: items with a tiny or non-finite part, and `Pow`’s special cases. `Abs`, `Angle` and `Sqrt` keep their loop over items, which runs faster than a split for their short formulas. Other complex slice forms, such as `Lgamma`’s, compute one item at a time.
+The complex slice forms of `Exp`, `Ln`, `Pow`, `Sin`, `Cos`, `Sinh` and `Cosh` vectorize too. Each one splits a chunk of complex items into their real and imaginary parts and computes the results from the real slice forms. On macOS, the sines and cosines they need come from vForce, which computes both in one call. It then redoes the rare items with the scalar complex function: items with a tiny or non-finite part, and `Pow`’s special cases. `Abs`, `Angle` and `Sqrt` keep their loop over items, which runs faster than a split for their short formulas. Other complex slice forms, such as `Lgamma`’s, compute one item at a time.
 
 `divide(x, y)` divides complex numbers, inline in the caller’s loop, as the free functions do. Two real arguments divide as reals, so a real zero divisor gives ±∞ or NaN with an imaginary part of 0. Its formula’s \|y\|² overflows beyond about 1e154 at f64 and 1e19 at f32.
 
 ### Tolerant comparison
 
-The `tolerant` module has APL’s tolerant comparison: x equals y when \|x - y\| is at most the tolerance times the larger of \|x\| and \|y\|. Its objects, such as `Equal`, `Less`, `Floor`, `Residue` and `Gcd`, each hold a `Tolerance`. With `Tolerance::EXACT`, a slice form runs a loop of plain IEEE comparisons, chosen once per call.
+The `tolerant` module has APL’s tolerant comparison: x equals y when \|x - y\| is less than the tolerance times the larger of \|x\| and \|y\|. Its objects, such as `Equal`, `Less`, `Floor`, `Residue` and `Gcd`, each hold a `Tolerance`. With `Tolerance::EXACT`, a slice form runs a loop of plain IEEE comparisons, chosen once per call.
 
 ``` rust
 use rustymath::{tolerant::{Equal, Tolerance}, Arg, Binary};

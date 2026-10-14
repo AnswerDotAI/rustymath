@@ -5,34 +5,13 @@
 //! one. Back substitution gives the Schur form's eigenvectors. The accumulated transformations turn them into the matrix's own. Those
 //! transformations build up as the rows of Zᵀ, where each reflection reads contiguous memory.
 use super::*;
-use super::eigen::reflections;
 use num_complex::Complex;
-use std::ops::{Range, RangeInclusive};
+use std::ops::Range;
 
-/// The eigen decomposition of an `n`×`n` matrix: `a V = V diag(values)`, with complex values and vectors whose parts have type `T`.
-/// The eigenvalues come in the order the Schur form holds them. Column `j` of the `n`×`n` matrix `vectors` is an eigenvector for
-/// `values[j]`, of unit length. For a real matrix, a real eigenvalue has an imaginary part of exactly 0, and a real eigenvector. A complex
-/// pair comes as the eigenvalue with the positive imaginary part, then its conjugate. Their eigenvectors are conjugates too.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Eig<T> {
-    pub values: Vec<Complex<T>>,
-    pub vectors: Vec<Complex<T>>,
-}
-
-/// The eigen decomposition of the real or complex `n`×`n` matrix `a`. `None` where the iterations don't converge, as for a matrix
-/// holding NaN or an infinity.
-pub fn eig<T: Factor>(a: &[T], n: usize) -> Option<Eig<T::Real>> { T::matrix_eig(a, n, true) }
-
-/// The eigenvalues of the `n`×`n` matrix `a`, as `eig` gives them. Without eigenvectors to build, each iteration transforms only the
-/// rows and columns it still acts on.
-pub fn eigenvalues<T: Factor>(a: &[T], n: usize) -> Option<Vec<Complex<T::Real>>> { T::matrix_eig(a, n, false).map(|f| f.values) }
-
-/// `eig` for real or complex items `T`, with eigenvectors only where `vectors` is true, and an empty `vectors` otherwise. A matrix
-/// whose largest item lies outside the safe range first scales by a power of two. Its eigenvalues then scale back exactly.
-pub(super) fn eig_factor<T: Schur>(a: &[T], n: usize, vectors: bool) -> Option<Eig<T::Real>> {
-    assert_eq!(a.len(), n * n, "`a` must hold `n`×`n` items");
-    if a.iter().any(|x| !(x.re().is_finite() && x.im().is_finite())) { return None }
-    if n == 0 { return Some(Eig { values: Vec::new(), vectors: Vec::new() }) }
+/// The native eigen decomposition of the finite, nonempty real or complex `n`×`n` matrix `a`, with eigenvectors only where `vectors`
+/// is true. `Tiled::eig` uses it for complex matrices on every target, and for real ones off macOS. A matrix whose largest item lies
+/// outside the safe range first scales by a power of two. Its eigenvalues then scale back exactly.
+pub(in crate::linalg) fn native<T: Schur>(a: &[T], n: usize, vectors: bool) -> Option<Eig<T::Real>> {
     // The working copy's rows start `ld` items apart. The right reflections read down columns. With rows whose length is a multiple of
     // a large power of two, a column's items would all fall in the same few cache sets and keep evicting each other.
     let ld = n + 8;
@@ -46,13 +25,12 @@ pub(super) fn eig_factor<T: Schur>(a: &[T], n: usize, vectors: bool) -> Option<E
     let values = schur.iter().map(|&z| scale.map_or(z, |s| z / s)).collect();
     if !vectors { return Some(Eig { values, vectors: Vec::new() }) }
     let x = T::schur_vectors(&h, ld, n, &schur);
-    let mut v = vec![T::zero(); n * n];
-    T::add_product(&mut v, n, |i, p| zt[p * n + i], Rows(&x, n), [n; 3]);
+    let v = T::multiply(Matrix::rows(&zt, n).transpose(), Matrix::rows(&x, n), [n; 3]);
     Some(Eig { values, vectors: T::unit_vectors(&v, n, &schur) })
 }
 
-/// The steps of the general eigen problem that differ between real and complex matrices. `eig_factor` runs the steps they share.
-pub(super) trait Schur: Scalar + Tiled {
+/// The steps of the general eigen problem that differ between real and complex matrices. `native` runs the steps they share.
+pub(in crate::linalg) trait Schur: Tiled {
     /// Reduces the upper Hessenberg matrix `h`, whose rows start `ld` items apart, to Schur form, and gives the eigenvalues in the order
     /// the Schur form holds them. Where `wantt` is true, each iteration transforms the whole of `h`. Each transformation then also acts
     /// on the rows of `zt`, which hold Qᵀ on entry and Zᵀ on exit. Where `wantt` is false, `zt` is empty. Each iteration then transforms
@@ -66,7 +44,7 @@ pub(super) trait Schur: Scalar + Tiled {
 }
 
 /// A real matrix's Schur form is quasi-triangular. Each 2×2 diagonal block holds a complex conjugate pair of eigenvalues.
-impl<T: Native + Tiled> Schur for T {
+impl<T: Native + Tiled<Real = T>> Schur for T {
     fn schur(h: &mut [T], ld: usize, zt: &mut [T], n: usize, wantt: bool) -> Option<Vec<Complex<T>>> {
         let (wr, wi) = francis(h, ld, zt, n, wantt)?;
         Some(wr.into_iter().zip(wi).map(|(re, im)| Complex::new(re, im)).collect())
@@ -76,14 +54,14 @@ impl<T: Native + Tiled> Schur for T {
 }
 
 /// A complex matrix's Schur form is upper triangular, with the eigenvalues on its diagonal.
-impl<R: Native + Tiled> Schur for Complex<R> {
+impl<R: Native + Tiled<Real = R>> Schur for Complex<R> where Complex<R>: Tiled<Real = R> {
     fn schur(h: &mut [Self], ld: usize, zt: &mut [Self], n: usize, wantt: bool) -> Option<Vec<Self>> { single_shift(h, ld, zt, n, wantt) }
     fn schur_vectors(t: &[Self], ld: usize, n: usize, _: &[Self]) -> Vec<Self> { triangular_vectors(t, ld, n) }
     fn unit_vectors(v: &[Self], n: usize, _: &[Self]) -> Vec<Self> {
         let mut vectors = v.to_vec();
         for j in 0..n {
             let scale = unit(&(0..n).map(|i| v[i * n + j]).collect::<Vec<_>>());
-            for i in 0..n { vectors[i * n + j] = vectors[i * n + j] * scale }
+            for i in 0..n { vectors[i * n + j] = vectors[i * n + j].mul_real(scale) }
         }
         vectors
     }
@@ -275,7 +253,7 @@ impl<T: Native> Bulge<T> {
     /// Applies the reflection from the left to `columns` of the matrix `a`, whose rows hold `n` items. Each row's items are contiguous,
     /// and the loop over them vectorizes.
     #[inline(always)]
-    fn left(&self, a: &mut [T], n: usize, columns: RangeInclusive<usize>) {
+    fn left(&self, a: &mut [T], n: usize, columns: std::ops::RangeInclusive<usize>) {
         let (k, [v2, v3], [t1, t2, t3]) = (self.k, self.v, self.t);
         let (r0, rest) = a[k * n..(k + if self.three { 3 } else { 2 }) * n].split_at_mut(n);
         if self.three {

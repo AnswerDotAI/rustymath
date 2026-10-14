@@ -18,6 +18,7 @@ use crate::{
     Log1p, Logb, Pow, Sign, Sin, Sinh, Sqrt, Sqrt1mx2, Sqrt1px2, Sqrtx2m1, Tan, Tanh, Unary,
 };
 use num_complex::Complex;
+use std::mem::MaybeUninit;
 
 #[inline(always)]
 fn c<R>(re: R, im: R) -> Complex<R> { Complex::new(re, im) }
@@ -93,6 +94,34 @@ pub(crate) fn exp<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R> {
 fn cis_parts<R: Native>(y: R, cy: R, sy: R) -> Complex<R> {
     let (cy, sy) = quarter(y).unwrap_or((cy, sy));
     c(cy, if y == R::zero() { y } else { sy })
+}
+
+/// Sine and cosine over slices, computed together. vForce implements it on macOS, in `vforce.rs`.
+pub(crate) trait SinCos: Native {
+    /// Appends sin y to `sin` and cos y to `cos` for each item y of `ys`.
+    fn sin_cos_many(ys: &[Self], sin: &mut Vec<Self>, cos: &mut Vec<Self>);
+    /// Writes cos y + i sin y into `out` for each item y of `ys`. `parts` holds buffers that calls can reuse.
+    fn cis(ys: &[Self], out: &mut [MaybeUninit<Complex<Self>>], parts: &mut (Vec<Self>, Vec<Self>));
+}
+
+/// `SinCos` through the slice forms of `Sin` and `Cos`.
+#[cfg(not(accelerate))]
+impl<R: Native> SinCos for R
+where
+    Sin: Unary<R, Out = R>,
+    Cos: Unary<R, Out = R>,
+{
+    fn sin_cos_many(ys: &[R], sin: &mut Vec<R>, cos: &mut Vec<R>) {
+        Sin.many(Arg::Many(ys), ys.len(), sin);
+        Cos.many(Arg::Many(ys), ys.len(), cos);
+    }
+
+    fn cis(ys: &[R], out: &mut [MaybeUninit<Complex<R>>], (sin, cos): &mut (Vec<R>, Vec<R>)) {
+        sin.clear();
+        cos.clear();
+        R::sin_cos_many(ys, sin, cos);
+        for ((z, &cy), &sy) in out.iter_mut().zip(&*cos).zip(&*sin) { z.write(c(cy, sy)); }
+    }
 }
 
 /// z scaled up exactly by 2^(2p) where it is so small that its halves or its magnitude would lose bits, and p, or z itself and 0. p
@@ -410,16 +439,13 @@ fn finite<R: Native>(z: Complex<R>) -> bool { z.re.is_finite() & z.im.is_finite(
 
 /// e^z's parts, computed through real slice forms from slices of z's parts, as `exp` combines them. Where e^x overflows, or x is -∞
 /// beside an infinite or NaN y, a part is non-finite here, and the slice form gives the item to `exp`.
-fn exp_parts<R: Native>(x: &[R], y: &[R], re: &mut Vec<R>, im: &mut Vec<R>)
+fn exp_parts<R: SinCos>(x: &[R], y: &[R], re: &mut Vec<R>, im: &mut Vec<R>)
 where
     Exp: Unary<R, Out = R>,
-    Cos: Unary<R, Out = R>,
-    Sin: Unary<R, Out = R>,
 {
     let (n, mut e, mut cy, mut sy) = (x.len(), Vec::new(), Vec::new(), Vec::new());
     Exp.many(Arg::Many(x), n, &mut e);
-    Cos.many(Arg::Many(y), n, &mut cy);
-    Sin.many(Arg::Many(y), n, &mut sy);
+    R::sin_cos_many(y, &mut sy, &mut cy);
     re.extend(x.iter().zip(y).zip(e.iter().zip(&cy)).map(|((&x, &y), (&e, &c))| part(x, quarter(y).map_or(c, |q| q.0), e)));
     im.extend(x.iter().zip(y).zip(e.iter().zip(&sy)).map(|((&x, &y), (&e, &s))| {
         if y == R::zero() { y } else { part(x, quarter(y).map_or(s, |q| q.1), e) }
@@ -428,18 +454,15 @@ where
 
 /// sinh z's parts, or with `cosh` cosh z's, computed through real slice forms from slices of z's parts, as `sinh` and `cosh` combine
 /// them.
-fn hyperbolic_parts<R: Native>(x: &[R], y: &[R], cosh: bool, re: &mut Vec<R>, im: &mut Vec<R>)
+fn hyperbolic_parts<R: SinCos>(x: &[R], y: &[R], cosh: bool, re: &mut Vec<R>, im: &mut Vec<R>)
 where
     Sinh: Unary<R, Out = R>,
     Cosh: Unary<R, Out = R>,
-    Sin: Unary<R, Out = R>,
-    Cos: Unary<R, Out = R>,
 {
     let (n, mut sh, mut ch, mut s, mut c) = (x.len(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     Sinh.many(Arg::Many(x), n, &mut sh);
     Cosh.many(Arg::Many(x), n, &mut ch);
-    Sin.many(Arg::Many(y), n, &mut s);
-    Cos.many(Arg::Many(y), n, &mut c);
+    R::sin_cos_many(y, &mut s, &mut c);
     let zero = R::zero();
     if cosh {
         re.extend(ch.iter().zip(&c).map(|(&ch, &c)| ch * c));
@@ -613,15 +636,12 @@ where
 }
 
 /// `tanh` of `x + iy` through real slice forms, where `rough_tanh` is false.
-fn tanh_parts<R: Native>(x: &[R], y: &[R], re: &mut Vec<R>, im: &mut Vec<R>)
+fn tanh_parts<R: SinCos>(x: &[R], y: &[R], re: &mut Vec<R>, im: &mut Vec<R>)
 where
-    Sin: Unary<R, Out = R>,
-    Cos: Unary<R, Out = R>,
     Sinh: Unary<R, Out = R>,
 {
     let (n, one, mut sy, mut cy, mut s) = (x.len(), R::one(), Vec::new(), Vec::new(), Vec::new());
-    Sin.many(Arg::Many(y), n, &mut sy);
-    Cos.many(Arg::Many(y), n, &mut cy);
+    R::sin_cos_many(y, &mut sy, &mut cy);
     Sinh.many(Arg::Many(x), n, &mut s);
     let t: Vec<R> = sy.iter().zip(&cy).map(|(&sy, &cy)| sy / cy).collect();
     let b: Vec<R> = t.iter().map(|&t| t.mla::<{ crate::FUSED }>(t, one)).collect();
@@ -672,7 +692,7 @@ unary! {
 forms!(Exp at Complex<f32>, Complex<f64>: |_, [z]| exp::<_, { crate::FUSED }>(z),
     many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| exp_parts(x, y, re, im), |_, r| !finite(r), |[z]| exp::<_, { crate::FUSED }>(z)));
 /// e^(iz), the cis of z, as a function object, which is cos z + i sin z for a real z. It takes real and complex items. On reals, its
-/// slice form runs `Cos`'s and `Sin`'s.
+/// slice form runs vForce's `vvcosisin` on macOS, and `Cos`'s and `Sin`'s elsewhere.
 #[derive(Clone, Copy, Debug)]
 pub struct Cis;
 forms!(Cis at Complex<f32>, Complex<f64>: |_, [z]| exp::<_, { crate::FUSED }>(turned(z)),
@@ -680,7 +700,7 @@ forms!(Cis at Complex<f32>, Complex<f64>: |_, [z]| exp::<_, { crate::FUSED }>(tu
         |[z]| exp::<_, { crate::FUSED }>(turned(z))));
 forms!(Cis at f32 => Complex<f32>, f64 => Complex<f64>: |_, [y]| exp::<_, { crate::FUSED }>(c(0.0, y)),
     many |_, [y], n, out| {
-        let (mut fill, mut cos, mut sin, mut ok) = (Vec::new(), Vec::new(), Vec::new(), true);
+        let (mut fill, mut parts, mut ok) = (Vec::new(), (Vec::new(), Vec::new()), true);
         for (from, slots) in (0..n).step_by(crate::CHUNK).zip(out.chunks_mut(crate::CHUNK)) {
             let m = slots.len();
             let ys = match y.part(from, m) {
@@ -691,12 +711,11 @@ forms!(Cis at f32 => Complex<f32>, f64 => Complex<f64>: |_, [y]| exp::<_, { crat
                 }
                 Arg::Many(ys) => ys,
             };
-            cos.clear();
-            sin.clear();
-            ok &= Cos.many(Arg::Many(ys), m, &mut cos) & Sin.many(Arg::Many(ys), m, &mut sin);
-            // A zero y keeps its sign through `Sin`. Only quarter turns, which are rare, need `cis_parts`.
-            for ((z, &cy), &sy) in slots.iter_mut().zip(&cos).zip(&sin) { z.write(c(cy, sy)); }
-            if ys.iter().fold(false, |any, &y| any | turns(y).1) {
+            SinCos::cis(ys, slots, &mut parts);
+            // An infinite y fails, as `Cos` and `Sin` judge it. Only quarter turns, zero among them, need `cis_parts`. They're rare.
+            let (infinite, turned) = ys.iter().fold((false, false), |(i, t), &y| (i | y.is_infinite(), t | turns(y).1));
+            ok &= !infinite;
+            if turned {
                 for (z, &y) in crate::slice::written(slots).iter_mut().zip(ys) { if turns(y).1 { *z = cis_parts(y, z.re, z.im) } }
             }
         }

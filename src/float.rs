@@ -33,7 +33,7 @@ pub trait Float: num_traits::Float + sealed::Sealed + sealed::Item {
 }
 
 /// A float type that rustymath's algorithms run in: `f32` or `f64`.
-pub trait Native: Float<Working = Self> + sealed::Core + sealed::Extremes {
+pub trait Native: Float<Working = Self> + sealed::Core + sealed::Folds {
     /// `+` that may be reordered with other algebraic operations. A sum of them vectorizes.
     fn algebraic_add(self, other: Self) -> Self;
     /// `×` that may be reordered with other algebraic operations.
@@ -107,14 +107,15 @@ pub(crate) mod sealed {
         /// The lesser of `self` and `y`, as `maximum` gives the greater.
         fn minimum(self, y: Self) -> Self;
     }
-    /// The folds and scans of floats by maximum and minimum. The defaults' fold loops vectorize. Each step passes the running result
-    /// as `Core::maximum`'s or `Core::minimum`'s `y`, which a NaN item leaves unchanged. `reduce.rs` overrides them where a target has an
-    /// instruction that does better.
-    pub trait Extremes: Core + num_traits::Float {
+    /// The folds and scans of floats by maximum and minimum, and their running sums. The defaults' fold loops vectorize. Each step of
+    /// a maximum or minimum passes the running result as `Core::maximum`'s or `Core::minimum`'s `y`, which a NaN item leaves unchanged.
+    /// The default running sum is `grouped`'s. `reduce.rs` overrides them where a target has instructions that do better.
+    pub trait Folds: Core + num_traits::Float {
         fn fold_max(x: &[Self]) -> Self { crate::reduce::folded(x, Self::neg_infinity(), |t, v| Self::maximum(v, t), Self::maximum) }
         fn fold_min(x: &[Self]) -> Self { crate::reduce::folded(x, Self::infinity(), |t, v| Self::minimum(v, t), Self::minimum) }
         fn scan_max(x: &[Self], start: Option<Self>, out: &mut Vec<Self>) { crate::reduce::records(x, start, out, |t, v| Self::maximum(v, t), crate::reduce::below) }
         fn scan_min(x: &[Self], start: Option<Self>, out: &mut Vec<Self>) { crate::reduce::records(x, start, out, |t, v| Self::minimum(v, t), crate::reduce::above) }
+        fn scan_sum(x: &[Self], start: Option<Self>, out: &mut Vec<Self>) { crate::reduce::grouped(x, start, out, |v| v, |a, b| a + b, |t| t) }
     }
 }
 

@@ -19,6 +19,12 @@ repository = "https://github.com/AnswerDotAI/rustymath"
 name = "rustymath"
 test = false
 
+[features]
+default = ["native"]
+# Compiles rustymath's own linear algebra into macOS builds too, beside Accelerate, so `RUSTYMATH_NATIVE=1` can select it at run time.
+# Other targets always compile it. The Mac release builds turn it off with `--no-default-features`.
+native = []
+
 [dependencies]
 half = { version = ">=2.7.1, <3", features = ["num-traits"] }
 hashbrown = ">=0.15, <1"

@@ -21,6 +21,9 @@ pub fn thread_setting() -> usize { THREADS.get() }
 /// How many threads the calls made on this thread split their work across.
 pub fn threads() -> usize { requested().map_or(1, |n| if n == 0 { pool::get(0).current_num_threads() } else { n }) }
 
+/// Whether calls made on this thread run serially: after `set_threads(1)`, or on a pool's worker thread.
+pub(crate) fn serial() -> bool { requested().is_none() }
+
 /// The pool that calls made on this thread split across, as its number of threads, 0 for the default. `None` where they run on this
 /// thread.
 fn requested() -> Option<usize> {
@@ -78,7 +81,7 @@ pub const PIECE_TIME: Duration = Duration::from_micros(30);
 #[inline(never)]
 pub fn ranges(n: usize, unit: usize, run: &(dyn Fn(Range<usize>) -> bool + Sync)) -> bool {
     assert!(unit > 0, "a work unit must contain at least one item");
-    if n <= unit || requested().is_none() { return run(0..n) }
+    if n <= unit || serial() { return run(0..n) }
     let start = Instant::now();
     let ok = run(0..unit);
     let units = (n - unit).div_ceil(unit);

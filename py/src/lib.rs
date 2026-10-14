@@ -267,8 +267,7 @@ unsafe fn write<O: Code>(out: &[O], p: *mut c_char, step: npy_intp, start: usize
 /// Whether different items write disjoint bytes and cannot change any other item's inputs. Exact in-place mappings are safe:
 /// each chunk finishes reading its inputs before writing its results. Any other input/output overlap stays serial.
 fn independent<E: Code, O: Code>(n: usize, x: &[*mut c_char], xs: &[npy_intp], o: *mut c_char, os: npy_intp) -> bool {
-    if os.unsigned_abs() < size_of::<O>() { return false }
-    let Some(out) = parallel::span(o as usize, size_of::<O>(), &[(n, os)]) else { return false };
+    let Some(out) = parallel::separate(o as usize, size_of::<O>(), &[], n, os) else { return false };
     x.iter().zip(xs).all(|(&p, &step)| {
         (p == o && step == os && size_of::<E>() == size_of::<O>()) ||
             parallel::span(p as usize, size_of::<E>(), &[(n, step)]).is_some_and(|s| !parallel::overlaps(&s, &out))

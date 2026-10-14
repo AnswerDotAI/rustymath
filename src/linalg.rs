@@ -12,16 +12,54 @@
 //! result NaN. On x86-64 a NaN term is skipped. Targets without these vectors run the plain kernels.
 //!
 //! A product large enough splits its rows across the threads that [`crate::parallel::set_threads`] sets.
+//! On macOS, Accelerate computes real and complex plus-times products instead. `Tiled` also sends the decompositions' triangular
+//! solves, SVDs and Hermitian eigen decompositions to it, and the general eigen decompositions of real matrices from
+//! `accelerate::GEEV_FROM` rows. macOS builds with the `native` feature also compile rustymath's own kernels, and `RUSTYMATH_NATIVE=1`
+//! selects them for the whole process.
 //!
 //! The private module `factor` holds decompositions of real and complex matrices, whose blocked updates run on these loops. This module
 //! re-exports its public items, and [`Scalar`], the trait of the item types they take. [`transpose_into`] transposes a matrix through 8×8
 //! tiles.
-use crate::{convert, float::{sealed::Core, FUSED}, parallel, slice, Float, Native};
+use crate::{convert, float::{sealed::Core, FUSED}, parallel, slice, Float};
 use num_complex::Complex;
-use std::mem::MaybeUninit;
+use num_traits::{One, Zero};
+use std::{mem::MaybeUninit, sync::LazyLock};
 
 mod factor;
 mod scalar;
+#[cfg(accelerate)]
+mod accelerate;
+// The platform's own BLAS and LAPACK, which every `Tiled` type implements: Accelerate on macOS, and none elsewhere.
+#[cfg(accelerate)]
+pub(crate) use accelerate::Accelerated as Vendor;
+#[cfg(not(accelerate))]
+pub(crate) trait Vendor {}
+#[cfg(not(accelerate))]
+impl<T> Vendor for T {}
+
+/// Whether this process selects rustymath's own kernels where Accelerate is also compiled in: in macOS builds with the `native`
+/// feature, when `RUSTYMATH_NATIVE=1`. It's read once.
+fn switched() -> bool {
+    static NATIVE: LazyLock<bool> = LazyLock::new(|| std::env::var_os("RUSTYMATH_NATIVE").is_some_and(|v| v == "1"));
+    cfg!(all(accelerate, native)) && *NATIVE
+}
+
+/// Whether Accelerate serves this process's products, triangular solves and decompositions.
+pub(crate) fn accelerated() -> bool { cfg!(accelerate) && !switched() }
+
+/// `$vendor` where Accelerate serves this process, and `$native` where rustymath's own kernels do. Each compiles only where its kernels
+/// do.
+macro_rules! dispatch {
+    ($vendor:expr, $native:expr) => {{
+        #[cfg(all(accelerate, native))]
+        let r = if accelerated() { $vendor } else { $native };
+        #[cfg(all(accelerate, not(native)))]
+        let r = $vendor;
+        #[cfg(not(accelerate))]
+        let r = $native;
+        r
+    }};
+}
 pub mod exact;
 pub use factor::*;
 pub use scalar::Scalar;
@@ -78,27 +116,35 @@ pub trait Inner<T> {
     fn inner_into(&self, a: &[T], b: &[T], size: [usize; 3], out: &mut [Self::Out]) { out.copy_from_slice(&self.inner(a, b, size)) }
 }
 
-/// `+.×`, the matrix product, at `i64`, `f32` and `f64`, and complex numbers with parts of either type. Each float step is a fused
-/// multiply-add where the target has one. A complex product sums three real products of the parts, as the 3M method does. Its real
-/// parts are as accurate as four real products make them. Its normwise error is about 4 units of roundoff, against about 2.5 for four
-/// real products. An imaginary part's error scales with the size of the whole product. An imaginary part a millionth the size of its
-/// real part keeps about 10 of f64's 16 digits and about 1 of f32's 7. A result whose 3M imaginary part isn't finite takes four real
-/// products instead.
+/// `+.×`, the matrix product, at `i64`, `f32` and `f64`, and complex numbers with parts of either type. Native float steps use fused
+/// multiply-add where the target has one; Accelerate computes them on macOS.
+/// Nonfinite complex results need not match scalar arithmetic. Native complex products sum three real products of the parts, as the
+/// 3M method does. Their real parts are as accurate as four real products make them. Its normwise error is about 4 units of roundoff,
+/// against about 2.5 for four real products. An imaginary part's error scales with the size of the whole product. An imaginary part a
+/// millionth the size of its real part keeps about 10 of f64's 16 digits and about 1 of f32's 7. A result whose 3M imaginary part isn't
+/// finite takes four real products instead.
+#[derive(Default)]
 pub struct PlusTimes;
 /// `⌈.+`, the max-plus product of longest-path problems, at `i64`, `f32` and `f64`. On AArch64 a NaN term makes its result NaN.
 /// Other targets skip NaN terms.
+#[derive(Default)]
 pub struct MaxPlus;
 /// `⌊.+`, the min-plus product of shortest-path problems, at `i64`, `f32` and `f64`. Its minimum treats NaN as `MaxPlus`'s maximum does.
+#[derive(Default)]
 pub struct MinPlus;
 /// `∨.∧` on Booleans: whether some `p` has both `a[i][p]` and `b[p][j]`.
+#[derive(Default)]
 pub struct OrAnd;
 /// `∧.∨` on Booleans: whether every `p` has `a[i][p]` or `b[p][j]`.
+#[derive(Default)]
 pub struct AndOr;
 /// `+.=`, at `i16`, `i32`, `i64`, `f32` and `f64`: the number of `p` where `a[i][p]` equals `b[p][j]`. The count has the width of the
 /// items, as `i16`, `i32` or `i64`, so an `i16` count needs `k` below 2^15 and an `i32` count below 2^31. Floats compare exactly, so NaN
 /// equals nothing.
+#[derive(Default)]
 pub struct PlusEqual;
 /// `+.≠`, at `i16`, `i32`, `i64`, `f32` and `f64`: the number of `p` where `a[i][p]` differs from `b[p][j]`, with `+.=`'s count type.
+#[derive(Default)]
 pub struct PlusNotEqual;
 
 /// The scalar operations of a pair at item type `T`.
@@ -257,7 +303,9 @@ pub const NC: usize = 2048;
 #[cfg(target_arch = "aarch64")]
 mod tiles {
     pub(super) const BYTES: usize = 16;
+    #[cfg(native)]
     pub(super) const TIMES64: [usize; 2] = [8, 4];
+    #[cfg(native)]
     pub(super) const TIMES32: [usize; 2] = [8, 8];
     pub(super) const COMPARES64: [usize; 2] = [6, 8];
     pub(super) const COMPARES32: [usize; 2] = [6, 16];
@@ -266,7 +314,9 @@ mod tiles {
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
 mod tiles {
     pub(super) const BYTES: usize = 32;
+    #[cfg(native)]
     pub(super) const TIMES64: [usize; 2] = [6, 8];
+    #[cfg(native)]
     pub(super) const TIMES32: [usize; 2] = [6, 16];
     pub(super) const COMPARES64: [usize; 2] = [4, 8];
     pub(super) const COMPARES32: [usize; 2] = [4, 16];
@@ -331,11 +381,9 @@ fn tiled_into<T: Copy + Default + Send + Sync, P: Pair<T>, const MR: usize, cons
 ) {
     assert!(a.len() == m * k && b.len() == k * n && c.len() == m * n, "`a` must hold `m`×`k` items, `b` `k`×`n` and `c` `m`×`n`");
     if k == 0 { c.fill(P::UNIT) }
-    product::<T, P, MR, NR>(c, n, |i, p| a[i * k + p], Rows(b, n), [m, k, n], true, Part::Whole, kernel);
+    product::<T, P, MR, NR>(c, n, |i, p| a[i * k + p], |p, j, out| row_run(b, n, p, j, out), [m, k, n], true, Part::Whole, kernel);
 }
 inner! {
-    PlusTimes at f64 => f64: tiles::TIMES64, times64;
-    PlusTimes at f32 => f32: tiles::TIMES32, times32;
     MaxPlus at f64 => f64: tiles::COMPARES64, max_plus64;
     MaxPlus at f32 => f32: tiles::COMPARES32, max_plus32;
     MinPlus at f64 => f64: tiles::COMPARES64, min_plus64;
@@ -431,34 +479,133 @@ fn exactly<F: Float, P: Inner<F, Out = F>>(pair: &P, a: &[i64], b: &[i64], size:
     pair.inner(&floats(a), &floats(b), size).into_iter().map(|x| convert::shifted(x.wide())).collect()
 }
 
-/// A matrix whose rows start `ld` items apart in a slice, as `Rows(items, ld)`. `product` copies each run of a row from one checked
-/// slice.
-pub(crate) struct Rows<'a, T>(pub &'a [T], pub usize);
-impl<T: Copy> Rows<'_, T> {
-    /// Writes `out.len()` items of row `p` into `out`, from column `j` on.
+/// A strided matrix borrowed in its stored, transposed, conjugated or adjoint orientation.
+#[derive(Clone, Copy)]
+pub(crate) struct Matrix<'a, T> { pub data: &'a [T], pub ld: usize, pub op: Op }
+#[derive(Clone, Copy)]
+pub(crate) enum Op { Normal, Transpose, Adjoint, Conjugate }
+#[derive(Clone, Copy)]
+pub(crate) enum Side { Left, Right }
+/// The stored triangle, before applying the matrix view's transpose or adjoint.
+#[derive(Clone, Copy)]
+pub(crate) enum Triangle { Lower, UnitUpper }
+impl Op {
     #[inline(always)]
-    fn run(&self, p: usize, j: usize, out: &mut [MaybeUninit<T>]) {
-        let items = &self.0[p * self.1 + j..][..out.len()];
-        for l in 0..out.len() { out[l] = MaybeUninit::new(items[l]) }
+    fn transposed(self) -> bool { matches!(self, Self::Transpose | Self::Adjoint) }
+}
+impl<'a, T: Copy> Matrix<'a, T> {
+    pub fn rows(data: &'a [T], ld: usize) -> Self { Self { data, ld, op: Op::Normal } }
+    pub fn transpose(self) -> Self {
+        Self { op: match self.op { Op::Normal => Op::Transpose, Op::Transpose => Op::Normal, Op::Adjoint => Op::Conjugate, Op::Conjugate => Op::Adjoint }, ..self }
     }
+    /// Starts at a row and column in the logical orientation.
+    #[cfg(native)]
+    pub fn offset(self, row: usize, col: usize) -> Self {
+        let at = if self.op.transposed() { col * self.ld + row } else { row * self.ld + col };
+        Self { data: &self.data[at..], ..self }
+    }
+    /// Checks the stored extent once, before any foreign call.
+    fn check(self, mut rows: usize, mut cols: usize) {
+        if self.op.transposed() { std::mem::swap(&mut rows, &mut cols) }
+        if rows == 0 || cols == 0 { return }
+        let end = (rows - 1).checked_mul(self.ld).and_then(|n| n.checked_add(cols));
+        assert!(self.ld >= cols && end.is_some_and(|n| n <= self.data.len()), "matrix view must hold its rows and columns");
+    }
+}
+impl<T: Scalar> Matrix<'_, T> {
+    pub fn conjugate(self) -> Self {
+        // Conjugation is an identity for real scalars; don't make their BLAS views more restrictive.
+        if size_of::<T>() == size_of::<T::Real>() { return self }
+        Self { op: match self.op { Op::Normal => Op::Conjugate, Op::Transpose => Op::Adjoint, Op::Adjoint => Op::Transpose, Op::Conjugate => Op::Normal }, ..self }
+    }
+    pub fn adjoint(self) -> Self { self.transpose().conjugate() }
+    #[inline(always)]
+    pub fn at(self, i: usize, j: usize) -> T {
+        let x = self.data[if self.op.transposed() { j * self.ld + i } else { i * self.ld + j }];
+        if matches!(self.op, Op::Adjoint | Op::Conjugate) { x.conj() } else { x }
+    }
+    #[cfg(native)]
+    #[inline(always)]
+    fn run(self, p: usize, j: usize, out: &mut [MaybeUninit<T>]) {
+        if matches!(self.op, Op::Normal) { row_run(self.data, self.ld, p, j, out) }
+        else { for (l, slot) in out.iter_mut().enumerate() { *slot = MaybeUninit::new(self.at(p, j + l)) } }
+    }
+}
+/// Copies a contiguous run without repeating its bounds check for each packed item.
+#[inline(always)]
+fn row_run<T: Copy>(data: &[T], ld: usize, p: usize, j: usize, out: &mut [MaybeUninit<T>]) {
+    let items = &data[p * ld + j..][..out.len()];
+    for l in 0..out.len() { out[l] = MaybeUninit::new(items[l]) }
 }
 /// Item types whose matrix products run on the tiled `+.×` kernels: `f32` and `f64`, and complex numbers with parts of either type.
 /// The decompositions in `factor` build on them.
-pub(crate) trait Tiled: Copy + Default + Send + Sync {
-    /// `c += a b` for the items of `c` in `part`, where `c` is an `m`×`n` matrix whose rows start `ldc` items apart, `a(i, p)` gives the
-    /// items of the `m`×`k` matrix `a`, and `b` holds the `k`×`n` matrix `b`. `size` is `[m, k, n]`. Items outside `part` change too,
-    /// where their tile reaches the diagonal.
-    fn add_part_product(c: &mut [Self], ldc: usize, a: impl Fn(usize, usize) -> Self + Sync, b: Rows<'_, Self>, size: [usize; 3], part: Part);
-    /// `add_part_product` for all of `c`.
+pub(crate) trait Tiled: Scalar + Default + Vendor {
+    /// The row-major matrix product, allocated once through the same GEMM operation as updates.
     #[inline]
-    fn add_product(c: &mut [Self], ldc: usize, a: impl Fn(usize, usize) -> Self + Sync, b: Rows<'_, Self>, size: [usize; 3]) {
-        Self::add_part_product(c, ldc, a, b, size, Part::Whole)
+    fn multiply(a: Matrix<'_, Self>, b: Matrix<'_, Self>, size: [usize; 3]) -> Vec<Self> {
+        let mut c = filled(size[0] * size[2], Self::zero());
+        Self::gemm(&mut c, size[2], a, b, size, Self::one(), Self::zero());
+        c
     }
-    /// `add_part_product` for the items of `c` on and below its diagonal.
+    /// `c = alpha a b + beta c`, with `size = [m, k, n]`. Dispatch precedes native packing and row splitting.
     #[inline]
-    fn add_lower_product(c: &mut [Self], ldc: usize, a: impl Fn(usize, usize) -> Self + Sync, b: Rows<'_, Self>, size: [usize; 3]) {
-        Self::add_part_product(c, ldc, a, b, size, Part::Lower)
+    fn gemm(c: &mut [Self], ldc: usize, a: Matrix<'_, Self>, b: Matrix<'_, Self>, size: [usize; 3], alpha: Self, beta: Self) {
+        gemm(c, ldc, a, b, size, alpha, beta, Part::Whole)
     }
+    /// The lower triangle of `c = alpha x xᴴ + beta c`, for `x` of size `[n, k]`. Native diagonal tiles may also change upper items.
+    #[inline]
+    fn gram(c: &mut [Self], ldc: usize, x: Matrix<'_, Self>, [n, k]: [usize; 2], alpha: Self::Real, beta: Self::Real) {
+        gemm(c, ldc, x, x.adjoint(), [n, k, n], Self::from_real(alpha), Self::from_real(beta), Part::Lower)
+    }
+    /// Solves `a x = b` or `x a = b` in place, with `triangle` describing the stored square matrix `a`.
+    fn triangular(x: &mut [Self], ldx: usize, a: Matrix<'_, Self>, [m, n]: [usize; 2], side: Side, triangle: Triangle) {
+        let order = match side { Side::Left => m, Side::Right => n };
+        a.check(order, order);
+        Matrix::rows(x, ldx).check(m, n);
+        if m == 0 || n == 0 { return }
+        dispatch!(accelerate::triangular(x, ldx, a, [m, n], side, triangle), factor::triangular_native(x, ldx, a, [m, n], side, triangle))
+    }
+    /// Native packing also serves computed real parts inside the complex 3M implementation.
+    #[cfg(native)]
+    fn native_product(c: &mut [Self], ldc: usize, a: impl Fn(usize, usize) -> Self + Sync, b: Matrix<'_, Self>, size: [usize; 3], start: bool, part: Part);
+    /// The thin SVD of the finite, nonempty `m`×`n` matrix `a` as `(U, s, V)`, with its singular vectors only where `vectors` is true, or
+    /// `None` where it doesn't converge.
+    fn svd(a: &[Self], size: [usize; 2], vectors: bool) -> Option<(Vec<Self>, Vec<Self::Real>, Vec<Self>)>;
+    /// The eigen decomposition of the nonempty Hermitian `n`×`n` matrix whose finite lower triangle `a` holds, with its eigenvectors only
+    /// where `vectors` is true, or `None` where it doesn't converge.
+    fn eigh(a: &[Self], n: usize, vectors: bool) -> Option<Eigh<Self>>;
+    /// The eigen decomposition of the finite, nonempty `n`×`n` matrix `a`, with its eigenvectors only where `vectors` is true, or `None`
+    /// where it doesn't converge.
+    fn eig(a: &[Self], n: usize, vectors: bool) -> Option<Eig<Self::Real>>;
+}
+
+fn gemm<T: Tiled>(c: &mut [T], ldc: usize, a: Matrix<'_, T>, b: Matrix<'_, T>, [m, k, n]: [usize; 3], alpha: T, beta: T, part: Part) {
+    a.check(m, k);
+    b.check(k, n);
+    Matrix::rows(c, ldc).check(m, n);
+    if m == 0 || n == 0 { return }
+    if k == 0 || alpha == T::zero() { return scale(c, ldc, [m, n], beta, part) }
+    dispatch!(accelerate::product(c, ldc, a, b, [m, k, n], alpha, beta, part), native_gemm(c, ldc, a, b, [m, k, n], alpha, beta, part))
+}
+
+/// `c = beta c` for the items of `c` in `part`, where `c` is an `m`×`n` matrix whose rows start `ldc` items apart. A zero `beta` writes
+/// zeros, whatever `c` held.
+fn scale<T: Tiled>(c: &mut [T], ldc: usize, [m, n]: [usize; 2], beta: T, part: Part) {
+    if beta == T::one() { return }
+    for i in 0..m {
+        for j in part.columns(i, n) {
+            let x = &mut c[i * ldc + j];
+            *x = if beta == T::zero() { T::zero() } else { beta * *x };
+        }
+    }
+}
+
+/// `gemm` on rustymath's own packed kernels, for a nonzero `k` and `alpha`.
+#[cfg(native)]
+fn native_gemm<T: Tiled>(c: &mut [T], ldc: usize, a: Matrix<'_, T>, b: Matrix<'_, T>, [m, k, n]: [usize; 3], alpha: T, beta: T, part: Part) {
+    let start = beta == T::zero();
+    if !start { scale(c, ldc, [m, n], beta, part) }
+    T::native_product(c, ldc, |i, p| if alpha == T::one() { a.at(i, p) } else { alpha * a.at(i, p) }, b, [m, k, n], start, part)
 }
 /// The items of a product's result that it must fold: all of them, or those on and below its diagonal.
 #[derive(Clone, Copy)]
@@ -471,75 +618,93 @@ impl Part {
     }
 }
 macro_rules! tiled {
-    ($($t:ty: $tile:ident, $kernel:ident;)+) => {$(
+    (@real $t:ty, $tile:ident, $kernel:ident; $c:ident, $ldc:ident, $a:ident, $b:ident, $size:ident, $start:ident, $part:ident) => {{
+        const MR: usize = tiles::$tile[0];
+        const NR: usize = tiles::$tile[1];
+        product::<$t, PlusTimes, MR, NR>($c, $ldc, $a, |p, j, out| $b.run(p, j, out), $size, $start, $part, $kernel::<MR, NR, { NR * size_of::<$t>() / tiles::BYTES }>)
+    }};
+    (@complex $r:ty; $c:ident, $ldc:ident, $a:ident, $b:ident, $size:ident, $start:ident, $part:ident) => {
+        complex_product::<$r>($c, $ldc, $a, $b, $size, $start, $part)
+    };
+    (@eig real; $a:ident, $n:ident, $vectors:ident) => {{
+        #[cfg(accelerate)]
+        if $n >= accelerate::GEEV_FROM && accelerated() { return accelerate::eig($a, $n, $vectors) }
+        factor::general::native($a, $n, $vectors)
+    }};
+    (@eig complex; $a:ident, $n:ident, $vectors:ident) => { factor::general::native($a, $n, $vectors) };
+    ($($t:ty: $kind:ident($($args:tt)*);)+) => {$(
         impl Tiled for $t {
+            #[cfg(native)]
             #[inline]
-            fn add_part_product(c: &mut [$t], ldc: usize, a: impl Fn(usize, usize) -> $t + Sync, b: Rows<'_, $t>, size: [usize; 3], part: Part) {
-                const MR: usize = tiles::$tile[0];
-                const NR: usize = tiles::$tile[1];
-                product::<$t, PlusTimes, MR, NR>(c, ldc, a, b, size, false, part, $kernel::<MR, NR, { NR * size_of::<$t>() / tiles::BYTES }>)
+            fn native_product(c: &mut [$t], ldc: usize, a: impl Fn(usize, usize) -> $t + Sync, b: Matrix<'_, $t>, size: [usize; 3], start: bool, part: Part) {
+                tiled!(@$kind $($args)*; c, ldc, a, b, size, start, part)
+            }
+            fn svd(a: &[$t], size: [usize; 2], vectors: bool) -> Option<(Vec<$t>, Vec<<$t as Scalar>::Real>, Vec<$t>)> {
+                dispatch!(accelerate::svd(a, size, vectors), factor::svd::native(a, size, vectors))
+            }
+            fn eigh(a: &[$t], n: usize, vectors: bool) -> Option<Eigh<$t>> {
+                dispatch!(accelerate::eigh(a, n, vectors), factor::eigen::native(a, n, vectors))
+            }
+            fn eig(a: &[$t], n: usize, vectors: bool) -> Option<Eig<<$t as Scalar>::Real>> {
+                tiled!(@eig $kind; a, n, vectors)
+            }
+        }
+        impl Inner<$t> for PlusTimes {
+            type Out = $t;
+            fn inner(&self, a: &[$t], b: &[$t], [m, k, n]: [usize; 3]) -> Vec<$t> {
+                assert!(a.len() == m * k && b.len() == k * n, "`a` must hold `m`×`k` items and `b` `k`×`n`");
+                <$t>::multiply(Matrix::rows(a, k), Matrix::rows(b, n), [m, k, n])
+            }
+            fn inner_into(&self, a: &[$t], b: &[$t], [m, k, n]: [usize; 3], c: &mut [$t]) {
+                assert!(a.len() == m * k && b.len() == k * n && c.len() == m * n, "`a` must hold `m`×`k` items, `b` `k`×`n` and `c` `m`×`n`");
+                <$t>::gemm(c, n, Matrix::rows(a, k), Matrix::rows(b, n), [m, k, n], <$t>::one(), <$t>::zero())
             }
         }
     )+};
 }
 tiled! {
-    f64: TIMES64, times64;
-    f32: TIMES32, times32;
+    f32: real(f32, TIMES32, times32);
+    f64: real(f64, TIMES64, times64);
+    Complex<f32>: complex(f32);
+    Complex<f64>: complex(f64);
 }
-impl<R: Native + Tiled> Tiled for Complex<R> {
-    /// Sums real products of the parts into `c`, each on the real kernels. With `p = aᵣ bᵣ`, `q = aᵢ bᵢ` and `s = (aᵣ + aᵢ)(bᵣ + bᵢ)`,
-    /// the real part of `c` gains `p - q` and the imaginary part gains `s - p - q`, as the 3M method forms them from three real products.
-    /// Where a result's `s - p - q` isn't finite, through an overflow or a non-finite item, its imaginary part gains `aᵣ bᵢ + aᵢ bᵣ`
-    /// instead, from two more real products, as four real products give it. Only the items in `part` gain the sums.
-    fn add_part_product(c: &mut [Self], ldc: usize, a: impl Fn(usize, usize) -> Self + Sync, b: Rows<'_, Self>, size: [usize; 3], part: Part) {
-        let [m, k, n] = size;
-        if m == 0 || k == 0 || n == 0 { return }
-        let (mut p, mut q, mut s) = (filled(m * n, R::zero()), filled(m * n, R::zero()), filled(m * n, R::zero()));
-        let (mut br, mut bi, mut bs) = (filled(k * n, R::zero()), filled(k * n, R::zero()), filled(k * n, R::zero()));
-        for l in 0..k {
-            let (row, re, im, sum) = (&b.0[l * b.1..][..n], &mut br[l * n..][..n], &mut bi[l * n..][..n], &mut bs[l * n..][..n]);
-            for j in 0..n { (re[j], im[j], sum[j]) = (row[j].re, row[j].im, row[j].re + row[j].im) }
+/// Native complex 3M: `p = aᵣ bᵣ`, `q = aᵢ bᵢ`, `s = (aᵣ + aᵢ)(bᵣ + bᵢ)` gives real `p-q` and imaginary `s-p-q`.
+/// Nonfinite imaginary parts use the two ordinary cross-products instead.
+#[cfg(native)]
+fn complex_product<R: crate::Native + Tiled>(c: &mut [Complex<R>], ldc: usize, a: impl Fn(usize, usize) -> Complex<R> + Sync, b: Matrix<'_, Complex<R>>, size: [usize; 3], start: bool, part: Part) {
+    let [m, k, n] = size;
+    if m == 0 || k == 0 || n == 0 { return }
+    let (mut p, mut q, mut s) = (filled(m * n, R::zero()), filled(m * n, R::zero()), filled(m * n, R::zero()));
+    let (mut br, mut bi, mut bs) = (filled(k * n, R::zero()), filled(k * n, R::zero()), filled(k * n, R::zero()));
+    for l in 0..k {
+        let (re, im, sum) = (&mut br[l * n..][..n], &mut bi[l * n..][..n], &mut bs[l * n..][..n]);
+        for j in 0..n { let x = b.at(l, j); (re[j], im[j], sum[j]) = (x.re, x.im, x.re + x.im) }
+    }
+    R::native_product(&mut p, n, |i, l| a(i, l).re, Matrix::rows(&br, n), size, true, part);
+    R::native_product(&mut q, n, |i, l| a(i, l).im, Matrix::rows(&bi, n), size, true, part);
+    R::native_product(&mut s, n, |i, l| { let x = a(i, l); x.re + x.im }, Matrix::rows(&bs, n), size, true, part);
+    let mut finite = true;
+    for i in 0..m {
+        for j in part.columns(i, n) {
+            let (t, x) = (i * n + j, &mut c[i * ldc + j]);
+            let im = s[t] - p[t] - q[t];
+            finite &= im.is_finite();
+            if start { *x = Complex::default() }
+            *x = Complex::new(x.re + (p[t] - q[t]), if im.is_finite() { x.im + im } else { x.im });
         }
-        R::add_part_product(&mut p, n, |i, l| a(i, l).re, Rows(&br, n), size, part);
-        R::add_part_product(&mut q, n, |i, l| a(i, l).im, Rows(&bi, n), size, part);
-        R::add_part_product(&mut s, n, |i, l| { let x = a(i, l); x.re + x.im }, Rows(&bs, n), size, part);
-        let mut finite = true;
+    }
+    if !finite {
+        let mut four = filled(m * n, R::zero());
+        R::native_product(&mut four, n, |i, l| a(i, l).re, Matrix::rows(&bi, n), size, true, part);
+        R::native_product(&mut four, n, |i, l| a(i, l).im, Matrix::rows(&br, n), size, false, part);
         for i in 0..m {
             for j in part.columns(i, n) {
                 let (t, x) = (i * n + j, &mut c[i * ldc + j]);
-                let im = s[t] - p[t] - q[t];
-                finite &= im.is_finite();
-                *x = Complex::new(x.re + (p[t] - q[t]), if im.is_finite() { x.im + im } else { x.im });
-            }
-        }
-        if !finite {
-            let mut four = filled(m * n, R::zero());
-            R::add_part_product(&mut four, n, |i, l| a(i, l).re, Rows(&bi, n), size, part);
-            R::add_part_product(&mut four, n, |i, l| a(i, l).im, Rows(&br, n), size, part);
-            for i in 0..m {
-                for j in part.columns(i, n) {
-                    let (t, x) = (i * n + j, &mut c[i * ldc + j]);
-                    if !(s[t] - p[t] - q[t]).is_finite() { x.im = x.im + four[t] }
-                }
+                if !(s[t] - p[t] - q[t]).is_finite() { x.im = x.im + four[t] }
             }
         }
     }
 }
-/// `+.×` on complex matrices, through `Tiled`'s three real products. Each item type has its own impl, so the loops compile in rustymath.
-macro_rules! complex_inner {
-    ($($r:ty),+) => {$(
-        impl Inner<Complex<$r>> for PlusTimes {
-            type Out = Complex<$r>;
-            fn inner(&self, a: &[Complex<$r>], b: &[Complex<$r>], [m, k, n]: [usize; 3]) -> Vec<Self::Out> {
-                assert!(a.len() == m * k && b.len() == k * n, "`a` must hold `m`×`k` items and `b` `k`×`n`");
-                let mut c = filled(m * n, Complex::default());
-                Complex::<$r>::add_product(&mut c, n, |i, p| a[i * k + p], Rows(b, n), [m, k, n]);
-                c
-            }
-        }
-    )+};
-}
-complex_inner!(f32, f64);
 
 /// The micro-kernels in plain Rust, for targets without the explicit ones. Each takes the number of vectors in a tile row, `V`, as
 /// the explicit ones do, and ignores it.
@@ -621,10 +786,14 @@ mod lanes {
             }
         )+};
     }
-    #[cfg(target_arch = "aarch64")]
+    // rustymath's own plus-times products, which macOS compiles only with the `native` feature.
+    #[cfg(all(target_arch = "aarch64", native))]
     lanes! {
         times64: f64, 2, vdupq_n_f64, vld1q_f64, vst1q_f64, |a, b| vmulq_f64(a, b), |c| vfmaq_f64(c, a, b);
         times32: f32, 4, vdupq_n_f32, vld1q_f32, vst1q_f32, |a, b| vmulq_f32(a, b), |c| vfmaq_f32(c, a, b);
+    }
+    #[cfg(target_arch = "aarch64")]
+    lanes! {
         max_plus64: f64, 2, vdupq_n_f64, vld1q_f64, vst1q_f64, |a, b| vaddq_f64(a, b), |c| vmaxq_f64(c, vaddq_f64(a, b));
         max_plus32: f32, 4, vdupq_n_f32, vld1q_f32, vst1q_f32, |a, b| vaddq_f32(a, b), |c| vmaxq_f32(c, vaddq_f32(a, b));
         min_plus64: f64, 2, vdupq_n_f64, vld1q_f64, vst1q_f64, |a, b| vaddq_f64(a, b), |c| vminq_f64(c, vaddq_f64(a, b));
@@ -640,11 +809,15 @@ mod lanes {
         min_plus64: f64, 2, f64x2_splat, v128_load, v128_store, |a, b| f64x2_add(a, b), |c| f64x2_min(c, f64x2_add(a, b));
         min_plus32: f32, 4, f32x4_splat, v128_load, v128_store, |a, b| f32x4_add(a, b), |c| f32x4_min(c, f32x4_add(a, b));
     }
-    // AVX2's `maxpd` and `minpd` give their second argument beside NaN.
-    #[cfg(target_arch = "x86_64")]
+    // rustymath's own plus-times products, which macOS compiles only with the `native` feature.
+    #[cfg(all(target_arch = "x86_64", native))]
     lanes! {
         times64: f64, 4, _mm256_set1_pd, _mm256_loadu_pd, _mm256_storeu_pd, |a, b| _mm256_mul_pd(a, b), |c| _mm256_fmadd_pd(a, b, c);
         times32: f32, 8, _mm256_set1_ps, _mm256_loadu_ps, _mm256_storeu_ps, |a, b| _mm256_mul_ps(a, b), |c| _mm256_fmadd_ps(a, b, c);
+    }
+    // AVX2's `maxpd` and `minpd` give their second argument beside NaN.
+    #[cfg(target_arch = "x86_64")]
+    lanes! {
         max_plus64: f64, 4, _mm256_set1_pd, _mm256_loadu_pd, _mm256_storeu_pd, |a, b| _mm256_add_pd(a, b), |c| _mm256_max_pd(_mm256_add_pd(a, b), c);
         max_plus32: f32, 8, _mm256_set1_ps, _mm256_loadu_ps, _mm256_storeu_ps, |a, b| _mm256_add_ps(a, b), |c| _mm256_max_ps(_mm256_add_ps(a, b), c);
         min_plus64: f64, 4, _mm256_set1_pd, _mm256_loadu_pd, _mm256_storeu_pd, |a, b| _mm256_add_pd(a, b), |c| _mm256_min_pd(_mm256_add_pd(a, b), c);
@@ -743,7 +916,7 @@ fn product<T: Copy + Default + Send + Sync, P: Pair<T>, const MR: usize, const N
     c: &mut [P::Out],
     ldc: usize,
     a: impl Fn(usize, usize) -> T + Sync,
-    b: Rows<'_, T>,
+    b: impl Fn(usize, usize, &mut [MaybeUninit<T>]) + Sync,
     [m, k, n]: [usize; 3],
     start: bool,
     part: Part,
@@ -770,7 +943,7 @@ fn product<T: Copy + Default + Send + Sync, P: Pair<T>, const MR: usize, const N
                     let (j, lines) = (jc + s * NR, NR.min(nc - s * NR));
                     for (step, part) in strip.chunks_mut(NR * KC).enumerate() {
                         let pc = pp + step * KC;
-                        pack::<_, NR>(part, part.len() / NR, lines, |p, l, out| b.run(pc + p, j + l, out));
+                        pack::<_, NR>(part, part.len() / NR, lines, |p, l, out| b(pc + p, j + l, out));
                     }
                 }
                 true

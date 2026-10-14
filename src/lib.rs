@@ -20,6 +20,8 @@ mod special;
 mod sqrts;
 mod table;
 mod trig;
+#[cfg(accelerate)]
+mod vforce;
 pub mod convert;
 pub mod distribution;
 pub mod gather;

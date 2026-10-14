@@ -6,131 +6,49 @@
 //! more than 11/6 times as tall as it is wide first reduces to the R of its QR factorization, through CholeskyQR2 where `qr` or `lstsq`
 //! would use it. A wider one is replaced by its conjugate transpose.
 //!
-//! Above `SPLIT` columns, divide and conquer gives the bidiagonal matrix's singular vectors, and the reflections apply to them without
+//! Above `SVD_SPLIT` columns, divide and conquer gives the bidiagonal matrix's singular vectors, and the reflections apply to them without
 //! forming Q, as LAPACK's `dbdsdc` and `dormbr` do. The recursion, the deflation and the arrow matrix's SVD follow faer's
 //! `bidiag_svd.rs`, and share `secular::root` with `eigen`'s divide and conquer. See `THIRD-PARTY.md`.
 use super::*;
 
-/// `svd` for `T`: the thin SVD `a = U Σ Vᴴ` of the `m`×`n` matrix `a`. It gives the singular vectors only where `vectors` is true. A
-/// matrix holding a NaN or an infinity gives NaN for every result.
-pub(super) fn svd_factor<T: Scalar + Tiled>(a: &[T], [m, n]: [usize; 2], vectors: bool) -> Svd<T>
+/// The native thin SVD `a = U Σ Vᴴ` of the finite, nonempty `m`×`n` matrix `a`, which `Tiled::svd` uses off macOS, as `(U, s, V)`. It
+/// gives the singular vectors only where `vectors` is true, and `None` where the QR algorithm doesn't converge.
+pub(in crate::linalg) fn native<T: Tiled>(a: &[T], [m, n]: [usize; 2], vectors: bool) -> Option<(Vec<T>, Vec<T::Real>, Vec<T>)>
 where
-    T::Real: Tiled,
+    T::Real: Tiled<Real = T::Real>,
 {
-    assert_eq!(a.len(), m * n, "`a` must hold `m`×`n` items");
     if m < n {
         // The conjugate transpose's SVD is V Σ Uᴴ.
-        let Svd { u, s, v, .. } = svd_factor(&adjoint(a, m, n), [n, m], vectors);
-        return Svd::new([m, n], v, s, u);
+        let (u, s, v) = native(&adjoint(a, m, n), [n, m], vectors)?;
+        return Some((v, s, u));
     }
-    let svd = |(u, s, v)| Svd::new([m, n], u, s, v);
-    let undefined = || {
-        let nan = T::Real::nan();
-        let filled = |len| if vectors { vec![T::from_real(nan); len] } else { Vec::new() };
-        svd((filled(m * n), vec![nan; n], filled(n * n)))
-    };
-    if a.iter().any(|x| !(x.re().is_finite() && x.im().is_finite())) { return undefined() }
-    if 6 * m < 11 * n { return bidiagonal_svd(a, [m, n], vectors).map_or_else(undefined, svd) }
+    if 6 * m < 11 * n { return bidiagonal_svd(a, [m, n], vectors) }
     // A tall matrix's SVD is the SVD of its R, with U multiplied by Q. CholeskyQR2 gives Q and R where `qr` would use it, or only R
     // for singular values where `lstsq` would. Householder reflections give them otherwise.
     let cholesky = if vectors { tall_for_qr([m, n]) } else { tall_for_lstsq([m, n]) };
     if cholesky && let Some((r, q)) = tall_qr(a, [m, n], if vectors { Tall::Q } else { Tall::R }) {
-        let Some((ur, s, v)) = bidiagonal_svd(&r, [n, n], vectors) else { return undefined() };
-        let mut u = Vec::new();
-        if vectors {
-            u = filled(m * n, T::zero());
-            T::add_product(&mut u, n, |i, j| q[i * n + j], Rows(&ur, n), [m, n, n]);
-        }
-        return svd((u, s, v));
+        let (ur, s, v) = bidiagonal_svd(&r, [n, n], vectors)?;
+        let u = if vectors { T::multiply(Matrix::rows(&q, n), Matrix::rows(&ur, n), [m, n, n]) } else { Vec::new() };
+        return Some((u, s, v));
     }
     let (reflections, r) = reflect(a, [m, n]);
-    let Some((ur, s, v)) = bidiagonal_svd(&r, [n, n], vectors) else { return undefined() };
+    let (ur, s, v) = bidiagonal_svd(&r, [n, n], vectors)?;
     let mut u = Vec::new();
     if vectors {
         u = filled(m * n, T::zero());
         u[..n * n].copy_from_slice(&ur);
         reflections.apply(&mut u, n);
     }
-    svd((u, s, v))
+    Some((u, s, v))
 }
 
-/// Columns beyond `k` in `truncated_factor`'s test matrix. Halko, Martinsson and Tropp suggest about 10.
-const OVERSAMPLE: usize = 10;
-/// Power iterations in `truncated_factor`. Each multiplies by `aᴴ` and `a` once more, which separates slowly decaying singular values.
-const POWERS: usize = 2;
-
-/// `truncated_svd` for `T`: an approximation to the `k` largest singular values of the `m`×`n` matrix `a` and their singular vectors,
-/// by Halko, Martinsson and Tropp's randomized range finder. `a` times `k + OVERSAMPLE` pseudorandom columns spans a space close to
-/// that of the leading left singular vectors. `POWERS` power iterations refine it, with a thin QR factorization after each product.
-/// The SVD of `a` projected onto that space gives the result. Where
-/// `k + OVERSAMPLE` reaches `a`'s smaller side, the result is the thin SVD's first `k` columns. A matrix holding a NaN or an infinity
-/// gives NaN for every result.
-pub(super) fn truncated_factor<T: Scalar + Tiled>(a: &[T], [m, n]: [usize; 2], k: usize) -> Svd<T>
-where
-    T::Real: Tiled,
-{
-    assert_eq!(a.len(), m * n, "`a` must hold `m`×`n` items");
-    let p = m.min(n);
-    let (k, l) = (k.min(p), (k + OVERSAMPLE).min(p));
-    if l == p { return leading(svd_factor(a, [m, n], true), k) }
-    if m < n {
-        // The conjugate transpose's SVD is V Σ Uᴴ.
-        let Svd { u, s, v, .. } = truncated_factor(&adjoint(a, m, n), [n, m], k);
-        return Svd::new([m, n], v, s, u);
-    }
-    let times = |x: &[T]| {
-        let mut y = filled(m * l, T::zero());
-        T::add_product(&mut y, l, |i, r| a[i * n + r], Rows(x, l), [m, n, l]);
-        y
-    };
-    let adjoint_times = |x: &[T]| {
-        let mut y = filled(n * l, T::zero());
-        T::add_product(&mut y, l, |i, r| a[r * n + i].conj(), Rows(x, l), [n, m, l]);
-        y
-    };
-    let basis = |y: Vec<T>, rows: usize| qr_factor(&y, [rows, l], false).0;
-    let mut q = basis(times(&test_matrix(n * l)), m);
-    for _ in 0..POWERS { q = basis(times(&basis(adjoint_times(&q), n)), m) }
-    // B = Qᴴ a is `l`×`n`, and its SVD B = U_B Σ Vᴴ gives a ≈ (Q U_B) Σ Vᴴ.
-    let mut b = filled(l * n, T::zero());
-    T::add_product(&mut b, n, |i, r| q[r * l + i].conj(), Rows(a, n), [l, m, n]);
-    let Svd { u: ub, s, v, .. } = svd_factor(&b, [l, n], true);
-    let mut u = filled(m * l, T::zero());
-    T::add_product(&mut u, l, |i, r| q[i * l + r], Rows(&ub, l), [m, l, l]);
-    leading(Svd::new([m, n], u, s, v), k)
-}
-
-/// The first `k` singular values of `svd`, with their singular vectors.
-fn leading<T: Scalar>(Svd { size: [m, n], u, s, v, .. }: Svd<T>, k: usize) -> Svd<T> {
-    let p = s.len();
-    let first = |x: Vec<T>, rows: usize| {
-        if k == p { return x }
-        let mut y = Vec::with_capacity(rows * k);
-        for i in 0..rows { y.extend_from_slice(&x[i * p..i * p + k]) }
-        y
-    };
-    Svd::new([m, n], first(u, m), s[..k].to_vec(), first(v, n))
-}
-
-/// `len` numbers uniform from -1 to 1, from SplitMix64 with a fixed seed.
-fn test_matrix<T: Scalar>(len: usize) -> Vec<T> {
-    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
-    (0..len).map(|_| {
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let z = (state ^ (state >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        let z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        let z = z ^ (z >> 31);
-        T::from_real(<T::Real as crate::Float>::narrow((z >> 11) as f64 * 2f64.powi(-52) - 1.0))
-    }).collect()
-}
-
-/// The SVD of the finite `m`×`n` matrix `a`, where `m` is at least `n`, through its bidiagonal form B, as `svd_factor` gives it. Singular
-/// values descend. With vectors and more than `SPLIT` columns, divide and conquer gives B's singular vectors, and the reflections then
+/// The SVD of the finite `m`×`n` matrix `a`, where `m` is at least `n`, through its bidiagonal form B, as `native` gives it. Singular
+/// values descend. With vectors and more than `SVD_SPLIT` columns, divide and conquer gives B's singular vectors, and the reflections then
 /// apply to them. Otherwise the QR algorithm rotates the reflections' Q into B's singular vectors. `None` where the QR algorithm doesn't
 /// converge.
-fn bidiagonal_svd<T: Scalar + Tiled>(a: &[T], [m, n]: [usize; 2], vectors: bool) -> Option<(Vec<T>, Vec<T::Real>, Vec<T>)>
+fn bidiagonal_svd<T: Tiled>(a: &[T], [m, n]: [usize; 2], vectors: bool) -> Option<(Vec<T>, Vec<T::Real>, Vec<T>)>
 where
-    T::Real: Tiled,
+    T::Real: Tiled<Real = T::Real>,
 {
     let mut w = a.to_vec();
     let scale = safe_scale(a);
@@ -142,21 +60,21 @@ where
     let unit = if top > T::Real::zero() && top.is_finite() { unit_scale(top) } else { None };
     if let Some(u) = unit { for x in d.iter_mut().chain(&mut e) { *x = *x * u } }
     let unscaled = |d: &[T::Real]| d.iter().map(|&x| [scale, unit].iter().flatten().fold(x, |x, &c| x / c)).collect();
-    if vectors && n > SPLIT {
+    if vectors && n > SVD_SPLIT {
         // [Bᵀ; 0] = U' [Σ; 0] V'ᵀ, so B's left singular vectors are the columns of V', and its right ones the first n items of the
         // columns of U'.
         e.push(T::Real::zero());
-        let (upt, vpt) = conquer(&mut d, &mut e, SPLIT)?;
+        let (upt, vpt) = conquer(&mut d, &mut e, SVD_SPLIT)?;
         let mut u: Vec<T> = (0..m * n).map(|ij| if ij < n * n { T::from_real(vpt[ij % n * n + ij / n]) } else { T::zero() }).collect();
         left_reflections(&w, &left, [m, n]).apply(&mut u, n);
         let mut v: Vec<T> = (0..n * n).map(|ij| T::from_real(upt[ij % n * (n + 1) + ij / n])).collect();
-        eigen::blocked(&w, &right, n).apply(&mut v[n..], n);
+        blocked(&w, &right, n).apply(&mut v[n..], n);
         return Some((u, unscaled(&d), v));
     }
     let (mut ut, mut vt) = (Vec::new(), Vec::new());
     if vectors {
         ut = transpose(&left_reflections(&w, &left, [m, n]).q(), m, n);
-        vt = eigen::reflections(&w, &right, n);
+        vt = reflections(&w, &right, n);
     }
     golub_kahan(&mut d, &mut e, &mut ut, &mut vt)?;
     for (k, x) in d.iter_mut().enumerate() {
@@ -180,7 +98,7 @@ where
 /// vector stays below the diagonal in its column, and each right reflection's beyond the superdiagonal in its row, each with its leading
 /// 1 left out. Each step makes one pass over the rows below its own. The pass applies both of its reflections to each row, then adds
 /// the row's part of the next step's `vᴴ A`. `eigen::summed_rows` splits each pass's rows across threads.
-fn bidiagonalize<T: Scalar + Tiled>(w: &mut [T], [m, n]: [usize; 2]) -> (Vec<T::Real>, Vec<T::Real>, Vec<T>, Vec<T>) {
+fn bidiagonalize<T: Tiled>(w: &mut [T], [m, n]: [usize; 2]) -> (Vec<T::Real>, Vec<T::Real>, Vec<T>, Vec<T>) {
     let zero = T::Real::zero();
     let (mut d, mut left) = (vec![zero; n], vec![T::zero(); n]);
     let (mut e, mut right) = (vec![zero; n.saturating_sub(1)], vec![T::zero(); n.saturating_sub(1)]);
@@ -236,10 +154,8 @@ fn bidiagonalize<T: Scalar + Tiled>(w: &mut [T], [m, n]: [usize; 2]) -> (Vec<T::
 }
 
 /// The left reflections that `bidiagonalize` leaves in `w`, in QR's blocked form.
-fn left_reflections<T: Scalar + Tiled>(w: &[T], taus: &[T], [m, n]: [usize; 2]) -> Reflections<T> {
-    let width = qr_block(n);
-    let blocks = (0..n).step_by(width).map(|k0| { let k1 = (k0 + width).min(n); Block::new(k0, transposed(w, n, k0, k1), &taus[k0..k1]) }).collect();
-    Reflections { m, blocks }
+fn left_reflections<T: Tiled>(w: &[T], taus: &[T], [m, n]: [usize; 2]) -> Reflections<T> {
+    Reflections { m, blocks: blocks_of(&taus[..n], qr_block(n), |k0, k1| transposed(w, n, k0, k1)) }
 }
 
 /// Drives the superdiagonal `e` of the real upper bidiagonal matrix with diagonal `d` to zero, leaving its singular values in `d`, some
@@ -319,10 +235,6 @@ fn golub_kahan<T: Scalar>(d: &mut [T::Real], e: &mut [T::Real], ut: &mut [T], vt
     Some(())
 }
 
-/// Above this many columns, divide and conquer splits a bidiagonal matrix's SVD in two. The QR algorithm solves smaller ones.
-#[doc(hidden)]
-pub const SPLIT: usize = 64;
-
 /// The plane rotation `(c, s)` that takes `(p, q)` to `(r, 0)`, with `c p - s q = r` and `s p + c q = 0`. `rotate` applies it to two
 /// rows.
 fn plane<R: Native>(p: R, q: R) -> (R, R) {
@@ -344,7 +256,7 @@ fn plane<R: Native>(p: R, q: R) -> (R, R) {
 /// Column k splits the matrix. Its diagonal item α and subdiagonal item β leave a (k+1)×k matrix above and to the left of them, and a
 /// (rem+1)×rem one below and to the right. In the halves' singular vectors, the matrix is an arrow matrix M: a first column z, and a
 /// diagonal of the halves' singular values. M's SVD comes from one secular equation for each singular value, as in `eigen::merge`.
-fn conquer<R: Native + Tiled>(d: &mut [R], sub: &mut [R], leaf: usize) -> Option<(Vec<R>, Vec<R>)> {
+fn conquer<R: Native + Tiled<Real = R>>(d: &mut [R], sub: &mut [R], leaf: usize) -> Option<(Vec<R>, Vec<R>)> {
     let n = d.len();
     if n <= leaf.max(2) { return qr_leaf(d, sub) }
     let zero = R::zero();
@@ -387,8 +299,9 @@ fn conquer<R: Native + Tiled>(d: &mut [R], sub: &mut [R], leaf: usize) -> Option
     let b1: Vec<R> = q1.iter().map(|&q| c0 * q).chain(u1[..k * w1].iter().copied()).collect();
     let mut b2 = u2.clone();
     for x in &mut b2[rem * w2..] { *x = c0 * *x }
-    R::add_product(&mut ut, n + 1, |j, p| um[j * (n + 1) + p], Rows(&b1, w1), [n + 1, w1, w1]);
-    R::add_product(&mut ut[w1..], n + 1, |j, p| um[j * (n + 1) + w1 + p], Rows(&b2, w2), [n + 1, w2, w2]);
+    let um_view = Matrix::rows(&um, n + 1);
+    R::gemm(&mut ut, n + 1, um_view, Matrix::rows(&b1, w1), [n + 1, w1, w1], R::one(), zero);
+    R::gemm(&mut ut[w1..], n + 1, um_view.offset(0, w1), Matrix::rows(&b2, w2), [n + 1, w2, w2], R::one(), zero);
     for (row, m) in ut.chunks_exact_mut(n + 1).zip(um.chunks_exact(n + 1)) {
         let (top, bottom) = row.split_at_mut(w1);
         axpy(top, -s0 * m[n], q1);
@@ -396,8 +309,8 @@ fn conquer<R: Native + Tiled>(d: &mut [R], sub: &mut [R], leaf: usize) -> Option
     }
     // V's column 0 is the unit vector at row k, and its other columns are the halves' vectors.
     let mut vt = vec![zero; n * n];
-    R::add_product(&mut vt, n, |j, p| vm[j * n + 1 + p], Rows(&v1, k), [n, k, k]);
-    R::add_product(&mut vt[w1..], n, |j, p| vm[j * n + w1 + p], Rows(&v2, rem), [n, rem, rem]);
+    R::gemm(&mut vt, n, Matrix::rows(&vm, n).offset(0, 1), Matrix::rows(&v1, k), [n, k, k], R::one(), zero);
+    R::gemm(&mut vt[w1..], n, Matrix::rows(&vm, n).offset(0, w1), Matrix::rows(&v2, rem), [n, rem, rem], R::one(), zero);
     for (row, m) in vt.chunks_exact_mut(n).zip(vm.chunks_exact(n)) { row[k] = m[0] }
     for x in d.iter_mut() { *x = *x * largest }
     Some((ut, vt))
@@ -406,7 +319,7 @@ fn conquer<R: Native + Tiled>(d: &mut [R], sub: &mut [R], leaf: usize) -> Option
 /// `conquer` for a leaf of the recursion. Rotations of the last row with each row above it, from the bottom, move its
 /// subdiagonal item up and out, leaving a square lower bidiagonal matrix. That matrix is the transpose of an upper one, whose row
 /// rotations act on V, and whose column rotations act on the rows of Uᵀ.
-fn qr_leaf<R: Native + Tiled>(d: &mut [R], sub: &mut [R]) -> Option<(Vec<R>, Vec<R>)> {
+fn qr_leaf<R: Native + Tiled<Real = R>>(d: &mut [R], sub: &mut [R]) -> Option<(Vec<R>, Vec<R>)> {
     let (n, w) = (d.len(), d.len() + 1);
     let (mut ut, mut vt) = (identity(w), identity(n));
     let mut bulge = sub[n - 1];
@@ -523,7 +436,7 @@ fn deflate<R: Native>(d: &mut [R], z: &mut [R], k: usize) -> (Vec<usize>, Vec<(u
 /// The SVD of the deflated n×n arrow matrix M with diagonal `d` and first column `z`, where `d[0]` equals `z[0]`. Its singular values
 /// replace `d`, in descending order. It gives the rows of Uᵀ, (n+1)×(n+1), whose last
 /// row is the unit vector at item n, and of Vᵀ, n×n, with their items in the order of M's rows before `deflate` permuted them by `outer`.
-fn arrow<R: Native + Tiled>(d: &mut [R], z: &[R], outer: &[usize]) -> (Vec<R>, Vec<R>) {
+fn arrow<R: Native + Tiled<Real = R>>(d: &mut [R], z: &[R], outer: &[usize]) -> (Vec<R>, Vec<R>) {
     let (n, zero, one) = (d.len(), R::zero(), R::one());
     d[0] = zero;
     let mut actual = n;

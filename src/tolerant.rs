@@ -1,6 +1,6 @@
-//! Tolerant comparison of floats, as APL defines it: `x` equals `y` within a relative tolerance `t` when `|x-y|` is at most `t` times
-//! the larger of `|x|` and `|y|`. Dyalog APL calls `t` the comparison tolerance, `⎕CT`, and its default is 1e-14. A tolerance has no
-//! effect when either number is zero.
+//! Tolerant comparison of floats: `x` equals `y` within a relative tolerance `t` when `|x-y|` is less than `t` times the larger of
+//! `|x|` and `|y|`. APL's definition says at most, which differs only where `|x-y|` lands exactly on that bound. Dyalog APL calls `t`
+//! the comparison tolerance, `⎕CT`, and its default is 1e-14. A tolerance has no effect when either number is zero.
 //!
 //! A tolerance is a value of a type that implements `Tolerant`: a `Tolerance`, or `Exactly`, whose methods compile to plain IEEE
 //! comparisons and `floor`. A function written once over `Tolerant` compiles to a version for each. `with_tolerance!` picks one when
@@ -167,15 +167,20 @@ impl Tolerant for Tolerance {
     #[inline]
     fn value(self) -> f64 { self.0 }
     // A loop of comparisons vectorizes only when the test has no branch. The test therefore uses `&` and `|`, not `&&` and `||`.
+    // With a strict `<`, an infinity is unequal to every finite number without a finiteness test, because `inf < inf` is false. NaN
+    // fails every comparison.
     #[inline]
     fn equal<F: Float>(self, x: F, y: F) -> bool {
         let t = F::narrow(self.0);
-        (x == y) | (x.is_finite() & y.is_finite() & ((x - y).abs() <= t * larger(x.abs(), y.abs())))
+        (x == y) | ((x - y).abs() < t * larger(x.abs(), y.abs()))
     }
     #[inline]
     fn floor<F: Float>(self, y: F) -> F {
-        let (n, t) = (y.floor() + F::one(), F::narrow(self.0));
-        if n - y <= t * larger(y.abs(), n.abs()) { n } else { n - F::one() }
+        // `y` equals the whole number above it when raising `y` by `t·|y|` reaches that number. Capping the raise just below a half
+        // keeps a whole number from reaching the next one where `t·|y|` exceeds a half. Where floats are 1 or more apart, the sum
+        // rounds back to `y`.
+        let (raise, most) = (F::narrow(self.0) * y.abs(), F::narrow(0.5).next_down());
+        (y + if raise < most { raise } else { most }).floor()
     }
 }
 
@@ -579,7 +584,7 @@ pub fn classes<F: Float>(t: impl Tolerant, x: &[F]) -> Vec<u32> {
 #[inline(never)]
 pub fn classes_with<F: Float, E>(t: impl Tolerant, x: &[F], mut check: impl FnMut() -> Result<(), E>) -> Result<Vec<u32>, E> {
     if let Some((keys, _)) = wholes(t, x, whole_limit(t)) { return Ok(search::classes(&keys)); }
-    if t.value() == 0.0 { return Ok(search::classes(&order_keys(x))); }
+    if t.value() == 0.0 { return Ok(search::first_classes(x, F::order_key)); }
     let (mut classes, mut since) = (vec![0; x.len()], 0);
     runs(t, x, |run| {
         since += run.len();
@@ -600,7 +605,7 @@ pub fn firsts<F: Float>(t: impl Tolerant, x: &[F]) -> Vec<bool> {
 #[inline(never)]
 pub fn firsts_with<F: Float, E>(t: impl Tolerant, x: &[F], check: impl FnMut() -> Result<(), E>) -> Result<Vec<bool>, E> {
     if let Some((keys, _)) = wholes(t, x, whole_limit(t)) { return Ok(search::firsts(&keys)); }
-    if t.value() == 0.0 { return Ok(search::firsts(&order_keys(x))); }
+    if t.value() == 0.0 { return Ok(search::first_mask(&search::first_classes(x, F::order_key))); }
     Ok(classes_with(t, x, check)?.into_iter().enumerate().map(|(i, c)| c as usize == i).collect())
 }
 
@@ -654,7 +659,8 @@ impl<F: Float> Near<F> {
     }
 }
 
-/// The order key of each float.
+/// The order key of each float, in one pass that vectorises. Exact searches hash these keys, because f32 searches ran about 6% slower
+/// when each lookup computed its own key.
 fn order_keys<F: Float>(x: &[F]) -> Vec<F::OrderKey> { x.iter().map(|v| v.order_key()).collect() }
 
 /// The magnitude below which each whole number equals no other whole number within tolerance `t`, nor do floats equal to different

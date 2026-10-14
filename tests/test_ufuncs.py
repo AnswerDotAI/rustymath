@@ -167,6 +167,11 @@ def test_scalar_functions_and_integer_binomial():
         assert rm.factorial(x).dtype == dt and np.allclose(rm.factorial(x), [1, 1, 2, 120])
         assert rm.logb(dt(2), dt([1, 2, 8])).dtype == dt and np.allclose(rm.logb(dt(2), dt([1, 2, 8])), [0, 1, 3])
         assert rm.cis(x).dtype == np.result_type(dt, np.complex64) and np.allclose(rm.cis(x), np.exp(1j * x.astype(float)), atol=1e-6)
+    for dt in [np.float32, np.float64]:
+        e = rm.cis(dt([-0.0, np.pi / 2, np.nan]))
+        assert np.signbit(e[0].imag) and e[1] == 1j and np.isnan(e[2])
+        with pytest.warns(RuntimeWarning): assert np.isnan(rm.cis(dt([np.inf]))).all()
+        assert np.signbit(rm.tanh(np.array([complex(1, -0.0)]).astype(np.result_type(dt, np.complex64))).imag).all()
     z = np.array([1 + 2j, 2 - 1j])
     assert np.allclose(rm.logb(2 + 1j, z), np.log(z) / np.log(2 + 1j)) and np.allclose(rm.cis(z), np.exp(1j * z))
     assert np.allclose(rm.divide(z, 2 - 1j), z / (2 - 1j)) and np.allclose(rm.divide([1., 2.], 2), [0.5, 1.])

@@ -1,14 +1,4 @@
-"""Maths in plain Rust, from fast f16, f32 and f64 functions to exact rationals.
-
-Modules:
-
-- `rustymath.linalg`: linear algebra on stacks of matrices, under the names of NumPy's similar functions. Its docstring gives the width each dtype computes at.
-- `rustymath.polynomial`: polynomials of one variable, under the names of NumPy's functions in `numpy.polynomial.polynomial`.
-- `rustymath.exact`: exact rational arithmetic on integers and `fractions.Fraction`.
-- `rustymath.integer`: checked int64 mixed-radix conversions.
-- `rustymath.search`: numeric search, stable sorting and grouping. The package also exports its functions directly.
-- `rustymath.number_theory`: primes, factors, totients, prime counts and factorials of Python integers of any size.
-- `rustymath.distribution`: probability distributions, whose methods take a number or an array of any shape."""
+"""Maths in plain Rust, from fast f16, f32 and f64 functions to exact rationals."""
 
 import sys
 import numpy as np

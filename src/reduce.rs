@@ -6,7 +6,7 @@
 //! integer sum or product computes at `i64`, or at `u64` for `u64` items. Where it doesn't fit, it wraps, and reports that it
 //! doesn't fit, as the running versions do.
 use crate::{
-    float::sealed::{Core, Extremes},
+    float::sealed::{Core, Folds},
     parallel,
     slice::{appended, CHUNK},
     Float, Native, Overflowing,
@@ -203,7 +203,7 @@ fn running_by<A: Copy, S: Copy, T, const R: usize>(x: &[A], unit: S, add: impl F
 /// and `to` writes each total. Each group of four items scans within itself in two steps, then combines with the total before it, so
 /// only one operation in each group waits for the group before. `f` may therefore combine items in any order.
 #[inline(always)]
-fn grouped<A: Copy, S: Copy, O>(x: &[A], start: Option<S>, out: &mut Vec<O>, from: impl Fn(A) -> S, f: impl Fn(S, S) -> S, to: impl Fn(S) -> O) {
+pub(crate) fn grouped<A: Copy, S: Copy, O>(x: &[A], start: Option<S>, out: &mut Vec<O>, from: impl Fn(A) -> S, f: impl Fn(S, S) -> S, to: impl Fn(S) -> O) {
     let Some((&first, rest)) = x.split_first() else { return };
     appended(out, x.len(), |slots| {
         let first = from(first);
@@ -260,7 +260,7 @@ macro_rules! floats {
     )+};
 }
 floats! {
-    Sum: zero, identity: -F::zero(), |a, b| a.algebraic_add(b), |x: &[F]| if x.is_empty() { <Self as Reduction<F>>::unit() } else { folded(x, <Self as Reduction<F>>::identity(), Self::step, Self::step) }, |x, start, out| grouped(x, start, out, |v| v, |a: F, b: F| a + b, |t| t);
+    Sum: zero, identity: -F::zero(), |a, b| a.algebraic_add(b), |x: &[F]| if x.is_empty() { <Self as Reduction<F>>::unit() } else { folded(x, <Self as Reduction<F>>::identity(), Self::step, Self::step) }, F::scan_sum;
     Product: one, |a, b| a.algebraic_mul(b), |x| folded(x, F::one(), Self::step, Self::step), |x, start, out| grouped(x, start, out, |v| v, |a: F, b: F| a * b, |t| t);
     Max: neg_infinity, |acc, x| x.maximum(acc), F::fold_max, F::scan_max;
     Min: infinity, |acc, x| x.minimum(acc), F::fold_min, F::scan_min;
@@ -351,6 +351,8 @@ impl<F: Native> Reduction<Complex<F>> for Product {
 /// block with a new maximum paid for a test it didn't use. The others skip blocks through `records`. AArch64's `f32` tests a block
 /// by comparing each item, as `below` does. Wasm tests it by its fold, then one comparison. In wasm, comparing each item took five
 /// instructions for two items.
+/// Each entry also names its running sum. `f32`'s is `sum_scan`, which scans four-lane vectors and makes `+\` about 1.3 times faster.
+/// `f64`'s is `grouped`, because a two-lane vector scan needs more operations per item than `grouped`'s two additions.
 #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
 mod lanes {
     use super::*;
@@ -361,8 +363,8 @@ mod lanes {
     /// How many running vectors a fold keeps.
     const PARTS: usize = 8;
     macro_rules! lanes {
-        ($($t:ty: $lanes:literal, $splat:ident, $load:ident, $max:ident, $min:ident, $step:ident($arg:tt), $scan:ident;)+) => {$(
-            impl Extremes for $t {
+        ($($t:ty: $lanes:literal, $splat:ident, $load:ident, $max:ident, $min:ident, $step:ident($arg:tt), $scan:ident, $sum:ident;)+) => {$(
+            impl Folds for $t {
                 fn fold_max(x: &[$t]) -> $t { lanes!(@fold x, $t, $lanes, NEG_INFINITY, $splat, $load, $max, |a, b| lanes!(@$step $arg, "fmax", $splat, $max, a, b)) }
                 fn fold_min(x: &[$t]) -> $t { lanes!(@fold x, $t, $lanes, INFINITY, $splat, $load, $min, |a, b| lanes!(@$step $arg, "fmin", $splat, $min, a, b)) }
                 fn scan_max(x: &[$t], start: Option<$t>, out: &mut Vec<$t>) {
@@ -375,6 +377,7 @@ mod lanes {
                     fn step(a: $t, b: $t) -> $t { lanes!(@$step $arg, "fmin", $splat, $min, a, b) }
                     lanes!(@scan $scan, x, start, out, step, above, |b: &[$t], t: $t| Self::fold_min(b) > t)
                 }
+                fn scan_sum(x: &[$t], start: Option<$t>, out: &mut Vec<$t>) { lanes!(@sum $sum, x, start, out) }
             }
         )+};
         (@fold $x:ident, $t:ty, $lanes:literal, $unit:ident, $splat:ident, $load:ident, $op:ident, $step:expr) => {{
@@ -398,25 +401,92 @@ mod lanes {
         (@scan grouped, $x:ident, $start:ident, $out:ident, $step:ident, $compare:expr, $fold:expr) => { grouped($x, $start, $out, |v| v, $step, |t| t) };
         (@scan compare, $x:ident, $start:ident, $out:ident, $step:ident, $compare:expr, $fold:expr) => { records($x, $start, $out, $step, $compare) };
         (@scan fold, $x:ident, $start:ident, $out:ident, $step:ident, $compare:expr, $fold:expr) => { records($x, $start, $out, $step, $fold) };
+        (@sum grouped, $x:ident, $start:ident, $out:ident) => { grouped($x, $start, $out, |v| v, |a, b| a + b, |t| t) };
+        (@sum vector, $x:ident, $start:ident, $out:ident) => { sum_scan($x, $start, $out) };
     }
     #[cfg(target_arch = "aarch64")]
     lanes! {
-        f64: 2, vdupq_n_f64, vld1q_f64, vmaxq_f64, vminq_f64, asm("d"), grouped;
-        f32: 4, vdupq_n_f32, vld1q_f32, vmaxq_f32, vminq_f32, asm("s"), compare;
+        f64: 2, vdupq_n_f64, vld1q_f64, vmaxq_f64, vminq_f64, asm("d"), grouped, grouped;
+        f32: 4, vdupq_n_f32, vld1q_f32, vmaxq_f32, vminq_f32, asm("s"), compare, vector;
+    }
+    /// Four-lane `f32` vectors, for `sum_scan`. `up1` and `up2` move a vector up one lane or two, filling the gap from `fill`. `last`
+    /// copies lane 3 to every lane.
+    #[cfg(target_arch = "aarch64")]
+    mod quad {
+        use core::arch::aarch64::*;
+        pub type V = float32x4_t;
+        // SAFETY: AArch64 always has these instructions. The loads and stores leave their bounds to the caller.
+        #[inline(always)] pub fn splat(x: f32) -> V { unsafe { vdupq_n_f32(x) } }
+        #[inline(always)] pub unsafe fn load(p: *const f32) -> V { unsafe { vld1q_f32(p) } }
+        #[inline(always)] pub unsafe fn store(p: *mut f32, v: V) { unsafe { vst1q_f32(p, v) } }
+        #[inline(always)] pub fn add(a: V, b: V) -> V { unsafe { vaddq_f32(a, b) } }
+        #[inline(always)] pub fn up1(fill: V, v: V) -> V { unsafe { vextq_f32::<3>(fill, v) } }
+        #[inline(always)] pub fn up2(fill: V, v: V) -> V { unsafe { vextq_f32::<2>(fill, v) } }
+        #[inline(always)] pub fn last(v: V) -> V { unsafe { vdupq_laneq_f32::<3>(v) } }
+        #[inline(always)] pub fn first(v: V) -> f32 { unsafe { vgetq_lane_f32::<0>(v) } }
+    }
+    #[cfg(target_arch = "wasm32")]
+    mod quad {
+        use core::arch::wasm32::*;
+        pub type V = v128;
+        #[inline(always)] pub fn splat(x: f32) -> V { f32x4_splat(x) }
+        #[inline(always)] pub unsafe fn load(p: *const f32) -> V { unsafe { v128_load(p.cast()) } }
+        #[inline(always)] pub unsafe fn store(p: *mut f32, v: V) { unsafe { v128_store(p.cast(), v) } }
+        #[inline(always)] pub fn add(a: V, b: V) -> V { f32x4_add(a, b) }
+        #[inline(always)] pub fn up1(fill: V, v: V) -> V { i32x4_shuffle::<3, 4, 5, 6>(fill, v) }
+        #[inline(always)] pub fn up2(fill: V, v: V) -> V { i32x4_shuffle::<2, 3, 4, 5>(fill, v) }
+        #[inline(always)] pub fn last(v: V) -> V { i32x4_shuffle::<3, 3, 3, 3>(v, v) }
+        #[inline(always)] pub fn first(v: V) -> f32 { f32x4_extract_lane::<0>(v) }
+    }
+    /// The running sums of `x` after `start`, 16 items at a time. Each vector of four scans within itself in two shifted additions.
+    /// Each vector then adds the total of everything before it: the running total, plus the sums of the vectors before it in its
+    /// block. Only one addition in each block waits for the block before.
+    fn sum_scan(x: &[f32], start: Option<f32>, out: &mut Vec<f32>) {
+        use quad::*;
+        appended(out, x.len(), |slots| {
+            let ((chunks, rest), (outs, tail)) = (x.as_chunks::<16>(), slots.as_chunks_mut::<16>());
+            let (fill, mut c) = (splat(-0.0), splat(start.unwrap_or(-0.0)));
+            for (o, x) in outs.iter_mut().zip(chunks) {
+                let scanned = |k: usize| {
+                    // SAFETY: the load reads four items of one chunk.
+                    let v = unsafe { load(x.as_ptr().add(4 * k)) };
+                    let v = add(v, up1(fill, v));
+                    add(v, up2(fill, v))
+                };
+                let (p0, p1, p2, p3) = (scanned(0), scanned(1), scanned(2), scanned(3));
+                let s0 = last(p0);
+                let s01 = add(s0, last(p1));
+                let s012 = add(s01, last(p2));
+                let o = o.as_mut_ptr().cast::<f32>();
+                // SAFETY: each store writes four slots of one chunk.
+                unsafe {
+                    store(o, add(c, p0));
+                    store(o.add(4), add(add(c, s0), p1));
+                    store(o.add(8), add(add(c, s01), p2));
+                    store(o.add(12), add(add(c, s012), p3));
+                }
+                c = add(c, add(s012, last(p3)));
+            }
+            let mut total = first(c);
+            for (o, &v) in tail.iter_mut().zip(rest) {
+                total += v;
+                o.write(total);
+            }
+        })
     }
     #[cfg(target_arch = "wasm32")]
     lanes! {
-        f64: 2, f64x2_splat, v128_load, f64x2_max, f64x2_min, lane(f64x2_extract_lane), fold;
-        f32: 4, f32x4_splat, v128_load, f32x4_max, f32x4_min, lane(f32x4_extract_lane), fold;
+        f64: 2, f64x2_splat, v128_load, f64x2_max, f64x2_min, lane(f64x2_extract_lane), fold, grouped;
+        f32: 4, f32x4_splat, v128_load, f32x4_max, f32x4_min, lane(f32x4_extract_lane), fold, vector;
     }
 }
 
-/// Elsewhere, the folds and scans use `Extremes`' defaults. A fold's loop of `Core::maximum` vectorizes, and each step of a scan is
+/// Elsewhere, the folds and scans use `Folds`' defaults. A fold's loop of `Core::maximum` vectorizes, and each step of a scan is
 /// one `maxsd` or `minsd` on x86-64.
 #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
 mod plain {
-    impl super::Extremes for f32 {}
-    impl super::Extremes for f64 {}
+    impl super::Folds for f32 {}
+    impl super::Folds for f64 {}
 }
 
 /// The sum of 32-bit integers, wrapped to `i64`, and whether it fits. Sums of up to 2^31 of them fit `i64`, which their running
@@ -714,13 +784,11 @@ impl<S: Copy> Piece<'_, S> {
 
 /// Folds lanes `first..first + totals.len()` along the middle axis of `data`, an array of shape `[_, len, inner]` held row by row,
 /// into `totals`, and gives whether every fold fits. Each lane folds whole. A lane along the last axis folds as [`fold_rows`] folds it.
-/// Along another axis, the lanes come in whole groups of `inner`, and each group steps down its rows as [`fold_into`] steps them.
+/// Along another axis, the lanes come in whole groups of `inner`, and each group folds its rows as [`step_rows`] folds them.
 fn lanes<T: Copy, R: Reduction<T>>(totals: &mut [R::Total], first: usize, data: &[T], [_, len, inner]: [usize; 3]) -> bool {
     let block = &data[first * len..(first + totals.len()) * len];
     if inner == 1 { return fold_rows::<T, R>(block, len, totals) }
-    totals.chunks_mut(inner).zip(block.chunks_exact(len * inner)).fold(true, |fits, (folds, group)| {
-        group.chunks_exact(inner).enumerate().fold(fits, |fits, (j, row)| fits & step_row::<T, R>(folds, row, j == 0))
-    })
+    totals.chunks_mut(inner).zip(block.chunks_exact(len * inner)).fold(true, |fits, (folds, group)| fits & step_rows::<T, R>(folds, group, true))
 }
 
 /// Steps each of `totals` by the matching item of `row`, and gives whether every fold fits. In a lane's first row, each fold is the
@@ -732,10 +800,84 @@ fn step_row<T: Copy, R: Reduction<T>>(totals: &mut [R::Total], row: &[T], first:
     else { row.fold(true, |ok, (s, &x)| { let (t, f) = R::checked(*s, x); *s = t; ok & f }) }
 }
 
+/// Steps `totals` by every row of `rows`, which hold `totals.len()` items each, and gives whether every fold fits. Where `first` is
+/// true, the first row starts each fold, as in [`step_row`]. Narrow rows fold a block of whole rows at a time, into one running total
+/// for each item of the block. Each column's running totals then merge.
+#[inline(always)]
+fn step_rows<T: Copy, R: Reduction<T>>(totals: &mut [R::Total], rows: &[T], first: bool) -> bool {
+    match crate::slice::running(size_of::<R::Total>()) {
+        8 => rows_by::<T, R, 8>(totals, rows, first),
+        16 => rows_by::<T, R, 16>(totals, rows, first),
+        _ => rows_by::<T, R, 32>(totals, rows, first),
+    }
+}
+
+/// `step_rows` with up to `N` running totals. Rows wider than `N` fold in strips of `N` columns, each down every row, where there are at
+/// least 4 rows and the totals are narrower than complex numbers. Complex strips measured slower than stepping row by row. Other wide
+/// rows, and too few rows to fill two blocks, step one row at a time. A block is `N` items where `inner` divides `N`, and three quarters
+/// of `N` for rows of 3.
+#[inline(always)]
+fn rows_by<T: Copy, R: Reduction<T>, const N: usize>(totals: &mut [R::Total], rows: &[T], first: bool) -> bool {
+    let inner = totals.len();
+    if inner > N && rows.len() >= 4 * inner && size_of::<R::Total>() < 16 {
+        return totals.chunks_mut(N).enumerate().fold(true, |fits, (s, out)| {
+            fits & if out.len() == N { strip_by::<T, R, N>(out, rows, inner, s * N, N, first) } else { strip_by::<T, R, N>(out, rows, inner, s * N, out.len(), first) }
+        });
+    }
+    if inner > N || rows.len() < 2 * N {
+        return rows.chunks_exact(inner).enumerate().fold(true, |fits, (j, row)| fits & step_row::<T, R>(totals, row, first && j == 0));
+    }
+    match inner {
+        _ if N % inner == 0 => blocks_by::<T, R, N>(totals, rows, first, N),
+        3 => blocks_by::<T, R, N>(totals, rows, first, 3 * (N / 4)),
+        _ => blocks_by::<T, R, N>(totals, rows, first, N - N % inner),
+    }
+}
+
+/// Folds columns `start..start + width` of `rows`, which hold `inner` items each, down every row into `out`, their `width` totals, and
+/// gives whether every fold fits. `width` is at most `N`. Where `first` is true, the fold of the strip replaces `out`. A width the
+/// compiler knows keeps the running totals in registers.
+#[inline(always)]
+fn strip_by<T: Copy, R: Reduction<T>, const N: usize>(out: &mut [R::Total], rows: &[T], inner: usize, start: usize, width: usize, first: bool) -> bool {
+    let (mut run, mut fits) = ([R::identity(); N], true);
+    for row in rows.chunks_exact(inner) {
+        let strip = &row[start..start + width];
+        for k in 0..width { let (t, f) = R::checked(run[k], strip[k]); (run[k], fits) = (t, fits & f) }
+    }
+    for k in 0..width {
+        let (t, f) = if first { (run[k], true) } else { R::merge(out[k], run[k]) };
+        (out[k], fits) = (t, fits & f);
+    }
+    fits
+}
+
+/// `rows_by` in blocks of `width` items, a multiple of `inner` no greater than `N`. A width the compiler knows keeps the running totals
+/// in registers.
+#[inline(always)]
+fn blocks_by<T: Copy, R: Reduction<T>, const N: usize>(totals: &mut [R::Total], rows: &[T], first: bool, width: usize) -> bool {
+    let inner = totals.len();
+    let (blocks, rest) = rows.split_at(rows.len() - rows.len() % width);
+    // `run` can stay in registers through the loop because nothing takes its address, unlike `all`.
+    let (mut run, mut fits) = ([R::identity(); N], true);
+    for block in blocks.chunks_exact(width) {
+        for k in 0..width { let (t, f) = R::checked(run[k], block[k]); (run[k], fits) = (t, fits & f) }
+    }
+    let mut all = run;
+    let parts = &mut all[..width];
+    for (k, &x) in rest.iter().enumerate() { let (t, f) = R::checked(parts[k], x); (parts[k], fits) = (t, fits & f) }
+    for (c, total) in totals.iter_mut().enumerate() {
+        let (column, ok) = parts[c..].iter().step_by(inner).fold((R::identity(), true), |(s, ok), &p| { let (t, f) = R::merge(s, p); (t, ok & f) });
+        let (t, f) = if first { (column, ok) } else { let (t, f) = R::merge(*total, column); (t, f & ok) };
+        (*total, fits) = (t, fits & f);
+    }
+    fits
+}
+
 /// Folds `block`, the items from position `start` on of an array of shape `[outer, len, inner]` held row by row, into `totals`, the
 /// folds by `R` of the array's lanes along its middle axis so far, which start at `R::unit()`. Gives whether every fold still fits.
 /// Along the last axis, a lane's items are consecutive. Whole lanes fold as `fold_rows` folds them, and the pieces of a lane that a
-/// block boundary splits fold by `slice` and join by `merge`. Along any other axis, each item steps its lane's fold by `checked`.
+/// block boundary splits fold by `slice` and join by `merge`. Along any other axis, runs of whole rows fold as [`step_rows`] folds
+/// them, and a row that a block boundary splits steps item by item.
 pub fn fold_into<T: Copy, R: Reduction<T>>(totals: &mut [R::Total], [_, len, inner]: [usize; 3], start: usize, block: &[T]) -> bool {
     let (mut rest, mut fits) = (block, true);
     if rest.is_empty() { return true; }
@@ -762,10 +904,17 @@ pub fn fold_into<T: Copy, R: Reduction<T>>(totals: &mut [R::Total], [_, len, inn
         let row = start / inner;
         let (mut i, mut j, mut k) = (row / len, row % len, start % inner);
         while !rest.is_empty() {
-            let (piece, after) = rest.split_at((inner - k).min(rest.len()));
-            fits &= step_row::<T, R>(&mut totals[i * inner + k..], piece, j == 0);
-            (rest, k) = (after, k + piece.len());
-            if k == inner { (j, k) = (j + 1, 0); }
+            let rows = if k == 0 { (len - j).min(rest.len() / inner) } else { 0 };
+            if rows > 0 {
+                let (whole, after) = rest.split_at(rows * inner);
+                fits &= step_rows::<T, R>(&mut totals[i * inner..(i + 1) * inner], whole, j == 0);
+                (rest, j) = (after, j + rows);
+            } else {
+                let (piece, after) = rest.split_at((inner - k).min(rest.len()));
+                fits &= step_row::<T, R>(&mut totals[i * inner + k..], piece, j == 0);
+                (rest, k) = (after, k + piece.len());
+                if k == inner { (j, k) = (j + 1, 0); }
+            }
             if j == len { (i, j) = (i + 1, 0); }
         }
     }

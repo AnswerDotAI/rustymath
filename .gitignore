@@ -1,3 +1,4 @@
+meta/
 .last_checked
 __pycache__/
 *.py[cod]

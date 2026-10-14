@@ -18,7 +18,7 @@ use pyo3::prelude::*;
 use rustymath::linalg::{self, AndOr, Factor, Inner, LuRef, LuWork, MaxPlus, MinPlus, OrAnd, PlusEqual, PlusNotEqual, PlusTimes, Scalar, SvdRef};
 use rustymath::Float;
 
-use crate::{fe, parallel::{overlaps, span}, Code, Loop, NONE};
+use crate::{fe, parallel::{overlaps, separate}, Code, Loop, NONE};
 
 /// A generalized ufunc loop.
 type Ufunc = unsafe extern "C" fn(*mut *mut c_char, *mut npy_intp, *mut npy_intp, *mut c_void);
@@ -40,11 +40,8 @@ impl MatrixLoop {
     /// calls the loop.
     fn independent(&self, pointers: &[usize], dims: &[usize], outer: &[npy_intp], core: &[npy_intp], n: usize) -> bool {
         let spans: Option<Vec<_>> = self.args.iter().zip(pointers).zip(outer).skip(self.nin).map(|((arg, &p), &outer)| {
-            let mut axes: Vec<_> = arg.shape.iter().zip(&core[arg.at..]).map(|(&d, &s)| (dims[d], s)).collect();
-            let one = span(p, arg.width, &axes)?;
-            if !one.is_empty() && outer.unsigned_abs() < one.len() { return None }
-            axes.push((n, outer));
-            span(p, arg.width, &axes)
+            let axes: Vec<_> = arg.shape.iter().zip(&core[arg.at..]).map(|(&d, &s)| (dims[d], s)).collect();
+            separate(p, arg.width, &axes, n, outer)
         }).collect();
         spans.is_some_and(|s| (1..s.len()).all(|i| (0..i).all(|j| !overlaps(&s[i], &s[j]))))
     }
@@ -213,8 +210,8 @@ fn nans<W: Scalar>(n: usize) -> Vec<W> { vec![W::from_real(W::Real::nan()); n] }
 /// `n` complex NaNs, the complex results of a matrix of item type `E` that fails.
 fn complex_nans<E: Item>(n: usize) -> Vec<Complex<Part<E>>> { vec![Complex::new(Part::<E>::nan(), Part::<E>::nan()); n] }
 
-/// Runs `f` on the LU factorization in the first two inputs: an `n`×`n` matrix of packed factors and the positions of its `n` rows.
-/// `None` where a position is out of range.
+/// Runs `f` on the LU factorization in the first two inputs: the `n`×`n` packed factors, transposed as the `lu` gufunc writes them, and
+/// the positions of the `n` rows. `None` where a position is out of range.
 fn with_lu<E: Item, R>(c: &Cell<'_>, n: usize, f: impl FnOnce(LuRef<'_, E::W>) -> R) -> Option<R> {
     let (factors, perm) = (c.read::<E>(0), c.read::<i64>(1));
     let perm: Vec<usize> = perm.iter().map(|&i| i as usize).collect();
@@ -269,7 +266,8 @@ gufunc_types! {
         c.write(2, &[log], E::Real::store);
         true
     }
-    /// `lu`: the packed LU factors of an `m`×`m` matrix, and the positions of its rows.
+    /// `lu`: the packed LU factors of an `m`×`m` matrix and the positions of its rows. NumPy holds the factors transposed: their rows
+    /// are rustymath's columns.
     Lu(c, work: LuWork<E::W>) {
         let [m] = c.dims();
         let f = work.factor(&c.read::<E>(0), m);
@@ -466,34 +464,24 @@ fn echelon<'py>(py: Python<'py>, a: &Bound<'py, PyUntypedArray>, columns: Option
     }
 }
 
-/// A rustymath inner product, as the value of its unit type.
-trait Pair { const PAIR: Self; }
-impl Pair for PlusTimes { const PAIR: Self = PlusTimes; }
-impl Pair for MaxPlus { const PAIR: Self = MaxPlus; }
-impl Pair for MinPlus { const PAIR: Self = MinPlus; }
-impl Pair for OrAnd { const PAIR: Self = OrAnd; }
-impl Pair for AndOr { const PAIR: Self = AndOr; }
-impl Pair for PlusEqual { const PAIR: Self = PlusEqual; }
-impl Pair for PlusNotEqual { const PAIR: Self = PlusNotEqual; }
-
 /// `matmul` and the other matrix products: `P`'s inner product of an `n`×`k` matrix and a `k`×`m` matrix.
 struct Product<P>(PhantomData<P>);
-impl<P: Pair + Inner<E::W, Out = E::W>, E: Stored> Gufunc<E> for Product<P> {
+impl<P: Default + Inner<E::W, Out = E::W>, E: Stored> Gufunc<E> for Product<P> {
     type S = ();
     fn each(c: &Cell<'_>, _: &mut ()) -> bool {
         let [n, k, m] = c.dims();
-        c.write(2, &P::PAIR.inner(&c.read::<E>(0), &c.read::<E>(1), [n, k, m]), E::store);
+        c.write(2, &P::default().inner(&c.read::<E>(0), &c.read::<E>(1), [n, k, m]), E::store);
         true
     }
 }
 
 /// `add_equal` and `add_not_equal`: `P`'s count over each row of an `n`×`k` matrix and column of a `k`×`m` matrix, as int64.
 struct Count<P>(PhantomData<P>);
-impl<P: Pair + Inner<E::W, Out: Copy + Into<i64>>, E: Stored> Gufunc<E> for Count<P> {
+impl<P: Default + Inner<E::W, Out: Copy + Into<i64>>, E: Stored> Gufunc<E> for Count<P> {
     type S = ();
     fn each(c: &Cell<'_>, _: &mut ()) -> bool {
         let [n, k, m] = c.dims();
-        c.write(2, &P::PAIR.inner(&c.read::<E>(0), &c.read::<E>(1), [n, k, m]), Into::<i64>::into);
+        c.write(2, &P::default().inner(&c.read::<E>(0), &c.read::<E>(1), [n, k, m]), Into::<i64>::into);
         true
     }
 }
@@ -508,16 +496,16 @@ fn entry<E: Item>(f: Ufunc, kinds: &[Kind]) -> Loop {
 }
 
 /// `P`'s product loops at float16, float32 and float64.
-fn float_products<P: Pair + Inner<f32, Out = f32> + Inner<f64, Out = f64>>() -> Vec<Loop> {
+fn float_products<P: Default + Inner<f32, Out = f32> + Inner<f64, Out = f64>>() -> Vec<Loop> {
     let kinds = [Kind::E; 3];
     vec![entry::<f16>(looped::<Product<P>, f16>, &kinds), entry::<f32>(looped::<Product<P>, f32>, &kinds), entry::<f64>(looped::<Product<P>, f64>, &kinds)]
 }
 
 /// `P`'s product loop at int64, whose arithmetic wraps.
-fn integer_product<P: Pair + Inner<i64, Out = i64>>() -> Loop { (Some(looped::<Product<P>, i64> as Ufunc), vec![i64::CODE as c_char; 3]) }
+fn integer_product<P: Default + Inner<i64, Out = i64>>() -> Loop { (Some(looped::<Product<P>, i64> as Ufunc), vec![i64::CODE as c_char; 3]) }
 
 /// `P`'s count loops at int64, float16, float32 and float64, each giving int64 counts.
-fn counts<P: Pair + Inner<i64, Out = i64> + Inner<f32, Out = i32> + Inner<f64, Out = i64>>() -> Vec<Loop> {
+fn counts<P: Default + Inner<i64, Out = i64> + Inner<f32, Out = i32> + Inner<f64, Out = i64>>() -> Vec<Loop> {
     let entry = |f: Ufunc, t: NPY_TYPES| (Some(f), vec![t as c_char, t as c_char, i64::CODE as c_char]);
     vec![entry(looped::<Count<P>, i64>, i64::CODE), entry(looped::<Count<P>, f16>, f16::CODE), entry(looped::<Count<P>, f32>, f32::CODE), entry(looped::<Count<P>, f64>, f64::CODE)]
 }
@@ -548,11 +536,11 @@ pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "pinv" "(m,n)->(n,m)": 1 => [E, E] = Pinv, "The pseudoinverse of each matrix. A square matrix with no negligible LU pivot gives its inverse through LU, with no cutoff.";
         "det" "(m,m)->()": 1 => [E, E] = Det, "The determinant of each square matrix.";
         "slogdet" "(m,m)->(),()": 1 => [E, E, R] = Slogdet, "The sign of each square matrix's determinant, and the logarithm of its magnitude.";
-        "lu" "(m,m)->(m,m),(m)": 1 => [E, E, I] = Lu, "Packed LU factors and the row positions of each square matrix.";
-        "lu_solve" "(m,m),(m),(m,k)->(m,k)": 3 => [E, I, E, E] = LuSolve, "Solve from packed LU factors, without refactoring.";
-        "lu_inverse" "(m,m),(m)->(m,m)": 2 => [E, I, E] = LuInverse, "Inverse from packed LU factors, without refactoring.";
-        "lu_det" "(m,m),(m)->()": 2 => [E, I, E] = LuDet, "Determinant from packed LU factors.";
-        "lu_slogdet" "(m,m),(m)->(),()": 2 => [E, I, E, R] = LuSlogdet, "Sign and log magnitude of a determinant from packed LU factors.";
+        "lu" "(m,m)->(m,m),(m)": 1 => [E, E, I] = Lu, "Packed LU factors and the row positions of each square matrix. The factors are transposed, because rustymath stores them column by column.";
+        "lu_solve" "(m,m),(m),(m,k)->(m,k)": 3 => [E, I, E, E] = LuSolve, "Solve from transposed packed LU factors, as `lu` gives them, without refactoring.";
+        "lu_inverse" "(m,m),(m)->(m,m)": 2 => [E, I, E] = LuInverse, "Inverse from transposed packed LU factors, as `lu` gives them, without refactoring.";
+        "lu_det" "(m,m),(m)->()": 2 => [E, I, E] = LuDet, "Determinant from transposed packed LU factors, as `lu` gives them.";
+        "lu_slogdet" "(m,m),(m)->(),()": 2 => [E, I, E, R] = LuSlogdet, "Sign and log magnitude of a determinant from transposed packed LU factors, as `lu` gives them.";
         "cholesky" "(m,m)->(m,m)": 1 => [E, E] = Cholesky, "The lower triangular Cholesky factor of each positive definite matrix.";
         "qr_m" "(m,n)->(m,m),(m,n)": 1 => [E, E, E] = Qr, "Q and R of each matrix with no more rows than columns.";
         "qr_n" "(m,n)->(m,n),(n,n)": 1 => [E, E, E] = Qr, "Q and R of each matrix with no more columns than rows.";
