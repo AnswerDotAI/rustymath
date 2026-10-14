@@ -50,8 +50,11 @@ fn prepared<T: Scalar>(a: Matrix<'_, T>, [rows, cols]: [usize; 2], gram: bool) -
         Op::Normal => 111, Op::Transpose => 112, Op::Adjoint => adjoint, Op::Conjugate => if complex::<T>() { 0 } else { 111 },
     };
     if op == 0 || (gram && op != 111 && op != adjoint) {
-        let mut data = Vec::with_capacity(rows * cols);
-        for i in 0..rows { data.extend((0..cols).map(|j| a.at(i, j))) }
+        let data = if a.op.transposed() { transpose_by(a.data, a.ld, [cols, rows], |x| x) } else {
+            let mut data = Vec::with_capacity(rows * cols);
+            for i in 0..rows { data.extend(a.data[i * a.ld..][..cols].iter().map(|&x| x.conj())) }
+            data
+        };
         return (Cow::Owned(data), cols as Int, 111)
     }
     (Cow::Borrowed(a.data), a.ld as Int, op)

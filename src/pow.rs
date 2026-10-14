@@ -150,7 +150,10 @@ const MULTIPLIED: u32 = 8;
 #[inline(always)]
 fn small_whole<R: Native>(y: R) -> Option<(u32, bool)> {
     let a = y.abs();
-    ((a.trunc() == a) & (a >= R::narrow(2.0)) & (a <= R::narrow(MULTIPLIED.into()))).then(|| (a.wide() as u32, y < R::zero()))
+    // Clamped to the range and truncated, a is unchanged only if it's a whole number in that range. That one comparison is one branch.
+    // Separate tests compile to separate branches on x86, which mispredict for exponents in a random order.
+    let m = a.max(R::narrow(2.0)).min(R::narrow(MULTIPLIED.into())).trunc();
+    (m == a).then(|| (a.wide() as u32, y < R::zero()))
 }
 
 /// `$body` with `$k` a const for the magnitude m that `small_whole` gives, from 2 to `MULTIPLIED`.

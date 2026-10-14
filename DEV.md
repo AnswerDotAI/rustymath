@@ -26,15 +26,15 @@ Keep these profiles aligned with basedpl's. Cargo uses the consuming workspace's
 
 ### Speed measurements
 
-`tests/speed.txt` holds budgets in copies of the same number of items. The speed test times each copy immediately before its operation. The standard-library comparisons are informational. A budget failure often identifies a loop that stopped vectorizing. `RUSTYMATH_COSTS` prints every cost and the README's comparison table.
+`tests/speed.txt` holds budgets in copies of the same number of items. A copy is the time to write that many items of the same type, each negated, into a second buffer. The speed test times each copy immediately before its operation. The standard-library comparisons are informational. A budget failure often identifies a loop that stopped vectorizing. `RUSTYMATH_COSTS` prints every cost and the README's comparison table.
 
-The manually triggered `Speed` workflow measures the Ubicloud runner used by `Test` and restores its cache. After a run, use `basedpl.bpltests` to set budgets under the rule in `tests/speed.txt`:
+The manually triggered `Speed` workflow measures the Ubicloud runner used by `Test` and restores its cache. After a run, review it and decide which budgets should change, following basedpl's DEV.md on `Speed` runs. Then use `basedpl.bpltests` to set those budgets under the rule in `tests/speed.txt`:
 
 ```python
-set_budgets(native=[cargo_costs(rms), logged_costs(log)], run=run, path=rms/'tests/speed.txt')
+set_budgets(native=[cargo_costs(rms), logged_costs(log)], path=rms/'tests/speed.txt', cases=cases)
 ```
 
-Here `rms` is this repo's `Path`, `log` is the job log and `run` is its run number. Budget measurements use `parallel::set_threads(1)`; multicore scaling is a separate measurement.
+Here `rms` is this repo's `Path`, `log` is the job log and `cases` lists the codes of the cases you decided to change. Add `run=` with the run number only when the run sets every budget. It replaces the header line that names the run all the CI figures come from. Budget measurements use `parallel::set_threads(1)`. Measure multicore scaling separately.
 
 On macOS, a native timing measures Accelerate wherever the Linear algebra section says Accelerate replaces rustymath's own code. To time rustymath's own versions natively on the Mac, pass `native=True` to basedpl's `time_cases` or `speed_costs`. That sets `RUSTYMATH_NATIVE=1` for their worker, which dev builds honour. basedpl's wasm build, timed with `speed_costs(wasm=DIR)`, also runs rustymath's own versions. CI's `Speed` run times them natively on x86-64.
 

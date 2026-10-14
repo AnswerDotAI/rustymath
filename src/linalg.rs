@@ -9,7 +9,8 @@
 //! at opt-level 2. It vectorizes only tiles of up to 32 items, too few to keep the multiply-add units busy. On AArch64, in wasm
 //! and on x86-64 with AVX2 and FMA, the float pairs run micro-kernels on explicit vectors instead. Their maximum and minimum are each
 //! target's own instruction: `fmax` on AArch64, `max` in wasm and `maxpd` on x86-64. On AArch64 and in wasm a NaN term makes a
-//! result NaN. On x86-64 a NaN term is skipped. Targets without these vectors run the plain kernels.
+//! result NaN. On x86-64 only a NaN first term makes a result NaN. Later NaN terms are skipped. Targets without these vectors
+//! run the plain kernels.
 //!
 //! A product large enough splits its rows across the threads that [`crate::parallel::set_threads`] sets.
 //! On macOS, Accelerate computes real and complex plus-times products instead. `Tiled` also sends the decompositions' triangular
@@ -125,8 +126,8 @@ pub trait Inner<T> {
 /// finite takes four real products instead.
 #[derive(Default)]
 pub struct PlusTimes;
-/// `⌈.+`, the max-plus product of longest-path problems, at `i64`, `f32` and `f64`. On AArch64 a NaN term makes its result NaN.
-/// Other targets skip NaN terms.
+/// `⌈.+`, the max-plus product of longest-path problems, at `i64`, `f32` and `f64`. The module doc says how each target treats a
+/// NaN term.
 #[derive(Default)]
 pub struct MaxPlus;
 /// `⌊.+`, the min-plus product of shortest-path problems, at `i64`, `f32` and `f64`. Its minimum treats NaN as `MaxPlus`'s maximum does.
@@ -381,7 +382,7 @@ fn tiled_into<T: Copy + Default + Send + Sync, P: Pair<T>, const MR: usize, cons
 ) {
     assert!(a.len() == m * k && b.len() == k * n && c.len() == m * n, "`a` must hold `m`×`k` items, `b` `k`×`n` and `c` `m`×`n`");
     if k == 0 { c.fill(P::UNIT) }
-    product::<T, P, MR, NR>(c, n, |i, p| a[i * k + p], |p, j, out| row_run(b, n, p, j, out), [m, k, n], true, Part::Whole, kernel);
+    product::<T, P, MR, NR>(c, n, |rows, p0, out| strip(a, k, false, rows, p0, out, |x| x), |columns, p0, out| strip(b, n, true, columns, p0, out, |x| x), [m, k, n], true, Part::Whole, kernel);
 }
 inner! {
     MaxPlus at f64 => f64: tiles::COMPARES64, max_plus64;
@@ -519,23 +520,46 @@ impl<T: Scalar> Matrix<'_, T> {
         Self { op: match self.op { Op::Normal => Op::Conjugate, Op::Transpose => Op::Adjoint, Op::Adjoint => Op::Transpose, Op::Conjugate => Op::Normal }, ..self }
     }
     pub fn adjoint(self) -> Self { self.transpose().conjugate() }
+    #[cfg(native)]
     #[inline(always)]
     pub fn at(self, i: usize, j: usize) -> T {
         let x = self.data[if self.op.transposed() { j * self.ld + i } else { i * self.ld + j }];
         if matches!(self.op, Op::Adjoint | Op::Conjugate) { x.conj() } else { x }
     }
+    /// Writes a packing strip of this view, times `scale`, as the free function `strip` does: item `[p][l]` is item `(r0 + l, p0 + p)`.
+    /// A product packs strips of `a` from `a`, and of `b` from `b`'s transpose.
     #[cfg(native)]
     #[inline(always)]
-    fn run(self, p: usize, j: usize, out: &mut [MaybeUninit<T>]) {
-        if matches!(self.op, Op::Normal) { row_run(self.data, self.ld, p, j, out) }
-        else { for (l, slot) in out.iter_mut().enumerate() { *slot = MaybeUninit::new(self.at(p, j + l)) } }
+    fn strip<const W: usize>(self, rows: [usize; 2], p0: usize, scale: T, out: &mut [[MaybeUninit<T>; W]]) where T: Default {
+        let (transposed, one) = (self.op.transposed(), scale == T::one());
+        if size_of::<T>() == size_of::<T::Real>() || !matches!(self.op, Op::Adjoint | Op::Conjugate) {
+            if one { strip(self.data, self.ld, transposed, rows, p0, out, |x| x) } else { strip(self.data, self.ld, transposed, rows, p0, out, |x| scale * x) }
+        } else if one { strip(self.data, self.ld, transposed, rows, p0, out, |x: T| x.conj()) } else { strip(self.data, self.ld, transposed, rows, p0, out, |x: T| scale * x.conj()) }
     }
 }
-/// Copies a contiguous run without repeating its bounds check for each packed item.
+/// Writes all `W` items of each step of a packing strip, through `f`. Item `[p][l]` is item `(r0 + l, p0 + p)` of the matrix that `data`
+/// holds at `r * ld + p`, or at `p * ld + r` where `transposed`, for `l` below `lines`, and the default after that. Transposed data gives
+/// each step from one run, and other data from `lines` rows read side by side. Every step writes a fixed `W` items, which keeps short
+/// strips from calling `memcpy` or `memset` at each step.
 #[inline(always)]
-fn row_run<T: Copy>(data: &[T], ld: usize, p: usize, j: usize, out: &mut [MaybeUninit<T>]) {
-    let items = &data[p * ld + j..][..out.len()];
-    for l in 0..out.len() { out[l] = MaybeUninit::new(items[l]) }
+fn strip<S: Copy, T: Default, const W: usize>(data: &[S], ld: usize, transposed: bool, [r0, lines]: [usize; 2], p0: usize, out: &mut [[MaybeUninit<T>; W]], f: impl Fn(S) -> T) {
+    assert!(lines <= W);
+    let kc = out.len();
+    let rows: [&[S]; W] = std::array::from_fn(|l| if transposed || l >= lines { &[] } else { &data[(r0 + l) * ld + p0..][..kc] });
+    match (transposed, lines == W) {
+        (true, true) => for (p, step) in out.iter_mut().enumerate() {
+            let run: &[S; W] = data[(p0 + p) * ld + r0..].first_chunk().expect("a whole step lies in `data`");
+            for l in 0..W { step[l] = MaybeUninit::new(f(run[l])) }
+        },
+        (true, false) => for (p, step) in out.iter_mut().enumerate() {
+            let run = &data[(p0 + p) * ld + r0..][..lines];
+            for l in 0..W { step[l] = MaybeUninit::new(if l < lines { f(run[l]) } else { T::default() }) }
+        },
+        (false, true) => for (p, step) in out.iter_mut().enumerate() { for l in 0..W { step[l] = MaybeUninit::new(f(rows[l][p])) } },
+        (false, false) => for (p, step) in out.iter_mut().enumerate() {
+            for l in 0..W { step[l] = MaybeUninit::new(if l < lines { f(rows[l][p]) } else { T::default() }) }
+        },
+    }
 }
 /// Item types whose matrix products run on the tiled `+.×` kernels: `f32` and `f64`, and complex numbers with parts of either type.
 /// The decompositions in `factor` build on them.
@@ -565,9 +589,10 @@ pub(crate) trait Tiled: Scalar + Default + Vendor {
         if m == 0 || n == 0 { return }
         dispatch!(accelerate::triangular(x, ldx, a, [m, n], side, triangle), factor::triangular_native(x, ldx, a, [m, n], side, triangle))
     }
-    /// Native packing also serves computed real parts inside the complex 3M implementation.
+    /// `alpha a b` on rustymath's own packed kernels, replacing `c` with `start` and added to it otherwise. Complex items run three real
+    /// products through `complex_product`.
     #[cfg(native)]
-    fn native_product(c: &mut [Self], ldc: usize, a: impl Fn(usize, usize) -> Self + Sync, b: Matrix<'_, Self>, size: [usize; 3], start: bool, part: Part);
+    fn native_product(c: &mut [Self], ldc: usize, a: Matrix<'_, Self>, alpha: Self, b: Matrix<'_, Self>, size: [usize; 3], start: bool, part: Part);
     /// The thin SVD of the finite, nonempty `m`×`n` matrix `a` as `(U, s, V)`, with its singular vectors only where `vectors` is true, or
     /// `None` where it doesn't converge.
     fn svd(a: &[Self], size: [usize; 2], vectors: bool) -> Option<(Vec<Self>, Vec<Self::Real>, Vec<Self>)>;
@@ -605,7 +630,7 @@ fn scale<T: Tiled>(c: &mut [T], ldc: usize, [m, n]: [usize; 2], beta: T, part: P
 fn native_gemm<T: Tiled>(c: &mut [T], ldc: usize, a: Matrix<'_, T>, b: Matrix<'_, T>, [m, k, n]: [usize; 3], alpha: T, beta: T, part: Part) {
     let start = beta == T::zero();
     if !start { scale(c, ldc, [m, n], beta, part) }
-    T::native_product(c, ldc, |i, p| if alpha == T::one() { a.at(i, p) } else { alpha * a.at(i, p) }, b, [m, k, n], start, part)
+    T::native_product(c, ldc, a, alpha, b, [m, k, n], start, part)
 }
 /// The items of a product's result that it must fold: all of them, or those on and below its diagonal.
 #[derive(Clone, Copy)]
@@ -618,13 +643,14 @@ impl Part {
     }
 }
 macro_rules! tiled {
-    (@real $t:ty, $tile:ident, $kernel:ident; $c:ident, $ldc:ident, $a:ident, $b:ident, $size:ident, $start:ident, $part:ident) => {{
+    (@real $t:ty, $tile:ident, $kernel:ident; $c:ident, $ldc:ident, $a:ident, $alpha:ident, $b:ident, $size:ident, $start:ident, $part:ident) => {{
         const MR: usize = tiles::$tile[0];
         const NR: usize = tiles::$tile[1];
-        product::<$t, PlusTimes, MR, NR>($c, $ldc, $a, |p, j, out| $b.run(p, j, out), $size, $start, $part, $kernel::<MR, NR, { NR * size_of::<$t>() / tiles::BYTES }>)
+        let one = <$t>::one();
+        product::<$t, PlusTimes, MR, NR>($c, $ldc, |rows, p0, out| $a.strip(rows, p0, $alpha, out), |columns, p0, out| $b.transpose().strip(columns, p0, one, out), $size, $start, $part, $kernel::<MR, NR, { NR * size_of::<$t>() / tiles::BYTES }>)
     }};
-    (@complex $r:ty; $c:ident, $ldc:ident, $a:ident, $b:ident, $size:ident, $start:ident, $part:ident) => {
-        complex_product::<$r>($c, $ldc, $a, $b, $size, $start, $part)
+    (@complex $r:ty; $c:ident, $ldc:ident, $a:ident, $alpha:ident, $b:ident, $size:ident, $start:ident, $part:ident) => {
+        complex_product::<$r>($c, $ldc, $a, $alpha, $b, $size, $start, $part)
     };
     (@eig real; $a:ident, $n:ident, $vectors:ident) => {{
         #[cfg(accelerate)]
@@ -636,8 +662,8 @@ macro_rules! tiled {
         impl Tiled for $t {
             #[cfg(native)]
             #[inline]
-            fn native_product(c: &mut [$t], ldc: usize, a: impl Fn(usize, usize) -> $t + Sync, b: Matrix<'_, $t>, size: [usize; 3], start: bool, part: Part) {
-                tiled!(@$kind $($args)*; c, ldc, a, b, size, start, part)
+            fn native_product(c: &mut [$t], ldc: usize, a: Matrix<'_, $t>, alpha: $t, b: Matrix<'_, $t>, size: [usize; 3], start: bool, part: Part) {
+                tiled!(@$kind $($args)*; c, ldc, a, alpha, b, size, start, part)
             }
             fn svd(a: &[$t], size: [usize; 2], vectors: bool) -> Option<(Vec<$t>, Vec<<$t as Scalar>::Real>, Vec<$t>)> {
                 dispatch!(accelerate::svd(a, size, vectors), factor::svd::native(a, size, vectors))
@@ -669,20 +695,17 @@ tiled! {
     Complex<f64>: complex(f64);
 }
 /// Native complex 3M: `p = aᵣ bᵣ`, `q = aᵢ bᵢ`, `s = (aᵣ + aᵢ)(bᵣ + bᵢ)` gives real `p-q` and imaginary `s-p-q`.
-/// Nonfinite imaginary parts use the two ordinary cross-products instead.
+/// Nonfinite imaginary parts use the two ordinary cross-products instead. `parts` splits each operand once, before the real products.
 #[cfg(native)]
-fn complex_product<R: crate::Native + Tiled>(c: &mut [Complex<R>], ldc: usize, a: impl Fn(usize, usize) -> Complex<R> + Sync, b: Matrix<'_, Complex<R>>, size: [usize; 3], start: bool, part: Part) {
+fn complex_product<R: crate::Native + Tiled>(c: &mut [Complex<R>], ldc: usize, a: Matrix<'_, Complex<R>>, alpha: Complex<R>, b: Matrix<'_, Complex<R>>, size: [usize; 3], start: bool, part: Part) {
     let [m, k, n] = size;
     if m == 0 || k == 0 || n == 0 { return }
+    let ([ar, ai, asum], [br, bi, bs]) = (parts(a, [m, k], alpha), parts(b, [k, n], Complex::new(R::one(), R::zero())));
+    let real = |c: &mut [R], x: &[R], y: &[R], start: bool| R::native_product(c, n, Matrix::rows(x, k), R::one(), Matrix::rows(y, n), size, start, part);
     let (mut p, mut q, mut s) = (filled(m * n, R::zero()), filled(m * n, R::zero()), filled(m * n, R::zero()));
-    let (mut br, mut bi, mut bs) = (filled(k * n, R::zero()), filled(k * n, R::zero()), filled(k * n, R::zero()));
-    for l in 0..k {
-        let (re, im, sum) = (&mut br[l * n..][..n], &mut bi[l * n..][..n], &mut bs[l * n..][..n]);
-        for j in 0..n { let x = b.at(l, j); (re[j], im[j], sum[j]) = (x.re, x.im, x.re + x.im) }
-    }
-    R::native_product(&mut p, n, |i, l| a(i, l).re, Matrix::rows(&br, n), size, true, part);
-    R::native_product(&mut q, n, |i, l| a(i, l).im, Matrix::rows(&bi, n), size, true, part);
-    R::native_product(&mut s, n, |i, l| { let x = a(i, l); x.re + x.im }, Matrix::rows(&bs, n), size, true, part);
+    real(&mut p, &ar, &br, true);
+    real(&mut q, &ai, &bi, true);
+    real(&mut s, &asum, &bs, true);
     let mut finite = true;
     for i in 0..m {
         for j in part.columns(i, n) {
@@ -695,8 +718,8 @@ fn complex_product<R: crate::Native + Tiled>(c: &mut [Complex<R>], ldc: usize, a
     }
     if !finite {
         let mut four = filled(m * n, R::zero());
-        R::native_product(&mut four, n, |i, l| a(i, l).re, Matrix::rows(&bi, n), size, true, part);
-        R::native_product(&mut four, n, |i, l| a(i, l).im, Matrix::rows(&br, n), size, false, part);
+        real(&mut four, &ar, &bi, true);
+        real(&mut four, &ai, &br, false);
         for i in 0..m {
             for j in part.columns(i, n) {
                 let (t, x) = (i * n + j, &mut c[i * ldc + j]);
@@ -704,6 +727,17 @@ fn complex_product<R: crate::Native + Tiled>(c: &mut [Complex<R>], ldc: usize, a
             }
         }
     }
+}
+
+/// The real parts, imaginary parts and their sums of `scale` times the `rows`×`cols` matrix that `x` views, each row by row.
+#[cfg(native)]
+fn parts<R: crate::Native + Tiled>(x: Matrix<'_, Complex<R>>, [rows, cols]: [usize; 2], scale: Complex<R>) -> [Vec<R>; 3] {
+    let (one, conj) = (scale == Complex::new(R::one(), R::zero()), matches!(x.op, Op::Adjoint | Op::Conjugate));
+    let value = |v: Complex<R>| { let v = if conj { v.conj() } else { v }; if one { v } else { scale * v } };
+    let mut z = filled(rows * cols, Complex::default());
+    if x.op.transposed() { transpose_into(x.data, x.ld, &mut z, cols, [cols, rows], value) }
+    else { for (row, out) in z.chunks_exact_mut(cols).enumerate() { for (o, &v) in out.iter_mut().zip(&x.data[row * x.ld..][..cols]) { *o = value(v) } } }
+    [z.iter().map(|v| v.re).collect(), z.iter().map(|v| v.im).collect(), z.iter().map(|v| v.re + v.im).collect()]
 }
 
 /// The micro-kernels in plain Rust, for targets without the explicit ones. Each takes the number of vectors in a tile row, `V`, as
@@ -904,7 +938,8 @@ const PANEL: usize = 1 << 22;
 /// with 32 MB ones, and a threaded tall QR whose threads each ran one such product was 2% slower with 4 MB panels than with 2 MB ones.
 const SERIAL_PANEL: usize = 2 << 20;
 /// Folds the inner product of `P` into `c`, an `m`×`n` matrix whose rows start `ldc` items apart, with `kernel` folding each `MR`×`NR`
-/// tile as `micro` does. `a(i, p)` gives the items of the `m`×`k` matrix `a`, and `b` holds the `k`×`n` matrix `b`. With `start`, the
+/// tile as `micro` does. `a(rows, p0, steps)` writes a strip of the `m`×`k` matrix `a`, and `b(columns, p0, steps)` a strip of the
+/// transpose of the `k`×`n` matrix `b`, as `Matrix::strip` does. With `start`, the
 /// product replaces `c`, which must then hold `f`'s identity where `k` is 0. Otherwise each result folds into `c`'s item with `f`. Only
 /// tiles that hold items of `part` fold. Items outside `part` in those tiles fold too. Each block of `NC`
 /// columns packs `b` in panels of at most [`PANEL`] items, or [`SERIAL_PANEL`] bytes on one thread, across threads as [`parallel::split`] chooses. Then it runs bands of rows
@@ -915,8 +950,8 @@ const SERIAL_PANEL: usize = 2 << 20;
 fn product<T: Copy + Default + Send + Sync, P: Pair<T>, const MR: usize, const NR: usize>(
     c: &mut [P::Out],
     ldc: usize,
-    a: impl Fn(usize, usize) -> T + Sync,
-    b: impl Fn(usize, usize, &mut [MaybeUninit<T>]) + Sync,
+    a: impl Fn([usize; 2], usize, &mut [[MaybeUninit<T>; MR]]) + Sync,
+    b: impl Fn([usize; 2], usize, &mut [[MaybeUninit<T>; NR]]) + Sync,
     [m, k, n]: [usize; 3],
     start: bool,
     part: Part,
@@ -943,7 +978,7 @@ fn product<T: Copy + Default + Send + Sync, P: Pair<T>, const MR: usize, const N
                     let (j, lines) = (jc + s * NR, NR.min(nc - s * NR));
                     for (step, part) in strip.chunks_mut(NR * KC).enumerate() {
                         let pc = pp + step * KC;
-                        pack::<_, NR>(part, part.len() / NR, lines, |p, l, out| b(pc + p, j + l, out));
+                        pack::<_, NR>(part, part.len() / NR, lines, |first, ln, steps| b([j + first, ln], pc, steps));
                     }
                 }
                 true
@@ -961,7 +996,7 @@ fn product<T: Copy + Default + Send + Sync, P: Pair<T>, const MR: usize, const N
                     for ic in (i0..i1).step_by(MC) {
                         let mc = MC.min(i1 - ic);
                         if lower && ic + mc <= jc { continue }
-                        let ap = pack::<_, MR>(&mut slots, kc, mc, |p, i, out| for l in 0..out.len() { out[l] = MaybeUninit::new(a(ic + i + l, pc + p)) });
+                        let ap = pack::<_, MR>(&mut slots, kc, mc, |first, lines, steps| a([ic + first, lines], pc, steps));
                         for jr in (0..nc).step_by(NR) {
                             let bj = &bp[jr / NR * unit + step * NR * KC..][..NR * kc];
                             for ir in (0..mc).step_by(MR) {
@@ -983,20 +1018,12 @@ fn product<T: Copy + Default + Send + Sync, P: Pair<T>, const MR: usize, const N
 }
 
 /// Packs `len` lines of `kc` steps into strips of `W` lines at the start of `buffer`, and gives the items it wrote. Each strip holds its
-/// `W` items for step 0, then those for step 1, and so on. `run(p, l, out)` writes `out.len()` items of step `p` into `out`, from line
-/// `l` on. Lines past `len` hold the default, and the results computed from them are never stored.
-fn pack<T: Copy + Default, const W: usize>(buffer: &mut [MaybeUninit<T>], kc: usize, len: usize, run: impl Fn(usize, usize, &mut [MaybeUninit<T>])) -> &[T] {
+/// `W` items for step 0, then those for step 1, and so on. `strip(first, lines, steps)` writes all `W` items of each of the strip's
+/// `kc` steps: `lines` items for lines `first` on, then the default. The results computed from the defaults are never stored.
+fn pack<T: Copy + Default, const W: usize>(buffer: &mut [MaybeUninit<T>], kc: usize, len: usize, strip: impl Fn(usize, usize, &mut [[MaybeUninit<T>; W]])) -> &[T] {
     let strips = len.div_ceil(W);
-    for (s, strip) in buffer.chunks_exact_mut(W * kc).take(strips).enumerate() {
-        let (first, lines) = (s * W, W.min(len - s * W));
-        for (p, step) in strip.as_chunks_mut::<W>().0.iter_mut().enumerate() {
-            if lines == W {
-                run(p, first, step)
-            } else {
-                run(p, first, &mut step[..lines]);
-                for slot in &mut step[lines..] { *slot = MaybeUninit::new(T::default()) }
-            }
-        }
+    for (s, chunk) in buffer.chunks_exact_mut(W * kc).take(strips).enumerate() {
+        strip(s * W, W.min(len - s * W), chunk.as_chunks_mut::<W>().0);
     }
     slice::written(&mut buffer[..strips * W * kc])
 }
