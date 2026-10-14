@@ -179,7 +179,8 @@ fn implicit_ql<T: Scalar>(d: &mut [T::Real], e: &mut [T::Real], vt: &mut [T], n:
             let mut split = false;
             for i in (l..m).rev() {
                 let (f, b) = (s * e[i], c * e[i]);
-                let r = plain_hypot(f, g);
+                let r;
+                (c, s, r) = givens(g, f);
                 e[i + 1] = r;
                 if r == zero {
                     // An exact zero splits the block: d[i + 1] has converged.
@@ -188,7 +189,6 @@ fn implicit_ql<T: Scalar>(d: &mut [T::Real], e: &mut [T::Real], vt: &mut [T], n:
                     split = true;
                     break;
                 }
-                (s, c) = (f / r, g / r);
                 g = d[i + 1] - p;
                 let r = (d[i] - g) * s + (c + c) * b;
                 p = s * r;

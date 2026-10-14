@@ -470,9 +470,16 @@ fn largest<T: Scalar>(x: &[T]) -> usize {
     x.iter().position(|v| v.abs1() == top).unwrap_or(0)
 }
 
-/// `√(x² + y²)` with no scaling, for the rotations of the tridiagonal and bidiagonal iterations. It overflows where `x²` or `y²` does.
-#[cfg(native)]
+/// `√(x² + y²)` with no scaling, for plane rotations and the shifts of the tridiagonal and bidiagonal iterations. It overflows where
+/// `x²` or `y²` does.
 fn plain_hypot<R: Native>(x: R, y: R) -> R { x.mla::<FUSED>(x, y * y).sqrt() }
+
+/// The plane rotation that takes `(y, z)` to `(r, 0)`, as `(c, s, r)` with `c = y/r` and `s = z/r`, or `(1, 0, 0)` where both are
+/// zero. The tridiagonal QL and bidiagonal QR steps and the Krylov methods of `optimize` build their rotations with it.
+pub(crate) fn givens<R: Native>(y: R, z: R) -> (R, R, R) {
+    let r = plain_hypot(y, z);
+    if r == R::zero() { (R::one(), R::zero(), R::zero()) } else { (y / r, z / r, r) }
+}
 
 /// The greatest `f(v)` over the items `v` of `x`, ignoring NaN, or 0 for an empty `x`. Eight running maximums find it, which vectorizes.
 fn greatest<T: Copy, R: Native>(x: &[T], f: impl Fn(T) -> R) -> R {

@@ -1,5 +1,5 @@
 import numpy as np, pytest
-from rustymath.optimize import minimize, root_scalar
+from rustymath.optimize import minimize, root_scalar, least_squares, cg, minres, gmres, lsmr
 
 def rosen(x): return (1-x[0])**2 + 100*(x[1]-x[0]**2)**2
 def rosen_grad(x): return np.array([-2*(1-x[0]) - 400*x[0]*(x[1]-x[0]**2), 200*(x[1]-x[0]**2)])
@@ -24,4 +24,49 @@ def test_minimize():
 def test_root_scalar():
     r = root_scalar(lambda x: np.cos(x) - x, [0, 1])
     assert r.converged and r.root == pytest.approx(0.7390851332151607, abs=1e-8) and r.function_calls < 20
+    assert root_scalar(lambda x: np.cos(x) - x, x0=-20).root == pytest.approx(0.7390851332151607, abs=1e-8)
     assert not root_scalar(lambda x: x*x + 1, [0, 1]).converged
+    with pytest.raises(TypeError, match='bracket or x0'): root_scalar(np.cos)
+
+def test_least_squares():
+    t = np.linspace(0, 2, 5)
+    calls = []
+    def fit(p):
+        calls.append(p)
+        return p[0]*np.exp(p[1]*t) - 2*np.exp(0.3*t)
+    def jac(p): return np.column_stack([np.exp(p[1]*t), p[0]*t*np.exp(p[1]*t)])
+    r = least_squares(fit, [1, 1])
+    assert r.success and np.allclose(r.x, [2, 0.3]) and r.cost < 1e-20 and r.nfev == len(calls)
+    assert np.allclose(least_squares(fit, [1, 1], jac=jac).x, [2, 0.3])
+    y, s = np.array([1, 2.9, 5.2, 6.8, 9.1]), np.arange(5.)
+    assert np.allclose(least_squares(lambda c: c[0] + c[1]*s - y, [0, 0]).x, np.polyfit(s, y, 1)[::-1])
+
+def test_linear():
+    rng = np.random.default_rng(0)
+    m, b = rng.uniform(-0.5, 0.5, (30, 30)), rng.uniform(size=30)
+    spd, general = m.T @ m + np.eye(30), m + 4*np.eye(30)
+    for solve in (cg, minres, gmres):
+        r = solve(spd, b, rtol=1e-12)
+        assert r.success and np.allclose(r.x, np.linalg.solve(spd, b)) and r.normr < 1e-9, solve.__name__
+    assert np.allclose(gmres(general, b, rtol=1e-12).x, np.linalg.solve(general, b))
+    assert cg(spd, b.astype(np.float32)).x.dtype == np.float32
+    # `maxiter` counts iterations as SciPy does. Four CG steps take four products, plus the residual's at the start and at the end. One
+    # GMRES cycle takes 20 steps and its own residual's product.
+    assert [cg(spd, b, maxiter=4).nmatvec, gmres(general, b, rtol=1e-14, maxiter=1).nmatvec] == [6, 22]
+    tall, y = rng.uniform(size=(60, 20)), rng.uniform(size=60)
+    r = lsmr(tall, y, rtol=1e-12)
+    assert r.success and np.allclose(r.x, np.linalg.lstsq(tall, y, rcond=None)[0])
+    # Three LSMR steps take a product with `A` and one with its transpose each, after one for Aᵀb and two for the starting residual,
+    # and the residual at the end takes one more.
+    assert lsmr(tall, y, maxiter=3).nmatvec == 1 + 2 + 3*2 + 1
+    # Jacobi's preconditioner, the reciprocal of the diagonal, cuts the products for a matrix whose diagonal spans four orders.
+    d = 10**np.linspace(0, 2, 30)
+    scaled = d[:, None] * spd * d
+    plain, fast = cg(scaled, b, rtol=1e-10), cg(scaled, b, rtol=1e-10, M=np.diag(1/np.diag(scaled)))
+    assert fast.success and 2*fast.nmatvec < plain.nmatvec and np.allclose(fast.x, np.linalg.solve(scaled, b))
+    class Products:
+        "A matrix that gives only its products, as SciPy's `LinearOperator` can"
+        shape = tall.shape
+        def matvec(self, v): return tall @ v
+    with pytest.raises(TypeError, match='rmatvec'): lsmr(Products(), y)
+    with pytest.raises(ValueError, match='transpose'): cg(tall, y)

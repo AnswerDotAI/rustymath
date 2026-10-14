@@ -166,11 +166,6 @@ fn golub_kahan<T: Scalar>(d: &mut [T::Real], e: &mut [T::Real], ut: &mut [T], vt
     if n < 2 { return Some(()) }
     let (m, w, vectors) = (ut.len() / n, vt.len() / n, !vt.is_empty());
     let (zero, eps) = (T::Real::zero(), T::Real::epsilon());
-    // The rotation that takes (y, z) to (r, 0), as (c, s, r).
-    let givens = |y: T::Real, z: T::Real| {
-        let r = plain_hypot(y, z);
-        if r == zero { (T::Real::one(), zero, zero) } else { (y / r, z / r, r) }
-    };
     let tiny = eps * d.iter().chain(e.iter()).fold(zero, |b, &x| b.max(x.abs()));
     let negligible = |e: T::Real, d0: T::Real, d1: T::Real| e.abs() <= eps * (d0.abs() + d1.abs()) || e.abs() <= T::Real::min_positive_value();
     let (mut end, mut sweeps) = (n, 0);

@@ -413,7 +413,7 @@ mod optimize {
             assert!(found.converged && off(&found.x, &[1.0, 1.0]) < 1e-6, "{method:?} {bounds:?}: {found:?}");
         }
         // With a gradient and no bounds, `minimize` runs L-BFGS.
-        let found = minimize(&mut Differentiable { value: rosenbrock, gradient: rosenbrock_gradient }, &[-1.2, 1.0], &Options::default()).unwrap();
+        let found = minimize(&mut Differentiable { value: rosenbrock, derivative: rosenbrock_gradient }, &[-1.2, 1.0], &Options::default()).unwrap();
         assert!(found.converged && off(&found.x, &[1.0, 1.0]) < 1e-6, "L-BFGS: {found:?}");
         // One variable runs Brent's method, which brackets the minimum or stops at a bound.
         let mut parabola = |x: &[f64]| Ok::<_, Infallible>((x[0] - 2.0).powi(2) + 1.0);
@@ -446,8 +446,15 @@ mod optimize {
     #[test]
     fn defaults_limits_and_failures() {
         use Method::*;
-        let choices = [(1, true, false), (2, true, false), (2, true, true), (2, false, true), (2, false, false)].map(|(n, g, b)| Method::choose(n, g, b));
+        let minimizing = [(1, true, false), (2, true, false), (2, true, true), (2, false, true), (2, false, false)];
+        let choices = minimizing.map(|(n, gradient, bounded)| Method::choose(Task::Minimize { gradient }, n, bounded));
         assert_eq!(choices, [Brent, Lbfgs, Powell, Powell, NelderMead]);
+        // Solving picks Brent's method for one equation in one variable, and solving linear equations picks MINRES for least squares.
+        let solving = [(Task::Solve { residuals: 1 }, 1), (Task::Solve { residuals: 3 }, 2), (Task::Linear { equations: 3, adjoint: false }, 3)];
+        let least_squares = [(Task::Linear { equations: 3, adjoint: true }, 3), (Task::Linear { equations: 5, adjoint: true }, 3)];
+        let choices = solving.into_iter().chain(least_squares).map(|(task, n)| Method::choose(task, n, false)).collect::<Vec<_>>();
+        assert_eq!(choices, [Brent, LevenbergMarquardt, Gmres, Minres, Minres]);
+        assert_eq!(Options::<f64> { method: Some(Cg), ..Default::default() }.check(Task::Minimize { gradient: false }, 2), Err("that method solves equations, and doesn't minimize"));
         // A search that runs out of evaluations returns its best point so far, unconverged.
         let found = minimize(&mut rosenbrock, &[-1.2, 1.0], &Options { evaluations: Some(25), ..Default::default() }).unwrap();
         assert!(!found.converged && found.evaluations == 25 && found.value < rosenbrock(&[-1.2, 1.0]).unwrap(), "{found:?}");
@@ -461,8 +468,8 @@ mod optimize {
         assert!(found.converged && off(&found.x, &[0.5, 0.0]) < 1e-6, "{found:?}");
         // Reversed bounds, and a tolerance that isn't a positive number, are errors that a binding reports.
         let reversed = Options { bounds: Some(Bounds { lower: &[1.0], upper: &[0.0] }), ..Default::default() };
-        assert_eq!(reversed.check(1, false), Err("each lower limit must be at most its upper limit"));
-        assert_eq!(Options { tolerance: Some(0.0), ..Default::default() }.check(1, false), Err("the tolerance must be a positive number"));
+        assert_eq!(reversed.check(Task::Minimize { gradient: false }, 1), Err("each lower limit must be at most its upper limit"));
+        assert_eq!(Options { tolerance: Some(0.0), ..Default::default() }.check(Task::Minimize { gradient: false }, 1), Err("the tolerance must be a positive number"));
     }
 
     /// The sum of squares, as an objective that records how many points each call evaluates.
@@ -474,6 +481,7 @@ mod optimize {
             self.0.push(1);
             Ok(x.iter().map(|v| v * v).sum())
         }
+        fn batch(&self) -> bool { true }
         fn values(&mut self, xs: &[f64], out: &mut [f64]) -> Result<(), Infallible> {
             self.0.push(out.len());
             let n = xs.len() / out.len();
@@ -495,18 +503,223 @@ mod optimize {
         assert!(found.converged && off(&found.x, &[0.0; 3]) < 1e-6 && evolving.0.iter().filter(|&&k| k == 12).count() > 2, "{found:?}");
     }
 
+    /// `f` as a mapping of one variable to one value.
+    fn scalar<F: Copy>(f: impl Fn(F) -> F) -> impl FnMut(&[F], &mut [F]) -> Result<(), Infallible> {
+        move |x, out| {
+            out[0] = f(x[0]);
+            Ok(())
+        }
+    }
+
+    /// `solve` from `start`, after evaluating `mapping` there for its `residuals` first values, as a caller does.
+    fn solved<F: rustymath::Native + rustymath::linalg::Factor, M: Mapping<F>>(
+        mapping: &mut M, start: &[F], residuals: usize, options: &Options<'_, F>,
+    ) -> Result<Found<Vec<F>, F>, M::Error> {
+        let mut first = vec![F::zero(); residuals];
+        mapping.value(start, &mut first)?;
+        solve(mapping, start, &first, options)
+    }
+
     #[test]
     fn roots() {
-        let found = root(|x: f64| Ok::<_, Infallible>(x.cos() - x), [0.0, 1.0], None, None).unwrap();
-        assert!(found.converged && (found.x - 0.739_085_133_215_160_6).abs() < 1e-8 && found.evaluations < 12, "{found:?}");
-        let found = root(|x: f32| Ok::<_, Infallible>(x * x * x - 2.0), [0.0, 2.0], None, None).unwrap();
-        assert!(found.converged && (found.x - 2f32.cbrt()).abs() < 1e-3, "{found:?}");
-        // A root at zero, and ends whose signs agree, which give the end nearer zero.
-        let found = root(|x: f64| Ok::<_, Infallible>(x.sinh()), [-1.0, 3.0], None, None).unwrap();
-        assert!(found.converged && found.x.abs() < 1e-15, "{found:?}");
-        let found = root(|x: f64| Ok::<_, Infallible>(x * x + 1.0), [-1.0, 2.0], None, None).unwrap();
-        assert!(!found.converged && found.x == -1.0, "{found:?}");
-        assert_eq!(root(|_: f64| Err::<f64, _>("stopped"), [0.0, 1.0], None, None), Err("stopped"));
+        let options = Options::default();
+        // Finite bounds are the bracket. Without them, the search steps outward from the start until the signs differ.
+        let bracket = Options { bounds: Some(Bounds { lower: &[0.0], upper: &[1.0] }), ..options };
+        let found = solved(&mut scalar(|x: f64| x.cos() - x), &[0.0], 1, &bracket).unwrap();
+        assert!(found.converged && (found.x[0] - 0.739_085_133_215_160_6).abs() < 1e-8 && found.evaluations < 12, "{found:?}");
+        let found = solved(&mut scalar(|x: f64| x.cos() - x), &[-20.0], 1, &options).unwrap();
+        assert!(found.converged && (found.x[0] - 0.739_085_133_215_160_6).abs() < 1e-8, "{found:?}");
+        let found = solved(&mut scalar(|x: f32| x * x * x - 2.0), &[0.0f32], 1, &Options::default()).unwrap();
+        assert!(found.converged && (found.x[0] - 2f32.cbrt()).abs() < 1e-3, "{found:?}");
+        let found = solved(&mut scalar(|x: f64| x.sinh()), &[3.0], 1, &options).unwrap();
+        assert!(found.converged && found.x[0].abs() < 1e-15, "{found:?}");
+        // A step into negative numbers, where √ is NaN, halves back until the value is defined, and so finds the root at 1/9.
+        let found = solved(&mut scalar(|x: f64| 1.0 / x.sqrt() - 3.0), &[1.0], 1, &options).unwrap();
+        assert!(found.converged && (found.x[0] - 1.0 / 9.0).abs() < 1e-8, "{found:?}");
+        // A bracket whose ends have the same sign fails, and gives the point nearest zero of the three evaluated: the start and the ends.
+        let same = Options { bounds: Some(Bounds { lower: &[-1.0], upper: &[2.0] }), ..options };
+        let found = solved(&mut scalar(|x: f64| x * x + 1.0), &[0.0], 1, &same).unwrap();
+        assert!(!found.converged && found.x == [0.0] && found.evaluations == 3, "{found:?}");
+        assert_eq!(solved(&mut |_: &[f64], _: &mut [f64]| Err::<(), _>("stopped"), &[0.0], 1, &options), Err("stopped"));
+    }
+
+    #[test]
+    fn nonlinear_systems() {
+        let options = Options::default();
+        // y = a e^(b x) through five points that it fits exactly, from a start far off.
+        let xs = [0.0, 0.5, 1.0, 1.5, 2.0];
+        let mut curve = |p: &[f64], r: &mut [f64]| {
+            for (r, &x) in r.iter_mut().zip(&xs) { *r = p[0] * (p[1] * x).exp() - 2.0 * (0.3 * x).exp() }
+            Ok::<_, Infallible>(())
+        };
+        let found = solved(&mut curve, &[1.0, 1.0], 5, &options).unwrap();
+        assert!(found.converged && off(&found.x, &[2.0, 0.3]) < 1e-8 && found.value < 1e-10, "{found:?}");
+        // Rosenbrock's function as two equations, 10 (y - x²) = 0 and 1 - x = 0, whose root is (1, 1). With a vector–Jacobian
+        // product, the Jacobian comes from it, row by row, in place of forward differences.
+        let rosen = |p: &[f64], r: &mut [f64]| {
+            (r[0], r[1]) = (10.0 * (p[1] - p[0] * p[0]), 1.0 - p[0]);
+            Ok::<_, Infallible>(())
+        };
+        let differenced = solved(&mut { rosen }, &[-1.2, 1.0], 2, &options).unwrap();
+        assert!(differenced.converged && off(&differenced.x, &[1.0, 1.0]) < 1e-10, "{differenced:?}");
+        let vjp = |u: &[f64], p: &[f64], g: &mut [f64]| {
+            (g[0], g[1]) = (-20.0 * p[0] * u[0] - u[1], 10.0 * u[0]);
+            Ok::<_, Infallible>(())
+        };
+        let exact = solved(&mut Differentiable { value: rosen, derivative: vjp }, &[-1.2, 1.0], 2, &options).unwrap();
+        assert!(exact.converged && off(&exact.x, &[1.0, 1.0]) < 1e-10 && exact.evaluations < differenced.evaluations, "{exact:?}");
+        // Data that no line fits gives the least-squares line, as `lstsq` gives it.
+        let (t, y) = ([0.0, 1.0, 2.0, 3.0, 4.0], [1.0, 2.9, 5.2, 6.8, 9.1]);
+        let mut line = |c: &[f64], r: &mut [f64]| {
+            for i in 0..5 { r[i] = c[0] + c[1] * t[i] - y[i] }
+            Ok::<_, Infallible>(())
+        };
+        let found = solved(&mut line, &[0.0, 0.0], 5, &options).unwrap();
+        let design: Vec<f64> = t.iter().flat_map(|&t| [1.0, t]).collect();
+        let (best, _) = rustymath::linalg::lstsq(&design, &y, [5, 2], 1);
+        assert!(found.converged && off(&found.x, &best) < 1e-7, "{found:?}");
+        // Residuals a million times larger change nothing: the damping scales with the Jacobian's columns.
+        let mut steep = |p: &[f64], r: &mut [f64]| {
+            for i in 0..2 { r[i] = 1e6 * (p[i] - 2.0) }
+            Ok::<_, Infallible>(())
+        };
+        let found = solved(&mut steep, &[1.0, 1.0], 2, &options).unwrap();
+        assert!(found.converged && off(&found.x, &[2.0, 2.0]) < 1e-8, "{found:?}");
+        // Where the residuals are infinite, or every difference for the Jacobian is NaN, the gradient test can't pass.
+        let mut pole = |p: &[f64], r: &mut [f64]| {
+            (r[0], r[1]) = (1.0 / p[0] - 1.0, p[1] - 1.0);
+            Ok::<_, Infallible>(())
+        };
+        let found = solved(&mut pole, &[0.0, 0.0], 2, &options).unwrap();
+        assert!(!found.converged, "{found:?}");
+        let mut edge = |p: &[f64], r: &mut [f64]| {
+            for i in 0..2 { r[i] = (1.0 - p[i]).sqrt() - 0.5 }
+            Ok::<_, Infallible>(())
+        };
+        let found = solved(&mut edge, &[1.0, 1.0], 2, &options).unwrap();
+        assert!(!found.converged, "{found:?}");
+        // A search that runs out of evaluations returns its best point so far, and an error from the function ends it.
+        let found = solved(&mut curve, &[1.0, 1.0], 5, &Options { evaluations: Some(6), ..options }).unwrap();
+        assert!(!found.converged && found.evaluations == 6, "{found:?}");
+        assert_eq!(solved(&mut |_: &[f64], _: &mut [f64]| Err::<(), _>("stopped"), &[0.0, 0.0], 2, &options), Err("stopped"));
+        let bounded = Options { bounds: Some(Bounds { lower: &[0.0; 2], upper: &[1.0; 2] }), ..options };
+        assert_eq!(bounded.check(Task::Solve { residuals: 5 }, 2), Err("Levenberg–Marquardt takes no bounds"));
+    }
+
+    /// A uniform number from -0.5 to 0.5, the `i`th of a fixed sequence.
+    fn uniform(i: usize) -> f64 { (super::support::random(i as u64) >> 11) as f64 / (1u64 << 53) as f64 - 0.5 }
+
+    /// AᵀA + I for an `n`×`n` matrix A of the `uniform` numbers from the `first`th on, which is symmetric positive definite.
+    fn positive_definite(n: usize, first: usize) -> Vec<f64> {
+        let a: Vec<f64> = (first..first + n * n).map(uniform).collect();
+        (0..n * n).map(|k| (0..n).map(|l| a[l * n + k / n] * a[l * n + k % n]).sum::<f64>() + if k % (n + 1) == 0 { 1.0 } else { 0.0 }).collect()
+    }
+
+    /// The products of the matrix `a`, whose rows hold `cols` items, with vectors.
+    fn product(a: &[f64], cols: usize) -> impl FnMut(&[f64], &mut [f64]) -> Result<(), Infallible> + '_ {
+        move |v, out| {
+            for (i, o) in out.iter_mut().enumerate() { *o = (0..cols).map(|j| a[i * cols + j] * v[j]).sum() }
+            Ok(())
+        }
+    }
+
+    /// The products of the transpose of `a`, whose rows hold `cols` items, with vectors, as a vector–Jacobian product.
+    fn transposed(a: &[f64], cols: usize) -> impl FnMut(&[f64], &[f64], &mut [f64]) -> Result<(), Infallible> + '_ {
+        move |u, _, out| {
+            for (j, o) in out.iter_mut().enumerate() { *o = u.iter().enumerate().map(|(i, &u)| a[i * cols + j] * u).sum() }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn linear_systems() {
+        let n = 30;
+        let tight = Options { tolerance: Some(1e-12), ..Default::default() };
+        let random: Vec<f64> = (0..n * n).map(uniform).collect();
+        let spd = positive_definite(n, 0);
+        let general: Vec<f64> = (0..n * n).map(|k| random[k] + if k % (n + 1) == 0 { 4.0 } else { 0.0 }).collect();
+        let b: Vec<f64> = (1000..1000 + n).map(uniform).collect();
+        let zeros = vec![0.0; n];
+        // CG, MINRES and GMRES on a symmetric positive definite system, and GMRES, the default for a square system, on a general one.
+        for method in [Method::Cg, Method::Minres, Method::Gmres] {
+            let found = solve_linear(&mut product(&spd, n), &b, &zeros, &Options { method: Some(method), ..tight }).unwrap();
+            let exact = rustymath::linalg::solve(&spd, &b, [n, n], 1);
+            assert!(found.converged && off(&found.x, &exact) < 1e-9 && found.value < 1e-10, "{method:?}: {found:?}");
+        }
+        let found = solve_linear(&mut product(&general, n), &b, &zeros, &tight).unwrap();
+        let exact = rustymath::linalg::solve(&general, &b, [n, n], 1);
+        assert!(found.converged && off(&found.x, &exact) < 1e-9 && found.evaluations > 20, "{found:?}");
+        // Least squares on a tall system, by MINRES, the default, and by CG on the normal equations, against `lstsq`.
+        let (m, k) = (60, 20);
+        let tall: Vec<f64> = (5000..5000 + m * k).map(uniform).collect();
+        let y: Vec<f64> = (9000..9000 + m).map(uniform).collect();
+        let (best, _) = rustymath::linalg::lstsq(&tall, &y, [m, k], 1);
+        for method in [None, Some(Method::Cg)] {
+            let mut a = Differentiable { value: product(&tall, k), derivative: transposed(&tall, k) };
+            let found = solve_linear(&mut a, &y, &vec![0.0; k], &Options { method, ..tight }).unwrap();
+            assert!(found.converged && off(&found.x, &best) < 1e-8, "{method:?}: {found:?}");
+        }
+        assert_eq!(Options::<f64>::default().check(Task::Linear { equations: m, adjoint: false }, k), Err("least squares needs products with the transpose"));
+        // A right-hand side of zeros gives zeros, from any start.
+        let found = solve_linear(&mut product(&spd, n), &zeros, &b, &tight).unwrap();
+        assert!(found.converged && found.x == zeros, "{found:?}");
+        // A solve that runs out of products returns its last iterate, and an error from a product ends it.
+        let found = solve_linear(&mut product(&general, n), &b, &zeros, &Options { evaluations: Some(5), ..tight }).unwrap();
+        assert!(!found.converged && found.evaluations == 6, "{found:?}");
+        assert_eq!(solve_linear(&mut |_: &[f64], _: &mut [f64]| Err::<(), _>("stopped"), &b, &zeros, &tight), Err("stopped"));
+    }
+
+    /// The matrix `a`, whose rows hold `cols` items, as a mapping that gives its transpose's products where `adjoint`. Where `diagonal`
+    /// isn't empty, its preconditioner is Jacobi's, which divides by `diagonal`.
+    struct Dense<'a> {
+        a: &'a [f64],
+        cols: usize,
+        adjoint: bool,
+        diagonal: Vec<f64>,
+    }
+
+    impl Mapping<f64> for Dense<'_> {
+        type Error = Infallible;
+        fn value(&mut self, v: &[f64], out: &mut [f64]) -> Result<(), Infallible> { product(self.a, self.cols)(v, out) }
+        fn has_vjp(&self) -> bool { self.adjoint }
+        fn vjp(&mut self, u: &[f64], x: &[f64], out: &mut [f64]) -> Result<(), Infallible> { transposed(self.a, self.cols)(u, x, out) }
+        fn has_preconditioner(&self) -> bool { !self.diagonal.is_empty() }
+        fn precondition(&mut self, v: &[f64], out: &mut [f64]) -> Result<(), Infallible> {
+            for i in 0..v.len() { out[i] = v[i] / self.diagonal[i] }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn preconditioners() {
+        // A symmetric positive definite matrix whose diagonal spans four orders of magnitude. Jacobi's preconditioner, the reciprocal
+        // of the diagonal, cuts the products that each method needs.
+        let n = 40;
+        let scale: Vec<f64> = (0..n).map(|i| 10f64.powf(2.0 * i as f64 / (n - 1) as f64)).collect();
+        let core = positive_definite(n, 20_000);
+        let a: Vec<f64> = (0..n * n).map(|k| core[k] * scale[k / n] * scale[k % n]).collect();
+        let b: Vec<f64> = (30_000..30_000 + n).map(uniform).collect();
+        let diagonal: Vec<f64> = (0..n).map(|i| a[i * (n + 1)]).collect();
+        let options = Options { tolerance: Some(1e-10), evaluations: Some(10_000), ..Default::default() };
+        let exact = rustymath::linalg::solve(&a, &b, [n, n], 1);
+        let size = exact.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        for method in [Method::Cg, Method::Minres, Method::Gmres] {
+            let options = Options { method: Some(method), ..options };
+            let plain = solve_linear(&mut Dense { a: &a, cols: n, adjoint: false, diagonal: vec![] }, &b, &vec![0.0; n], &options).unwrap();
+            let fast = solve_linear(&mut Dense { a: &a, cols: n, adjoint: false, diagonal: diagonal.clone() }, &b, &vec![0.0; n], &options).unwrap();
+            assert!(fast.converged && off(&fast.x, &exact) < 1e-6 * size && 2 * fast.evaluations < plain.evaluations, "{method:?}: {plain:?} {fast:?}");
+        }
+        // Least squares with columns of very different sizes, where M approximates (AᵀA)⁻¹ by the reciprocals of the columns' squared
+        // norms.
+        let (m, k) = (200, 60);
+        let tall: Vec<f64> = (40_000..40_000 + m * k).map(|i| uniform(i) * 10f64.powf(3.0 * (i % k) as f64 / (k - 1) as f64)).collect();
+        let y: Vec<f64> = (50_000..50_000 + m).map(uniform).collect();
+        let squares: Vec<f64> = (0..k).map(|j| (0..m).map(|i| tall[i * k + j] * tall[i * k + j]).sum()).collect();
+        let (best, _) = rustymath::linalg::lstsq(&tall, &y, [m, k], 1);
+        let size = best.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        let plain = solve_linear(&mut Dense { a: &tall, cols: k, adjoint: true, diagonal: vec![] }, &y, &vec![0.0; k], &options).unwrap();
+        let fast = solve_linear(&mut Dense { a: &tall, cols: k, adjoint: true, diagonal: squares }, &y, &vec![0.0; k], &options).unwrap();
+        assert!(fast.converged && off(&fast.x, &best) < 1e-6 * size && 2 * fast.evaluations < plain.evaluations, "{plain:?} {fast:?}");
     }
 }
 

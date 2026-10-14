@@ -1,13 +1,24 @@
-//! Minimizing a function of several variables, and finding a zero of a function of one.
+//! Minimizing a function of several variables, and solving equations, nonlinear or linear.
 //!
-//! [`minimize`] runs one of five methods on an [`Objective`]. [`Options`] gives the method, the bounds and when to stop. Where it
-//! gives no method, [`Method::choose`] picks one from the number of variables, whether the objective has a gradient and whether
-//! there are bounds. Every method starts from the start point moved inside the bounds, evaluates the objective only inside them, and
-//! returns the best point it evaluated. A NaN value counts as +∞. An error from the objective stops the search and comes back as
-//! `minimize`'s error. A search that uses up its evaluations returns its best point with `converged` false.
+//! [`minimize`] runs one of five methods on an [`Objective`]. [`solve`] finds a zero of a [`Mapping`], or its least-squares solution
+//! where it gives more values than it has variables: by Brent's method for one equation in one variable, and by Levenberg–Marquardt
+//! otherwise. [`solve_linear`] solves A x = b by a Krylov method, where a [`Mapping`] gives A's products with vectors, and
+//! [`solve_affine`] solves f(x) = 0 the same way for an affine `f`, through f's values alone. [`Options`] gives the method, the bounds
+//! and when to stop. Where it gives no method, [`Method::choose`] picks one for the [`Task`].
 //!
-//! [`root`] finds a zero of a function of one variable between two points where its signs differ, by Brent's method.
-use crate::{linalg::{axpy, dot}, random::SplitMix64, Native};
+//! [`minimize`] and [`solve`] start from the start point moved inside the bounds, evaluate the function only inside them, and return
+//! the best point they evaluated. A NaN value counts as +∞. An error from the function stops the search and comes back as the front's
+//! error. A search that uses up its evaluations returns its best point with `converged` false.
+//!
+//! The Krylov methods use A only through its products. Conjugate gradients (CG) solves a symmetric positive definite system, MINRES a
+//! symmetric one, and GMRES any square one. Least squares runs CG or MINRES on the normal equations AᵀA x = Aᵀb, with one product
+//! with A and one with Aᵀ for each product with AᵀA. MINRES there gives the iterates of Fong and Saunders' LSMR, and CG those of CGLS,
+//! which match Paige and Saunders' LSQR. Running on AᵀA squares A's condition number. On ill-conditioned problems that costs some
+//! accuracy next to LSMR's and LSQR's own Golub–Kahan bidiagonalization, which works on A itself. A mapping's
+//! [`Mapping::precondition`] gives a preconditioner, an approximation to the inverse of the matrix the method runs on, which cuts the
+//! steps a solve needs. CG and MINRES apply it on each step, and GMRES on the right. CG and MINRES both build on the Lanczos process.
+//! MINRES and GMRES both track the residual through plane rotations, the same ones the tridiagonal and bidiagonal iterations use.
+use crate::{linalg::{axpy, dot, givens, lstsq, Factor}, random::SplitMix64, Native};
 use rand::RngExt;
 use std::collections::VecDeque;
 
@@ -17,12 +28,14 @@ pub trait Objective<F> {
     type Error;
     /// The value at `x`.
     fn value(&mut self, x: &[F]) -> Result<F, Self::Error>;
-    /// The value at each row of `xs`, into `out`, with `xs.len() / out.len()` items to a row. Nelder–Mead evaluates its first simplex
-    /// and each shrink through one call, and differential evolution each generation. By default it calls `value` on each row.
+    /// Whether `values` evaluates a batch of points in one call. Nelder–Mead evaluates its first simplex and each shrink as a batch,
+    /// and differential evolution each generation. Without `batch`, a search calls `value` on each point.
+    fn batch(&self) -> bool { false }
+    /// The value at each row of `xs`, into `out`, with `xs.len() / out.len()` items to a row. Methods call it only where `batch` is
+    /// true.
     fn values(&mut self, xs: &[F], out: &mut [F]) -> Result<(), Self::Error> {
-        let n = xs.len() / out.len();
-        for (y, x) in out.iter_mut().zip(xs.chunks_exact(n)) { *y = self.value(x)? }
-        Ok(())
+        let _ = (xs, out);
+        unreachable!("this objective evaluates no batches")
     }
     /// Whether `gradient` gives the gradient. L-BFGS needs one, and [`Method::choose`] picks L-BFGS for an objective that has one.
     fn has_gradient(&self) -> bool { false }
@@ -38,24 +51,85 @@ impl<F, E, V: FnMut(&[F]) -> Result<F, E>> Objective<F> for V {
     fn value(&mut self, x: &[F]) -> Result<F, E> { self(x) }
 }
 
-/// An objective from a closure that gives its value and one that writes its gradient.
+/// A function from a slice of `F` to a slice of `F`, for [`solve`] and [`solve_linear`]. A closure that writes the values into its
+/// second argument and returns a `Result` is one. [`Differentiable`] adds vector–Jacobian products.
+pub trait Mapping<F> {
+    /// What stops an evaluation, as for [`Objective`].
+    type Error;
+    /// The values at `x`, into `out`.
+    fn value(&mut self, x: &[F], out: &mut [F]) -> Result<(), Self::Error>;
+    /// Whether `vjp` gives vector–Jacobian products. Least squares in [`solve_linear`] needs them.
+    fn has_vjp(&self) -> bool { false }
+    /// uᵀJ, the product of `u` with the Jacobian at `x`, into `out`. For a linear mapping it's the product of the transpose with `u`,
+    /// at any `x`. Methods call it only where `has_vjp` is true.
+    fn vjp(&mut self, u: &[F], x: &[F], out: &mut [F]) -> Result<(), Self::Error> {
+        let _ = (u, x, out);
+        unreachable!("this mapping has no vector–Jacobian product")
+    }
+    /// The Jacobian at `x`, with a row of `x.len()` items for each value, into `j`, or `false` where Levenberg–Marquardt should take
+    /// forward differences instead. By default, a mapping with `vjp` builds it one row per product when it has no more values than
+    /// variables, which takes no more calls than differences do, and otherwise gives `false`.
+    fn jacobian(&mut self, x: &[F], j: &mut [F]) -> Result<bool, Self::Error>
+    where
+        F: Native,
+    {
+        let n = x.len();
+        if !self.has_vjp() || n == 0 || j.len() > n * n { return Ok(false) }
+        let mut u = vec![F::zero(); j.len() / n];
+        for (i, row) in j.chunks_exact_mut(n).enumerate() {
+            u[i] = F::one();
+            self.vjp(&u, x, row)?;
+            u[i] = F::zero();
+        }
+        Ok(true)
+    }
+    /// Whether `precondition` gives a preconditioner's products. [`solve_linear`] runs without one otherwise.
+    fn has_preconditioner(&self) -> bool { false }
+    /// The product with `v` of a preconditioner for [`solve_linear`], into `out`: M, an approximation to the inverse of the matrix,
+    /// or of AᵀA for least squares. CG and MINRES need M symmetric positive definite. Methods call it only where
+    /// `has_preconditioner` is true.
+    fn precondition(&mut self, v: &[F], out: &mut [F]) -> Result<(), Self::Error> {
+        let _ = (v, out);
+        unreachable!("this mapping has no preconditioner")
+    }
+}
+
+impl<F, E, V: FnMut(&[F], &mut [F]) -> Result<(), E>> Mapping<F> for V {
+    type Error = E;
+    fn value(&mut self, x: &[F], out: &mut [F]) -> Result<(), E> { self(x, out) }
+}
+
+/// A function and its derivative, from two closures. As an [`Objective`], `value` gives the value and `derivative` writes the
+/// gradient. As a [`Mapping`], `value` writes the values and `derivative` takes `(u, x, out)` and writes the vector–Jacobian product.
 pub struct Differentiable<V, G> {
     pub value: V,
-    pub gradient: G,
+    pub derivative: G,
 }
 
 impl<F, E, V: FnMut(&[F]) -> Result<F, E>, G: FnMut(&[F], &mut [F]) -> Result<(), E>> Objective<F> for Differentiable<V, G> {
     type Error = E;
     fn value(&mut self, x: &[F]) -> Result<F, E> { (self.value)(x) }
     fn has_gradient(&self) -> bool { true }
-    fn gradient(&mut self, x: &[F], g: &mut [F]) -> Result<(), E> { (self.gradient)(x, g) }
+    fn gradient(&mut self, x: &[F], g: &mut [F]) -> Result<(), E> { (self.derivative)(x, g) }
 }
 
-/// The methods [`minimize`] runs.
+impl<F, E, V: FnMut(&[F], &mut [F]) -> Result<(), E>, G: FnMut(&[F], &[F], &mut [F]) -> Result<(), E>> Mapping<F> for Differentiable<V, G> {
+    type Error = E;
+    fn value(&mut self, x: &[F], out: &mut [F]) -> Result<(), E> { (self.value)(x, out) }
+    fn has_vjp(&self) -> bool { true }
+    fn vjp(&mut self, u: &[F], x: &[F], out: &mut [F]) -> Result<(), E> { (self.derivative)(u, x, out) }
+}
+
+/// The methods [`minimize`], [`solve`] and [`solve_linear`] run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
-    /// Brent's method, for one variable: golden-section steps, and parabolic steps where they shrink the interval fast enough. It
-    /// first brackets a minimum with growing steps from the start, which stop at a bound.
+    /// Brent's method, for one variable. Minimizing, it brackets a minimum with growing steps from the start, which stop at a bound,
+    /// then takes golden-section steps, and parabolic steps where they shrink the interval fast enough. Solving one equation, it
+    /// takes finite bounds as its bracket. Otherwise it steps outward from the start, extending the end whose value is nearer zero by
+    /// 1.6 times the bracket's width, until the values' signs differ. A step that lands where the value is NaN moves halfway back
+    /// toward its end until the value is defined. A side stops stepping at a bound, or where it can't step to a defined value.
+    /// Inverse quadratic interpolation and secant steps then shrink the bracket, with bisection wherever they don't shrink it fast
+    /// enough.
     Brent,
     /// Nelder–Mead's simplex, with Gao and Han's coefficients for the number of variables. It restarts from its best point until a
     /// restart no longer lowers the value.
@@ -69,39 +143,85 @@ pub enum Method {
     /// generation. The start is one member, and the rest are uniform within the bounds. It stops when the members' values lie within
     /// 1% of the best, or their points within 1% of the bounds' width in every variable. Powell's method then polishes the best point.
     Evolution,
+    /// Levenberg–Marquardt, for a zero or least-squares solution of nonlinear equations. Each step solves the linear least-squares
+    /// problem of the Jacobian, damped with Marquardt's scale for each variable, through `linalg::lstsq`. Nielsen's rule adjusts the
+    /// damping after each step. The Jacobian comes from [`Mapping::jacobian`], or else from forward differences, at one evaluation
+    /// for each variable. It stops when a step moves the point by less than `tolerance`, relative, or when the values are orthogonal
+    /// to every column of the Jacobian within `tolerance`. It fails where the values are infinite or the Jacobian isn't finite. It
+    /// takes no bounds.
+    LevenbergMarquardt,
+    /// Conjugate gradients, for a symmetric positive definite matrix. On the normal equations of least squares it gives the iterates
+    /// of CGLS, which match Paige and Saunders' LSQR.
+    Cg,
+    /// MINRES, for a symmetric matrix, definite or not. On the normal equations of least squares it gives the iterates of Fong and
+    /// Saunders' LSMR.
+    Minres,
+    /// GMRES, restarted every [`GMRES_RESTART`] steps, for any square matrix.
+    Gmres,
 }
 
 impl Method {
     /// Each method's name, which `FromStr` reads, ignoring case, and `Display` writes.
-    pub const NAMES: [(&'static str, Method); 5] = [
+    pub const NAMES: [(&'static str, Method); 9] = [
         ("brent", Method::Brent),
         ("nelder-mead", Method::NelderMead),
         ("powell", Method::Powell),
         ("l-bfgs", Method::Lbfgs),
         ("differential-evolution", Method::Evolution),
+        ("levenberg-marquardt", Method::LevenbergMarquardt),
+        ("cg", Method::Cg),
+        ("minres", Method::Minres),
+        ("gmres", Method::Gmres),
     ];
 
-    /// The method [`minimize`] runs when [`Options::method`] is `None`: Brent's method for one variable, L-BFGS for an objective with
-    /// a gradient and no bounds, Powell's method within bounds, and Nelder–Mead otherwise.
-    pub fn choose(variables: usize, gradient: bool, bounded: bool) -> Method {
-        if variables == 1 { Method::Brent }
-        else if gradient && !bounded { Method::Lbfgs }
-        else if bounded { Method::Powell }
-        else { Method::NelderMead }
+    /// The method a front runs for `task` on `variables` variables when [`Options::method`] is `None`. Minimizing, that's Brent's
+    /// method for one variable, L-BFGS for an objective with a gradient and no bounds, Powell's method within bounds, and Nelder–Mead
+    /// otherwise. Solving, it's Brent's method for one equation in one variable, and Levenberg–Marquardt otherwise. Solving linear
+    /// equations, it's MINRES for least squares, and GMRES for a square system.
+    pub fn choose(task: Task, variables: usize, bounded: bool) -> Method {
+        match task {
+            Task::Minimize { gradient } => {
+                if variables == 1 { Method::Brent }
+                else if gradient && !bounded { Method::Lbfgs }
+                else if bounded { Method::Powell }
+                else { Method::NelderMead }
+            }
+            Task::Solve { residuals } => if variables == 1 && residuals == 1 { Method::Brent } else { Method::LevenbergMarquardt },
+            Task::Linear { .. } => if task.least_squares(variables) { Method::Minres } else { Method::Gmres },
+        }
     }
 }
 
 impl std::str::FromStr for Method {
-    type Err = &'static str;
-    fn from_str(name: &str) -> Result<Method, &'static str> {
+    type Err = String;
+    fn from_str(name: &str) -> Result<Method, String> {
         let found = Method::NAMES.iter().find(|(key, _)| key.eq_ignore_ascii_case(name));
-        found.map(|&(_, method)| method).ok_or("unknown method: use brent, nelder-mead, powell, l-bfgs or differential-evolution")
+        found.map(|&(_, method)| method).ok_or_else(|| format!("unknown method: use one of {}", Method::NAMES.map(|(key, _)| key).join(", ")))
     }
 }
 
 impl std::fmt::Display for Method {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(Method::NAMES.iter().find(|&&(_, method)| method == *self).expect("every method has a name").0)
+    }
+}
+
+/// What a front is for, which decides the methods that suit it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Task {
+    /// [`minimize`], for an objective with or without a gradient.
+    Minimize { gradient: bool },
+    /// [`solve`], for a mapping that gives `residuals` values.
+    Solve { residuals: usize },
+    /// [`solve_linear`], for `equations` equations, with or without products with the matrix's transpose.
+    Linear { equations: usize, adjoint: bool },
+}
+
+impl Task {
+    /// Whether [`solve_linear`] solves least squares for `variables` unknowns: for a system that isn't square, or whose matrix gives
+    /// products with its transpose.
+    pub fn least_squares(&self, variables: usize) -> bool {
+        matches!(*self, Task::Linear { equations, adjoint } if equations != variables || adjoint)
     }
 }
 
@@ -129,18 +249,21 @@ impl<F: Native> Bounds<'_, F> {
     }
 }
 
-/// What [`minimize`] runs and when it stops. `Options::default()` lets [`Method::choose`] pick the method and leaves every
-/// variable unbounded.
-#[derive(Clone, Copy, Debug, Default)]
+/// What a front runs and when it stops. `Options::default()` lets [`Method::choose`] pick the method and leaves every variable
+/// unbounded.
+#[derive(Clone, Copy, Debug)]
 pub struct Options<'a, F> {
     /// The method, or `None` for the one [`Method::choose`] picks.
     pub method: Option<Method>,
-    /// Limits on the variables. L-BFGS takes none, and differential evolution needs finite ones.
+    /// Limits on the variables. L-BFGS, Levenberg–Marquardt and the Krylov methods take none, and differential evolution needs
+    /// finite ones. For Brent's method solving an equation, finite limits are the bracket.
     pub bounds: Option<Bounds<'a, F>>,
-    /// The relative change at which a method stops, or `None` for √ε of `F`.
+    /// The relative change at which a method stops, or `None` for √ε of `F`. A Krylov method stops when its residual's norm falls to
+    /// `tolerance` times its right-hand side's.
     pub tolerance: Option<F>,
-    /// The most evaluations of the objective, or `None` for 1000 for each variable, plus 1000, and for differential evolution another
-    /// 1000 for each member of its population.
+    /// The most evaluations of the function, or `None` for 1000 for each variable, plus 1000, and for differential evolution another
+    /// 1000 for each member of its population. For [`solve_linear`], the most products with the matrix and its transpose, or `None`
+    /// for 20 for each unknown, plus 20.
     pub evaluations: Option<usize>,
     /// Differential evolution's population, or `None` for 15 for each variable, and at least 5.
     pub population: Option<usize>,
@@ -148,16 +271,20 @@ pub struct Options<'a, F> {
     pub seed: u64,
 }
 
+impl<F> Default for Options<'_, F> {
+    fn default() -> Self { Options { method: None, bounds: None, tolerance: None, evaluations: None, population: None, seed: 0 } }
+}
+
 impl<F: Native> Options<'_, F> {
-    /// The method [`minimize`] runs for `variables` variables and an objective with or without a gradient: `method`, or the one
-    /// [`Method::choose`] picks.
-    pub fn method_for(&self, variables: usize, gradient: bool) -> Method {
-        self.method.unwrap_or_else(|| Method::choose(variables, gradient, self.bounds.is_some()))
+    /// The method a front runs for `task` on `variables` variables: `method`, or the one [`Method::choose`] picks.
+    pub fn method_for(&self, task: Task, variables: usize) -> Method {
+        self.method.unwrap_or_else(|| Method::choose(task, variables, self.bounds.is_some()))
     }
 
-    /// Why [`minimize`] would reject these options for `variables` variables and an objective with or without a gradient. A binding
-    /// calls it first and reports the message as an error.
-    pub fn check(&self, variables: usize, gradient: bool) -> Result<(), &'static str> {
+    /// Why a front would reject these options for `task` on `variables` variables. A binding calls it first and reports the message
+    /// as an error.
+    pub fn check(&self, task: Task, variables: usize) -> Result<(), &'static str> {
+        use Method::*;
         let bounds = self.bounds;
         if bounds.is_some_and(|b| b.lower.len() != variables || b.upper.len() != variables) {
             return Err("bounds need a lower and an upper limit for each variable");
@@ -166,27 +293,51 @@ impl<F: Native> Options<'_, F> {
             return Err("each lower limit must be at most its upper limit");
         }
         if self.tolerance.is_some_and(|t| !(t > F::zero() && t.is_finite())) { return Err("the tolerance must be a positive number") }
-        match self.method_for(variables, gradient) {
-            Method::Brent if variables > 1 => Err("Brent's method takes one variable"),
-            Method::Lbfgs if !gradient => Err("L-BFGS needs an objective with a gradient"),
-            Method::Lbfgs if bounds.is_some() => Err("L-BFGS takes no bounds"),
-            Method::Evolution if !bounds.is_some_and(|b| b.lower.iter().chain(b.upper).all(|v| v.is_finite())) => {
-                Err("differential evolution needs finite bounds")
-            }
-            Method::Evolution if self.population.is_some_and(|p| p < 4) => Err("differential evolution needs a population of at least 4"),
-            _ => Ok(()),
+        let method = self.method_for(task, variables);
+        match task {
+            Task::Minimize { gradient } => match method {
+                Brent if variables > 1 => Err("Brent's method takes one variable"),
+                Lbfgs if !gradient => Err("L-BFGS needs an objective with a gradient"),
+                Lbfgs if bounds.is_some() => Err("L-BFGS takes no bounds"),
+                Evolution if !bounds.is_some_and(|b| b.lower.iter().chain(b.upper).all(|v| v.is_finite())) => {
+                    Err("differential evolution needs finite bounds")
+                }
+                Evolution if self.population.is_some_and(|p| p < 4) => Err("differential evolution needs a population of at least 4"),
+                Brent | NelderMead | Powell | Lbfgs | Evolution => Ok(()),
+                _ => Err("that method solves equations, and doesn't minimize"),
+            },
+            Task::Solve { residuals } => match method {
+                Brent if variables != 1 || residuals != 1 => Err("Brent's method solves one equation in one variable"),
+                LevenbergMarquardt if bounds.is_some() => Err("Levenberg–Marquardt takes no bounds"),
+                Brent | LevenbergMarquardt => Ok(()),
+                _ => Err("that method doesn't solve nonlinear equations"),
+            },
+            Task::Linear { equations, adjoint } => match method {
+                Cg | Minres | Gmres if bounds.is_some() => Err("linear solving takes no bounds"),
+                Cg | Minres | Gmres if equations != variables && !adjoint => Err("least squares needs products with the transpose"),
+                Cg | Minres | Gmres => Ok(()),
+                _ => Err("that method doesn't solve linear equations"),
+            },
         }
+    }
+
+    /// The method and the tolerance a front runs with for `task` on `variables` variables. It panics where [`Options::check`] rejects
+    /// the options.
+    fn settings(&self, task: Task, variables: usize) -> (Method, F) {
+        if let Err(problem) = self.check(task, variables) { panic!("{problem}") }
+        (self.method_for(task, variables), self.tolerance.unwrap_or_else(|| F::epsilon().sqrt()))
     }
 }
 
-/// What [`minimize`] or [`root`] found.
+/// What a front found.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Found<X, F> {
-    /// The best point evaluated. For `root`, it's the end of the last bracket nearer zero.
+    /// The best point evaluated. For [`solve_linear`], the last iterate.
     pub x: X,
-    /// The function's value at `x`.
+    /// The function's value at `x`. For [`solve`] and [`solve_linear`], the norm of the residuals there.
     pub value: F,
-    /// How many times the function was evaluated.
+    /// How many times the function was evaluated. For [`solve_linear`], how many products with the matrix and its transpose,
+    /// including one for the residual at `x`.
     pub evaluations: usize,
     /// Whether the method's stopping test passed before the evaluations ran out.
     pub converged: bool,
@@ -198,35 +349,111 @@ pub struct Found<X, F> {
 ///
 /// If [`Options::check`] rejects the options.
 pub fn minimize<F: Native, O: Objective<F>>(objective: &mut O, start: &[F], options: &Options<'_, F>) -> Result<Found<Vec<F>, F>, O::Error> {
-    let (n, gradient) = (start.len(), objective.has_gradient());
-    if let Err(problem) = options.check(n, gradient) { panic!("{problem}") }
-    if n == 0 {
-        let value = objective.value(start)?;
-        return Ok(Found { x: Vec::new(), value: if value.is_nan() { F::infinity() } else { value }, evaluations: 1, converged: true });
-    }
-    let method = options.method_for(n, gradient);
-    let tolerance = options.tolerance.unwrap_or_else(|| F::epsilon().sqrt());
+    let (n, task) = (start.len(), Task::Minimize { gradient: objective.has_gradient() });
+    let (method, tolerance) = options.settings(task, n);
     let population = options.population.unwrap_or((15 * n).max(5));
     let limit = options.evaluations.unwrap_or(1000 * (n + 1) + if method == Method::Evolution { 1000 * population } else { 0 });
     let mut search = Search::new(objective, start, options.bounds, limit);
     let outcome = match method {
+        _ if n == 0 => search.value(&mut []).map(|_| true),
         Method::Brent => brent_method(&mut search, tolerance),
         Method::NelderMead => nelder_mead(&mut search, tolerance),
         Method::Powell => powell(&mut search, tolerance),
         Method::Lbfgs => lbfgs(&mut search, tolerance),
         Method::Evolution => evolution(&mut search, population, tolerance, options.seed),
+        _ => unreachable!("`check` accepts only methods that minimize"),
     };
-    match outcome {
-        Ok(converged) => Ok(search.found(converged)),
-        Err(Halt::Spent) => Ok(search.found(false)),
-        Err(Halt::Error(e)) => Err(e),
-    }
+    passed(outcome).map(|converged| search.found(converged))
 }
 
-/// Why a method stopped before its stopping test passed: the objective's error, or the evaluations ran out.
+/// A zero of `mapping` from `start`, by the method [`Options::method_for`] gives. `first` holds `mapping`'s values at `start`, which
+/// the caller computes. They give the number of values, and count as the search's first evaluation. Where `mapping` gives more values
+/// than it has variables, the result is the least-squares solution, and where it gives fewer, a nearby solution.
+///
+/// # Panics
+///
+/// If [`Options::check`] rejects the options.
+pub fn solve<F: Native + Factor, M: Mapping<F>>(mapping: &mut M, start: &[F], first: &[F], options: &Options<'_, F>) -> Result<Found<Vec<F>, F>, M::Error> {
+    let (n, task) = (start.len(), Task::Solve { residuals: first.len() });
+    let (method, tolerance) = options.settings(task, n);
+    let mut residual = Norm { mapping, r: first.to_vec() };
+    let mut search = Search::new(&mut residual, start, options.bounds, options.evaluations.unwrap_or(1000 * (n + 1)));
+    search.seed(start, norm(first));
+    let outcome = match method {
+        _ if n == 0 => Ok(true),
+        Method::Brent => root(&mut search, (start[0], first[0]), tolerance),
+        _ => levenberg_marquardt(&mut search, tolerance),
+    };
+    passed(outcome).map(|converged| search.found(converged))
+}
+
+/// The solution of A x = `b` from `start`, by the method [`Options::method_for`] gives. `a` gives A's products with vectors, and
+/// `b` has one item for each equation. A system that isn't square, or whose `a` gives products with A's transpose through
+/// [`Mapping::vjp`], gets its least-squares solution, from the normal equations AᵀA x = Aᵀb. A right-hand side of zeros gives zeros.
+/// `a`'s [`Mapping::precondition`] gives the products of a preconditioner M, which approximates A⁻¹, or (AᵀA)⁻¹ for least squares.
+/// CG and MINRES need M symmetric positive definite, and GMRES applies it on the right. A good M cuts the products a solve needs.
+///
+/// # Panics
+///
+/// If [`Options::check`] rejects the options.
+pub fn solve_linear<F: Native, M: Mapping<F>>(a: &mut M, b: &[F], start: &[F], options: &Options<'_, F>) -> Result<Found<Vec<F>, F>, M::Error> {
+    let (m, n) = (b.len(), start.len());
+    let task = Task::Linear { equations: m, adjoint: a.has_vjp() };
+    let (method, tolerance) = options.settings(task, n);
+    let limit = options.evaluations.unwrap_or(20 * (n + 1));
+    let mut op = Products { a, at: start, normal: task.least_squares(n), inner: vec![F::zero(); m], products: 0, limit };
+    let mut x = start.to_vec();
+    let outcome = op.rhs(b).and_then(|rhs| {
+        if norm(&rhs) == F::zero() {
+            x.fill(F::zero());
+            return Ok(true);
+        }
+        match method {
+            Method::Cg => cg(&mut op, &rhs, &mut x, tolerance),
+            Method::Minres => minres(&mut op, &rhs, &mut x, tolerance),
+            _ => gmres(&mut op, &rhs, &mut x, tolerance),
+        }
+    });
+    let converged = passed(outcome)?;
+    op.a.value(&x, &mut op.inner)?;
+    for (r, &v) in op.inner.iter_mut().zip(b) { *r = v - *r }
+    Ok(Found { value: norm(&op.inner), x, evaluations: op.products + 1, converged })
+}
+
+/// The solution of f(x) = 0 for an affine `f`, f(x) = A x − b, from `start`, by [`solve_linear`] on products that it computes from
+/// `f`'s values alone. `first` holds f(`start`), which the caller computes. It gives the number of residuals, and serves as f(0) where
+/// `start` is zero. f(0) gives −b. Each product A v is (f(t v) − f(0)) ÷ t, for the power of two t that makes t |A v| about 16 |b|.
+/// The subtraction of f(0) then loses no digits, however large b is. `f`'s `vjp` gives the transpose's products, and its
+/// `precondition` the preconditioner's. A product evaluates `f` once, or twice where the ratio |A v| ÷ |v| from the last product gave
+/// too small a t. `evaluations` counts products, as for `solve_linear`.
+///
+/// # Panics
+///
+/// If [`Options::check`] rejects the options.
+pub fn solve_affine<F: Native, M: Mapping<F>>(f: &mut M, start: &[F], first: &[F], options: &Options<'_, F>) -> Result<Found<Vec<F>, F>, M::Error> {
+    let f0 = if start.iter().all(|&x| x == F::zero()) { first.to_vec() } else {
+        let mut f0 = vec![F::zero(); first.len()];
+        f.value(&vec![F::zero(); start.len()], &mut f0)?;
+        f0
+    };
+    let b: Vec<F> = f0.iter().map(|&v| -v).collect();
+    let mut a = Affine { f, size: norm(&b), f0, ratio: None, scaled: Vec::with_capacity(start.len()) };
+    solve_linear(&mut a, &b, start, options)
+}
+
+/// Why a method stopped before its stopping test passed: the function's error, or the evaluations ran out.
 enum Halt<E> {
     Error(E),
     Spent,
+}
+
+/// Whether a method's stopping test passed, from how it ended: `false` where the evaluations ran out, or the error that stopped it.
+fn passed<E>(outcome: Result<bool, Halt<E>>) -> Result<bool, E> {
+    match outcome {
+        Ok(converged) => Ok(converged),
+        Err(Halt::Spent) => Ok(false),
+        Err(Halt::Error(e)) => Err(e),
+    }
 }
 
 /// The objective as every method sees it: each value counted against the limit, taken at the caller's point after moving it inside
@@ -249,7 +476,7 @@ impl<'a, F: Native, O: Objective<F>> Search<'a, F, O> {
 
     /// Counts `k` evaluations, and moves each row of `xs` inside the bounds.
     fn prepare(&mut self, xs: &mut [F], k: usize) -> Result<(), Halt<O::Error>> {
-        if self.limit - self.evaluations < k { return Err(Halt::Spent) }
+        if self.evaluations + k > self.limit { return Err(Halt::Spent) }
         self.evaluations += k;
         if let Some(b) = self.bounds {
             for x in xs.chunks_exact_mut(self.best.len()) { b.clamp(x) }
@@ -267,6 +494,12 @@ impl<'a, F: Native, O: Objective<F>> Search<'a, F, O> {
         y
     }
 
+    /// Counts the caller's evaluation at `start`, which gave `y`, and keeps `start` as the best point where it lies within the bounds.
+    fn seed(&mut self, start: &[F], y: F) {
+        self.evaluations += 1;
+        if start == self.best { self.record(y, start); }
+    }
+
     /// The value at `x`, after moving `x` inside the bounds.
     fn value(&mut self, x: &mut [F]) -> Result<F, Halt<O::Error>> {
         self.prepare(x, 1)?;
@@ -274,11 +507,14 @@ impl<'a, F: Native, O: Objective<F>> Search<'a, F, O> {
         Ok(self.record(y, x))
     }
 
-    /// The values at the rows of `xs`, into `out`, after moving each row inside the bounds.
+    /// The values at the rows of `xs`, into `out`, after moving each row inside the bounds: through one call of `values` where the
+    /// objective evaluates batches, and otherwise through `value` on each row.
     fn values(&mut self, xs: &mut [F], out: &mut [F]) -> Result<(), Halt<O::Error>> {
         self.prepare(xs, out.len())?;
-        self.objective.values(xs, out).map_err(Halt::Error)?;
-        for (y, x) in out.iter_mut().zip(xs.chunks_exact(self.best.len())) { *y = self.record(*y, x) }
+        let n = self.best.len();
+        if self.objective.batch() { self.objective.values(xs, out).map_err(Halt::Error)? }
+        else { for (y, x) in out.iter_mut().zip(xs.chunks_exact(n)) { *y = self.objective.value(x).map_err(Halt::Error)? } }
+        for (y, x) in out.iter_mut().zip(xs.chunks_exact(n)) { *y = self.record(*y, x) }
         Ok(())
     }
 
@@ -677,29 +913,74 @@ fn evolution<F: Native, O: Objective<F>>(search: &mut Search<'_, F, O>, populati
     powell(search, tolerance)
 }
 
-/// A zero of `f` between the ends of `bracket`, where `f`'s signs differ, by Brent's method: inverse quadratic interpolation and
-/// secant steps, with bisection wherever they don't shrink the bracket fast enough. It stops when the bracket is within `tolerance` of
-/// its end nearer zero, relative, or within `tolerance`² near zero, with `None` for √ε of `F`. It also stops after `evaluations`
-/// values, with `None` for 1000. Ends whose signs agree give the one nearer zero, with `converged` false.
-pub fn root<F: Native, E>(mut f: impl FnMut(F) -> Result<F, E>, bracket: [F; 2], tolerance: Option<F>, evaluations: Option<usize>) -> Result<Found<F, F>, E> {
-    let (tolerance, limit) = (tolerance.unwrap_or_else(|| F::epsilon().sqrt()), evaluations.unwrap_or(1000).max(2));
-    let (half, two, three) = (F::narrow(0.5), F::narrow(2.0), F::narrow(3.0));
-    let [mut a, mut b] = bracket;
-    let (mut fa, mut fb) = (f(a)?, f(b)?);
-    let mut count = 2;
-    let found = |x, value, evaluations, converged| Found { x, value, evaluations, converged };
+/// A [`Mapping`] as an [`Objective`] whose value is the norm of the mapping's values, which it keeps in `r`. [`solve`]'s methods run
+/// on a [`Search`] of it.
+struct Norm<'m, F, M> {
+    mapping: &'m mut M,
+    r: Vec<F>,
+}
+
+impl<F: Native, M: Mapping<F>> Objective<F> for Norm<'_, F, M> {
+    type Error = M::Error;
+    fn value(&mut self, x: &[F]) -> Result<F, M::Error> {
+        self.mapping.value(x, &mut self.r)?;
+        Ok(norm(&self.r))
+    }
+}
+
+/// The Euclidean norm of `x`, with no scaling.
+fn norm<F: Native>(x: &[F]) -> F { dot(x, x).sqrt() }
+
+/// The point `x`, moved inside the bounds, and the value there of a mapping of one variable to one value.
+fn at<F: Native, M: Mapping<F>>(search: &mut Search<'_, F, Norm<'_, F, M>>, x: F) -> Result<(F, F), Halt<M::Error>> {
+    let mut p = [x];
+    search.value(&mut p)?;
+    Ok((p[0], search.objective.r[0]))
+}
+
+/// Brent's method for a zero of one equation in one variable, which [`Method::Brent`] describes, from `start`, a point and its value.
+/// It stops when the bracket is within `tolerance` of its end nearer zero, relative, or within `tolerance`² near zero. It fails where
+/// it finds no change of sign.
+fn root<F: Native, M: Mapping<F>>(search: &mut Search<'_, F, Norm<'_, F, M>>, start: (F, F), tolerance: F) -> Result<bool, Halt<M::Error>> {
+    let (half, two, three, grow) = (F::narrow(0.5), F::narrow(2.0), F::narrow(3.0), F::narrow(1.6));
+    let differ = |fa: F, fb: F| (fa > F::zero()) != (fb > F::zero());
+    let ends = search.bounds.map(|b| (b.lower[0], b.upper[0])).filter(|(l, u)| l.is_finite() && u.is_finite());
+    // `start` holds the caller's evaluation, which `solve` has counted. A point that equals it needs no evaluation of its own.
+    let ((mut a, mut fa), (mut b, mut fb)) = match ends {
+        Some((l, u)) => (if l == start.0 { start } else { at(search, l)? }, if u == start.0 { start } else { at(search, u)? }),
+        None => {
+            let from = if search.best[0] == start.0 { start } else { at(search, search.best[0])? };
+            (from, from)
+        }
+    };
+    // Whether each end can still step outward.
+    let (mut low, mut high) = (ends.is_none(), ends.is_none());
+    while fa != F::zero() && fb != F::zero() && !differ(fa, fb) {
+        if !low && !high { return Ok(false) }
+        let down = low && (!high || fa.abs() < fb.abs());
+        let width = if b > a { b - a } else { first_step(a) };
+        let end = if down { a } else { b };
+        let mut target = if down { a - grow * width } else { b + grow * width };
+        let (x, fx) = loop {
+            let (x, fx) = at(search, target)?;
+            let inward = end + half * (target - end);
+            if (!fx.is_nan() && x.is_finite()) || inward == end || inward == target { break (x, fx) }
+            target = inward;
+        };
+        let undefined = fx.is_nan() || !x.is_finite();
+        if !undefined { if down { (a, fa) = (x, fx) } else { (b, fb) = (x, fx) } }
+        if undefined || x != target { if down { low = false } else { high = false } }
+    }
+    if fa == F::zero() || fb == F::zero() { return Ok(true) }
     if fa.abs() < fb.abs() { (a, b, fa, fb) = (b, a, fb, fa) }
-    if fb == F::zero() { return Ok(found(b, fb, count, true)) }
-    if (fa > F::zero()) == (fb > F::zero()) { return Ok(found(b, fb, count, false)) }
     let (mut c, mut fc) = (a, fa);
     let (mut d, mut e) = (b - a, b - a);
     loop {
-        if (fb > F::zero()) == (fc > F::zero()) { (c, fc, d, e) = (a, fa, b - a, b - a) }
+        if !differ(fb, fc) { (c, fc, d, e) = (a, fa, b - a, b - a) }
         if fc.abs() < fb.abs() { (a, b, c, fa, fb, fc) = (b, c, b, fb, fc, fb) }
         let tol1 = half * tolerance * (b.abs() + tolerance);
         let m = half * (c - b);
-        if m.abs() <= tol1 || fb == F::zero() { return Ok(found(b, fb, count, true)) }
-        if count == limit { return Ok(found(b, fb, count, false)) }
+        if m.abs() <= tol1 || fb == F::zero() { return Ok(true) }
         if e.abs() >= tol1 && fa.abs() > fb.abs() {
             let s = fb / fa;
             let (mut p, mut q) = if a == c {
@@ -715,7 +996,314 @@ pub fn root<F: Native, E>(mut f: impl FnMut(F) -> Result<F, E>, bracket: [F; 2],
         }
         (a, fa) = (b, fb);
         b = b + if d.abs() > tol1 { d } else { tol1.copysign(m) };
-        fb = f(b)?;
-        count += 1;
+        fb = at(search, b)?.1;
+    }
+}
+
+/// Levenberg–Marquardt from the start, whose values `solve` has recorded, which [`Method::LevenbergMarquardt`] describes.
+fn levenberg_marquardt<F: Native + Factor, M: Mapping<F>>(search: &mut Search<'_, F, Norm<'_, F, M>>, tolerance: F) -> Result<bool, Halt<M::Error>> {
+    let (n, m) = (search.best.len(), search.objective.r.len());
+    let (one, two) = (F::one(), F::narrow(2.0));
+    let mut x = search.best.clone();
+    let mut fx = search.least;
+    let mut r = search.objective.r.clone();
+    // The Jacobian, and the damped problem [J; √λ D] δ = [-r; 0] that each step solves.
+    let (mut j, mut damped, mut target) = (vec![F::zero(); m * n], vec![F::zero(); (m + n) * n], vec![F::zero(); m + n]);
+    let (mut scale, mut trial, mut fit) = (vec![F::zero(); n], vec![F::zero(); n], vec![F::zero(); m]);
+    // D holds each column's largest norm so far, so λ is relative to JᵀJ's diagonal and starts at Marquardt's 10⁻³.
+    let (mut damping, mut growth) = (F::narrow(1e-3), two);
+    loop {
+        if fx == F::zero() { return Ok(true) }
+        jacobian(search, &x, &r, &mut j)?;
+        let mut cosine = F::zero();
+        for c in 0..n {
+            let (mut length, mut product) = (F::zero(), F::zero());
+            for i in 0..m { (length, product) = (length + j[i * n + c] * j[i * n + c], product + j[i * n + c] * r[i]) }
+            let length = length.sqrt();
+            // Infinite residuals, or a Jacobian with NaN or infinite items, leave no step to take and no gradient to test.
+            if !(length.is_finite() && product.is_finite()) { return Ok(false) }
+            if length > F::zero() { cosine = cosine.max(product.abs() / (length * fx)) }
+            scale[c] = scale[c].max(length);
+        }
+        if cosine <= tolerance { return Ok(true) }
+        loop {
+            damped[..m * n].copy_from_slice(&j);
+            damped[m * n..].fill(F::zero());
+            for c in 0..n { damped[(m + c) * n + c] = damping.sqrt() * scale[c] }
+            for i in 0..m { target[i] = -r[i] }
+            target[m..].fill(F::zero());
+            let (step, _) = lstsq(&damped, &target, [m + n, n], 1);
+            for c in 0..n { trial[c] = x[c] + step[c] }
+            let ft = search.value(&mut trial)?;
+            let small = norm(&step) <= tolerance * (norm(&x) + tolerance);
+            if ft < fx {
+                for i in 0..m { fit[i] = r[i] + dot(&j[i * n..][..n], &step) }
+                let predicted = fx * fx - dot(&fit, &fit);
+                let ratio = if predicted > F::zero() { (fx * fx - ft * ft) / predicted } else { one };
+                let swing = two * ratio - one;
+                damping = damping * F::narrow(1.0 / 3.0).max(one - swing * swing * swing);
+                growth = two;
+                x.copy_from_slice(&trial);
+                r.copy_from_slice(&search.objective.r);
+                fx = ft;
+                if small { return Ok(true) }
+                break;
+            }
+            if small { return Ok(true) }
+            damping = damping * growth;
+            growth = growth * two;
+        }
+    }
+}
+
+/// The Jacobian at `x`, where the values are `r`, into `j`: the mapping's own, or forward differences, which take one evaluation for
+/// each variable.
+fn jacobian<F: Native, M: Mapping<F>>(search: &mut Search<'_, F, Norm<'_, F, M>>, x: &[F], r: &[F], j: &mut [F]) -> Result<(), Halt<M::Error>> {
+    if search.objective.mapping.jacobian(x, j).map_err(Halt::Error)? { return Ok(()) }
+    let n = x.len();
+    let mut shifted = x.to_vec();
+    for c in 0..n {
+        shifted[c] = x[c] + F::epsilon().sqrt() * x[c].abs().max(F::one());
+        let h = shifted[c] - x[c];
+        search.value(&mut shifted)?;
+        for (i, (&after, &before)) in search.objective.r.iter().zip(r).enumerate() { j[i * n + c] = (after - before) / h }
+        shifted[c] = x[c];
+    }
+    Ok(())
+}
+
+/// The products A v of an affine `f`, f(x) = A x − b, from `f`'s values, as [`solve_affine`] computes them. It passes on `f`'s
+/// vector–Jacobian products and preconditioner.
+struct Affine<'m, F, M> {
+    f: &'m mut M,
+    /// f(0), which is −b.
+    f0: Vec<F>,
+    /// The norm of b.
+    size: F,
+    /// |A v| ÷ |v| at the last product, which gives the next t.
+    ratio: Option<F>,
+    /// t v, the point at which `f` is evaluated.
+    scaled: Vec<F>,
+}
+
+impl<F: Native, M: Mapping<F>> Affine<'_, F, M> {
+    /// The power of two t that makes t |A v| about 16 |b|, for a `v` of norm `nv` where |A v| ÷ |v| is `ratio`, or 1 where b is zero.
+    fn scale(&self, nv: F, ratio: F) -> F {
+        if self.size == F::zero() { return F::one() }
+        let t = (F::narrow(16.0) * self.size / (ratio * nv)).log2().round().exp2();
+        if t.is_finite() && t > F::zero() { t } else { F::one() }
+    }
+
+    /// (f(t v) − f(0)) ÷ t, into `out`.
+    fn at(&mut self, v: &[F], t: F, out: &mut [F]) -> Result<(), M::Error> {
+        self.scaled.clear();
+        self.scaled.extend(v.iter().map(|&x| x * t));
+        self.f.value(&self.scaled, out)?;
+        for (o, &z) in out.iter_mut().zip(&self.f0) { *o = (*o - z) / t }
+        Ok(())
+    }
+}
+
+impl<F: Native, M: Mapping<F>> Mapping<F> for Affine<'_, F, M> {
+    type Error = M::Error;
+    /// A v, computed again with a corrected t where the t from the last product's ratio made t |A v| smaller than |b|.
+    fn value(&mut self, v: &[F], out: &mut [F]) -> Result<(), M::Error> {
+        let nv = norm(v);
+        if nv == F::zero() {
+            out.fill(F::zero());
+            return Ok(());
+        }
+        let t = self.scale(nv, self.ratio.unwrap_or(F::one()));
+        self.at(v, t, out)?;
+        let mut av = norm(out);
+        if av > F::zero() && t * av < self.size {
+            self.at(v, self.scale(nv, av / nv), out)?;
+            av = norm(out);
+        }
+        if av > F::zero() { self.ratio = Some(av / nv) }
+        Ok(())
+    }
+    fn has_vjp(&self) -> bool { self.f.has_vjp() }
+    fn vjp(&mut self, u: &[F], x: &[F], out: &mut [F]) -> Result<(), M::Error> { self.f.vjp(u, x, out) }
+    fn has_preconditioner(&self) -> bool { self.f.has_preconditioner() }
+    fn precondition(&mut self, v: &[F], out: &mut [F]) -> Result<(), M::Error> { self.f.precondition(v, out) }
+}
+
+/// The operator a Krylov method runs on, the matrix or AᵀA for least squares, with each product counted against the limit.
+struct Products<'a, F, M> {
+    a: &'a mut M,
+    /// The point at which `vjp` gives the transpose's products.
+    at: &'a [F],
+    normal: bool,
+    /// The matrix's product inside a product with AᵀA.
+    inner: Vec<F>,
+    products: usize,
+    limit: usize,
+}
+
+impl<F: Native, M: Mapping<F>> Products<'_, F, M> {
+    /// Counts `k` products against the limit.
+    fn count(&mut self, k: usize) -> Result<(), Halt<M::Error>> {
+        if self.products + k > self.limit { return Err(Halt::Spent) }
+        self.products += k;
+        Ok(())
+    }
+
+    /// The operator's product with `v`, into `out`.
+    fn apply(&mut self, v: &[F], out: &mut [F]) -> Result<(), Halt<M::Error>> {
+        if !self.normal {
+            self.count(1)?;
+            return self.a.value(v, out).map_err(Halt::Error);
+        }
+        self.count(2)?;
+        self.a.value(v, &mut self.inner).map_err(Halt::Error)?;
+        self.a.vjp(&self.inner, self.at, out).map_err(Halt::Error)
+    }
+
+    /// M·v, the preconditioner's product with `v`, written into `out`, or `v` itself where the mapping has no preconditioner. It
+    /// counts no product.
+    fn precondition<'v>(&mut self, v: &'v [F], out: &'v mut [F]) -> Result<&'v [F], Halt<M::Error>> {
+        if !self.a.has_preconditioner() { return Ok(v) }
+        self.a.precondition(v, out).map_err(Halt::Error)?;
+        Ok(out)
+    }
+
+    /// The right-hand side of the system the method runs on: `b`, or Aᵀb for least squares.
+    fn rhs(&mut self, b: &[F]) -> Result<Vec<F>, Halt<M::Error>> {
+        if !self.normal { return Ok(b.to_vec()) }
+        self.count(1)?;
+        let mut v = vec![F::zero(); self.at.len()];
+        self.a.vjp(b, self.at, &mut v).map_err(Halt::Error)?;
+        Ok(v)
+    }
+
+    /// `rhs` minus the operator's product with `x`, into `r`.
+    fn residual(&mut self, rhs: &[F], x: &[F], r: &mut [F]) -> Result<(), Halt<M::Error>> {
+        self.apply(x, r)?;
+        for (r, &b) in r.iter_mut().zip(rhs) { *r = b - *r }
+        Ok(())
+    }
+}
+
+/// Conjugate gradients on `op` from `x`, with `op`'s preconditioner. It stops when the residual's norm falls to `tolerance` times
+/// `rhs`'s, or where the operator or the preconditioner turns out not to be positive definite.
+fn cg<F: Native, M: Mapping<F>>(op: &mut Products<'_, F, M>, rhs: &[F], x: &mut [F], tolerance: F) -> Result<bool, Halt<M::Error>> {
+    let (n, zero, goal) = (x.len(), F::zero(), tolerance * norm(rhs));
+    let (mut r, mut z, mut q) = (vec![zero; n], vec![zero; n], vec![zero; n]);
+    op.residual(rhs, x, &mut r)?;
+    let mut p = op.precondition(&r, &mut z)?.to_vec();
+    let mut rz = dot(&r, &p);
+    loop {
+        let size = norm(&r);
+        if !(size > goal) { return Ok(size <= goal) }
+        if !(rz > zero) { return Ok(false) }
+        op.apply(&p, &mut q)?;
+        let pq = dot(&p, &q);
+        if !(pq > zero) { return Ok(false) }
+        let alpha = rz / pq;
+        axpy(x, alpha, &p);
+        axpy(&mut r, -alpha, &q);
+        let mz = op.precondition(&r, &mut z)?;
+        let next = dot(&r, mz);
+        let beta = next / rz;
+        rz = next;
+        for i in 0..n { p[i] = mz[i] + beta * p[i] }
+    }
+}
+
+/// MINRES on the symmetric `op` from `x`, with `op`'s preconditioner, as Paige and Saunders give it: the Lanczos process, with plane
+/// rotations that track the residual's norm. That norm is the preconditioner's, √(rᵀMr), which is the residual's own without one.
+/// It stops when that norm falls to `tolerance` times `rhs`'s in the same norm.
+fn minres<F: Native, M: Mapping<F>>(op: &mut Products<'_, F, M>, rhs: &[F], x: &mut [F], tolerance: F) -> Result<bool, Halt<M::Error>> {
+    let (n, zero) = (x.len(), F::zero());
+    let (mut r1, mut y, mut v) = (vec![zero; n], vec![zero; n], vec![zero; n]);
+    let goal = tolerance * dot(rhs, op.precondition(rhs, &mut v)?).sqrt();
+    op.residual(rhs, x, &mut r1)?;
+    let my = op.precondition(&r1, &mut y)?;
+    let mut beta = dot(&r1, my).sqrt();
+    if !(beta > goal) { return Ok(beta <= goal) }
+    for i in 0..n { v[i] = my[i] / beta }
+    let mut r2 = r1.clone();
+    let (mut w, mut w1, mut w2) = (vec![zero; n], vec![zero; n], vec![zero; n]);
+    let (mut oldb, mut dbar, mut epsln, mut phibar, mut cs, mut sn) = (zero, zero, zero, beta, -F::one(), zero);
+    loop {
+        op.apply(&v, &mut y)?;
+        if oldb > zero { axpy(&mut y, -beta / oldb, &r1) }
+        let alfa = dot(&v, &y);
+        axpy(&mut y, -alfa / beta, &r2);
+        std::mem::swap(&mut r1, &mut r2);
+        r2.copy_from_slice(&y);
+        let my = op.precondition(&r2, &mut y)?;
+        (oldb, beta) = (beta, dot(&r2, my).sqrt());
+        let oldeps = epsln;
+        let delta = cs * dbar + sn * alfa;
+        let gbar = sn * dbar - cs * alfa;
+        (epsln, dbar) = (sn * beta, -cs * beta);
+        let (c, s, gamma) = givens(gbar, beta);
+        if gamma == zero { return Ok(false) }
+        (cs, sn) = (c, s);
+        let phi = cs * phibar;
+        phibar = sn * phibar;
+        std::mem::swap(&mut w1, &mut w2);
+        std::mem::swap(&mut w2, &mut w);
+        for i in 0..n { w[i] = (v[i] - oldeps * w1[i] - delta * w2[i]) / gamma }
+        axpy(x, phi, &w);
+        if !(phibar > goal) { return Ok(phibar <= goal) }
+        for i in 0..n { v[i] = my[i] / beta }
+    }
+}
+
+/// The most steps GMRES takes between restarts. A system with fewer unknowns restarts after one step for each unknown.
+pub const GMRES_RESTART: usize = 20;
+
+/// GMRES on `op` from `x`, restarted every [`GMRES_RESTART`] steps, with `op`'s preconditioner on the right: it runs on the operator
+/// times the preconditioner, which leaves the residual the operator's own. That's the Arnoldi process with modified Gram–Schmidt,
+/// and plane rotations that turn its Hessenberg matrix into a triangle and track the residual's norm. It stops when that norm falls
+/// to `tolerance` times `rhs`'s, or where the Krylov space stops growing.
+fn gmres<F: Native, M: Mapping<F>>(op: &mut Products<'_, F, M>, rhs: &[F], x: &mut [F], tolerance: F) -> Result<bool, Halt<M::Error>> {
+    let (n, zero, goal) = (x.len(), F::zero(), tolerance * norm(rhs));
+    let k = GMRES_RESTART.min(n);
+    let (mut basis, mut h) = (vec![zero; (k + 1) * n], vec![zero; k * k]);
+    let (mut turns, mut g, mut y) = (vec![(zero, zero); k], vec![zero; k + 1], vec![zero; k]);
+    let (mut w, mut z) = (vec![zero; n], vec![zero; n]);
+    loop {
+        op.residual(rhs, x, &mut basis[..n])?;
+        let beta = norm(&basis[..n]);
+        if !(beta > goal) { return Ok(beta <= goal) }
+        for v in &mut basis[..n] { *v = *v / beta }
+        g.fill(zero);
+        g[0] = beta;
+        let (mut steps, mut ended) = (0, false);
+        while steps < k && !ended {
+            let j = steps;
+            let mv = op.precondition(&basis[j * n..][..n], &mut z)?;
+            op.apply(mv, &mut w)?;
+            for i in 0..=j {
+                let hij = dot(&w, &basis[i * n..][..n]);
+                h[i * k + j] = hij;
+                axpy(&mut w, -hij, &basis[i * n..][..n]);
+            }
+            let next = norm(&w);
+            for (i, &(c, s)) in turns[..j].iter().enumerate() {
+                let (p, q) = (h[i * k + j], h[(i + 1) * k + j]);
+                (h[i * k + j], h[(i + 1) * k + j]) = (c * p + s * q, c * q - s * p);
+            }
+            let (c, s, r) = givens(h[j * k + j], next);
+            if r == zero { break }
+            (turns[j], h[j * k + j]) = ((c, s), r);
+            (g[j], g[j + 1]) = (c * g[j], -s * g[j]);
+            steps += 1;
+            ended = !(g[steps].abs() > goal) || next == zero;
+            if !ended { for i in 0..n { basis[steps * n + i] = w[i] / next } }
+        }
+        for i in (0..steps).rev() {
+            let t = (i + 1..steps).fold(g[i], |t, l| t - h[i * k + l] * y[l]);
+            y[i] = t / h[i * k + i];
+        }
+        z.fill(zero);
+        for i in 0..steps { axpy(&mut z, y[i], &basis[i * n..][..n]) }
+        let step = op.precondition(&z, &mut w)?;
+        axpy(x, F::one(), step);
+        if ended || steps < k { return Ok(g[steps].abs() <= goal) }
     }
 }
