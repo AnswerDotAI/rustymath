@@ -43,15 +43,34 @@ pub trait Mapping<F> {
         let _ = (u, x, out);
         unreachable!("this mapping has no vector–Jacobian product")
     }
-    /// The Jacobian at `x`, with a row of `x.len()` items for each value, into `j`, or `false` where Levenberg–Marquardt should take forward differences instead. By default, a mapping with `vjp` builds it one row per product when it has no more values than variables, which takes no more calls than differences do, and otherwise gives `false`.
+    /// Whether `jvp` gives Jacobian–vector products.
+    fn has_jvp(&self) -> bool { false }
+    /// Jv, the product of the Jacobian at `x` with `v`, into `out`. For a linear mapping it's the product of the matrix with `v`, at any `x`. It gives `false` where it declines, as for a function it can't differentiate at `x`, and the caller then takes differences instead. Methods call it only where `has_jvp` is true.
+    fn jvp(&mut self, v: &[F], x: &[F], out: &mut [F]) -> Result<bool, Self::Error> {
+        let _ = (v, x, out);
+        unreachable!("this mapping has no Jacobian–vector product")
+    }
+    /// The Jacobian at `x`, with a row of `x.len()` items for each value, into `j`, or `false` where Levenberg–Marquardt should take forward differences instead. By default, a mapping builds it from `vjp`, one row per product, when it has no more values than variables or no `jvp`. Otherwise it builds it from `jvp`, one column per product. Each takes no more calls than differences do. It gives `false` for a mapping with neither, or where `jvp` declines.
     fn jacobian(&mut self, x: &[F], j: &mut [F]) -> Result<bool, Self::Error> where F: Native {
         let n = x.len();
-        if !self.has_vjp() || n == 0 || j.len() > n * n { return Ok(false); }
-        let mut u = vec![F::zero(); j.len() / n];
-        for (i, row) in j.chunks_exact_mut(n).enumerate() {
-            u[i] = F::one();
-            self.vjp(&u, x, row)?;
-            u[i] = F::zero();
+        if n == 0 { return Ok(false); }
+        let m = j.len() / n;
+        if self.has_vjp() && (m <= n || !self.has_jvp()) {
+            let mut u = vec![F::zero(); m];
+            for (i, row) in j.chunks_exact_mut(n).enumerate() {
+                u[i] = F::one();
+                self.vjp(&u, x, row)?;
+                u[i] = F::zero();
+            }
+            return Ok(true);
+        }
+        if !self.has_jvp() { return Ok(false); }
+        let (mut v, mut column) = (vec![F::zero(); n], vec![F::zero(); m]);
+        for c in 0..n {
+            v[c] = F::one();
+            if !self.jvp(&v, x, &mut column)? { return Ok(false); }
+            v[c] = F::zero();
+            for (i, &value) in column.iter().enumerate() { j[i * n + c] = value; }
         }
         Ok(true)
     }

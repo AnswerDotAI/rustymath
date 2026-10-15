@@ -546,6 +546,22 @@ mod optimize {
         };
         let found = solved(&mut curve, &[1.0, 1.0], 5, &options).unwrap();
         assert!(found.converged && off(&found.x, &[2.0, 0.3]) < 1e-8 && found.value < 1e-10, "{found:?}");
+        // With a Jacobian–vector product and more residuals than variables, the Jacobian comes from it, column by column, in place of forward differences.
+        struct Curve<'a>(&'a [f64]);
+        impl Mapping<f64> for Curve<'_> {
+            type Error = Infallible;
+            fn value(&mut self, p: &[f64], r: &mut [f64]) -> Result<(), Infallible> {
+                for (r, &x) in r.iter_mut().zip(self.0) { *r = p[0] * (p[1] * x).exp() - 2.0 * (0.3 * x).exp() }
+                Ok(())
+            }
+            fn has_jvp(&self) -> bool { true }
+            fn jvp(&mut self, v: &[f64], p: &[f64], out: &mut [f64]) -> Result<bool, Infallible> {
+                for (o, &x) in out.iter_mut().zip(self.0) { *o = (v[0] + v[1] * p[0] * x) * (p[1] * x).exp() }
+                Ok(true)
+            }
+        }
+        let forward = solved(&mut Curve(&xs), &[1.0, 1.0], 5, &options).unwrap();
+        assert!(forward.converged && off(&forward.x, &[2.0, 0.3]) < 1e-8 && forward.evaluations < found.evaluations, "{forward:?}");
         // Rosenbrock's function as two equations, 10 (y - x²) = 0 and 1 - x = 0, whose root is (1, 1). With a vector–Jacobian product, the Jacobian comes from it, row by row, in place of forward differences.
         let rosen = |p: &[f64], r: &mut [f64]| {
             (r[0], r[1]) = (10.0 * (p[1] - p[0] * p[0]), 1.0 - p[0]);

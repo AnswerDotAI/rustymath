@@ -148,6 +148,10 @@ pub fn scatter<S: Copy, D>(out: &mut [D], offsets: &[usize], items: &[S], f: imp
     if let [x] = *items { return offsets.iter().for_each(|&o| out[o] = f(x)); }
     for (&o, &x) in offsets.iter().zip(items) { out[o] = f(x) }
 }
+/// Adds each item to the item of `out` at its offset. Offsets can repeat, and each repeat adds again: the transpose of a gather that reads a position more than once.
+pub fn scatter_add<T: Copy + std::ops::AddAssign>(out: &mut [T], pairs: impl IntoIterator<Item = (usize, T)>) {
+    for (o, x) in pairs { out[o] += x }
+}
 
 /// The source offsets that one axis of `walk`'s result reads. Regular patterns are held as a formula, so a long axis needs no table. A `None` offset gives a fill.
 #[derive(Clone, Debug)]

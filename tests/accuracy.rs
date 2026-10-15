@@ -652,16 +652,21 @@ mod complex {
         assert_eq!(Binom.one(k(2.0, 0.0), k(3.0, 0.0)), k(0.0, 0.0));
     }
 
-    /// A real part of z too small to change 1 ± z still changes the smaller part of each composite square root, by first order in that real part. Complex-step differentiation reads derivatives from such a part.
+    /// A real part of z too small to change 1 ± z still changes the smaller part of each composite square root, by first order in that real part. Complex-step differentiation reads derivatives from such a part. At magnitudes near 64-bit floats' limits, a tiny part of z still gives the result's tiny part, without underflow.
     #[test]
     fn tiny_parts() {
         let (e, q) = (1e-30, 1.16f64.sqrt());
-        let cases = [("sqrt1mx2", c(e, 0.4), c(q, -e * 0.4 / q)), ("sqrt1px2", c(0.4, e), c(q, e * 0.4 / q)), ("sqrtx2m1", c(e, 0.4), c(e * 0.4 / q, q))];
+        let cases = [
+            ("sqrt1mx2", c(e, 0.4), c(q, -e * 0.4 / q), true), ("sqrt1px2", c(0.4, e), c(q, e * 0.4 / q), true), ("sqrtx2m1", c(e, 0.4), c(e * 0.4 / q, q), true),
+            ("sqrtx2m1", c(1e200, 1e-200), c(1e200, 1e-200), false), ("sqrt1mx2", c(1e200, 1e-200), c(1e-200, -1e200), false),
+            ("sqrtx2m1", c(1e300, 1e-300), c(1e300, 1e-300), false),
+        ];
         let close = |g: f64, w: f64, eps: f64| (g - w).abs() <= 4.0 * eps * w.abs();
-        for (name, z, want) in cases {
+        for (name, z, want, narrow) in cases {
             for sliced in [false, true] {
                 let got = double::apply(name, &[z; 17], sliced).unwrap();
                 assert!(close(got.re, want.re, f64::EPSILON) && close(got.im, want.im, f64::EPSILON), "{name}({z}) gave {got}, not {want}");
+                if !narrow { continue; }
                 let got = single::apply(name, &[c(z.re as f32, z.im as f32); 17], sliced).unwrap();
                 let eps = f32::EPSILON.into();
                 assert!(close(got.re.into(), want.re, eps) && close(got.im.into(), want.im, eps), "f32 {name}({z}) gave {got}, not {want}");

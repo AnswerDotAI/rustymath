@@ -124,6 +124,19 @@ pub fn stack_with<B: Default + Send, S: Default, E>(
 pub fn extended<B: Copy + Send>(out: &mut Vec<B>, n: usize, unit: usize, write: &(dyn Fn(Range<usize>, &mut Slots<'_, B>) -> bool + Sync)) -> bool {
     crate::slice::appended(out, n, |slots| split(slots, unit, &|start, slots| filled(slots, |slots| write(start..start + slots.slots.len(), slots))))
 }
+/// [`extended`] for two outputs, which `write` fills together: `write(range, a, b)` fills the slots of `a` and of `b` with the items in `range`. Each call gets the same range of both.
+pub fn extended2<A: Copy + Send, B: Copy + Send>(
+    a: &mut Vec<A>, b: &mut Vec<B>, n: usize, unit: usize, write: &(dyn Fn(Range<usize>, &mut Slots<'_, A>, &mut Slots<'_, B>) -> bool + Sync),
+) -> bool {
+    crate::slice::appended(a, n, |sa| crate::slice::appended(b, n, |sb| {
+        let shared = Shared(sb.as_mut_ptr());
+        // SAFETY: `split` gives each call its own range within `0..n`, and `b` has `n` slots too.
+        split(sa, unit, &|start, sa| {
+            let sb = unsafe { shared.part(start..start + sa.len()) };
+            filled(sa, |sa| filled(sb, |sb| write(start..start + sa.slots.len(), sa, sb)))
+        })
+    }))
+}
 
 /// `write`'s result for `slots`, which it fills in order through one [`Slots`]. Panics where it leaves any unfilled.
 fn filled<B, T>(slots: &mut [MaybeUninit<B>], write: impl FnOnce(&mut Slots<'_, B>) -> T) -> T {
@@ -144,6 +157,13 @@ impl<B> Slots<'_, B> {
     /// Writes the `n` results of [`pairs`](crate::pairs) after the items already written, on this thread, and gives whether every result succeeded. Panics where they don't fit.
     pub fn pairs<X: Copy, Y: Copy>(&mut self, x: Arg<'_, X>, y: Arg<'_, Y>, n: usize, f: impl Fn(X, Y) -> (B, bool)) -> bool {
         self.fill(n, |slots| crate::slice::pairs_into(x, y, n, slots, f))
+    }
+    /// Writes `items` after the items already written, on this thread. Panics where they don't fit.
+    pub fn copy(&mut self, items: &[B]) where B: Copy {
+        self.fill(items.len(), |slots| {
+            for (slot, &item) in slots.iter_mut().zip(items) { slot.write(item); }
+            true
+        });
     }
     /// `write`'s result for the next `n` slots, which it must fill. They then count as written. Panics where they don't fit.
     pub(crate) fn fill(&mut self, n: usize, write: impl FnOnce(&mut [MaybeUninit<B>]) -> bool) -> bool {
