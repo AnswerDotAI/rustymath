@@ -88,6 +88,13 @@ pub trait Inner<T> {
     fn checked(&self, a: &[T], b: &[T], size: [usize; 3]) -> Option<Vec<Self::Out>> { Some(self.inner(a, b, size)) }
     /// `inner`, written into `out`, which holds `m`×`n` items.
     fn inner_into(&self, a: &[T], b: &[T], size: [usize; 3], out: &mut [Self::Out]) { out.copy_from_slice(&self.inner(a, b, size)) }
+    /// `inner` of the matrices that `a` and `b` give in the orientations given, with `size` `[m, k, n]` for those matrices. A transposed `a` holds a `k`×`m` matrix, row-major, and gives its `m`×`k` transpose. This default copies a transposed operand into its orientation. Float and complex `PlusTimes` read it in place.
+    fn inner_ops(&self, a: &[T], b: &[T], [oa, ob]: [Orientation; 2], [m, k, n]: [usize; 3]) -> Vec<Self::Out> where T: Copy {
+        fn oriented<T: Copy>(x: &[T], o: Orientation, [rows, cols]: [usize; 2]) -> std::borrow::Cow<'_, [T]> {
+            match o { Orientation::Normal => std::borrow::Cow::Borrowed(x), Orientation::Transpose => (0..rows * cols).map(|ij| x[ij % cols * rows + ij / cols]).collect() }
+        }
+        self.inner(&oriented(a, oa, [m, k]), &oriented(b, ob, [k, n]), [m, k, n])
+    }
 }
 
 /// `+.×`, the matrix product, at `i64`, `f32` and `f64`, and complex numbers with parts of either type. Native float steps use fused multiply-add where the target has one; Accelerate computes them on macOS. Nonfinite complex results need not match scalar arithmetic. Native complex products form each part from two real products of the parts, as scalar multiplication does. A small imaginary part beside a large real part keeps its own relative accuracy.
@@ -427,6 +434,9 @@ fn exactly<F: Float, P: Inner<F, Out = F>>(pair: &P, a: &[i64], b: &[i64], size:
 pub(crate) struct Matrix<'a, T> { pub data: &'a [T], pub ld: usize, pub op: Op }
 #[derive(Clone, Copy)]
 pub(crate) enum Op { Normal, Transpose, Adjoint, Conjugate }
+/// Whether an operand of [`Inner::inner_ops`] holds its matrix as stored or transposed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Orientation { Normal, Transpose }
 #[derive(Clone, Copy)]
 pub(crate) enum Side { Left, Right }
 /// The stored triangle, before applying the matrix view's transpose or adjoint.
@@ -617,9 +627,14 @@ macro_rules! tiled {
         }
         impl Inner<$t> for PlusTimes {
             type Out = $t;
-            fn inner(&self, a: &[$t], b: &[$t], [m, k, n]: [usize; 3]) -> Vec<$t> {
+            fn inner(&self, a: &[$t], b: &[$t], size: [usize; 3]) -> Vec<$t> { self.inner_ops(a, b, [Orientation::Normal; 2], size) }
+            fn inner_ops(&self, a: &[$t], b: &[$t], [oa, ob]: [Orientation; 2], [m, k, n]: [usize; 3]) -> Vec<$t> {
                 assert!(a.len() == m * k && b.len() == k * n, "`a` must hold `m`×`k` items and `b` `k`×`n`");
-                <$t>::multiply(Matrix::rows(a, k), Matrix::rows(b, n), [m, k, n])
+                let view = |data, o: Orientation, [rows, cols]: [usize; 2]| match o {
+                    Orientation::Normal => Matrix { data, ld: cols, op: Op::Normal },
+                    Orientation::Transpose => Matrix { data, ld: rows, op: Op::Transpose },
+                };
+                <$t>::multiply(view(a, oa, [m, k]), view(b, ob, [k, n]), [m, k, n])
             }
             fn inner_into(&self, a: &[$t], b: &[$t], [m, k, n]: [usize; 3], c: &mut [$t]) {
                 assert!(a.len() == m * k && b.len() == k * n && c.len() == m * n, "`a` must hold `m`×`k` items, `b` `k`×`n` and `c` `m`×`n`");

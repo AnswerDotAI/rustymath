@@ -1,7 +1,7 @@
-//! How fast each function object's slice form runs on 65,536 inputs. The slice form is the code that callers such as basedpl and the Python package run. `speed.txt` gives each function a budget at f64 and at f32, in copies of the same number of items: the most time it may take, as a multiple of the time to copy those items. Each row's copy is timed just before the row, as basedpl's speed test times each case's copy. A loop that stops vectorizing takes several times as long and goes over budget. Where the standard library has the function, its time item by item is measured too, for the README's table, but sets no limit. The rows `Pow.one` and `Root.one` time the scalar forms pair by pair, as a caller with one value at a time runs them. The inner products multiply 256×256 matrices, whose results hold the same number of items. The decompositions factor 256×256 real matrices and 128×128 complex ones, and `lstsq` solves a 4096×16 real one. Each of these counts copies of as many items as its matrix holds. The test fails listing every cost over its budget, as its width, name, cost and budget, in the form that `basedpl.bpltests.logged_costs` reads. `RUSTYMATH_COSTS=1 cargo test --test speed -- --nocapture` prints the README's table, then every cost in that form. The test holds the machine's timing lock while it runs, as `timing_lock` describes.
+//! How fast each function object's slice form runs on 65,536 inputs. The slice form is the code that callers such as basedpl and the Python package run. `speed.txt` gives each function a budget at f64 and at f32, in copies of the same number of items: the most time it may take, as a multiple of the time to copy those items. Each row's copy is timed just before the row, as basedpl's speed test times each case's copy. A loop that stops vectorizing takes several times as long and goes over budget. Where the standard library has the function, its time item by item is measured too, for the README's table, but sets no limit. The rows `Pow.one` and `Root.one` time the scalar forms pair by pair, as a caller with one value at a time runs them. The inner products multiply 256×256 matrices, whose results hold the same number of items. The decompositions factor 256×256 real matrices and 128×128 complex ones, and `lstsq` solves a 4096×16 real one. Each of these counts copies of as many items as its matrix holds. The test fails listing every cost over its budget, as its width, name, cost and budget, in the form that `basedpl.bpltests.logged_costs` reads. With `RUSTYMATH_COSTS` set, as in `RUSTYMATH_COSTS=1 cargo test --test speed`, the test writes the README's table, then every cost in that form, straight to stderr. The test harness captures `println!` output from a passing test, but not these lines. CI's `Test` and `Speed` workflows set it. The test holds the machine's timing lock while it runs, as `timing_lock` describes.
 use rand::seq::SliceRandom;
 use rustymath::*;
-use std::{collections::HashMap, hint::black_box, ops::Neg, time::Instant};
+use std::{collections::HashMap, hint::black_box, io::Write, ops::Neg, time::Instant};
 pub mod support;
 
 const N: usize = 65_536;
@@ -369,9 +369,9 @@ fn timing_lock() -> std::fs::File {
             Ok(()) => return file, Err(std::fs::TryLockError::WouldBlock) => {} Err(std::fs::TryLockError::Error(e)) => panic!("{TIMING_LOCK}: {e}")
         }
         assert!(start.elapsed().as_secs() < 300, "a build or another timing has held {TIMING_LOCK} for 5 minutes");
-        if !waiting { eprintln!("waiting for a build or another timing to release {TIMING_LOCK}"); }
+        if !waiting { writeln!(std::io::stderr(), "waiting for a build or another timing to release {TIMING_LOCK}").unwrap(); }
         if !reported && start.elapsed().as_secs() >= 30 {
-            eprintln!("{TIMING_LOCK} is still taken after 30 seconds. Processes with it open: {}", lock_users());
+            writeln!(std::io::stderr(), "{TIMING_LOCK} is still taken after 30 seconds. Processes with it open: {}", lock_users()).unwrap();
             reported = true;
         }
         waiting = true;
@@ -441,10 +441,11 @@ fn speed() {
     let costed: Vec<Costed> = compared.iter().map(|&(name, _, costs)| (name, costs)).chain(special(&units)).chain(complex(&complex_units))
         .chain(inner_products(&units)).chain(decompositions(&units, &complex_units)).collect();
     let print_all = std::env::var_os("RUSTYMATH_COSTS").is_some();
+    let mut stderr = std::io::stderr();
     if print_all {
-        println!("| Function | f64 | std f64 | f32 | std f32 |\n|---|---|---|---|---|");
-        for (name, t, _) in compared.iter() { println!("| `{name}` | {:.2} | {:.2} | {:.2} | {:.2} |", t[0], t[1], t[2], t[3]); }
-        println!();
+        writeln!(stderr, "| Function | f64 | std f64 | f32 | std f32 |\n|---|---|---|---|---|").unwrap();
+        for (name, t, _) in compared.iter() { writeln!(stderr, "| `{name}` | {:.2} | {:.2} | {:.2} | {:.2} |", t[0], t[1], t[2], t[3]).unwrap(); }
+        writeln!(stderr).unwrap();
     }
     let budgets = budgets(include_str!("speed.txt"));
     let mut failures = Vec::new();
@@ -454,7 +455,7 @@ fn speed() {
             let line = match budget {
                 Some(budget) => format!("{width} {name}: {cost:.2}, budget {budget}"), None => format!("{width} {name}: {cost:.2}, with no budget in speed.txt")
             };
-            if print_all { println!("{line}"); }
+            if print_all { writeln!(stderr, "{line}").unwrap(); }
             if budget.is_none_or(|budget| cost > budget) { failures.push(line); }
         }
     }

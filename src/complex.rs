@@ -219,13 +219,17 @@ fn shifted_roots<R: Native, const FUSED: bool>(z: Complex<R>) -> (Complex<R>, Co
     (sqrt::<R, FUSED>(c(z.re - R::one(), z.im)), sqrt::<R, FUSED>(c(z.re + R::one(), z.im)))
 }
 
-/// `r`, a square root of a number whose imaginary part is 2xy, with its smaller part recomputed as xy divided by its larger part. A product of two square roots, as `sqrt1mx2` and `sqrtx2m1` form, loses the smaller part where x is too small to change 1 ± x. The product xy keeps it. The larger of x and y is divided first, so a huge x with a tiny y doesn't underflow. `r` stays as it is where x or y is 0, to keep the signs of zeros on the branch cuts, and where a part isn't finite.
+/// `r`, a square root of a number whose imaginary part is 2xy, with its smaller part recomputed as xy divided by its larger part. A product of two square roots, as `sqrt1mx2` and `sqrtx2m1` form, loses the smaller part where x is too small to change 1 ± x. The product xy keeps it. The larger of x and y is divided first, so a huge x with a tiny y doesn't underflow. `r` stays as it is where x or y is 0, to keep the signs of zeros on the branch cuts, and where a part isn't finite. It selects between values in place of branching, so a loop over a slice vectorizes.
 #[inline(always)]
 fn balanced<R: Native>(r: Complex<R>, x: R, y: R) -> Complex<R> {
     let zero = R::zero();
-    if (x == zero) | (y == zero) | !(r.re.is_finite() & r.im.is_finite() & x.is_finite() & y.is_finite()) { return r; }
-    let (hi, lo) = if x.abs() >= y.abs() { (x, y) } else { (y, x) };
-    if r.re.abs() >= r.im.abs() { if r.re == zero { r } else { c(r.re, hi / r.re * lo) } } else { c(hi / r.im * lo, r.im) }
+    let swap = x.abs() < y.abs();
+    let (hi, lo) = (if swap { y } else { x }, if swap { x } else { y });
+    let wide = r.re.abs() >= r.im.abs();
+    let big = if wide { r.re } else { r.im };
+    let keep = (x == zero) | (y == zero) | (big == zero) | !(r.re.is_finite() & r.im.is_finite() & x.is_finite() & y.is_finite());
+    let small = if keep { if wide { r.im } else { r.re } } else { hi / big * lo };
+    if wide { c(r.re, small) } else { c(small, r.im) }
 }
 
 /// √(1 - z²) as √(1 - z) √(1 + z), whose real part is never negative. Neither factor loses digits near z = ±1, or overflows where z² would. [`balanced`] restores the smaller part where z's real part is too small to change 1.
@@ -494,9 +498,10 @@ fn root_products_parts<R: Native>(roots: impl Fn(&[R], &[R]) -> [(Vec<R>, Vec<R>
     let [a, b] = roots(x, y);
     let start = re.len();
     times_parts(&a, &b, re, im);
-    for (i, (&x, &y)) in x.iter().zip(y).enumerate() {
-        let r = balanced(c(re[start + i], im[start + i]), if negate { -x } else { x }, y);
-        (re[start + i], im[start + i]) = (r.re, r.im);
+    let sign = if negate { -R::one() } else { R::one() };
+    for (((re, im), &x), &y) in re[start..].iter_mut().zip(&mut im[start..]).zip(x).zip(y) {
+        let r = balanced(c(*re, *im), sign * x, y);
+        (*re, *im) = (r.re, r.im);
     }
 }
 

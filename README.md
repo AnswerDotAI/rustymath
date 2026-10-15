@@ -269,7 +269,7 @@ Equal(Tolerance::DEFAULT).many(Arg::Many(&[0.3, 0.1 + 0.2, 0.31]), Arg::One(0.3)
 - `exact`: `residue`, `gcd`, `lcm` and `binom` of exact rationals, at any integer type, such as `BigRational`. `linalg::exact` solves matrices of them.
 - `distribution`: sixteen distributions. The objects `Pdf`, `Cdf` and `Quantile` hold a distribution and evaluate it over a slice. Each distribution also samples from a seeded generator.
 - `random`: rolls and deals that fill a slice from one generator.
-- `gather`: copying a slice’s items into a buffer by position: `cycle`, `repeat`, `compress` by a mask, `take` at indices, `windows`, `walk` along a pattern of `Steps` with fills, and `scatter` at offsets, each applying the caller’s conversion to each item.
+- `gather`: copying a slice’s items into a buffer by position: `cycle`, `repeat`, `compress` by a mask, `take` at indices, `windows`, `walk` along a pattern of `Steps` with fills, and `scatter` at offsets, each applying the caller’s conversion to each item. `walk` also takes `Same`, which copies whole slices of one type. `Steps::reach` gives the source offset of one item of a walk, and `Steps::run` the offset of a run of items that lie in order in the source.
 - `convert`: `int` converts a whole float to an integer type. It gives `None` outside the type’s range, and for `i64` and `u32` beyond a magnitude of 2^51 - 1. `float` converts an integer to the nearest float. Loops that call either vectorize on every target. AVX2 and wasm lack a vector instruction between `f64` and 64-bit integers. On those targets a loop that converts with `as` runs one item at a time.
 
 The special functions `gamma`, `lgamma`, `erf`, `erfc`, their inverses, the incomplete gamma and beta functions and Lambert W have free functions and objects at the crate root, as the elementary functions do.
@@ -278,7 +278,7 @@ The special functions `gamma`, `lgamma`, `erf`, `erfc`, their inverses, the inco
 
 ## Accuracy and speed
 
-The table gives nanoseconds per item for a loop over 65,536 inputs on an Apple M5 Max, in October 2026, beside the standard library’s version of each function. A row named after an object times its slice form. `Pow.one` and `Root.one` time the scalar forms. To print the table on your own machine, run `RUSTYMATH_COSTS=1 cargo test --test speed -- --nocapture`.
+The table gives nanoseconds per item for a loop over 65,536 inputs on an Apple M5 Max, in October 2026, beside the standard library’s version of each function. A row named after an object times its slice form. `Pow.one` and `Root.one` time the scalar forms. To print the table on your own machine, run `RUSTYMATH_COSTS=1 cargo test --test speed`.
 
 | Function               | f64  | std f64 | f32  | std f32 |
 |------------------------|------|---------|------|---------|

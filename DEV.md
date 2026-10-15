@@ -10,7 +10,7 @@ Keep the accuracy contracts that callers use. Check a change that alters arithme
 
 ```bash
 cargo test
-RUSTYMATH_COSTS=1 cargo test --test speed -- --nocapture
+RUSTYMATH_COSTS=1 cargo test --test speed
 cargo develop && pytest -q
 nbdev-test
 nbdev-preview
@@ -32,7 +32,7 @@ Keep these profiles aligned with basedpl's. Cargo uses the consuming workspace's
 
 `tests/speed.txt` holds budgets in copies of the same number of items. A copy is the time to write that many items of the same type, each negated, into a second buffer. The speed test times each copy immediately before its operation. The standard-library comparisons are informational. A budget failure often identifies a loop that stopped vectorizing. `RUSTYMATH_COSTS` prints every cost and the README's comparison table.
 
-The manually triggered `Speed` workflow measures the Ubicloud runner used by `Test` and restores its cache. After a run, review it and decide which budgets should change, following basedpl's DEV.md on `Speed` runs. Then use `basedpl.bpltests` to set those budgets under the rule in `tests/speed.txt`:
+The manually triggered `Speed` workflow measures the Ubicloud runner used by `Test` and restores its cache. The `Test` job also sets `RUSTYMATH_COSTS` on every push. `logged_costs` reads its log as it reads a `Speed` job's. After a run, review it and decide which budgets should change, following basedpl's DEV.md on `Speed` runs. Then use `basedpl.bpltests` to set those budgets under the rule in `tests/speed.txt`:
 
 ```python
 set_budgets(native=[cargo_costs(rms), logged_costs(log)], path=rms/'tests/speed.txt', cases=cases)

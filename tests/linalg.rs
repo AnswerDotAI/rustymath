@@ -23,6 +23,21 @@ mod products {
     }
 
     #[test]
+    fn transposed_operands_read_as_their_transposes() {
+        // Float `PlusTimes` reads a transposed operand in place, and `MaxPlus` takes the default, which copies it. Small whole numbers keep every sum exact.
+        fn check<P: Inner<f64, Out = f64>>(p: P, a: &[f64], b: &[f64], [m, k, n]: [usize; 3]) {
+            let (at, bt, expected) = (transpose(a, m, k), transpose(b, k, n), p.inner(a, b, [m, k, n]));
+            assert_eq!(p.inner_ops(&at, b, [Orientation::Transpose, Orientation::Normal], [m, k, n]), expected);
+            assert_eq!(p.inner_ops(a, &bt, [Orientation::Normal, Orientation::Transpose], [m, k, n]), expected);
+            assert_eq!(p.inner_ops(&at, &bt, [Orientation::Transpose, Orientation::Transpose], [m, k, n]), expected);
+        }
+        let [m, k, n] = [5, 7, 9];
+        let a: Vec<f64> = (0..m * k).map(|i| (i * 7 % 17) as f64 - 8.0).collect();
+        let b: Vec<f64> = (0..k * n).map(|i| (i * 5 % 13) as f64 - 6.0).collect();
+        check(PlusTimes, &a, &b, [m, k, n]);
+        check(MaxPlus, &a, &b, [m, k, n]);
+    }
+    #[test]
     fn products_match_folds_in_order() {
         // The sizes leave partial tiles, give no steps or a single one, and cross each block size. Small whole numbers keep every float sum exact, in any order.
         let sizes = [[0, 3, 4], [3, 0, 4], [3, 4, 0], [1, 1, 1], [5, 7, 9], [MC + 3, KC + 5, 37], [17, 3, NC + 5]];
@@ -355,6 +370,9 @@ mod factor {
         let det = |a: &[T], n: usize| lu(a, n).determinant().wide();
         let inverse = pinv(&regular, [6, 6]);
         assert!((det(&regular, 6) * det(&inverse, 6) - 1.0).abs() < bound, "determinants of a matrix and its inverse");
+        let (x, d) = rustymath::linalg::inverse(&regular, 6).expect("a regular matrix has an inverse");
+        assert!(x == inverse && d.wide() == det(&regular, 6), "a regular matrix's inverse, which pinv gives, and its determinant, which lu gives");
+        assert!(rustymath::linalg::inverse(&[1., 2., 2., 4.].map(T::narrow), 2).is_none(), "a singular matrix has no inverse");
         let (sign, log) = lu(&regular, 6).log_determinant();
         assert!((sign.wide() * log.wide().exp() / det(&regular, 6) - 1.0).abs() < bound, "log-determinant");
         // diag(1, 2, 3, 4) with two rows swapped has determinant -24, and with a zero column, 0 and a logarithm of -∞.
@@ -1094,7 +1112,10 @@ mod exact {
         assert_eq!(solve(&q(&[1, 1, 1]), &q(&[3]), [1, 3], 1), q(&[1, 1, 1]));
         // The pseudoinverse of a column (1, 1) is the row (1/2, 1/2).
         let half = BigRational::new(1.into(), 2.into());
-        assert_eq!(pinv(&q(&[1, 1]), [2, 1]), vec![half.clone(), half]);
+        assert_eq!(pinv(&q(&[1, 1]), [2, 1]), vec![half.clone(), half.clone()]);
+        // An inverse exists only for a matrix of full rank.
+        assert_eq!(rustymath::linalg::exact::inverse(&q(&[1, 1, 2, 2]), 2), None);
+        assert_eq!(rustymath::linalg::exact::inverse(&q(&[2, 0, 0, 1]), 2), Some((vec![half, BigRational::default(), BigRational::default(), BigRational::from_integer(1.into())], BigRational::from_integer(2.into()))));
         let e = echelon(q(&[1, 2, 3, 2, 4, 7]), [2, 3], 3);
         assert_eq!((e.pivots, e.rows), (vec![0, 2], q(&[1, 2, 0, 0, 0, 1])));
     }

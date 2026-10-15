@@ -21,7 +21,8 @@ jobs:
         with:
           shared-key: native
       - run: grep -m1 'model name' /proc/cpuinfo
-      - run: cargo test
+      # With `RUSTYMATH_COSTS`, the speed test logs every cost, which `basedpl.bpltests.logged_costs` reads.
+      - run: RUSTYMATH_COSTS=1 cargo test
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'

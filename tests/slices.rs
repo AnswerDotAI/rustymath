@@ -743,3 +743,39 @@ mod tolerant {
         assert_eq!((classes(T, &wx), firsts(T, &wx)), (search::classes(&ints), search::firsts(&ints)));
     }
 }
+
+mod gather {
+    use rustymath::gather::{walk, walk_range, Same, Steps};
+    /// The items of `s` that `steps` reach from `base`, with -1 for a fill.
+    fn read(s: &[i64], base: usize, steps: &[Steps]) -> Vec<i64> {
+        let mut out = vec![];
+        walk(&mut out, s, base, steps, -1, Same);
+        out
+    }
+    fn along(len: usize, step: isize) -> Steps { Steps::Stride { start: 0, len, step } }
+    #[test]
+    fn walks_reach_and_run_agree() {
+        // Each item of `s` is its own offset, so a walk shows the offsets it read.
+        let s: Vec<i64> = (0..600).collect();
+        let cases = [
+            (0, vec![along(3, 20), along(20, 1)]),
+            (0, vec![along(3, 20), Steps::Stride { start: 19, len: 20, step: -1 }]),
+            (0, vec![along(2, 50), Steps::Rotated { shift: 7, len: 30, stride: 1 }]),
+            (0, vec![along(2, 50), Steps::Clipped { start: -3, len: 40, size: 30, stride: 1 }]),
+            (0, vec![Steps::Table(vec![Some(4), None, Some(1)]), along(3, 1)]),
+        ];
+        for (base, steps) in &cases {
+            let whole = read(&s, *base, steps);
+            let mut mapped = vec![];
+            walk(&mut mapped, &s, *base, steps, -1, |x: i64| x);
+            assert_eq!(whole, mapped);
+            for (i, &x) in whole.iter().enumerate() { assert_eq!(Steps::reach(*base, steps, i).map_or(-1, |o| o as i64), x) }
+            for (from, n) in [(1, 7), (5, whole.len() - 5), (0, whole.len())] {
+                let mut part = vec![];
+                walk_range(&mut part, &s, *base, steps, -1, from, n, Same);
+                assert_eq!(part, whole[from..from + n]);
+            }
+        }
+        assert_eq!((Steps::run(0, &cases[0].1, 3, 5), Steps::run(0, &cases[0].1, 18, 5)), (Some(3), None));
+    }
+}

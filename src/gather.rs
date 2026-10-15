@@ -187,14 +187,31 @@ impl Steps {
     }
     /// Every offset, in order.
     pub fn offsets(&self) -> impl ExactSizeIterator<Item = Option<usize>> + '_ { (0..self.len()).map(|j| self.get(j)) }
+    /// Offsets `start..start + len`, as at most two entries.
+    fn pieces(&self, start: usize, len: usize) -> Vec<Self> {
+        if len == 0 { return vec![]; }
+        match *self {
+            Self::Stride { start: s, step, .. } => vec![Self::Stride { start: s.wrapping_add_signed(step * start as isize), len, step }],
+            Self::Clipped { start: s, size, stride, .. } => vec![Self::Clipped { start: s + start as i128, len, size, stride }],
+            Self::Rotated { shift, len: n, stride } => {
+                let first = (shift + start) % n;
+                let head = len.min(n - first);
+                let mut out = vec![Self::Stride { start: first * stride, len: head, step: stride as isize }];
+                if head < len { out.push(Self::Stride { start: 0, len: len - head, step: stride as isize }) }
+                out
+            }
+            Self::Table(ref t) => vec![Self::Table(t[start..start + len].to_vec())],
+        }
+    }
     /// Every sum of one offset from each of `tables`, in the order that `walk` visits them. No table may reach a fill.
     pub fn combined(tables: &[impl std::borrow::Borrow<Self>]) -> Vec<usize> {
         tables.iter().fold(vec![0], |sums, t| sums.iter().flat_map(|&s| t.borrow().offsets().map(move |o| s + o.expect("no fills"))).collect())
     }
     /// `steps` without axes of one position, whose offset moves into `base`, and with neighbouring runs merged into one longer run.
-    fn simplify(mut base: usize, steps: &[Self]) -> (usize, Vec<Cow<'_, Self>>) {
+    fn simplify<B: std::borrow::Borrow<Self>>(mut base: usize, steps: &[B]) -> (usize, Vec<Cow<'_, Self>>) {
         let mut kept: Vec<Cow<Self>> = Vec::with_capacity(steps.len());
         for s in steps {
+            let s = s.borrow();
             if let Some(o) = if s.len() == 1 { s.get(0) } else { None } { base += o; continue; }
             kept.push(Cow::Borrowed(s));
             while let [.., outer, inner] = kept.as_slice() {
@@ -206,13 +223,87 @@ impl Steps {
         }
         (base, kept)
     }
+    /// The offset that `steps`, one entry for each axis, outermost first, reach from `base` for item `i` of their frame, or `None` for a fill.
+    #[inline]
+    pub fn reach(base: usize, steps: &[Self], mut i: usize) -> Option<usize> {
+        let mut offset = base;
+        for s in steps.iter().rev() {
+            offset += s.get(i % s.len())?;
+            i /= s.len();
+        }
+        Some(offset)
+    }
+    /// The offset of the first of items `start..start + n` of what `steps` reach from `base`, where those items are consecutive in the source within one forward run of the innermost entry, so that a reader can take them in place.
+    #[inline]
+    pub fn run(base: usize, steps: &[Self], start: usize, n: usize) -> Option<usize> {
+        let (last, outer) = steps.split_last()?;
+        let len = last.len();
+        if len == 0 || start % len + n > len { return None; }
+        let (q, i) = (start / len, start % len);
+        let inner = match *last {
+            Self::Stride { start: s, step: 1, .. } => s + i,
+            Self::Clipped { start: s, size, stride: 1, .. } if s + i as i128 >= 0 && s + (i + n) as i128 <= size as i128 => (s + i as i128) as usize,
+            Self::Rotated { shift, len, stride: 1 } if (shift + i) % len + n <= len => (shift + i) % len,
+            _ => return None,
+        };
+        Self::reach(base + inner, outer, q)
+    }
 }
 
-/// Appends the items of `s` that `steps` reach from `base`, each converted by `f`: one `Steps` for each axis, with the last varying fastest. A `None` offset gives `fill`, converted. The last axis copies whole slices where its pattern allows.
+/// How `walk` turns a source item into a result item. Every `Fn(S) -> D` converts item by item, and [`Same`] copies whole slices of a source and result of one type.
+pub trait Convert<S: Copy, D> {
+    /// `x`, converted.
+    fn one(&self, x: S) -> D;
+    /// Appends the items of `s`, converted.
+    fn slice(&self, d: &mut Vec<D>, s: &[S]) { d.extend(s.iter().map(|&x| self.one(x))) }
+    /// Appends the items of `s` from last to first, converted.
+    fn reversed(&self, d: &mut Vec<D>, s: &[S]) { d.extend(s.iter().rev().map(|&x| self.one(x))) }
+}
+impl<S: Copy, D, F: Fn(S) -> D> Convert<S, D> for F {
+    fn one(&self, x: S) -> D { self(x) }
+}
+/// A [`Convert`] for a source and result of one type, which copies whole slices with no conversion of each item, so that the copies vectorize.
+pub struct Same;
+impl<T: Copy> Convert<T, T> for Same {
+    fn one(&self, x: T) -> T { x }
+    fn slice(&self, d: &mut Vec<T>, s: &[T]) { d.extend_from_slice(s) }
+    fn reversed(&self, d: &mut Vec<T>, s: &[T]) { d.extend(s.iter().rev().copied()) }
+}
+
+/// Appends the items of `s` that `steps` reach from `base`, each converted by `conv`: one `Steps` for each axis, with the last varying fastest. A `None` offset gives `fill`, converted. `conv` is any `Fn(S) -> D`, or [`Same`] for a source and result of one type, which copies whole slices of the last axis where its pattern allows.
 #[inline]
-pub fn walk<S: Copy + 'static, D: Clone + 'static>(out: &mut Vec<D>, s: &[S], base: usize, steps: &[Steps], fill: S, f: impl Fn(S) -> D) {
+pub fn walk<S: Copy, D: Clone>(out: &mut Vec<D>, s: &[S], base: usize, steps: &[Steps], fill: S, conv: impl Convert<S, D>) {
     let (base, steps) = Steps::simplify(base, steps);
-    walk_into(out, s, &f, fill, base, &steps)
+    walk_into(out, s, &conv, fill, base, &steps)
+}
+
+/// Items `from..from + n` of what [`walk`] gives for the same arguments, appended to `out`. Whole runs of the innermost axis copy as `walk` copies them, so a range in the middle of a long axis costs no more per item than the whole walk.
+pub fn walk_range<S: Copy, D: Clone>(out: &mut Vec<D>, s: &[S], base: usize, steps: &[Steps], fill: S, from: usize, n: usize, conv: impl Convert<S, D>) {
+    range_into(out, s, &conv, fill, base, steps, from, n)
+}
+
+/// `walk_range` over `steps`: a partial row at each end recurses into the next axis, and the whole rows between them walk as one box.
+fn range_into<S: Copy, D: Clone, C: Convert<S, D>>(d: &mut Vec<D>, s: &[S], conv: &C, fill: S, base: usize, steps: &[Steps], from: usize, n: usize) {
+    if n == 0 { return; }
+    let Some((axis, rest)) = steps.split_first() else { return d.push(conv.one(s[base])) };
+    let width: usize = rest.iter().map(Steps::len).product();
+    let row = |d: &mut Vec<D>, j: usize, at: usize, m: usize| match axis.get(j) {
+        Some(o) => range_into(d, s, conv, fill, base + o, rest, at, m),
+        None => d.extend(std::iter::repeat_n(conv.one(fill), m)),
+    };
+    let (mut j, at, mut left) = (from / width, from % width, n);
+    if at > 0 {
+        let m = left.min(width - at);
+        row(d, j, at, m);
+        (j, left) = (j + 1, left - m);
+    }
+    let whole = left / width;
+    for piece in axis.pieces(j, whole) {
+        let cells: Vec<Cow<Steps>> = std::iter::once(Cow::Owned(piece)).chain(rest.iter().map(Cow::Borrowed)).collect();
+        let (base, cells) = Steps::simplify(base, &cells);
+        walk_into(d, s, conv, fill, base, &cells);
+    }
+    if left > whole * width { row(d, j + whole, 0, left - whole * width) }
 }
 
 /// The longest run of adjacent items that `walk_into` copies item by item. A longer run copies with `extend_from_slice`.
@@ -221,19 +312,18 @@ const RUN: usize = 8;
 const CELL: usize = 64;
 
 /// `walk` after `Steps::simplify`.
-fn walk_into<S: Copy + 'static, D: Clone + 'static>(d: &mut Vec<D>, s: &[S], f: &impl Fn(S) -> D, fill: S, base: usize, steps: &[Cow<Steps>]) {
-    let filled = || f(fill);
-    let Some((axis, rest)) = steps.split_first() else { return d.push(f(s[base])) };
+fn walk_into<S: Copy, D: Clone, C: Convert<S, D>>(d: &mut Vec<D>, s: &[S], conv: &C, fill: S, base: usize, steps: &[Cow<Steps>]) {
+    let filled = || conv.one(fill);
+    let Some((axis, rest)) = steps.split_first() else { return d.push(conv.one(s[base])) };
     if let [inner] = rest {
         if let (&Steps::Stride { start: a, len: m, step: 1 }, &Steps::Stride { start: b, len: n, step }) = (&**axis, &**inner) {
-            if step > 1 { return transposed(d, &s[base + a + b..], f, filled(), m, n, step as usize); }
+            if step > 1 { return transposed(d, &s[base + a + b..], &|x| conv.one(x), filled(), m, n, step as usize); }
         }
-        // One run of `n` adjacent items for each offset along `axis`, as windows give. A run longer than `RUN` copies fastest with `extend_from_slice`, which needs the source and the buffer to hold one type.
+        // One run of `n` adjacent items for each offset along `axis`, as windows give. A run longer than `RUN` copies as one slice.
         if let Steps::Stride { start: b, len: n, step: 1 } = **inner {
-            let same = if n > RUN { (d as &mut dyn std::any::Any).downcast_mut::<Vec<S>>() } else { None };
-            if let Some(d) = same {
+            if n > RUN {
                 d.reserve(axis.len() * n);
-                for o in axis.offsets() { match o { Some(o) => d.extend_from_slice(&s[base + b + o..][..n]), None => d.extend(std::iter::repeat_n(fill, n)) } }
+                for o in axis.offsets() { match o { Some(o) => conv.slice(d, &s[base + b + o..][..n]), None => d.extend(std::iter::repeat_n(filled(), n)) } }
                 return;
             }
         }
@@ -244,7 +334,7 @@ fn walk_into<S: Copy + 'static, D: Clone + 'static>(d: &mut Vec<D>, s: &[S], f: 
     if !rest.is_empty() && (1..=CELL).contains(&width) && run <= RUN && rest.iter().all(|t| matches!(**t, Steps::Stride { .. })) {
         let cell = Steps::combined(rest);
         if let Steps::Stride { start: a, len: m, step } = **axis {
-            macro_rules! widths { ($($w:literal)+) => { match width { $($w => return windows::<$w, _, _>(d, s, base + a, step, m, cell.as_slice().try_into().expect("`cell` holds `width` offsets"), |x| f(x)),)+ _ => {} } } }
+            macro_rules! widths { ($($w:literal)+) => { match width { $($w => return windows::<$w, _, _>(d, s, base + a, step, m, cell.as_slice().try_into().expect("`cell` holds `width` offsets"), |x| conv.one(x)),)+ _ => {} } } }
             widths!(2 3 4 5 6 7 8 9);
         }
         let start = d.len();
@@ -252,37 +342,37 @@ fn walk_into<S: Copy + 'static, D: Clone + 'static>(d: &mut Vec<D>, s: &[S], f: 
         for (out, o) in d[start..].chunks_exact_mut(width).zip(axis.offsets()) {
             let Some(o) = o else { continue };
             let s = &s[base + o..];
-            for (slot, &c) in out.iter_mut().zip(&cell) { *slot = f(s[c]) }
+            for (slot, &k) in out.iter_mut().zip(&cell) { *slot = conv.one(s[k]) }
         }
         return;
     }
     if !rest.is_empty() {
         for j in 0..axis.len() {
-            match axis.get(j) { Some(o) => walk_into(d, s, f, fill, base + o, rest), None => d.extend(std::iter::repeat_n(filled(), width)) }
+            match axis.get(j) { Some(o) => walk_into(d, s, conv, fill, base + o, rest), None => d.extend(std::iter::repeat_n(filled(), width)) }
         }
         return;
     }
     if axis.len() == 0 { return; }
     // Each loop gets the source from `base` onwards by value, so that the compiler keeps its bounds in registers.
     let s = &s[base..];
-    let slice = move |start: usize, len: usize| s[start..start + len].iter().map(|&x| f(x));
     match **axis {
-        Steps::Stride { start, len, step: 1 } => d.extend(slice(start, len)),
-        Steps::Stride { start, len, step: -1 } => d.extend(slice(start + 1 - len, len).rev()),
-        Steps::Stride { start, len, step } if step > 0 => { let (s, step) = (&s[start..], step as usize); d.extend((0..len).map(move |j| f(s[j * step]))) }
+        Steps::Stride { start, len, step: 1 } => conv.slice(d, &s[start..start + len]),
+        Steps::Stride { start, len, step: -1 } => conv.reversed(d, &s[start + 1 - len..=start]),
+        Steps::Stride { start, len, step: 0 } => d.extend(std::iter::repeat_n(conv.one(s[start]), len)),
+        Steps::Stride { start, len, step } if step > 0 => { let (s, step) = (&s[start..], step as usize); d.extend((0..len).map(move |j| conv.one(s[j * step]))) }
         Steps::Rotated { shift, len, stride: 1 } => {
-            d.extend(slice(shift, len - shift));
-            d.extend(slice(0, shift));
+            conv.slice(d, &s[shift..len]);
+            conv.slice(d, &s[..shift]);
         }
         Steps::Clipped { start, len, size, stride: 1 } => {
             let (lo, hi) = (start.clamp(0, size as i128), (start + len as i128).clamp(0, size as i128));
             let before = (lo - start).clamp(0, len as i128) as usize;
             let middle = (hi - lo).max(0) as usize;
             d.extend(std::iter::repeat_n(filled(), before));
-            d.extend(slice(lo as usize, middle));
+            conv.slice(d, &s[lo as usize..lo as usize + middle]);
             d.extend(std::iter::repeat_n(filled(), len - before - middle));
         }
-        _ => d.extend(axis.offsets().map(move |o| o.map_or_else(filled, |o| f(s[o])))),
+        _ => d.extend(axis.offsets().map(move |o| o.map_or_else(filled, |o| conv.one(s[o])))),
     }
 }
 
