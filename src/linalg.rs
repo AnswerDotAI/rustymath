@@ -90,7 +90,7 @@ pub trait Inner<T> {
     fn inner_into(&self, a: &[T], b: &[T], size: [usize; 3], out: &mut [Self::Out]) { out.copy_from_slice(&self.inner(a, b, size)) }
 }
 
-/// `+.×`, the matrix product, at `i64`, `f32` and `f64`, and complex numbers with parts of either type. Native float steps use fused multiply-add where the target has one; Accelerate computes them on macOS. Nonfinite complex results need not match scalar arithmetic. Native complex products sum three real products of the parts, as the 3M method does. Their real parts are as accurate as four real products make them. Its normwise error is about 4 units of roundoff, against about 2.5 for four real products. An imaginary part's error scales with the size of the whole product. An imaginary part a millionth the size of its real part keeps about 10 of f64's 16 digits and about 1 of f32's 7. A result whose 3M imaginary part isn't finite takes four real products instead.
+/// `+.×`, the matrix product, at `i64`, `f32` and `f64`, and complex numbers with parts of either type. Native float steps use fused multiply-add where the target has one; Accelerate computes them on macOS. Nonfinite complex results need not match scalar arithmetic. Native complex products form each part from two real products of the parts, as scalar multiplication does. A small imaginary part beside a large real part keeps its own relative accuracy.
 #[derive(Default)]
 pub struct PlusTimes;
 /// `⌈.+`, the max-plus product of longest-path problems, at `i64`, `f32` and `f64`. The module doc says how each target treats a NaN term.
@@ -536,7 +536,7 @@ pub(crate) trait Tiled: Scalar + Default + Vendor {
         if m == 0 || n == 0 { return; }
         dispatch!(accelerate::triangular(x, ldx, a, [m, n], side, triangle), factor::triangular_native(x, ldx, a, [m, n], side, triangle))
     }
-    /// `alpha a b` on rustymath's own packed kernels, replacing `c` with `start` and added to it otherwise. Complex items run three real products through `complex_product`.
+    /// `alpha a b` on rustymath's own packed kernels, replacing `c` with `start` and added to it otherwise. Complex items run four real products through `complex_product`.
     #[cfg(native)]
     fn native_product(c: &mut [Self], ldc: usize, a: Matrix<'_, Self>, alpha: Self, b: Matrix<'_, Self>, size: [usize; 3], start: bool, part: Part);
     /// The thin SVD of the finite, nonempty `m`×`n` matrix `a` as `(U, s, V)`, with its singular vectors only where `vectors` is true, or `None` where it doesn't converge.
@@ -634,48 +634,37 @@ tiled! {
     Complex<f32>: complex(f32);
     Complex<f64>: complex(f64);
 }
-/// Native complex 3M: `p = aᵣ bᵣ`, `q = aᵢ bᵢ`, `s = (aᵣ + aᵢ)(bᵣ + bᵢ)` gives real `p-q` and imaginary `s-p-q`. Nonfinite imaginary parts use the two ordinary cross-products instead. `parts` splits each operand once, before the real products.
+/// `alpha a b`, from four real products of the parts: real parts `aᵣbᵣ - aᵢbᵢ` and imaginary parts `aᵣbᵢ + aᵢbᵣ`, as scalar multiplication forms them. `parts` splits each operand once, before the real products.
 #[cfg(native)]
 fn complex_product<R: crate::Native + Tiled>(
     c: &mut [Complex<R>], ldc: usize, a: Matrix<'_, Complex<R>>, alpha: Complex<R>, b: Matrix<'_, Complex<R>>, size: [usize; 3], start: bool, part: Part) {
     let [m, k, n] = size;
     if m == 0 || k == 0 || n == 0 { return; }
-    let ([ar, ai, asum], [br, bi, bs]) = (parts(a, [m, k], alpha), parts(b, [k, n], Complex::new(R::one(), R::zero())));
-    let real = |c: &mut [R], x: &[R], y: &[R], start: bool| R::native_product(c, n, Matrix::rows(x, k), R::one(), Matrix::rows(y, n), size, start, part);
-    let (mut p, mut q, mut s) = (filled(m * n, R::zero()), filled(m * n, R::zero()), filled(m * n, R::zero()));
-    real(&mut p, &ar, &br, true);
-    real(&mut q, &ai, &bi, true);
-    real(&mut s, &asum, &bs, true);
-    let mut finite = true;
+    let ([ar, ai], [br, bi]) = (parts(a, [m, k], alpha), parts(b, [k, n], Complex::new(R::one(), R::zero())));
+    let real = |c: &mut [R], x: &[R], y: &[R], scale: R, start: bool| R::native_product(c, n, Matrix::rows(x, k), scale, Matrix::rows(y, n), size, start, part);
+    let (mut re, mut im) = (filled(m * n, R::zero()), filled(m * n, R::zero()));
+    real(&mut re, &ar, &br, R::one(), true);
+    real(&mut re, &ai, &bi, -R::one(), false);
+    real(&mut im, &ar, &bi, R::one(), true);
+    real(&mut im, &ai, &br, R::one(), false);
     for i in 0..m {
         for j in part.columns(i, n) {
             let (t, x) = (i * n + j, &mut c[i * ldc + j]);
-            let im = s[t] - p[t] - q[t];
-            finite &= im.is_finite();
-            if start { *x = Complex::default() }
-            *x = Complex::new(x.re + (p[t] - q[t]), if im.is_finite() { x.im + im } else { x.im });
-        }
-    }
-    if !finite {
-        let mut four = filled(m * n, R::zero());
-        real(&mut four, &ar, &bi, true);
-        real(&mut four, &ai, &br, false);
-        for i in 0..m {
-            for j in part.columns(i, n) { let (t, x) = (i * n + j, &mut c[i * ldc + j]); if !(s[t] - p[t] - q[t]).is_finite() { x.im = x.im + four[t] } }
+            *x = if start { Complex::new(re[t], im[t]) } else { Complex::new(x.re + re[t], x.im + im[t]) };
         }
     }
 }
 
-/// The real parts, imaginary parts and their sums of `scale` times the `rows`×`cols` matrix that `x` views, each row by row.
+/// The real parts and the imaginary parts of `scale` times the `rows`×`cols` matrix that `x` views, each row by row.
 #[cfg(native)]
-fn parts<R: crate::Native + Tiled>(x: Matrix<'_, Complex<R>>, [rows, cols]: [usize; 2], scale: Complex<R>) -> [Vec<R>; 3] {
+fn parts<R: crate::Native + Tiled>(x: Matrix<'_, Complex<R>>, [rows, cols]: [usize; 2], scale: Complex<R>) -> [Vec<R>; 2] {
     let (one, conj) = (scale == Complex::new(R::one(), R::zero()), matches!(x.op, Op::Adjoint | Op::Conjugate));
     let value = |v: Complex<R>| { let v = if conj { v.conj() } else { v }; if one { v } else { scale * v } };
     let mut z = filled(rows * cols, Complex::default());
     if x.op.transposed() { transpose_into(x.data, x.ld, &mut z, cols, [cols, rows], value) } else {
         for (row, out) in z.chunks_exact_mut(cols).enumerate() { for (o, &v) in out.iter_mut().zip(&x.data[row * x.ld..][..cols]) { *o = value(v) } }
     }
-    [z.iter().map(|v| v.re).collect(), z.iter().map(|v| v.im).collect(), z.iter().map(|v| v.re + v.im).collect()]
+    [z.iter().map(|v| v.re).collect(), z.iter().map(|v| v.im).collect()]
 }
 
 /// The micro-kernels in plain Rust, for targets without the explicit ones. Each takes the number of vectors in a tile row, `V`, as the explicit ones do, and ignores it.

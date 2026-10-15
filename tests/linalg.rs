@@ -89,7 +89,7 @@ mod products {
 
     #[test]
     fn finite_complex_products_match_four_products() {
-        // Finite inputs can overflow 3M's intermediates where four real products give finite parts. `s` overflows for x(1+i) squared with x² above a quarter of the largest float. Its sum `aᵣ + aᵢ` overflows at max(1+i). The values keep every product exact, so `*`, which forms four real products, gives each result's bits.
+        // Every product of parts is exact for these values. Native complex products must then give the same bits as `*`. x(1+i) squared, with x² above a quarter of the largest float, and max(1+i) times 1 have finite results, though sums of their parts overflow.
         macro_rules! check {
             ($r:ty, $x:expr) => {{
                 let (c, x, max) = (Complex::<$r>::new, $x, <$r>::MAX);
@@ -99,9 +99,10 @@ mod products {
                     PlusTimes.inner_into(&[p], &[q], [1, 1, 1], &mut into);
                     assert_eq!(into, [p * q]);
                 }
-                // A cell whose 3M intermediates overflow must not affect its neighbours.
-                let (a, b) = ([c(x, x), c(1.0, 2.0)], [c(x, x), c(3.0, 4.0)]);
-                assert_eq!(PlusTimes.inner(&a, &b, [2, 1, 2]), [a[0] * b[0], a[0] * b[1], a[1] * b[0], a[1] * b[1]]);
+                // Complex-step differentiation reads an imaginary part far smaller than its real part. A real matrix times one with such parts must keep them.
+                let tiny = (2.0 as $r).powi(-100);
+                let (a, b) = ([c(1.0, 0.0), c(2.0, 0.0)], [c(3.0, tiny), c(5.0, tiny)]);
+                assert_eq!(PlusTimes.inner(&a, &b, [1, 2, 1]), [c(13.0, 3.0 * tiny)]);
             }};
         }
         check!(f64, 2f64.powi(511));
