@@ -175,7 +175,9 @@ pub trait TolerantComplex: Tolerant {
     fn complex_floor<R: Native>(self, y: Complex<R>) -> Complex<R> {
         let (a, b) = (self.floor(y.re), self.floor(y.im));
         let (x, z) = (y.re - a, y.im - b);
-        if x + z < R::one() - R::narrow(self.value()) { Complex::new(a, b) } else if x <= z { Complex::new(a, b + R::one()) } else { Complex::new(a + R::one(), b) }
+        if x + z < R::one() - R::narrow(self.value()) { Complex::new(a, b) }
+        else if x <= z { Complex::new(a, b + R::one()) }
+        else { Complex::new(a + R::one(), b) }
     }
     #[inline]
     fn complex_ceil<R: Native>(self, y: Complex<R>) -> Complex<R> { -self.complex_floor(-y) }

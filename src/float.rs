@@ -237,7 +237,8 @@ pub(crate) fn horner<R: Native, const FUSED: bool, const N: usize>(x: R, c: [f64
 /// ln 2, split into a part whose product with any whole number up to 2^11 at f64 or 2^8 at f32 is exact, and the rest. That covers every exponent of a float and every n that `exp` reduces by.
 #[inline]
 pub(crate) fn ln2<R: Native>() -> (R, R) {
-    let (hi, lo) = if R::WIDE { (0.69314718055966295651160180568695068359375, 0.28235290563031577122588448175013436025525412068e-12) } else { (0.693145751953125, 1.428606765330187e-06) };
+    let (hi, lo) = if R::WIDE { (0.69314718055966295651160180568695068359375, 0.28235290563031577122588448175013436025525412068e-12) }
+    else { (0.693145751953125, 1.428606765330187e-06) };
     (R::narrow(hi), R::narrow(lo))
 }
 

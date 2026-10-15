@@ -335,14 +335,7 @@ fn deflate<R: Native>(d: &mut [R], z: &mut [R], k: usize) -> (Vec<usize>, Vec<(u
             i += 1;
         }
     }
-    if total {
-        for i in 1..n {
-            if d[perm[i]].abs() < small || d[perm[i]] > d[0] { perm[i - 1] = perm[i] } else {
-                perm[i - 1] = 0;
-                break;
-            }
-        }
-    }
+    if total { for i in 1..n { if d[perm[i]].abs() < small || d[perm[i]] > d[0] { perm[i - 1] = perm[i] } else { perm[i - 1] = 0; break; } } }
     // Swaps put d into ascending order, from the end of `perm`, recording each swap.
     let (mut real_ind, mut real_col, mut swaps): (Vec<usize>, Vec<usize>, Vec<usize>) = ((0..n).collect(), (0..n).collect(), (0..n).collect());
     let start = if total { 0 } else { 1 };
@@ -420,10 +413,7 @@ fn arrow<R: Native + Tiled<Real = R>>(d: &mut [R], z: &[R], outer: &[usize]) -> 
                 let dk = d[k];
                 let mut product = (s[tail] + dk) * (mus[tail] + (shifts[tail] - dk));
                 for (l, &i) in perm.iter().enumerate().filter(|&(_, &i)| i != k) {
-                    if i >= k && l == 0 {
-                        product = zero;
-                        break;
-                    }
+                    if i >= k && l == 0 { product = zero; break; }
                     let j = if i < k || l == 0 { i } else { perm[l - 1] };
                     product = product * (((s[j] + dk) / (d[i] + dk)) * ((mus[j] + (shifts[j] - dk)) / (d[i] - dk)));
                 }
@@ -453,10 +443,7 @@ fn arrow<R: Native + Tiled<Real = R>>(d: &mut [R], z: &[R], outer: &[usize]) -> 
         crate::parallel::split(&mut rows, 1, &|start, pairs| {
             for (row, (u, v)) in (start..).zip(pairs.iter_mut()) {
                 let (u, k) = (&mut u[..n], from[row]);
-                if zhat[k] == zero {
-                    (u[outer[k]], v[outer[k]]) = (one, one);
-                    continue;
-                }
+                if zhat[k] == zero { (u[outer[k]], v[outer[k]]) = (one, one); continue; }
                 let (shift, mu) = (shifts[k], mus[k]);
                 for &i in &perm { u[outer[i]] = zhat[i] / ((d[i] - shift) - mu) / (d[i] + (shift + mu)) }
                 unit(u);

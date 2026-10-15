@@ -348,10 +348,7 @@ fn decompositions(units: &Units<f64, f32>, complex_units: &Units<num_complex::Co
 fn budgets(text: &str) -> HashMap<(&str, &str), f64> {
     let mut width = "";
     text.lines().filter(|line| !line.is_empty() && !line.starts_with('#')).filter_map(|line| {
-        if let Some(w) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            width = w;
-            return None;
-        }
+        if let Some(w) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) { width = w; return None; }
         let (name, budget) = line.split_once('\t').expect("a budget line holds a name, a tab and a budget");
         Some(((width, name), budget.parse().expect("a budget is a number")))
     }).collect()

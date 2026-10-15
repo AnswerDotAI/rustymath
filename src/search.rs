@@ -365,7 +365,8 @@ pub fn grouped_keys<K: Key>(x: &[K]) -> Option<Grouped> {
     for (g, &f) in firsts.iter().enumerate() { table[x[f].key().wrapping_sub(min) as usize] = g; }
     let table = &table[..];
     // With two keys, each item's class is its offset from the lower key, flipped when the higher key comes first.
-    Some(if let [lower, _] = *table { grouped_classes(x, firsts, move |k| k.key().wrapping_sub(min) as usize ^ lower) } else { grouped_classes(x, firsts, move |k| table[k.key().wrapping_sub(min) as usize]) })
+    Some(if let [lower, _] = *table { grouped_classes(x, firsts, move |k| k.key().wrapping_sub(min) as usize ^ lower) }
+    else { grouped_classes(x, firsts, move |k| table[k.key().wrapping_sub(min) as usize]) })
 }
 
 /// `grouped` for the positions of `items`, each in the group that `group` gives its item.
@@ -488,10 +489,7 @@ fn counted<K: RadixKey>(keys: &[K]) -> Option<Vec<u32>> {
 pub(crate) fn sorted<K: RadixKey>(mut keys: Vec<K>) -> (Vec<K>, Vec<u32>) {
     let n = keys.len();
     let mut order: Vec<u32> = (0..n as u32).collect();
-    if n < 256 {
-        order.sort_by_key(|&i| keys[i as usize]);
-        return (order.iter().map(|&i| keys[i as usize]).collect(), order);
-    }
+    if n < 256 { order.sort_by_key(|&i| keys[i as usize]); return (order.iter().map(|&i| keys[i as usize]).collect(), order); }
     radix(&mut keys, &mut order, &mut (vec![K::default(); n], vec![0; n]));
     (keys, order)
 }

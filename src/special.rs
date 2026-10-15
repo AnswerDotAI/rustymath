@@ -442,7 +442,9 @@ fn erfc_blocks<R: Native, const FUSED: bool>(x: &[R], out: &mut [MaybeUninit<R>]
     let split = R::narrow(ERFC_SPLIT);
     for (xs, os) in x.chunks(BLOCK).zip(out.chunks_mut(BLOCK)) {
         let (low, high) = xs.iter().fold((R::infinity(), R::zero()), |(low, high), &v| (low.min(v.abs()), high.max(v.abs())));
-        if high < split { fill(xs, os, #[inline(always)] |v| erfc_ends(v, erfc_near::<R, FUSED>(v))); } else if low >= split { fill(xs, os, #[inline(always)] |v| erfc_ends(v, erfc_far::<R, FUSED>(v))); } else { fill(xs, os, erfc::<R, FUSED>); }
+        if high < split { fill(xs, os, #[inline(always)] |v| erfc_ends(v, erfc_near::<R, FUSED>(v))); }
+        else if low >= split { fill(xs, os, #[inline(always)] |v| erfc_ends(v, erfc_far::<R, FUSED>(v))); }
+        else { fill(xs, os, erfc::<R, FUSED>); }
     }
     true
 }
@@ -540,7 +542,10 @@ fn maddock_g<const FUSED: bool>(q: f64) -> f64 { (-ln::<f64, FUSED>(q)).sqrt() }
 #[inline(always)]
 fn maddock_below<const FUSED: bool>(g: f64) -> f64 {
     use erfinv_regions::*;
-    if g < 3.0 { BELOW_3.scaled::<FUSED>(g, g) } else if g < 6.0 { BELOW_6.scaled::<FUSED>(g, g) } else if g < 18.0 { BELOW_18.scaled::<FUSED>(g, g) } else { BELOW_44.scaled::<FUSED>(g, g) }
+    if g < 3.0 { BELOW_3.scaled::<FUSED>(g, g) }
+    else if g < 6.0 { BELOW_6.scaled::<FUSED>(g, g) }
+    else if g < 18.0 { BELOW_18.scaled::<FUSED>(g, g) }
+    else { BELOW_44.scaled::<FUSED>(g, g) }
 }
 
 /// One region of `maddock`: polynomials `p` and `q`, highest degree first, in x - `shift`, and the constant `y` that their ratio corrects.

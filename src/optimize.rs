@@ -118,7 +118,10 @@ impl Method {
     pub fn choose(task: Task, variables: usize, bounded: bool) -> Method {
         match task {
             Task::Minimize { gradient } => {
-                if variables == 1 { Method::Brent } else if gradient && !bounded { Method::Lbfgs } else if bounded { Method::Powell } else { Method::NelderMead }
+                if variables == 1 { Method::Brent }
+                else if gradient && !bounded { Method::Lbfgs }
+                else if bounded { Method::Powell }
+                else { Method::NelderMead }
             }
             Task::Solve { residuals } => { if variables == 1 && residuals == 1 { Method::Brent } else { Method::LevenbergMarquardt } }
             Task::Linear { .. } => { if task.least_squares(variables) { Method::Minres } else { Method::Gmres } }
@@ -301,10 +304,7 @@ pub fn solve_linear<F: Native, M: Mapping<F>>(a: &mut M, b: &[F], start: &[F], o
     let mut op = Products { a, at: start, normal: task.least_squares(n), inner: vec![F::zero(); m], products: 0, limit };
     let mut x = start.to_vec();
     let outcome = op.rhs(b).and_then(|rhs| {
-        if norm(&rhs) == F::zero() {
-            x.fill(F::zero());
-            return Ok(true);
-        }
+        if norm(&rhs) == F::zero() { x.fill(F::zero()); return Ok(true); }
         match method {
             Method::Cg => cg(&mut op, &rhs, &mut x, tolerance), Method::Minres => minres(&mut op, &rhs, &mut x, tolerance),
             _ => gmres(&mut op, &rhs, &mut x, tolerance)
@@ -382,8 +382,7 @@ impl<'a, F: Native, O: Objective<F>> Search<'a, F, O> {
     fn values(&mut self, xs: &mut [F], out: &mut [F]) -> Result<(), Halt<O::Error>> {
         self.prepare(xs, out.len())?;
         let n = self.best.len();
-        if self.objective.batch() { self.objective.values(xs, out).map_err(Halt::Error)? }
-        else {
+        if self.objective.batch() { self.objective.values(xs, out).map_err(Halt::Error)? } else {
             for (y, x) in out.iter_mut().zip(xs.chunks_exact(n)) { *y = self.objective.value(x).map_err(Halt::Error)? }
         }
         for (y, x) in out.iter_mut().zip(xs.chunks_exact(n)) { *y = self.record(*y, x) }
@@ -665,10 +664,7 @@ fn wolfe<F: Native, O: Objective<F>>(
     let mut alpha = F::one();
     for i in 0..STEPS {
         let fa = probe(search, alpha, xn)?;
-        if !sufficient(alpha, fa) || (i > 0 && fa >= flo) {
-            bracket = Some((alpha, fa));
-            break;
-        }
+        if !sufficient(alpha, fa) || (i > 0 && fa >= flo) { bracket = Some((alpha, fa)); break; }
         search.gradient(xn, gn)?;
         let sa = dot(gn, d);
         if sa.abs() <= -c2 * slope { return Ok(Some(fa)); }
@@ -689,10 +685,7 @@ fn wolfe<F: Native, O: Objective<F>>(
             let (p, q) = (lo + tenth * width, hi - tenth * width);
             let alpha = guess.max(p.min(q)).min(p.max(q));
             let fa = probe(search, alpha, xn)?;
-            if !sufficient(alpha, fa) || fa >= flo {
-                (hi, fhi) = (alpha, fa);
-                continue;
-            }
+            if !sufficient(alpha, fa) || fa >= flo { (hi, fhi) = (alpha, fa); continue; }
             search.gradient(xn, gn)?;
             let sa = dot(gn, d);
             if sa.abs() <= -c2 * slope { return Ok(Some(fa)); }
@@ -818,8 +811,7 @@ fn root<F: Native, M: Mapping<F>>(search: &mut Search<'_, F, Norm<'_, F, M>>, st
             if p > F::zero() { q = -q }
             else { p = -p }
             if two * p < (three * m * q - (tol1 * q).abs()).min((e * q).abs()) { (e, d) = (d, p / q) } else { (d, e) = (m, m) }
-        }
-        else { (d, e) = (m, m); }
+        } else { (d, e) = (m, m); }
         (a, fa) = (b, fb);
         b = b + if d.abs() > tol1 { d } else { tol1.copysign(m) };
         fb = at(search, b)?.1;
@@ -933,10 +925,7 @@ impl<F: Native, M: Mapping<F>> Mapping<F> for Affine<'_, F, M> {
     /// A v, computed again with a corrected t where the t from the last product's ratio made t |A v| smaller than |b|.
     fn value(&mut self, v: &[F], out: &mut [F]) -> Result<(), M::Error> {
         let nv = norm(v);
-        if nv == F::zero() {
-            out.fill(F::zero());
-            return Ok(());
-        }
+        if nv == F::zero() { out.fill(F::zero()); return Ok(()); }
         let t = self.scale(nv, self.ratio.unwrap_or(F::one()));
         self.at(v, t, out)?;
         let mut av = norm(out);
@@ -975,10 +964,7 @@ impl<F: Native, M: Mapping<F>> Products<'_, F, M> {
 
     /// The operator's product with `v`, into `out`.
     fn apply(&mut self, v: &[F], out: &mut [F]) -> Result<(), Halt<M::Error>> {
-        if !self.normal {
-            self.count(1)?;
-            return self.a.value(v, out).map_err(Halt::Error);
-        }
+        if !self.normal { self.count(1)?; return self.a.value(v, out).map_err(Halt::Error); }
         self.count(2)?;
         self.a.value(v, &mut self.inner).map_err(Halt::Error)?;
         self.a.vjp(&self.inner, self.at, out).map_err(Halt::Error)

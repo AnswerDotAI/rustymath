@@ -421,7 +421,8 @@ impl Formulas for StudentT {
         let h = self.df / 2.0;
         // The probability outside -|t| to |t|, and inside it, where 1 - 2q is exact.
         let q = 2.0 * p.min(1.0 - p);
-        let t = if q > 0.5 { let y = betaincinv(0.5, h, 1.0 - q); (self.df * y / (1.0 - y)).sqrt() } else { let x = betaincinv(h, 0.5, q); (self.df * (1.0 - x) / x).sqrt() };
+        let t = if q > 0.5 { let y = betaincinv(0.5, h, 1.0 - q); (self.df * y / (1.0 - y)).sqrt() }
+        else { let x = betaincinv(h, 0.5, q); (self.df * (1.0 - x) / x).sqrt() };
         if p < 0.5 { -t } else { t }
     }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { standard_normal(rng) / (standard_gamma(self.df / 2.0, rng) * 2.0 / self.df).sqrt() }
@@ -458,8 +459,7 @@ fn least(target: f64, guess: f64, max: f64, cdf: impl Fn(f64) -> f64) -> f64 {
             above = below;
             step *= 2.0;
         }
-    }
-    else {
+    } else {
         loop {
             if below >= max { return max; }
             above = (below + step).min(max);
@@ -548,10 +548,7 @@ fn btrd<R: Rng + ?Sized>(n: f64, p: f64, rng: &mut R) -> f64 {
     let urvr = 0.86 * vr;
     loop {
         let mut v: f64 = StandardUniform.sample(rng);
-        if v <= urvr {
-            let u = v / vr - 0.43;
-            return ((2.0 * a / (0.5 - u.abs()) + b) * u + c).floor();
-        }
+        if v <= urvr { let u = v / vr - 0.43; return ((2.0 * a / (0.5 - u.abs()) + b) * u + c).floor(); }
         let u = if v >= vr { let u: f64 = StandardUniform.sample(rng); u - 0.5 } else {
             let w = v / vr - 0.93;
             let w2: f64 = StandardUniform.sample(rng);
@@ -593,7 +590,9 @@ impl Formulas for Poisson {
     }
     /// No whole number has cdf 1, so the quantile of 1 is ∞.
     fn quantile(&self, q: f64) -> f64 {
-        if self.rate == 0.0 { 0.0 } else if q == 1.0 { f64::INFINITY } else { least(q, normal_guess(self.rate, self.rate.sqrt(), q), f64::INFINITY, |k| self.cdf(k)) }
+        if self.rate == 0.0 { 0.0 }
+        else if q == 1.0 { f64::INFINITY }
+        else { least(q, normal_guess(self.rate, self.rate.sqrt(), q), f64::INFINITY, |k| self.cdf(k)) }
     }
     /// Multiplying uniform draws below a rate of 10, and Hörmann's PTRS method (transformed rejection with squeeze) above.
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 {

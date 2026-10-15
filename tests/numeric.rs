@@ -76,7 +76,8 @@ mod distribution {
         for d in cases() {
             for p in [0.001, 0.1, 0.5, 0.9, 0.999] {
                 let x = d.quantile(p);
-                if d.is_discrete() { assert!(d.cdf(x) >= p * (1.0 - 1e-14) && d.cdf(x - 1.0) < p, "{d:?} at {p}: {x}"); } else { assert!((d.cdf(x) - p).abs() < 1e-12, "{d:?} at {p}: cdf({x}) is {}", d.cdf(x)); }
+                if d.is_discrete() { assert!(d.cdf(x) >= p * (1.0 - 1e-14) && d.cdf(x - 1.0) < p, "{d:?} at {p}: {x}"); }
+                else { assert!((d.cdf(x) - p).abs() < 1e-12, "{d:?} at {p}: cdf({x}) is {}", d.cdf(x)); }
             }
             for p in [0.1, 0.5, 0.9] {
                 let x = d.quantile(p);

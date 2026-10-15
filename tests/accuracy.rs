@@ -55,7 +55,9 @@ measured!(f16: u16, f32: u32, f64: u64);
 /// The error of `got` in ulps, against the result `want` at `x`. A special input or a NaN must give exactly the right result, or the error is `u64::MAX`.
 fn error<A: Input, T: Measured>(x: A, got: T, want: T) -> u64 {
     let exact = |same: bool| if same { 0 } else { u64::MAX };
-    if want.is_nan() || got.is_nan() { exact(want.is_nan() && got.is_nan()) } else if x.is_special() { exact(got.key() == want.key()) } else { got.key().abs_diff(want.key()) }
+    if want.is_nan() || got.is_nan() { exact(want.is_nan() && got.is_nan()) }
+    else if x.is_special() { exact(got.key() == want.key()) }
+    else { got.key().abs_diff(want.key()) }
 }
 
 /// The worst error of `f` against `reference` at the inputs `input(i)` for each `i` below `n`, with the input that gives it.
@@ -233,7 +235,8 @@ fn logarithms_exact() {
         let cases = twos.map(|k| (2.0, 2f64.powi(k / 2) * 2f64.powi(k - k / 2), k)).chain(tens.map(|k| (10.0, 10f64.powi(k), k)));
         for (b, x, k) in cases {
             let (b, x, k) = (F::narrow(b), F::narrow(x), F::narrow(k.into()));
-            let alone = if b == F::narrow(2.0) { [rustymath::fused::log2(x), rustymath::unfused::log2(x)] } else { [rustymath::fused::log10(x), rustymath::unfused::log10(x)] };
+            let alone = if b == F::narrow(2.0) { [rustymath::fused::log2(x), rustymath::unfused::log2(x)] }
+            else { [rustymath::fused::log10(x), rustymath::unfused::log10(x)] };
             let mut out = Vec::new();
             assert!(Logb.many(Arg::One(b), Arg::Many(&[x]), 1, &mut out) & Logb.many(Arg::Many(&[b, F::narrow(3.0)]), Arg::One(x), 2, &mut out));
             assert!(Logb.many(Arg::Many(&[b]), Arg::Many(&[x]), 1, &mut out));
@@ -399,7 +402,9 @@ fn circle_roots_accuracy() {
 /// The worst error of `f` at `cases` of inputs and reference results, in units of `eps` times the larger of |reference| and `floor`, with the input that gives it. Infinities and NaN must match exactly.
 fn scaled<A: Copy + Debug>(cases: impl IntoIterator<Item = (A, f64)>, f: impl Fn(A) -> f64, eps: f64, floor: f64) -> (u64, A) {
     let error = |got: f64, want: f64| {
-        if !want.is_finite() || !got.is_finite() { if got == want || (got.is_nan() && want.is_nan()) { 0 } else { u64::MAX } } else { ((got - want).abs() / (eps * want.abs().max(floor))).ceil() as u64 }
+        if !want.is_finite() || !got.is_finite() { if got == want || (got.is_nan() && want.is_nan()) { 0 }
+        else { u64::MAX } }
+        else { ((got - want).abs() / (eps * want.abs().max(floor))).ceil() as u64 }
     };
     cases.into_iter().map(|(x, want)| (error(f(x), want), x)).max_by_key(|&(e, _)| e).unwrap()
 }

@@ -107,7 +107,8 @@ fn minimize<'py>(
     fun: Bound<'py, PyAny>, x0: Bound<'py, PyAny>, method: Option<&str>, jac: Option<Bound<'py, PyAny>>, limits: Option<(Bound<'py, PyAny>, Bound<'py, PyAny>)>,
     tol: Option<f64>, maxfev: Option<usize>, population: Option<usize>, seed: u64, vectorized: bool) -> PyResult<Outcome<'py>> {
     let method = method.map(str::parse::<Method>).transpose().map_err(PyValueError::new_err)?;
-    if x0.cast::<PyArray1<f32>>().is_ok() { minimize_at::<f32>(fun, jac, vectorized, &x0, limits, method, tol, maxfev, population, seed) } else { minimize_at::<f64>(fun, jac, vectorized, &x0, limits, method, tol, maxfev, population, seed) }
+    if x0.cast::<PyArray1<f32>>().is_ok() { minimize_at::<f32>(fun, jac, vectorized, &x0, limits, method, tol, maxfev, population, seed) }
+    else { minimize_at::<f64>(fun, jac, vectorized, &x0, limits, method, tol, maxfev, population, seed) }
 }
 
 /// A zero of `f` by Brent's method, as the point, the number of evaluations and whether the bracket shrank within `rtol` before `maxfev` evaluations. With `bracket`, the search starts from its ends. Without it, the search steps outward from `x0`.
@@ -178,7 +179,8 @@ fn linear<'py>(
     matvec: Bound<'py, PyAny>, b: Bound<'py, PyAny>, x0: Bound<'py, PyAny>, method: &str, rmatvec: Option<Bound<'py, PyAny>>, msolve: Option<Bound<'py, PyAny>>,
     rtol: Option<f64>, maxiter: Option<usize>) -> PyResult<Outcome<'py>> {
     let method = method.parse::<Method>().map_err(PyValueError::new_err)?;
-    if b.cast::<PyArray1<f32>>().is_ok() { linear_at::<f32>(matvec, &b, &x0, method, rmatvec, msolve, rtol, maxiter) } else { linear_at::<f64>(matvec, &b, &x0, method, rmatvec, msolve, rtol, maxiter) }
+    if b.cast::<PyArray1<f32>>().is_ok() { linear_at::<f32>(matvec, &b, &x0, method, rmatvec, msolve, rtol, maxiter) }
+    else { linear_at::<f64>(matvec, &b, &x0, method, rmatvec, msolve, rtol, maxiter) }
 }
 
 /// Adds this module's functions to `m`.

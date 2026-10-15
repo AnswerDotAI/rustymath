@@ -424,7 +424,8 @@ fn ln_parts<R: Native>(x: &[R], y: &[R], re: &mut Vec<R>, im: &mut Vec<R>) where
 
 /// The moduli of `x + iy`, as `modulus` computes them: at f64 through `Hypot`'s slice form, at f32 from squares summed in f64.
 fn moduli<R: Native>(x: &[R], y: &[R], out: &mut Vec<R>) where Hypot: Binary<R, Out = R> {
-    if R::WIDE { Hypot.many(Arg::Many(x), Arg::Many(y), x.len(), out); } else { out.extend(x.iter().zip(y).map(|(&x, &y)| modulus::<R, { crate::FUSED }>(x, y))) }
+    if R::WIDE { Hypot.many(Arg::Many(x), Arg::Many(y), x.len(), out); }
+    else { out.extend(x.iter().zip(y).map(|(&x, &y)| modulus::<R, { crate::FUSED }>(x, y))) }
 }
 
 /// The square roots of `x + iy` through real slice forms, as `sqrt` computes them where `rough_root` is false.

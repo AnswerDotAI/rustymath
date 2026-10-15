@@ -176,8 +176,7 @@ fn francis<T: Native>(h: &mut [T], ld: usize, zt: &mut [T], n: usize, wantt: boo
                     h[k * ld + k - 1] = v[0];
                     h[(k + 1) * ld + k - 1] = zero;
                     if k + 1 < i { h[(k + 2) * ld + k - 1] = zero }
-                }
-                else if m > l {
+                } else if m > l {
                     // This avoids LAPACK's bug where v[1] and v[2] underflow.
                     h[k * ld + k - 1] = h[k * ld + k - 1] * (one - t1);
                 }
@@ -188,8 +187,7 @@ fn francis<T: Native>(h: &mut [T], ld: usize, zt: &mut [T], n: usize, wantt: boo
                 for row in h[i1 * ld..(i.min(k + 3) + 1) * ld].chunks_exact_mut(ld) { bulge.right(row) }
             }
         }
-        if l == i { wr[i] = h[i * ld + i]; }
-        else {
+        if l == i { wr[i] = h[i * ld + i]; } else {
             // A 2×2 block in rows p and q has converged.
             let (p, q) = (i - 1, i);
             let (block, values, (cs, sn)) = standard(h[p * ld + p], h[p * ld + q], h[q * ld + p], h[q * ld + q]);
@@ -266,9 +264,7 @@ fn standard<T: Native>(mut a: T, mut b: T, mut c: T, mut d: T) -> ([T; 4], [T; 4
         // Swap the rows and columns.
         (cs, sn) = (zero, one);
         (a, d, b, c) = (d, a, -c, zero);
-    }
-    else if a - d == zero && sign(b) != sign(c) { }
-    else {
+    } else if a - d == zero && sign(b) != sign(c) { } else {
         let mut temp = a - d;
         let p = half * temp;
         let bcmax = b.abs().max(c.abs());
@@ -345,8 +341,7 @@ fn quasi_vectors<T: Native>(t: &[T], ld: usize, n: usize, values: &[Complex<T>])
         if pair {
             let (b, c) = (t[top * ld + k], t[k * ld + top]);
             if b.abs() >= c.abs() { (xr[top], xi[k]) = (T::one(), values[top].im / b) } else { (xr[top], xi[k]) = (-values[top].im / c, T::one()) }
-        }
-        else { xr[k] = T::one(); }
+        } else { xr[k] = T::one(); }
         // Rows i to k are solved. Each step solves the row above them, or the 2×2 block that ends there.
         let mut i = top;
         while i > 0 {
@@ -457,7 +452,8 @@ fn single_shift<R: Native>(h: &mut [Complex<R>], ld: usize, zt: &mut [Complex<R>
             if its > itmax { return None; }
             kdefl += 1;
             if !wantt { (i1, i2) = (l, i) }
-            let shift = if kdefl % 20 == 0 { h[i * ld + i] + dat1 * h[i * ld + i - 1].re.abs() } else if kdefl % 10 == 0 { h[l * ld + l] + dat1 * h[(l + 1) * ld + l].re.abs() } else {
+            let shift = if kdefl % 20 == 0 { h[i * ld + i] + dat1 * h[i * ld + i - 1].re.abs() }
+            else if kdefl % 10 == 0 { h[l * ld + l] + dat1 * h[(l + 1) * ld + l].re.abs() } else {
                 // Wilkinson's shift: the eigenvalue of the trailing 2×2 block nearer h[i][i].
                 let t = h[i * ld + i];
                 let u = h[(i - 1) * ld + i].sqrt() * h[i * ld + i - 1].sqrt();

@@ -162,10 +162,7 @@ fn real_eig<R: Native>(
         let pair = wi[j] != R::zero();
         for r in 0..n {
             let x = vr[j * ldvr + r];
-            if !pair {
-                v[r * n + j] = Complex::new(x, R::zero());
-                continue;
-            }
+            if !pair { v[r * n + j] = Complex::new(x, R::zero()); continue; }
             let y = vr[(j + 1) * ldvr + r];
             (v[r * n + j], v[r * n + j + 1]) = (Complex::new(x, y), Complex::new(x, -y));
         }

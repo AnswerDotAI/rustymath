@@ -240,7 +240,8 @@ fn merge<R: Native + Tiled<Real = R>>(d: &mut [R], z: &[R], rho: R, s0: &[R], s1
     if rho * zmax <= tol {
         // The update is negligible, so the halves' eigenvectors are the whole matrix's.
         for (j, &k) in p.iter().enumerate() {
-            if k < n1 { st[j * n..j * n + n1].copy_from_slice(&s0[k * n1..(k + 1) * n1]); } else { st[j * n + n1..(j + 1) * n].copy_from_slice(&s1[(k - n1) * n2..(k - n1 + 1) * n2]); }
+            if k < n1 { st[j * n..j * n + n1].copy_from_slice(&s0[k * n1..(k + 1) * n1]); }
+            else { st[j * n + n1..(j + 1) * n].copy_from_slice(&s1[(k - n1) * n2..(k - n1 + 1) * n2]); }
         }
         d.copy_from_slice(&pd);
         return st;

@@ -940,10 +940,7 @@ fn cutoff<R: crate::Float>(s: &[R], scale: usize) -> R { R::epsilon() * R::narro
 /// `lstsq` for `T`. A matrix with at least as many rows as columns reduces to the R of its QR factorization, and `b` to `Qᴴ b`, without forming Q: through `tall_qr` where that succeeds, and otherwise through the reflections. A wider matrix solves through its own SVD.
 fn lstsq_solve<T: Tiled>(a: &[T], b: &[T], [m, n]: [usize; 2], k: usize) -> (Vec<T>, Vec<T::Real>) {
     assert_eq!(b.len(), m * k, "`b` must hold `m`×`k` items");
-    if m < n {
-        let svd = svd_factor(a, [m, n], true);
-        return (pseudo_solve(svd.as_ref(), Some(b), k, n), svd.s);
-    }
+    if m < n { let svd = svd_factor(a, [m, n], true); return (pseudo_solve(svd.as_ref(), Some(b), k, n), svd.s); }
     let reduced = tall_for_lstsq([m, n]).then(|| tall_qr(a, [m, n], Tall::Project(b, k))).flatten();
     let (r, y) = reduced.unwrap_or_else(|| {
         let (reflections, r) = reflect(a, [m, n]);
@@ -1030,10 +1027,7 @@ fn tall_qr<T: Tiled>(a: &[T], [m, n]: [usize; 2], want: Tall<'_, T>) -> Option<(
     let l = T::multiply(Matrix::rows(&l1, n), Matrix::rows(&l2, n), [n, n, n]);
     let mut r = adjoint(&l, n, n);
     if let Some(s) = scale { for v in &mut r { *v = v.div_real(s) } }
-    if !matches!(want, Tall::Q) {
-        T::triangular(&mut y, k, Matrix::rows(&l2, n), [n, k], Side::Left, Triangle::Lower);
-        return Some((r, y));
-    }
+    if !matches!(want, Tall::Q) { T::triangular(&mut y, k, Matrix::rows(&l2, n), [n, k], Side::Left, Triangle::Lower); return Some((r, y)); }
     parallel::pieces_of(&mut q, rows * n, usize::MAX, &|_, band| {
         let h = band.len() / n;
         T::triangular(band, n, Matrix::rows(&l2, n).adjoint(), [h, n], Side::Right, Triangle::Lower);

@@ -39,7 +39,8 @@ pub fn roots<F: Float>(c: &[Complex<F>]) -> Option<Vec<Complex<F>>> {
     // The companion matrix has ones below its diagonal and -c[i]/c[n] down its last column.
     let a: Vec<Complex<f64>> = c[..n].iter().map(|&k| -crate::complex::divide(k, c[n])).collect();
     let companion: Vec<Complex<f64>> = (0..n * n).map(|k| if k % n == n - 1 { a[k / n] } else { Complex::new(f64::from(k / n == k % n + 1), 0.0) }).collect();
-    let mut values = if a.iter().all(|z| z.im == 0.0) { crate::linalg::eigenvalues(&companion.iter().map(|z| z.re).collect::<Vec<f64>>(), n)? } else { crate::linalg::eigenvalues(&companion, n)? };
+    let mut values = if a.iter().all(|z| z.im == 0.0) { crate::linalg::eigenvalues(&companion.iter().map(|z| z.re).collect::<Vec<f64>>(), n)? }
+    else { crate::linalg::eigenvalues(&companion, n)? };
     values.sort_by(|x, y| x.re.total_cmp(&y.re).then(x.im.total_cmp(&y.im)));
     Some(values.into_iter().map(|z| Complex::new(F::narrow(z.re), F::narrow(z.im))).collect())
 }

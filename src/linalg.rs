@@ -479,7 +479,8 @@ impl<T: Scalar> Matrix<'_, T> {
         let (transposed, one) = (self.op.transposed(), scale == T::one());
         if size_of::<T>() == size_of::<T::Real>() || !matches!(self.op, Op::Adjoint | Op::Conjugate) {
             if one { strip(self.data, self.ld, transposed, rows, p0, out, |x| x) } else { strip(self.data, self.ld, transposed, rows, p0, out, |x| scale * x) }
-        } else if one { strip(self.data, self.ld, transposed, rows, p0, out, |x: T| x.conj()) } else { strip(self.data, self.ld, transposed, rows, p0, out, |x: T| scale * x.conj()) }
+        } else if one { strip(self.data, self.ld, transposed, rows, p0, out, |x: T| x.conj()) }
+        else { strip(self.data, self.ld, transposed, rows, p0, out, |x: T| scale * x.conj()) }
     }
 }
 /// Writes all `W` items of each step of a packing strip, through `f`. Item `[p][l]` is item `(r0 + l, p0 + p)` of the matrix that `data` holds at `r * ld + p`, or at `p * ld + r` where `transposed`, for `l` below `lines`, and the default after that. Transposed data gives each step from one run, and other data from `lines` rows read side by side. Every step writes a fixed `W` items, which keeps short strips from calling `memcpy` or `memset` at each step.
@@ -671,8 +672,7 @@ fn parts<R: crate::Native + Tiled>(x: Matrix<'_, Complex<R>>, [rows, cols]: [usi
     let (one, conj) = (scale == Complex::new(R::one(), R::zero()), matches!(x.op, Op::Adjoint | Op::Conjugate));
     let value = |v: Complex<R>| { let v = if conj { v.conj() } else { v }; if one { v } else { scale * v } };
     let mut z = filled(rows * cols, Complex::default());
-    if x.op.transposed() { transpose_into(x.data, x.ld, &mut z, cols, [cols, rows], value) }
-    else {
+    if x.op.transposed() { transpose_into(x.data, x.ld, &mut z, cols, [cols, rows], value) } else {
         for (row, out) in z.chunks_exact_mut(cols).enumerate() { for (o, &v) in out.iter_mut().zip(&x.data[row * x.ld..][..cols]) { *o = value(v) } }
     }
     [z.iter().map(|v| v.re).collect(), z.iter().map(|v| v.im).collect(), z.iter().map(|v| v.re + v.im).collect()]

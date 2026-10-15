@@ -49,14 +49,8 @@ pub(super) fn root<R: Native>(f: impl Fn(R, R) -> R, four: impl Fn([R; 4], [R; 4
                 for _ in 0..4 {
                     let opposite = -a / (k * f_next + b);
                     let f_opposite = f(shift, opposite);
-                    if f_next < zero && f_opposite >= zero {
-                        above = Some(opposite);
-                        break;
-                    }
-                    if f_next > zero && f_opposite <= zero {
-                        below = Some(opposite);
-                        break;
-                    }
+                    if f_next < zero && f_opposite >= zero { above = Some(opposite); break; }
+                    if f_next > zero && f_opposite <= zero { below = Some(opposite); break; }
                     k = k * two;
                 }
                 bisect = true;
@@ -88,7 +82,9 @@ pub(super) fn root<R: Native>(f: impl Fn(R, R) -> R, four: impl Fn([R; 4], [R; 4
         if f_m == zero { return (shift, m); }
         if f_m > zero { (hi, f_prev, f_hi) = (m, f_hi, f_m); } else { (lo, f_prev, f_lo) = (m, f_lo, f_m); }
     }
-    let (start, next, f_start, f_next) = if lo == zero { (hi * two, hi, f_prev, f_hi) } else if hi == zero { (lo * two, lo, f_prev, f_lo) } else { (lo, hi, f_lo, f_hi) };
+    let (start, next, f_start, f_next) = if lo == zero { (hi * two, hi, f_prev, f_hi) }
+    else if hi == zero { (lo * two, lo, f_prev, f_lo) }
+    else { (lo, hi, f_lo, f_hi) };
     let (bisect, mut mu, below, above) = secant(start, next, f_start, f_next);
     if let (Some(b), Some(a)) = (below, above) {
         if b < a {

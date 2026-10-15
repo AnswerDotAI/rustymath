@@ -44,10 +44,7 @@ fn kept<const TABLE: bool, M: Key, D: Copy>(out: &mut Vec<D>, mask: &[M], total:
             let mut n = 0u8;
             for x in m { n += x.key() as u8 & 1 }
             let n = usize::from(n);
-            if !TABLE && 0 < n && n < m.len() {
-                mixed += n;
-                continue;
-            }
+            if !TABLE && 0 < n && n < m.len() { mixed += n; continue; }
             if mixed > 0 { written(&mut d[k..], &mask[from..start], |j| item(from + j)) }
             (k, mixed, from) = (k + mixed, 0, start + m.len());
             if n == m.len() { let run = &mut d[k..k + n]; for j in 0..n { run[j].write(item(start + j)); } }
@@ -194,10 +191,7 @@ impl Steps {
     fn simplify(mut base: usize, steps: &[Self]) -> (usize, Vec<Cow<'_, Self>>) {
         let mut kept: Vec<Cow<Self>> = Vec::with_capacity(steps.len());
         for s in steps {
-            if let Some(o) = if s.len() == 1 { s.get(0) } else { None } {
-                base += o;
-                continue;
-            }
+            if let Some(o) = if s.len() == 1 { s.get(0) } else { None } { base += o; continue; }
             kept.push(Cow::Borrowed(s));
             while let [.., outer, inner] = kept.as_slice() {
                 let (&Self::Stride { start: a, len: m, step }, &Self::Stride { start: b, len: n, step: 1 }) = (outer.as_ref(), inner.as_ref()) else { break };

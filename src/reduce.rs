@@ -749,7 +749,8 @@ fn rows_by<T: Copy, R: Reduction<T>, const N: usize>(totals: &mut [R::Total], ro
     let inner = totals.len();
     if inner > N && rows.len() >= 4 * inner && size_of::<R::Total>() < 16 {
         return totals.chunks_mut(N).enumerate().fold(true, |fits, (s, out)| {
-            fits & if out.len() == N { strip_by::<T, R, N>(out, rows, inner, s * N, N, first) } else { strip_by::<T, R, N>(out, rows, inner, s * N, out.len(), first) }
+            fits & if out.len() == N { strip_by::<T, R, N>(out, rows, inner, s * N, N, first) }
+            else { strip_by::<T, R, N>(out, rows, inner, s * N, out.len(), first) }
         });
     }
     if inner > N || rows.len() < 2 * N {
@@ -821,8 +822,7 @@ pub fn fold_into<T: Copy, R: Reduction<T>>(totals: &mut [R::Total], [_, len, inn
             let (s, f) = R::slice(started);
             (totals[i + count], fits) = (s, fits & f);
         }
-    }
-    else {
+    } else {
         let row = start / inner;
         let (mut i, mut j, mut k) = (row / len, row % len, start % inner);
         while !rest.is_empty() {
@@ -831,8 +831,7 @@ pub fn fold_into<T: Copy, R: Reduction<T>>(totals: &mut [R::Total], [_, len, inn
                 let (whole, after) = rest.split_at(rows * inner);
                 fits &= step_rows::<T, R>(&mut totals[i * inner..(i + 1) * inner], whole, j == 0);
                 (rest, j) = (after, j + rows);
-            }
-            else {
+            } else {
                 let (piece, after) = rest.split_at((inner - k).min(rest.len()));
                 fits &= step_row::<T, R>(&mut totals[i * inner + k..], piece, j == 0);
                 (rest, k) = (after, k + piece.len());
