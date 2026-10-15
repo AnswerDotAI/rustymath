@@ -880,7 +880,11 @@ const THREAD_WORK: usize = 1 << 17;
 const PANEL: usize = 1 << 22;
 /// The most bytes of `b` that `product` packs into one panel when this thread's calls run serially, as on a pool thread. Larger panels outgrow the cache: on an M5 Max, a one-thread Gram product of a 16384×256 f64 matrix took 3% longer with 8 MB panels and 10% longer with 32 MB ones, and a threaded tall QR whose threads each ran one such product was 2% slower with 4 MB panels than with 2 MB ones.
 const SERIAL_PANEL: usize = 2 << 20;
-/// Folds the inner product of `P` into `c`, an `m`×`n` matrix whose rows start `ldc` items apart, with `kernel` folding each `MR`×`NR` tile as `micro` does. `a(rows, p0, steps)` writes a strip of the `m`×`k` matrix `a`, and `b(columns, p0, steps)` a strip of the transpose of the `k`×`n` matrix `b`, as `Matrix::strip` does. With `start`, the product replaces `c`, which must then hold `f`'s identity where `k` is 0. Otherwise each result folds into `c`'s item with `f`. Only tiles that hold items of `part` fold. Items outside `part` in those tiles fold too. Each block of `NC` columns packs `b` in panels of at most [`PANEL`] items, or [`SERIAL_PANEL`] bytes on one thread, across threads as [`parallel::split`] chooses. Then it runs bands of rows across at most √(w / [`THREAD_WORK`]) of this thread's [`parallel::threads`], for a panel of `w` multiply-adds: about one band for each [`BAND_WORK`] multiply-adds, up to four bands for each thread, each at most `MC` rows. Each band runs the panel's steps of `KC` in turn, packing its own block of `a` for each.
+/// The steps of `b` that `product` packs across all of a panel's strips before packing the next steps. Packing a strip reads `NR` items from each row of a row-major `b`. Unless those items fill whole cache lines, the next strip reads the rest of each line. When `b`'s rows were a power of two apart, packing one strip at a time had already evicted those lines: on an M5 Max, a 64×256×16384 f64 product took 15 to 28% longer than with 16 steps at a time.
+const ROWS: usize = 16;
+/// The columns of the result that `product` fills one row of tiles at a time, before the next row of tiles. Filling each row of tiles in turn writes each row of `c` in order, whatever `ldc` is. Sweeping the whole width instead wrote the rows of a column of tiles together, and a power-of-two `ldc` maps those rows to the same cache sets: on an M5 Max, a 64×32×16384 f64 product took 2.3 times as long as a 64×32×16000 one. 128 columns of a packed `KC`-step f64 block of `b` hold 256 KB, which stays in a Zen 4 core's 1 MB second-level cache while each row of tiles rereads it.
+const SWEEP: usize = 128;
+/// Folds the inner product of `P` into `c`, an `m`×`n` matrix whose rows start `ldc` items apart, with `kernel` folding each `MR`×`NR` tile as `micro` does. `a(rows, p0, steps)` writes a strip of the `m`×`k` matrix `a`, and `b(columns, p0, steps)` a strip of the transpose of the `k`×`n` matrix `b`, as `Matrix::strip` does. With `start`, the product replaces `c`, which must then hold `f`'s identity where `k` is 0. Otherwise each result folds into `c`'s item with `f`. Only tiles that hold items of `part` fold. Items outside `part` in those tiles fold too. Each block of `NC` columns packs `b` in panels of at most [`PANEL`] items, or [`SERIAL_PANEL`] bytes on one thread, [`ROWS`] steps at a time across the panel's strips, across threads as [`parallel::split`] chooses. Then it runs bands of rows across at most √(w / [`THREAD_WORK`]) of this thread's [`parallel::threads`], for a panel of `w` multiply-adds: about one band for each [`BAND_WORK`] multiply-adds, up to four bands for each thread, each at most `MC` rows. Each band runs the panel's steps of `KC` in turn, packing its own block of `a` for each. Within a block of `a`, it fills one row of tiles at a time across [`SWEEP`] columns of the result.
 #[inline(always)]
 fn product<T: Copy + Default + Send + Sync, P: Pair<T>, const MR: usize, const NR: usize>(
     c: &mut [P::Out], ldc: usize, a: impl Fn([usize; 2], usize, &mut [[MaybeUninit<T>; MR]]) + Sync,
@@ -902,12 +906,12 @@ fn product<T: Copy + Default + Send + Sync, P: Pair<T>, const MR: usize, const N
             let threads = if work < 2 * BAND_WORK { 1 } else { parallel::threads().min((work / THREAD_WORK).isqrt()) };
             let band_rows = if threads == 1 { m } else { m.div_ceil((work / BAND_WORK).min(4 * threads)).next_multiple_of(MR).min(MC) };
             let pack_b = |at: usize, units: &mut [MaybeUninit<T>]| {
-                for (u, strip) in units.chunks_exact_mut(unit).enumerate() {
-                    let s = at / unit + u;
-                    let (j, lines) = (jc + s * NR, NR.min(nc - s * NR));
-                    for (step, part) in strip.chunks_mut(NR * KC).enumerate() {
-                        let pc = pp + step * KC;
-                        pack::<_, NR>(part, part.len() / NR, lines, |first, ln, steps| b([j + first, ln], pc, steps));
+                for p0 in (0..kp).step_by(ROWS) {
+                    let rows = ROWS.min(kp - p0);
+                    for (u, strip) in units.chunks_exact_mut(unit).enumerate() {
+                        let s = at / unit + u;
+                        let (j, lines) = (jc + s * NR, NR.min(nc - s * NR));
+                        pack::<_, NR>(&mut strip[p0 * NR..][..rows * NR], rows, lines, |first, ln, steps| b([j + first, ln], pp + p0, steps));
                     }
                 }
                 true
@@ -926,16 +930,18 @@ fn product<T: Copy + Default + Send + Sync, P: Pair<T>, const MR: usize, const N
                         let mc = MC.min(i1 - ic);
                         if lower && ic + mc <= jc { continue; }
                         let ap = pack::<_, MR>(&mut slots, kc, mc, |first, lines, steps| a([ic + first, lines], pc, steps));
-                        for jr in (0..nc).step_by(NR) {
-                            let bj = &bp[jr / NR * unit + step * NR * KC..][..NR * kc];
+                        for jb in (0..nc).step_by(SWEEP) {
                             for ir in (0..mc).step_by(MR) {
-                                if lower && ic + ir + MR.min(mc - ir) <= jc + jr { continue; }
-                                let (rows, cols) = (MR.min(mc - ir), NR.min(nc - jr));
-                                let at = |r: usize, s: usize| (ic - i0 + ir + r) * ldc + jc + jr + s;
-                                let mut t = [[P::UNIT; NR]; MR];
-                                if load { for r in 0..rows { for s in 0..cols { t[r][s] = band[at(r, s)] } } }
-                                kernel(&ap[ir * kc..(ir + MR) * kc], bj, &mut t, !load);
-                                for r in 0..rows { for s in 0..cols { band[at(r, s)] = t[r][s] } }
+                                for jr in (jb..nc.min(jb + SWEEP)).step_by(NR) {
+                                    let bj = &bp[jr / NR * unit + step * NR * KC..][..NR * kc];
+                                    if lower && ic + ir + MR.min(mc - ir) <= jc + jr { continue; }
+                                    let (rows, cols) = (MR.min(mc - ir), NR.min(nc - jr));
+                                    let at = |r: usize, s: usize| (ic - i0 + ir + r) * ldc + jc + jr + s;
+                                    let mut t = [[P::UNIT; NR]; MR];
+                                    if load { for r in 0..rows { for s in 0..cols { t[r][s] = band[at(r, s)] } } }
+                                    kernel(&ap[ir * kc..(ir + MR) * kc], bj, &mut t, !load);
+                                    for r in 0..rows { for s in 0..cols { band[at(r, s)] = t[r][s] } }
+                                }
                             }
                         }
                     }
