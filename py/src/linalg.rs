@@ -179,7 +179,9 @@ unsafe fn read<'a, E: Stored + 'a>(p: *mut c_char, [rs, cs]: [npy_intp; 2], [row
 
 /// Writes the `rows`×`cols` matrix `x`, held row by row, through `f` to `p`, whose rows lie `rs` bytes apart and items `cs` bytes apart. A vector is a matrix of one column, and a scalar one of one item.
 unsafe fn write<W: Copy, O>(x: &[W], p: *mut c_char, [rs, cs]: [npy_intp; 2], [rows, cols]: [usize; 2], f: impl Fn(W) -> O) {
-    for i in 0..rows { for j in 0..cols { unsafe { (p.offset(i as isize * rs + j as isize * cs) as *mut O).write_unaligned(f(x[i * cols + j])) } } }
+    for i in 0..rows {
+        for j in 0..cols { unsafe { (p.offset(i as isize * rs + j as isize * cs) as *mut O).write_unaligned(f(x[i * cols + j])) } }
+    }
 }
 
 /// `n` NaNs, the results of a matrix that fails.

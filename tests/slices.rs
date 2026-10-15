@@ -110,7 +110,9 @@ mod forms {
             let mut out = vec![F::one()];
             let ok = k.many(x, y, z, n, &mut out);
             assert_eq!((out.len(), out[0]), (n + 1, F::one()), "{name}");
-            for i in 0..n { assert!(same(out[i + 1], k.one(at(x, i), at(y, i), at(z, i))), "{name}({:?}, {:?}, {:?})", at(x, i), at(y, i), at(z, i)) }
+            for i in 0..n {
+                assert!(same(out[i + 1], k.one(at(x, i), at(y, i), at(z, i))), "{name}({:?}, {:?}, {:?})", at(x, i), at(y, i), at(z, i))
+            }
             assert_eq!(ok, (0..n).all(|i| k.checked(at(x, i), at(y, i), at(z, i)).is_some()), "{name}");
             assert_eq!(ok, (0..n).all(|i| !out[i + 1].is_nan() || [at(x, i), at(y, i), at(z, i)].iter().any(|v| v.is_nan())), "{name} breaks the NaN rule");
         };
@@ -144,8 +146,7 @@ mod forms {
         each_width!(
             unary: Exp, Expm1, Ln, Log1p, Log2, Log10, Sin, Cos, Tan, Asin, Acos, Atan, Sinh, Cosh, Tanh, Asinh, Acosh, Atanh, Cbrt, Gamma,
                 Lgamma, Erf, Erfc, Erfinv, Erfcinv, LambertW, Sqrt, Sqrt1mx2, Sqrt1px2, Sqrtx2m1, Abs, Sign, Angle;
-            binary: Pow, Root, Hypot, Atan2, Gammainc, Gammaincc, Gammaincinv, Binom, Logb, Maximum, Minimum;
-            ternary: Betainc, Betaincinv
+            binary: Pow, Root, Hypot, Atan2, Gammainc, Gammaincc, Gammaincinv, Binom, Logb, Maximum, Minimum; ternary: Betainc, Betaincinv
         );
         // `Erfinv`'s and `Erfcinv`'s f64 slice forms place each block's items by region. Several blocks of uniform items, in random order, reach every region.
         use rand::RngExt;
@@ -210,13 +211,10 @@ mod reductions {
         let mut maxima = Vec::new();
         cummax(&sums, Some(-5), &mut maxima);
         assert_eq!(
-            maxima,
-            sums.iter()
-                .scan(-5, |m, &v| {
-                    *m = (*m).max(v);
-                    Some(*m)
-                })
-                .collect::<Vec<_>>()
+            maxima, sums.iter().scan(-5, |m, &v| {
+                *m = (*m).max(v);
+                Some(*m)
+            }).collect::<Vec<_>>()
         );
         assert_eq!((max(&sums), min(&sums)), (*sums.iter().max().unwrap(), *sums.iter().min().unwrap()));
         // Complex sums of whole numbers are exact in any order.
@@ -225,13 +223,10 @@ mod reductions {
         let mut out = Vec::new();
         assert!(cumsum(&z, Some(Complex::new(1.0, 1.0)), &mut out));
         assert_eq!(
-            out,
-            z.iter()
-                .scan(Complex::new(1.0, 1.0), |s, &v| {
-                    *s += v;
-                    Some(*s)
-                })
-                .collect::<Vec<_>>()
+            out, z.iter().scan(Complex::new(1.0, 1.0), |s, &v| {
+                *s += v;
+                Some(*s)
+            }).collect::<Vec<_>>()
         );
     }
 

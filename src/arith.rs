@@ -59,9 +59,7 @@ macro_rules! signed {
     )+};
 }
 signed!(
-    i8: |x, y| wide_product!(i8, i16, x, y),
-    i16: |x, y| wide_product!(i16, i32, x, y),
-    i32: |x, y| wide_product!(i32, i64, x, y),
+    i8: |x, y| wide_product!(i8, i16, x, y), i16: |x, y| wide_product!(i16, i32, x, y), i32: |x, y| wide_product!(i32, i64, x, y),
     i64: |x, y| { let (p, over) = x.overflowing_mul(y); (p, !over) }
 );
 
@@ -83,9 +81,7 @@ macro_rules! unsigned {
     )+};
 }
 unsigned!(
-    u8: |x, y| wide_product!(u8, u16, x, y),
-    u16: |x, y| wide_product!(u16, u32, x, y),
-    u32: |x, y| wide_product!(u32, u64, x, y),
+    u8: |x, y| wide_product!(u8, u16, x, y), u16: |x, y| wide_product!(u16, u32, x, y), u32: |x, y| wide_product!(u32, u64, x, y),
     u64: |x, y| { let (p, over) = x.overflowing_mul(y); (p, !over) }
 );
 

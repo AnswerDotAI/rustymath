@@ -283,12 +283,7 @@ trait Banded: Copy + PartialOrd {
     #[inline(always)]
     fn banded(xs: &[Self], lo: Self, hi: Self, band: Band, out: &mut [std::mem::MaybeUninit<bool>]) {
         with_band!(band, |B| pairs_into(
-            Arg::Many(xs),
-            Arg::One(()),
-            xs.len(),
-            out,
-            #[inline(always)]
-            |v, ()| (B.holds(lo, hi, v), true)
+            Arg::Many(xs), Arg::One(()), xs.len(), out, #[inline(always)] |v, ()| (B.holds(lo, hi, v), true)
         ));
     }
 }

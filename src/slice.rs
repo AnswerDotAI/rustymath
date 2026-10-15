@@ -180,11 +180,7 @@ pub(crate) fn each<E: Item, O: Item, R: Outcome<O>, const N: usize>(x: [Arg<'_, 
 macro_rules! each {
     ($x:expr, $n:expr, $out:expr, |$args:pat_param| $body:expr $(,)?) => {
         crate::slice::each(
-            $x,
-            $n,
-            $out,
-            #[inline(always)]
-            |$args| $body,
+            $x, $n, $out, #[inline(always)] |$args| $body,
         )
     };
 }
@@ -355,13 +351,7 @@ pub(crate) fn two_pass<R: crate::Float, const N: usize>(
 macro_rules! two_pass {
     ($x:expr, $n:expr, $out:expr, |$fa:pat_param| $fast:expr, |$sa:pat_param| $f:expr $(,)?) => {
         crate::slice::two_pass(
-            $x,
-            $n,
-            $out,
-            #[inline(always)]
-            |$fa| $fast,
-            #[inline(always)]
-            |$sa| $f,
+            $x, $n, $out, #[inline(always)] |$fa| $fast, #[inline(always)] |$sa| $f,
         )
     };
 }
@@ -396,13 +386,7 @@ pub(crate) fn split<R: crate::Native, const N: usize>(
 macro_rules! split {
     ($x:expr, $n:expr, $out:expr, |$pa:pat_param, $re:pat_param, $im:pat_param| $fast:expr, |$ra:pat_param, $rr:pat_param| $rare:expr, |$fa:pat_param| $f:expr $(,)?) => {
         crate::slice::split(
-            $x,
-            $n,
-            $out,
-            |$pa, $re, $im| $fast,
-            #[inline(always)]
-            |$ra, $rr| $rare,
-            |$fa| $f,
+            $x, $n, $out, |$pa, $re, $im| $fast, #[inline(always)] |$ra, $rr| $rare, |$fa| $f,
         )
     };
 }

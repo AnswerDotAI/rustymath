@@ -134,8 +134,7 @@ macro_rules! variants {
     ($f:ident, 2) => {
         [
             (
-                (|(x, y)| rustymath::fused::$f::<f64>(x, y)) as fn((f64, f64)) -> f64,
-                (|(x, y)| rustymath::fused::$f::<f32>(x, y)) as fn((f32, f32)) -> f32,
+                (|(x, y)| rustymath::fused::$f::<f64>(x, y)) as fn((f64, f64)) -> f64, (|(x, y)| rustymath::fused::$f::<f32>(x, y)) as fn((f32, f32)) -> f32,
                 "fused",
             ), (|(x, y)| rustymath::unfused::$f::<f64>(x, y), |(x, y)| rustymath::unfused::$f::<f32>(x, y), "unfused"),
         ]
@@ -153,7 +152,9 @@ fn unary(name: &str, variants: Variants<fn(f64) -> f64, fn(f32) -> f32>, f16: fn
             check_libm(&format!("f64 {name} in {range:?}, {how}"), worst(SAMPLES, |i| uniform(i, range), wide, libm));
             check(&format!("f32 {name} in {range:?}, {how}"), worst(SAMPLES, |i| uniform(i, range) as f32, narrow, narrow_libm));
         }
-        if !extra.is_empty() { check_libm(&format!("f64 {name} at extra inputs, {how}"), worst(extra.len() as u64, |i| extra[i as usize], wide, libm)); }
+        if !extra.is_empty() {
+            check_libm(&format!("f64 {name} at extra inputs, {how}"), worst(extra.len() as u64, |i| extra[i as usize], wide, libm));
+        }
         check_cases(&format!("CORE-MATH {name}, {how}"), &hard, wide);
         for (source, text) in VECTORS {
             check_cases(&format!("{source} {name}, {how}"), &vectors::<f64, f64>(text, name), wide);
@@ -180,7 +181,9 @@ fn binary(
             let pair = |i: u64| (uniform(2 * i, xs) as f32, uniform(2 * i + 1, ys) as f32);
             check(&format!("f32 {name} in {xs:?} by {ys:?}, {how}"), worst(SAMPLES, pair, narrow, narrow_libm));
         }
-        if !extra.is_empty() { check_libm(&format!("f64 {name} at extra pairs, {how}"), worst(extra.len() as u64, |i| extra[i as usize], wide, wide_libm)); }
+        if !extra.is_empty() {
+            check_libm(&format!("f64 {name} at extra pairs, {how}"), worst(extra.len() as u64, |i| extra[i as usize], wide, wide_libm));
+        }
         check_cases(&format!("CORE-MATH {name}, {how}"), &hard, wide);
         for (source, text) in VECTORS {
             check_cases(&format!("{source} {name}, {how}"), &vectors::<(f64, f64), f64>(text, name), wide);
@@ -635,7 +638,9 @@ mod complex {
             for name in ["exp", "sin", "cos", "sinh", "cosh", "tanh", "tan"] {
                 assert_eq!(double::apply(name, &[k(x, 0.0)], false).unwrap().im, 0.0, "{name}({x})");
             }
-            if x > 0.0 { for name in ["log", "sqrt"] { assert_eq!(double::apply(name, &[k(x, 0.0)], false).unwrap().im, 0.0, "{name}({x})"); } }
+            if x > 0.0 {
+                for name in ["log", "sqrt"] { assert_eq!(double::apply(name, &[k(x, 0.0)], false).unwrap().im, 0.0, "{name}({x})"); }
+            }
             for name in ["sin", "sinh", "tan", "tanh"] { assert_eq!(double::apply(name, &[k(0.0, x)], false).unwrap().re, 0.0, "{name}({x}i)"); }
         }
         assert_eq!(Pow.one(k(1.0, 1.0), k(0.0, 0.0)), k(1.0, 0.0));
@@ -645,6 +650,23 @@ mod complex {
         assert_eq!(Sign.one(k(-0.0, 0.0)), k(-0.0, 0.0));
         assert!(Lgamma.one(k(-3.0, 0.0)).re.is_nan());
         assert_eq!(Binom.one(k(2.0, 0.0), k(3.0, 0.0)), k(0.0, 0.0));
+    }
+
+    /// A real part of z too small to change 1 ± z still changes the smaller part of each composite square root, by first order in that real part. Complex-step differentiation reads derivatives from such a part.
+    #[test]
+    fn tiny_parts() {
+        let (e, q) = (1e-30, 1.16f64.sqrt());
+        let cases = [("sqrt1mx2", c(e, 0.4), c(q, -e * 0.4 / q)), ("sqrt1px2", c(0.4, e), c(q, e * 0.4 / q)), ("sqrtx2m1", c(e, 0.4), c(e * 0.4 / q, q))];
+        let close = |g: f64, w: f64, eps: f64| (g - w).abs() <= 4.0 * eps * w.abs();
+        for (name, z, want) in cases {
+            for sliced in [false, true] {
+                let got = double::apply(name, &[z; 17], sliced).unwrap();
+                assert!(close(got.re, want.re, f64::EPSILON) && close(got.im, want.im, f64::EPSILON), "{name}({z}) gave {got}, not {want}");
+                let got = single::apply(name, &[c(z.re as f32, z.im as f32); 17], sliced).unwrap();
+                let eps = f32::EPSILON.into();
+                assert!(close(got.re.into(), want.re, eps) && close(got.im.into(), want.im, eps), "f32 {name}({z}) gave {got}, not {want}");
+            }
+        }
     }
 
     /// Division divides two reals as reals, so a real zero divisor gives ∞ with an imaginary part of 0. Any other zero divisor gives NaN.

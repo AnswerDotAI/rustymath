@@ -189,10 +189,7 @@ mod integer {
                 let g = num_integer::Integer::gcd(&a, &b);
                 assert_eq!(gcd(x, y), fit(g), "gcd({x}, {y})");
                 assert_eq!(lcm(x, y), if g == 0 { Some(0) } else { fit(a / g * b) }, "lcm({x}, {y})");
-                if x == 0 {
-                    assert!(residue(0, y) == y && Divisor::new(0).is_none());
-                    continue;
-                }
+                if x == 0 { assert!(residue(0, y) == y && Divisor::new(0).is_none()); continue; }
                 // The floored residue, with x's sign, and the quotient it leaves.
                 let r = (b % a + a) % a;
                 let d = Divisor::new(x).unwrap();
@@ -471,8 +468,7 @@ mod optimize {
         let reversed = Options { bounds: Some(Bounds { lower: &[1.0], upper: &[0.0] }), ..Default::default() };
         assert_eq!(reversed.check(Task::Minimize { gradient: false }, 1), Err("each lower limit must be at most its upper limit"));
         assert_eq!(
-            Options { tolerance: Some(0.0), ..Default::default() }.check(Task::Minimize { gradient: false }, 1),
-            Err("the tolerance must be a positive number")
+            Options { tolerance: Some(0.0), ..Default::default() }.check(Task::Minimize { gradient: false }, 1), Err("the tolerance must be a positive number")
         );
     }
 

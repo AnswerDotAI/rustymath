@@ -335,7 +335,9 @@ fn deflate<R: Native>(d: &mut [R], z: &mut [R], k: usize) -> (Vec<usize>, Vec<(u
             i += 1;
         }
     }
-    if total { for i in 1..n { if d[perm[i]].abs() < small || d[perm[i]] > d[0] { perm[i - 1] = perm[i] } else { perm[i - 1] = 0; break; } } }
+    if total {
+        for i in 1..n { if d[perm[i]].abs() < small || d[perm[i]] > d[0] { perm[i - 1] = perm[i] } else { perm[i - 1] = 0; break; } }
+    }
     // Swaps put d into ascending order, from the end of `perm`, recording each swap.
     let (mut real_ind, mut real_col, mut swaps): (Vec<usize>, Vec<usize>, Vec<usize>) = ((0..n).collect(), (0..n).collect(), (0..n).collect());
     let start = if total { 0 } else { 1 };

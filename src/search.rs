@@ -167,10 +167,7 @@ pub fn counts<K: Key>(x: &[K]) -> Option<(i64, Vec<usize>)> {
         counts[0] = x.len() - counts[1..].iter().sum::<usize>();
         return Some((min, counts));
     }
-    if n >= 64 {
-        for k in x { counts[at(k)] += 1 }
-        return Some((min, counts));
-    }
+    if n >= 64 { for k in x { counts[at(k)] += 1 } return Some((min, counts)); }
     let mut parts = vec![0; 4 * n];
     let (chunks, rest) = x.as_chunks::<4>();
     for chunk in chunks { for (p, k) in chunk.iter().enumerate() { parts[p * n + at(k)] += 1 } }

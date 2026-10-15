@@ -104,10 +104,7 @@ const ROW_PIECE: usize = 64;
 pub(super) fn summed_rows<T: Tiled, F: Fn(usize, &mut [T], &mut [T]) + Sync>(
     rows: &mut [T], stride: usize, count: usize, sums: &mut [T], parts: &mut Vec<T>, row: F) {
     let pieces = (count / ROW_PIECE).min(crate::parallel::threads());
-    if pieces <= 1 {
-        for (i, items) in rows.chunks_mut(stride).take(count).enumerate() { row(i, items, sums) }
-        return;
-    }
+    if pieces <= 1 { for (i, items) in rows.chunks_mut(stride).take(count).enumerate() { row(i, items, sums) } return; }
     let per = count.div_ceil(pieces);
     let (len, width) = (sums.len(), sums.len().max(1));
     parts.clear();

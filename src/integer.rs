@@ -129,8 +129,7 @@ forms!(Lcm at i64: |_, [x, y]| lcm(x, y));
 forms!(Binom at i64: |_, [n, k]| binom(n, k));
 forms!(Pow at i64: |_, [x, y]| power(x, y));
 forms!(
-    Residue at i64: |_, [x, y]| residue(x, y),
-    many |_, [x, y], n, out| if let Arg::One(d) = x && let Some(d) = Divisor::new(d) {
+    Residue at i64: |_, [x, y]| residue(x, y), many |_, [x, y], n, out| if let Arg::One(d) = x && let Some(d) = Divisor::new(d) {
         each!([y], n, out, |[y]| d.residue(y))
     } else {
         each!([x, y], n, out, |[x, y]| residue(x, y))

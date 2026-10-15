@@ -206,7 +206,9 @@ mod factor {
             let l = wide(&cholesky(&spd, n).expect("a positive definite matrix"));
             assert!((0..n * n).all(|k| k % n <= k / n || l[k] == 0.0), "cholesky's upper triangle at {n}");
             assert!(distance(&product(&l, &transpose(&l, n, n), [n; 3]), &wide(&spd), norm(&wide(&spd)).max(1.0)) < bound, "cholesky at {n}");
-            if n > 0 { assert_eq!(cholesky(&spd.iter().map(|&v| -v).collect::<Vec<_>>(), n), None, "cholesky of a negative definite matrix") }
+            if n > 0 {
+                assert_eq!(cholesky(&spd.iter().map(|&v| -v).collect::<Vec<_>>(), n), None, "cholesky of a negative definite matrix")
+            }
             // QR and the SVD, of square, tall and wide matrices.
             for (m, c) in [(n, n), (n + 5, n), (n, n + 5)] {
                 let a = random::<T>(m, c, (m * 31 + c) as u64);
@@ -257,8 +259,7 @@ mod factor {
         let f = svd(&b, [5, 5]);
         let us: Vec<f64> = (0..25).map(|k| wide(&f.u)[k] * wide(&f.s)[k % 5]).collect();
         assert!(
-            distance(&product(&us, &transpose(&wide(&f.v), 5, 5), [5; 3]), &wide(&b), norm(&wide(&b))) < 8.0 * tolerance,
-            "svd of a bidiagonal with a zero"
+            distance(&product(&us, &transpose(&wide(&f.v), 5, 5), [5; 3]), &wide(&b), norm(&wide(&b))) < 8.0 * tolerance, "svd of a bidiagonal with a zero"
         );
         assert!(orthogonality(&wide(&f.u), 5, 5) < 8.0 * tolerance, "u of a bidiagonal with a zero");
     }
@@ -449,8 +450,7 @@ mod factor {
                 let (qw, rw) = (wide(&q), wide(&r));
                 assert_eq!(rw[0] > 0.0, condition < beyond, "qr's path at {at}");
                 assert!(
-                    distance(&product(&qw, &rw, [m, n, n]), &aw, norm(&aw)) < bound,
-                    "tall qr at {at}: {:e} of {bound:e}",
+                    distance(&product(&qw, &rw, [m, n, n]), &aw, norm(&aw)) < bound, "tall qr at {at}: {:e} of {bound:e}",
                     distance(&product(&qw, &rw, [m, n, n]), &aw, norm(&aw))
                 );
                 assert!(orthogonality(&qw, m, n) < bound, "tall qr's q at {at}: {:e} of {bound:e}", orthogonality(&qw, m, n));
@@ -600,7 +600,9 @@ mod factor {
             assert!((0..n * n).all(|k| k % n <= k / n || l[k] == zero), "complex cholesky's upper triangle at {n}");
             assert!((0..n).all(|j| l[j * (n + 1)].im == 0.0 && l[j * (n + 1)].re > 0.0), "complex cholesky's diagonal at {n}");
             assert!(complex_distance(&complex_product(&l, &adjoint(&l, n, n), [n; 3]), &hw, complex_norm(&hw).max(1.0)) < bound, "complex cholesky at {n}");
-            if n > 0 { assert!(cholesky(&hpd.iter().map(|&v| -v).collect::<Vec<_>>(), n).is_none(), "complex cholesky of a negative definite matrix") }
+            if n > 0 {
+                assert!(cholesky(&hpd.iter().map(|&v| -v).collect::<Vec<_>>(), n).is_none(), "complex cholesky of a negative definite matrix")
+            }
             // QR of square, tall and wide matrices gives orthonormal columns of Q, and R with a real, non-negative diagonal.
             for (m, c) in [(n, n), (n + 5, n), (n, n + 5)] {
                 let a = complex_random::<R>(m, c, (m * 31 + c) as u64);
@@ -655,14 +657,12 @@ mod factor {
                 let (aw, p) = (complex_wide(&a), m.min(c));
                 let Svd { u, s, v, .. } = svd(&a, [m, c]);
                 assert!(
-                    distance(&wide(&singular_values(&a, [m, c])), &wide(&s), complex_norm(&aw).max(1.0)) < bound,
-                    "complex singular values alone at {m}×{c}"
+                    distance(&wide(&singular_values(&a, [m, c])), &wide(&s), complex_norm(&aw).max(1.0)) < bound, "complex singular values alone at {m}×{c}"
                 );
                 let (u, v, s) = (complex_wide(&u), complex_wide(&v), wide(&s));
                 let us: Vec<C64> = (0..m * p).map(|k| u[k] * s[k % p]).collect();
                 assert!(
-                    complex_distance(&complex_product(&us, &adjoint(&v, c, p), [m, p, c]), &aw, complex_norm(&aw).max(1.0)) < bound,
-                    "complex svd at {m}×{c}"
+                    complex_distance(&complex_product(&us, &adjoint(&v, c, p), [m, p, c]), &aw, complex_norm(&aw).max(1.0)) < bound, "complex svd at {m}×{c}"
                 );
                 assert!(complex_distance(&complex_product(&adjoint(&u, m, p), &u, [p, m, p]), &identity::<C64>(p), 1.0) < bound, "complex svd's u at {m}×{c}");
                 assert!(complex_distance(&complex_product(&adjoint(&v, c, p), &v, [p, c, p]), &identity::<C64>(p), 1.0) < bound, "complex svd's v at {m}×{c}");
@@ -680,8 +680,7 @@ mod factor {
             let vl: Vec<C64> = (0..n * n).map(|k| vectors[k] * values[k % n]).collect();
             assert!(complex_distance(&complex_product(&hw, &vectors, [n; 3]), &vl, complex_norm(&hw).max(1.0)) < bound, "complex hermitian eigen at {n}");
             assert!(
-                complex_distance(&complex_product(&adjoint(&vectors, n, n), &vectors, [n; 3]), &identity::<C64>(n), 1.0) < bound,
-                "unitary eigenvectors at {n}"
+                complex_distance(&complex_product(&adjoint(&vectors, n, n), &vectors, [n; 3]), &identity::<C64>(n), 1.0) < bound, "unitary eigenvectors at {n}"
             );
             // A complex matrix with real items gives the real code's singular values and eigenvalues, within rounding.
             let re: Vec<R> = h.iter().map(|z| z.re).collect();

@@ -219,17 +219,25 @@ fn shifted_roots<R: Native, const FUSED: bool>(z: Complex<R>) -> (Complex<R>, Co
     (sqrt::<R, FUSED>(c(z.re - R::one(), z.im)), sqrt::<R, FUSED>(c(z.re + R::one(), z.im)))
 }
 
-/// √(1 - z²) as √(1 - z) √(1 + z), whose real part is never negative. Neither factor loses digits near z = ±1, or overflows where z² would.
+/// `r`, a square root of a number whose imaginary part is 2xy, with its smaller part recomputed as xy divided by its larger part. A product of two square roots, as `sqrt1mx2` and `sqrtx2m1` form, loses the smaller part where x is too small to change 1 ± x. The product xy keeps it. `r` stays as it is where x or y is 0, to keep the signs of zeros on the branch cuts, and where a part isn't finite.
+#[inline(always)]
+fn balanced<R: Native>(r: Complex<R>, x: R, y: R) -> Complex<R> {
+    let zero = R::zero();
+    if (x == zero) | (y == zero) | !(r.re.is_finite() & r.im.is_finite() & x.is_finite() & y.is_finite()) { return r; }
+    if r.re.abs() >= r.im.abs() { if r.re == zero { r } else { c(r.re, x * (y / r.re)) } } else { c(x * (y / r.im), r.im) }
+}
+
+/// √(1 - z²) as √(1 - z) √(1 + z), whose real part is never negative. Neither factor loses digits near z = ±1, or overflows where z² would. [`balanced`] restores the smaller part where z's real part is too small to change 1.
 #[inline]
-pub(crate) fn sqrt1mx2<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R> { let (a, b) = roots::<R, FUSED>(z); a * b }
+pub(crate) fn sqrt1mx2<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R> { let (a, b) = roots::<R, FUSED>(z); balanced(a * b, -z.re, z.im) }
 
 /// √(1 + z²) as `sqrt1mx2` at iz, because 1 + z² is 1 - (iz)². Its real part is never negative. Neither factor overflows where z² would.
 #[inline]
 pub(crate) fn sqrt1px2<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R> { sqrt1mx2::<R, FUSED>(turned(z)) }
 
-/// √(z - 1) √(z + 1), the continuation of the real `sqrtx2m1` off the real line. Neither factor loses digits near z = ±1, or overflows where z² would.
+/// √(z - 1) √(z + 1), the continuation of the real `sqrtx2m1` off the real line. Neither factor loses digits near z = ±1, or overflows where z² would. [`balanced`] restores the smaller part where z's real part is too small to change 1.
 #[inline]
-pub(crate) fn sqrtx2m1<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R> { let (a, b) = shifted_roots::<R, FUSED>(z); a * b }
+pub(crate) fn sqrtx2m1<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R> { let (a, b) = shifted_roots::<R, FUSED>(z); balanced(a * b, z.re, z.im) }
 
 /// asin z, by Kahan's formula: with a = √(1 - z) and b = √(1 + z), Re asin z = atan(x / Re(ab)) and Im asin z = asinh(Im(conj(a) b)).
 #[inline]
@@ -480,10 +488,20 @@ fn times_parts<R: Native>((ar, ai): &(Vec<R>, Vec<R>), (br, bi): &(Vec<R>, Vec<R
     im.extend(ar.iter().zip(ai).zip(br.iter().zip(bi)).map(|((&ar, &ai), (&br, &bi))| ar * bi + ai * br));
 }
 
+/// Applies [`balanced`] to the last `x.len()` results in `re` and `im`, the products of square roots for each `z` = `x + iy`, with `x` negated where `negate` is set.
+fn balanced_parts<R: Native>(x: &[R], y: &[R], negate: bool, re: &mut [R], im: &mut [R]) {
+    let start = re.len() - x.len();
+    for (i, (&x, &y)) in x.iter().zip(y).enumerate() {
+        let r = balanced(c(re[start + i], im[start + i]), if negate { -x } else { x }, y);
+        (re[start + i], im[start + i]) = (r.re, r.im);
+    }
+}
+
 /// Appends √(1 - z²) for each `z` = `x + iy`, as `sqrt1mx2` computes it.
 fn sqrt1mx2_parts<R: Native>(x: &[R], y: &[R], re: &mut Vec<R>, im: &mut Vec<R>) where Hypot: Binary<R, Out = R> {
     let [a, b] = roots_parts(x, y);
     times_parts(&a, &b, re, im);
+    balanced_parts(x, y, true, re, im);
 }
 
 /// Appends `g` of `turned(z)`, which is iz, for each `z` = `x + iy`, where `g` appends its results' parts.
@@ -642,6 +660,7 @@ forms!(Sqrtx2m1 at Complex<f32>, Complex<f64>: |_, [z]| sqrtx2m1::<_, { crate::F
     many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| {
         let [a, b] = shifted_roots_parts(x, y);
         times_parts(&a, &b, re, im);
+        balanced_parts(x, y, false, re, im);
     }, |[z], _| rough_shifted_roots(z), |[z]| sqrtx2m1::<_, { crate::FUSED }>(z)));
 forms!(Ln at Complex<f32>, Complex<f64>: |_, [z]| ln::<_, { crate::FUSED }>(z),
     many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| ln_parts(x, y, re, im), |[z], r| tiny(z) | !finite(r), |[z]| ln::<_, { crate::FUSED }>(z)));

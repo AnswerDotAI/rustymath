@@ -680,8 +680,7 @@ fn parts<R: crate::Native + Tiled>(x: Matrix<'_, Complex<R>>, [rows, cols]: [usi
 
 /// The micro-kernels in plain Rust, for targets without the explicit ones. Each takes the number of vectors in a tile row, `V`, as the explicit ones do, and ignores it.
 #[cfg(not(any(
-    target_arch = "aarch64",
-    all(target_arch = "wasm32", target_feature = "simd128"),
+    target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"),
     all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")
 )))]
 mod plain {
@@ -690,10 +689,7 @@ mod plain {
         ($($name:ident: $t:ty, $object:ident;)+) => {$(
             #[inline(always)]
             pub(super) fn $name<const MR: usize, const NR: usize, const V: usize>(
-                a: &[$t],
-                b: &[$t],
-                t: &mut [[<$object as Pair<$t>>::Out; NR]; MR],
-                first: bool,
+                a: &[$t], b: &[$t], t: &mut [[<$object as Pair<$t>>::Out; NR]; MR], first: bool,
             ) {
                 micro::<$t, $object, MR, NR>(a, b, t, first)
             }
@@ -714,16 +710,14 @@ mod plain {
     }
 }
 #[cfg(not(any(
-    target_arch = "aarch64",
-    all(target_arch = "wasm32", target_feature = "simd128"),
+    target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"),
     all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")
 )))]
 use plain::*;
 
 /// Micro-kernels on explicit vectors: 16 bytes on AArch64 and in wasm, and 32 with AVX2. Each entry gives its first step from `a` and `b`, then each later step from the tile's running value `c`, `a` and `b`.
 #[cfg(any(
-    target_arch = "aarch64",
-    all(target_arch = "wasm32", target_feature = "simd128"),
+    target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"),
     all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")
 ))]
 mod lanes {
@@ -864,8 +858,7 @@ mod lanes {
     }
 }
 #[cfg(any(
-    target_arch = "aarch64",
-    all(target_arch = "wasm32", target_feature = "simd128"),
+    target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"),
     all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")
 ))]
 use lanes::*;
@@ -965,7 +958,10 @@ fn pack<T: Copy + Default, const W: usize>(
 fn micro<T: Copy, P: Pair<T>, const MR: usize, const NR: usize>(a: &[T], b: &[T], t: &mut [[P::Out; NR]; MR], first: bool) {
     let mut acc = *t;
     let mut steps = a.as_chunks::<MR>().0.iter().zip(b.as_chunks::<NR>().0);
-    if first { let (a, b) = steps.next().expect("a block has at least one step"); for r in 0..MR { for s in 0..NR { acc[r][s] = P::g(a[r], b[s]) } } }
+    if first {
+        let (a, b) = steps.next().expect("a block has at least one step");
+        for r in 0..MR { for s in 0..NR { acc[r][s] = P::g(a[r], b[s]) } }
+    }
     for (a, b) in steps { for r in 0..MR { for s in 0..NR { acc[r][s] = P::step(acc[r][s], a[r], b[s]) } } }
     *t = acc;
 }

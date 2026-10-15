@@ -891,10 +891,7 @@ impl<T: Tiled> Reflections<T> {
 
     /// `Qᴴ x` for the `m`×`k` matrix `x`, in place: the blocks' adjoints, first block first. Up to `FEW_COLUMNS` columns, each reflection applies alone to each column of a transposed copy, where each column is contiguous.
     fn apply_adjoint(&self, x: &mut [T], k: usize) {
-        if k > FEW_COLUMNS {
-            for block in &self.blocks { block.apply(x, k, [0, k], true) }
-            return;
-        }
+        if k > FEW_COLUMNS { for block in &self.blocks { block.apply(x, k, [0, k], true) } return; }
         let m = self.m;
         let mut xt = transpose(x, m, k);
         for (row, tau, v) in self.each() {
