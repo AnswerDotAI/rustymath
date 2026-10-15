@@ -1,43 +1,34 @@
-//! rustymath's `linalg` module as NumPy generalized ufuncs, which `python/rustymath/linalg.py` wraps. A loop runs once for each matrix
-//! of a stack. It borrows contiguous core matrices and copies strided or float16 matrices into worker-local row-major buffers, calls
-//! rustymath, then writes the results through the outputs' strides, rounded to the loop's type. complex64 and complex128 matrices compute at their
-//! own width. Results that are always real, such as singular values, have the real type of the loop's width. A matrix that fails gets
-//! NaN results and makes the loop report NumPy's "invalid value", as a failing item of any rustymath ufunc does.
+//! rustymath's `linalg` module as NumPy generalized ufuncs, which `python/rustymath/linalg.py` wraps. A loop runs once for each matrix of a stack. It borrows contiguous core matrices and copies strided or float16 matrices into worker-local row-major buffers, calls rustymath, then writes the results through the outputs' strides, rounded to the loop's type. complex64 and complex128 matrices compute at their own width. Results that are always real, such as singular values, have the real type of the loop's width. A matrix that fails gets NaN results and makes the loop report NumPy's "invalid value", as a failing item of any rustymath ufunc does.
 //!
-//! A core dimension can't be the smaller of two others. Each function whose results have `min(m, n)` rows or items therefore
-//! registers twice: once for `m ≤ n`, with a name ending `_m`, and once for `m ≥ n`, ending `_n`. One loop serves both.
-use std::{borrow::Cow, convert::Infallible, ffi::{c_char, c_void}, marker::PhantomData, mem::{align_of, size_of}};
+//! A core dimension can't be the smaller of two others. Each function whose results have `min(m, n)` rows or items therefore registers twice: once for `m ≤ n`, with a name ending `_m`, and once for `m ≥ n`, ending `_n`. One loop serves both.
 use std::slice;
+use std::{borrow::Cow, convert::Infallible, ffi::{c_char, c_void}, marker::PhantomData, mem::{align_of, size_of}};
 
 use half::f16;
 use num_complex::Complex;
 use num_traits::{Float as _, NumAssignRef, Zero as _};
+use numpy::npyffi::{NPY_TYPES, npy_intp};
 use numpy::{PyArray1, PyArrayDescrMethods, PyArrayMethods, PyReadonlyArray2, PyUntypedArray, PyUntypedArrayMethods};
-use numpy::npyffi::{npy_intp, NPY_TYPES};
 use pyo3::prelude::*;
-use rustymath::linalg::{self, AndOr, Factor, Inner, LuRef, LuWork, MaxPlus, MinPlus, OrAnd, PlusEqual, PlusNotEqual, PlusTimes, Scalar, SvdRef};
 use rustymath::Float;
+use rustymath::linalg::{self, AndOr, Factor, Inner, LuRef, LuWork, MaxPlus, MinPlus, OrAnd, PlusEqual, PlusNotEqual, PlusTimes, Scalar, SvdRef};
 
-use crate::{fe, parallel::{overlaps, separate}, Code, Loop, NONE};
+use crate::{Code, Loop, NONE, fe, parallel::{overlaps, separate}};
 
 /// A generalized ufunc loop.
 type Ufunc = unsafe extern "C" fn(*mut *mut c_char, *mut npy_intp, *mut npy_intp, *mut c_void);
 
-/// One argument of a loop: its NumPy type, its width in bytes, the positions of its core dimensions among the loop's, and the position
-/// of its first core stride among the loop's.
+/// One argument of a loop: its NumPy type, its width in bytes, the positions of its core dimensions among the loop's, and the position of its first core stride among the loop's.
 struct Arg { code: c_char, width: usize, shape: Vec<usize>, at: usize }
 
-/// A loop's number of inputs, its number of core dimensions and its arguments, derived once from the registered dtype loop and
-/// signature.
+/// A loop's number of inputs, its number of core dimensions and its arguments, derived once from the registered dtype loop and signature.
 struct MatrixLoop { nin: usize, ndims: usize, args: Vec<Arg> }
 
 impl MatrixLoop {
     /// The number of core strides that NumPy passes: one for each core dimension of each argument.
     fn strides(&self) -> usize { self.args.iter().map(|a| a.shape.len()).sum() }
 
-    /// Whether conservative byte bounds prove that no two of the `n` matrices write the same bytes: each output's matrices are
-    /// separate, and so are different outputs. Inputs need no check, because NumPy copies any input that an output overlaps before it
-    /// calls the loop.
+    /// Whether conservative byte bounds prove that no two of the `n` matrices write the same bytes: each output's matrices are separate, and so are different outputs. Inputs need no check, because NumPy copies any input that an output overlaps before it calls the loop.
     fn independent(&self, pointers: &[usize], dims: &[usize], outer: &[npy_intp], core: &[npy_intp], n: usize) -> bool {
         let spans: Option<Vec<_>> = self.args.iter().zip(pointers).zip(outer).skip(self.nin).map(|((arg, &p), &outer)| {
             let axes: Vec<_> = arg.shape.iter().zip(&core[arg.at..]).map(|(&d, &s)| (dims[d], s)).collect();
@@ -47,8 +38,7 @@ impl MatrixLoop {
     }
 }
 
-/// Registers the generalized ufunc `name`, with `counts` inputs and outputs, and gives each of its `loops` the `MatrixLoop` that the
-/// loop's types and `signature` describe.
+/// Registers the generalized ufunc `name`, with `counts` inputs and outputs, and gives each of its `loops` the `MatrixLoop` that the loop's types and `signature` describe.
 fn register(m: &Bound<'_, PyModule>, name: &str, doc: &str, counts: [usize; 2], signature: &str, loops: Vec<Loop>) -> PyResult<()> {
     let mut dimensions = Vec::new();
     let shapes: Vec<Vec<usize>> = signature.split('(').skip(1).map(|s| {
@@ -58,7 +48,10 @@ fn register(m: &Bound<'_, PyModule>, name: &str, doc: &str, counts: [usize; 2], 
         }).collect()
     }).collect();
     fn code_width<T: Code>() -> (c_char, usize) { (T::CODE as c_char, size_of::<T>()) }
-    let widths = [code_width::<f16>(), code_width::<f32>(), code_width::<f64>(), code_width::<Complex<f32>>(), code_width::<Complex<f64>>(), code_width::<bool>(), code_width::<i64>()];
+    let widths = [
+        code_width::<f16>(), code_width::<f32>(), code_width::<f64>(), code_width::<Complex<f32>>(), code_width::<Complex<f64>>(), code_width::<bool>(),
+        code_width::<i64>(),
+    ];
     let data = loops.iter().map(|(_, codes)| {
         let mut at = 0;
         let args = codes.iter().zip(&shapes).map(|(&code, shape)| {
@@ -98,8 +91,7 @@ itself!(f32, f64, Complex<f32>, Complex<f64>, bool, i64);
 /// The real type that the item type `E` computes in, or computes its parts in: `f32` for `float16`, `float32` and `complex64`.
 type Part<E> = <<E as Stored>::W as Scalar>::Real;
 
-/// A float loop's element type: `float16`, `float32`, `float64`, `complex64` or `complex128`, which rustymath factors in its working
-/// type.
+/// A float loop's element type: `float16`, `float32`, `float64`, `complex64` or `complex128`, which rustymath factors in its working type.
 trait Item: Stored<W: Factor> {
     /// The element type of results that are always real, such as singular values: the real type of the same width.
     type Real: Stored<W = Part<Self>>;
@@ -124,17 +116,12 @@ impl Cell<'_> {
     /// The loop's core dimensions, in the order that the signature first names them.
     fn dims<const N: usize>(&self) -> [usize; N] { self.dims.try_into().expect("a loop's number of core dimensions") }
 
-    /// Argument `k`, which holds items of type `code`: its address, its row and item strides in bytes, and its rows and columns. A
-    /// vector is a matrix of one column, and a scalar one of one item.
+    /// Argument `k`, which holds items of type `code`: its address, its row and item strides in bytes, and its rows and columns. A vector is a matrix of one column, and a scalar one of one item.
     fn matrix(&self, k: usize, code: NPY_TYPES) -> (*mut c_char, [npy_intp; 2], [usize; 2]) {
         let arg = &self.layout.args[k];
         assert_eq!(arg.code, code as c_char, "argument {k} holds the loop's type");
         let (p, s) = ((self.pointers[k] as *mut c_char).wrapping_offset(self.i as isize * self.outer[k]), &self.core[arg.at..]);
-        match arg.shape[..] {
-            [r, c] => (p, [s[0], s[1]], [self.dims[r], self.dims[c]]),
-            [r] => (p, [s[0], 0], [self.dims[r], 1]),
-            _ => (p, [0, 0], [1, 1]),
-        }
+        match arg.shape[..] { [r, c] => (p, [s[0], s[1]], [self.dims[r], self.dims[c]]), [r] => (p, [s[0], 0], [self.dims[r], 1]), _ => (p, [0, 0], [1, 1]) }
     }
 
     /// Input `k`, row by row in `T`'s working type.
@@ -162,8 +149,7 @@ trait Gufunc<E> {
     fn each(c: &Cell<'_>, s: &mut Self::S) -> bool;
 }
 
-/// The loop that runs `G` on each matrix of a stack. Where no two matrices write the same bytes, rustymath's `stack_with` splits the
-/// stack across threads. Otherwise the matrices run in turn on this thread.
+/// The loop that runs `G` on each matrix of a stack. Where no two matrices write the same bytes, rustymath's `stack_with` splits the stack across threads. Otherwise the matrices run in turn on this thread.
 unsafe extern "C" fn looped<G: Gufunc<E>, E>(args: *mut *mut c_char, dims: *mut npy_intp, steps: *mut npy_intp, data: *mut c_void) {
     let incoming = unsafe { fe::fetestexcept(fe::REPORTED) };
     let layout = unsafe { &*data.cast::<MatrixLoop>() };
@@ -175,33 +161,25 @@ unsafe extern "C" fn looped<G: Gufunc<E>, E>(args: *mut *mut c_char, dims: *mut 
     let ok = if n > 1 && layout.independent(&pointers, &dims, outer, core, n) {
         let Ok((_, ok)) = rustymath::parallel::stack_with(n, 0, &each, || Ok::<_, Infallible>(()));
         ok
-    } else {
-        let mut s = G::S::default();
-        (0..n).fold(true, |ok, i| each(i, &mut [], &mut s) & ok)
-    };
+    } else { let mut s = G::S::default(); (0..n).fold(true, |ok, i| each(i, &mut [], &mut s) & ok) };
     unsafe { fe::finish(incoming, if ok { 0 } else { fe::INVALID }); }
 }
 
 /// The `rows`×`cols` matrix at `p`, whose rows lie `rs` bytes apart and items `cs` bytes apart, row by row in `E`'s working type.
 unsafe fn read<'a, E: Stored + 'a>(p: *mut c_char, [rs, cs]: [npy_intp; 2], [rows, cols]: [usize; 2]) -> Cow<'a, [E::W]> {
     let len = rows * cols;
-    if len == 0 { return Cow::Borrowed(&[]) }
+    if len == 0 { return Cow::Borrowed(&[]); }
     if (cols == 1 || cs == size_of::<E>() as isize) && (rows == 1 || rs == (cols * size_of::<E>()) as isize) && (p as usize).is_multiple_of(align_of::<E>()) {
-        if let Some(x) = E::borrow(unsafe { slice::from_raw_parts(p.cast::<E>(), len) }) { return Cow::Borrowed(x) }
+        if let Some(x) = E::borrow(unsafe { slice::from_raw_parts(p.cast::<E>(), len) }) { return Cow::Borrowed(x); }
     }
     let mut x = Vec::with_capacity(rows * cols);
-    for i in 0..rows as isize {
-        for j in 0..cols as isize { x.push(unsafe { (p.offset(i * rs + j * cs) as *const E).read_unaligned() }.load()) }
-    }
+    for i in 0..rows as isize { for j in 0..cols as isize { x.push(unsafe { (p.offset(i * rs + j * cs) as *const E).read_unaligned() }.load()) } }
     Cow::Owned(x)
 }
 
-/// Writes the `rows`×`cols` matrix `x`, held row by row, through `f` to `p`, whose rows lie `rs` bytes apart and items `cs` bytes
-/// apart. A vector is a matrix of one column, and a scalar one of one item.
+/// Writes the `rows`×`cols` matrix `x`, held row by row, through `f` to `p`, whose rows lie `rs` bytes apart and items `cs` bytes apart. A vector is a matrix of one column, and a scalar one of one item.
 unsafe fn write<W: Copy, O>(x: &[W], p: *mut c_char, [rs, cs]: [npy_intp; 2], [rows, cols]: [usize; 2], f: impl Fn(W) -> O) {
-    for i in 0..rows {
-        for j in 0..cols { unsafe { (p.offset(i as isize * rs + j as isize * cs) as *mut O).write_unaligned(f(x[i * cols + j])) } }
-    }
+    for i in 0..rows { for j in 0..cols { unsafe { (p.offset(i as isize * rs + j as isize * cs) as *mut O).write_unaligned(f(x[i * cols + j])) } } }
 }
 
 /// `n` NaNs, the results of a matrix that fails.
@@ -210,8 +188,7 @@ fn nans<W: Scalar>(n: usize) -> Vec<W> { vec![W::from_real(W::Real::nan()); n] }
 /// `n` complex NaNs, the complex results of a matrix of item type `E` that fails.
 fn complex_nans<E: Item>(n: usize) -> Vec<Complex<Part<E>>> { vec![Complex::new(Part::<E>::nan(), Part::<E>::nan()); n] }
 
-/// Runs `f` on the LU factorization in the first two inputs: the `n`×`n` packed factors, transposed as the `lu` gufunc writes them, and
-/// the positions of the `n` rows. `None` where a position is out of range.
+/// Runs `f` on the LU factorization in the first two inputs: the `n`×`n` packed factors, transposed as the `lu` gufunc writes them, and the positions of the `n` rows. `None` where a position is out of range.
 fn with_lu<E: Item, R>(c: &Cell<'_>, n: usize, f: impl FnOnce(LuRef<'_, E::W>) -> R) -> Option<R> {
     let (factors, perm) = (c.read::<E>(0), c.read::<i64>(1));
     let perm: Vec<usize> = perm.iter().map(|&i| i as usize).collect();
@@ -223,8 +200,7 @@ fn with_svd<E: Item, R>(c: &Cell<'_>, [m, n]: [usize; 2], f: impl FnOnce(SvdRef<
     f(SvdRef::new([m, n], &c.read::<E>(0), &c.read::<E::Real>(1), &c.read::<E>(2)))
 }
 
-/// Defines each listed generalized ufunc's work on one matrix as a unit type, for every float and complex element type `E`.
-/// `Name(c, s: S) { body }` runs `body` with the matrix's `Cell` `c` and the shared scratch value `s` of type `S`.
+/// Defines each listed generalized ufunc's work on one matrix as a unit type, for every float and complex element type `E`. `Name(c, s: S) { body }` runs `body` with the matrix's `Cell` `c` and the shared scratch value `s` of type `S`.
 macro_rules! gufunc_types {
     ($($(#[$doc:meta])* $name:ident($c:ident, $s:tt: $S:ty) $body:block)+) => {$(
         $(#[$doc])*
@@ -257,8 +233,7 @@ gufunc_types! {
         c.write(1, &[work.factor(&c.read::<E>(0), m).determinant()], E::store);
         true
     }
-    /// `slogdet`: the sign of the determinant of an `m`×`m` matrix and the natural logarithm of its magnitude, as
-    /// `Lu::log_determinant` gives them.
+    /// `slogdet`: the sign of the determinant of an `m`×`m` matrix and the natural logarithm of its magnitude, as `Lu::log_determinant` gives them.
     Slogdet(c, work: LuWork<E::W>) {
         let [m] = c.dims();
         let (sign, log) = work.factor(&c.read::<E>(0), m).log_determinant();
@@ -266,8 +241,7 @@ gufunc_types! {
         c.write(2, &[log], E::Real::store);
         true
     }
-    /// `lu`: the packed LU factors of an `m`×`m` matrix and the positions of its rows. NumPy holds the factors transposed: their rows
-    /// are rustymath's columns.
+    /// `lu`: the packed LU factors of an `m`×`m` matrix and the positions of its rows. NumPy holds the factors transposed: their rows are rustymath's columns.
     Lu(c, work: LuWork<E::W>) {
         let [m] = c.dims();
         let f = work.factor(&c.read::<E>(0), m);
@@ -291,8 +265,7 @@ gufunc_types! {
         c.write(2, &x.unwrap_or_else(|| nans(n * n)), E::store);
         ok
     }
-    /// `lu_slogdet`: the sign of an `m`×`m` matrix's determinant and the natural logarithm of its magnitude, from its packed LU
-    /// factors and row positions.
+    /// `lu_slogdet`: the sign of an `m`×`m` matrix's determinant and the natural logarithm of its magnitude, from its packed LU factors and row positions.
     LuSlogdet(c, _: ()) {
         let [n] = c.dims();
         let r = with_lu::<E, _>(c, n, |lu| lu.log_determinant());
@@ -332,8 +305,7 @@ gufunc_types! {
         c.write(2, &r, E::store);
         true
     }
-    /// `svd_m` and `svd_n`: the thin SVD of an `m`×`n` matrix, as U, which is `m`×`p`, the `p` singular values in descending order, and
-    /// V, which is `n`×`p`, where `p` is the smaller of `m` and `n`.
+    /// `svd_m` and `svd_n`: the thin SVD of an `m`×`n` matrix, as U, which is `m`×`p`, the `p` singular values in descending order, and V, which is `n`×`p`, where `p` is the smaller of `m` and `n`.
     Svd(c, _: ()) {
         let [m, n] = c.dims();
         let f = linalg::svd(&c.read::<E>(0), [m, n]);
@@ -342,8 +314,7 @@ gufunc_types! {
         c.write(3, &f.v, E::store);
         true
     }
-    /// `truncated_svd`: an approximation to the first `k` singular values of an `m`×`n` matrix and their vectors, as U, which is
-    /// `m`×`k`, the values in descending order, and V, which is `n`×`k`. The outputs set `k`. A `k` above `m` or `n` gives NaN results.
+    /// `truncated_svd`: an approximation to the first `k` singular values of an `m`×`n` matrix and their vectors, as U, which is `m`×`k`, the values in descending order, and V, which is `n`×`k`. The outputs set `k`. A `k` above `m` or `n` gives NaN results.
     TruncatedSvd(c, _: ()) {
         let [m, n, k] = c.dims();
         let ok = k <= m.min(n);
@@ -380,8 +351,7 @@ gufunc_types! {
         c.write(1, &[linalg::rank(&c.read::<E>(0), [m, n]) as i64], |r| r);
         true
     }
-    /// `lstsq_m` and `lstsq_n`: the least-squares solution `x` of `a x = b` with the least norm, for an `m`×`n` matrix `a` and an
-    /// `m`×`k` matrix `b`, and `a`'s singular values in descending order.
+    /// `lstsq_m` and `lstsq_n`: the least-squares solution `x` of `a x = b` with the least norm, for an `m`×`n` matrix `a` and an `m`×`k` matrix `b`, and `a`'s singular values in descending order.
     Lstsq(c, _: ()) {
         let [m, n, k] = c.dims();
         let (x, sv) = linalg::lstsq(&c.read::<E>(0), &c.read::<E>(1), [m, n], k);
@@ -389,8 +359,7 @@ gufunc_types! {
         c.write(3, &sv, E::Real::store);
         true
     }
-    /// `eigh`: the eigenvalues of a symmetric or Hermitian `m`×`m` matrix in ascending order, and its unit eigenvectors in columns,
-    /// reading only its lower triangle.
+    /// `eigh`: the eigenvalues of a symmetric or Hermitian `m`×`m` matrix in ascending order, and its unit eigenvectors in columns, reading only its lower triangle.
     Eigh(c, _: ()) {
         let [m] = c.dims();
         let f = linalg::eigh(&c.read::<E>(0), m);
@@ -440,10 +409,11 @@ impl<E: Item> Gufunc<E> for Permanent where E::W: NumAssignRef {
     }
 }
 
-fn row_reduce<'py, E: Item>(py: Python<'py>, a: PyReadonlyArray2<'py, E>, columns: Option<usize>) -> PyResult<Bound<'py, PyAny>>
-where E::W: NumAssignRef {
+fn row_reduce<'py, E: Item>(py: Python<'py>, a: PyReadonlyArray2<'py, E>, columns: Option<usize>) -> PyResult<Bound<'py, PyAny>> where E::W: NumAssignRef {
     let shape = a.shape();
-    let f = linalg::exact::echelon_with(a.as_array().iter().map(|&x| x.load()).collect(), [shape[0], shape[1]], columns.unwrap_or(shape[1]), || py.check_signals())?;
+    let f = linalg::exact::echelon_with(a.as_array().iter().map(|&x| x.load()).collect(), [shape[0], shape[1]], columns.unwrap_or(shape[1]), || {
+        py.check_signals()
+    })?;
     let rows = PyArray1::from_vec(py, f.rows.into_iter().map(E::store).collect()).reshape([f.pivots.len(), shape[1]])?;
     let pivots = PyArray1::from_vec(py, f.pivots.into_iter().map(|i| i as isize).collect());
     let determinant = PyArray1::from_vec(py, vec![E::store(f.determinant)]).get_item(0)?;
@@ -455,12 +425,10 @@ where E::W: NumAssignRef {
 #[pyo3(signature = (a, columns=None))]
 fn echelon<'py>(py: Python<'py>, a: &Bound<'py, PyUntypedArray>, columns: Option<usize>) -> PyResult<Bound<'py, PyAny>> {
     match a.dtype().char() {
-        b'e' => row_reduce(py, a.extract::<PyReadonlyArray2<f16>>()?, columns),
-        b'f' => row_reduce(py, a.extract::<PyReadonlyArray2<f32>>()?, columns),
-        b'd' => row_reduce(py, a.extract::<PyReadonlyArray2<f64>>()?, columns),
-        b'F' => row_reduce(py, a.extract::<PyReadonlyArray2<Complex<f32>>>()?, columns),
+        b'e' => row_reduce(py, a.extract::<PyReadonlyArray2<f16>>()?, columns), b'f' => row_reduce(py, a.extract::<PyReadonlyArray2<f32>>()?, columns),
+        b'd' => row_reduce(py, a.extract::<PyReadonlyArray2<f64>>()?, columns), b'F' => row_reduce(py, a.extract::<PyReadonlyArray2<Complex<f32>>>()?, columns),
         b'D' => row_reduce(py, a.extract::<PyReadonlyArray2<Complex<f64>>>()?, columns),
-        _ => Err(pyo3::exceptions::PyTypeError::new_err("echelon takes real or complex matrices")),
+        _ => Err(pyo3::exceptions::PyTypeError::new_err("echelon takes real or complex matrices"))
     }
 }
 
@@ -492,7 +460,9 @@ enum Kind { E, R, C, I }
 
 /// The loop `f` at element type `E`, whose arguments have the types `kinds`.
 fn entry<E: Item>(f: Ufunc, kinds: &[Kind]) -> Loop {
-    (Some(f), kinds.iter().map(|k| (match k { Kind::E => E::CODE, Kind::R => E::Real::CODE, Kind::C => E::Complex::CODE, Kind::I => i64::CODE }) as c_char).collect())
+    (Some(f), kinds.iter().map(|k| {
+        (match k { Kind::E => E::CODE, Kind::R => E::Real::CODE, Kind::C => E::Complex::CODE, Kind::I => i64::CODE }) as c_char
+    }).collect())
 }
 
 /// `P`'s product loops at float16, float32 and float64.
@@ -507,20 +477,19 @@ fn integer_product<P: Default + Inner<i64, Out = i64>>() -> Loop { (Some(looped:
 /// `P`'s count loops at int64, float16, float32 and float64, each giving int64 counts.
 fn counts<P: Default + Inner<i64, Out = i64> + Inner<f32, Out = i32> + Inner<f64, Out = i64>>() -> Vec<Loop> {
     let entry = |f: Ufunc, t: NPY_TYPES| (Some(f), vec![t as c_char, t as c_char, i64::CODE as c_char]);
-    vec![entry(looped::<Count<P>, i64>, i64::CODE), entry(looped::<Count<P>, f16>, f16::CODE), entry(looped::<Count<P>, f32>, f32::CODE), entry(looped::<Count<P>, f64>, f64::CODE)]
+    vec![
+        entry(looped::<Count<P>, i64>, i64::CODE), entry(looped::<Count<P>, f16>, f16::CODE), entry(looped::<Count<P>, f32>, f32::CODE),
+        entry(looped::<Count<P>, f64>, f64::CODE),
+    ]
 }
 
-/// Registers each generalized ufunc in `m`, with loops at float16, float32, float64, complex64 and complex128. `$nin` counts its
-/// inputs, and `$kind` gives the type of each argument, inputs first.
+/// Registers each generalized ufunc in `m`, with loops at float16, float32, float64, complex64 and complex128. `$nin` counts its inputs, and `$kind` gives the type of each argument, inputs first.
 macro_rules! gufuncs {
     ($m:expr; $($name:literal $signature:literal: $nin:literal => [$($kind:ident),+] = $f:ident, $doc:literal;)+) => {$({
         let kinds = [$(Kind::$kind),+];
         let loops = vec![
-            entry::<f16>(looped::<$f, f16>, &kinds),
-            entry::<f32>(looped::<$f, f32>, &kinds),
-            entry::<f64>(looped::<$f, f64>, &kinds),
-            entry::<Complex<f32>>(looped::<$f, Complex<f32>>, &kinds),
-            entry::<Complex<f64>>(looped::<$f, Complex<f64>>, &kinds),
+            entry::<f16>(looped::<$f, f16>, &kinds), entry::<f32>(looped::<$f, f32>, &kinds), entry::<f64>(looped::<$f, f64>, &kinds),
+            entry::<Complex<f32>>(looped::<$f, Complex<f32>>, &kinds), entry::<Complex<f64>>(looped::<$f, Complex<f64>>, &kinds),
         ];
         register($m, $name, $doc, [$nin, kinds.len() - $nin], $signature, loops)?;
     })+};
@@ -566,10 +535,19 @@ pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let and_or = (Some(looped::<Product<AndOr>, bool> as Ufunc), vec![NPY_TYPES::NPY_BOOL as c_char; 3]);
     register(m, "logical_and_or", "Whether every k has either a[i,k] or b[k,j].", [2, 1], PRODUCT, vec![and_or])?;
     let complex = [Kind::E; 3];
-    let complex = vec![entry::<Complex<f32>>(looped::<Product<PlusTimes>, Complex<f32>>, &complex), entry::<Complex<f64>>(looped::<Product<PlusTimes>, Complex<f64>>, &complex)];
-    register(m, "matmul", "The matrix product of each pair of matrices, or for Booleans, whether some k has both a[i,k] and b[k,j]. Integers wrap on overflow.", [2, 1], PRODUCT, [vec![or_and, integer_product::<PlusTimes>()], float_products::<PlusTimes>(), complex].concat())?;
-    register(m, "maximum_add", "The max-plus product of each pair of real matrices: the greatest a[i,k] + b[k,j].", [2, 1], PRODUCT, [vec![integer_product::<MaxPlus>()], float_products::<MaxPlus>()].concat())?;
-    register(m, "minimum_add", "The min-plus product of each pair of real matrices: the least a[i,k] + b[k,j].", [2, 1], PRODUCT, [vec![integer_product::<MinPlus>()], float_products::<MinPlus>()].concat())?;
+    let complex = vec![
+        entry::<Complex<f32>>(looped::<Product<PlusTimes>, Complex<f32>>, &complex),
+        entry::<Complex<f64>>(looped::<Product<PlusTimes>, Complex<f64>>, &complex),
+    ];
+    register(
+        m, "matmul", "The matrix product of each pair of matrices, or for Booleans, whether some k has both a[i,k] and b[k,j]. Integers wrap on overflow.",
+        [2, 1], PRODUCT, [vec![or_and, integer_product::<PlusTimes>()], float_products::<PlusTimes>(), complex].concat())?;
+    register(
+        m, "maximum_add", "The max-plus product of each pair of real matrices: the greatest a[i,k] + b[k,j].", [2, 1], PRODUCT,
+        [vec![integer_product::<MaxPlus>()], float_products::<MaxPlus>()].concat())?;
+    register(
+        m, "minimum_add", "The min-plus product of each pair of real matrices: the least a[i,k] + b[k,j].", [2, 1], PRODUCT,
+        [vec![integer_product::<MinPlus>()], float_products::<MinPlus>()].concat())?;
     register(m, "add_equal", "The number of k where a[i,k] equals b[k,j], for each pair of real matrices.", [2, 1], PRODUCT, counts::<PlusEqual>())?;
     register(m, "add_not_equal", "The number of k where a[i,k] differs from b[k,j], for each pair of real matrices.", [2, 1], PRODUCT, counts::<PlusNotEqual>())
 }

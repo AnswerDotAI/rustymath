@@ -1,13 +1,9 @@
-//! Probability distributions. Each has a density, a cumulative distribution, a quantile function and a sampler. The first three are
-//! also function objects, `Pdf`, `Cdf` and `Quantile`, which hold the distribution. Their slice forms choose the distribution's
-//! formulas once, outside the loop, so the loops of the closed-form distributions vectorize. An item of a slice form fails where its
-//! result is NaN and its argument isn't, as for a quantile of p outside 0 to 1. A discrete distribution's density is its mass at a
-//! whole x, and its quantile function and sampler give whole numbers.
-use crate::{atan, betainc, betaincinv, cos, erfc, erfcinv, exp, expm1, gammainc, gammaincc, gammaincinv, lgamma, ln, log1p, pow, sin, tan, Arg, Erfc, Erfcinv, Float, Unary};
-use rand::{
-    distr::{Distribution as _, Open01, StandardUniform},
-    Rng,
+//! Probability distributions. Each has a density, a cumulative distribution, a quantile function and a sampler. The first three are also function objects, `Pdf`, `Cdf` and `Quantile`, which hold the distribution. Their slice forms choose the distribution's formulas once, outside the loop, so the loops of the closed-form distributions vectorize. An item of a slice form fails where its result is NaN and its argument isn't, as for a quantile of p outside 0 to 1. A discrete distribution's density is its mass at a whole x, and its quantile function and sampler give whole numbers.
+use crate::{
+    Arg, Erfc, Erfcinv, Float, Unary, atan, betainc, betaincinv, cos, erfc, erfcinv, exp, expm1, gammainc, gammaincc, gammaincinv, lgamma, ln, log1p, pow, sin,
+    tan,
 };
+use rand::{Rng, distr::{Distribution as _, Open01, StandardUniform}};
 use std::f64::consts::{FRAC_1_SQRT_2, PI, SQRT_2, TAU};
 
 /// √(2π).
@@ -21,29 +17,14 @@ pub struct Distribution(Law);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Invalid(pub &'static str);
 
-impl std::fmt::Display for Invalid {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.0) }
-}
+impl std::fmt::Display for Invalid { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.0) } }
 
 impl std::error::Error for Invalid {}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Law {
-    Normal(Normal),
-    Uniform(Uniform),
-    Beta(Beta),
-    Cauchy(Cauchy),
-    Exponential(Exponential),
-    Fisher(Fisher),
-    Gamma(Gamma),
-    InverseGamma(InverseGamma),
-    Laplace(Laplace),
-    Logistic(Logistic),
-    LogNormal(LogNormal),
-    StudentT(StudentT),
-    Weibull(Weibull),
-    Binomial(Binomial),
-    Poisson(Poisson),
+    Normal(Normal), Uniform(Uniform), Beta(Beta), Cauchy(Cauchy), Exponential(Exponential), Fisher(Fisher), Gamma(Gamma), InverseGamma(InverseGamma),
+    Laplace(Laplace), Logistic(Logistic), LogNormal(LogNormal), StudentT(StudentT), Weibull(Weibull), Binomial(Binomial), Poisson(Poisson)
 }
 
 /// `$body` with `$d` bound to the formulas of the distribution that `$law` holds.
@@ -75,9 +56,7 @@ trait Formulas {
     fn cdf(&self, x: f64) -> f64;
     fn quantile(&self, p: f64) -> f64;
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64;
-    fn samples<R: Rng + ?Sized>(&self, rng: &mut R, out: &mut [f64]) {
-        for o in out { *o = self.sample(rng); }
-    }
+    fn samples<R: Rng + ?Sized>(&self, rng: &mut R, out: &mut [f64]) { for o in out { *o = self.sample(rng); } }
 }
 
 /// The quantile of p from a distribution's formulas, which take p from 0 to 1. Any other p gives NaN.
@@ -93,37 +72,33 @@ pub struct Pdf(pub Distribution);
 forms!(Pdf at real: |k, [x]| narrowed(x, |x| each_law!(&k.0 .0, d => d.pdf(x))),
     many |k, [x], n, out| each_law!(&k.0 .0, d => each!([x], n, out, |[x]| narrowed(x, |x| d.pdf(x)))));
 
-/// [`Distribution::cdf`] as a function object. The normal and log-normal distributions' slice forms take erfc from [`Erfc`]'s slice
-/// form, which computes only the formulas that each block of arguments needs.
+/// [`Distribution::cdf`] as a function object. The normal and log-normal distributions' slice forms take erfc from [`Erfc`]'s slice form, which computes only the formulas that each block of arguments needs.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cdf(pub Distribution);
 forms!(Cdf at real: |k, [x]| narrowed(x, |x| each_law!(&k.0 .0, d => d.cdf(x))),
-    many |k, [x], n, out| match (&k.0 .0, x) {
-        (Law::Normal(d), Arg::Many(x)) => composed(&x[..n], out, #[inline(always)] |x| (d.mean - x) / d.sd * FRAC_1_SQRT_2, Erfc,
-            #[inline(always)] |_, e| 0.5 * e),
-        (Law::LogNormal(d), Arg::Many(x)) => composed(&x[..n], out, #[inline(always)] |x| (d.location - ln(x)) / d.scale * FRAC_1_SQRT_2,
-            Erfc, #[inline(always)] |x, e| if x <= 0.0 { 0.0 } else { 0.5 * e }),
-        (law, x) => each_law!(law, d => each!([x], n, out, |[x]| narrowed(x, |x| d.cdf(x)))),
-    });
+many |k, [x], n, out| match (&k.0 .0, x) {
+    (Law::Normal(d), Arg::Many(x)) => composed(&x[..n], out, #[inline(always)] |x| (d.mean - x) / d.sd * FRAC_1_SQRT_2, Erfc,
+        #[inline(always)] |_, e| 0.5 * e),
+    (Law::LogNormal(d), Arg::Many(x)) => composed(&x[..n], out, #[inline(always)] |x| (d.location - ln(x)) / d.scale * FRAC_1_SQRT_2,
+        Erfc, #[inline(always)] |x, e| if x <= 0.0 { 0.0 } else { 0.5 * e }),
+    (law, x) => each_law!(law, d => each!([x], n, out, |[x]| narrowed(x, |x| d.cdf(x)))),
+});
 
-/// [`Distribution::quantile`] as a function object. The normal and log-normal distributions' slice forms take erfcinv(2p) from
-/// [`Erfcinv`]'s slice form, whose loops don't branch on each item's region.
+/// [`Distribution::quantile`] as a function object. The normal and log-normal distributions' slice forms take erfcinv(2p) from [`Erfcinv`]'s slice form, whose loops don't branch on each item's region.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Quantile(pub Distribution);
 forms!(Quantile at real: |k, [p]| narrowed(p, |p| each_law!(&k.0 .0, d => quantile_of(d, p))),
-    many |k, [p], n, out| match (&k.0 .0, p) {
-        (Law::Normal(d), Arg::Many(p)) => composed(&p[..n], out, #[inline(always)] |p| 2.0 * p, Erfcinv,
-            #[inline(always)] |_, e| d.mean - d.sd * SQRT_2 * e),
-        (Law::LogNormal(d), Arg::Many(p)) => composed(&p[..n], out, #[inline(always)] |p| 2.0 * p, Erfcinv,
-            #[inline(always)] |_, e| exp(d.location - d.scale * SQRT_2 * e)),
-        (law, p) => each_law!(law, d => each!([p], n, out, |[p]| narrowed(p, |p| quantile_of(d, p)))),
-    });
+many |k, [p], n, out| match (&k.0 .0, p) {
+    (Law::Normal(d), Arg::Many(p)) => composed(&p[..n], out, #[inline(always)] |p| 2.0 * p, Erfcinv,
+        #[inline(always)] |_, e| d.mean - d.sd * SQRT_2 * e),
+    (Law::LogNormal(d), Arg::Many(p)) => composed(&p[..n], out, #[inline(always)] |p| 2.0 * p, Erfcinv,
+        #[inline(always)] |_, e| exp(d.location - d.scale * SQRT_2 * e)),
+    (law, p) => each_law!(law, d => each!([p], n, out, |[p]| narrowed(p, |p| quantile_of(d, p)))),
+});
 
-/// `finish(x, g(inner(x)))` for each item of `x`, written into `out`, with `g` from its f64 slice form. Gives whether `g` succeeded on
-/// every item.
+/// `finish(x, g(inner(x)))` for each item of `x`, written into `out`, with `g` from its f64 slice form. Gives whether `g` succeeded on every item.
 fn composed<F: Float, G: Unary<f64, Out = f64>>(
-    x: &[F], out: &mut [std::mem::MaybeUninit<F>], inner: impl Fn(f64) -> f64, g: G, finish: impl Fn(f64, f64) -> f64,
-) -> bool {
+    x: &[F], out: &mut [std::mem::MaybeUninit<F>], inner: impl Fn(f64) -> f64, g: G, finish: impl Fn(f64, f64) -> f64) -> bool {
     let (mut args, mut values) = (Vec::with_capacity(x.len()), Vec::with_capacity(x.len()));
     args.extend(x.iter().map(|&v| inner(v.wide())));
     let ok = g.many(Arg::Many(&args), args.len(), &mut values);
@@ -148,9 +123,7 @@ impl Distribution {
 
 /// `Ok` when every parameter is finite and `ok` holds, or else `Invalid(message)`.
 fn checked(parameters: &[f64], ok: bool, message: &'static str) -> Result<(), Invalid> {
-    if !parameters.iter().all(|p| p.is_finite()) { Err(Invalid("distribution parameters must be finite")) }
-    else if ok { Ok(()) }
-    else { Err(Invalid(message)) }
+    if !parameters.iter().all(|p| p.is_finite()) { Err(Invalid("distribution parameters must be finite")) } else if ok { Ok(()) } else { Err(Invalid(message)) }
 }
 
 impl Distribution {
@@ -260,8 +233,7 @@ fn standard_normal<R: Rng + ?Sized>(rng: &mut R) -> f64 {
     (-2.0 * ln(u)).sqrt() * cos(TAU * v)
 }
 
-/// A value drawn from the gamma distribution with this shape and scale 1, by Marsaglia and Tsang's method. A shape below 1 draws
-/// with shape + 1 and scales by u^(1/shape).
+/// A value drawn from the gamma distribution with this shape and scale 1, by Marsaglia and Tsang's method. A shape below 1 draws with shape + 1 and scales by u^(1/shape).
 fn standard_gamma<R: Rng + ?Sized>(shape: f64, rng: &mut R) -> f64 {
     if shape < 1.0 { return standard_gamma(shape + 1.0, rng) * exp(ln(open(rng)) / shape); }
     let d = shape - 1.0 / 3.0;
@@ -277,16 +249,10 @@ fn standard_gamma<R: Rng + ?Sized>(shape: f64, rng: &mut R) -> f64 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Normal {
-    mean: f64,
-    sd: f64,
-}
+struct Normal { mean: f64, sd: f64 }
 
 impl Formulas for Normal {
-    fn pdf(&self, x: f64) -> f64 {
-        let z = (x - self.mean) / self.sd;
-        exp(-0.5 * z * z) / (self.sd * SQRT_TAU)
-    }
+    fn pdf(&self, x: f64) -> f64 { let z = (x - self.mean) / self.sd; exp(-0.5 * z * z) / (self.sd * SQRT_TAU) }
     fn cdf(&self, x: f64) -> f64 { 0.5 * erfc((self.mean - x) / self.sd * FRAC_1_SQRT_2) }
     fn quantile(&self, p: f64) -> f64 { self.mean - self.sd * SQRT_2 * erfcinv(2.0 * p) }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { self.mean + self.sd * standard_normal(rng) }
@@ -302,32 +268,20 @@ impl Formulas for Normal {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Uniform {
-    min: f64,
-    max: f64,
-}
+struct Uniform { min: f64, max: f64 }
 
 impl Formulas for Uniform {
     fn pdf(&self, x: f64) -> f64 { if (self.min..=self.max).contains(&x) { 1.0 / (self.max - self.min) } else { 0.0 } }
     fn cdf(&self, x: f64) -> f64 { ((x - self.min) / (self.max - self.min)).clamp(0.0, 1.0) }
     fn quantile(&self, p: f64) -> f64 { self.min + p * (self.max - self.min) }
-    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 {
-        let u: f64 = StandardUniform.sample(rng);
-        self.min + u * (self.max - self.min)
-    }
+    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { let u: f64 = StandardUniform.sample(rng); self.min + u * (self.max - self.min) }
 }
 
 /// The beta distribution, with ln B(a, b) computed once.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Beta {
-    a: f64,
-    b: f64,
-    ln_beta: f64,
-}
+struct Beta { a: f64, b: f64, ln_beta: f64 }
 
-impl Beta {
-    fn new(a: f64, b: f64) -> Self { Self { a, b, ln_beta: lgamma(a) + lgamma(b) - lgamma(a + b) } }
-}
+impl Beta { fn new(a: f64, b: f64) -> Self { Self { a, b, ln_beta: lgamma(a) + lgamma(b) - lgamma(a + b) } } }
 
 impl Formulas for Beta {
     fn pdf(&self, x: f64) -> f64 {
@@ -336,23 +290,14 @@ impl Formulas for Beta {
     }
     fn cdf(&self, x: f64) -> f64 { betainc(self.a, self.b, x.clamp(0.0, 1.0)) }
     fn quantile(&self, p: f64) -> f64 { betaincinv(self.a, self.b, p) }
-    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 {
-        let x = standard_gamma(self.a, rng);
-        x / (x + standard_gamma(self.b, rng))
-    }
+    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { let x = standard_gamma(self.a, rng); x / (x + standard_gamma(self.b, rng)) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Cauchy {
-    location: f64,
-    scale: f64,
-}
+struct Cauchy { location: f64, scale: f64 }
 
 impl Formulas for Cauchy {
-    fn pdf(&self, x: f64) -> f64 {
-        let z = (x - self.location) / self.scale;
-        1.0 / (PI * self.scale * (1.0 + z * z))
-    }
+    fn pdf(&self, x: f64) -> f64 { let z = (x - self.location) / self.scale; 1.0 / (PI * self.scale * (1.0 + z * z)) }
     fn cdf(&self, x: f64) -> f64 { 0.5 + atan((x - self.location) / self.scale) / PI }
     fn quantile(&self, p: f64) -> f64 {
         if p == 0.0 { f64::NEG_INFINITY } else if p == 1.0 { f64::INFINITY } else { self.location + self.scale * tan(PI * (p - 0.5)) }
@@ -361,9 +306,7 @@ impl Formulas for Cauchy {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Exponential {
-    rate: f64,
-}
+struct Exponential { rate: f64 }
 
 impl Formulas for Exponential {
     fn pdf(&self, x: f64) -> f64 { if x < 0.0 { 0.0 } else { self.rate * exp(-self.rate * x) } }
@@ -374,15 +317,9 @@ impl Formulas for Exponential {
 
 /// The F distribution, through the beta distribution of y = df1 x / (df1 x + df2).
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Fisher {
-    df1: f64,
-    df2: f64,
-    beta: Beta,
-}
+struct Fisher { df1: f64, df2: f64, beta: Beta }
 
-impl Fisher {
-    fn y(&self, x: f64) -> f64 { self.df1 * x / (self.df1 * x + self.df2) }
-}
+impl Fisher { fn y(&self, x: f64) -> f64 { self.df1 * x / (self.df1 * x + self.df2) } }
 
 impl Formulas for Fisher {
     fn pdf(&self, x: f64) -> f64 {
@@ -391,10 +328,7 @@ impl Formulas for Fisher {
         self.beta.pdf(self.y(x)) * self.df1 * self.df2 / (d * d)
     }
     fn cdf(&self, x: f64) -> f64 { if x <= 0.0 { 0.0 } else if x.is_infinite() { 1.0 } else { self.beta.cdf(self.y(x)) } }
-    fn quantile(&self, p: f64) -> f64 {
-        let y = self.beta.quantile(p);
-        self.df2 * y / (self.df1 * (1.0 - y))
-    }
+    fn quantile(&self, p: f64) -> f64 { let y = self.beta.quantile(p); self.df2 * y / (self.df1 * (1.0 - y)) }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 {
         let x = standard_gamma(self.df1 / 2.0, rng) / self.df1;
         x / (standard_gamma(self.df2 / 2.0, rng) / self.df2)
@@ -403,15 +337,9 @@ impl Formulas for Fisher {
 
 /// The gamma distribution, with ln Γ(shape) computed once.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Gamma {
-    shape: f64,
-    scale: f64,
-    ln_gamma: f64,
-}
+struct Gamma { shape: f64, scale: f64, ln_gamma: f64 }
 
-impl Gamma {
-    fn new(shape: f64, scale: f64) -> Self { Self { shape, scale, ln_gamma: lgamma(shape) } }
-}
+impl Gamma { fn new(shape: f64, scale: f64) -> Self { Self { shape, scale, ln_gamma: lgamma(shape) } } }
 
 impl Formulas for Gamma {
     fn pdf(&self, x: f64) -> f64 {
@@ -425,11 +353,7 @@ impl Formulas for Gamma {
 
 /// The inverse gamma distribution: 1/x has a gamma distribution with scale 1/scale.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct InverseGamma {
-    shape: f64,
-    scale: f64,
-    ln_gamma: f64,
-}
+struct InverseGamma { shape: f64, scale: f64, ln_gamma: f64 }
 
 impl Formulas for InverseGamma {
     fn pdf(&self, x: f64) -> f64 {
@@ -442,35 +366,21 @@ impl Formulas for InverseGamma {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Laplace {
-    location: f64,
-    scale: f64,
-}
+struct Laplace { location: f64, scale: f64 }
 
 impl Formulas for Laplace {
     fn pdf(&self, x: f64) -> f64 { exp(-(x - self.location).abs() / self.scale) / (2.0 * self.scale) }
-    fn cdf(&self, x: f64) -> f64 {
-        let z = (x - self.location) / self.scale;
-        if z < 0.0 { 0.5 * exp(z) } else { 1.0 - 0.5 * exp(-z) }
-    }
-    fn quantile(&self, p: f64) -> f64 {
-        if p < 0.5 { self.location + self.scale * ln(2.0 * p) } else { self.location - self.scale * ln(2.0 * (1.0 - p)) }
-    }
+    fn cdf(&self, x: f64) -> f64 { let z = (x - self.location) / self.scale; if z < 0.0 { 0.5 * exp(z) } else { 1.0 - 0.5 * exp(-z) } }
+    fn quantile(&self, p: f64) -> f64 { if p < 0.5 { self.location + self.scale * ln(2.0 * p) } else { self.location - self.scale * ln(2.0 * (1.0 - p)) } }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { self.quantile(open(rng)) }
 }
 
 /// The logistic distribution. Its formulas use e^-|z|, which can't overflow, so its tails stay exact.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Logistic {
-    location: f64,
-    scale: f64,
-}
+struct Logistic { location: f64, scale: f64 }
 
 impl Formulas for Logistic {
-    fn pdf(&self, x: f64) -> f64 {
-        let e = exp(-((x - self.location) / self.scale).abs());
-        e / ((1.0 + e) * (1.0 + e)) / self.scale
-    }
+    fn pdf(&self, x: f64) -> f64 { let e = exp(-((x - self.location) / self.scale).abs()); e / ((1.0 + e) * (1.0 + e)) / self.scale }
     fn cdf(&self, x: f64) -> f64 {
         let z = (x - self.location) / self.scale;
         let e = exp(-z.abs());
@@ -481,10 +391,7 @@ impl Formulas for Logistic {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct LogNormal {
-    location: f64,
-    scale: f64,
-}
+struct LogNormal { location: f64, scale: f64 }
 
 impl Formulas for LogNormal {
     fn pdf(&self, x: f64) -> f64 {
@@ -497,13 +404,9 @@ impl Formulas for LogNormal {
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { exp(self.location + self.scale * standard_normal(rng)) }
 }
 
-/// Student's t distribution, with its density's constant factor computed once. Its cdf comes from the incomplete beta function: of
-/// y = t²/(df + t²) near the centre, and of 1 - y = df/(df + t²) in the tails, whichever keeps its digits.
+/// Student's t distribution, with its density's constant factor computed once. Its cdf comes from the incomplete beta function: of y = t²/(df + t²) near the centre, and of 1 - y = df/(df + t²) in the tails, whichever keeps its digits.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct StudentT {
-    df: f64,
-    factor: f64,
-}
+struct StudentT { df: f64, factor: f64 }
 
 impl Formulas for StudentT {
     fn pdf(&self, t: f64) -> f64 { self.factor * exp(-(self.df + 1.0) / 2.0 * log1p(t * t / self.df)) }
@@ -518,23 +421,14 @@ impl Formulas for StudentT {
         let h = self.df / 2.0;
         // The probability outside -|t| to |t|, and inside it, where 1 - 2q is exact.
         let q = 2.0 * p.min(1.0 - p);
-        let t = if q > 0.5 {
-            let y = betaincinv(0.5, h, 1.0 - q);
-            (self.df * y / (1.0 - y)).sqrt()
-        } else {
-            let x = betaincinv(h, 0.5, q);
-            (self.df * (1.0 - x) / x).sqrt()
-        };
+        let t = if q > 0.5 { let y = betaincinv(0.5, h, 1.0 - q); (self.df * y / (1.0 - y)).sqrt() } else { let x = betaincinv(h, 0.5, q); (self.df * (1.0 - x) / x).sqrt() };
         if p < 0.5 { -t } else { t }
     }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { standard_normal(rng) / (standard_gamma(self.df / 2.0, rng) * 2.0 / self.df).sqrt() }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Weibull {
-    shape: f64,
-    scale: f64,
-}
+struct Weibull { shape: f64, scale: f64 }
 
 impl Formulas for Weibull {
     fn pdf(&self, x: f64) -> f64 {
@@ -550,8 +444,7 @@ impl Formulas for Weibull {
 /// Whether x is a whole number from 0 to `max`.
 fn whole(x: f64, max: f64) -> bool { (0.0..=max).contains(&x) && x.fract() == 0.0 }
 
-/// The least whole k from 0 to `max` whose `cdf` reaches `target`, searched outward from `guess` and then by halving. A cdf within
-/// 1e-14 below `target` reaches it, so a probability that the cdf of a whole k gives only after rounding maps back to that k.
+/// The least whole k from 0 to `max` whose `cdf` reaches `target`, searched outward from `guess` and then by halving. A cdf within 1e-14 below `target` reaches it, so a probability that the cdf of a whole k gives only after rounding maps back to that k.
 fn least(target: f64, guess: f64, max: f64, cdf: impl Fn(f64) -> f64) -> f64 {
     let reached = |k: f64| cdf(k) >= target * (1.0 - 1e-14);
     let start = if guess.is_nan() { 0.0 } else { guess.floor().clamp(0.0, max) };
@@ -565,7 +458,8 @@ fn least(target: f64, guess: f64, max: f64, cdf: impl Fn(f64) -> f64) -> f64 {
             above = below;
             step *= 2.0;
         }
-    } else {
+    }
+    else {
         loop {
             if below >= max { return max; }
             above = (below + step).min(max);
@@ -574,10 +468,7 @@ fn least(target: f64, guess: f64, max: f64, cdf: impl Fn(f64) -> f64) -> f64 {
             step *= 2.0;
         }
     }
-    while above - below > 1.0 {
-        let middle = ((below + above) / 2.0).floor();
-        if reached(middle) { above = middle } else { below = middle }
-    }
+    while above - below > 1.0 { let middle = ((below + above) / 2.0).floor(); if reached(middle) { above = middle } else { below = middle } }
     above
 }
 
@@ -585,10 +476,7 @@ fn least(target: f64, guess: f64, max: f64, cdf: impl Fn(f64) -> f64) -> f64 {
 fn normal_guess(mean: f64, sd: f64, p: f64) -> f64 { mean - sd * SQRT_2 * erfcinv(2.0 * p) }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Binomial {
-    n: f64,
-    p: f64,
-}
+struct Binomial { n: f64, p: f64 }
 
 impl Formulas for Binomial {
     fn pdf(&self, x: f64) -> f64 {
@@ -608,8 +496,7 @@ impl Formulas for Binomial {
         let (n, p) = (self.n, self.p);
         if p == 0.0 { 0.0 } else if p == 1.0 { n } else { least(q, normal_guess(n * p, (n * p * (1.0 - p)).sqrt(), q), n, |k| self.cdf(k)) }
     }
-    /// Inversion when the smaller of np and n(1-p) is below 10, and Hörmann's BTRD method otherwise. Both draw with p up to 1/2 and
-    /// reflect.
+    /// Inversion when the smaller of np and n(1-p) is below 10, and Hörmann's BTRD method otherwise. Both draw with p up to 1/2 and reflect.
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 {
         let flip = self.p > 0.5;
         let p = if flip { 1.0 - self.p } else { self.p };
@@ -618,8 +505,7 @@ impl Formulas for Binomial {
     }
 }
 
-/// A binomial draw by inversion: the cdf's terms in turn, until they pass a uniform draw. Past np + 10 √(np(1-p) + 1), which a draw
-/// almost never reaches, it starts again.
+/// A binomial draw by inversion: the cdf's terms in turn, until they pass a uniform draw. Past np + 10 √(np(1-p) + 1), which a draw almost never reaches, it starts again.
 fn binomial_inversion<R: Rng + ?Sized>(n: f64, p: f64, rng: &mut R) -> f64 {
     let q = 1.0 - p;
     let first = exp(n * log1p(-p));
@@ -639,8 +525,8 @@ fn binomial_inversion<R: Rng + ?Sized>(n: f64, p: f64, rng: &mut R) -> f64 {
 /// The correction ln k! - ((k + 1/2) ln(k + 1) - (k + 1) + ln √(2π)) to Stirling's formula, from a table below 10 and its series above.
 fn stirling(k: f64) -> f64 {
     const TABLE: [f64; 10] = [
-        0.08106146679532726, 0.0413406959554093, 0.02767792568499834, 0.020790672103765093, 0.016644691189821193, 0.013876128823070748,
-        0.01189670994589177, 0.010411265261972096, 0.009255462182712733, 0.00833056343336287,
+        0.08106146679532726, 0.0413406959554093, 0.02767792568499834, 0.020790672103765093, 0.016644691189821193, 0.013876128823070748, 0.01189670994589177,
+        0.010411265261972096, 0.009255462182712733, 0.00833056343336287,
     ];
     if k < 10.0 { return TABLE[k as usize]; }
     let r = 1.0 / (k + 1.0);
@@ -666,10 +552,7 @@ fn btrd<R: Rng + ?Sized>(n: f64, p: f64, rng: &mut R) -> f64 {
             let u = v / vr - 0.43;
             return ((2.0 * a / (0.5 - u.abs()) + b) * u + c).floor();
         }
-        let u = if v >= vr {
-            let u: f64 = StandardUniform.sample(rng);
-            u - 0.5
-        } else {
+        let u = if v >= vr { let u: f64 = StandardUniform.sample(rng); u - 0.5 } else {
             let w = v / vr - 0.93;
             let w2: f64 = StandardUniform.sample(rng);
             v = w2 * vr;
@@ -684,10 +567,7 @@ fn btrd<R: Rng + ?Sized>(n: f64, p: f64, rng: &mut R) -> f64 {
             // f(k)/f(m) by the ratio of successive terms.
             let mut f = 1.0;
             let mut i = m.min(k);
-            while i < m.max(k) {
-                i += 1.0;
-                if m < k { f *= nr / i - r } else { v *= nr / i - r }
-            }
+            while i < m.max(k) { i += 1.0; if m < k { f *= nr / i - r } else { v *= nr / i - r } }
             if v <= f { return k; }
             continue;
         }
@@ -704,15 +584,10 @@ fn btrd<R: Rng + ?Sized>(n: f64, p: f64, rng: &mut R) -> f64 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Poisson {
-    rate: f64,
-}
+struct Poisson { rate: f64 }
 
 impl Formulas for Poisson {
-    fn pdf(&self, x: f64) -> f64 {
-        if !whole(x, f64::INFINITY) { return 0.0; }
-        exp(times(x, ln(self.rate)) - self.rate - lgamma(x + 1.0))
-    }
+    fn pdf(&self, x: f64) -> f64 { if !whole(x, f64::INFINITY) { return 0.0; } exp(times(x, ln(self.rate)) - self.rate - lgamma(x + 1.0)) }
     fn cdf(&self, x: f64) -> f64 {
         if x < 0.0 { 0.0 } else if self.rate == 0.0 || x.is_infinite() { 1.0 } else { gammaincc(x.floor() + 1.0, self.rate) }
     }

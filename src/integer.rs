@@ -1,35 +1,22 @@
-//! Functions of `i64`s: greatest common divisor, least common multiple, binomial coefficients, powers, square roots and residues.
-//! Each gives `None` where its result isn't an `i64`. Their function objects are the ones that floats and complex numbers use:
-//! [`Gcd`], [`Lcm`] and [`Residue`] from [`tolerant`](crate::tolerant), whose integer forms ignore the tolerance they hold, and
-//! [`Binom`] and [`Pow`]. A slice form appends results to a vector and reports whether every item fitted. [`Divisor`] divides many
-//! integers by one, with multiplications in place of division instructions. `Residue`'s slice form uses one where every item has
-//! the same divisor. For types of 16 bits or fewer it multiplies 32-bit integers instead, which vectorizes.
+//! Functions of `i64`s: greatest common divisor, least common multiple, binomial coefficients, powers, square roots and residues. Each gives `None` where its result isn't an `i64`. Their function objects are the ones that floats and complex numbers use: [`Gcd`], [`Lcm`] and [`Residue`] from [`tolerant`](crate::tolerant), whose integer forms ignore the tolerance they hold, and [`Binom`] and [`Pow`]. A slice form appends results to a vector and reports whether every item fitted. [`Divisor`] divides many integers by one, with multiplications in place of division instructions. `Residue`'s slice form uses one where every item has the same divisor. For types of 16 bits or fewer it multiplies 32-bit integers instead, which vectorizes.
 //!
-//! `Gcd`, `Lcm`, `Pow` and `Residue` also take every narrower integer type, which they compute through these functions. Their `u64`
-//! forms have functions of their own, because a `u64` can exceed `i64::MAX`. A result that doesn't fit its type fails. The tolerant
-//! comparisons, [`Floor`] and [`Ceil`] take every integer type exactly, ignoring the tolerance. [`Abs`] and [`Sign`] take every
-//! integer type through [`Overflowing`](crate::Overflowing): `Abs` of a signed type's least value wraps to itself, as NumPy's does.
-//! `Floor`, `Ceil` and `Abs` keep Booleans as they are.
-use crate::{
-    tolerant::{Ceil, Equal, Floor, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue},
-    Abs, Arg, Binom, Pow,
-};
+//! `Gcd`, `Lcm`, `Pow` and `Residue` also take every narrower integer type, which they compute through these functions. Their `u64` forms have functions of their own, because a `u64` can exceed `i64::MAX`. A result that doesn't fit its type fails. The tolerant comparisons, [`Floor`] and [`Ceil`] take every integer type exactly, ignoring the tolerance. [`Abs`] and [`Sign`] take every integer type through [`Overflowing`](crate::Overflowing): `Abs` of a signed type's least value wraps to itself, as NumPy's does. `Floor`, `Ceil` and `Abs` keep Booleans as they are.
+use crate::{Abs, Arg, Binom, Pow, tolerant::{Ceil, Equal, Floor, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue}};
 use strength_reduce::StrengthReducedU64;
 
-/// The greatest common divisor of x and y, which is never negative. `gcd(0, 0)` is 0. `None` only where it is 2^63, as for
-/// `gcd(i64::MIN, 0)`.
+/// The greatest common divisor of x and y, which is never negative. `gcd(0, 0)` is 0. `None` only where it is 2^63, as for `gcd(i64::MIN, 0)`.
 pub fn gcd(x: i64, y: i64) -> Option<i64> { i64::try_from(unsigned_gcd(x.unsigned_abs(), y.unsigned_abs())).ok() }
 
 /// The greatest common divisor of a and b by Stein's algorithm, with shifts and subtractions and no division. It is 0 for 0 and 0.
 fn unsigned_gcd(mut a: u64, mut b: u64) -> u64 {
-    if a == 0 || b == 0 { return a | b }
+    if a == 0 || b == 0 { return a | b; }
     let shift = (a | b).trailing_zeros();
     a >>= a.trailing_zeros();
     loop {
         b >>= b.trailing_zeros();
         if a > b { std::mem::swap(&mut a, &mut b) }
         b -= a;
-        if b == 0 { return a << shift }
+        if b == 0 { return a << shift; }
     }
 }
 
@@ -37,30 +24,23 @@ fn unsigned_gcd(mut a: u64, mut b: u64) -> u64 {
 fn unsigned_lcm(x: u64, y: u64) -> Option<u64> { if x == 0 || y == 0 { Some(0) } else { (x / unsigned_gcd(x, y)).checked_mul(y) } }
 
 /// The least common multiple of x and y, with the sign of x × y. It is 0 where either is 0.
-pub fn lcm(x: i64, y: i64) -> Option<i64> {
-    if x == 0 || y == 0 { return Some(0) }
-    (x / gcd(x, y)?).checked_mul(y)
-}
+pub fn lcm(x: i64, y: i64) -> Option<i64> { if x == 0 || y == 0 { return Some(0); } (x / gcd(x, y)?).checked_mul(y) }
 
-/// The binomial coefficient C(n, k), the number of ways to choose k things from n, for k from 0. A negative n gives
-/// (-1)^k C(k - n - 1, k), the coefficient of t^k in (1 + t)^n. `None` for a negative k.
+/// The binomial coefficient C(n, k), the number of ways to choose k things from n, for k from 0. A negative n gives (-1)^k C(k - n - 1, k), the coefficient of t^k in (1 + t)^n. `None` for a negative k.
 pub fn binom(n: i64, k: i64) -> Option<i64> {
-    if k < 0 { return None }
+    if k < 0 { return None; }
     let k = k as u64;
     // For a negative n, C(k - n - 1, k) is C(k + m, k) with m = -n - 1, which is never negative. k + m fits a u64.
     let (top, negative) = if n >= 0 { (n as u64, false) } else { (k + (n.unsigned_abs() - 1), k % 2 == 1) };
-    if top < k { return Some(0) }
+    if top < k { return Some(0); }
     let c = choose(top, k.min(top - k), 1 << 63)? as i128;
     i64::try_from(if negative { -c } else { c }).ok()
 }
 
 /// The unsigned binomial coefficient, with the full range of `u64` results.
-fn unsigned_binom(n: u64, k: u64) -> Option<u64> {
-    if k > n { Some(0) } else { choose(n, k.min(n - k), u64::MAX) }
-}
+fn unsigned_binom(n: u64, k: u64) -> Option<u64> { if k > n { Some(0) } else { choose(n, k.min(n - k), u64::MAX) } }
 
-/// C(n, k) for 0 ≤ k ≤ n, through C(n, i + 1) = C(n, i) (n - i) / (i + 1), whose division is exact. Each step's product fits a
-/// `u128`. A coefficient beyond the caller's largest representable magnitude stops the steps.
+/// C(n, k) for 0 ≤ k ≤ n, through C(n, i + 1) = C(n, i) (n - i) / (i + 1), whose division is exact. Each step's product fits a `u128`. A coefficient beyond the caller's largest representable magnitude stops the steps.
 fn choose(n: u64, k: u64, limit: u64) -> Option<u64> {
     (0..k).try_fold(1u64, |c, i| {
         let c = c as u128 * (n - i) as u128 / (i + 1) as u128;
@@ -71,22 +51,12 @@ fn choose(n: u64, k: u64, limit: u64) -> Option<u64> {
 /// x^y. 0^0 is 1. `None` for a negative y beside an x other than 1 or -1, where the power isn't a whole number.
 pub fn power(x: i64, y: i64) -> Option<i64> {
     match x {
-        1 => Some(1),
-        -1 => Some(if y % 2 == 0 { 1 } else { -1 }),
-        _ if y < 0 => None,
-        0 => Some(i64::from(y == 0)),
-        _ => x.checked_pow(u32::try_from(y).ok()?),
+        1 => Some(1), -1 => Some(if y % 2 == 0 { 1 } else { -1 }), _ if y < 0 => None, 0 => Some(i64::from(y == 0)), _ => x.checked_pow(u32::try_from(y).ok()?)
     }
 }
 
 /// x^y, where 0^0 is 1. `None` where it is beyond `u64`.
-fn unsigned_power(x: u64, y: u64) -> Option<u64> {
-    match x {
-        0 => Some(u64::from(y == 0)),
-        1 => Some(1),
-        _ => x.checked_pow(u32::try_from(y).ok()?),
-    }
-}
+fn unsigned_power(x: u64, y: u64) -> Option<u64> { match x { 0 => Some(u64::from(y == 0)), 1 => Some(1), _ => x.checked_pow(u32::try_from(y).ok()?) } }
 
 /// The residue of y modulo x, y - x⌊y/x⌋, which takes the sign of x. A zero x gives y. Every residue fits an `i64`.
 pub fn residue(x: i64, y: i64) -> i64 { if x == 0 { y } else { floored(y.wrapping_rem(x), x) } }
@@ -95,13 +65,9 @@ pub fn residue(x: i64, y: i64) -> i64 { if x == 0 { y } else { floored(y.wrappin
 #[inline]
 fn floored<T: num_traits::PrimInt + num_traits::Signed>(r: T, x: T) -> T { if !r.is_zero() && r.is_negative() != x.is_negative() { r + x } else { r } }
 
-/// A fixed nonzero divisor for dividing many integers. Each division multiplies and shifts, where a division instruction would take
-/// several times as long. Setting one up costs more than one division.
+/// A fixed nonzero divisor for dividing many integers. Each division multiplies and shifts, where a division instruction would take several times as long. Setting one up costs more than one division.
 #[derive(Clone, Copy, Debug)]
-pub struct Divisor {
-    x: i64,
-    magnitude: StrengthReducedU64,
-}
+pub struct Divisor { x: i64, magnitude: StrengthReducedU64 }
 
 impl Divisor {
     /// The divisor x, or `None` for 0.
@@ -109,10 +75,7 @@ impl Divisor {
 
     /// The residue of y modulo x, as [`residue`] gives it.
     #[inline]
-    pub fn residue(self, y: i64) -> i64 {
-        let r = (y.unsigned_abs() % self.magnitude) as i64;
-        floored(if y < 0 { -r } else { r }, self.x)
-    }
+    pub fn residue(self, y: i64) -> i64 { let r = (y.unsigned_abs() % self.magnitude) as i64; floored(if y < 0 { -r } else { r }, self.x) }
 
     /// The floored quotient ⌊y/x⌋ and the residue of y modulo x. `None` where the quotient isn't an `i64`: `i64::MIN` divided by -1.
     #[inline]
@@ -125,15 +88,9 @@ impl Divisor {
     }
 }
 
-/// A fixed divisor whose magnitude is from 2 to 2¹⁶ - 1, for dividends whose magnitude is below 2¹⁶. Each division multiplies two
-/// 32-bit integers to 64 bits and shifts, which vectorizes, where [`Divisor`]'s 64-bit high product doesn't. With m = ⌈2³²/d⌉,
-/// ⌊a·m/2³²⌋ is ⌊a/d⌋ for each such dividend a: a·m/2³² exceeds a/d by less than 2⁻¹⁶, and the fraction of a/d is at most 1 - 1/d.
+/// A fixed divisor whose magnitude is from 2 to 2¹⁶ - 1, for dividends whose magnitude is below 2¹⁶. Each division multiplies two 32-bit integers to 64 bits and shifts, which vectorizes, where [`Divisor`]'s 64-bit high product doesn't. With m = ⌈2³²/d⌉, ⌊a·m/2³²⌋ is ⌊a/d⌋ for each such dividend a: a·m/2³² exceeds a/d by less than 2⁻¹⁶, and the fraction of a/d is at most 1 - 1/d.
 #[derive(Clone, Copy)]
-struct Short {
-    x: i32,
-    magnitude: u32,
-    multiplier: u32,
-}
+struct Short { x: i32, magnitude: u32, multiplier: u32 }
 
 impl Short {
     /// The divisor `x`, or `None` where its magnitude is outside 2 to 2¹⁶ - 1.
@@ -151,22 +108,18 @@ impl Short {
     }
 }
 
-/// The digits of each of `values` in the mixed radix of `bases`, as APL's `⊤` gives them: each value's digits together, the most
-/// significant first. A base of 0 takes all of what remains as its digit. `None` where a quotient isn't an `i64`.
+/// The digits of each of `values` in the mixed radix of `bases`, as APL's `⊤` gives them: each value's digits together, the most significant first. A base of 0 takes all of what remains as its digit. `None` where a quotient isn't an `i64`.
 pub fn encode(bases: &[i64], values: &[i64]) -> Option<Vec<i64>> {
     let divisors: Vec<_> = bases.iter().map(|&b| Divisor::new(b)).collect();
     let mut digits = vec![0; bases.len() * values.len()];
     for (out, &value) in digits.chunks_mut(bases.len().max(1)).zip(values) {
         let mut value = value;
-        for (digit, divisor) in out.iter_mut().zip(&divisors).rev() {
-            (value, *digit) = match divisor { Some(d) => d.div_mod(value)?, None => (0, value) };
-        }
+        for (digit, divisor) in out.iter_mut().zip(&divisors).rev() { (value, *digit) = match divisor { Some(d) => d.div_mod(value)?, None => (0, value) }; }
     }
     Some(digits)
 }
 
-/// The value of each cell of `bases.len()` digits in `digits`, in the mixed radix of `bases`, as APL's `⊥` gives it. The first base
-/// is never used. `None` where a step isn't an `i64`.
+/// The value of each cell of `bases.len()` digits in `digits`, in the mixed radix of `bases`, as APL's `⊥` gives it. The first base is never used. `None` where a step isn't an `i64`.
 pub fn decode(bases: &[i64], digits: &[i64]) -> Option<Vec<i64>> {
     digits.chunks(bases.len()).map(|d| (1..d.len()).try_fold(d[0], |v, k| v.checked_mul(bases[k])?.checked_add(d[k]))).collect()
 }
@@ -189,8 +142,7 @@ forms!(Binom at u64: |_, [n, k]| unsigned_binom(n, k));
 forms!(Pow at u64: |_, [x, y]| unsigned_power(x, y));
 forms!(Residue at u64: |_, [x, y]| if x == 0 { y } else { y % x });
 
-/// The narrower types' forms of `Gcd`, `Lcm`, `Binom`, `Pow` and `Residue`, which compute at `i64`. A result that doesn't fit the type fails,
-/// as one beyond `i64` does. Every residue fits.
+/// The narrower types' forms of `Gcd`, `Lcm`, `Binom`, `Pow` and `Residue`, which compute at `i64`. A result that doesn't fit the type fails, as one beyond `i64` does. Every residue fits.
 macro_rules! narrower {
     ($($t:ty),+) => {$(
         forms!(Gcd at $t: |_, [x, y]| gcd(x.into(), y.into()).and_then(|r| <$t>::try_from(r).ok()));

@@ -1,7 +1,8 @@
-//! rustymath's `polynomial` module under the names of `numpy.polynomial.polynomial`. The wrappers in `python/rustymath/polynomial.py`
-//! give each argument a contiguous float or complex array. Root finding computes in complex128.
+//! rustymath's `polynomial` module under the names of `numpy.polynomial.polynomial`. The wrappers in `python/rustymath/polynomial.py` give each argument a contiguous float or complex array. Root finding computes in complex128.
 use half::f16;
-use numpy::{Complex32, Complex64, PyArray1, PyArrayDescrMethods, PyReadonlyArray0, PyReadonlyArray1, PyReadwriteArrayDyn, PyUntypedArray, PyUntypedArrayMethods};
+use numpy::{
+    Complex32, Complex64, PyArray1, PyArrayDescrMethods, PyReadonlyArray0, PyReadonlyArray1, PyReadwriteArrayDyn, PyUntypedArray, PyUntypedArrayMethods,
+};
 use pyo3::prelude::*;
 use rustymath::polynomial;
 
@@ -19,16 +20,20 @@ macro_rules! numbers {
 /// Replaces each item of `x` with the value there of the polynomial `c`.
 #[pyfunction]
 pub fn polyval(x: &Bound<'_, PyUntypedArray>, c: &Bound<'_, PyUntypedArray>) -> PyResult<()> {
-    if x.dtype().kind() == b'c' { numbers!(x, T => {
-        let c = c.extract::<PyReadonlyArray1<T>>()?;
-        let c = c.as_slice()?;
-        let mut x = x.extract::<PyReadwriteArrayDyn<T>>()?;
-        for v in x.as_slice_mut()? { *v = polynomial::value(c, v); }
-        Ok(())
-    }) } else { floats!(x, F => {
-        polynomial::evaluate(c.extract::<PyReadonlyArray1<F>>()?.as_slice()?, x.extract::<PyReadwriteArrayDyn<F>>()?.as_slice_mut()?);
-        Ok(())
-    }) }
+    if x.dtype().kind() == b'c' {
+        numbers!(x, T => {
+            let c = c.extract::<PyReadonlyArray1<T>>()?;
+            let c = c.as_slice()?;
+            let mut x = x.extract::<PyReadwriteArrayDyn<T>>()?;
+            for v in x.as_slice_mut()? { *v = polynomial::value(c, v); }
+            Ok(())
+        })
+    } else {
+        floats!(x, F => {
+            polynomial::evaluate(c.extract::<PyReadonlyArray1<F>>()?.as_slice()?, x.extract::<PyReadwriteArrayDyn<F>>()?.as_slice_mut()?);
+            Ok(())
+        })
+    }
 }
 
 /// Replaces each item of `x` with `m` times the product of its differences from `roots`.
@@ -49,11 +54,7 @@ pub fn polyvalfromroots(x: &Bound<'_, PyUntypedArray>, roots: &Bound<'_, PyUntyp
 pub fn polyroots<'py>(py: Python<'py>, c: PyReadonlyArray1<'py, Complex64>) -> PyResult<Bound<'py, PyArray1<Complex64>>> {
     let c = c.as_slice()?;
     let roots = match polynomial::roots(c) {
-        Some(roots) => roots,
-        None => {
-            crate::report_invalid(py, c"polyroots")?;
-            vec![Complex64::new(f64::NAN, f64::NAN); polynomial::trimmed(c).len() - 1]
-        }
+        Some(roots) => roots, None => { crate::report_invalid(py, c"polyroots")?; vec![Complex64::new(f64::NAN, f64::NAN); polynomial::trimmed(c).len() - 1] }
     };
     Ok(PyArray1::from_vec(py, roots))
 }
@@ -94,9 +95,9 @@ pub fn polyfit<'py>(x: &Bound<'py, PyUntypedArray>, y: &Bound<'py, PyUntypedArra
 
 /// Adds this module's functions to `m`.
 pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    for f in [wrap_pyfunction!(polyval, m)?, wrap_pyfunction!(polyvalfromroots, m)?, wrap_pyfunction!(polyroots, m)?, wrap_pyfunction!(polyfromroots, m)?,
-        wrap_pyfunction!(polyder, m)?, wrap_pyfunction!(polydecode, m)?, wrap_pyfunction!(polyfit, m)?] {
-        m.add_function(f)?;
-    }
+    for f in [
+        wrap_pyfunction!(polyval, m)?, wrap_pyfunction!(polyvalfromroots, m)?, wrap_pyfunction!(polyroots, m)?, wrap_pyfunction!(polyfromroots, m)?,
+        wrap_pyfunction!(polyder, m)?, wrap_pyfunction!(polydecode, m)?, wrap_pyfunction!(polyfit, m)?,
+    ] { m.add_function(f)?; }
     Ok(())
 }

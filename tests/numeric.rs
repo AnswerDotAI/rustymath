@@ -3,8 +3,7 @@ pub mod support;
 mod arith {
     use rustymath::Overflowing;
 
-    /// Each operation at type `$t`, on every pair of edge values, against the exact result in `i128`: the wrapped result, and whether
-    /// it fits.
+    /// Each operation at type `$t`, on every pair of edge values, against the exact result in `i128`: the wrapped result, and whether it fits.
     macro_rules! check {
         ($($t:ty),+) => {$({
             let edges: Vec<$t> = [<$t>::MIN, <$t>::MAX, 0, 1, 2, 3, 7].into_iter().chain([-1i128, -2, -3].map(|v| v as $t))
@@ -28,8 +27,8 @@ mod arith {
 }
 
 mod convert {
-    use rustymath::convert::*;
     use half::f16;
+    use rustymath::convert::*;
 
     /// Each conversion against `as` and exact arithmetic, at the edges of each type's range and of the wide limit.
     #[test]
@@ -43,7 +42,10 @@ mod convert {
         for i in [0, 1, -1, 255, 1 << 31, -(1 << 31) - 1, (1 << 53) + 1, (1 << 53) + 3, i64::MAX, i64::MIN, 0x7fff_ffff_ffff_fdff] {
             assert_eq!((float::<f64, i64>(i), float::<f32, i64>(i)), (i as f64, i as f64 as f32), "{i}");
         }
-        assert_eq!((float::<f64, u8>(255), float::<f32, u16>(65535), float::<f64, u32>(u32::MAX), float::<f16, i32>(-3)), (255.0, 65535.0, 4294967295.0, f16::from_f32(-3.0)));
+        assert_eq!(
+            (float::<f64, u8>(255), float::<f32, u16>(65535), float::<f64, u32>(u32::MAX), float::<f16, i32>(-3)),
+            (255.0, 65535.0, 4294967295.0, f16::from_f32(-3.0))
+        );
         let mut counts = Vec::new();
         count(&mut counts, 0, false, 21);
         count(&mut counts, 20, true, 21);
@@ -52,25 +54,21 @@ mod convert {
 }
 
 mod distribution {
+    use crate::support::seeded;
+    use rand::RngExt;
     use rustymath::distribution::*;
     use rustymath::{Arg, Unary};
-    use rand::RngExt;
-    use crate::support::seeded;
 
-    /// One of each distribution, with each sampling method's case: binomials that draw by inversion, by BTRD and reflected, and
-    /// Poisson distributions that draw by multiplying and by PTRS.
+    /// One of each distribution, with each sampling method's case: binomials that draw by inversion, by BTRD and reflected, and Poisson distributions that draw by multiplying and by PTRS.
     fn cases() -> Vec<Distribution> {
         let d = Distribution::binomial;
         [
             Distribution::normal(1.0, 2.0), Distribution::uniform(-1.0, 3.0), Distribution::beta(0.5, 2.0), Distribution::beta(3.0, 4.0),
             Distribution::cauchy(0.0, 1.0), Distribution::chi_squared(3.0), Distribution::exponential(2.0), Distribution::fisher(4.0, 7.0),
             Distribution::gamma(0.5, 2.0), Distribution::gamma(5.0, 1.0), Distribution::inverse_gamma(3.0, 2.0), Distribution::laplace(1.0, 2.0),
-            Distribution::logistic(0.0, 1.0), Distribution::log_normal(0.0, 0.5), Distribution::student_t(3.0), Distribution::weibull(1.5, 2.0),
-            d(10, 0.3), d(1000, 0.4), d(100, 0.9), Distribution::poisson(3.0), Distribution::poisson(50.0),
-        ]
-        .into_iter()
-        .map(Result::unwrap)
-        .collect()
+            Distribution::logistic(0.0, 1.0), Distribution::log_normal(0.0, 0.5), Distribution::student_t(3.0), Distribution::weibull(1.5, 2.0), d(10, 0.3),
+            d(1000, 0.4), d(100, 0.9), Distribution::poisson(3.0), Distribution::poisson(50.0),
+        ].into_iter().map(Result::unwrap).collect()
     }
 
     #[test]
@@ -78,11 +76,7 @@ mod distribution {
         for d in cases() {
             for p in [0.001, 0.1, 0.5, 0.9, 0.999] {
                 let x = d.quantile(p);
-                if d.is_discrete() {
-                    assert!(d.cdf(x) >= p * (1.0 - 1e-14) && d.cdf(x - 1.0) < p, "{d:?} at {p}: {x}");
-                } else {
-                    assert!((d.cdf(x) - p).abs() < 1e-12, "{d:?} at {p}: cdf({x}) is {}", d.cdf(x));
-                }
+                if d.is_discrete() { assert!(d.cdf(x) >= p * (1.0 - 1e-14) && d.cdf(x - 1.0) < p, "{d:?} at {p}: {x}"); } else { assert!((d.cdf(x) - p).abs() < 1e-12, "{d:?} at {p}: cdf({x}) is {}", d.cdf(x)); }
             }
             for p in [0.1, 0.5, 0.9] {
                 let x = d.quantile(p);
@@ -118,8 +112,7 @@ mod distribution {
         assert_eq!(one[0], 0.0);
     }
 
-    /// `f`'s slice form against `scalar` for each item of `xs`, at f64 and at f32. Gives whether the slice form reported every item
-    /// as succeeding.
+    /// `f`'s slice form against `scalar` for each item of `xs`, at f64 and at f32. Gives whether the slice form reported every item as succeeding.
     fn matches_scalar(f: impl Unary<f64, Out = f64> + Unary<f32, Out = f32>, scalar: impl Fn(f64) -> f64, xs: &[f64]) -> bool {
         let same = |a: f64, b: f64| a == b || (a.is_nan() && b.is_nan());
         let (mut out, mut out32) = (Vec::new(), Vec::new());
@@ -150,8 +143,8 @@ mod distribution {
 }
 
 mod exact {
-    use rustymath::exact::*;
     use num_rational::BigRational;
+    use rustymath::exact::*;
 
     fn q(n: i64, d: i64) -> BigRational { BigRational::new(n.into(), d.into()) }
 
@@ -161,19 +154,19 @@ mod exact {
         assert_eq!((gcd(&q(1, 2), &q(1, 3)), gcd(&q(-4, 1), &q(6, 1)), gcd(&q(0, 1), &q(0, 1))), (q(1, 6), q(2, 1), q(0, 1)));
         assert_eq!((lcm(&q(1, 2), &q(1, 3)), lcm(&q(-4, 1), &q(6, 1)), lcm(&q(0, 1), &q(5, 1))), (q(1, 1), q(-12, 1), q(0, 1)));
         // C(5, 2), C(5, 7), C(1/2, 2) = -1/8, C(-1, 2) = 1, C(-3, -5) = (-1)^2 C(4, 2) = 6, C(-3, -1) = 0 and C(1/2, -1) = 0.
-        let c: Vec<BigRational> = [(q(5, 1), 2), (q(5, 1), 7), (q(1, 2), 2), (q(-1, 1), 2), (q(-3, 1), -5), (q(-3, 1), -1), (q(1, 2), -1)]
-            .iter()
-            .map(|(n, k)| binom(n, *k))
-            .collect();
+        let c: Vec<BigRational> = [(q(5, 1), 2), (q(5, 1), 7), (q(1, 2), 2), (q(-1, 1), 2), (q(-3, 1), -5), (q(-3, 1), -1), (q(1, 2), -1)].iter()
+            .map(|(n, k)| binom(n, *k)).collect();
         assert_eq!(c, [q(10, 1), q(0, 1), q(-1, 8), q(1, 1), q(6, 1), q(0, 1), q(0, 1)]);
     }
 }
 
 mod integer {
-    use rustymath::integer::*;
     use crate::support::random;
-    use rustymath::{tolerant::{Ceil, Equal, Floor, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue}, Abs, Arg, Binary, Binom, Pow, Sign, Unary};
     use num_bigint::BigInt;
+    use rustymath::integer::*;
+    use rustymath::{
+        Abs, Arg, Binary, Binom, Pow, Sign, Unary, tolerant::{Ceil, Equal, Floor, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue}
+    };
 
     /// Integers that exercise overflow and sign: the extremes, small numbers, powers of two and random bits.
     fn samples() -> Vec<i64> {
@@ -224,8 +217,7 @@ mod integer {
             for k in 0..=75 {
                 let c = exact(n, k);
                 assert_eq!(binom(n, k), c, "binom({n}, {k})");
-                // The float binomial coefficient of whole arguments is exact while the result times |n| + k fits the type's whole
-                // numbers.
+                // The float binomial coefficient of whole arguments is exact while the result times |n| + k fits the type's whole numbers.
                 let fits = |bits: u32| c.is_some_and(|c| (c.unsigned_abs() as u128) * (n.unsigned_abs() + k as u64) as u128 >> bits == 0);
                 if fits(53) { assert_eq!(rustymath::binom(n as f64, k as f64), c.unwrap() as f64, "f64 binom({n}, {k})") }
                 if fits(24) { assert_eq!(rustymath::binom(n as f32, k as f32), c.unwrap() as f32, "f32 binom({n}, {k})") }
@@ -296,13 +288,14 @@ mod integer {
                 assert_eq!(Residue(t).one(x, y), if x == 0 { y } else { y % x }, "residue({x}, {y})");
                 assert_eq!((Equal(t).one(x, y), Less(t).one(x, y)), (x == y, x < y), "comparisons of {x} and {y}");
             }
-            for y in 0..70u64 {
-                assert_eq!(Binary::<u64>::checked(&Pow, x, y), BigInt::from(x).pow(y as u32).try_into().ok(), "power({x}, {y})");
-            }
+            for y in 0..70u64 { assert_eq!(Binary::<u64>::checked(&Pow, x, y), BigInt::from(x).pow(y as u32).try_into().ok(), "power({x}, {y})"); }
         }
         // Integers compare exactly, however close they are within the tolerance.
         let (n, m) = (1_000_000_000_000_000i64, 1_000_000_000_000_001i64);
-        assert_eq!([Equal(t).one(n, m), NotEqual(t).one(n, m), LessEqual(t).one(m, n), GreaterEqual(t).one(m, n), Greater(t).one(m, n)], [false, true, false, true, true]);
+        assert_eq!(
+            [Equal(t).one(n, m), NotEqual(t).one(n, m), LessEqual(t).one(m, n), GreaterEqual(t).one(m, n), Greater(t).one(m, n)],
+            [false, true, false, true, true]
+        );
         assert_eq!((Floor(t).one(m), Ceil(t).one(-m), Floor(t).one(true)), (m, -m, true));
         assert_eq!((Abs.one(i8::MIN), Abs.one(-5i16), Abs.one(7u8), Abs.one(false)), (i8::MIN, 5, 7, false));
         assert_eq!((Sign.one(-9i32), Sign.one(0i64), Sign.one(200u8)), (-1, 0, 1));
@@ -310,8 +303,8 @@ mod integer {
 }
 
 mod number_theory {
-    use rustymath::number_theory::*;
     use num_bigint::BigUint;
+    use rustymath::number_theory::*;
 
     const M61: u64 = (1 << 61) - 1;
     const M89: u128 = (1 << 89) - 1;
@@ -408,10 +401,11 @@ mod optimize {
     fn methods_find_minimums() {
         let (lower, upper) = ([-2.0, -2.0], [2.0, 2.0]);
         let boxed = Some(Bounds { lower: &lower, upper: &upper });
-        for (method, bounds) in [(Method::NelderMead, None), (Method::NelderMead, boxed), (Method::Powell, None), (Method::Powell, boxed), (Method::Evolution, boxed)] {
-            let found = minimize(&mut rosenbrock, &[-1.2, 1.0], &Options { method: Some(method), bounds, ..Default::default() }).unwrap();
-            assert!(found.converged && off(&found.x, &[1.0, 1.0]) < 1e-6, "{method:?} {bounds:?}: {found:?}");
-        }
+        for (method, bounds) in
+            [(Method::NelderMead, None), (Method::NelderMead, boxed), (Method::Powell, None), (Method::Powell, boxed), (Method::Evolution, boxed)] {
+                let found = minimize(&mut rosenbrock, &[-1.2, 1.0], &Options { method: Some(method), bounds, ..Default::default() }).unwrap();
+                assert!(found.converged && off(&found.x, &[1.0, 1.0]) < 1e-6, "{method:?} {bounds:?}: {found:?}");
+            }
         // With a gradient and no bounds, `minimize` runs L-BFGS.
         let found = minimize(&mut Differentiable { value: rosenbrock, derivative: rosenbrock_gradient }, &[-1.2, 1.0], &Options::default()).unwrap();
         assert!(found.converged && off(&found.x, &[1.0, 1.0]) < 1e-6, "L-BFGS: {found:?}");
@@ -454,13 +448,19 @@ mod optimize {
         let least_squares = [(Task::Linear { equations: 3, adjoint: true }, 3), (Task::Linear { equations: 5, adjoint: true }, 3)];
         let choices = solving.into_iter().chain(least_squares).map(|(task, n)| Method::choose(task, n, false)).collect::<Vec<_>>();
         assert_eq!(choices, [Brent, LevenbergMarquardt, Gmres, Minres, Minres]);
-        assert_eq!(Options::<f64> { method: Some(Cg), ..Default::default() }.check(Task::Minimize { gradient: false }, 2), Err("that method solves equations, and doesn't minimize"));
+        assert_eq!(
+            Options::<f64> { method: Some(Cg), ..Default::default() }.check(Task::Minimize { gradient: false }, 2),
+            Err("that method solves equations, and doesn't minimize")
+        );
         // A search that runs out of evaluations returns its best point so far, unconverged.
         let found = minimize(&mut rosenbrock, &[-1.2, 1.0], &Options { evaluations: Some(25), ..Default::default() }).unwrap();
         assert!(!found.converged && found.evaluations == 25 && found.value < rosenbrock(&[-1.2, 1.0]).unwrap(), "{found:?}");
         // An error from the objective ends the search.
         let mut calls = 0;
-        let mut failing = |x: &[f64]| { calls += 1; if calls > 10 { Err("stopped") } else { Ok(x[0] * x[0] + x[1] * x[1]) } };
+        let mut failing = |x: &[f64]| {
+            calls += 1;
+            if calls > 10 { Err("stopped") } else { Ok(x[0] * x[0] + x[1] * x[1]) }
+        };
         assert_eq!(minimize(&mut failing, &[3.0, 1.0], &Options::default()), Err("stopped"));
         // NaN counts as +∞, so the search stays where the objective is defined.
         let mut holed = |x: &[f64]| Ok::<_, Infallible>(if x[0] < 0.5 { f64::NAN } else { x[0] * x[0] + x[1] * x[1] });
@@ -469,7 +469,10 @@ mod optimize {
         // Reversed bounds, and a tolerance that isn't a positive number, are errors that a binding reports.
         let reversed = Options { bounds: Some(Bounds { lower: &[1.0], upper: &[0.0] }), ..Default::default() };
         assert_eq!(reversed.check(Task::Minimize { gradient: false }, 1), Err("each lower limit must be at most its upper limit"));
-        assert_eq!(Options { tolerance: Some(0.0), ..Default::default() }.check(Task::Minimize { gradient: false }, 1), Err("the tolerance must be a positive number"));
+        assert_eq!(
+            Options { tolerance: Some(0.0), ..Default::default() }.check(Task::Minimize { gradient: false }, 1),
+            Err("the tolerance must be a positive number")
+        );
     }
 
     /// The sum of squares, as an objective that records how many points each call evaluates.
@@ -477,10 +480,7 @@ mod optimize {
 
     impl Objective<f64> for Recorded {
         type Error = Infallible;
-        fn value(&mut self, x: &[f64]) -> Result<f64, Infallible> {
-            self.0.push(1);
-            Ok(x.iter().map(|v| v * v).sum())
-        }
+        fn value(&mut self, x: &[f64]) -> Result<f64, Infallible> { self.0.push(1); Ok(x.iter().map(|v| v * v).sum()) }
         fn batch(&self) -> bool { true }
         fn values(&mut self, xs: &[f64], out: &mut [f64]) -> Result<(), Infallible> {
             self.0.push(out.len());
@@ -498,23 +498,18 @@ mod optimize {
         assert_eq!(simplex.0[0], 4);
         let (lower, upper) = ([-5.0; 3], [5.0; 3]);
         let mut evolving = Recorded(Vec::new());
-        let options = Options { method: Some(Method::Evolution), bounds: Some(Bounds { lower: &lower, upper: &upper }), population: Some(12), ..Default::default() };
+        let options =
+            Options { method: Some(Method::Evolution), bounds: Some(Bounds { lower: &lower, upper: &upper }), population: Some(12), ..Default::default() };
         let found = minimize(&mut evolving, &[1.0, 2.0, 3.0], &options).unwrap();
         assert!(found.converged && off(&found.x, &[0.0; 3]) < 1e-6 && evolving.0.iter().filter(|&&k| k == 12).count() > 2, "{found:?}");
     }
 
     /// `f` as a mapping of one variable to one value.
-    fn scalar<F: Copy>(f: impl Fn(F) -> F) -> impl FnMut(&[F], &mut [F]) -> Result<(), Infallible> {
-        move |x, out| {
-            out[0] = f(x[0]);
-            Ok(())
-        }
-    }
+    fn scalar<F: Copy>(f: impl Fn(F) -> F) -> impl FnMut(&[F], &mut [F]) -> Result<(), Infallible> { move |x, out| { out[0] = f(x[0]); Ok(()) } }
 
     /// `solve` from `start`, after evaluating `mapping` there for its `residuals` first values, as a caller does.
     fn solved<F: rustymath::Native + rustymath::linalg::Factor, M: Mapping<F>>(
-        mapping: &mut M, start: &[F], residuals: usize, options: &Options<'_, F>,
-    ) -> Result<Found<Vec<F>, F>, M::Error> {
+        mapping: &mut M, start: &[F], residuals: usize, options: &Options<'_, F>) -> Result<Found<Vec<F>, F>, M::Error> {
         let mut first = vec![F::zero(); residuals];
         mapping.value(start, &mut first)?;
         solve(mapping, start, &first, options)
@@ -554,8 +549,7 @@ mod optimize {
         };
         let found = solved(&mut curve, &[1.0, 1.0], 5, &options).unwrap();
         assert!(found.converged && off(&found.x, &[2.0, 0.3]) < 1e-8 && found.value < 1e-10, "{found:?}");
-        // Rosenbrock's function as two equations, 10 (y - x²) = 0 and 1 - x = 0, whose root is (1, 1). With a vector–Jacobian
-        // product, the Jacobian comes from it, row by row, in place of forward differences.
+        // Rosenbrock's function as two equations, 10 (y - x²) = 0 and 1 - x = 0, whose root is (1, 1). With a vector–Jacobian product, the Jacobian comes from it, row by row, in place of forward differences.
         let rosen = |p: &[f64], r: &mut [f64]| {
             (r[0], r[1]) = (10.0 * (p[1] - p[0] * p[0]), 1.0 - p[0]);
             Ok::<_, Infallible>(())
@@ -669,14 +663,8 @@ mod optimize {
         assert_eq!(solve_linear(&mut |_: &[f64], _: &mut [f64]| Err::<(), _>("stopped"), &b, &zeros, &tight), Err("stopped"));
     }
 
-    /// The matrix `a`, whose rows hold `cols` items, as a mapping that gives its transpose's products where `adjoint`. Where `diagonal`
-    /// isn't empty, its preconditioner is Jacobi's, which divides by `diagonal`.
-    struct Dense<'a> {
-        a: &'a [f64],
-        cols: usize,
-        adjoint: bool,
-        diagonal: Vec<f64>,
-    }
+    /// The matrix `a`, whose rows hold `cols` items, as a mapping that gives its transpose's products where `adjoint`. Where `diagonal` isn't empty, its preconditioner is Jacobi's, which divides by `diagonal`.
+    struct Dense<'a> { a: &'a [f64], cols: usize, adjoint: bool, diagonal: Vec<f64> }
 
     impl Mapping<f64> for Dense<'_> {
         type Error = Infallible;
@@ -684,16 +672,12 @@ mod optimize {
         fn has_vjp(&self) -> bool { self.adjoint }
         fn vjp(&mut self, u: &[f64], x: &[f64], out: &mut [f64]) -> Result<(), Infallible> { transposed(self.a, self.cols)(u, x, out) }
         fn has_preconditioner(&self) -> bool { !self.diagonal.is_empty() }
-        fn precondition(&mut self, v: &[f64], out: &mut [f64]) -> Result<(), Infallible> {
-            for i in 0..v.len() { out[i] = v[i] / self.diagonal[i] }
-            Ok(())
-        }
+        fn precondition(&mut self, v: &[f64], out: &mut [f64]) -> Result<(), Infallible> { for i in 0..v.len() { out[i] = v[i] / self.diagonal[i] } Ok(()) }
     }
 
     #[test]
     fn preconditioners() {
-        // A symmetric positive definite matrix whose diagonal spans four orders of magnitude. Jacobi's preconditioner, the reciprocal
-        // of the diagonal, cuts the products that each method needs.
+        // A symmetric positive definite matrix whose diagonal spans four orders of magnitude. Jacobi's preconditioner, the reciprocal of the diagonal, cuts the products that each method needs.
         let n = 40;
         let scale: Vec<f64> = (0..n).map(|i| 10f64.powf(2.0 * i as f64 / (n - 1) as f64)).collect();
         let core = positive_definite(n, 20_000);
@@ -709,8 +693,7 @@ mod optimize {
             let fast = solve_linear(&mut Dense { a: &a, cols: n, adjoint: false, diagonal: diagonal.clone() }, &b, &vec![0.0; n], &options).unwrap();
             assert!(fast.converged && off(&fast.x, &exact) < 1e-6 * size && 2 * fast.evaluations < plain.evaluations, "{method:?}: {plain:?} {fast:?}");
         }
-        // Least squares with columns of very different sizes, where M approximates (AᵀA)⁻¹ by the reciprocals of the columns' squared
-        // norms.
+        // Least squares with columns of very different sizes, where M approximates (AᵀA)⁻¹ by the reciprocals of the columns' squared norms.
         let (m, k) = (200, 60);
         let tall: Vec<f64> = (40_000..40_000 + m * k).map(|i| uniform(i) * 10f64.powf(3.0 * (i % k) as f64 / (k - 1) as f64)).collect();
         let y: Vec<f64> = (50_000..50_000 + m).map(uniform).collect();
@@ -724,9 +707,9 @@ mod optimize {
 }
 
 mod polynomial {
-    use rustymath::polynomial::*;
     use half::f16;
     use num_complex::Complex;
+    use rustymath::polynomial::*;
 
     #[test]
     fn polynomials() {
@@ -773,9 +756,9 @@ mod polynomial {
 }
 
 mod random {
-    use rustymath::random::*;
-    use rustymath::Arg;
     use crate::support::seeded;
+    use rustymath::Arg;
+    use rustymath::random::*;
 
     #[test]
     fn rolls_and_deals() {

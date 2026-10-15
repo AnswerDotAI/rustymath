@@ -1,13 +1,8 @@
-//! Double-word arithmetic: a value held as an unevaluated sum `hi + lo`, with `lo` below half an ulp of `hi`. It carries about twice
-//! a float's precision where a later step magnifies errors, as `pow`'s exponent multiplies the error of its logarithm. The operations
-//! and their forms with and without FMA come from SLEEF's `dd.h`. See `THIRD-PARTY.md`.
+//! Double-word arithmetic: a value held as an unevaluated sum `hi + lo`, with `lo` below half an ulp of `hi`. It carries about twice a float's precision where a later step magnifies errors, as `pow`'s exponent multiplies the error of its logarithm. The operations and their forms with and without FMA come from SLEEF's `dd.h`. See `THIRD-PARTY.md`.
 use crate::float::Native;
 
 #[derive(Clone, Copy)]
-pub(crate) struct Double<R> {
-    pub(crate) hi: R,
-    pub(crate) lo: R,
-}
+pub(crate) struct Double<R> { pub(crate) hi: R, pub(crate) lo: R }
 
 impl<R: Native> Double<R> {
     #[inline]
@@ -21,22 +16,13 @@ impl<R: Native> Double<R> {
     }
     /// The same value with `lo` below half an ulp of `hi` again, when |lo| is below |hi|.
     #[inline]
-    pub(crate) fn normalize(self) -> Self {
-        let s = self.hi + self.lo;
-        Self::new(s, (self.hi - s) + self.lo)
-    }
+    pub(crate) fn normalize(self) -> Self { let s = self.hi + self.lo; Self::new(s, (self.hi - s) + self.lo) }
     /// self + y, when |self| is at least |y|.
     #[inline]
-    pub(crate) fn add(self, y: Self) -> Self {
-        let s = self.hi + y.hi;
-        Self::new(s, (self.hi - s) + y.hi + self.lo + y.lo)
-    }
+    pub(crate) fn add(self, y: Self) -> Self { let s = self.hi + y.hi; Self::new(s, (self.hi - s) + y.hi + self.lo + y.lo) }
     /// self + y, whatever their magnitudes.
     #[inline(always)]
-    pub(crate) fn plus(self, y: Self) -> Self {
-        let s = Self::sum(self.hi, y.hi);
-        Self::new(s.hi, s.lo + self.lo + y.lo)
-    }
+    pub(crate) fn plus(self, y: Self) -> Self { let s = Self::sum(self.hi, y.hi); Self::new(s.hi, s.lo + self.lo + y.lo) }
     /// self × y.
     #[inline]
     pub(crate) fn mul_float<const FUSED: bool>(self, y: R) -> Self {
@@ -61,9 +47,7 @@ impl<R: Native> Double<R> {
         let u = nh * th - s + nh * tl + nl * th + nl * tl + s * (R::one() - dh * th - dh * tl - dl * th - dl * tl);
         Self::new(s, t.mla::<false>(self.lo - s * d.lo, u))
     }
-    /// The polynomial of degree 12 with coefficients `c`, highest degree first, at `x`, by Horner's rule in double words. The steps
-    /// are written out because at opt-level 2, as basedpl builds, LLVM leaves a loop of them rolled, and that loop stops the caller's
-    /// loop vectorizing.
+    /// The polynomial of degree 12 with coefficients `c`, highest degree first, at `x`, by Horner's rule in double words. The steps are written out because at opt-level 2, as basedpl builds, LLVM leaves a loop of them rolled, and that loop stops the caller's loop vectorizing.
     #[inline(always)]
     pub(crate) fn horner<const FUSED: bool>(x: R, c: [f64; 13]) -> Self {
         let step = |y: Self, k: f64| y.mul_float::<FUSED>(x).plus(Self::new(R::narrow(k), R::zero()));

@@ -6,6 +6,9 @@ default-members = [".", "py"]
 version = "0.1.20"
 edition = "2024"
 
+[workspace.metadata.fastfmt]
+join_comments = true
+
 [package]
 name = "rustymath"
 version.workspace = true

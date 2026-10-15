@@ -1,18 +1,14 @@
-//! rustymath's functions as NumPy ufuncs. Independent ranges split across threads, each running a function object's slice form on
-//! chunks of `CHUNK` items. An
-//! input with stride 0 is one item beside the others, and a strided input is copied into a buffer first. Through `numpy.errstate`,
-//! NumPy reports "invalid value" for a NaN result from arguments that aren't NaN, and "overflow" for an integer result that doesn't
-//! fit. Each loop clears the other floating-point status flags, which rustymath's branch-free code sets in lanes it discards.
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+//! rustymath's functions as NumPy ufuncs. Independent ranges split across threads, each running a function object's slice form on chunks of `CHUNK` items. An input with stride 0 is one item beside the others, and a strided input is copied into a buffer first. Through `numpy.errstate`, NumPy reports "invalid value" for a NaN result from arguments that aren't NaN, and "overflow" for an integer result that doesn't fit. Each loop clears the other floating-point status flags, which rustymath's branch-free code sets in lanes it discards.
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::{array, ops::Range, ptr, slice};
 
 use half::f16;
-use numpy::npyffi::{npy_intp, PyUFuncGenericFunction, NPY_TYPES, PY_UFUNC_API};
+use numpy::npyffi::{NPY_TYPES, PY_UFUNC_API, PyUFuncGenericFunction, npy_intp};
 use numpy::{Complex32, Complex64, PyArray1, PyArrayMethods, PyReadonlyArrayDyn, PyUntypedArrayMethods};
 use pyo3::prelude::*;
 use pyo3::types::PyCapsule;
 use rustymath::tolerant::{Ceil, Equal, Floor, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue, Tolerance, Tolerant};
-use rustymath::{reduce::{self, Reduction}, Arg, Binary, Flipped, Ternary, Unary, CHUNK};
+use rustymath::{Arg, Binary, CHUNK, Flipped, Ternary, Unary, reduce::{self, Reduction}};
 
 /// Runs `$body` with `$t` as the element type of the float array `$a`.
 macro_rules! floats {
@@ -38,9 +34,7 @@ mod search;
 /// The tolerance that `ct` gives, or `Tolerance::EXACT` where it's out of range. The Python wrappers check the range first.
 fn tolerance(ct: f64) -> Tolerance { Tolerance::new(ct).unwrap_or(Tolerance::EXACT) }
 
-/// Reports NumPy's "invalid value" for the function `name`, as NumPy does after a ufunc loop with a failed item. `numpy.errstate` then
-/// decides whether it warns, raises or does nothing. It calls `PyUFunc_GiveFloatingpointErrors`, slot 46 of NumPy 2's ufunc API. The
-/// `numpy` crate doesn't bind that slot.
+/// Reports NumPy's "invalid value" for the function `name`, as NumPy does after a ufunc loop with a failed item. `numpy.errstate` then decides whether it warns, raises or does nothing. It calls `PyUFunc_GiveFloatingpointErrors`, slot 46 of NumPy 2's ufunc API. The `numpy` crate doesn't bind that slot.
 fn report_invalid(py: Python<'_>, name: &CStr) -> PyResult<()> {
     const NPY_FPE_INVALID: c_int = 8;
     let api = py.import("numpy._core.umath")?.getattr("_UFUNC_API")?.cast_into::<PyCapsule>()?.pointer_checked(None)?;
@@ -78,20 +72,14 @@ mod fe {
     }
 
     /// Discards incidental arithmetic flags, retaining failures from earlier callbacks and this one.
-    pub unsafe fn finish(previous: c_int, failed: c_int) {
-        unsafe {
-            feclearexcept(REPORTED);
-            if previous | failed != 0 { feraiseexcept(previous | failed); }
-        }
-    }
+    pub unsafe fn finish(previous: c_int, failed: c_int) { unsafe { feclearexcept(REPORTED); if previous | failed != 0 { feraiseexcept(previous | failed); } } }
 }
 
 /// An element type of a ufunc loop.
 trait Code: Copy + Default + Send + Sync {
     /// Its NumPy type number.
     const CODE: NPY_TYPES;
-    /// The status flag for a loop with a failed item. NumPy then reports "invalid value", as it does for a NaN from arguments that
-    /// aren't NaN.
+    /// The status flag for a loop with a failed item. NumPy then reports "invalid value", as it does for a NaN from arguments that aren't NaN.
     const FLAG: c_int = fe::INVALID;
 }
 
@@ -149,18 +137,13 @@ impl<E: Copy, K: Ternary<E, Out: Code> + Sync> Kernel<E, 3> for Obj<K> {
     fn many(&self, [x, y, z]: [Arg<'_, E>; 3], n: usize, out: &mut Vec<K::Out>) -> bool { self.0.many(x, y, z, n, out) }
 }
 
-/// NumPy's `add` and `multiply`, which run rustymath's `Add` and `Multiply`. On Booleans they run `Maximum` and `Minimum`, the `or` and
-/// `and` that NumPy gives. On floats, complex numbers and 64-bit integers, their `reduce` and `accumulate` run rustymath's sums and
-/// products. Narrower integers fold item by item.
+/// NumPy's `add` and `multiply`, which run rustymath's `Add` and `Multiply`. On Booleans they run `Maximum` and `Minimum`, the `or` and `and` that NumPy gives. On floats, complex numbers and 64-bit integers, their `reduce` and `accumulate` run rustymath's sums and products. Narrower integers fold item by item.
 #[derive(Clone, Copy)]
 struct Add;
 #[derive(Clone, Copy)]
 struct Multiply;
 
-/// Writes each type's kernel for `$k`, which runs the function object `$obj`. With a bracketed reduction `$r`, `reduce` folds each
-/// lane by `$r`, then combines that with the running total, and `accumulate` runs `$r`'s scan. An integer fold or scan
-/// wraps, as `$obj` does, so the kernel ignores whether it fits. `@half` writes the `f16` kernel, whose running total is `$r`'s `f32`
-/// total across every chunk. `reduce` rounds that total once at the end. `accumulate` rounds each running result once. `@fold` writes the fold methods of a kernel whose running total is its item. `Logical` uses it too.
+/// Writes each type's kernel for `$k`, which runs the function object `$obj`. With a bracketed reduction `$r`, `reduce` folds each lane by `$r`, then combines that with the running total, and `accumulate` runs `$r`'s scan. An integer fold or scan wraps, as `$obj` does, so the kernel ignores whether it fits. `@half` writes the `f16` kernel, whose running total is `$r`'s `f32` total across every chunk. `reduce` rounds that total once at the end. `accumulate` rounds each running result once. `@fold` writes the fold methods of a kernel whose running total is its item. `Logical` uses it too.
 macro_rules! arithmetic {
     (@one $k:ty, $e:ty, $obj:expr, [$($r:ty)?]) => {
         impl Kernel<$e, 2> for $k {
@@ -219,9 +202,7 @@ impl<R: Reduction<bool, Total = bool> + Sync> Kernel<bool, 2> for Logical<R> {
     type Out = bool;
     type Total = bool;
     const FOLDS: bool = true;
-    fn many(&self, [x, y]: [Arg<'_, bool>; 2], n: usize, out: &mut Vec<bool>) -> bool {
-        rustymath::pairs(x, y, n, out, |a, b| (R::step(a, b), true))
-    }
+    fn many(&self, [x, y]: [Arg<'_, bool>; 2], n: usize, out: &mut Vec<bool>) -> bool { rustymath::pairs(x, y, n, out, |a, b| (R::step(a, b), true)) }
     arithmetic!(@fold bool, R);
 }
 
@@ -247,12 +228,11 @@ division!(Complex32, Complex64; |x, y| rustymath::divide(x, y));
 /// Whether the array at `p` with stride `step` holds contiguous, aligned items of type `T`.
 fn dense<T>(p: *mut c_char, step: npy_intp) -> bool { step == size_of::<T>() as npy_intp && p as usize % align_of::<T>() == 0 }
 
-/// Items `start..start + len` of the input at `p` with stride `step`: one item where the stride is 0, the items themselves where they
-/// are contiguous and aligned, and otherwise a copy in `buf`.
+/// Items `start..start + len` of the input at `p` with stride `step`: one item where the stride is 0, the items themselves where they are contiguous and aligned, and otherwise a copy in `buf`.
 unsafe fn input<'a, E: Code>(p: *mut c_char, step: npy_intp, start: usize, len: usize, buf: &'a mut Vec<E>) -> Arg<'a, E> {
     let at = |j: usize| unsafe { p.offset((start + j) as isize * step) as *const E };
-    if step == 0 { return Arg::One(unsafe { at(0).read_unaligned() }) }
-    if dense::<E>(p, step) { return Arg::Many(unsafe { slice::from_raw_parts(at(0), len) }) }
+    if step == 0 { return Arg::One(unsafe { at(0).read_unaligned() }); }
+    if dense::<E>(p, step) { return Arg::Many(unsafe { slice::from_raw_parts(at(0), len) }); }
     buf.clear();
     buf.extend((0..len).map(|j| unsafe { at(j).read_unaligned() }));
     Arg::Many(buf)
@@ -261,23 +241,21 @@ unsafe fn input<'a, E: Code>(p: *mut c_char, step: npy_intp, start: usize, len: 
 /// Writes `out` to the output at `p` with stride `step`, from item `start`.
 unsafe fn write<O: Code>(out: &[O], p: *mut c_char, step: npy_intp, start: usize) {
     let at = |j: usize| unsafe { p.offset((start + j) as isize * step) as *mut O };
-    if dense::<O>(p, step) { unsafe { slice::from_raw_parts_mut(at(0), out.len()) }.copy_from_slice(out) }
-    else { for (j, &r) in out.iter().enumerate() { unsafe { at(j).write_unaligned(r) } } }
+    if dense::<O>(p, step) { unsafe { slice::from_raw_parts_mut(at(0), out.len()) }.copy_from_slice(out) } else {
+        for (j, &r) in out.iter().enumerate() { unsafe { at(j).write_unaligned(r) } }
+    }
 }
 
-/// Whether different items write disjoint bytes and cannot change any other item's inputs. Exact in-place mappings are safe:
-/// each chunk finishes reading its inputs before writing its results. Any other input/output overlap stays serial.
+/// Whether different items write disjoint bytes and cannot change any other item's inputs. Exact in-place mappings are safe: each chunk finishes reading its inputs before writing its results. Any other input/output overlap stays serial.
 fn independent<E: Code, O: Code>(n: usize, x: &[*mut c_char], xs: &[npy_intp], o: *mut c_char, os: npy_intp) -> bool {
     let Some(out) = parallel::separate(o as usize, size_of::<O>(), &[], n, os) else { return false };
     x.iter().zip(xs).all(|(&p, &step)| {
-        (p == o && step == os && size_of::<E>() == size_of::<O>()) ||
-            parallel::span(p as usize, size_of::<E>(), &[(n, step)]).is_some_and(|s| !parallel::overlaps(&s, &out))
+        (p == o && step == os && size_of::<E>() == size_of::<O>())
+            || parallel::span(p as usize, size_of::<E>(), &[(n, step)]).is_some_and(|s| !parallel::overlaps(&s, &out))
     })
 }
 
-/// `k` on `n` items of the inputs `x` with strides `xs`, written to the output `o` with stride `os`, giving whether every item
-/// succeeded. `reduce` and `accumulate` pass the output as the first input, which then changes from item to item. Otherwise `many`
-/// runs on independent ranges, or serially where the arrays overlap in another way.
+/// `k` on `n` items of the inputs `x` with strides `xs`, written to the output `o` with stride `os`, giving whether every item succeeded. `reduce` and `accumulate` pass the output as the first input, which then changes from item to item. Otherwise `many` runs on independent ranges, or serially where the arrays overlap in another way.
 unsafe fn run<K: Kernel<E, N>, E: Code, const N: usize>(k: &K, n: usize, x: &[*mut c_char], xs: &[npy_intp], o: *mut c_char, os: npy_intp) -> bool {
     let reducing = N == 2 && os == 0 && xs[0] == 0 && o == x[0];
     let accumulating = N == 2 && os != 0 && xs[0] == os && o == x[0].wrapping_offset(os);
@@ -288,14 +266,11 @@ unsafe fn run<K: Kernel<E, N>, E: Code, const N: usize>(k: &K, n: usize, x: &[*m
     let out = o as usize;
     let write = |range| unsafe { chunked::<K, E, N>(k, range, &addresses, xs, out, os) };
     // SAFETY: the NumPy callback owns these arrays until `ranges` returns. `independent` proves that distinct ranges cannot race.
-    if independent::<E, K::Out>(n, x, xs, o, os) { rustymath::parallel::ranges(n, CHUNK, &write) }
-    else { write(0..n) }
+    if independent::<E, K::Out>(n, x, xs, o, os) { rustymath::parallel::ranges(n, CHUNK, &write) } else { write(0..n) }
 }
 
 /// One independent range, with bounded input and output scratch buffers local to this worker.
-unsafe fn chunked<K: Kernel<E, N>, E: Code, const N: usize>(
-    k: &K, range: Range<usize>, x: &[usize; N], xs: &[npy_intp], o: usize, os: npy_intp,
-) -> bool {
+unsafe fn chunked<K: Kernel<E, N>, E: Code, const N: usize>(k: &K, range: Range<usize>, x: &[usize; N], xs: &[npy_intp], o: usize, os: npy_intp) -> bool {
     let (mut bufs, mut out, mut ok): ([Vec<E>; N], _, _) = (array::from_fn(|_| Vec::new()), Vec::with_capacity(CHUNK.min(range.len())), true);
     for start in (range.start..range.end).step_by(CHUNK) {
         let len = CHUNK.min(range.end - start);
@@ -320,8 +295,7 @@ unsafe fn serial<K: Kernel<E, N>, E: Code, const N: usize>(k: &K, n: usize, x: &
     ok
 }
 
-/// A whole strided lane folded in bounded pieces, without writing to any aliased input until all the pieces finish. The running total
-/// stays in `R::Total`, including `f32` for half sums/products. NumPy integer reductions wrap, so overflow status is ignored.
+/// A whole strided lane folded in bounded pieces, without writing to any aliased input until all the pieces finish. The running total stays in `R::Total`, including `f32` for half sums/products. NumPy integer reductions wrap, so overflow status is ignored.
 unsafe fn fold_lane<E: Code, R: Reduction<E>>(t: R::Total, n: usize, p: *mut c_char, step: npy_intp) -> R::Total {
     let (address, mut total) = (p as usize, [R::unit()]);
     reduce::fold_pieces::<E, R>(&mut total, [1, n, 1], &|range, fold| {
@@ -337,8 +311,7 @@ unsafe fn fold_lane<E: Code, R: Reduction<E>>(t: R::Total, n: usize, p: *mut c_c
 
 /// `reduce` through whole-lane pieces or `accumulate` through serial chunks. Scans retain the kernel's `Total` across chunks.
 unsafe fn folded<K: Kernel<E, N>, E: Code, const N: usize>(
-    k: &K, n: usize, x: &[*mut c_char], xs: &[npy_intp], o: *mut c_char, os: npy_intp, reducing: bool,
-) -> bool {
+    k: &K, n: usize, x: &[*mut c_char], xs: &[npy_intp], o: *mut c_char, os: npy_intp, reducing: bool) -> bool {
     let mut t = k.total(unsafe { (x[0] as *const K::Out).read_unaligned() });
     if reducing {
         t = unsafe { k.reduce(t, n, x[1], xs[1]) };
@@ -363,12 +336,9 @@ trait Make {
     fn make(ct: f64) -> Self::K;
 }
 
-/// The ufunc loop for `M`'s kernel at element type `E`. It clears the floating-point status flags that rustymath's branch-free code
-/// sets in lanes whose results it discards, then raises the result type's `FLAG` if an item failed.
-unsafe extern "C" fn inner<M: Make, E: Code, const N: usize>(args: *mut *mut c_char, dims: *mut npy_intp, steps: *mut npy_intp, _: *mut c_void)
-where
-    M::K: Kernel<E, N>,
-{
+/// The ufunc loop for `M`'s kernel at element type `E`. It clears the floating-point status flags that rustymath's branch-free code sets in lanes whose results it discards, then raises the result type's `FLAG` if an item failed.
+unsafe extern "C" fn inner<M: Make, E: Code, const N: usize>(args: *mut *mut c_char, dims: *mut npy_intp, steps: *mut npy_intp, _: *mut c_void) where
+    M::K: Kernel<E, N> {
     let n = unsafe { *dims } as usize;
     if n == 0 { return; }
     let previous = unsafe { fe::fetestexcept(fe::REPORTED) };
@@ -383,70 +353,43 @@ where
 type Loop = (PyUFuncGenericFunction, Vec<c_char>);
 
 /// The loop for `M`'s kernel at element type `E`.
-fn entry<M: Make, E: Code, const N: usize>() -> Loop
-where
-    M::K: Kernel<E, N>,
-{
+fn entry<M: Make, E: Code, const N: usize>() -> Loop where M::K: Kernel<E, N> {
     let ct = M::CT.then_some(NPY_TYPES::NPY_DOUBLE);
     let codes = [E::CODE; N].into_iter().chain(ct).chain([<<M::K as Kernel<E, N>>::Out as Code>::CODE]).map(|c| c as c_char).collect();
     (Some(inner::<M, E, N>), codes)
 }
 
 /// The loop at `bool`. NumPy picks the first loop whose types its inputs cast to safely, so it comes before every other loop.
-fn boolean<M: Make, const N: usize>() -> Vec<Loop>
-where
-    M::K: Kernel<bool, N>,
-{
-    vec![entry::<M, bool, N>()]
-}
+fn boolean<M: Make, const N: usize>() -> Vec<Loop> where M::K: Kernel<bool, N> { vec![entry::<M, bool, N>()] }
 
-/// The loops at every integer type, narrower before wider and signed before unsigned, as NumPy orders its own. They come before the
-/// float loops.
-fn int<M: Make, const N: usize>() -> Vec<Loop>
-where
-    M::K: Kernel<i8, N> + Kernel<u8, N> + Kernel<i16, N> + Kernel<u16, N> + Kernel<i32, N> + Kernel<u32, N> + Kernel<i64, N> + Kernel<u64, N>,
-{
+/// The loops at every integer type, narrower before wider and signed before unsigned, as NumPy orders its own. They come before the float loops.
+fn int<M: Make, const N: usize>() -> Vec<Loop> where
+    M::K: Kernel<i8, N> + Kernel<u8, N> + Kernel<i16, N> + Kernel<u16, N> + Kernel<i32, N> + Kernel<u32, N> + Kernel<i64, N> + Kernel<u64, N> {
     vec![
-        entry::<M, i8, N>(),
-        entry::<M, u8, N>(),
-        entry::<M, i16, N>(),
-        entry::<M, u16, N>(),
-        entry::<M, i32, N>(),
-        entry::<M, u32, N>(),
-        entry::<M, i64, N>(),
+        entry::<M, i8, N>(), entry::<M, u8, N>(), entry::<M, i16, N>(), entry::<M, u16, N>(), entry::<M, i32, N>(), entry::<M, u32, N>(), entry::<M, i64, N>(),
         entry::<M, u64, N>(),
     ]
 }
 
 /// The loops at `float16`, `float32` and `float64`.
-fn real<M: Make, const N: usize>() -> Vec<Loop>
-where
-    M::K: Kernel<f16, N> + Kernel<f32, N> + Kernel<f64, N>,
-{
+fn real<M: Make, const N: usize>() -> Vec<Loop> where M::K: Kernel<f16, N> + Kernel<f32, N> + Kernel<f64, N> {
     let mut loops = vec![entry::<M, f16, N>()];
     loops.extend(native::<M, N>());
     loops
 }
 
 /// The native float loops, for functions such as `Cis` whose output has no float16 complex dtype.
-fn native<M: Make, const N: usize>() -> Vec<Loop>
-where
-    M::K: Kernel<f32, N> + Kernel<f64, N>,
-{
-    vec![entry::<M, f32, N>(), entry::<M, f64, N>()]
-}
+fn native<M: Make, const N: usize>() -> Vec<Loop> where M::K: Kernel<f32, N> + Kernel<f64, N> { vec![entry::<M, f32, N>(), entry::<M, f64, N>()] }
 
 /// The loops at `complex64` and `complex128`.
-fn complex<M: Make, const N: usize>() -> Vec<Loop>
-where
-    M::K: Kernel<Complex32, N> + Kernel<Complex64, N>,
-{
+fn complex<M: Make, const N: usize>() -> Vec<Loop> where M::K: Kernel<Complex32, N> + Kernel<Complex64, N> {
     vec![entry::<M, Complex32, N>(), entry::<M, Complex64, N>()]
 }
 
-/// Adds the ufunc `name` with `nin` inputs and `nout` outputs, NumPy identity `identity` and `loops` to `m`.
-/// A `signature`, such as `"(m,n),(n,p)->(m,p)"`, makes it a generalized ufunc. Each of its loops then takes whole core matrices.
-fn register(m: &Bound<'_, PyModule>, name: &str, doc: &str, [nin, nout]: [usize; 2], identity: c_int, signature: Option<&str>, loops: Vec<Loop>, data: Option<Vec<*mut c_void>>) -> PyResult<()> {
+/// Adds the ufunc `name` with `nin` inputs and `nout` outputs, NumPy identity `identity` and `loops` to `m`. A `signature`, such as `"(m,n),(n,p)->(m,p)"`, makes it a generalized ufunc. Each of its loops then takes whole core matrices.
+fn register(
+    m: &Bound<'_, PyModule>, name: &str, doc: &str, [nin, nout]: [usize; 2], identity: c_int, signature: Option<&str>, loops: Vec<Loop>,
+    data: Option<Vec<*mut c_void>>) -> PyResult<()> {
     let (funcs, codes): (Vec<_>, Vec<Vec<c_char>>) = loops.into_iter().unzip();
     // NumPy keeps these pointers for the life of the ufunc, which is the life of the process.
     let (count, funcs, types) = (funcs.len(), Vec::leak(funcs), Vec::leak(codes.concat()));
@@ -455,34 +398,28 @@ fn register(m: &Bound<'_, PyModule>, name: &str, doc: &str, [nin, nout]: [usize;
     let signature_c = signature.map(CString::new).transpose()?.map_or(ptr::null(), |s| s.into_raw().cast_const());
     let ufunc = unsafe {
         PY_UFUNC_API.PyUFunc_FromFuncAndDataAndSignature(
-            m.py(), funcs.as_mut_ptr(), data.as_mut_ptr(), types.as_mut_ptr(), count as c_int, nin as c_int, nout as c_int, identity, name_c,
-            doc_c, 0, signature_c,
-        )
+            m.py(), funcs.as_mut_ptr(), data.as_mut_ptr(), types.as_mut_ptr(), count as c_int, nin as c_int, nout as c_int, identity, name_c, doc_c, 0,
+            signature_c)
     };
     m.add(name, unsafe { Bound::from_owned_ptr_or_err(m.py(), ufunc)? })
 }
 
-/// NumPy's identities: `PyUFunc_Zero`, `PyUFunc_One`, `PyUFunc_None` and `PyUFunc_ReorderableNone`. A ufunc with an identity, or
-/// a reorderable one, reduces over several axes at once.
+/// NumPy's identities: `PyUFunc_Zero`, `PyUFunc_One`, `PyUFunc_None` and `PyUFunc_ReorderableNone`. A ufunc with an identity, or a reorderable one, reduces over several axes at once.
 const ZERO: c_int = 0;
 const ONE: c_int = 1;
 const NONE: c_int = -1;
 const REORDERABLE: c_int = -2;
 
 /// A generalized ufunc core loop computing both bounds of each lane.
-unsafe extern "C" fn minmax_inner<E: Code>(args: *mut *mut c_char, dims: *mut npy_intp, steps: *mut npy_intp, _: *mut c_void)
-where
-    reduce::Min: Reduction<E, Total = E>,
-    reduce::Max: Reduction<E, Total = E>,
-{
+unsafe extern "C" fn minmax_inner<E: Code>(args: *mut *mut c_char, dims: *mut npy_intp, steps: *mut npy_intp, _: *mut c_void) where
+    reduce::Min: Reduction<E, Total = E>, reduce::Max: Reduction<E, Total = E> {
     let previous = unsafe { fe::fetestexcept(fe::REPORTED) };
     let (args, dims, steps) = unsafe { (slice::from_raw_parts(args, 3), slice::from_raw_parts(dims, 2), slice::from_raw_parts(steps, 4)) };
     let (n, mut buf) = (dims[1] as usize, Vec::new());
     for i in 0..dims[0] {
         let (lo, hi) = if n == 0 { reduce::extremes::<E>(&[]) } else {
             match unsafe { input(args[0].offset(i * steps[0]), steps[3], 0, n, &mut buf) } {
-                Arg::One(v) => (v, v),
-                Arg::Many(items) => reduce::extremes(items),
+                Arg::One(v) => (v, v), Arg::Many(items) => reduce::extremes(items)
             }
         };
         unsafe {
@@ -493,18 +430,15 @@ where
     unsafe { fe::finish(previous, 0); }
 }
 
-fn minmax_entry<E: Code>() -> Loop
-where
-    reduce::Min: Reduction<E, Total = E>,
-    reduce::Max: Reduction<E, Total = E>,
-{
+fn minmax_entry<E: Code>() -> Loop where reduce::Min: Reduction<E, Total = E>, reduce::Max: Reduction<E, Total = E> {
     (Some(minmax_inner::<E>), vec![E::CODE as c_char; 3])
 }
 
 /// Scans a Boolean array by `table[r][x]`, where `r` is the running result and `x` the next item.
 #[pyfunction]
 #[pyo3(signature = (x, table, axis=-1, start=None))]
-fn logical_scan<'py>(py: Python<'py>, x: PyReadonlyArrayDyn<'py, bool>, table: [[bool; 2]; 2], axis: isize, start: Option<bool>) -> PyResult<Bound<'py, PyAny>> {
+fn logical_scan<'py>(
+    py: Python<'py>, x: PyReadonlyArrayDyn<'py, bool>, table: [[bool; 2]; 2], axis: isize, start: Option<bool>) -> PyResult<Bound<'py, PyAny>> {
     let shape = x.shape();
     let axis = if axis < 0 { axis + shape.len() as isize } else { axis };
     if axis < 0 || axis >= shape.len() as isize { return Err(pyo3::exceptions::PyValueError::new_err("axis is out of bounds")); }
@@ -527,8 +461,7 @@ fn thread_setting() -> usize { rustymath::parallel::thread_setting() }
 #[pyfunction]
 fn threads() -> usize { rustymath::parallel::threads() }
 
-/// For each entry, adds a ufunc to `m` whose kernel has type `$k`, made by `$make`. A `; ct` after the inputs makes the tolerance
-/// the ufunc's last input, named `ct` in `$make`. The groups `int`, `real` and `complex` choose the loops.
+/// For each entry, adds a ufunc to `m` whose kernel has type `$k`, made by `$make`. A `; ct` after the inputs makes the tolerance the ufunc's last input, named `ct` in `$make`. The groups `int`, `real` and `complex` choose the loops.
 macro_rules! ufuncs {
     ($m:expr; $($name:ident($($x:ident),+ $(; $ct:ident)?) $(identity $id:ident)?: $k:ty = $make:expr, $($group:ident),+: $doc:literal;)+) => {$({
         #[allow(non_camel_case_types)]
@@ -629,18 +562,22 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         gcd(x, y; ct): Obj<Gcd> = Obj(Gcd(tolerance(ct))), int, real, complex: "The greatest common divisor of x and y. The tolerance applies to floats.";
         lcm(x, y; ct): Obj<Lcm> = Obj(Lcm(tolerance(ct))), int, real: "The least common multiple of x and y, with the sign of x y. The tolerance applies to floats.";
     }
-    register(m, "minmax", "The minimum and maximum along an axis, preserving the input dtype. Empty lanes give the dtype's extrema identities.", [1, 2], NONE, Some("(n)->(),()"), vec![
-        minmax_entry::<bool>(), minmax_entry::<i8>(), minmax_entry::<u8>(), minmax_entry::<i16>(), minmax_entry::<u16>(),
-        minmax_entry::<i32>(), minmax_entry::<u32>(), minmax_entry::<i64>(), minmax_entry::<u64>(), minmax_entry::<f16>(),
-        minmax_entry::<f32>(), minmax_entry::<f64>(),
-    ], None)?;
+    register(
+        m, "minmax", "The minimum and maximum along an axis, preserving the input dtype. Empty lanes give the dtype's extrema identities.", [1, 2], NONE,
+        Some("(n)->(),()"), vec![
+            minmax_entry::<bool>(), minmax_entry::<i8>(), minmax_entry::<u8>(), minmax_entry::<i16>(), minmax_entry::<u16>(), minmax_entry::<i32>(),
+            minmax_entry::<u32>(), minmax_entry::<i64>(), minmax_entry::<u64>(), minmax_entry::<f16>(), minmax_entry::<f32>(), minmax_entry::<f64>(),
+        ], None)?;
     for f in [wrap_pyfunction!(logical_scan, m)?, wrap_pyfunction!(set_threads, m)?, wrap_pyfunction!(thread_setting, m)?, wrap_pyfunction!(threads, m)?] {
         m.add_function(f)?;
     }
     polynomial::add(m)?;
     search::add(m)?;
     integer::add(m)?;
-    for (name, add) in [("number_theory", number_theory::add as fn(&Bound<'_, PyModule>) -> PyResult<()>), ("distribution", distribution::add), ("linalg", linalg::add), ("exact", exact::add), ("optimize", optimize::add)] {
+    for (name, add) in [
+        ("number_theory", number_theory::add as fn(&Bound<'_, PyModule>) -> PyResult<()>), ("distribution", distribution::add), ("linalg", linalg::add),
+        ("exact", exact::add), ("optimize", optimize::add),
+    ] {
         let sub = PyModule::new(m.py(), name)?;
         add(&sub)?;
         m.add_submodule(&sub)?;

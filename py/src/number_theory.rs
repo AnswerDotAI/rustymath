@@ -1,5 +1,4 @@
-//! rustymath's `number_theory` module on Python integers of any size. Each function checks for Ctrl-C at least about once a
-//! millisecond, and stops with `KeyboardInterrupt`.
+//! rustymath's `number_theory` module on Python integers of any size. Each function checks for Ctrl-C at least about once a millisecond, and stops with `KeyboardInterrupt`.
 use num_bigint::BigUint;
 use num_traits::Zero;
 use numpy::PyArray1;
@@ -16,10 +15,7 @@ pub fn is_prime(py: Python<'_>, n: BigUint) -> PyResult<bool> { nt::is_prime_wit
 
 /// The prime factors of `n` in increasing order, each with its multiplicity.
 #[pyfunction]
-pub fn factor(py: Python<'_>, n: BigUint) -> PyResult<Vec<(BigUint, u32)>> {
-    positive(&n, "factor")?;
-    nt::factor_with(&n, || py.check_signals())
-}
+pub fn factor(py: Python<'_>, n: BigUint) -> PyResult<Vec<(BigUint, u32)>> { positive(&n, "factor")?; nt::factor_with(&n, || py.check_signals()) }
 
 /// The smallest prime above `n`.
 #[pyfunction]
@@ -33,10 +29,7 @@ pub fn prev_prime(py: Python<'_>, n: BigUint) -> PyResult<Option<BigUint>> { nt:
 
 /// Euler's totient: how many integers from 1 to `n` are coprime to `n`.
 #[pyfunction]
-pub fn totient(py: Python<'_>, n: BigUint) -> PyResult<BigUint> {
-    positive(&n, "totient")?;
-    nt::totient_with(&n, || py.check_signals())
-}
+pub fn totient(py: Python<'_>, n: BigUint) -> PyResult<BigUint> { positive(&n, "totient")?; nt::totient_with(&n, || py.check_signals()) }
 
 /// How many primes are below `n`.
 #[pyfunction]
@@ -46,8 +39,7 @@ pub fn prime_count(py: Python<'_>, n: u64) -> PyResult<u64> { nt::prime_count_wi
 #[pyfunction]
 pub fn factorial(py: Python<'_>, n: u64) -> PyResult<BigUint> { nt::factorial_with(n, || py.check_signals()) }
 
-/// The primes from `start` up to but not including `stop`, as an array of uint64. With one argument, the primes below it, as `range`
-/// counts.
+/// The primes from `start` up to but not including `stop`, as an array of uint64. With one argument, the primes below it, as `range` counts.
 #[pyfunction]
 #[pyo3(signature = (start, stop=None))]
 pub fn primes(py: Python<'_>, start: u64, stop: Option<u64>) -> PyResult<Bound<'_, PyArray1<u64>>> {
@@ -63,8 +55,6 @@ pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
     for f in [
         wrap_pyfunction!(is_prime, m)?, wrap_pyfunction!(factor, m)?, wrap_pyfunction!(next_prime, m)?, wrap_pyfunction!(prev_prime, m)?,
         wrap_pyfunction!(totient, m)?, wrap_pyfunction!(prime_count, m)?, wrap_pyfunction!(primes, m)?, wrap_pyfunction!(factorial, m)?,
-    ] {
-        m.add_function(f)?;
-    }
+    ] { m.add_function(f)?; }
     Ok(())
 }

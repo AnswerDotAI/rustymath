@@ -1,19 +1,11 @@
-//! The general eigen problem for real and complex matrices, as LAPACK's `dgehd2`, `dlahqr` and `dtrevc` solve it for real ones, and
-//! `zgehd2`, `zlahqr` and `ztrevc` for complex ones. Householder reflections reduce the matrix to upper Hessenberg form. QR iterations
-//! then reduce that to Schur form. For a real matrix, Francis double-shift iterations leave a quasi-triangular matrix whose 2×2
-//! diagonal blocks each hold a complex conjugate pair of eigenvalues. For a complex matrix, single-shift iterations leave a triangular
-//! one. Back substitution gives the Schur form's eigenvectors. The accumulated transformations turn them into the matrix's own. Those
-//! transformations build up as the rows of Zᵀ, where each reflection reads contiguous memory.
+//! The general eigen problem for real and complex matrices, as LAPACK's `dgehd2`, `dlahqr` and `dtrevc` solve it for real ones, and `zgehd2`, `zlahqr` and `ztrevc` for complex ones. Householder reflections reduce the matrix to upper Hessenberg form. QR iterations then reduce that to Schur form. For a real matrix, Francis double-shift iterations leave a quasi-triangular matrix whose 2×2 diagonal blocks each hold a complex conjugate pair of eigenvalues. For a complex matrix, single-shift iterations leave a triangular one. Back substitution gives the Schur form's eigenvectors. The accumulated transformations turn them into the matrix's own. Those transformations build up as the rows of Zᵀ, where each reflection reads contiguous memory.
 use super::*;
 use num_complex::Complex;
 use std::ops::Range;
 
-/// The native eigen decomposition of the finite, nonempty real or complex `n`×`n` matrix `a`, with eigenvectors only where `vectors`
-/// is true. `Tiled::eig` uses it for complex matrices on every target, and for real ones off macOS. A matrix whose largest item lies
-/// outside the safe range first scales by a power of two. Its eigenvalues then scale back exactly.
+/// The native eigen decomposition of the finite, nonempty real or complex `n`×`n` matrix `a`, with eigenvectors only where `vectors` is true. `Tiled::eig` uses it for complex matrices on every target, and for real ones off macOS. A matrix whose largest item lies outside the safe range first scales by a power of two. Its eigenvalues then scale back exactly.
 pub(in crate::linalg) fn native<T: Schur>(a: &[T], n: usize, vectors: bool) -> Option<Eig<T::Real>> {
-    // The working copy's rows start `ld` items apart. The right reflections read down columns. With rows whose length is a multiple of
-    // a large power of two, a column's items would all fall in the same few cache sets and keep evicting each other.
+    // The working copy's rows start `ld` items apart. The right reflections read down columns. With rows whose length is a multiple of a large power of two, a column's items would all fall in the same few cache sets and keep evicting each other.
     let ld = n + 8;
     let mut h = vec![T::zero(); n * ld];
     for (row, src) in h.chunks_exact_mut(ld).zip(a.chunks_exact(n)) { row[..n].copy_from_slice(src) }
@@ -23,7 +15,7 @@ pub(in crate::linalg) fn native<T: Schur>(a: &[T], n: usize, vectors: bool) -> O
     let mut zt = if vectors { reflections(&w, &taus, n) } else { Vec::new() };
     let schur = T::schur(&mut h, ld, &mut zt, n, vectors)?;
     let values = schur.iter().map(|&z| scale.map_or(z, |s| z / s)).collect();
-    if !vectors { return Some(Eig { values, vectors: Vec::new() }) }
+    if !vectors { return Some(Eig { values, vectors: Vec::new() }); }
     let x = T::schur_vectors(&h, ld, n, &schur);
     let v = T::multiply(Matrix::rows(&zt, n).transpose(), Matrix::rows(&x, n), [n; 3]);
     Some(Eig { values, vectors: T::unit_vectors(&v, n, &schur) })
@@ -31,13 +23,9 @@ pub(in crate::linalg) fn native<T: Schur>(a: &[T], n: usize, vectors: bool) -> O
 
 /// The steps of the general eigen problem that differ between real and complex matrices. `native` runs the steps they share.
 pub(in crate::linalg) trait Schur: Tiled {
-    /// Reduces the upper Hessenberg matrix `h`, whose rows start `ld` items apart, to Schur form, and gives the eigenvalues in the order
-    /// the Schur form holds them. Where `wantt` is true, each iteration transforms the whole of `h`. Each transformation then also acts
-    /// on the rows of `zt`, which hold Qᵀ on entry and Zᵀ on exit. Where `wantt` is false, `zt` is empty. Each iteration then transforms
-    /// only the rows and columns it still acts on. `None` where the iterations don't converge.
+    /// Reduces the upper Hessenberg matrix `h`, whose rows start `ld` items apart, to Schur form, and gives the eigenvalues in the order the Schur form holds them. Where `wantt` is true, each iteration transforms the whole of `h`. Each transformation then also acts on the rows of `zt`, which hold Qᵀ on entry and Zᵀ on exit. Where `wantt` is false, `zt` is empty. Each iteration then transforms only the rows and columns it still acts on. `None` where the iterations don't converge.
     fn schur(h: &mut [Self], ld: usize, zt: &mut [Self], n: usize, wantt: bool) -> Option<Vec<Complex<Self::Real>>>;
-    /// The eigenvectors of the Schur form `t`, whose rows start `ld` items apart, as the columns of an `n`×`n` matrix, for the
-    /// eigenvalues `values` that `schur` gave.
+    /// The eigenvectors of the Schur form `t`, whose rows start `ld` items apart, as the columns of an `n`×`n` matrix, for the eigenvalues `values` that `schur` gave.
     fn schur_vectors(t: &[Self], ld: usize, n: usize, values: &[Complex<Self::Real>]) -> Vec<Self>;
     /// The eigenvectors in the columns of the `n`×`n` matrix `v`, each scaled to unit length.
     fn unit_vectors(v: &[Self], n: usize, values: &[Complex<Self::Real>]) -> Vec<Complex<Self::Real>>;
@@ -67,10 +55,7 @@ impl<R: Native + Tiled<Real = R>> Schur for Complex<R> where Complex<R>: Tiled<R
     }
 }
 
-/// Reduces `h` to upper Hessenberg form by Householder reflections, as LAPACK's `dgehd2` and `zgehd2` do, and gives the reflections
-/// in the layout that `reflections` reads, with each one's `τ`. Reflection `k`, `H = I - τ v vᴴ`, maps column `k`'s items below the
-/// subdiagonal to zero. Its vector is 1 at row `k + 1`, and row `k` of the first result keeps the rest of it, from column `k + 2`. Each
-/// reflection applies as `Hᴴ` from the left to the rows below row `k`, then as `H` from the right to every row.
+/// Reduces `h` to upper Hessenberg form by Householder reflections, as LAPACK's `dgehd2` and `zgehd2` do, and gives the reflections in the layout that `reflections` reads, with each one's `τ`. Reflection `k`, `H = I - τ v vᴴ`, maps column `k`'s items below the subdiagonal to zero. Its vector is 1 at row `k + 1`, and row `k` of the first result keeps the rest of it, from column `k + 2`. Each reflection applies as `Hᴴ` from the left to the rows below row `k`, then as `H` from the right to every row.
 fn hessenberg<T: Scalar>(h: &mut [T], n: usize, ld: usize) -> (Vec<T>, Vec<T>) {
     let (mut w, mut taus) = (vec![T::zero(); n * n], vec![T::zero(); n.saturating_sub(1)]);
     let (mut v, mut y) = (vec![T::zero(); n], vec![T::zero(); n]);
@@ -81,7 +66,7 @@ fn hessenberg<T: Scalar>(h: &mut [T], n: usize, ld: usize) -> (Vec<T>, Vec<T>) {
         let tau = reflector(v);
         h[(k + 1) * ld + k] = v[0];
         for i in 1..m { h[(k + 1 + i) * ld + k] = T::zero() }
-        if tau == T::zero() { continue }
+        if tau == T::zero() { continue; }
         taus[k] = tau;
         v[0] = T::one();
         w[k * n + k + 2..(k + 1) * n].copy_from_slice(&v[1..]);
@@ -101,15 +86,11 @@ fn hessenberg<T: Scalar>(h: &mut [T], n: usize, ld: usize) -> (Vec<T>, Vec<T>) {
     (w, taus)
 }
 
-/// Reduces the upper Hessenberg matrix `h`, whose rows start `ld` items apart, to real Schur form by Francis double-shift QR
-/// iterations, as LAPACK's `dlahqr` does. Gives the real and imaginary parts of the eigenvalues. Where `wantt` is true, each iteration
-/// transforms the whole of `h`. Each reflection and rotation then also acts on the rows of `zt`, which hold Qᵀ on entry and Zᵀ on exit.
-/// Where `wantt` is false, `zt` is empty. Each iteration then transforms only the rows and columns it still acts on. Each converged 2×2
-/// block takes the standard form that `standard` gives. `None` where a block takes more than `30 max(10, n)` iterations.
+/// Reduces the upper Hessenberg matrix `h`, whose rows start `ld` items apart, to real Schur form by Francis double-shift QR iterations, as LAPACK's `dlahqr` does. Gives the real and imaginary parts of the eigenvalues. Where `wantt` is true, each iteration transforms the whole of `h`. Each reflection and rotation then also acts on the rows of `zt`, which hold Qᵀ on entry and Zᵀ on exit. Where `wantt` is false, `zt` is empty. Each iteration then transforms only the rows and columns it still acts on. Each converged 2×2 block takes the standard form that `standard` gives. `None` where a block takes more than `30 max(10, n)` iterations.
 fn francis<T: Native>(h: &mut [T], ld: usize, zt: &mut [T], n: usize, wantt: bool) -> Option<(Vec<T>, Vec<T>)> {
     let (zero, one, two) = (T::zero(), T::one(), T::one() + T::one());
     let (mut wr, mut wi) = (vec![zero; n], vec![zero; n]);
-    if n == 0 { return Some((wr, wi)) }
+    if n == 0 { return Some((wr, wi)); }
     let (ulp, safmin) = (T::epsilon(), T::min_positive_value());
     let smlnum = safmin * (T::narrow(n as f64) / ulp);
     let (dat1, dat2) = (T::narrow(0.75), T::narrow(-0.4375));
@@ -128,12 +109,9 @@ fn francis<T: Native>(h: &mut [T], ld: usize, zt: &mut [T], n: usize, wantt: boo
             let mut k = i;
             while k > l {
                 let sub = h[k * ld + k - 1].abs();
-                if sub <= smlnum { break }
+                if sub <= smlnum { break; }
                 let mut tst = h[(k - 1) * ld + k - 1].abs() + h[k * ld + k].abs();
-                if tst == zero {
-                    if k >= 2 { tst = tst + h[(k - 1) * ld + k - 2].abs() }
-                    if k + 1 < n { tst = tst + h[(k + 1) * ld + k].abs() }
-                }
+                if tst == zero { if k >= 2 { tst = tst + h[(k - 1) * ld + k - 2].abs() } if k + 1 < n { tst = tst + h[(k + 1) * ld + k].abs() } }
                 // Ahues and Tisseur's conservative test, as LAPACK applies it.
                 if sub <= ulp * tst {
                     let sup = h[(k - 1) * ld + k].abs();
@@ -141,15 +119,15 @@ fn francis<T: Native>(h: &mut [T], ld: usize, zt: &mut [T], n: usize, wantt: boo
                     let (d, e) = (h[k * ld + k].abs(), (h[(k - 1) * ld + k - 1] - h[k * ld + k]).abs());
                     let (aa, bb) = (d.max(e), d.min(e));
                     let s = aa + ab;
-                    if ba * (ab / s) <= smlnum.max(ulp * (bb * (aa / s))) { break }
+                    if ba * (ab / s) <= smlnum.max(ulp * (bb * (aa / s))) { break; }
                 }
                 k -= 1;
             }
             l = k;
             if l > 0 { h[l * ld + l - 1] = zero }
-            if l + 1 >= i { break }
+            if l + 1 >= i { break; }
             its += 1;
-            if its > itmax { return None }
+            if its > itmax { return None; }
             kdefl += 1;
             if !wantt { (i1, i2) = (l, i) }
             let (h11, h12, h21, h22) = if kdefl % 20 == 0 {
@@ -158,9 +136,7 @@ fn francis<T: Native>(h: &mut [T], ld: usize, zt: &mut [T], n: usize, wantt: boo
             } else if kdefl % 10 == 0 {
                 let s = h[(l + 1) * ld + l].abs() + h[(l + 2) * ld + l + 1].abs();
                 (dat1 * s + h[l * ld + l], dat2 * s, s, dat1 * s + h[l * ld + l])
-            } else {
-                (h[(i - 1) * ld + i - 1], h[(i - 1) * ld + i], h[i * ld + i - 1], h[i * ld + i])
-            };
+            } else { (h[(i - 1) * ld + i - 1], h[(i - 1) * ld + i], h[i * ld + i - 1], h[i * ld + i]) };
             // The shifts are the eigenvalues of the 2×2 block above, or the real one nearer h22 twice.
             let s = h11.abs() + h12.abs() + h21.abs() + h22.abs();
             let (rt1r, rt1i, rt2r, rt2i) = if s == zero { (zero, zero, zero, zero) } else {
@@ -168,16 +144,13 @@ fn francis<T: Native>(h: &mut [T], ld: usize, zt: &mut [T], n: usize, wantt: boo
                 let tr = (h11 + h22) / two;
                 let det = (h11 - tr) * (h22 - tr) - h12 * h21;
                 let rtdisc = det.abs().sqrt();
-                if det >= zero {
-                    (tr * s, rtdisc * s, tr * s, -rtdisc * s)
-                } else {
+                if det >= zero { (tr * s, rtdisc * s, tr * s, -rtdisc * s) } else {
                     let (r1, r2) = (tr + rtdisc, tr - rtdisc);
                     let r = if (r1 - h22).abs() <= (r2 - h22).abs() { r1 * s } else { r2 * s };
                     (r, zero, r, zero)
                 }
             };
-            // The sweep starts at the lowest row m where two consecutive small subdiagonal items let it begin without disturbing
-            // the rows above. v is the first column of the shifted product, scaled.
+            // The sweep starts at the lowest row m where two consecutive small subdiagonal items let it begin without disturbing the rows above. v is the first column of the shifted product, scaled.
             let mut m = i - 2;
             loop {
                 let (hmm, hm1m, hmm1) = (h[m * ld + m], h[(m + 1) * ld + m], h[m * ld + m + 1]);
@@ -188,10 +161,10 @@ fn francis<T: Native>(h: &mut [T], ld: usize, zt: &mut [T], n: usize, wantt: boo
                 v[2] = h21s * h[(m + 2) * ld + m + 1];
                 let s = v[0].abs() + v[1].abs() + v[2].abs();
                 for x in &mut v { *x = *x / s }
-                if m == l { break }
+                if m == l { break; }
                 let h00 = h[m * ld + m - 1].abs() * (v[1].abs() + v[2].abs());
                 let h01 = ulp * v[0].abs() * (h[(m - 1) * ld + m - 1].abs() + hmm.abs() + h[(m + 1) * ld + m + 1].abs());
-                if h00 <= h01 { break }
+                if h00 <= h01 { break; }
                 m -= 1;
             }
             // The double-shift sweep: a reflection of order 3 makes a bulge, and each later one chases it down a row.
@@ -203,7 +176,8 @@ fn francis<T: Native>(h: &mut [T], ld: usize, zt: &mut [T], n: usize, wantt: boo
                     h[k * ld + k - 1] = v[0];
                     h[(k + 1) * ld + k - 1] = zero;
                     if k + 1 < i { h[(k + 2) * ld + k - 1] = zero }
-                } else if m > l {
+                }
+                else if m > l {
                     // This avoids LAPACK's bug where v[1] and v[2] underflow.
                     h[k * ld + k - 1] = h[k * ld + k - 1] * (one - t1);
                 }
@@ -214,9 +188,8 @@ fn francis<T: Native>(h: &mut [T], ld: usize, zt: &mut [T], n: usize, wantt: boo
                 for row in h[i1 * ld..(i.min(k + 3) + 1) * ld].chunks_exact_mut(ld) { bulge.right(row) }
             }
         }
-        if l == i {
-            wr[i] = h[i * ld + i];
-        } else {
+        if l == i { wr[i] = h[i * ld + i]; }
+        else {
             // A 2×2 block in rows p and q has converged.
             let (p, q) = (i - 1, i);
             let (block, values, (cs, sn)) = standard(h[p * ld + p], h[p * ld + q], h[q * ld + p], h[q * ld + q]);
@@ -234,24 +207,17 @@ fn francis<T: Native>(h: &mut [T], ld: usize, zt: &mut [T], n: usize, wantt: boo
             }
         }
         kdefl = 0;
-        if l == 0 { return Some((wr, wi)) }
+        if l == 0 { return Some((wr, wi)); }
         i = l - 1;
     }
 }
 
-/// One reflection of a double-shift sweep, `I - τ u uᵀ`, acting on rows or columns `k` to `k + 2` with `u = [1, v[0], v[1]]`, or on `k`
-/// and `k + 1` with `u = [1, v[0]]` where `three` is false. `t` is `τ u`.
+/// One reflection of a double-shift sweep, `I - τ u uᵀ`, acting on rows or columns `k` to `k + 2` with `u = [1, v[0], v[1]]`, or on `k` and `k + 1` with `u = [1, v[0]]` where `three` is false. `t` is `τ u`.
 #[derive(Clone, Copy)]
-struct Bulge<T> {
-    k: usize,
-    three: bool,
-    v: [T; 2],
-    t: [T; 3],
-}
+struct Bulge<T> { k: usize, three: bool, v: [T; 2], t: [T; 3] }
 
 impl<T: Native> Bulge<T> {
-    /// Applies the reflection from the left to `columns` of the matrix `a`, whose rows hold `n` items. Each row's items are contiguous,
-    /// and the loop over them vectorizes.
+    /// Applies the reflection from the left to `columns` of the matrix `a`, whose rows hold `n` items. Each row's items are contiguous, and the loop over them vectorizes.
     #[inline(always)]
     fn left(&self, a: &mut [T], n: usize, columns: std::ops::RangeInclusive<usize>) {
         let (k, [v2, v3], [t1, t2, t3]) = (self.k, self.v, self.t);
@@ -286,10 +252,7 @@ impl<T: Native> Bulge<T> {
     }
 }
 
-/// The standard form of the 2×2 block `[a b; c d]`, as LAPACK's `dlanv2` gives it, then its eigenvalues as `[re1, im1, re2, im2]`, then
-/// the rotation `(cs, sn)` that takes it there: `[a b; c d] = [cs -sn; sn cs] F [cs sn; -sn cs]`, where F is the standard form. A
-/// complex pair's form has equal diagonal items and off-diagonal items of opposite signs, and `im1 > 0`. A real pair's form is upper
-/// triangular.
+/// The standard form of the 2×2 block `[a b; c d]`, as LAPACK's `dlanv2` gives it, then its eigenvalues as `[re1, im1, re2, im2]`, then the rotation `(cs, sn)` that takes it there: `[a b; c d] = [cs -sn; sn cs] F [cs sn; -sn cs]`, where F is the standard form. A complex pair's form has equal diagonal items and off-diagonal items of opposite signs, and `im1 > 0`. A real pair's form is upper triangular.
 fn standard<T: Native>(mut a: T, mut b: T, mut c: T, mut d: T) -> ([T; 4], [T; 4], (T, T)) {
     let (zero, one) = (T::zero(), T::one());
     let half = one / (one + one);
@@ -298,13 +261,14 @@ fn standard<T: Native>(mut a: T, mut b: T, mut c: T, mut d: T) -> ([T; 4], [T; 4
     let safmn2 = T::narrow(2f64.powi(((T::min_positive_value() / eps).wide().log2() / 2.0) as i32));
     let safmx2 = one / safmn2;
     let (mut cs, mut sn) = (one, zero);
-    if c == zero {
-    } else if b == zero {
+    if c == zero { }
+    else if b == zero {
         // Swap the rows and columns.
         (cs, sn) = (zero, one);
         (a, d, b, c) = (d, a, -c, zero);
-    } else if a - d == zero && sign(b) != sign(c) {
-    } else {
+    }
+    else if a - d == zero && sign(b) != sign(c) { }
+    else {
         let mut temp = a - d;
         let p = half * temp;
         let bcmax = b.abs().max(c.abs());
@@ -327,14 +291,8 @@ fn standard<T: Native>(mut a: T, mut b: T, mut c: T, mut d: T) -> ([T; 4], [T; 4
             loop {
                 count += 1;
                 let scale = temp.abs().max(sigma.abs());
-                if scale >= safmx2 {
-                    (sigma, temp) = (sigma * safmn2, temp * safmn2);
-                    if count <= 20 { continue }
-                }
-                if scale <= safmn2 {
-                    (sigma, temp) = (sigma * safmx2, temp * safmx2);
-                    if count <= 20 { continue }
-                }
+                if scale >= safmx2 { (sigma, temp) = (sigma * safmn2, temp * safmn2); if count <= 20 { continue; } }
+                if scale <= safmn2 { (sigma, temp) = (sigma * safmx2, temp * safmx2); if count <= 20 { continue; } }
                 break;
             }
             let p = half * temp;
@@ -367,12 +325,7 @@ fn standard<T: Native>(mut a: T, mut b: T, mut c: T, mut d: T) -> ([T; 4], [T; 4
     ([a, b, c, d], [a, im, d, -im], (cs, sn))
 }
 
-/// The eigenvectors of the quasi-triangular `n`×`n` Schur form `t`, whose eigenvalues are `values`, as the columns of an `n`×`n`
-/// matrix. A real eigenvalue's vector fills its own column. A complex pair's first column holds the real part of the vector for the
-/// eigenvalue with the positive imaginary part, and its second column the imaginary part. Each vector comes from back substitution in
-/// `t - λ I`, as LAPACK's `dtrevc` does it, with a divisor smaller than `ε` times `t`'s size raised to that. Complex quotients
-/// follow Smith's method, which never squares a divisor. A vector whose items grow past the square root of the largest float scales
-/// down, so that sums of its products never overflow.
+/// The eigenvectors of the quasi-triangular `n`×`n` Schur form `t`, whose eigenvalues are `values`, as the columns of an `n`×`n` matrix. A real eigenvalue's vector fills its own column. A complex pair's first column holds the real part of the vector for the eigenvalue with the positive imaginary part, and its second column the imaginary part. Each vector comes from back substitution in `t - λ I`, as LAPACK's `dtrevc` does it, with a divisor smaller than `ε` times `t`'s size raised to that. Complex quotients follow Smith's method, which never squares a divisor. A vector whose items grow past the square root of the largest float scales down, so that sums of its products never overflow.
 fn quasi_vectors<T: Native>(t: &[T], ld: usize, n: usize, values: &[Complex<T>]) -> Vec<T> {
     let zero = T::zero();
     let size = (0..n).fold(zero, |s, i| t[i * ld + i.saturating_sub(1)..i * ld + n].iter().fold(s, |s, x| s + x.abs()));
@@ -392,9 +345,8 @@ fn quasi_vectors<T: Native>(t: &[T], ld: usize, n: usize, values: &[Complex<T>])
         if pair {
             let (b, c) = (t[top * ld + k], t[k * ld + top]);
             if b.abs() >= c.abs() { (xr[top], xi[k]) = (T::one(), values[top].im / b) } else { (xr[top], xi[k]) = (-values[top].im / c, T::one()) }
-        } else {
-            xr[k] = T::one();
         }
+        else { xr[k] = T::one(); }
         // Rows i to k are solved. Each step solves the row above them, or the 2×2 block that ends there.
         let mut i = top;
         while i > 0 {
@@ -412,28 +364,19 @@ fn quasi_vectors<T: Native>(t: &[T], ld: usize, n: usize, values: &[Complex<T>])
                 let (a, b, c, d) = (at(p, p) - lambda, at(p, q), at(q, p), at(q, q) - lambda);
                 let (rp, rq, det) = (r(p), r(q), raised(a * d - b * c));
                 [(rp * d - b * rq).quotient(det), (a * rq - c * rp).quotient(det)]
-            } else {
-                [r(p).quotient(raised(at(p, p) - lambda)), Complex::new(zero, zero)]
-            };
+            } else { [r(p).quotient(raised(at(p, p) - lambda)), Complex::new(zero, zero)] };
             for (row, x) in (p..p + rows).zip(solved) { (xr[row], xi[row]) = (x.re, x.im) }
             i = p;
             let largest = solved[..rows].iter().fold(zero, |m, x| m.max(x.re.abs()).max(x.im.abs()));
-            if largest > bound {
-                let shrink = largest.recip();
-                for x in xr[i..=k].iter_mut().chain(&mut xi[i..=k]) { *x = *x * shrink }
-            }
+            if largest > bound { let shrink = largest.recip(); for x in xr[i..=k].iter_mut().chain(&mut xi[i..=k]) { *x = *x * shrink } }
         }
-        for row in 0..=k {
-            x[row * n + top] = xr[row];
-            if pair { x[row * n + k] = xi[row] }
-        }
+        for row in 0..=k { x[row * n + top] = xr[row]; if pair { x[row * n + k] = xi[row] } }
         k = top;
     }
     x
 }
 
-/// The eigenvectors that the columns of the real `n`×`n` matrix `v` give, as `quasi_vectors` lays them out for the eigenvalues `values`,
-/// each of unit length.
+/// The eigenvectors that the columns of the real `n`×`n` matrix `v` give, as `quasi_vectors` lays them out for the eigenvalues `values`, each of unit length.
 fn real_units<T: Native>(v: &[T], n: usize, values: &[Complex<T>]) -> Vec<Complex<T>> {
     let zero = T::zero();
     let mut vectors = vec![Complex::new(zero, zero); n * n];
@@ -442,30 +385,23 @@ fn real_units<T: Native>(v: &[T], n: usize, values: &[Complex<T>]) -> Vec<Comple
         let pair = values[j].im != zero;
         let z: Vec<Complex<T>> = (0..n).map(|i| Complex::new(v[i * n + j], if pair { v[i * n + j + 1] } else { zero })).collect();
         let scale = unit(&z);
-        for (i, &x) in z.iter().enumerate() {
-            vectors[i * n + j] = x * scale;
-            if pair { vectors[i * n + j + 1] = (x * scale).conj() }
-        }
+        for (i, &x) in z.iter().enumerate() { vectors[i * n + j] = x * scale; if pair { vectors[i * n + j + 1] = (x * scale).conj() } }
         j += if pair { 2 } else { 1 };
     }
     vectors
 }
 
-/// The factor that scales the vector `z` to unit length. Dividing by the largest modulus before squaring keeps the sum of squares
-/// finite.
+/// The factor that scales the vector `z` to unit length. Dividing by the largest modulus before squaring keeps the sum of squares finite.
 fn unit<R: Native>(z: &[Complex<R>]) -> R {
     let largest = z.iter().fold(R::zero(), |m, x| m.max(x.norm()));
     (largest * z.iter().fold(R::zero(), |s, &x| s + (x / largest).norm_sqr()).sqrt()).recip()
 }
 
-/// Reduces the complex upper Hessenberg matrix `h`, whose rows start `ld` items apart, to upper triangular Schur form by single-shift
-/// QR iterations, as LAPACK's `zlahqr` does, and gives the eigenvalues from its diagonal. `zt` and `wantt` act as in `francis`. Unit
-/// scalings of rows and columns first make each subdiagonal item real. Each iteration keeps them real. `None` where an eigenvalue takes
-/// more than `30 max(10, n)` iterations.
+/// Reduces the complex upper Hessenberg matrix `h`, whose rows start `ld` items apart, to upper triangular Schur form by single-shift QR iterations, as LAPACK's `zlahqr` does, and gives the eigenvalues from its diagonal. `zt` and `wantt` act as in `francis`. Unit scalings of rows and columns first make each subdiagonal item real. Each iteration keeps them real. `None` where an eigenvalue takes more than `30 max(10, n)` iterations.
 fn single_shift<R: Native>(h: &mut [Complex<R>], ld: usize, zt: &mut [Complex<R>], n: usize, wantt: bool) -> Option<Vec<Complex<R>>> {
-    // Applies the similarity `D⁻¹ h D`, where `D` is the identity with the unit factor `d` at position `j`. Row `j`'s items in `columns`
-    // scale by `d̄`. Column `j`'s items in `rows` scale by `d`, as does row `j` of Zᵀ where `zt` isn't empty.
-    fn rescale<R: Native>(h: &mut [Complex<R>], ld: usize, zt: &mut [Complex<R>], n: usize, j: usize, d: Complex<R>, columns: Range<usize>, rows: Range<usize>) {
+    // Applies the similarity `D⁻¹ h D`, where `D` is the identity with the unit factor `d` at position `j`. Row `j`'s items in `columns` scale by `d̄`. Column `j`'s items in `rows` scale by `d`, as does row `j` of Zᵀ where `zt` isn't empty.
+    fn rescale<R: Native>(
+        h: &mut [Complex<R>], ld: usize, zt: &mut [Complex<R>], n: usize, j: usize, d: Complex<R>, columns: Range<usize>, rows: Range<usize>) {
         for c in columns { h[j * ld + c] = h[j * ld + c] * d.conj() }
         for r in rows { h[r * ld + j] = h[r * ld + j] * d }
         if let Some(row) = zt.get_mut(j * n..(j + 1) * n) { for x in row { *x = *x * d } }
@@ -473,7 +409,7 @@ fn single_shift<R: Native>(h: &mut [Complex<R>], ld: usize, zt: &mut [Complex<R>
     let (rzero, rone) = (R::zero(), R::one());
     let zero = Complex::new(rzero, rzero);
     let mut w = vec![zero; n];
-    if n == 0 { return Some(w) }
+    if n == 0 { return Some(w); }
     let (ulp, safmin) = (R::epsilon(), R::min_positive_value());
     let smlnum = safmin * (R::narrow(n as f64) / ulp);
     let (dat1, half) = (R::narrow(0.75), R::narrow(0.5));
@@ -500,12 +436,9 @@ fn single_shift<R: Native>(h: &mut [Complex<R>], ld: usize, zt: &mut [Complex<R>
             let mut k = i;
             while k > l {
                 let sub = h[k * ld + k - 1];
-                if sub.abs1() <= smlnum { break }
+                if sub.abs1() <= smlnum { break; }
                 let mut tst = h[(k - 1) * ld + k - 1].abs1() + h[k * ld + k].abs1();
-                if tst == rzero {
-                    if k >= 2 { tst = tst + h[(k - 1) * ld + k - 2].re.abs() }
-                    if k + 1 < n { tst = tst + h[(k + 1) * ld + k].re.abs() }
-                }
+                if tst == rzero { if k >= 2 { tst = tst + h[(k - 1) * ld + k - 2].re.abs() } if k + 1 < n { tst = tst + h[(k + 1) * ld + k].re.abs() } }
                 // Ahues and Tisseur's conservative test, as LAPACK applies it.
                 if sub.re.abs() <= ulp * tst {
                     let (sub, sup) = (sub.abs1(), h[(k - 1) * ld + k].abs1());
@@ -513,22 +446,18 @@ fn single_shift<R: Native>(h: &mut [Complex<R>], ld: usize, zt: &mut [Complex<R>
                     let (d, e) = (h[k * ld + k].abs1(), (h[(k - 1) * ld + k - 1] - h[k * ld + k]).abs1());
                     let (aa, bb) = (d.max(e), d.min(e));
                     let s = aa + ab;
-                    if ba * (ab / s) <= smlnum.max(ulp * (bb * (aa / s))) { break }
+                    if ba * (ab / s) <= smlnum.max(ulp * (bb * (aa / s))) { break; }
                 }
                 k -= 1;
             }
             l = k;
             if l > 0 { h[l * ld + l - 1] = zero }
-            if l >= i { break }
+            if l >= i { break; }
             its += 1;
-            if its > itmax { return None }
+            if its > itmax { return None; }
             kdefl += 1;
             if !wantt { (i1, i2) = (l, i) }
-            let shift = if kdefl % 20 == 0 {
-                h[i * ld + i] + dat1 * h[i * ld + i - 1].re.abs()
-            } else if kdefl % 10 == 0 {
-                h[l * ld + l] + dat1 * h[(l + 1) * ld + l].re.abs()
-            } else {
+            let shift = if kdefl % 20 == 0 { h[i * ld + i] + dat1 * h[i * ld + i - 1].re.abs() } else if kdefl % 10 == 0 { h[l * ld + l] + dat1 * h[(l + 1) * ld + l].re.abs() } else {
                 // Wilkinson's shift: the eigenvalue of the trailing 2×2 block nearer h[i][i].
                 let t = h[i * ld + i];
                 let u = h[(i - 1) * ld + i].sqrt() * h[i * ld + i - 1].sqrt();
@@ -539,15 +468,11 @@ fn single_shift<R: Native>(h: &mut [Complex<R>], ld: usize, zt: &mut [Complex<R>
                     let s = s.max(sx);
                     let (xs, us) = (x.div_real(s), u.div_real(s));
                     let mut y = (xs * xs + us * us).sqrt() * s;
-                    if sx > rzero {
-                        let unit = x.div_real(sx);
-                        if unit.re * y.re + unit.im * y.im < rzero { y = -y }
-                    }
+                    if sx > rzero { let unit = x.div_real(sx); if unit.re * y.re + unit.im * y.im < rzero { y = -y } }
                     t - u * u.quotient(x + y)
                 }
             };
-            // The sweep starts at the lowest row m where a small subdiagonal item lets it begin without disturbing the rows above. v is
-            // the first column of the shifted matrix there, scaled.
+            // The sweep starts at the lowest row m where a small subdiagonal item lets it begin without disturbing the rows above. v is the first column of the shifted matrix there, scaled.
             let mut m = i - 1;
             let mut v;
             loop {
@@ -556,12 +481,11 @@ fn single_shift<R: Native>(h: &mut [Complex<R>], ld: usize, zt: &mut [Complex<R>
                 let h21 = h[(m + 1) * ld + m].re;
                 let s = h11s.abs1() + h21.abs();
                 v = [h11s.div_real(s), Complex::new(h21 / s, rzero)];
-                if m == l { break }
-                if h[m * ld + m - 1].re.abs() * v[1].re.abs() <= ulp * (v[0].abs1() * (h11.abs1() + h22.abs1())) { break }
+                if m == l { break; }
+                if h[m * ld + m - 1].re.abs() * v[1].re.abs() <= ulp * (v[0].abs1() * (h11.abs1() + h22.abs1())) { break; }
                 m -= 1;
             }
-            // The single-shift sweep: a reflection of order 2 makes a bulge, and each later one chases it down a row. v[1] is real
-            // before each reflection, so t2 is real.
+            // The single-shift sweep: a reflection of order 2 makes a bulge, and each later one chases it down a row. v[1] is real before each reflection, so t2 is real.
             for k in m..i {
                 if k > m { v = [h[k * ld + k - 1], h[(k + 1) * ld + k - 1]] }
                 let t1 = reflector(&mut v);
@@ -604,14 +528,12 @@ fn single_shift<R: Native>(h: &mut [Complex<R>], ld: usize, zt: &mut [Complex<R>
         }
         w[i] = h[i * ld + i];
         kdefl = 0;
-        if i == 0 { return Some(w) }
+        if i == 0 { return Some(w); }
         i -= 1;
     }
 }
 
-/// The eigenvectors of the upper triangular `n`×`n` Schur form `t`, whose rows start `ld` items apart, as the columns of an `n`×`n`
-/// matrix. Column `k` solves `(t - t_kk I) x = 0`, with `x_k = 1` and zeros below it, by back substitution, as LAPACK's `ztrevc`
-/// does. Small divisors raise to `smin`, and large vectors scale down, as in `quasi_vectors`.
+/// The eigenvectors of the upper triangular `n`×`n` Schur form `t`, whose rows start `ld` items apart, as the columns of an `n`×`n` matrix. Column `k` solves `(t - t_kk I) x = 0`, with `x_k = 1` and zeros below it, by back substitution, as LAPACK's `ztrevc` does. Small divisors raise to `smin`, and large vectors scale down, as in `quasi_vectors`.
 fn triangular_vectors<R: Native>(t: &[Complex<R>], ld: usize, n: usize) -> Vec<Complex<R>> {
     let rzero = R::zero();
     let size = (0..n).fold(rzero, |s, i| t[i * ld + i..i * ld + n].iter().fold(s, |s, x| s + x.norm()));
@@ -627,13 +549,9 @@ fn triangular_vectors<R: Native>(t: &[Complex<R>], ld: usize, n: usize) -> Vec<C
             let d = if d.norm() < smin { Complex::new(smin, rzero) } else { d };
             col[p] = (-dot(&t[p * ld + p + 1..p * ld + k + 1], &col[p + 1..=k])).quotient(d);
             let largest = col[p].re.abs().max(col[p].im.abs());
-            if largest > bound {
-                let shrink = largest.recip();
-                for x in &mut col[p..=k] { *x = *x * shrink }
-            }
+            if largest > bound { let shrink = largest.recip(); for x in &mut col[p..=k] { *x = *x * shrink } }
         }
         for row in 0..=k { x[row * n + k] = col[row] }
     }
     x
 }
-

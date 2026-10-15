@@ -1,35 +1,16 @@
-//! The inverse circle functions. `asin` and `acos` reduce as SLEEF's `xasin_u35` and `xacos_u35` do (see `THIRD-PARTY.md`). `atan`
-//! reduces to three intervals, as Cephes' `atan` does. The polynomials are minimax fits.
-use crate::float::{horner, Native};
+//! The inverse circle functions. `asin` and `acos` reduce as SLEEF's `xasin_u35` and `xacos_u35` do (see `THIRD-PARTY.md`). `atan` reduces to three intervals, as Cephes' `atan` does. The polynomials are minimax fits.
+use crate::float::{Native, horner};
 
 /// The coefficients of (asin s - s)/s³ as a polynomial in s², highest degree first, for |s| up to ½.
 const ASIN_64: [f64; 12] = [
-    0.03191217485978631,
-    -0.01622411038464979,
-    0.019528172105463745,
-    0.006528010080512205,
-    0.012169203417632283,
-    0.01388523674904418,
-    0.017359704628917373,
-    0.02237175805979482,
-    0.030381959136550615,
-    0.0446428568283393,
-    0.07500000000337,
-    0.16666666666665408,
+    0.03191217485978631, -0.01622411038464979, 0.019528172105463745, 0.006528010080512205, 0.012169203417632283, 0.01388523674904418, 0.017359704628917373,
+    0.02237175805979482, 0.030381959136550615, 0.0446428568283393, 0.07500000000337, 0.16666666666665408,
 ];
 const ASIN_32: [f64; 5] = [0.04216631501913071, 0.02417951077222824, 0.04547037556767464, 0.07495297491550446, 0.16666752099990845];
 /// The coefficients of (atan u - u)/u³ as a polynomial in u², highest degree first, for |u| up to tan(π/8).
 const ATAN_64: [f64; 10] = [
-    0.02125986000857051,
-    -0.043590968108632014,
-    0.05692539639740812,
-    -0.06641121338420021,
-    0.07690068320282498,
-    -0.09090782414081072,
-    0.1111110665366684,
-    -0.14285714195263532,
-    0.19999999999088985,
-    -0.3333333333333015,
+    0.02125986000857051, -0.043590968108632014, 0.05692539639740812, -0.06641121338420021, 0.07690068320282498, -0.09090782414081072, 0.1111110665366684,
+    -0.14285714195263532, 0.19999999999088985, -0.3333333333333015,
 ];
 const ATAN_32: [f64; 4] = [0.08053722977638245, -0.13877679407596588, 0.19977709650993347, -0.3333294987678528];
 
@@ -73,8 +54,7 @@ pub(crate) fn acos<R: Native, const FUSED: bool>(x: R) -> R {
     if !big { hi - (p - lo) } else if x > R::zero() { p + p } else { (hi + hi) - ((p + p) - (lo + lo)) }
 }
 
-/// atan x. |x| reduces to u with |u| up to tan(π/8): u = |x| up to tan(π/8), u = (|x| - 1)/(|x| + 1) up to tan(3π/8), where
-/// atan |x| = π/4 + atan u, and u = -1/|x| beyond, where atan |x| = π/2 + atan u. One division serves all three.
+/// atan x. |x| reduces to u with |u| up to tan(π/8): u = |x| up to tan(π/8), u = (|x| - 1)/(|x| + 1) up to tan(3π/8), where atan |x| = π/4 + atan u, and u = -1/|x| beyond, where atan |x| = π/2 + atan u. One division serves all three.
 #[inline]
 pub(crate) fn atan<R: Native, const FUSED: bool>(x: R) -> R {
     let t = x.abs();
@@ -90,8 +70,7 @@ pub(crate) fn atan<R: Native, const FUSED: bool>(x: R) -> R {
     (hi + ((u * z).mla::<FUSED>(p, u) + lo)).copysign(x)
 }
 
-/// [`atan2`](crate::atan2), as atan(y/x) in the point's quadrant. It takes the arctangent of the smaller magnitude over the larger,
-/// which never overflows.
+/// [`atan2`](crate::atan2), as atan(y/x) in the point's quadrant. It takes the arctangent of the smaller magnitude over the larger, which never overflows.
 #[inline]
 pub(crate) fn atan2<R: Native, const FUSED: bool>(y: R, x: R) -> R {
     let (ax, ay) = (x.abs(), y.abs());

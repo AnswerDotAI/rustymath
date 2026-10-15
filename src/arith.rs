@@ -1,11 +1,5 @@
-//! Addition, subtraction and multiplication as function objects, at every float, complex and integer type, and the integer
-//! arithmetic they run. No result fails. An integer result wraps to its type, as Rust's wrapping arithmetic and NumPy's integer
-//! arrays do.
-use crate::{
-    float::sealed::Sealed,
-    slice::Total,
-    Abs, Sign,
-};
+//! Addition, subtraction and multiplication as function objects, at every float, complex and integer type, and the integer arithmetic they run. No result fails. An integer result wraps to its type, as Rust's wrapping arithmetic and NumPy's integer arrays do.
+use crate::{Abs, Sign, float::sealed::Sealed, slice::Total};
 use num_complex::Complex;
 
 /// x + y.
@@ -25,10 +19,7 @@ forms!(Add at Complex<f32>, Complex<f64>: |_, [x, y]| Total(x + y));
 forms!(Subtract at Complex<f32>, Complex<f64>: |_, [x, y]| Total(x - y));
 forms!(Multiply at Complex<f32>, Complex<f64>: |_, [x, y]| Total(x * y));
 
-/// An integer type's arithmetic. Each operation that can overflow gives its result wrapped to the type, and whether that is the exact
-/// result, so that a caller with exact integers can take another path. The tests have no branch, so a loop of them vectorizes. The one
-/// exception is a 64-bit product, because no vector instruction gives its 128-bit result. [`Add`], [`Subtract`], [`Multiply`],
-/// [`Abs`](crate::Abs) and [`Sign`](crate::Sign) run these on slices.
+/// An integer type's arithmetic. Each operation that can overflow gives its result wrapped to the type, and whether that is the exact result, so that a caller with exact integers can take another path. The tests have no branch, so a loop of them vectorizes. The one exception is a 64-bit product, because no vector instruction gives its 128-bit result. [`Add`], [`Subtract`], [`Multiply`], [`Abs`](crate::Abs) and [`Sign`](crate::Sign) run these on slices.
 pub trait Overflowing: Copy + Sealed {
     /// x + y.
     fn plus(self, y: Self) -> (Self, bool);
@@ -50,8 +41,7 @@ macro_rules! wide_product {
     }};
 }
 
-/// The signed types' arithmetic. A sum overflows where its sign differs from both arguments'. A difference overflows where the
-/// arguments' signs differ and its sign differs from the first argument's.
+/// The signed types' arithmetic. A sum overflows where its sign differs from both arguments'. A difference overflows where the arguments' signs differ and its sign differs from the first argument's.
 macro_rules! signed {
     ($($t:ty: |$x:ident, $y:ident| $times:expr),+) => {$(
         impl Overflowing for $t {

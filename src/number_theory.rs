@@ -1,14 +1,9 @@
-//! Number theory on unsigned integers: primality, factorisation, next and previous primes, Euler's totient, and the
-//! enumeration and counting of primes.
+//! Number theory on unsigned integers: primality, factorisation, next and previous primes, Euler's totient, and the enumeration and counting of primes.
 //!
-//! Each function on a single integer is generic over [`Natural`], which `u64`, `u128` and `BigUint` implement. A `u128` or
-//! `BigUint` small enough for a narrower type computes in that type. Primality uses the Baillie–PSW test, which no known
-//! composite passes and which has no exceptions below 2^64. Factorisation uses trial division, then Brent's form of
-//! Pollard's rho. `u64` and `u128` compute in Montgomery form, with no allocation.
+//! Each function on a single integer is generic over [`Natural`], which `u64`, `u128` and `BigUint` implement. A `u128` or `BigUint` small enough for a narrower type computes in that type. Primality uses the Baillie–PSW test, which no known composite passes and which has no exceptions below 2^64. Factorisation uses trial division, then Brent's form of Pollard's rho. `u64` and `u128` compute in Montgomery form, with no allocation.
 //!
-//! A function that can run long has a `_with` version, which takes a check as its last argument. It calls the check at
-//! least about once a millisecond, and returns the check's error as soon as it gets one.
-use crate::{ok, BETWEEN_CHECKS};
+//! A function that can run long has a `_with` version, which takes a check as its last argument. It calls the check at least about once a millisecond, and returns the check's error as soon as it gets one.
+use crate::{BETWEEN_CHECKS, ok};
 use num_bigint::BigUint;
 use num_integer::{Integer, Roots};
 use num_traits::{CheckedAdd, ToPrimitive};
@@ -55,10 +50,7 @@ trait Ring {
     fn gcd(&self, a: &Self::E) -> Self::N;
     fn pow(&self, a: &Self::E, e: &Self::N) -> Self::E {
         let mut r = self.elem(1);
-        for i in (0..e.bits()).rev() {
-            r = self.mul(&r, &r);
-            if e.bit(i) { r = self.mul(&r, a); }
-        }
+        for i in (0..e.bits()).rev() { r = self.mul(&r, &r); if e.bit(i) { r = self.mul(&r, a); } }
         r
     }
 }
@@ -78,10 +70,14 @@ macro_rules! montgomery {
             fn new(n: $t) -> Self {
                 // An odd n is its own inverse modulo 8, and each step doubles the number of correct bits.
                 let mut inv = n;
-                for _ in 0..7 { inv = inv.wrapping_mul((2 as $t).wrapping_sub(n.wrapping_mul(inv))); }
+                for _ in 0..7 {
+                    inv = inv.wrapping_mul((2 as $t).wrapping_sub(n.wrapping_mul(inv)));
+                }
                 let one = n.wrapping_neg() % n;
                 let mut ring = Self { n, inv: inv.wrapping_neg(), square: one };
-                for _ in 0..<$t>::BITS { ring.square = ring.add(&ring.square, &ring.square); }
+                for _ in 0..<$t>::BITS {
+                    ring.square = ring.add(&ring.square, &ring.square);
+                }
                 ring
             }
             #[inline]
@@ -95,19 +91,31 @@ macro_rules! montgomery {
         impl Ring for $name {
             type N = $t;
             type E = $t;
-            fn n(&self) -> &$t { &self.n }
-            fn elem(&self, x: u64) -> $t { self.mul(&(<$t>::from(x) % self.n), &self.square) }
+            fn n(&self) -> &$t {
+                &self.n
+            }
+            fn elem(&self, x: u64) -> $t {
+                self.mul(&(<$t>::from(x) % self.n), &self.square)
+            }
             #[inline]
-            fn mul(&self, a: &$t, b: &$t) -> $t { self.redc($wide(*a, *b)) }
+            fn mul(&self, a: &$t, b: &$t) -> $t {
+                self.redc($wide(*a, *b))
+            }
             #[inline]
             fn add(&self, a: &$t, b: &$t) -> $t {
                 let (s, over) = a.overflowing_add(*b);
                 if over || s >= self.n { s.wrapping_sub(self.n) } else { s }
             }
             #[inline]
-            fn sub(&self, a: &$t, b: &$t) -> $t { if a >= b { a - b } else { a.wrapping_sub(*b).wrapping_add(self.n) } }
-            fn half(&self, a: &$t) -> $t { if a % 2 == 0 { a >> 1 } else { (a >> 1) + (self.n >> 1) + 1 } }
-            fn gcd(&self, a: &$t) -> $t { a.gcd(&self.n) }
+            fn sub(&self, a: &$t, b: &$t) -> $t {
+                if a >= b { a - b } else { a.wrapping_sub(*b).wrapping_add(self.n) }
+            }
+            fn half(&self, a: &$t) -> $t {
+                if a % 2 == 0 { a >> 1 } else { (a >> 1) + (self.n >> 1) + 1 }
+            }
+            fn gcd(&self, a: &$t) -> $t {
+                a.gcd(&self.n)
+            }
         }
     };
 }
@@ -130,10 +138,7 @@ impl Ring for Residues {
     fn n(&self) -> &BigUint { &self.0 }
     fn elem(&self, x: u64) -> BigUint { BigUint::from(x) % &self.0 }
     fn mul(&self, a: &BigUint, b: &BigUint) -> BigUint { a * b % &self.0 }
-    fn add(&self, a: &BigUint, b: &BigUint) -> BigUint {
-        let s = a + b;
-        if s >= self.0 { s - &self.0 } else { s }
-    }
+    fn add(&self, a: &BigUint, b: &BigUint) -> BigUint { let s = a + b; if s >= self.0 { s - &self.0 } else { s } }
     fn sub(&self, a: &BigUint, b: &BigUint) -> BigUint { if a >= b { a - b } else { a + &self.0 - b } }
     fn half(&self, a: &BigUint) -> BigUint { if a.is_even() { a >> 1 } else { (a + &self.0) >> 1 } }
     fn gcd(&self, a: &BigUint) -> BigUint { a.gcd(&self.0) }
@@ -144,15 +149,27 @@ macro_rules! primitive {
     ($t:ty, $ring:ident, $narrow:ty, $narrowed:expr) => {
         impl Tier for $t {
             type Narrow = $narrow;
-            fn narrow(&self) -> Option<$narrow> { ($narrowed)(self) }
-            fn widen(x: $narrow) -> $t { x.into() }
-            fn bits(&self) -> u64 { (<$t>::BITS - self.leading_zeros()) as u64 }
-            fn bit(&self, i: u64) -> bool { self >> i & 1 == 1 }
-            fn rem_small(&self, m: u64) -> u64 { (self % m as $t) as u64 }
+            fn narrow(&self) -> Option<$narrow> {
+                ($narrowed)(self)
+            }
+            fn widen(x: $narrow) -> $t {
+                x.into()
+            }
+            fn bits(&self) -> u64 {
+                (<$t>::BITS - self.leading_zeros()) as u64
+            }
+            fn bit(&self, i: u64) -> bool {
+                self >> i & 1 == 1
+            }
+            fn rem_small(&self, m: u64) -> u64 {
+                (self % m as $t) as u64
+            }
             fn probable_prime<E>(n: &$t, check: &mut impl FnMut() -> Result<(), E>) -> Result<bool, E> {
                 baillie_psw(&$ring::new(*n), check)
             }
-            fn divisor<E>(n: &$t, check: &mut impl FnMut() -> Result<(), E>) -> Result<$t, E> { rho(&$ring::new(*n), check) }
+            fn divisor<E>(n: &$t, check: &mut impl FnMut() -> Result<(), E>) -> Result<$t, E> {
+                rho(&$ring::new(*n), check)
+            }
         }
     };
 }
@@ -165,9 +182,7 @@ impl Tier for BigUint {
     fn bits(&self) -> u64 { BigUint::bits(self) }
     fn bit(&self, i: u64) -> bool { BigUint::bit(self, i) }
     fn rem_small(&self, m: u64) -> u64 { (self % m).to_u64().unwrap() }
-    fn probable_prime<E>(n: &BigUint, check: &mut impl FnMut() -> Result<(), E>) -> Result<bool, E> {
-        baillie_psw(&Residues(n.clone()), check)
-    }
+    fn probable_prime<E>(n: &BigUint, check: &mut impl FnMut() -> Result<(), E>) -> Result<bool, E> { baillie_psw(&Residues(n.clone()), check) }
     fn divisor<E>(n: &BigUint, check: &mut impl FnMut() -> Result<(), E>) -> Result<BigUint, E> { rho(&Residues(n.clone()), check) }
 }
 
@@ -181,16 +196,12 @@ fn odd_part<N: Natural>(mut d: N) -> (N, u64) {
     (d, s)
 }
 
-
 /// The Jacobi symbol (a/n) for odd `n`.
 fn jacobi_small(mut a: u64, mut n: u64) -> i32 {
     let mut t = 1;
     a %= n;
     while a != 0 {
-        while a.is_multiple_of(2) {
-            a /= 2;
-            if n % 8 == 3 || n % 8 == 5 { t = -t; }
-        }
+        while a.is_multiple_of(2) { a /= 2; if n % 8 == 3 || n % 8 == 5 { t = -t; } }
         std::mem::swap(&mut a, &mut n);
         if a % 4 == 3 && n % 4 == 3 { t = -t; }
         a %= n;
@@ -210,27 +221,17 @@ fn strong_probable_prime<R: Ring>(ring: &R, d: &R::N, s: u64, base: &R::E) -> bo
     let (one, minus) = (ring.elem(1), ring.sub(&ring.elem(0), &ring.elem(1)));
     let mut x = ring.pow(base, d);
     if x == one || x == minus { return true; }
-    for _ in 1..s {
-        x = ring.mul(&x, &x);
-        if x == minus { return true; }
-    }
+    for _ in 1..s { x = ring.mul(&x, &x); if x == minus { return true; } }
     false
 }
 
-/// Whether `n` is a strong Lucas probable prime, with Selfridge's parameters: the first `D` in 5, -7, 9, -11, … whose Jacobi
-/// symbol is -1, `P = 1` and `Q = (1 - D)/4`. `n` is odd, not a square, and larger than any `D` the search reaches.
+/// Whether `n` is a strong Lucas probable prime, with Selfridge's parameters: the first `D` in 5, -7, 9, -11, … whose Jacobi symbol is -1, `P = 1` and `Q = (1 - D)/4`. `n` is odd, not a square, and larger than any `D` the search reaches.
 fn strong_lucas<R: Ring>(ring: &R) -> bool {
     let n = ring.n();
     let root = n.sqrt();
     if root.clone() * root == *n { return false; }
     let mut d = 5i64;
-    loop {
-        match jacobi(d, n) {
-            -1 => break,
-            0 => return false,
-            _ => d = if d > 0 { -d - 2 } else { 2 - d },
-        }
-    }
+    loop { match jacobi(d, n) { -1 => break, 0 => return false, _ => d = if d > 0 { -d - 2 } else { 2 - d } } }
     let signed = |x: i64| if x < 0 { ring.sub(&ring.elem(0), &ring.elem(x.unsigned_abs())) } else { ring.elem(x as u64) };
     let (d, q) = (signed(d), signed((1 - d) / 4));
     // U and V for successive prefixes of k's bits, from the top: doubling k, then adding 1 where the next bit is set.
@@ -263,8 +264,7 @@ fn baillie_psw<R: Ring, E>(ring: &R, check: &mut impl FnMut() -> Result<(), E>) 
     Ok(strong_lucas(ring))
 }
 
-/// A factor of the odd composite `n` other than 1 and `n`, by Brent's form of Pollard's rho, which takes one gcd for each
-/// batch of 128 steps.
+/// A factor of the odd composite `n` other than 1 and `n`, by Brent's form of Pollard's rho, which takes one gcd for each batch of 128 steps.
 fn rho<R: Ring, E>(ring: &R, check: &mut impl FnMut() -> Result<(), E>) -> Result<R::N, E> {
     let (n, one) = (ring.n(), R::N::from(1));
     for c in 1.. {
@@ -322,10 +322,7 @@ const fn product(xs: &[u64]) -> u64 {
 
 /// A factor of the odd composite `n` other than 1 and `n`, found in the narrowest type `n` fits.
 fn narrow_divisor<N: Natural, E>(n: &N, check: &mut impl FnMut() -> Result<(), E>) -> Result<N, E> {
-    match n.narrow() {
-        Some(x) => Ok(N::widen(narrow_divisor(&x, check)?)),
-        None => N::divisor(n, check),
-    }
+    match n.narrow() { Some(x) => Ok(N::widen(narrow_divisor(&x, check)?)), None => N::divisor(n, check) }
 }
 
 /// Whether `n` is prime.
@@ -337,10 +334,7 @@ pub fn is_prime_with<N: Natural, E>(n: &N, mut check: impl FnMut() -> Result<(),
     N::probable_prime(n, &mut check)
 }
 /// [`is_prime_with`] with no check.
-pub fn is_prime<N: Natural>(n: &N) -> bool {
-    let Ok(p) = is_prime_with(n, ok);
-    p
-}
+pub fn is_prime<N: Natural>(n: &N) -> bool { let Ok(p) = is_prime_with(n, ok); p }
 
 /// The prime factors of `n` in increasing order, each with its multiplicity. `factor(1)` is empty.
 ///
@@ -361,9 +355,7 @@ pub fn factor_with<N: Natural, E>(n: &N, mut check: impl FnMut() -> Result<(), E
     while let Some(m) = pending.pop() {
         check()?;
         if m.is_one() { continue; }
-        if is_prime_with(&m, &mut check)? {
-            found.push(m);
-        } else {
+        if is_prime_with(&m, &mut check)? { found.push(m); } else {
             let d = narrow_divisor(&m, &mut check)?;
             pending.push(m / d.clone());
             pending.push(d);
@@ -371,19 +363,11 @@ pub fn factor_with<N: Natural, E>(n: &N, mut check: impl FnMut() -> Result<(), E
     }
     found.sort_unstable();
     let mut result: Vec<(N, u32)> = Vec::new();
-    for p in found {
-        match result.last_mut() {
-            Some((q, count)) if *q == p => *count += 1,
-            _ => result.push((p, 1)),
-        }
-    }
+    for p in found { match result.last_mut() { Some((q, count)) if *q == p => *count += 1, _ => result.push((p, 1)) } }
     Ok(result)
 }
 /// [`factor_with`] with no check.
-pub fn factor<N: Natural>(n: &N) -> Vec<(N, u32)> {
-    let Ok(f) = factor_with(n, ok);
-    f
-}
+pub fn factor<N: Natural>(n: &N) -> Vec<(N, u32)> { let Ok(f) = factor_with(n, ok); f }
 
 /// The smallest prime above `n`, or `None` if it doesn't fit `N`.
 pub fn next_prime_with<N: Natural, E>(n: &N, mut check: impl FnMut() -> Result<(), E>) -> Result<Option<N>, E> {
@@ -398,10 +382,7 @@ pub fn next_prime_with<N: Natural, E>(n: &N, mut check: impl FnMut() -> Result<(
     }
 }
 /// [`next_prime_with`] with no check.
-pub fn next_prime<N: Natural>(n: &N) -> Option<N> {
-    let Ok(p) = next_prime_with(n, ok);
-    p
-}
+pub fn next_prime<N: Natural>(n: &N) -> Option<N> { let Ok(p) = next_prime_with(n, ok); p }
 
 /// The largest prime below `n`, or `None` if `n` is 2 or less.
 pub fn prev_prime_with<N: Natural, E>(n: &N, mut check: impl FnMut() -> Result<(), E>) -> Result<Option<N>, E> {
@@ -417,10 +398,7 @@ pub fn prev_prime_with<N: Natural, E>(n: &N, mut check: impl FnMut() -> Result<(
     }
 }
 /// [`prev_prime_with`] with no check.
-pub fn prev_prime<N: Natural>(n: &N) -> Option<N> {
-    let Ok(p) = prev_prime_with(n, ok);
-    p
-}
+pub fn prev_prime<N: Natural>(n: &N) -> Option<N> { let Ok(p) = prev_prime_with(n, ok); p }
 
 /// Euler's totient: how many integers from 1 to `n` are coprime to `n`.
 ///
@@ -431,10 +409,7 @@ pub fn totient_with<N: Natural, E>(n: &N, check: impl FnMut() -> Result<(), E>) 
     Ok(factor_with(n, check)?.into_iter().fold(n.clone(), |t, (p, _)| t / p.clone() * (p - N::from(1))))
 }
 /// [`totient_with`] with no check.
-pub fn totient<N: Natural>(n: &N) -> N {
-    let Ok(t) = totient_with(n, ok);
-    t
-}
+pub fn totient<N: Natural>(n: &N) -> N { let Ok(t) = totient_with(n, ok); t }
 
 /// n!, the product of the whole numbers from 1 to `n`.
 pub fn factorial_with<E>(n: u64, mut check: impl FnMut() -> Result<(), E>) -> Result<BigUint, E> {
@@ -447,15 +422,11 @@ pub fn factorial_with<E>(n: u64, mut check: impl FnMut() -> Result<(), E>) -> Re
 }
 
 /// [`factorial_with`] with no check.
-pub fn factorial(n: u64) -> BigUint {
-    let Ok(p) = factorial_with(n, ok);
-    p
-}
+pub fn factorial(n: u64) -> BigUint { let Ok(p) = factorial_with(n, ok); p }
 
 /// The primes below 7. The sieve stores only numbers that none of them divide, so it gives these separately.
 const WHEEL: [u64; 3] = [2, 3, 5];
-/// The residues modulo 30 of the numbers that `WHEEL`'s primes don't divide. A segment has one byte for each 30 numbers.
-/// In byte `b`, bit `j` stands for the number `30b + RESIDUES[j]` past the segment's start.
+/// The residues modulo 30 of the numbers that `WHEEL`'s primes don't divide. A segment has one byte for each 30 numbers. In byte `b`, bit `j` stands for the number `30b + RESIDUES[j]` past the segment's start.
 const RESIDUES: [u64; 8] = [1, 7, 11, 13, 17, 19, 23, 29];
 /// The bit that stands for `x mod 30` in its byte, for `x` coprime to 30.
 const BIT: [u8; 30] = {
@@ -481,17 +452,13 @@ const PERIOD: u64 = product(&PRESIEVED);
 fn pattern() -> &'static [u8] {
     static PATTERN: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     PATTERN.get_or_init(|| {
-        (0..BYTES as u64 + PERIOD)
-            .map(|b| (0..8).filter(|&j| PRESIEVED.iter().all(|p| (30 * b + RESIDUES[j]) % p != 0)).fold(0, |m, j| m | 1 << j))
-            .collect()
+        (0..BYTES as u64 + PERIOD).map(|b| (0..8).filter(|&j| PRESIEVED.iter().all(|p| (30 * b + RESIDUES[j]) % p != 0)).fold(0, |m, j| m | 1 << j)).collect()
     })
 }
 
-/// The primes from a given number upward, found a segment at a time by a sieve of Eratosthenes. A segment stores only the
-/// numbers that 2, 3 and 5 don't divide, and starts from a copy of the pattern that multiples of `PRESIEVED` leave.
+/// The primes from a given number upward, found a segment at a time by a sieve of Eratosthenes. A segment stores only the numbers that 2, 3 and 5 don't divide, and starts from a copy of the pattern that multiples of `PRESIEVED` leave.
 ///
-/// Sieving numbers near n needs the primes below √n, which `Primes` finds first. A start far above 2^40 therefore costs
-/// memory in proportion to its square root. `next_prime` suits that range better.
+/// Sieving numbers near n needs the primes below √n, which `Primes` finds first. A start far above 2^40 therefore costs memory in proportion to its square root. `next_prime` suits that range better.
 pub struct Primes {
     /// Where the current segment starts, a multiple of 30.
     lo: u64,
@@ -516,17 +483,8 @@ impl Primes {
     /// The primes from `start` upward.
     pub fn new(start: u64) -> Self {
         let lo = start / 30 * 30;
-        Self {
-            lo,
-            next: Some(lo),
-            bytes: Vec::new(),
-            at: 0,
-            skip: RESIDUES.iter().filter(|&&r| lo + r < start).count(),
-            sieving: Vec::new(),
-            limit: 1,
-            size: FIRST,
-            wheel: WHEEL.iter().filter(|&&p| p < start).count(),
-        }
+        Self { lo, next: Some(lo), bytes: Vec::new(), at: 0, skip: RESIDUES.iter().filter(|&&r| lo + r < start).count(), sieving: Vec::new(), limit: 1,
+            size: FIRST, wheel: WHEEL.iter().filter(|&&p| p < start).count() }
     }
 
     fn sieve(&mut self) {
@@ -555,17 +513,10 @@ impl Primes {
                 }
             }
         }
-        if lo == 0 {
-            bytes[0] &= !BIT[1];
-            for p in PRESIEVED { bytes[0] |= BIT[p as usize]; }
-        }
+        if lo == 0 { bytes[0] &= !BIT[1]; for p in PRESIEVED { bytes[0] |= BIT[p as usize]; } }
         let top = u64::MAX - lo;
         if top < 30 * len as u64 {
-            for b in (top / 30) as usize..len {
-                for (j, r) in RESIDUES.into_iter().enumerate() {
-                    if 30 * b as u64 + r > top { bytes[b] &= !(1 << j); }
-                }
-            }
+            for b in (top / 30) as usize..len { for (j, r) in RESIDUES.into_iter().enumerate() { if 30 * b as u64 + r > top { bytes[b] &= !(1 << j); } } }
         }
         let next = lo.checked_add(30 * len as u64);
         (self.lo, self.next, self.at, self.skip, self.size) = (lo, next, self.skip, 0, (2 * len).min(BYTES));
@@ -614,14 +565,8 @@ impl Primes {
 
 impl Iterator for Primes {
     type Item = u64;
-    fn next(&mut self) -> Option<u64> {
-        let Ok(p) = self.next_with(ok);
-        p
-    }
-    fn nth(&mut self, k: usize) -> Option<u64> {
-        let Ok(p) = self.nth_with(k as u64, ok);
-        p
-    }
+    fn next(&mut self) -> Option<u64> { let Ok(p) = self.next_with(ok); p }
+    fn nth(&mut self, k: usize) -> Option<u64> { let Ok(p) = self.nth_with(k as u64, ok); p }
 }
 
 /// How many primes are below `n`.
@@ -641,10 +586,7 @@ pub fn prime_count_with<E>(n: u64, mut check: impl FnMut() -> Result<(), E>) -> 
     Ok(count)
 }
 /// [`prime_count_with`] with no check.
-pub fn prime_count(n: u64) -> u64 {
-    let Ok(c) = prime_count_with(n, ok);
-    c
-}
+pub fn prime_count(n: u64) -> u64 { let Ok(c) = prime_count_with(n, ok); c }
 
 /// The odd primes below `limit`, by a plain sieve.
 fn odd_primes_below(limit: u64) -> Vec<u64> {

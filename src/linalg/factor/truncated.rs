@@ -6,20 +6,12 @@ const OVERSAMPLE: usize = 10;
 /// Power iterations in `truncated_factor`. Each multiplies by `aᴴ` and `a` once more, which separates slowly decaying singular values.
 const POWERS: usize = 2;
 
-/// `truncated_svd` for `T`: an approximation to the `k` largest singular values of the `m`×`n` matrix `a` and their singular vectors,
-/// by Halko, Martinsson and Tropp's randomized range finder. `a` times `k + OVERSAMPLE` pseudorandom columns spans a space close to
-/// that of the leading left singular vectors. `POWERS` power iterations refine it, with a thin QR factorization after each product.
-/// The SVD of `a` projected onto that space gives the result. Where
-/// `k + OVERSAMPLE` reaches `a`'s smaller side, the result is the thin SVD's first `k` columns. A matrix holding a NaN or an infinity
-/// gives NaN for every result.
-pub(super) fn truncated_factor<T: Tiled>(a: &[T], [m, n]: [usize; 2], k: usize) -> Svd<T>
-where
-    T::Real: Tiled<Real = T::Real>,
-{
+/// `truncated_svd` for `T`: an approximation to the `k` largest singular values of the `m`×`n` matrix `a` and their singular vectors, by Halko, Martinsson and Tropp's randomized range finder. `a` times `k + OVERSAMPLE` pseudorandom columns spans a space close to that of the leading left singular vectors. `POWERS` power iterations refine it, with a thin QR factorization after each product. The SVD of `a` projected onto that space gives the result. Where `k + OVERSAMPLE` reaches `a`'s smaller side, the result is the thin SVD's first `k` columns. A matrix holding a NaN or an infinity gives NaN for every result.
+pub(super) fn truncated_factor<T: Tiled>(a: &[T], [m, n]: [usize; 2], k: usize) -> Svd<T> where T::Real: Tiled<Real = T::Real> {
     assert_eq!(a.len(), m * n, "`a` must hold `m`×`n` items");
     let p = m.min(n);
     let (k, l) = (k.min(p), (k + OVERSAMPLE).min(p));
-    if l == p { return leading(svd_factor(a, [m, n], true), k) }
+    if l == p { return leading(svd_factor(a, [m, n], true), k); }
     // A wide matrix works on its conjugate transpose, through a view, and swaps U and V at the end: aᴴ = V Σ Uᴴ.
     let wide = m < n;
     let (view, [rows, cols]) = if wide { (Matrix::rows(a, n).adjoint(), [n, m]) } else { (Matrix::rows(a, n), [m, n]) };
@@ -35,14 +27,10 @@ where
     leading(Svd::new([m, n], u, s, v), k)
 }
 
-/// The first `k` singular values of `svd`, with their singular vectors. A vector that keeps less than half its columns releases its
-/// spare capacity.
+/// The first `k` singular values of `svd`, with their singular vectors. A vector that keeps less than half its columns releases its spare capacity.
 fn leading<T: Scalar>(Svd { size: [m, n], mut u, mut s, mut v, .. }: Svd<T>, k: usize) -> Svd<T> {
     let p = s.len();
-    for (x, rows) in [(&mut u, m), (&mut v, n)] {
-        compact(x, [rows, k], p);
-        if 2 * k < p { x.shrink_to_fit() }
-    }
+    for (x, rows) in [(&mut u, m), (&mut v, n)] { compact(x, [rows, k], p); if 2 * k < p { x.shrink_to_fit() } }
     s.truncate(k);
     Svd::new([m, n], u, s, v)
 }

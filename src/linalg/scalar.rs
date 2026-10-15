@@ -1,15 +1,10 @@
-//! The item types of the matrices that `factor` decomposes: `f32`, `f64`, and complex numbers with parts of either type. Each
-//! decomposition is written once for all of them. Where a real algorithm transposes, a complex one also conjugates. Real quantities,
-//! such as norms, the sizes of pivots and singular values, have the parts' type.
-use crate::{float::{sealed::Sealed, FUSED}, Native};
+//! The item types of the matrices that `factor` decomposes: `f32`, `f64`, and complex numbers with parts of either type. Each decomposition is written once for all of them. Where a real algorithm transposes, a complex one also conjugates. Real quantities, such as norms, the sizes of pivots and singular values, have the parts' type.
+use crate::{Native, float::{FUSED, sealed::Sealed}};
 use num_complex::Complex;
 use num_traits::{One, Zero};
 use std::ops::{Add, Mul, Neg, Sub};
 
-/// A real or complex number that the decompositions take: `f32`, `f64`, or a complex number with parts of either type. rustymath
-/// implements it for those four types, and no other crate can. For a real type each method is the plain operation, and the generic
-/// algorithms give the same real results as algorithms written for reals alone. The trait has no `/`. Quotients go through `quotient`
-/// and `reciprocal`, which keep a complex quotient from overflowing where its result fits.
+/// A real or complex number that the decompositions take: `f32`, `f64`, or a complex number with parts of either type. rustymath implements it for those four types, and no other crate can. For a real type each method is the plain operation, and the generic algorithms give the same real results as algorithms written for reals alone. The trait has no `/`. Quotients go through `quotient` and `reciprocal`, which keep a complex quotient from overflowing where its result fits.
 pub trait Scalar:
     Sealed + Copy + PartialEq + Zero + One + Add<Output = Self> + Sub<Output = Self> + Mul<Output = Self> + Neg<Output = Self> + Send + Sync
 {
@@ -28,8 +23,7 @@ pub trait Scalar:
     /// `self × b + c`, each multiply-add rounding once where `FUSED` is true, as `Core::mla` does.
     fn mul_acc(self, b: Self, c: Self) -> Self;
     fn reciprocal(self) -> Self;
-    /// `self / d`. A complex quotient halves operands near overflow and scales up operands near underflow, by powers of two, as Baudin
-    /// and Smith's form of Smith's algorithm does. It then applies Smith's formula.
+    /// `self / d`. A complex quotient halves operands near overflow and scales up operands near underflow, by powers of two, as Baudin and Smith's form of Smith's algorithm does. It then applies Smith's formula.
     fn quotient(self, d: Self) -> Self;
 }
 
@@ -95,8 +89,7 @@ impl<T: Native> Scalar for Complex<T> {
         if ys >= big { (y, scale) = (y.div_real(two), scale / two) }
         if xs <= small { (x, scale) = (x.mul_real(up), scale / up) }
         if ys <= small { (y, scale) = (y.mul_real(up), scale * up) }
-        // (a + bi) / (c + di) for |d| ≤ |c|, as its real and imaginary parts. Where `d / c` underflows to 0, the parts use `b / c` and
-        // `a / c` instead.
+        // (a + bi) / (c + di) for |d| ≤ |c|, as its real and imaginary parts. Where `d / c` underflows to 0, the parts use `b / c` and `a / c` instead.
         let smith = |a: T, b: T, c: T, d: T| {
             let r = d / c;
             let s = c + d * r;

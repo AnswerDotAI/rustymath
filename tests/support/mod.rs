@@ -1,5 +1,5 @@
-use std::convert::Infallible;
 use rand::TryRng;
+use std::convert::Infallible;
 
 /// SplitMix64's output at index `i`, shared by the tests' sampled inputs.
 pub fn random(i: u64) -> u64 {
@@ -21,7 +21,5 @@ impl TryRng for Seeded {
         self.0 = self.0.wrapping_add(1);
         Ok(value)
     }
-    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Infallible> {
-        rand::rand_core::utils::fill_bytes_via_next_word(dst, || self.try_next_u64())
-    }
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Infallible> { rand::rand_core::utils::fill_bytes_via_next_word(dst, || self.try_next_u64()) }
 }

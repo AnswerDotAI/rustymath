@@ -1,5 +1,4 @@
-//! Arithmetic on a type whose operators take references, as `num_traits::NumAssignRef` gives them, such as `BigRational`. Each
-//! function returns a new value, and clones only the operand it starts from.
+//! Arithmetic on a type whose operators take references, as `num_traits::NumAssignRef` gives them, such as `BigRational`. Each function returns a new value, and clones only the operand it starts from.
 use num_traits::NumAssignRef;
 
 /// `-x`, for a `T` whose operations include no negation.

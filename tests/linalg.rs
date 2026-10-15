@@ -2,15 +2,11 @@
 pub mod support;
 
 use num_complex::Complex;
-use rustymath::{linalg::*, Native};
+use rustymath::{Native, linalg::*};
 
-fn identity<T: num_traits::Zero + num_traits::One>(n: usize) -> Vec<T> {
-    (0..n * n).map(|k| if k % (n + 1) == 0 { T::one() } else { T::zero() }).collect()
-}
+fn identity<T: num_traits::Zero + num_traits::One>(n: usize) -> Vec<T> { (0..n * n).map(|k| if k % (n + 1) == 0 { T::one() } else { T::zero() }).collect() }
 
-fn transpose<T: Copy>(a: &[T], m: usize, n: usize) -> Vec<T> {
-    (0..m * n).map(|k| a[k % m * n + k / m]).collect()
-}
+fn transpose<T: Copy>(a: &[T], m: usize, n: usize) -> Vec<T> { (0..m * n).map(|k| a[k % m * n + k / m]).collect() }
 
 fn adjoint<T: Scalar>(a: &[T], m: usize, n: usize) -> Vec<T> { transpose(a, m, n).into_iter().map(T::conj).collect() }
 mod products {
@@ -28,8 +24,7 @@ mod products {
 
     #[test]
     fn products_match_folds_in_order() {
-        // The sizes leave partial tiles, give no steps or a single one, and cross each block size. Small whole numbers keep every
-        // float sum exact, in any order.
+        // The sizes leave partial tiles, give no steps or a single one, and cross each block size. Small whole numbers keep every float sum exact, in any order.
         let sizes = [[0, 3, 4], [3, 0, 4], [3, 4, 0], [1, 1, 1], [5, 7, 9], [MC + 3, KC + 5, 37], [17, 3, NC + 5]];
         for size @ [m, k, n] in sizes {
             let a64: Vec<f64> = (0..m * k).map(|i| (i * 7 % 17) as f64 - 8.0).collect();
@@ -49,8 +44,7 @@ mod products {
             assert_eq!(OrAnd.inner(&ab, &bb, size), folded(&ab, &bb, size, false, |s, x, y| s | (x & y)));
             assert_eq!(AndOr.inner(&ab, &bb, size), folded(&ab, &bb, size, true, |s, x, y| s & (x | y)));
             let (ai, bi): (Vec<i64>, Vec<i64>) = (a64.iter().map(|&x| x as i64).collect(), b64.iter().map(|&x| x as i64).collect());
-            // Items too large for 32 bits take `+.=`'s 64-bit kernel. Items that fit 32 bits but no window of 2^16 values take its 32-bit
-            // kernel. Small items, and items in a narrow window far from 0, take its 16-bit kernel.
+            // Items too large for 32 bits take `+.=`'s 64-bit kernel. Items that fit 32 bits but no window of 2^16 values take its 32-bit kernel. Small items, and items in a narrow window far from 0, take its 16-bit kernel.
             let (wa, wb): (Vec<i64>, Vec<i64>) = (ai.iter().map(|&x| x << 40).collect(), bi.iter().map(|&x| x << 40).collect());
             let (ma, mb): (Vec<i64>, Vec<i64>) = (ai.iter().map(|&x| x << 20).collect(), bi.iter().map(|&x| x << 20).collect());
             let (fa, fb): (Vec<i64>, Vec<i64>) = (ai.iter().map(|&x| x - (1 << 50)).collect(), bi.iter().map(|&x| x - (1 << 50)).collect());
@@ -73,9 +67,7 @@ mod products {
 
     #[test]
     fn integer_products_match_wrapping_folds() {
-        // Each pair of scales for `a` and `b` reaches one path. `+.×` runs at f32, f64, then i64 twice, the last time overflowing.
-        // `⌈.+` and `⌊.+` run at f32 twice, then f64, then i64, overflowing. Odd scales give products that a narrower path would
-        // round, where a power of two would keep them exact.
+        // Each pair of scales for `a` and `b` reaches one path. `+.×` runs at f32, f64, then i64 twice, the last time overflowing. `⌈.+` and `⌊.+` run at f32 twice, then f64, then i64, overflowing. Odd scales give products that a narrower path would round, where a power of two would keep them exact.
         let scales = [(1, 1), (4097, 4093), ((1 << 22) + 1, (1 << 22) + 3), ((1 << 59) + 1, (1 << 60) + 1)];
         for (sa, sb) in scales {
             for size @ [m, k, n] in [[0, 3, 4], [3, 0, 4], [3, 4, 0], [5, 7, 9], [MC + 3, KC + 5, 37]] {
@@ -97,9 +89,7 @@ mod products {
 
     #[test]
     fn finite_complex_products_match_four_products() {
-        // Finite inputs can overflow 3M's intermediates where four real products give finite parts. `s` overflows for x(1+i)
-        // squared with x² above a quarter of the largest float. Its sum `aᵣ + aᵢ` overflows at max(1+i).
-        // The values keep every product exact, so `*`, which forms four real products, gives each result's bits.
+        // Finite inputs can overflow 3M's intermediates where four real products give finite parts. `s` overflows for x(1+i) squared with x² above a quarter of the largest float. Its sum `aᵣ + aᵢ` overflows at max(1+i). The values keep every product exact, so `*`, which forms four real products, gives each result's bits.
         macro_rules! check {
             ($r:ty, $x:expr) => {{
                 let (c, x, max) = (Complex::<$r>::new, $x, <$r>::MAX);
@@ -120,17 +110,18 @@ mod products {
 
     #[test]
     fn nan_terms_stay_in_their_rows() {
-        // Rows 0 and 3 each have a NaN term, in the first step and in a later one. The other rows stay finite on every target. Where
-        // the target's maximum and minimum keep NaN, on AArch64 and in wasm, rows 0 and 3 are NaN.
+        // Rows 0 and 3 each have a NaN term, in the first step and in a later one. The other rows stay finite on every target. Where the target's maximum and minimum keep NaN, on AArch64 and in wasm, rows 0 and 3 are NaN.
         let size @ [m, k, n] = [9, 300, 11];
         let mut a: Vec<f64> = (0..m * k).map(|i| (i % 23) as f64).collect();
         let b: Vec<f64> = (0..k * n).map(|i| (i % 19) as f64).collect();
         (a[0], a[3 * k + 280]) = (f64::NAN, f64::NAN);
         let keeps = cfg!(any(target_arch = "aarch64", target_arch = "wasm32"));
-        let check = |c: &[f64]| for (i, row) in c.chunks(n).enumerate() {
-            let nan = i == 0 || i == 3;
-            if nan && !keeps { continue }
-            assert!(row.iter().all(|x| x.is_nan() == nan), "row {i}: {row:?}")
+        let check = |c: &[f64]| {
+            for (i, row) in c.chunks(n).enumerate() {
+                let nan = i == 0 || i == 3;
+                if nan && !keeps { continue; }
+                assert!(row.iter().all(|x| x.is_nan() == nan), "row {i}: {row:?}")
+            }
         };
         for c in [MaxPlus.inner(&a, &b, size), MinPlus.inner(&a, &b, size)] { check(&c) }
         let a32: Vec<f32> = a.iter().map(|&x| x as f32).collect();
@@ -180,8 +171,7 @@ mod factor {
         distance(&product(&qt, q, [cols, rows, cols]), &identity(cols), 1.0)
     }
 
-    /// Checks that `u`, `s` and `v` form an SVD of the `m`×`c` matrix `a`: a residual below `bound` relative to `a`'s norm, and U
-    /// and V orthonormal to within four times `bound`.
+    /// Checks that `u`, `s` and `v` form an SVD of the `m`×`c` matrix `a`: a residual below `bound` relative to `a`'s norm, and U and V orthonormal to within four times `bound`.
     fn check_svd(a: &[f64], [m, c]: [usize; 2], u: &[f64], s: &[f64], v: &[f64], bound: f64, what: &str) {
         let p = s.len();
         let us: Vec<f64> = (0..m * p).map(|k| u[k] * s[k % p]).collect();
@@ -211,7 +201,8 @@ mod factor {
             let inverse = wide(&f.inverse());
             assert!(distance(&product(&aw, &inverse, [n; 3]), &identity(n), (norm(&aw) * norm(&inverse)).max(1.0)) < bound, "inverse at {n}");
             // Cholesky of a positive definite matrix, and none of one that isn't.
-            let spd: Vec<T> = product(&aw, &transpose(&aw, n, n), [n; 3]).iter().enumerate().map(|(k, &v)| T::narrow(v + if k % (n + 1) == 0 { n as f64 } else { 0.0 })).collect();
+            let spd: Vec<T> = product(&aw, &transpose(&aw, n, n), [n; 3]).iter().enumerate()
+                .map(|(k, &v)| T::narrow(v + if k % (n + 1) == 0 { n as f64 } else { 0.0 })).collect();
             let l = wide(&cholesky(&spd, n).expect("a positive definite matrix"));
             assert!((0..n * n).all(|k| k % n <= k / n || l[k] == 0.0), "cholesky's upper triangle at {n}");
             assert!(distance(&product(&l, &transpose(&l, n, n), [n; 3]), &wide(&spd), norm(&wide(&spd)).max(1.0)) < bound, "cholesky at {n}");
@@ -258,13 +249,17 @@ mod factor {
         let f = svd(&a, [n, n]);
         assert!(f.s[n - 1].wide() <= tolerance * f.s[0].wide(), "a zero column's singular value");
         assert!(orthogonality(&wide(&f.u), n, n) < tolerance * n as f64, "u with a zero column");
-        // A bidiagonal matrix with a zero on its diagonal reaches the QR algorithm unchanged, which rotates that row's superdiagonal
-        // item away before it iterates.
+        // A bidiagonal matrix with a zero on its diagonal reaches the QR algorithm unchanged, which rotates that row's superdiagonal item away before it iterates.
         let (d, e) = ([3.0, 0.0, 2.0, 0.5, 1.0], [1.0, 1.0, 0.25, 2.0]);
-        let b: Vec<T> = (0..25).map(|k| T::narrow(match (k / 5, k % 5) { (i, j) if i == j => d[i], (i, j) if j == i + 1 => e[i], _ => 0.0 })).collect();
+        let b: Vec<T> = (0..25).map(|k| {
+            T::narrow(match (k / 5, k % 5) { (i, j) if i == j => d[i], (i, j) if j == i + 1 => e[i], _ => 0.0 })
+        }).collect();
         let f = svd(&b, [5, 5]);
         let us: Vec<f64> = (0..25).map(|k| wide(&f.u)[k] * wide(&f.s)[k % 5]).collect();
-        assert!(distance(&product(&us, &transpose(&wide(&f.v), 5, 5), [5; 3]), &wide(&b), norm(&wide(&b))) < 8.0 * tolerance, "svd of a bidiagonal with a zero");
+        assert!(
+            distance(&product(&us, &transpose(&wide(&f.v), 5, 5), [5; 3]), &wide(&b), norm(&wide(&b))) < 8.0 * tolerance,
+            "svd of a bidiagonal with a zero"
+        );
         assert!(orthogonality(&wide(&f.u), 5, 5) < 8.0 * tolerance, "u of a bidiagonal with a zero");
     }
 
@@ -278,16 +273,14 @@ mod factor {
         solves_and_determinants::<f32>(4.0 * f32::EPSILON as f64);
     }
 
-    /// Checks the decompositions at `T` on LAPACK's hard matrix types, where `tolerance` is a few times `T`'s epsilon. A matrix scaled
-    /// by a power of two near underflow or overflow gives LU, Cholesky and QR factors scaled exactly in step, and singular values and a
-    /// least-squares solution that match to rounding. Its singular vectors pass their own residual and orthogonality checks. A zero
-    /// column gives finite LU factors with a zero pivot. A subnormal pivot gives finite multipliers.
+    /// Checks the decompositions at `T` on LAPACK's hard matrix types, where `tolerance` is a few times `T`'s epsilon. A matrix scaled by a power of two near underflow or overflow gives LU, Cholesky and QR factors scaled exactly in step, and singular values and a least-squares solution that match to rounding. Its singular vectors pass their own residual and orthogonality checks. A zero column gives finite LU factors with a zero pivot. A subnormal pivot gives finite multipliers.
     fn hard_matrices<T: RealItem>(tolerance: f64) {
         let n = 40;
         let tiny = T::min_positive_value() / T::epsilon();
         let (a, b) = (random::<T>(n, n, 17), random::<T>(n, 3, 19));
         let aw = wide(&a);
-        let spd: Vec<T> = product(&aw, &transpose(&aw, n, n), [n; 3]).iter().enumerate().map(|(k, &v)| T::narrow(v + if k % (n + 1) == 0 { n as f64 } else { 0.0 })).collect();
+        let spd: Vec<T> = product(&aw, &transpose(&aw, n, n), [n; 3]).iter().enumerate()
+            .map(|(k, &v)| T::narrow(v + if k % (n + 1) == 0 { n as f64 } else { 0.0 })).collect();
         // Fourth powers of items scaled by `quartic` overflow, though sums of their squares don't, so `safe_scale` leaves them alone.
         let quartic = T::narrow(2f64.powi((T::max_value().log2().wide() / 4.0) as i32 + 6));
         // On macOS the SVD and least squares go through LAPACK, whose own scaling matches a scaled copy's results only to rounding.
@@ -329,8 +322,7 @@ mod factor {
         assert_eq!(lu(&[p, T::one(), q, T::one()], 2).factors, [p, q / p, T::one(), T::one() - q / p], "lu with a subnormal pivot");
     }
 
-    /// Checks `solve`, `pinv`, `qr_complete`, the determinants and `hermitian_eigenvalues` at `T`, where `tolerance` is a few times
-    /// `T`'s epsilon. The singular matrices repeat columns, so their rank is exact.
+    /// Checks `solve`, `pinv`, `qr_complete`, the determinants and `hermitian_eigenvalues` at `T`, where `tolerance` is a few times `T`'s epsilon. The singular matrices repeat columns, so their rank is exact.
     fn solves_and_determinants<T: RealItem>(tolerance: f64) {
         let bound = 64.0 * tolerance;
         let base = random::<T>(9, 4, 7);
@@ -378,8 +370,7 @@ mod factor {
         }
     }
 
-    /// Checks LU, Cholesky and QR at `T` on matrices large enough for the wider blocks, each leaving a partial last block, where
-    /// `tolerance` is a few times `T`'s epsilon. Products with random vectors keep each check to O(n²) time.
+    /// Checks LU, Cholesky and QR at `T` on matrices large enough for the wider blocks, each leaving a partial last block, where `tolerance` is a few times `T`'s epsilon. Products with random vectors keep each check to O(n²) time.
     fn blocked<T: RealItem>(tolerance: f64) {
         let times = |a: &[f64], v: &[f64]| product(a, v, [a.len() / v.len(), v.len(), 1]);
         for n in [530, 1030] {
@@ -421,7 +412,10 @@ mod factor {
             let b = random::<T>(rows, k, 13);
             let (x, _) = lstsq(&a, &b, [rows, n], k);
             let bw = wide(&b);
-            assert!(distance(&product(&r, &wide(&x), [n, n, k]), &product(&qt, &bw, [n, rows, k]), norm(&bw)) < tolerance * n as f64, "lstsq's Qᴴ b at {rows}×{n}×{k}");
+            assert!(
+                distance(&product(&r, &wide(&x), [n, n, k]), &product(&qt, &bw, [n, rows, k]), norm(&bw)) < tolerance * n as f64,
+                "lstsq's Qᴴ b at {rows}×{n}×{k}"
+            );
         }
     }
 
@@ -438,9 +432,7 @@ mod factor {
         PlusTimes.inner(&us, &transpose(&v, n, n), [m, n, n])
     }
 
-    /// QR, least squares and the SVD of tall matrices, with condition numbers from 1 to `worst`, which Cholesky QR factors, and `beyond`,
-    /// which falls back to Householder QR. Each matrix's singular values run from 1 down to 1/condition. Its first item is positive, so
-    /// R's first item is positive on the Cholesky path and negative on Householder's.
+    /// QR, least squares and the SVD of tall matrices, with condition numbers from 1 to `worst`, which Cholesky QR factors, and `beyond`, which falls back to Householder QR. Each matrix's singular values run from 1 down to 1/condition. Its first item is positive, so R's first item is positive on the Cholesky path and negative on Householder's.
     fn tall<T: RealItem>(tolerance: f64, worst: f64, beyond: f64) {
         let tiny = T::min_positive_value() / T::epsilon();
         let quartic = T::narrow(2f64.powi((T::max_value().log2().wide() / 4.0) as i32 + 6));
@@ -456,7 +448,11 @@ mod factor {
                 let (q, r) = qr(&a, [m, n]);
                 let (qw, rw) = (wide(&q), wide(&r));
                 assert_eq!(rw[0] > 0.0, condition < beyond, "qr's path at {at}");
-                assert!(distance(&product(&qw, &rw, [m, n, n]), &aw, norm(&aw)) < bound, "tall qr at {at}: {:e} of {bound:e}", distance(&product(&qw, &rw, [m, n, n]), &aw, norm(&aw)));
+                assert!(
+                    distance(&product(&qw, &rw, [m, n, n]), &aw, norm(&aw)) < bound,
+                    "tall qr at {at}: {:e} of {bound:e}",
+                    distance(&product(&qw, &rw, [m, n, n]), &aw, norm(&aw))
+                );
                 assert!(orthogonality(&qw, m, n) < bound, "tall qr's q at {at}: {:e} of {bound:e}", orthogonality(&qw, m, n));
                 assert!((0..n * n).all(|k| k % n >= k / n || rw[k] == 0.0), "tall qr's r at {at}");
                 // `lstsq` leaves its residual orthogonal to A's columns, and gives A's singular values.
@@ -477,8 +473,7 @@ mod factor {
                 assert!(orthogonality(&uw, m, n) < 4.0 * bound, "tall svd's u at {at}");
                 assert!(distance(&sw, &s, 1.0) < bound, "tall svd's singular values at {at}");
             }
-            // Scaling by a power of two scales R exactly, and the singular values to rounding. Unlike R of a matrix with orthonormal
-            // columns, a random matrix's R has no items small enough to lose bits as subnormals when scaled down.
+            // Scaling by a power of two scales R exactly, and the singular values to rounding. Unlike R of a matrix with orthonormal columns, a random matrix's R has no items small enough to lose bits as subnormals when scaled down.
             let (a, b) = (random::<T>(m, n, 7), random::<T>(m, 2, 13));
             let ((q, r), (x, sv)) = (qr(&a, [m, n]), lstsq(&a, &b, [m, n], 2));
             for c in [tiny, tiny.recip(), quartic] {
@@ -515,8 +510,7 @@ mod factor {
         assert!(distance(&sv, &s, 1.0) < bound, "wide tall lstsq's singular values");
     }
 
-    /// The truncated SVD of matrices whose singular values decay fast and slowly: its values at or just below the ones they estimate, its
-    /// vectors orthonormal, and its error within 10% of the best rank-`k` approximation's.
+    /// The truncated SVD of matrices whose singular values decay fast and slowly: its values at or just below the ones they estimate, its vectors orthonormal, and its error within 10% of the best rank-`k` approximation's.
     fn truncated<T: RealItem>(tolerance: f64) {
         let (m, n, k) = (2000, 300, 10);
         let bound = tolerance * n as f64;
@@ -575,12 +569,8 @@ mod factor {
     /// The norm of `x - y`, relative to `scale`.
     fn complex_distance(x: &[C64], y: &[C64], scale: f64) -> f64 { x.iter().zip(y).map(|(a, b)| (a - b).norm_sqr()).sum::<f64>().sqrt() / scale }
 
-    /// Checks LU with its solves and inverse, Cholesky and QR at complex items with parts of type `R`, on the matrices `decompositions`
-    /// takes, where `tolerance` is a few times `R`'s epsilon.
-    fn complex_decompositions<R: RealItem>(tolerance: f64)
-    where
-        Complex<R>: Factor + Scalar<Real = R>,
-    {
+    /// Checks LU with its solves and inverse, Cholesky and QR at complex items with parts of type `R`, on the matrices `decompositions` takes, where `tolerance` is a few times `R`'s epsilon.
+    fn complex_decompositions<R: RealItem>(tolerance: f64) where Complex<R>: Factor + Scalar<Real = R> {
         let zero = C64::new(0.0, 0.0);
         for n in [0, 1, 2, 5, 31, 32, 33, 71] {
             let bound = tolerance * (n as f64).max(1.0);
@@ -595,7 +585,10 @@ mod factor {
             for k in [1, 3] {
                 let b = complex_random::<R>(n, k, 99);
                 let x = complex_wide(&f.solve(&b, k));
-                assert!(complex_distance(&complex_product(&aw, &x, [n, n, k]), &complex_wide(&b), (scale * complex_norm(&x)).max(1.0)) < bound, "complex solve at {n}, {k}");
+                assert!(
+                    complex_distance(&complex_product(&aw, &x, [n, n, k]), &complex_wide(&b), (scale * complex_norm(&x)).max(1.0)) < bound,
+                    "complex solve at {n}, {k}"
+                );
             }
             let inverse = complex_wide(&f.inverse());
             assert!(complex_distance(&complex_product(&aw, &inverse, [n; 3]), &i, (scale * complex_norm(&inverse)).max(1.0)) < bound, "complex inverse at {n}");
@@ -632,12 +625,8 @@ mod factor {
         complex_tall::<f32>(4.0 * f32::EPSILON as f64);
     }
 
-    /// QR and least squares of a tall, well-conditioned complex matrix, which Cholesky QR factors, giving R a real, positive diagonal.
-    /// The matrix's first item has a positive real part, which Householder QR would turn into a negative item of R.
-    fn complex_tall<R: RealItem>(tolerance: f64)
-    where
-        Complex<R>: Factor + Scalar<Real = R>,
-    {
+    /// QR and least squares of a tall, well-conditioned complex matrix, which Cholesky QR factors, giving R a real, positive diagonal. The matrix's first item has a positive real part, which Householder QR would turn into a negative item of R.
+    fn complex_tall<R: RealItem>(tolerance: f64) where Complex<R>: Factor + Scalar<Real = R> {
         let (m, n) = (2000, 24);
         let bound = tolerance * n as f64;
         let mut a = complex_random::<R>(m, n, 41);
@@ -655,13 +644,8 @@ mod factor {
         assert!(complex_norm(&normal) / (scale * (scale * complex_norm(&x) + complex_norm(&complex_wide(&b)))) < bound, "tall complex lstsq");
     }
 
-
-    /// Checks the SVD and the Hermitian eigen decomposition at complex items with parts of type `R`, either side of each block width,
-    /// where `tolerance` is a few times `R`'s epsilon.
-    fn complex_svd_and_eigen<R: RealItem>(tolerance: f64)
-    where
-        Complex<R>: Factor + Scalar<Real = R>,
-    {
+    /// Checks the SVD and the Hermitian eigen decomposition at complex items with parts of type `R`, either side of each block width, where `tolerance` is a few times `R`'s epsilon.
+    fn complex_svd_and_eigen<R: RealItem>(tolerance: f64) where Complex<R>: Factor + Scalar<Real = R> {
         type C<R> = num_complex::Complex<R>;
         for n in [0, 1, 2, 5, 31, 64, 129] {
             let bound = tolerance * (n as f64).max(1.0);
@@ -670,10 +654,16 @@ mod factor {
                 let a = complex_random::<R>(m, c, (m * 37 + c) as u64);
                 let (aw, p) = (complex_wide(&a), m.min(c));
                 let Svd { u, s, v, .. } = svd(&a, [m, c]);
-                assert!(distance(&wide(&singular_values(&a, [m, c])), &wide(&s), complex_norm(&aw).max(1.0)) < bound, "complex singular values alone at {m}×{c}");
+                assert!(
+                    distance(&wide(&singular_values(&a, [m, c])), &wide(&s), complex_norm(&aw).max(1.0)) < bound,
+                    "complex singular values alone at {m}×{c}"
+                );
                 let (u, v, s) = (complex_wide(&u), complex_wide(&v), wide(&s));
                 let us: Vec<C64> = (0..m * p).map(|k| u[k] * s[k % p]).collect();
-                assert!(complex_distance(&complex_product(&us, &adjoint(&v, c, p), [m, p, c]), &aw, complex_norm(&aw).max(1.0)) < bound, "complex svd at {m}×{c}");
+                assert!(
+                    complex_distance(&complex_product(&us, &adjoint(&v, c, p), [m, p, c]), &aw, complex_norm(&aw).max(1.0)) < bound,
+                    "complex svd at {m}×{c}"
+                );
                 assert!(complex_distance(&complex_product(&adjoint(&u, m, p), &u, [p, m, p]), &identity::<C64>(p), 1.0) < bound, "complex svd's u at {m}×{c}");
                 assert!(complex_distance(&complex_product(&adjoint(&v, c, p), &v, [p, c, p]), &identity::<C64>(p), 1.0) < bound, "complex svd's v at {m}×{c}");
                 assert!(s.windows(2).all(|w| w[0] >= w[1]) && s.iter().all(|&x| x >= 0.0), "complex singular values descend at {m}×{c}");
@@ -689,7 +679,10 @@ mod factor {
             assert!(values.windows(2).all(|w| w[0] <= w[1]), "complex eigenvalues ascend at {n}");
             let vl: Vec<C64> = (0..n * n).map(|k| vectors[k] * values[k % n]).collect();
             assert!(complex_distance(&complex_product(&hw, &vectors, [n; 3]), &vl, complex_norm(&hw).max(1.0)) < bound, "complex hermitian eigen at {n}");
-            assert!(complex_distance(&complex_product(&adjoint(&vectors, n, n), &vectors, [n; 3]), &identity::<C64>(n), 1.0) < bound, "unitary eigenvectors at {n}");
+            assert!(
+                complex_distance(&complex_product(&adjoint(&vectors, n, n), &vectors, [n; 3]), &identity::<C64>(n), 1.0) < bound,
+                "unitary eigenvectors at {n}"
+            );
             // A complex matrix with real items gives the real code's singular values and eigenvalues, within rounding.
             let re: Vec<R> = h.iter().map(|z| z.re).collect();
             let real: Vec<C<R>> = re.iter().map(|&x| C::new(x, R::zero())).collect();
@@ -704,8 +697,7 @@ mod factor {
                 assert!(eigh(&nan, n).is_none(), "complex hermitian eigen of a matrix holding NaN at {n}");
             }
         }
-        // A wide complex matrix of rank 5 takes the truncated SVD's randomized path on a view of its conjugate transpose. U Σ Vᴴ
-        // recovers it to rounding.
+        // A wide complex matrix of rank 5 takes the truncated SVD's randomized path on a view of its conjugate transpose. U Σ Vᴴ recovers it to rounding.
         let (m, c, k) = (40, 300, 5);
         let low = complex_product(&complex_wide(&complex_random::<R>(m, k, 51)), &complex_wide(&complex_random::<R>(k, c, 53)), [m, k, c]);
         let a: Vec<C<R>> = low.iter().map(|z| C::new(R::narrow(z.re), R::narrow(z.im))).collect();
@@ -713,7 +705,10 @@ mod factor {
         let (u, v, s) = (complex_wide(&f.u), complex_wide(&f.v), wide(&f.s));
         let us: Vec<C64> = (0..m * k).map(|i| u[i] * s[i % k]).collect();
         let bound = tolerance * c as f64;
-        assert!(complex_distance(&complex_product(&us, &adjoint(&v, c, k), [m, k, c]), &aw, complex_norm(&aw)) < bound, "truncated svd of a wide complex matrix of rank {k}");
+        assert!(
+            complex_distance(&complex_product(&us, &adjoint(&v, c, k), [m, k, c]), &aw, complex_norm(&aw)) < bound,
+            "truncated svd of a wide complex matrix of rank {k}"
+        );
         // Both parts of `z` exceed half the largest float, so `abs1(z)` overflows, though `z`'s modulus and reciprocal fit.
         let z = C::new(R::max_value() * R::narrow(0.6), R::max_value() * R::narrow(0.6));
         let (zero, one, size) = (C::new(R::zero(), R::zero()), C::new(R::one(), R::zero()), z.modulus().wide());
@@ -723,32 +718,22 @@ mod factor {
         let r = z.reciprocal();
         assert!(r.im == -r.re && (r.re.wide() * 1.2 * R::max_value().wide() - 1.0).abs() < 64.0 * tolerance, "z's subnormal reciprocal");
     }
-
 }
 
 mod eigen {
-    use super::factor::{distance, near, norm, orthogonality, product, random, RealItem, wide};
+    use super::factor::{RealItem, distance, near, norm, orthogonality, product, random, wide};
     use super::*;
 
     /// The symmetric `n`×`n` matrix whose lower triangle comes from `lower`, with `junk` in its upper triangle, which `eigh` never reads.
-    fn symmetric<T: RealItem>(lower: &[T], n: usize, junk: T) -> Vec<T> {
-        (0..n * n).map(|k| if k % n > k / n { junk } else { lower[k] }).collect()
-    }
+    fn symmetric<T: RealItem>(lower: &[T], n: usize, junk: T) -> Vec<T> { (0..n * n).map(|k| if k % n > k / n { junk } else { lower[k] }).collect() }
 
     /// The symmetric tridiagonal `n`×`n` matrix with diagonal `d` and subdiagonal `e`, in full.
     fn tridiagonal_matrix(d: &[f64], e: &[f64]) -> Vec<f64> {
         let n = d.len();
-        (0..n * n)
-            .map(|k| match (k / n, k % n) {
-                (i, j) if i == j => d[i],
-                (i, j) if i == j + 1 || j == i + 1 => e[i.min(j)],
-                _ => 0.0,
-            })
-            .collect()
+        (0..n * n).map(|k| match (k / n, k % n) { (i, j) if i == j => d[i], (i, j) if i == j + 1 || j == i + 1 => e[i.min(j)], _ => 0.0 }).collect()
     }
 
-    /// Checks that `f` decomposes the symmetric `n`×`n` matrix `a`: ascending values, orthonormal vectors, and a small residual
-    /// `A V - V Λ`, all within `bound`.
+    /// Checks that `f` decomposes the symmetric `n`×`n` matrix `a`: ascending values, orthonormal vectors, and a small residual `A V - V Λ`, all within `bound`.
     fn check(a: &[f64], n: usize, f: &Eigh<f64>, bound: f64, what: &str) {
         assert!(f.values.windows(2).all(|w| w[0] <= w[1]), "values ascend for {what}");
         let (v, scale) = (&f.vectors, norm(a).max(f64::MIN_POSITIVE));
@@ -782,7 +767,10 @@ mod eigen {
     fn symmetric_eigen_survives_hard_spectra() {
         let bound = 64.0 * f64::EPSILON;
         // Repeated eigenvalues: the identity, a zero matrix and a diagonal matrix with ties.
-        for (a, n, values) in [(identity::<f64>(4), 4, vec![1.0; 4]), (vec![0.0; 9], 3, vec![0.0; 3]), (tridiagonal_matrix(&[2.0, 1.0, 2.0, 1.0], &[0.0; 3]), 4, vec![1.0, 1.0, 2.0, 2.0])] {
+        for (a, n, values) in [
+            (identity::<f64>(4), 4, vec![1.0; 4]), (vec![0.0; 9], 3, vec![0.0; 3]),
+            (tridiagonal_matrix(&[2.0, 1.0, 2.0, 1.0], &[0.0; 3]), 4, vec![1.0, 1.0, 2.0, 2.0]),
+        ] {
             let f = eigh(&a, n).unwrap();
             assert_eq!(f.values, values, "eigenvalues of a matrix with ties");
             check(&a, n, &f, bound, "a matrix with ties");
@@ -798,8 +786,7 @@ mod eigen {
         // A 2×2 block whose subdiagonal is barely above the negligible size.
         let a = tridiagonal_matrix(&[1.0000000000000002, 1.0000000000000002], &[7.216449660063518e-16]);
         check(&a, 2, &eigh(&a, 2).unwrap(), bound, "a nearly diagonal 2×2 matrix");
-        // In a matrix of rank 4, Householder reduction leaves only rounding noise below the leading rows. The iterations must count that
-        // noise as negligible against the matrix's norm. The 50-row case runs QL. The 300-row case runs divide and conquer.
+        // In a matrix of rank 4, Householder reduction leaves only rounding noise below the leading rows. The iterations must count that noise as negligible against the matrix's norm. The 50-row case runs QL. The 300-row case runs divide and conquer.
         for n in [50, 300] {
             let p: Vec<f64> = (0..n * n).map(|k| (k as f64).sin()).collect();
             let a: Vec<f64> = (0..n * n).map(|k| p[k] + p[k % n * n + k / n]).collect();
@@ -819,12 +806,9 @@ mod eigen {
         let clustered_d: Vec<f64> = (0..60).map(|i| if i < 30 { 1.0 } else { 2.0 }).collect();
         let clustered_e: Vec<f64> = (0..59).map(|i| if i % 7 == 0 { 0.5 } else { 1e-18 }).collect();
         let cases = [
-            (wilkinson.to_vec(), vec![1.0; 6], "a Wilkinson matrix"),
-            (glued_d, glued_e, "two glued Wilkinson matrices"),
-            (random_d, random_e, "a random tridiagonal matrix"),
-            (clustered_d, clustered_e, "a matrix with two clusters of eigenvalues"),
-            (vec![1.0; 50], vec![0.0; 49], "the identity"),
-            ((0..40).map(|i| (i % 2 + 1) as f64).collect(), vec![0.0; 39], "a diagonal matrix with ties"),
+            (wilkinson.to_vec(), vec![1.0; 6], "a Wilkinson matrix"), (glued_d, glued_e, "two glued Wilkinson matrices"),
+            (random_d, random_e, "a random tridiagonal matrix"), (clustered_d, clustered_e, "a matrix with two clusters of eigenvalues"),
+            (vec![1.0; 50], vec![0.0; 49], "the identity"), ((0..40).map(|i| (i % 2 + 1) as f64).collect(), vec![0.0; 39], "a diagonal matrix with ties"),
         ];
         for (d, e, what) in cases {
             let copies = (EIGH_CONQUER + 1).div_ceil(d.len());
@@ -837,9 +821,7 @@ mod eigen {
         }
     }
 
-    /// Checks that `eigh` at `T` handles a matrix scaled by a power of two near underflow or overflow, and gives `None` for a matrix
-    /// holding NaN. The scaled eigenvalues match the unscaled ones to rounding. The scaled eigenvectors, whose signs can change, pass
-    /// their own residual and orthogonality checks.
+    /// Checks that `eigh` at `T` handles a matrix scaled by a power of two near underflow or overflow, and gives `None` for a matrix holding NaN. The scaled eigenvalues match the unscaled ones to rounding. The scaled eigenvectors, whose signs can change, pass their own residual and orthogonality checks.
     fn hard_matrices<T: RealItem>() {
         let n = 40;
         let lower = random::<T>(n, n, 41);
@@ -858,11 +840,10 @@ mod eigen {
         nan[3 * n + 1] = T::nan();
         assert!(eigh(&nan, n).is_none(), "a matrix holding NaN");
     }
-
 }
 
 mod general {
-    use super::factor::{complex_random, complex_wide, random, RealItem, wide};
+    use super::factor::{RealItem, complex_random, complex_wide, random, wide};
     use super::*;
     use num_traits::Float as _;
     use rustymath::Float as _;
@@ -877,8 +858,7 @@ mod general {
         v
     }
 
-    /// Checks what `eig` promises for any `n`×`n` matrix `a`: a relative residual `‖A V - V Λ‖ / ‖A‖` below `bound`, and each
-    /// eigenvector of unit length, to within `bound`.
+    /// Checks what `eig` promises for any `n`×`n` matrix `a`: a relative residual `‖A V - V Λ‖ / ‖A‖` below `bound`, and each eigenvector of unit length, to within `bound`.
     fn check_units(a: &[Complex<f64>], n: usize, f: &Eig<f64>, bound: f64, what: &str) {
         assert_eq!((f.values.len(), f.vectors.len()), (n, n * n), "sizes for {what}");
         let mut sum = 0.0;
@@ -917,20 +897,16 @@ mod general {
     fn widen<T: RealItem>(z: &Complex<T>) -> Complex<f64> { Complex::new(z.re.wide(), z.im.wide()) }
 
     /// `f` at f64, from a decomposition at `T`.
-    fn widened<T: RealItem>(f: &Eig<T>) -> Eig<f64> {
-        Eig { values: f.values.iter().map(widen).collect(), vectors: f.vectors.iter().map(widen).collect() }
-    }
+    fn widened<T: RealItem>(f: &Eig<T>) -> Eig<f64> { Eig { values: f.values.iter().map(widen).collect(), vectors: f.vectors.iter().map(widen).collect() } }
 
-    /// Whether each value in `x` lies within `bound` times the largest magnitude of some value in `y`, and each value in `y` of some
-    /// value in `x`. Their orders can differ.
+    /// Whether each value in `x` lies within `bound` times the largest magnitude of some value in `y`, and each value in `y` of some value in `x`. Their orders can differ.
     fn same_values(x: &[Complex<f64>], y: &[Complex<f64>], bound: f64) -> bool {
         let largest = x.iter().chain(y).fold(f64::MIN_POSITIVE, |m, z| m.max(z.norm()));
         let within = |p: &[Complex<f64>], q: &[Complex<f64>]| p.iter().all(|z| q.iter().any(|w| (z - w).norm() < bound * largest));
         x.len() == y.len() && within(x, y) && within(y, x)
     }
 
-    /// Checks `eig` at `T` on random matrices, where `tolerance` is a few times `T`'s epsilon. On the Mac, 256 rows reach LAPACK's
-    /// `?geev`.
+    /// Checks `eig` at `T` on random matrices, where `tolerance` is a few times `T`'s epsilon. On the Mac, 256 rows reach LAPACK's `?geev`.
     fn random_matrices<T: RealItem>(tolerance: f64) {
         for n in [0, 1, 2, 3, 5, 31, 64, 129, 256] {
             let a = random::<T>(n, n, n as u64 + 7);
@@ -942,10 +918,7 @@ mod general {
     }
 
     /// Checks the complex general eigen problem at parts `R` on random matrices, where `tolerance` is a few times `R`'s epsilon.
-    fn complex_matrices<R: RealItem>(tolerance: f64)
-    where
-        Complex<R>: Factor + Scalar<Real = R>,
-    {
+    fn complex_matrices<R: RealItem>(tolerance: f64) where Complex<R>: Factor + Scalar<Real = R> {
         for n in [0, 1, 2, 3, 5, 31, 64, 129] {
             let a = complex_random::<R>(n, n, n as u64 + 11);
             let (f, bound) = (widened(&eig(&a, n).expect("a random complex matrix converges")), tolerance * (n as f64).max(1.0));
@@ -993,19 +966,29 @@ mod general {
         let f = eig(&triangular, 3).unwrap();
         assert_eq!(sorted(&f.values), [1.0, 2.0, 3.0].map(|x| Complex::new(x, 0.0)), "a triangular matrix's diagonal");
         check(&triangular, 3, &f, bound, "a triangular matrix");
-        // Grcar's matrix, whose eigenvalues are very sensitive, and Frank's, whose small ones are badly conditioned. The residual
-        // measures backward stability, which holds for both.
+        // Grcar's matrix, whose eigenvalues are very sensitive, and Frank's, whose small ones are badly conditioned. The residual measures backward stability, which holds for both.
         let n = 32;
-        let grcar: Vec<f64> = (0..n * n).map(|k| match (k / n, k % n) { (i, j) if j + 1 == i => -1.0, (i, j) if j >= i && j <= i + 3 => 1.0, _ => 0.0 }).collect();
+        let grcar: Vec<f64> = (0..n * n).map(|k| match (k / n, k % n) {
+            (i, j) if j + 1 == i => -1.0, (i, j) if j >= i && j <= i + 3 => 1.0, _ => 0.0
+        }).collect();
         check(&grcar, n, &eig(&grcar, n).unwrap(), bound * n as f64, "Grcar's matrix");
         let n = 12;
-        let frank: Vec<f64> = (0..n * n).map(|k| { let (i, j) = (k / n, k % n); if j + 1 < i { 0.0 } else { (n - i.max(j)) as f64 } }).collect();
+        let frank: Vec<f64> = (0..n * n).map(|k| {
+            let (i, j) = (k / n, k % n);
+            if j + 1 < i { 0.0 } else { (n - i.max(j)) as f64 }
+        }).collect();
         check(&frank, n, &eig(&frank, n).unwrap(), bound * n as f64, "Frank's matrix");
         // A symmetric matrix's eigenvalues are real, and match eigh's.
         let n = 20;
         let lower = random::<f64>(n, n, 5);
-        let symmetric: Vec<f64> = (0..n * n).map(|k| { let (i, j) = (k / n, k % n); lower[i.max(j) * n + i.min(j)] }).collect();
-        let mut values: Vec<f64> = eig(&symmetric, n).unwrap().values.iter().map(|z| { assert_eq!(z.im, 0.0); z.re }).collect();
+        let symmetric: Vec<f64> = (0..n * n).map(|k| {
+            let (i, j) = (k / n, k % n);
+            lower[i.max(j) * n + i.min(j)]
+        }).collect();
+        let mut values: Vec<f64> = eig(&symmetric, n).unwrap().values.iter().map(|z| {
+            assert_eq!(z.im, 0.0);
+            z.re
+        }).collect();
         values.sort_by(f64::total_cmp);
         let want = eigh(&symmetric, n).unwrap().values;
         assert!(values.iter().zip(&want).all(|(a, b)| (a - b).abs() < bound * n as f64), "symmetric eigenvalues match eigh's");
@@ -1033,13 +1016,8 @@ mod general {
         assert!(f.values.iter().all(|z| z.im.abs() < bound * n as f64), "a Hermitian matrix's eigenvalues are real");
     }
 
-    /// Checks `eig` on the `n`×`n` matrix `a` scaled by a power of two near underflow and near overflow. Each scaled decomposition,
-    /// with its eigenvalues divided by the scale, passes `a`'s residual and unit-length checks. Its eigenvalues also sum to `a`'s
-    /// trace. A matrix holding NaN or an infinity gives `None`.
-    fn scaled<T: Factor>(a: &[T], n: usize)
-    where
-        T::Real: RealItem,
-    {
+    /// Checks `eig` on the `n`×`n` matrix `a` scaled by a power of two near underflow and near overflow. Each scaled decomposition, with its eigenvalues divided by the scale, passes `a`'s residual and unit-length checks. Its eigenvalues also sum to `a`'s trace. A matrix holding NaN or an infinity gives `None`.
+    fn scaled<T: Factor>(a: &[T], n: usize) where T::Real: RealItem {
         let wide: Vec<Complex<f64>> = a.iter().map(|v| Complex::new(v.re().wide(), v.im().wide())).collect();
         let trace: Complex<f64> = (0..n).map(|i| wide[i * n + i]).sum();
         let size = wide.iter().map(|z| z.norm_sqr()).sum::<f64>().sqrt();
@@ -1058,7 +1036,6 @@ mod general {
             assert!(eig(&b, n).is_none() && eigenvalues(&b, n).is_none(), "a matrix holding {bad:?}");
         }
     }
-
 }
 
 mod singular {
@@ -1073,17 +1050,13 @@ mod singular {
 
     #[test]
     fn divide_and_conquer_survives_hard_bidiagonals() {
-        // Both sides of the public divide-and-conquer cutoff: zero singular values, negligible items of z, runs of equal singular
-        // values, and total deflation.
+        // Both sides of the public divide-and-conquer cutoff: zero singular values, negligible items of z, runs of equal singular values, and total deflation.
         for n in [40, SVD_SPLIT + 7] {
             let ramp = |f: fn(usize) -> f64| (0..n).map(f).collect::<Vec<f64>>();
             let cases = [
-                (random::<f64>(n, 1, 3), random::<f64>(n, 1, 5)),
-                (ramp(|_| 1.0), ramp(|_| 0.0)),
-                (ramp(|_| 0.0), ramp(|_| 0.0)),
+                (random::<f64>(n, 1, 3), random::<f64>(n, 1, 5)), (ramp(|_| 1.0), ramp(|_| 0.0)), (ramp(|_| 0.0), ramp(|_| 0.0)),
                 (ramp(|i| if i % 3 == 0 { 0.0 } else { 1.0 + i as f64 }), ramp(|i| (i % 2) as f64)),
-                (ramp(|i| 10f64.powf(-(i as f64) / 4.0)), ramp(|i| 10f64.powf(-(i as f64) / 4.0 - 1.0))),
-                (ramp(|i| 1.0 + 1e-15 * i as f64), ramp(|_| 1e-12)),
+                (ramp(|i| 10f64.powf(-(i as f64) / 4.0)), ramp(|i| 10f64.powf(-(i as f64) / 4.0 - 1.0))), (ramp(|i| 1.0 + 1e-15 * i as f64), ramp(|_| 1e-12)),
                 (ramp(|i| (i % 5) as f64), ramp(|i| 1.0 / (1.0 + i as f64))),
             ];
             for (d, sub) in &cases {
@@ -1099,8 +1072,8 @@ mod singular {
     }
 }
 mod exact {
-    use rustymath::linalg::exact::*;
     use num_rational::BigRational;
+    use rustymath::linalg::exact::*;
 
     fn q(items: &[i64]) -> Vec<BigRational> { items.iter().map(|&k| BigRational::from_integer(k.into())).collect() }
 
@@ -1132,12 +1105,9 @@ mod exact {
         assert_eq!(permanent(&q(&[1, 2, 3, 4]), 2), q(&[10])[0]);
         assert_eq!(permanent::<BigRational>(&[], 0), q(&[1])[0]);
         let a = q(&[2, -1, 3, 0, 5, 7, -2, 4, 1]);
-        let by_definition: i64 = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]]
-            .iter()
-            .map(|p: &[usize; 3]| (0..3).map(|i| [2, -1, 3, 0, 5, 7, -2, 4, 1][i * 3 + p[i]]).product::<i64>())
-            .sum();
+        let by_definition: i64 = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]].iter()
+            .map(|p: &[usize; 3]| (0..3).map(|i| [2, -1, 3, 0, 5, 7, -2, 4, 1][i * 3 + p[i]]).product::<i64>()).sum();
         assert_eq!(permanent(&a, 3), q(&[by_definition])[0]);
         assert_eq!(permanent(&vec![1.0f64; 36], 6), 720.0);
     }
 }
-

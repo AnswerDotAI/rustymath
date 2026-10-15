@@ -1,15 +1,12 @@
-//! rustymath's searches on contiguous vectors, which the wrappers in `python/rustymath/search.py` give each argument. Booleans and
-//! integers match exactly, through `search`. float16, float32 and float64 match within tolerance `ct`, through `tolerant`. Each float
-//! search checks for Ctrl-C as it goes, stopping with `KeyboardInterrupt`.
+//! rustymath's searches on contiguous vectors, which the wrappers in `python/rustymath/search.py` give each argument. Booleans and integers match exactly, through `search`. float16, float32 and float64 match within tolerance `ct`, through `tolerant`. Each float search checks for Ctrl-C as it goes, stopping with `KeyboardInterrupt`.
 use half::f16;
 use numpy::{PyArray1, PyArrayDescrMethods, PyReadonlyArray1, PyUntypedArray, PyUntypedArrayMethods};
 use pyo3::prelude::*;
-use rustymath::{search::{self, OrderKey}, tolerant, with_tolerance, Float};
+use rustymath::{Float, search::{self, OrderKey}, tolerant, with_tolerance};
 
 use crate::tolerance;
 
-/// Runs `$keys` with `$t` the Rust type of `$a`'s Boolean or integer dtype. A float dtype runs `$floats` with `$t` the type of that
-/// float, or `$other`, which takes no type.
+/// Runs `$keys` with `$t` the Rust type of `$a`'s Boolean or integer dtype. A float dtype runs `$floats` with `$t` the type of that float, or `$other`, which takes no type.
 macro_rules! items {
     (@match $a:expr, $t:ident, $keys:expr, $($floats:tt)+) => {{
         let dtype = $a.dtype();
@@ -43,11 +40,10 @@ fn classes(py: Python<'_>, x: &Bound<'_, PyUntypedArray>, ct: f64) -> PyResult<V
         floats: with_tolerance!(tolerance(ct), |t| tolerant::classes_with(t, x.extract::<PyReadonlyArray1<T>>()?.as_slice()?, || py.check_signals())))
 }
 
-/// The classes of `x`, numbered from 0 in order of first position, as `search::numbered` gives them: each class's first position, each
-/// item's class number, and each class's size.
+/// The classes of `x`, numbered from 0 in order of first position, as `search::numbered` gives them: each class's first position, each item's class number, and each class's size.
 #[pyfunction]
 pub fn unique<'py>(
-    py: Python<'py>, x: &Bound<'py, PyUntypedArray>, ct: f64,
+    py: Python<'py>, x: &Bound<'py, PyUntypedArray>, ct: f64
 ) -> PyResult<(Bound<'py, PyArray1<isize>>, Bound<'py, PyArray1<isize>>, Bound<'py, PyArray1<isize>>)> {
     let classes = classes(py, x, ct)?;
     let search::Numbered { firsts, numbers, counts } = search::numbered(&classes);
@@ -75,8 +71,7 @@ pub fn group_indices<'py>(py: Python<'py>, x: &Bound<'py, PyUntypedArray>, ct: f
     Ok(grouped.each().map(|positions| indices(py, positions.iter().map(|&p| p as usize))).collect())
 }
 
-/// Unsigned keys in numeric order. Float keys equate signed zeros and NaNs, with NaNs after infinity. Each lexsort column keeps its
-/// own dtype; normalizing its keys avoids promoting mixed integer columns through floats.
+/// Unsigned keys in numeric order. Float keys equate signed zeros and NaNs, with NaNs after infinity. Each lexsort column keeps its own dtype; normalizing its keys avoids promoting mixed integer columns through floats.
 fn ordered(x: &Bound<'_, PyUntypedArray>) -> PyResult<Vec<u64>> {
     items!(x, T => keys: Ok(x.extract::<PyReadonlyArray1<T>>()?.as_slice()?.iter().map(|&v| v.order_key().into()).collect()),
         floats: Ok(x.extract::<PyReadonlyArray1<T>>()?.as_slice()?.iter().map(|&v| v.order_key() as u64).collect()))
@@ -98,13 +93,11 @@ pub fn sort_indices<'py>(py: Python<'py>, keys: Vec<Bound<'py, PyUntypedArray>>,
 
 /// Insertion positions in an ascending vector. Complementing and reversing the keys turns strict-less into at-or-below.
 #[pyfunction]
-pub fn searchsorted<'py>(py: Python<'py>, a: &Bound<'py, PyUntypedArray>, v: &Bound<'py, PyUntypedArray>, right: bool) -> PyResult<Bound<'py, PyArray1<isize>>> {
+pub fn searchsorted<'py>(
+    py: Python<'py>, a: &Bound<'py, PyUntypedArray>, v: &Bound<'py, PyUntypedArray>, right: bool) -> PyResult<Bound<'py, PyArray1<isize>>> {
     let (mut a, mut v) = (ordered(a)?, ordered(v)?);
     let n = a.len();
-    if !right {
-        a.reverse();
-        for k in a.iter_mut().chain(&mut v) { *k = !*k; }
-    }
+    if !right { a.reverse(); for k in a.iter_mut().chain(&mut v) { *k = !*k; } }
     let found = search::bins(&a, &v);
     Ok(indices(py, found.into_iter().map(|p| if right { p as usize } else { n - p as usize })))
 }
@@ -140,7 +133,9 @@ pub fn index_of<'py>(py: Python<'py>, x: &Bound<'py, PyUntypedArray>, y: &Bound<
 
 /// Adds this module's functions to `m`.
 pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    for f in [wrap_pyfunction!(unique, m)?, wrap_pyfunction!(index_of, m)?, wrap_pyfunction!(class_counts, m)?, wrap_pyfunction!(group_indices, m)?,
-        wrap_pyfunction!(sort_indices, m)?, wrap_pyfunction!(searchsorted, m)?, wrap_pyfunction!(bincount, m)?] { m.add_function(f)?; }
+    for f in [
+        wrap_pyfunction!(unique, m)?, wrap_pyfunction!(index_of, m)?, wrap_pyfunction!(class_counts, m)?, wrap_pyfunction!(group_indices, m)?,
+        wrap_pyfunction!(sort_indices, m)?, wrap_pyfunction!(searchsorted, m)?, wrap_pyfunction!(bincount, m)?,
+    ] { m.add_function(f)?; }
     Ok(())
 }

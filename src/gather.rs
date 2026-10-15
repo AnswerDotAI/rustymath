@@ -1,7 +1,4 @@
-//! Copying the items of a slice into a buffer by position: cycling them, repeating each, keeping those a mask selects, taking them at
-//! indices, taking windows of them, walking an n-dimensional pattern of offsets over them, and writing them at offsets. `positions`
-//! writes the positions that a mask selects. Each applies a conversion to each item it writes, so a caller can widen items as it
-//! gathers them. Each is generic and `#[inline]`, so it compiles in the caller, with the caller's types and conversion.
+//! Copying the items of a slice into a buffer by position: cycling them, repeating each, keeping those a mask selects, taking them at indices, taking windows of them, walking an n-dimensional pattern of offsets over them, and writing them at offsets. `positions` writes the positions that a mask selects. Each applies a conversion to each item it writes, so a caller can widen items as it gathers them. Each is generic and `#[inline]`, so it compiles in the caller, with the caller's types and conversion.
 use crate::search::Key;
 use std::borrow::Cow;
 use std::mem::MaybeUninit;
@@ -9,13 +6,11 @@ use std::mem::MaybeUninit;
 /// Appends `len` items, cycling through the items of the nonempty `items`, each converted by `f`.
 #[inline]
 pub fn cycle<S: Copy, D: Clone>(out: &mut Vec<D>, items: &[S], len: usize, f: impl Fn(S) -> D) {
-    if let [x] = *items { return out.resize(out.len() + len, f(x)) }
+    if let [x] = *items { return out.resize(out.len() + len, f(x)); }
     for start in (0..len).step_by(items.len()) { out.extend(items[..items.len().min(len - start)].iter().map(|&x| f(x))) }
 }
 
-/// Appends each of `items`, converted by `f`, as many times as its count. `counts` holds one count for all the items, or one for each
-/// item. The counts are nonnegative and sum to `total`. An item with a count of at most 4 writes four copies where its run starts.
-/// The items after it overwrite the copies beyond its count. A larger count fills its run.
+/// Appends each of `items`, converted by `f`, as many times as its count. `counts` holds one count for all the items, or one for each item. The counts are nonnegative and sum to `total`. An item with a count of at most 4 writes four copies where its run starts. The items after it overwrite the copies beyond its count. A larger count fills its run.
 #[inline]
 pub fn repeat<S: Copy, D: Copy>(out: &mut Vec<D>, items: &[S], counts: &[i64], total: usize, f: impl Fn(S) -> D) {
     let count = |j: usize| counts[if counts.len() == 1 { 0 } else { j }] as usize;
@@ -23,31 +18,22 @@ pub fn repeat<S: Copy, D: Copy>(out: &mut Vec<D>, items: &[S], counts: &[i64], t
         let mut k = 0;
         for (j, &x) in items.iter().enumerate() {
             let (x, n) = (MaybeUninit::new(f(x)), count(j));
-            match d[k..].first_chunk_mut::<4>() {
-                Some(w) if n <= 4 => *w = [x; 4],
-                _ => d[k..k + n].fill(x),
-            }
+            match d[k..].first_chunk_mut::<4>() { Some(w) if n <= 4 => *w = [x; 4], _ => d[k..k + n].fill(x) }
             k += n;
         }
         assert_eq!(k, total, "the counts must sum to `total`");
     })
 }
 
-/// Appends `item(j)` for each position `j` whose count in `mask` is 1, in order. Every count is 0 or 1, and `total` of them are 1. It
-/// suits items read from a slice: where a block of counts holds both 0s and 1s, `written` reads every item in order.
+/// Appends `item(j)` for each position `j` whose count in `mask` is 1, in order. Every count is 0 or 1, and `total` of them are 1. It suits items read from a slice: where a block of counts holds both 0s and 1s, `written` reads every item in order.
 #[inline]
 pub fn compress<M: Key, D: Copy>(out: &mut Vec<D>, mask: &[M], total: usize, item: impl Fn(usize) -> D) { kept::<false, M, D>(out, mask, total, item) }
 
-/// Appends `position(j)` for each position `j` whose count in `mask` is 1, in order. Every count is 0 or 1, and `total` of them are 1. It
-/// suits items computed from `j`: where a block of counts holds both 0s and 1s, `selected` computes only the selected items.
+/// Appends `position(j)` for each position `j` whose count in `mask` is 1, in order. Every count is 0 or 1, and `total` of them are 1. It suits items computed from `j`: where a block of counts holds both 0s and 1s, `selected` computes only the selected items.
 #[inline]
-pub fn positions<M: Key, D: Copy>(out: &mut Vec<D>, mask: &[M], total: usize, position: impl Fn(usize) -> D) {
-    kept::<true, M, D>(out, mask, total, position)
-}
+pub fn positions<M: Key, D: Copy>(out: &mut Vec<D>, mask: &[M], total: usize, position: impl Fn(usize) -> D) { kept::<true, M, D>(out, mask, total, position) }
 
-/// `compress`, or `positions` with `TABLE`. Long runs cost little: a block of 64 counts that are all 0 is skipped, and one whose counts
-/// are all 1 is copied. Without `TABLE`, consecutive blocks that mix both go through `written` in one pass. Each count is read by its low
-/// bit, which writes every slot whatever the counts hold.
+/// `compress`, or `positions` with `TABLE`. Long runs cost little: a block of 64 counts that are all 0 is skipped, and one whose counts are all 1 is copied. Without `TABLE`, consecutive blocks that mix both go through `written` in one pass. Each count is read by its low bit, which writes every slot whatever the counts hold.
 #[inline(always)]
 fn kept<const TABLE: bool, M: Key, D: Copy>(out: &mut Vec<D>, mask: &[M], total: usize, item: impl Fn(usize) -> D) {
     crate::slice::appended(out, total, |d| {
@@ -64,10 +50,8 @@ fn kept<const TABLE: bool, M: Key, D: Copy>(out: &mut Vec<D>, mask: &[M], total:
             }
             if mixed > 0 { written(&mut d[k..], &mask[from..start], |j| item(from + j)) }
             (k, mixed, from) = (k + mixed, 0, start + m.len());
-            if n == m.len() {
-                let run = &mut d[k..k + n];
-                for j in 0..n { run[j].write(item(start + j)); }
-            } else if TABLE {
+            if n == m.len() { let run = &mut d[k..k + n]; for j in 0..n { run[j].write(item(start + j)); } }
+            else if TABLE {
                 let (blocks, rest) = m.as_chunks::<8>();
                 let mut at = k;
                 for (b, block) in blocks.iter().enumerate() {
@@ -84,11 +68,8 @@ fn kept<const TABLE: bool, M: Key, D: Copy>(out: &mut Vec<D>, mask: &[M], total:
     })
 }
 
-/// Writes `item(j)` into `d`, in order, for each position `j` whose count in `mask` is 1. `d` holds at least as many slots as the counts
-/// add up to. Each item is written where it goes if its count is 1, and the next item writes over it if its count is 0, so the loop has
-/// no branch on the counts. It takes four counts at a time, so that one addition moves on past all four.
-// Out of line: inlined into `kept`'s loop over blocks, the loop below ran out of x86-64's 16 registers and reloaded six values from
-// the stack for every four counts.
+/// Writes `item(j)` into `d`, in order, for each position `j` whose count in `mask` is 1. `d` holds at least as many slots as the counts add up to. Each item is written where it goes if its count is 1, and the next item writes over it if its count is 0, so the loop has no branch on the counts. It takes four counts at a time, so that one addition moves on past all four.
+// Out of line: inlined into `kept`'s loop over blocks, the loop below ran out of x86-64's 16 registers and reloaded six values from the stack for every four counts.
 #[inline(never)]
 fn written<M: Key, D: Copy>(d: &mut [MaybeUninit<D>], mask: &[M], item: impl Fn(usize) -> D) {
     let count = |m: M| (m.key() & 1) as usize;
@@ -130,41 +111,30 @@ const SET: [[u8; 8]; 256] = {
 /// The low bits of the keys of up to 8 mask items as a byte, with the first item's in the lowest bit.
 #[inline(always)]
 pub(crate) fn mask_bits<M: Key>(m: &[M]) -> u8 {
-    // An index loop, which compiles inline in the incremental build. A whole block's bytes take one load, which a mask on each byte
-    // would split. The multiplication gathers the low bit of each byte into the top byte.
+    // An index loop, which compiles inline in the incremental build. A whole block's bytes take one load, which a mask on each byte would split. The multiplication gathers the low bit of each byte into the top byte.
     let mut bytes = 0u64;
     for i in 0..m.len() { bytes |= u64::from(m[i].key() as u8) << (8 * i) }
     ((bytes & 0x0101_0101_0101_0101).wrapping_mul(0x0102_0408_1020_4080) >> 56) as u8
 }
 
-/// Writes `item(i)` into `d` from place `k`, in order, for each set bit `i` of `mask`, and gives the place after the last one. Where 8
-/// places remain, it writes all 8 items in a loop with no check or branch. Later calls write over the places after the selected items.
-/// `D` is `Copy`, which leaves nothing to drop in the items written over.
+/// Writes `item(i)` into `d` from place `k`, in order, for each set bit `i` of `mask`, and gives the place after the last one. Where 8 places remain, it writes all 8 items in a loop with no check or branch. Later calls write over the places after the selected items. `D` is `Copy`, which leaves nothing to drop in the items written over.
 #[inline(always)]
 pub(crate) fn selected<D: Copy>(d: &mut [MaybeUninit<D>], k: usize, mask: u8, item: impl Fn(u8) -> D) -> usize {
     let set = &SET[usize::from(mask)];
     let found = mask.count_ones() as usize;
-    if let Some(w) = d[k..].first_chunk_mut::<8>() {
-        for i in 0..8 { w[i].write(item(set[i])); }
-    } else {
-        for i in 0..found { d[k + i].write(item(set[i])); }
-    }
+    if let Some(w) = d[k..].first_chunk_mut::<8>() { for i in 0..8 { w[i].write(item(set[i])); } }
+    else { for i in 0..found { d[k + i].write(item(set[i])); } }
     k + found
 }
 
-/// Appends the items of `items` at `indices`, each converted by `f`. Each index is in `-n..n` for `n` items, and a negative index
-/// counts back from the end.
+/// Appends the items of `items` at `indices`, each converted by `f`. Each index is in `-n..n` for `n` items, and a negative index counts back from the end.
 #[inline]
 pub fn take<S: Copy, D, I: Copy + Into<i64>>(out: &mut Vec<D>, items: &[S], indices: &[I], f: impl Fn(S) -> D) {
     let n = items.len() as i64;
-    out.extend(indices.iter().map(move |&i| {
-        let i: i64 = i.into();
-        f(items[(i + (n & (i >> 63))) as usize])
-    }));
+    out.extend(indices.iter().map(move |&i| { let i: i64 = i.into(); f(items[(i + (n & (i >> 63))) as usize]) }));
 }
 
-/// Appends `m` windows of `W` items. Window `k` holds the items of `s` at `o + k × step` plus each offset in `cell`, each converted by
-/// `f`. Each item is written once, into `out`'s spare capacity.
+/// Appends `m` windows of `W` items. Window `k` holds the items of `s` at `o + k × step` plus each offset in `cell`, each converted by `f`. Each item is written once, into `out`'s spare capacity.
 #[inline]
 pub fn windows<const W: usize, S: Copy, D>(out: &mut Vec<D>, s: &[S], o: usize, step: isize, m: usize, cell: &[usize; W], f: impl Fn(S) -> D) {
     crate::slice::appended(out, m * W, |slots| {
@@ -175,22 +145,19 @@ pub fn windows<const W: usize, S: Copy, D>(out: &mut Vec<D>, s: &[S], o: usize, 
     })
 }
 
-/// Replaces the item of `out` at each offset with the matching one of `items`, converted by `f`, or with the only one when `items`
-/// holds one. A later offset wins.
+/// Replaces the item of `out` at each offset with the matching one of `items`, converted by `f`, or with the only one when `items` holds one. A later offset wins.
 #[inline]
 pub fn scatter<S: Copy, D>(out: &mut [D], offsets: &[usize], items: &[S], f: impl Fn(S) -> D) {
-    if let [x] = *items { return offsets.iter().for_each(|&o| out[o] = f(x)) }
+    if let [x] = *items { return offsets.iter().for_each(|&o| out[o] = f(x)); }
     for (&o, &x) in offsets.iter().zip(items) { out[o] = f(x) }
 }
 
-/// The source offsets that one axis of `walk`'s result reads. Regular patterns are held as a formula, so a long axis needs no table. A
-/// `None` offset gives a fill.
+/// The source offsets that one axis of `walk`'s result reads. Regular patterns are held as a formula, so a long axis needs no table. A `None` offset gives a fill.
 #[derive(Clone, Debug)]
 pub enum Steps {
     /// `len` offsets from `start`, each `step` further on. A negative step walks backwards.
     Stride { start: usize, len: usize, step: isize },
-    /// `len` positions from `start` along an axis of `size` items with `stride`. The start may lie outside the axis, and a position
-    /// outside gives a fill.
+    /// `len` positions from `start` along an axis of `size` items with `stride`. The start may lie outside the axis, and a position outside gives a fill.
     Clipped { start: i128, len: usize, size: usize, stride: usize },
     /// All `len` positions of an axis with `stride`, from position `shift`, wrapping round to the start.
     Rotated { shift: usize, len: usize, stride: usize },
@@ -243,8 +210,7 @@ impl Steps {
     }
 }
 
-/// Appends the items of `s` that `steps` reach from `base`, each converted by `f`: one `Steps` for each axis, with the last varying
-/// fastest. A `None` offset gives `fill`, converted. The last axis copies whole slices where its pattern allows.
+/// Appends the items of `s` that `steps` reach from `base`, each converted by `f`: one `Steps` for each axis, with the last varying fastest. A `None` offset gives `fill`, converted. The last axis copies whole slices where its pattern allows.
 #[inline]
 pub fn walk<S: Copy + 'static, D: Clone + 'static>(out: &mut Vec<D>, s: &[S], base: usize, steps: &[Steps], fill: S, f: impl Fn(S) -> D) {
     let (base, steps) = Steps::simplify(base, steps);
@@ -264,8 +230,7 @@ fn walk_into<S: Copy + 'static, D: Clone + 'static>(d: &mut Vec<D>, s: &[S], f: 
         if let (&Steps::Stride { start: a, len: m, step: 1 }, &Steps::Stride { start: b, len: n, step }) = (&**axis, &**inner) {
             if step > 1 { return transposed(d, &s[base + a + b..], f, filled(), m, n, step as usize); }
         }
-        // One run of `n` adjacent items for each offset along `axis`, as windows give. A run longer than `RUN` copies fastest with
-        // `extend_from_slice`, which needs the source and the buffer to hold one type.
+        // One run of `n` adjacent items for each offset along `axis`, as windows give. A run longer than `RUN` copies fastest with `extend_from_slice`, which needs the source and the buffer to hold one type.
         if let Steps::Stride { start: b, len: n, step: 1 } = **inner {
             let same = if n > RUN { (d as &mut dyn std::any::Any).downcast_mut::<Vec<S>>() } else { None };
             if let Some(d) = same {
@@ -276,9 +241,7 @@ fn walk_into<S: Copy + 'static, D: Clone + 'static>(d: &mut Vec<D>, s: &[S], f: 
         }
     }
     let width: usize = rest.iter().map(|s| s.len()).product();
-    // Each offset along `axis` starts a copy of the same few items, at the offsets that `rest` reaches from it, as windows give. One
-    // table of those offsets serves every start. Along a stride, `windows` makes each start's items one array, written straight into
-    // spare capacity, so the loop over starts makes no call. Other axes write the fills first, which a missing start keeps.
+    // Each offset along `axis` starts a copy of the same few items, at the offsets that `rest` reaches from it, as windows give. One table of those offsets serves every start. Along a stride, `windows` makes each start's items one array, written straight into spare capacity, so the loop over starts makes no call. Other axes write the fills first, which a missing start keeps.
     let run = match rest.last().map(|t| &**t) { Some(&Steps::Stride { len, step: 1, .. }) => len, _ => 1 };
     if !rest.is_empty() && (1..=CELL).contains(&width) && run <= RUN && rest.iter().all(|t| matches!(**t, Steps::Stride { .. })) {
         let cell = Steps::combined(rest);
@@ -296,7 +259,9 @@ fn walk_into<S: Copy + 'static, D: Clone + 'static>(d: &mut Vec<D>, s: &[S], f: 
         return;
     }
     if !rest.is_empty() {
-        for j in 0..axis.len() { match axis.get(j) { Some(o) => walk_into(d, s, f, fill, base + o, rest), None => d.extend(std::iter::repeat_n(filled(), width)) } }
+        for j in 0..axis.len() {
+            match axis.get(j) { Some(o) => walk_into(d, s, f, fill, base + o, rest), None => d.extend(std::iter::repeat_n(filled(), width)) }
+        }
         return;
     }
     if axis.len() == 0 { return; }
@@ -306,10 +271,7 @@ fn walk_into<S: Copy + 'static, D: Clone + 'static>(d: &mut Vec<D>, s: &[S], f: 
     match **axis {
         Steps::Stride { start, len, step: 1 } => d.extend(slice(start, len)),
         Steps::Stride { start, len, step: -1 } => d.extend(slice(start + 1 - len, len).rev()),
-        Steps::Stride { start, len, step } if step > 0 => {
-            let (s, step) = (&s[start..], step as usize);
-            d.extend((0..len).map(move |j| f(s[j * step])))
-        }
+        Steps::Stride { start, len, step } if step > 0 => { let (s, step) = (&s[start..], step as usize); d.extend((0..len).map(move |j| f(s[j * step]))) }
         Steps::Rotated { shift, len, stride: 1 } => {
             d.extend(slice(shift, len - shift));
             d.extend(slice(0, shift));
@@ -326,8 +288,7 @@ fn walk_into<S: Copy + 'static, D: Clone + 'static>(d: &mut Vec<D>, s: &[S], f: 
     }
 }
 
-/// Appends `m` rows of `n` items, where item `j` of row `i` is `f(s[i + j * stride])`, as `walk_into` does for a transposed matrix.
-/// Each block of 8 result rows is filled first, then overwritten by the tiled `linalg::transpose_into`.
+/// Appends `m` rows of `n` items, where item `j` of row `i` is `f(s[i + j * stride])`, as `walk_into` does for a transposed matrix. Each block of 8 result rows is filled first, then overwritten by the tiled `linalg::transpose_into`.
 fn transposed<S: Copy, D: Clone>(d: &mut Vec<D>, s: &[S], f: &impl Fn(S) -> D, fill: D, m: usize, n: usize, stride: usize) {
     for i0 in (0..m).step_by(8) {
         let (start, rows) = (d.len(), 8.min(m - i0));

@@ -1,10 +1,9 @@
-//! rustymath's `distribution` module. Each constructor checks its parameters and gives a `Distribution`, whose methods take a number
-//! or an array of any shape.
+//! rustymath's `distribution` module. Each constructor checks its parameters and gives a `Distribution`, whose methods take a number or an array of any shape.
 use numpy::ndarray::ArrayD;
 use numpy::{AllowTypeChange, IntoPyArray, PyArrayLikeDyn};
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyFloat};
-use rand::{rngs::StdRng, SeedableRng};
-use rustymath::{distribution::{self as dist, standard::*}, Arg, Unary};
+use rand::{SeedableRng, rngs::StdRng};
+use rustymath::{Arg, Unary, distribution::{self as dist, standard::*}};
 
 /// A probability distribution, with a density, a cumulative distribution, a quantile function and a sampler.
 #[pyclass(module = "rustymath.distribution", frozen)]
@@ -29,12 +28,9 @@ impl Distribution {
     fn cdf<'py>(&self, py: Python<'py>, x: PyArrayLikeDyn<'py, f64, AllowTypeChange>) -> Bound<'py, PyAny> { each(py, x, dist::Cdf(self.0)) }
 
     /// The least value whose `cdf` is at least each item of `p`. A `p` outside 0 to 1 gives NaN.
-    fn quantile<'py>(&self, py: Python<'py>, p: PyArrayLikeDyn<'py, f64, AllowTypeChange>) -> Bound<'py, PyAny> {
-        each(py, p, dist::Quantile(self.0))
-    }
+    fn quantile<'py>(&self, py: Python<'py>, p: PyArrayLikeDyn<'py, f64, AllowTypeChange>) -> Bound<'py, PyAny> { each(py, p, dist::Quantile(self.0)) }
 
-    /// Values drawn from the distribution: one float with no `size`, or else an array of shape `size`. The same `seed` gives the same
-    /// values.
+    /// Values drawn from the distribution: one float with no `size`, or else an array of shape `size`. The same `seed` gives the same values.
     #[pyo3(signature = (size=None, seed=None))]
     fn sample<'py>(&self, py: Python<'py>, size: Option<&Bound<'py, PyAny>>, seed: Option<u64>) -> PyResult<Bound<'py, PyAny>> {
         let mut rng = seed.map_or_else(rand::make_rng::<StdRng>, StdRng::seed_from_u64);
@@ -50,8 +46,7 @@ impl Distribution {
     fn is_discrete(&self) -> bool { self.0.is_discrete() }
 }
 
-/// Defines a constructor for each distribution, and `add`, which adds them and `Distribution` to a module. A parameter's default is
-/// one of rustymath's standard parameters.
+/// Defines a constructor for each distribution, and `add`, which adds them and `Distribution` to a module. A parameter's default is one of rustymath's standard parameters.
 macro_rules! constructors {
     ($($name:ident($($p:ident: $t:ty $(= $default:expr)?),+) $doc:literal;)+) => {
         $(

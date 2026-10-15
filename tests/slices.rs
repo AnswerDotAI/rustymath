@@ -7,7 +7,10 @@ mod parallel {
     #[test]
     fn ranges_and_outputs() {
         let empty = Mutex::new(Vec::new());
-        assert!(!ranges(0, 8, &|range| { empty.lock().unwrap().push(range); false }));
+        assert!(!ranges(0, 8, &|range| {
+            empty.lock().unwrap().push(range);
+            false
+        }));
         assert_eq!(empty.into_inner().unwrap(), [0..0]);
         assert!(std::panic::catch_unwind(|| ranges(0, 0, &|_| true)).is_err());
         for limit in [1, 4] {
@@ -32,7 +35,10 @@ mod parallel {
             let mut calls = calls.into_inner().unwrap();
             calls.sort_by_key(|range| range.start);
             let mut end = 0;
-            for range in &calls { assert_eq!(range.start, end); end = range.end; }
+            for range in &calls {
+                assert_eq!(range.start, end);
+                end = range.end;
+            }
             assert_eq!(end, 129);
             if limit == 1 { assert_eq!(calls, [0..129]); }
             #[cfg(not(target_arch = "wasm32"))]
@@ -42,14 +48,12 @@ mod parallel {
 }
 
 mod forms {
-    use rustymath::{reduce::{Maximum, Minimum}, *};
     use half::f16;
     use num_complex::Complex;
+    use rustymath::{reduce::{Maximum, Minimum}, *};
     use std::fmt::Debug;
 
-    /// Whether `a` and `b` agree: both NaN, the same value with the same sign, or finite and nonzero within 8 units in the last place
-    /// of each other. A scalar form and its slice form can round differently, as `Pow`'s do at f32, where only the scalar form reads
-    /// tables. Zeros, infinities and signs must match exactly.
+    /// Whether `a` and `b` agree: both NaN, the same value with the same sign, or finite and nonzero within 8 units in the last place of each other. A scalar form and its slice form can round differently, as `Pow`'s do at f32, where only the scalar form reads tables. Zeros, infinities and signs must match exactly.
     fn same<F: Float>(a: F, b: F) -> bool {
         if a.is_nan() || b.is_nan() { return a.is_nan() && b.is_nan(); }
         if a == b { return a.is_sign_negative() == b.is_sign_negative(); }
@@ -63,9 +67,7 @@ mod forms {
         wide.iter().flat_map(|&x| [x, -x]).map(F::narrow).collect()
     }
 
-    /// `k.many` against `k.one` for every pairing of `One` and `Many` among `items`. It must append after what `out` holds, and say
-    /// whether every item succeeded, as `checked` does item by item. The NaN rule must agree too. That catches a function marked total
-    /// that gives NaN from arguments that aren't NaN.
+    /// `k.many` against `k.one` for every pairing of `One` and `Many` among `items`. It must append after what `out` holds, and say whether every item succeeded, as `checked` does item by item. The NaN rule must agree too. That catches a function marked total that gives NaN from arguments that aren't NaN.
     fn binary<F: Float + Debug, K: Binary<F, Out = F>>(k: K, name: &str) {
         let items = items::<F>();
         let check = |x: Arg<'_, F>, y: Arg<'_, F>, n: usize| {
@@ -100,8 +102,7 @@ mod forms {
         for &v in items { check(Arg::One(v), 3) }
     }
 
-    /// `k.many` against `k.one` for every triple of `items`, as `Many` arguments and with each argument in turn as `One`, as for
-    /// `binary`.
+    /// `k.many` against `k.one` for every triple of `items`, as `Many` arguments and with each argument in turn as `One`, as for `binary`.
     fn ternary<F: Float + Debug, K: Ternary<F, Out = F>>(k: K, name: &str) {
         let items = items::<F>();
         let at = |a: Arg<'_, F>, i| match a { Arg::One(v) => v, Arg::Many(s) => s[i] };
@@ -114,7 +115,15 @@ mod forms {
             assert_eq!(ok, (0..n).all(|i| !out[i + 1].is_nan() || [at(x, i), at(y, i), at(z, i)].iter().any(|v| v.is_nan())), "{name} breaks the NaN rule");
         };
         let (mut xs, mut ys, mut zs) = (Vec::new(), Vec::new(), Vec::new());
-        for &x in &items { for &y in &items { for &z in &items { xs.push(x); ys.push(y); zs.push(z); } } }
+        for &x in &items {
+            for &y in &items {
+                for &z in &items {
+                    xs.push(x);
+                    ys.push(y);
+                    zs.push(z);
+                }
+            }
+        }
         check([Arg::Many(&xs), Arg::Many(&ys), Arg::Many(&zs)], xs.len());
         for &v in &items {
             check([Arg::One(v), Arg::Many(&items), Arg::Many(&items)], items.len());
@@ -138,8 +147,7 @@ mod forms {
             binary: Pow, Root, Hypot, Atan2, Gammainc, Gammaincc, Gammaincinv, Binom, Logb, Maximum, Minimum;
             ternary: Betainc, Betaincinv
         );
-        // `Erfinv`'s and `Erfcinv`'s f64 slice forms place each block's items by region. Several blocks of uniform items, in random
-        // order, reach every region.
+        // `Erfinv`'s and `Erfcinv`'s f64 slice forms place each block's items by region. Several blocks of uniform items, in random order, reach every region.
         use rand::RngExt;
         let mut rng = crate::support::seeded(1);
         let q: Vec<f64> = (0..2000).map(|_| 2.0 * rng.random::<f64>()).collect();
@@ -147,8 +155,7 @@ mod forms {
         unary(Erfinv, "Erfinv", &q.iter().map(|&q| q - 1.0).collect::<Vec<_>>());
     }
 
-    /// An output type other than the item type, at each float type, f16 included, and at concrete complex types. A `bool` output is
-    /// never NaN, so it never fails.
+    /// An output type other than the item type, at each float type, f16 included, and at concrete complex types. A `bool` output is never NaN, so it never fails.
     #[test]
     fn outputs_can_differ_from_items() {
         use rustymath::tolerant::{Greater, Tolerance};
@@ -167,18 +174,14 @@ mod forms {
 }
 
 mod reductions {
-    use rustymath::reduce::*;
     use half::f16;
     use num_complex::Complex;
+    use rustymath::reduce::*;
 
-    /// Each reduction and scan against the same taken item by item, in order: sums and running sums of `sums`, and the product of
-    /// `prods`. Their items keep every sum and product exact at every width, so any grouping gives the same result.
+    /// Each reduction and scan against the same taken item by item, in order: sums and running sums of `sums`, and the product of `prods`. Their items keep every sum and product exact at every width, so any grouping gives the same result.
     fn exact<T: Copy + PartialEq + std::fmt::Debug, S: Copy + PartialEq + std::fmt::Debug>(
-        sums: &[T], prods: &[T], add: impl Fn(S, T) -> Option<S>, mul: impl Fn(S, T) -> Option<S>, zero: S, one: S,
-    ) where
-        Sum: Reduction<T, Total = S>,
-        Product: Reduction<T, Total = S>,
-    {
+        sums: &[T], prods: &[T], add: impl Fn(S, T) -> Option<S>, mul: impl Fn(S, T) -> Option<S>, zero: S, one: S) where Sum: Reduction<T, Total = S>,
+        Product: Reduction<T, Total = S> {
         let mut total = Some(zero);
         let running: Vec<_> = sums.iter().map(|&v| { total = total.and_then(|t| add(t, v)); total.unwrap() }).collect();
         assert_eq!(sum(sums), (total.unwrap(), true));
@@ -190,10 +193,9 @@ mod reductions {
 
     #[test]
     fn folds_match_item_by_item() {
-        // 101 items cover the running results, the remainder, and the scans' groups of four or sixteen and their tails. Ten 2s keep
-        // the product within f16.
+        // 101 items cover the running results, the remainder, and the scans' groups of four or sixteen and their tails. Ten 2s keep the product within f16.
         let sums: Vec<i64> = (0..101).map(|i| (i * 7919) % 23 - 11).collect();
-        let prods: Vec<i64> = (0..101).map(|i| if i % 10 == 3 { 2 } else if i % 3 == 0 { -1 } else { 1 }).collect();
+        let prods: Vec<i64> = (0..101).map(|i| { if i % 10 == 3 { 2 } else if i % 3 == 0 { -1 } else { 1 } }).collect();
         let at = |f: fn(i64) -> f64| (sums.iter().map(|&v| f(v)).collect::<Vec<_>>(), prods.iter().map(|&v| f(v)).collect::<Vec<_>>());
         exact(&sums, &prods, |t, v| t.checked_add(v), |t, v| t.checked_mul(v), 0, 1);
         let (s, p): (Vec<i8>, Vec<i8>) = (sums.iter().map(|&v| v as i8).collect(), prods.iter().map(|&v| v as i8).collect());
@@ -207,21 +209,36 @@ mod reductions {
         assert_eq!(extremes(&sums), (*sums.iter().min().unwrap(), *sums.iter().max().unwrap()));
         let mut maxima = Vec::new();
         cummax(&sums, Some(-5), &mut maxima);
-        assert_eq!(maxima, sums.iter().scan(-5, |m, &v| { *m = (*m).max(v); Some(*m) }).collect::<Vec<_>>());
+        assert_eq!(
+            maxima,
+            sums.iter()
+                .scan(-5, |m, &v| {
+                    *m = (*m).max(v);
+                    Some(*m)
+                })
+                .collect::<Vec<_>>()
+        );
         assert_eq!((max(&sums), min(&sums)), (*sums.iter().max().unwrap(), *sums.iter().min().unwrap()));
         // Complex sums of whole numbers are exact in any order.
         let z: Vec<Complex<f64>> = (0..101).map(|k| Complex::new(k as f64, -(k as f64) / 2.0)).collect();
         assert_eq!(sum(&z), (z.iter().fold(Complex::new(0.0, 0.0), |s, &v| s + v), true));
         let mut out = Vec::new();
         assert!(cumsum(&z, Some(Complex::new(1.0, 1.0)), &mut out));
-        assert_eq!(out, z.iter().scan(Complex::new(1.0, 1.0), |s, &v| { *s += v; Some(*s) }).collect::<Vec<_>>());
+        assert_eq!(
+            out,
+            z.iter()
+                .scan(Complex::new(1.0, 1.0), |s, &v| {
+                    *s += v;
+                    Some(*s)
+                })
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn edges() {
         assert_eq!((sum::<f64>(&[]), prod::<i32>(&[]), max::<f32>(&[]), min::<i16>(&[])), ((0.0, true), (1, true), f32::NEG_INFINITY, i16::MAX));
-        // NaN at item 40 of 101 lies inside a fold's running results, which vectorize, and not in the remainder. AArch64's `fmax`
-        // gives NaN there, and other targets skip it.
+        // NaN at item 40 of 101 lies inside a fold's running results, which vectorize, and not in the remainder. AArch64's `fmax` gives NaN there, and other targets skip it.
         let mut v = vec![1.0f64; 101];
         v[40] = f64::NAN;
         let v32: Vec<f32> = v.iter().map(|&x| x as f32).collect();
@@ -254,7 +271,11 @@ mod reductions {
                 let mut out = Vec::new();
                 cummax(&y, start, &mut out);
                 let mut total = start;
-                let want = y.iter().map(|&v| { let t = total.map_or(v, |t| maximum(v, t)); total = Some(t); t });
+                let want = y.iter().map(|&v| {
+                    let t = total.map_or(v, |t| maximum(v, t));
+                    total = Some(t);
+                    t
+                });
                 assert!(out.len() == y.len() && out.iter().zip(want).all(|(&a, b)| a == b || a.is_nan()), "{nan:?} {start:?}");
             }
         }
@@ -265,9 +286,7 @@ mod reductions {
         (0..outer).flat_map(|i| (0..inner).map(move |k| (0..len).map(|j| x[(i * len + j) * inner + k]).collect())).collect()
     }
 
-    /// Folds and scans along the middle axis against the same taken lane by lane, item by item, for lanes of consecutive items and
-    /// otherwise, short and long, and empty. Folding in blocks of 13 splits lanes at many offsets. Booleans fold by each of their
-    /// reductions, and an `i64` sum that wraps reports it, along a lane and down the rows.
+    /// Folds and scans along the middle axis against the same taken lane by lane, item by item, for lanes of consecutive items and otherwise, short and long, and empty. Folding in blocks of 13 splits lanes at many offsets. Booleans fold by each of their reductions, and an `i64` sum that wraps reports it, along a lane and down the rows.
     #[test]
     fn axes_match_lane_by_lane() {
         for shape in [[3, 37, 5], [15, 37, 1], [4, 3, 2], [2, 0, 3], [2, 200, 1], [70, 3, 1], [5, 64, 1], [65, 1, 1], [3, 50, 2]] {
@@ -281,14 +300,22 @@ mod reductions {
             let mut want = vec![0; x.len()];
             for i in 0..outer {
                 for k in 0..inner {
-                    (0..len).fold(10, |t, j| { let p = (i * len + j) * inner + k; want[p] = t + x[p]; want[p] });
+                    (0..len).fold(10, |t, j| {
+                        let p = (i * len + j) * inner + k;
+                        want[p] = t + x[p];
+                        want[p]
+                    });
                 }
             }
             let mut out = Vec::new();
             assert!(scan_along::<i64, Sum>(&x, shape, Some(10), &mut out));
             assert_eq!(out, want, "{shape:?}");
             // `SumAs`'s running sums of Booleans and of narrow integers match `Sum`'s, which run at 64 bits.
-            let wide = |items: Vec<i64>, start: Option<i64>| { let mut out = Vec::new(); scan_along::<i64, Sum>(&items, shape, start, &mut out); out.into_iter().map(|v| v as i32).collect::<Vec<_>>() };
+            let wide = |items: Vec<i64>, start: Option<i64>| {
+                let mut out = Vec::new();
+                scan_along::<i64, Sum>(&items, shape, start, &mut out);
+                out.into_iter().map(|v| v as i32).collect::<Vec<_>>()
+            };
             let mut counts = Vec::new();
             scan_along::<bool, SumAs<i32>>(&x.iter().map(|v| v % 3 == 0).collect::<Vec<_>>(), shape, Some(3), &mut counts);
             assert_eq!(counts, wide(x.iter().map(|v| i64::from(v % 3 == 0)).collect(), Some(3)), "{shape:?}");
@@ -322,17 +349,14 @@ mod reductions {
                     // The Boolean reductions scan by their tables: `or` is 14, `and` 8, `!=` 6 and `==` 9.
                     let mut reduced = Vec::new();
                     match code {
-                        14 => scan_along::<bool, Max>(&b, shape, start, &mut reduced),
-                        8 => scan_along::<bool, Min>(&b, shape, start, &mut reduced),
-                        6 => scan_along::<bool, Xor>(&b, shape, start, &mut reduced),
-                        9 => scan_along::<bool, Xnor>(&b, shape, start, &mut reduced),
-                        _ => continue,
+                        14 => scan_along::<bool, Max>(&b, shape, start, &mut reduced), 8 => scan_along::<bool, Min>(&b, shape, start, &mut reduced),
+                        6 => scan_along::<bool, Xor>(&b, shape, start, &mut reduced), 9 => scan_along::<bool, Xnor>(&b, shape, start, &mut reduced),
+                        _ => continue
                     };
                     assert_eq!(reduced, want, "{shape:?} {start:?} {code}");
                 }
             }
-            // `chosen` picks each item's result from `low` or `high` by the result before it, from either carry. Item `first + i·len`
-            // takes `fixed[i]` whatever the result before it.
+            // `chosen` picks each item's result from `low` or `high` by the result before it, from either carry. Item `first + i·len` takes `fixed[i]` whatever the result before it.
             let high: Vec<bool> = x.iter().map(|v| v % 5 != 0).collect();
             for (carry, len, first, restarts) in [(false, 1, 0, false), (true, 1, 0, false), (true, 3, 2, true), (false, 4, 1, true), (true, 70, 5, true)] {
                 let fixed: Vec<bool> = if restarts { (first..b.len()).step_by(len).map(|p| x[p] % 3 == 0).collect() } else { Vec::new() };
@@ -352,8 +376,7 @@ mod reductions {
         assert!(!scan_along::<i64, Sum>(&[i64::MAX, 0, 1, 0], [1, 2, 2], None, &mut Vec::new()));
     }
 
-    /// Folds that run in pieces, of long lanes and of single matrices down their columns, and folds of many short lanes or groups,
-    /// which split across threads, match the sums taken lane by lane, on one thread and on four.
+    /// Folds that run in pieces, of long lanes and of single matrices down their columns, and folds of many short lanes or groups, which split across threads, match the sums taken lane by lane, on one thread and on four.
     #[test]
     fn long_and_many_lanes() {
         for shape in [[1, (3 << 18) + 5, 1], [2, (1 << 18) + 7, 3], [5000, 200, 1], [300, 50, 70], [1, 2000, 300], [1, 600, 2000]] {
@@ -394,8 +417,7 @@ mod reductions {
             assert_eq!(<Product as Alternating<Complex<f64>>>::alternating(&pz), (Complex::new(q, 0.0), true));
         }
         assert!(!<Sum as Alternating<i64>>::alternating(&[i64::MAX, -1]).1);
-        // The pairs' ratios alternate between 1e200 and 1e-200, so the right fold is 1. Each running product takes every 16th ratio, or
-        // every 8th in wasm, so half of them overflow and half underflow.
+        // The pairs' ratios alternate between 1e200 and 1e-200, so the right fold is 1. Each running product takes every 16th ratio, or every 8th in wasm, so half of them overflow and half underflow.
         let x: Vec<f64> = (0..256).map(|i| if (i % 4 == 0) | (i % 4 == 3) { 1e200 } else { 1.0 }).collect();
         assert_eq!(right(&x, 1.0, |a, b| a / b), 1.0);
         assert!(!<Product as Alternating<f64>>::alternating(&x).1);
@@ -423,16 +445,14 @@ mod search {
         assert_eq!(sort_rows(y.len(), vec![y.clone()]), stable);
         stable.sort_by_key(|&r| !y[r as usize]);
         assert_eq!(sort_rows(y.len(), vec![y.iter().map(|&v| !v).collect()]), stable);
-        // Two keys take the pass by masks of 8 items. Here group 0's block writes past its end, onto group 1's first places. In the
-        // second, group 1's only item follows the last block.
+        // Two keys take the pass by masks of 8 items. Here group 0's block writes past its end, onto group 1's first places. In the second, group 1's only item follows the last block.
         assert_eq!(grouped(&[1, 0, 0, 0, 0, 0, 1, 1], 2), (vec![1, 2, 3, 4, 5, 0, 6, 7], vec![5, 3]));
         assert_eq!(grouped(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 2), ((0..10).collect(), vec![9, 1]));
         let b: Vec<u16> = (0..300).map(|i| u16::from(i % 3 == 0)).collect();
         let mut two: Vec<u32> = (0..300).collect();
         two.sort_by_key(|&r| b[r as usize]);
         assert_eq!(sort_rows(b.len(), vec![b.clone()]), two);
-        // Keys too wide for a table take the radix sort, one column at a time from the last. Rows that tie on the first column follow
-        // the second, and rows that tie on both keep their order of position.
+        // Keys too wide for a table take the radix sort, one column at a time from the last. Rows that tie on the first column follow the second, and rows that tie on both keep their order of position.
         let wide: Vec<u64> = (0..300u64).map(|i| (i % 7).wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
         let second: Vec<u64> = (0..300u64).map(|i| (i % 11) << 40).collect();
         let mut rows: Vec<u32> = (0..300).collect();
@@ -441,8 +461,7 @@ mod search {
         rows.sort_by_key(|&r| (wide[r as usize], second[r as usize]));
         assert_eq!(sort_rows(300, vec![wide, second]), rows);
         assert_eq!((grouped(&[1, 0, 1, 1], 2), grouped(&[0, 0], 1)), ((vec![1, 0, 2, 3], vec![1, 3]), (vec![0, 1], vec![2])));
-        // `grouped_keys` gives the classes that `classes` and `numbered` give, each with its positions. The five keys first appear out of
-        // their order, and a range of 2^20 + 1 is too wide for a table.
+        // `grouped_keys` gives the classes that `classes` and `numbered` give, each with its positions. The five keys first appear out of their order, and a range of 2^20 + 1 is too wide for a table.
         let together = |k: &[i32]| {
             let n = numbered(&classes(k));
             let mut each = vec![Vec::new(); n.firsts.len()];
@@ -454,8 +473,7 @@ mod search {
         together(&(0..300).map(|i| i32::from(i % 3 == 0)).collect::<Vec<_>>());
         together(&(0..300).map(|i| 3 + (i * 7 + 2) % 5).collect::<Vec<_>>());
         assert_eq!(grouped_keys(&[0, 1 << 20]), None);
-        // Keys 0, 2 and 4 fill the first 595 places, and key 6 first appears at 595, after four blocks of 64 with no new key make
-        // `write_first` count the keys `x` holds.
+        // Keys 0, 2 and 4 fill the first 595 places, and key 6 first appears at 595, after four blocks of 64 with no new key make `write_first` count the keys `x` holds.
         let late: Vec<i32> = (0..600).map(|i| if i == 595 { 6 } else { i % 3 * 2 }).collect();
         assert_eq!((index_of(&late, &[6; 20]), classes(&late)[595]), (vec![595; 20], 595));
         // 299 items of 5 keys go to four tables, with 3 left over. A range of 2^20 + 1 is too wide for a table.
@@ -472,8 +490,7 @@ mod search {
         assert_eq!(bins(&wide, &values), values.iter().map(|&v| wide.partition_point(|&b| b <= v) as u32).collect::<Vec<_>>());
     }
 
-    /// Over more than one 65,536-key piece, the radix sort's passes and the lookups split across threads and give one thread's
-    /// results. Equal keys keep their order of position.
+    /// Over more than one 65,536-key piece, the radix sort's passes and the lookups split across threads and give one thread's results. Equal keys keep their order of position.
     #[test]
     fn pieces_across_threads() {
         use rustymath::tolerant::{self, Tolerance};
@@ -507,11 +524,11 @@ mod search {
 }
 
 mod tolerant {
-    use num_traits::Float as _;
-    use rustymath::{tolerant::*, search, with_tolerance, Arg, Binary, Float, Unary};
-    use std::cmp::Ordering;
     use half::f16;
     use num_complex::Complex64;
+    use num_traits::Float as _;
+    use rustymath::{Arg, Binary, Float, Unary, search, tolerant::*, with_tolerance};
+    use std::cmp::Ordering;
 
     const T: Tolerance = Tolerance::DEFAULT;
     fn c(re: f64, im: f64) -> Complex64 { Complex64::new(re, im) }
@@ -551,8 +568,7 @@ mod tolerant {
         assert!(T.floor(f64::NAN).is_nan());
         assert_eq!((T.floor(f16::from_f32(2.5)), T.ceil(2.5f32)), (f16::from_f32(2.0), 3.0));
         assert_eq!((T.whole(2.9999999999999996), T.whole(2.5), T.whole(f64::INFINITY), Exactly.whole(4.0)), (Some(3.0), None, None, Some(4.0)));
-        // Below 1/(8t), where no float equals two whole numbers, the tolerant floor is the ordinary floor of the greatest equal
-        // float. Step up to 60 floats either side of whole numbers.
+        // Below 1/(8t), where no float equals two whole numbers, the tolerant floor is the ordinary floor of the greatest equal float. Step up to 60 floats either side of whole numbers.
         for n in [1.0f64, 3.0, -3.0, 1e6, -1e6, 1e12, 4e12, -4e12] {
             let (mut down, mut up) = (n, n);
             for _ in 0..60 {
@@ -614,7 +630,10 @@ mod tolerant {
     #[test]
     fn range() {
         let specials = [0.3, -0.3, 1.0, 1e-5, 5e-324, 2.2250738585072014e-308, 8796093022208.0, -1e20, f64::MAX, -f64::MAX];
-        for c in specials { check_range(T, c); check_range(Exactly, c); }
+        for c in specials {
+            check_range(T, c);
+            check_range(Exactly, c);
+        }
         for c in (0..100_000).map(|i| f64::from_bits(crate::support::random(i))).filter(|c| !c.is_nan()) { check_range(T, c); }
         let t32 = Tolerance::new(4.0 * f32::EPSILON as f64).unwrap();
         for c in [0.3f32, -7.5, 1e-40, f32::MAX] { check_range(t32, c); }
@@ -625,18 +644,10 @@ mod tolerant {
         assert_eq!(T.range(f16::from_f32(0.3)), Some((f16::from_f32(0.3), f16::from_f32(0.3))));
     }
 
-    /// Checks each real comparison's slice form against its scalar form for many items against one number, in either order, with each
-    /// item of `items` as the number.
-    fn against_one<F: Float + std::fmt::Debug>(t: Tolerance, items: &[f64])
-    where
-        Equal: Binary<F, Out = bool>,
-        NotEqual: Binary<F, Out = bool>,
-        Less: Binary<F, Out = bool>,
-        LessEqual: Binary<F, Out = bool>,
-        Greater: Binary<F, Out = bool>,
-        GreaterEqual: Binary<F, Out = bool>,
-        Matches: Binary<F, Out = bool>,
-    {
+    /// Checks each real comparison's slice form against its scalar form for many items against one number, in either order, with each item of `items` as the number.
+    fn against_one<F: Float + std::fmt::Debug>(t: Tolerance, items: &[f64]) where Equal: Binary<F, Out = bool>, NotEqual: Binary<F, Out = bool>,
+        Less: Binary<F, Out = bool>, LessEqual: Binary<F, Out = bool>, Greater: Binary<F, Out = bool>, GreaterEqual: Binary<F, Out = bool>,
+        Matches: Binary<F, Out = bool> {
         fn check<F: Copy + std::fmt::Debug, K: Binary<F, Out = bool> + std::fmt::Debug>(k: K, x: &[F]) {
             for &c in x {
                 let (mut left, mut right) = (Vec::new(), Vec::new());
@@ -654,8 +665,7 @@ mod tolerant {
         check(GreaterEqual(t), &x);
         check(Matches(t), &x);
     }
-    /// Each tolerant object gives its method's result for each item, at the default tolerance and at 0, for slices beside slices and
-    /// one item beside a slice, at f32, f64 and complex items. Only `Gcd`'s infinite argument fails.
+    /// Each tolerant object gives its method's result for each item, at the default tolerance and at 0, for slices beside slices and one item beside a slice, at f32, f64 and complex items. Only `Gcd`'s infinite argument fails.
     #[test]
     fn objects() {
         let (xs, ys) = (&[3.0, -3.0, 0.3, 0.0, f64::NAN, 2.0][..], &[-5.0, 5.0, 0.1 + 0.2, 7.0, 1.0, 2.9999999999999996][..]);
@@ -703,37 +713,35 @@ mod tolerant {
         assert_eq!(Lcm(T).one(c(2.0, 0.0), c(0.0, 3.0)), c(0.0, 6.0));
     }
 
-    /// Tolerant search finds the first match that a brute-force search finds, at every width and at small and large tolerances, among
-    /// floats crowded near a few values, and among zeros, infinities and NaN, whether it scans for a few items or indexes many.
+    /// Tolerant search finds the first match that a brute-force search finds, at every width and at small and large tolerances, among floats crowded near a few values, and among zeros, infinities and NaN, whether it scans for a few items or indexes many.
     #[test]
     fn slice_search() {
         fn check<F: Float + std::fmt::Debug>(t: Tolerance) {
             let base = [1.0, -1.0, 3.0, 1e-3, 0.0, 1000.0];
-            let x: Vec<F> = (0..400u64)
-                .map(|i| {
-                    let r = crate::support::random(i);
-                    F::narrow(base[(r % 6) as usize] * (1.0 + (((r >> 8) % 9) as f64 - 4.0) * t.value() / 2.0))
-                })
-                .chain([F::nan(), F::infinity(), F::neg_infinity(), F::neg_zero()])
-                .collect();
+            let x: Vec<F> = (0..400u64).map(|i| {
+                let r = crate::support::random(i);
+                F::narrow(base[(r % 6) as usize] * (1.0 + (((r >> 8) % 9) as f64 - 4.0) * t.value() / 2.0))
+            }).chain([F::nan(), F::infinity(), F::neg_infinity(), F::neg_zero()]).collect();
             let y: Vec<F> = x.iter().rev().copied().chain([F::narrow(7.0)]).collect();
             let brute: Vec<u32> = y.iter().map(|&v| x.iter().position(|&h| t.matches(h, v)).unwrap_or(x.len()) as u32).collect();
             assert_eq!(index_of(t, &x, &y), brute, "{t:?}");
             assert_eq!(index_of(t, &x, &y[..5]), brute[..5], "{t:?}, scanning");
         }
-        for t in [T, Tolerance::new(1e-3).unwrap(), Tolerance::new(0.3).unwrap()] { check::<f64>(t); check::<f32>(t); check::<f16>(t); }
+        for t in [T, Tolerance::new(1e-3).unwrap(), Tolerance::new(0.3).unwrap()] {
+            check::<f64>(t);
+            check::<f32>(t);
+            check::<f16>(t);
+        }
         let x = [0.3, 1.0, 0.1 + 0.2];
         assert_eq!((index_of(T, &x, &[0.1 + 0.2, 2.0]), index_of(Exactly, &x, &[0.1 + 0.2, 2.0])), (vec![0, 3], vec![2, 3]));
-        // Floats that each equal a whole number index as integers. At a tolerance of 0.3, which makes 3 equal 4, `whole_limit` lets only
-        // 0 qualify, so the search falls back to buckets.
+        // Floats that each equal a whole number index as integers. At a tolerance of 0.3, which makes 3 equal 4, `whole_limit` lets only 0 qualify, so the search falls back to buckets.
         let wx: Vec<f64> = (0..300u64).map(|i| (crate::support::random(i) % 50) as f64 - 25.0).collect();
         let wy: Vec<f64> = (0..40).map(|i| i as f64 - 30.0).collect();
         for t in [T, Tolerance::EXACT, Tolerance::new(0.3).unwrap()] {
             let brute: Vec<u32> = wy.iter().map(|&v| wx.iter().position(|&h| t.matches(h, v)).unwrap_or(wx.len()) as u32).collect();
             assert_eq!(index_of(t, &wx, &wy), brute, "{t:?}");
         }
-        // Floats near one whole number each equal it, but needn't equal each other. An indexed search finds only true matches, as a
-        // scan of 16 or fewer does.
+        // Floats near one whole number each equal it, but needn't equal each other. An indexed search finds only true matches, as a scan of 16 or fewer does.
         let near = [1.0 - 8e-15, 1.0, 1.0 + 8e-15];
         assert_eq!((index_of(T, &near[..1], &[near[2]; 17]), index_of(T, &near[..2], &[near[2]; 17])), (vec![1; 17], vec![1; 17]));
         let ints: Vec<i64> = wx.iter().map(|&v| v as i64).collect();

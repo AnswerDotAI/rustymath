@@ -1,6 +1,5 @@
-//! The magnitude, sign and angle of a number, as function objects. Their real forms are here, and `complex.rs` attaches their complex
-//! ones.
-use crate::{slice::Total, FUSED};
+//! The magnitude, sign and angle of a number, as function objects. Their real forms are here, and `complex.rs` attaches their complex ones.
+use crate::{FUSED, slice::Total};
 
 /// |x|, or the magnitude |z| of a complex z, which is real, as a function object.
 #[derive(Clone, Copy, Debug)]
@@ -8,8 +7,7 @@ pub struct Abs;
 /// The sign of x as -1 or 1, or z/|z| for a complex z, as a function object. A zero gives itself, and NaN gives NaN.
 #[derive(Clone, Copy, Debug)]
 pub struct Sign;
-/// The angle from the positive real axis, from -π to π, as a function object. It is real for complex items too. A real x has angle 0,
-/// or π where its sign bit is set, as the angle of x + 0i is.
+/// The angle from the positive real axis, from -π to π, as a function object. It is real for complex items too. A real x has angle 0, or π where its sign bit is set, as the angle of x + 0i is.
 #[derive(Clone, Copy, Debug)]
 pub struct Angle;
 
