@@ -793,4 +793,27 @@ mod gather {
         }
         assert_eq!((Steps::run(0, &cases[0].1, 3, 5), Steps::run(0, &cases[0].1, 18, 5)), (Some(3), None));
     }
+    /// A composed walk reads what walking one walk and then the other reads. `spreads` and `rereads` find walks that read an item more than once or read a fill.
+    #[test]
+    fn walks_compose() {
+        let s: Vec<i64> = (0..600).collect();
+        // An array of shape 6 by 10 stored from offset 5 with strides 30 and 2, read through reversed rows, a take, a rotation and a clipped read.
+        let (shape, inner) = ([6, 10], [along(6, 30), along(10, 2)]);
+        let array = read(&s, 5, &inner);
+        for outer in [
+            vec![Steps::Stride { start: 50, len: 6, step: -10 }, along(10, 1)],
+            vec![Steps::Stride { start: 10, len: 4, step: 10 }, Steps::Stride { start: 2, len: 5, step: 1 }],
+            vec![along(6, 10), Steps::Rotated { shift: 3, len: 10, stride: 1 }],
+            vec![along(6, 10), Steps::Clipped { start: -2, len: 12, size: 10, stride: 1 }],
+        ] {
+            let (base, steps) = Steps::through(&outer, &shape, 5, &inner).expect("these reads compose");
+            assert_eq!(read(&s, base, &steps), read(&array, 0, &outer));
+        }
+        // An entry over a frame of 2 by 3 splits into one entry for each axis, which read the same items.
+        let tables = [along(6, 4), along(4, 1)];
+        let (base, steps) = Steps::per_axis(&tables, &[2, 3, 4]).expect("a stride splits");
+        assert_eq!(read(&s, base, &steps), read(&s, 0, &tables));
+        assert!(along(3, 0).spreads() && Steps::Table(vec![Some(1), Some(1)]).spreads() && !Steps::Rotated { shift: 1, len: 4, stride: 1 }.spreads());
+        assert!(Steps::rereads(&[along(8, 1), along(3, 1)], &[10]) && !Steps::rereads(&[along(10, 1)], &[10]));
+    }
 }

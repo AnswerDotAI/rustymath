@@ -30,7 +30,7 @@ Keep these profiles aligned with basedpl's. Cargo uses the consuming workspace's
 
 ### Speed measurements
 
-`tests/speed.txt` holds budgets in copies of the same number of items. A copy is the time to write that many items of the same type, each negated, into a second buffer. The speed test times each copy immediately before its operation. The standard-library comparisons are informational. A budget failure often identifies a loop that stopped vectorizing. `RUSTYMATH_COSTS` prints every cost and the README's comparison table.
+`tests/speed.txt` holds budgets in copies of the same number of items. A copy is the time to write that many items of the same type, each negated, into a second buffer. The speed test times each copy immediately before its operation. The standard-library comparisons are informational. A budget failure often identifies a loop that stopped vectorizing. `RUSTYMATH_COSTS` prints every cost and the comparison table in `src/lib.md`'s "Accuracy and speed".
 
 The manually triggered `Speed` workflow measures the Ubicloud runner used by `Test` and restores its cache. The `Test` job also sets `RUSTYMATH_COSTS` on every push. `logged_costs` reads its log as it reads a `Speed` job's. After a run, review it and decide which budgets should change, following basedpl's DEV.md on `Speed` runs. Then use `basedpl.bpltests` to set those budgets under the rule in `tests/speed.txt`:
 
@@ -216,7 +216,7 @@ The remaining binding files match their Python modules. The polynomial functions
 
 ## Tests and documentation
 
-Rust tests use the public API in `tests/accuracy.rs`, `slices.rs`, `linalg.rs`, `numeric.rs` and `speed.rs`. The library sets `test = false` to avoid a separate `cfg(test)` build. Shared `support::random` and `seeded` use SplitMix64 without additional rand features. Other helpers stay local. Combine related checks into readable tests rather than splitting every assertion into a test.
+Rust tests use the public API in `tests/accuracy.rs`, `slices.rs`, `linalg.rs`, `numeric.rs` and `speed.rs`. The library sets `test = false` to avoid a separate `cfg(test)` build. Because no build runs `#[cfg(test)]` code, the library holds no inline tests. Any internal behaviour worth a test is worth knowing for callers too. These tests check it through the public API, as `walks_compose` checks `Steps::through`. Shared `support::random` and `seeded` use SplitMix64 without additional rand features. Other helpers stay local. Combine related checks into readable tests rather than splitting every assertion into a test.
 
 Python tests are grouped by topic in `tests/test_ufuncs.py`, `test_linalg.py`, `test_search.py`, `test_exact.py` and `test_optimize.py`. A test that checks threaded paths takes the `threads` fixture from `tests/conftest.py`, which runs it on one thread and on four.
 
@@ -226,6 +226,6 @@ Elementary real accuracy checks use a four-ulp bound with an additional allowanc
 
 ## CI and release
 
-`Test` runs on pushes to main and pull requests. It uses the shared test-profile build before Python/notebook tests. `Speed` is manual. `Release` runs separately on `v*` tags, builds dist wheels/sdist, publishes the crate to crates.io and the Python artifacts to PyPI, and attaches artifacts to the GitHub release. It does not wait for `Test` or run tests itself.
+`Test` runs on pushes to main and pull requests. It uses the shared test-profile build before Python/notebook tests. `Speed` is manual. `Release` runs separately on `v*` tags, builds dist wheels/sdist, publishes `rustymath` then `rustymath-buffer` to crates.io and the Python artifacts to PyPI, and attaches artifacts to the GitHub release. It does not wait for `Test` or run tests itself.
 
 Before release approval, verify successful tests for the release commit and run `cargo develop && pytest -q` for the installed extension. Confirm `[workspace.package].version` in `Cargo.toml`; Python gets it through `dynamic = ["version"]`. After Jeremy approves, run `ship-release`. It pushes the current version's tag to start publication, then bumps Cargo's version. Never commit, push, tag or publish without approval.

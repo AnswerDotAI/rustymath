@@ -108,6 +108,10 @@ rm.polynomial.polyroots([-6, 11, -6, 1]), rm.number_theory.factor(2**64 + 1)
 
 [Polynomials, exact arithmetic and number theory](https://answerdotai.github.io/rustymath/exact.html) includes rational matrix solves and calculations with [`fractions.Fraction`](https://docs.python.org/3/library/fractions.html#fractions.Fraction).
 
+## Accuracy and speed
+
+The Rust page’s [Accuracy and speed](https://answerdotai.github.io/rustymath/rust.html#accuracy-and-speed) section compares each function’s speed with Rust’s standard library. It also explains how the 4-ulp bound holds for `f16`, with and without fused multiply-add, and for `pow` and `root`.
+
 ## Licence
 
 Apache-2.0. Some algorithms and constants come from SLEEF and Arm Optimized Routines. `THIRD-PARTY.md` has their notices.

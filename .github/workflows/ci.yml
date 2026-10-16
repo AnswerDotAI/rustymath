@@ -18,7 +18,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: PyO3/maturin-action@v1
         with:
-          args: --profile dist --no-default-features --out dist -i python3.10 -i python3.11 -i python3.12 -i python3.13
+          args: --profile dist --no-default-features --out dist -i python3.11 -i python3.12 -i python3.13
           manylinux: auto
       - uses: actions/upload-artifact@v7
         with:
@@ -50,6 +50,9 @@ jobs:
       - id: auth
         uses: rust-lang/crates-io-auth-action@v1
       - run: cargo publish -p rustymath --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      - run: cargo publish -p rustymath-buffer --no-verify
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
       - uses: actions/download-artifact@v8

@@ -7,7 +7,7 @@ name = "rustymath"
 dynamic = ["version"]
 description = "Maths in plain Rust, from fast f16, f32 and f64 functions to exact rationals."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
 authors = [{name = "Jeremy Howard", email = "github@jhoward.fastmail.fm"}]
 classifiers = ["Programming Language :: Rust", "Programming Language :: Python :: Implementation :: CPython"]

@@ -248,6 +248,100 @@ impl Steps {
         };
         Self::reach(base + inner, outer, q)
     }
+    /// Whether this entry repeats an offset or gives a fill. Applying an element-wise function to the items it reads, in place of reading the function's results, would then compute an item more than once, or apply the function to a fill.
+    pub fn spreads(&self) -> bool {
+        match *self {
+            Self::Stride { len, step, .. } => step == 0 && len > 1,
+            Self::Clipped { start, len, size, .. } => start < 0 || start + len as i128 > size as i128,
+            Self::Rotated { .. } => false,
+            Self::Table(ref t) => t.iter().any(Option::is_none) || { let mut seen = std::collections::HashSet::new(); !t.iter().flatten().all(|&o| seen.insert(o)) },
+        }
+    }
+    /// `tables`, a walk's entries for a result of `shape`, as one entry for each axis of `shape`, with the offset of each entry of one item moved into the base. An entry over several axes splits into one `Stride` for each. `None` where an entry that isn't a `Stride` covers several axes.
+    pub fn per_axis(tables: &[Self], shape: &[usize]) -> Option<(usize, Vec<Self>)> {
+        let (mut base, mut steps, mut a) = (0, Vec::with_capacity(shape.len()), 0);
+        let ones = |steps: &mut Vec<Self>, a: &mut usize| while *a < shape.len() && shape[*a] == 1 {
+            steps.push(Self::Stride { start: 0, len: 1, step: 0 });
+            *a += 1;
+        };
+        for t in tables {
+            if t.len() == 1 { base += t.get(0)?; continue; }
+            ones(&mut steps, &mut a);
+            let (first, mut n) = (a, 1);
+            while a < shape.len() && n < t.len() { n *= shape[a]; a += 1; }
+            if n != t.len() { return None; }
+            match (&shape[first..a], t) {
+                ([_], _) => steps.push(t.clone()),
+                (group, &Self::Stride { start, step, .. }) => {
+                    let mut width = n;
+                    for (i, &len) in group.iter().enumerate() {
+                        width /= len;
+                        steps.push(Self::Stride { start: if i == 0 { start } else { 0 }, len, step: step * width as isize });
+                    }
+                }
+                _ => return None,
+            }
+        }
+        ones(&mut steps, &mut a);
+        (a == shape.len()).then_some((base, steps))
+    }
+    /// `outer`'s reads of an array of `shape`, composed with `inner`, which maps the positions along each axis of `shape` to offsets from `base`: one entry for each of `outer`'s, with the new base. Walking the result reads what walking `inner` and then `outer` reads. `None` where an entry of `outer` doesn't walk one axis of `shape`, or two entries walk one axis that `inner` doesn't map by a `Stride`.
+    pub fn through(outer: &[Self], shape: &[usize], mut base: usize, inner: &[Self]) -> Option<(usize, Vec<Self>)> {
+        let strides = crate::layout::strides(shape);
+        let mut walked = vec![false; shape.len()];
+        let mut steps = Vec::with_capacity(outer.len());
+        for e in outer {
+            steps.push(match e.axis_of(shape, &strides)? {
+                None => Self::Stride { start: 0, len: e.len(), step: 0 },
+                Some(a) => e.read_through(strides[a], &inner[a], !std::mem::replace(&mut walked[a], true), &mut base)?,
+            });
+        }
+        for (r, _) in inner.iter().zip(&walked).filter(|&(_, &w)| !w) { base += r.get(0)?; }
+        Some((base, steps))
+    }
+    /// Whether two of `outer`'s entries walk one axis of `shape`, as overlapping windows do. Applying an element-wise function to the items they read, in place of reading its results, would then compute each item once for every window that holds it.
+    pub fn rereads(outer: &[Self], shape: &[usize]) -> bool {
+        let strides = crate::layout::strides(shape);
+        let mut walked = vec![false; shape.len()];
+        outer.iter().any(|e| matches!(e.axis_of(shape, &strides), Some(Some(a)) if std::mem::replace(&mut walked[a], true)))
+    }
+    /// This entry's positions along an axis whose stride is `unit`, read through `r`. The first entry along an axis takes `r`'s offset at position 0, in its own start or in `base`.
+    fn read_through(&self, unit: usize, r: &Self, first: bool, base: &mut usize) -> Option<Self> {
+        if first && matches!(*self, Self::Stride { start: 0, len, step } if step == unit as isize && len == r.len()) { return Some(r.clone()); }
+        if let Self::Stride { start: r0, step: s, .. } = *r {
+            let r0 = if first { r0 } else { 0 };
+            match *self {
+                Self::Stride { start, len, step } => {
+                    let start = usize::try_from(r0 as isize + (start / unit) as isize * s).ok()?;
+                    return Some(Self::Stride { start, len, step: step / unit as isize * s });
+                }
+                Self::Rotated { shift, len, .. } if s >= 0 => { *base += r0; return Some(Self::Rotated { shift, len, stride: s as usize }); }
+                Self::Clipped { start, len, size, .. } if s >= 0 => { *base += r0; return Some(Self::Clipped { start, len, size, stride: s as usize }); }
+                _ => {}
+            }
+        }
+        first.then(|| Self::Table(self.offsets().map(|o| o.and_then(|o| r.get(o / unit))).collect()))
+    }
+    /// The axis of `shape` whose stride divides each of this entry's offsets, each quotient within its length: `Some(None)` where every offset is 0, and `None` where no axis fits.
+    fn axis_of(&self, shape: &[usize], strides: &[usize]) -> Option<Option<usize>> {
+        let zero = match *self {
+            Self::Stride { start, len, step } => len == 0 || start == 0 && (step == 0 || len == 1),
+            Self::Rotated { stride, .. } | Self::Clipped { stride, .. } => stride == 0,
+            Self::Table(ref t) => t.iter().all(|&o| o == Some(0)),
+        };
+        if zero { return Some(None); }
+        let fits = |a: usize| {
+            let (s, n) = (strides[a], shape[a]);
+            let at = |o: usize| o % s == 0 && o / s < n;
+            match *self {
+                Self::Stride { start, len, step } => step.unsigned_abs() % s == 0 && at(start) && at(start.wrapping_add_signed(step * (len as isize - 1))),
+                Self::Rotated { stride, len, .. } => stride == s && len <= n,
+                Self::Clipped { stride, size, .. } => stride == s && size <= n,
+                Self::Table(ref t) => t.iter().flatten().all(|&o| at(o)),
+            }
+        };
+        (0..shape.len()).find(|&a| shape[a] > 1 && fits(a)).map(Some)
+    }
 }
 
 /// How `walk` turns a source item into a result item. Every `Fn(S) -> D` converts item by item, and [`Same`] copies whole slices of a source and result of one type.
