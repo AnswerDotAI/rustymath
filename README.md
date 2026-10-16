@@ -103,7 +103,7 @@ Polynomial coefficients start from the constant term. Number-theory functions ac
 rm.polynomial.polyroots([-6, 11, -6, 1]), rm.number_theory.factor(2**64 + 1)
 ```
 
-    (Array([(1+0j), (2+0j), (3+0j)], dtype=c128),
+    (Array([(1+0j), (2-0j), (3+0j)], dtype=c128),
      [(274177, 1), (67280421310721, 1)])
 
 [Polynomials, exact arithmetic and number theory](https://answerdotai.github.io/rustymath/exact.html) includes rational matrix solves and calculations with [`fractions.Fraction`](https://docs.python.org/3/library/fractions.html#fractions.Fraction).
