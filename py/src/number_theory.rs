@@ -1,8 +1,8 @@
 //! rustymath's `number_theory` module on Python integers of any size. Each function checks for Ctrl-C at least about once a millisecond, and stops with `KeyboardInterrupt`.
 use num_bigint::BigUint;
 use num_traits::Zero;
-use numpy::PyArray1;
-use pyo3::{exceptions::PyValueError, prelude::*};
+use crate::array::{core, give};
+use pyo3::{exceptions::{PyOverflowError, PyValueError}, prelude::*};
 use rustymath::number_theory as nt;
 
 fn positive(n: &BigUint, name: &str) -> PyResult<()> {
@@ -39,15 +39,18 @@ pub fn prime_count(py: Python<'_>, n: u64) -> PyResult<u64> { nt::prime_count_wi
 #[pyfunction]
 pub fn factorial(py: Python<'_>, n: u64) -> PyResult<BigUint> { nt::factorial_with(n, || py.check_signals()) }
 
-/// The primes from `start` up to but not including `stop`, as an array of uint64. With one argument, the primes below it, as `range` counts.
+/// The primes from `start` up to but not including `stop`, as an `i64` array. With one argument, the primes below it, as `range` counts.
 #[pyfunction]
 #[pyo3(signature = (start, stop=None))]
-pub fn primes(py: Python<'_>, start: u64, stop: Option<u64>) -> PyResult<Bound<'_, PyArray1<u64>>> {
+pub fn primes(py: Python<'_>, start: u64, stop: Option<u64>) -> PyResult<Bound<'_, PyAny>> {
     let (start, stop) = stop.map_or((0, start), |stop| (start, stop));
     let mut found = nt::Primes::new(start);
     let mut out = Vec::new();
-    while let Some(p) = found.next_with(|| py.check_signals())?.filter(|&p| p < stop) { out.push(p); }
-    Ok(PyArray1::from_vec(py, out))
+    while let Some(p) = found.next_with(|| py.check_signals())?.filter(|&p| p < stop) {
+        out.push(i64::try_from(p).map_err(|_| PyOverflowError::new_err(format!("the prime {p} doesn't fit i64")))?);
+    }
+    let len = out.len();
+    give(py, core(out, &[len])?, false)
 }
 
 /// Adds this module's functions to `m`.

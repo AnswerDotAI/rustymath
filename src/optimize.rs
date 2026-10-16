@@ -149,10 +149,11 @@ impl Method {
 }
 
 impl std::str::FromStr for Method {
-    type Err = String;
-    fn from_str(name: &str) -> Result<Method, String> {
+    type Err = crate::error::Error;
+    fn from_str(name: &str) -> Result<Method, Self::Err> {
         let found = Method::NAMES.iter().find(|(key, _)| key.eq_ignore_ascii_case(name));
-        found.map(|&(_, method)| method).ok_or_else(|| format!("unknown method: use one of {}", Method::NAMES.map(|(key, _)| key).join(", ")))
+        let unknown = || crate::error::Error::new(crate::error::Kind::Domain, format!("unknown method: use one of {}", Method::NAMES.map(|(key, _)| key).join(", ")));
+        found.map(|&(_, method)| method).ok_or_else(unknown)
     }
 }
 
@@ -222,8 +223,12 @@ impl<F: Native> Options<'_, F> {
     /// The method a front runs for `task` on `variables` variables: `method`, or the one [`Method::choose`] picks.
     pub fn method_for(&self, task: Task, variables: usize) -> Method { self.method.unwrap_or_else(|| Method::choose(task, variables, self.bounds.is_some())) }
 
-    /// Why a front would reject these options for `task` on `variables` variables. A binding calls it first and reports the message as an error.
-    pub fn check(&self, task: Task, variables: usize) -> Result<(), &'static str> {
+    /// Why a front would reject these options for `task` on `variables` variables: a Domain error with the reason. A binding calls it first and reports the error.
+    pub fn check(&self, task: Task, variables: usize) -> Result<(), crate::error::Error> {
+        self.problem(task, variables).map_err(|reason| crate::error::Error::new(crate::error::Kind::Domain, reason))
+    }
+
+    fn problem(&self, task: Task, variables: usize) -> Result<(), &'static str> {
         use Method::*;
         let bounds = self.bounds;
         if bounds.is_some_and(|b| b.lower.len() != variables || b.upper.len() != variables) {

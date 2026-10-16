@@ -1,6 +1,7 @@
 //! Search and sort over slices of keys. A key is an item read as a whole number (`Key`), or an unsigned word whose order is the order you want (`RadixKey`). `Float::order_key` gives each float such a word, as wide as the float. Positions take 32 bits inside these functions, so a slice holds at most `u32::MAX` items. `tolerant` builds its searches over floats on these functions.
 //!
 //! `index_of`, `classes` and `firsts` index the first position of each key. `index_of` passes over `x` once for each item of `y` when `y` has at most `SCANNED` items. The index is a table when the keys span at most twice the slice's length, or 1024, and a hash map otherwise. `numbered` numbers the classes in order of first position, with each one's size. `grouped_keys` numbers them the same way from a table of keys, with each one's positions, and `class_counts` gives only their sizes. `counts` counts the items with each key in such a table. `sort_rows` sorts keys that span such a table by counting them. It sorts other keys with an LSD radix sort that skips any byte that is the same in every key. With several threads, the sort splits each pass of more than `RADIX_PIECE` keys across them, and `index_of` splits its lookups.
+use crate::{Float, buffer::{DType, Element, View}, tolerant::{self, Tolerance}};
 use hashbrown::{HashMap, hash_map::Entry};
 use std::{hash::Hash, mem::MaybeUninit, ops::Not};
 
@@ -28,7 +29,7 @@ macro_rules! keys {
         }
     )+};
 }
-keys!(u8, u16, u32, u64, i8, i16, i32, i64);
+keys!(u8, u16, u32, u64, i16, i32, i64);
 impl Key for bool {
     #[inline]
     fn key(self) -> i64 { self.into() }
@@ -68,7 +69,7 @@ macro_rules! radix_keys {
         }
     )+};
 }
-radix_keys!(u16, u32, u64);
+radix_keys!(u8, u16, u32, u64);
 
 /// An unsigned key in an integer's numeric order. An unsigned integer is its own key. A signed integer's key is its bits with the sign bit flipped.
 pub trait OrderKey: Copy {
@@ -76,24 +77,29 @@ pub trait OrderKey: Copy {
     fn order_key(self) -> Self::Key;
 }
 macro_rules! order_keys {
-    ($($s:ty => $u:ty),+) => {$(
-        impl OrderKey for $s {
+    ($($s:ty => $u:ty),+; $($own:ty),+) => {
+        $(impl OrderKey for $s {
             type Key = $u;
             #[inline]
             fn order_key(self) -> $u { self as $u ^ 1 << (<$u>::BITS - 1) }
-        }
-        impl OrderKey for $u {
-            type Key = $u;
+        })+
+        $(impl OrderKey for $own {
+            type Key = $own;
             #[inline]
-            fn order_key(self) -> $u { self }
-        }
-    )+};
+            fn order_key(self) -> $own { self }
+        })+
+    };
 }
-order_keys!(i8 => u8, i16 => u16, i32 => u32, i64 => u64);
+order_keys!(i16 => u16, i32 => u32, i64 => u64; u8);
 impl OrderKey for bool {
     type Key = u8;
     #[inline]
     fn order_key(self) -> u8 { self as u8 }
+}
+impl OrderKey for char {
+    type Key = u32;
+    #[inline]
+    fn order_key(self) -> u32 { self.into() }
 }
 
 /// The number of items of `y` up to which `index_of` and `tolerant::index_of` pass over `x` once for each, in place of building an index.
@@ -634,3 +640,98 @@ impl Iterator for Links<'_> {
         Some(i as usize)
     }
 }
+
+/// `Some($body)` with `$x` bound to the items of the view `$view` when they're Booleans, characters or integers, the types that implement `Key`, and `None` for other items.
+macro_rules! keys_of {
+    ($view:expr, |$x:ident| $body:expr) => {
+        match $view {
+            View::Booleans($x) => Some($body),
+            View::Characters($x) => Some($body),
+            View::Integers(ints) => Some(with_ints!(ints, |$x| $body)),
+            _ => None,
+        }
+    };
+}
+
+/// `Some($body)` with `$x` and `$y` bound to the items of the views `$a` and `$b` when both hold Booleans, both characters or both integers, with integers of different widths read as `i64`, and `None` for other pairs.
+macro_rules! key_pairs {
+    ($a:expr, $b:expr, |$x:ident, $y:ident| $body:expr) => {
+        match ($a, $b) {
+            (View::Booleans($x), View::Booleans($y)) => Some($body),
+            (View::Characters($x), View::Characters($y)) => Some($body),
+            (View::Integers($x), View::Integers($y)) => Some(with_int_pair!($x, $y, |$x, $y| $body)),
+            _ => None,
+        }
+    };
+}
+
+/// The body of a search of one view: `Some(Ok($keys(x)))` for Booleans, integers and characters, `Some($floats(t, x, $check))` within the tolerance `$t` for floats, and `None` for complex numbers.
+macro_rules! keys_or_floats {
+    ($x:expr, $t:expr, $check:expr, $keys:path, $floats:path) => {{
+        if let Some(found) = keys_of!($x, |x| $keys(x)) { return Some(Ok(found)); }
+        let View::Floats(x) = $x else { return None };
+        Some(with_floats!(x, |x| crate::with_tolerance!($t, |t| $floats(t, x, $check))))
+    }};
+}
+
+/// The class of each item of `x`, as the first position of an item that matches it: exactly for Booleans, integers and characters, through [`classes`], and within `t` for floats, through [`tolerant::classes_with`], which calls `check` as it goes. `None` for complex numbers.
+pub fn view_classes<E>(x: View<'_>, t: Tolerance, check: impl FnMut() -> Result<(), E>) -> Option<Result<Vec<u32>, E>> {
+    keys_or_floats!(x, t, check, classes, tolerant::classes_with)
+}
+
+/// Whether each item of `x` is the first of its class, as [`view_classes`] matches them. `None` for complex numbers.
+pub fn view_firsts<E>(x: View<'_>, t: Tolerance, check: impl FnMut() -> Result<(), E>) -> Option<Result<Vec<bool>, E>> {
+    keys_or_floats!(x, t, check, firsts, tolerant::firsts_with)
+}
+
+/// The size of each class of `x`, in order of first position, as [`view_classes`] matches them. Booleans, integers and characters that span a table count from it, as [`class_counts`] does. `None` for complex numbers.
+pub fn view_class_counts<E>(x: View<'_>, t: Tolerance, check: impl FnMut() -> Result<(), E>) -> Option<Result<Vec<usize>, E>> {
+    if let Some(counts) = keys_of!(x, |x| class_counts(x)) { return Some(Ok(counts)); }
+    Some(view_classes(x, t, check)?.map(|classes| numbered(&classes).counts))
+}
+
+/// The classes of `x`, as [`view_classes`] matches them, numbered in order of first position, with the positions of each. Booleans, integers and characters that span a table group straight from it, as [`grouped_keys`] does. `None` for complex numbers.
+pub fn view_grouped<E>(x: View<'_>, t: Tolerance, check: impl FnMut() -> Result<(), E>) -> Option<Result<Grouped, E>> {
+    if let Some(Some(grouped)) = keys_of!(x, |x| grouped_keys(x)) { return Some(Ok(grouped)); }
+    Some(view_classes(x, t, check)?.map(|classes| { let Numbered { firsts, numbers, .. } = numbered(&classes); Grouped::new(firsts, &numbers) }))
+}
+
+/// For each item of `y`, the first position in `x` of an item that matches it, or the length of `x` where none does: exactly for Booleans, integers or characters of one kind, with integers of different widths read as `i64`, and within `t` for floats of one width, calling `check` as it goes. `None` for other pairs.
+pub fn view_index_of<E>(x: View<'_>, y: View<'_>, t: Tolerance, check: impl FnMut() -> Result<(), E>) -> Option<Result<Vec<u32>, E>> {
+    if let (DType::Float(w), true) = (x.dtype(), x.dtype() == y.dtype()) {
+        return with_float_width!(w, F => Some(crate::with_tolerance!(t, |t| tolerant::index_of_with(t, F::of(x)?, F::of(y)?, check))));
+    }
+    key_pairs!(x, y, |x, y| Ok(index_of(x, y)))
+}
+
+/// For each item of `values`, the number of `boundaries` at or below it, as [`bins`] counts them: for Booleans, integers or characters of one kind, with integers of different widths read as `i64`, and for floats of one width by their order keys. `None` for other pairs.
+pub fn view_bins(boundaries: View<'_>, values: View<'_>) -> Option<Vec<u32>> {
+    if let (DType::Float(w), true) = (boundaries.dtype(), boundaries.dtype() == values.dtype()) {
+        return with_float_width!(w, F => Some(bins(&tolerant::order_keys(F::of(boundaries)?), &tolerant::order_keys(F::of(values)?))));
+    }
+    key_pairs!(boundaries, values, |x, y| bins(x, y))
+}
+
+/// For each item of `values`, the number of `boundaries` below it, for views of one dtype other than complex: [`bins`] of the complemented order keys, with `boundaries` reversed. `None` for other views.
+pub fn view_bins_below(boundaries: View<'_>, values: View<'_>) -> Option<Vec<u32>> {
+    if boundaries.dtype() != values.dtype() { return None; }
+    let (mut a, mut v) = (view_order_keys(boundaries)?, view_order_keys(values)?);
+    let n = a.len() as u32;
+    a.reverse();
+    for k in a.iter_mut().chain(&mut v) { *k = !*k; }
+    Some(bins(&a, &v).into_iter().map(|p| n - p).collect())
+}
+
+/// Each item's order key, widened to 64 bits: [`OrderKey::order_key`] for Booleans, integers and characters, and [`Float::order_key`] for floats. Within one dtype, their unsigned order is the items' order, with every NaN last. `None` for complex numbers.
+pub fn view_order_keys(x: View<'_>) -> Option<Vec<u64>> {
+    Some(match x {
+        View::Booleans(x) => widened(x),
+        View::Characters(x) => widened(x),
+        View::Integers(ints) => with_ints!(ints, |x| widened(x)),
+        View::Floats(f) => with_floats!(f, |x| x.iter().map(|&v| v.order_key().into()).collect()),
+        View::Complexes(_) => return None,
+    })
+}
+
+/// Each item's [`OrderKey`], widened to 64 bits.
+fn widened<T: OrderKey>(x: &[T]) -> Vec<u64> { x.iter().map(|&v| v.order_key().into()).collect() }

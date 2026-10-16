@@ -1,34 +1,25 @@
 //! rustymath's `distribution` module. Each constructor checks its parameters and gives a `Distribution`, whose methods take a number or an array of any shape.
-use numpy::ndarray::ArrayD;
-use numpy::{AllowTypeChange, IntoPyArray, PyArrayLikeDyn};
+use crate::array::{core, give};
+use crate::functions::Apply;
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyFloat};
 use rand::{SeedableRng, rngs::StdRng};
-use rustymath::{Arg, Unary, distribution::{self as dist, standard::*}};
+use rustymath::{distribution::{self as dist, standard::*}, kernels, layout::generated_len};
+use rustymath_buffer::py_err;
 
 /// A probability distribution, with a density, a cumulative distribution, a quantile function and a sampler.
 #[pyclass(module = "rustymath.distribution", frozen)]
 pub struct Distribution(dist::Distribution);
 
-/// `f`'s slice form over `x`'s items, as an array of `x`'s shape, or a float for a number.
-fn each<'py>(py: Python<'py>, x: PyArrayLikeDyn<'py, f64, AllowTypeChange>, f: impl Unary<f64, Out = f64>) -> Bound<'py, PyAny> {
-    let x = x.as_array();
-    let x = x.as_standard_layout();
-    let mut out = Vec::with_capacity(x.len());
-    f.many(Arg::Many(x.as_slice().expect("a standard-layout array is one slice")), x.len(), &mut out);
-    let out = ArrayD::from_shape_vec(x.raw_dim(), out).expect("one result for each item");
-    if out.ndim() == 0 { PyFloat::new(py, *out.first().expect("a 0-d array has one item")).into_any() } else { out.into_pyarray(py).into_any() }
-}
-
 #[pymethods]
 impl Distribution {
     /// The density at each item of `x`, or for a discrete distribution the probability of each.
-    fn pdf<'py>(&self, py: Python<'py>, x: PyArrayLikeDyn<'py, f64, AllowTypeChange>) -> Bound<'py, PyAny> { each(py, x, dist::Pdf(self.0)) }
+    fn pdf<'py>(&self, py: Python<'py>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { let k = dist::Pdf(self.0); kernels!(Unary of k).apply(py, "pdf", &k, &[x]) }
 
     /// The probability of a value at most each item of `x`.
-    fn cdf<'py>(&self, py: Python<'py>, x: PyArrayLikeDyn<'py, f64, AllowTypeChange>) -> Bound<'py, PyAny> { each(py, x, dist::Cdf(self.0)) }
+    fn cdf<'py>(&self, py: Python<'py>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { let k = dist::Cdf(self.0); kernels!(Unary of k).apply(py, "cdf", &k, &[x]) }
 
     /// The least value whose `cdf` is at least each item of `p`. A `p` outside 0 to 1 gives NaN.
-    fn quantile<'py>(&self, py: Python<'py>, p: PyArrayLikeDyn<'py, f64, AllowTypeChange>) -> Bound<'py, PyAny> { each(py, p, dist::Quantile(self.0)) }
+    fn quantile<'py>(&self, py: Python<'py>, p: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { let k = dist::Quantile(self.0); kernels!(Unary of k).apply(py, "quantile", &k, &[p]) }
 
     /// Values drawn from the distribution: one float with no `size`, or else an array of shape `size`. The same `seed` gives the same values.
     #[pyo3(signature = (size=None, seed=None))]
@@ -36,9 +27,9 @@ impl Distribution {
         let mut rng = seed.map_or_else(rand::make_rng::<StdRng>, StdRng::seed_from_u64);
         let Some(size) = size else { return Ok(PyFloat::new(py, self.0.sample(&mut rng)).into_any()) };
         let shape = size.extract::<usize>().map(|n| vec![n]).or_else(|_| size.extract::<Vec<usize>>())?;
-        let mut out = ArrayD::zeros(shape);
-        self.0.samples(&mut rng, out.as_slice_mut().expect("a new array is one slice"));
-        Ok(out.into_pyarray(py).into_any())
+        let mut out = vec![0.0; generated_len(&shape).map_err(py_err)?];
+        self.0.samples(&mut rng, &mut out);
+        give(py, core(out, &shape)?, false)
     }
 
     /// Whether the distribution's values are whole numbers.

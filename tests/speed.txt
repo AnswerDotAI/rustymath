@@ -1,7 +1,7 @@
 # The budgets that `tests/speed.rs` checks. Each section starts with a float width in brackets. Each line under it holds a function's name and its budget at that width, separated by a tab. A budget counts copies of as many items as the function's inputs hold.
 # A budget is twice the most the function has cost on a Mac and on CI's runner, and at least 0.5. `basedpl.bpltests.set_budgets` rewrites the budgets under this rule.
-# A function that CI hasn't timed yet has four times its Mac cost, and at least 0.5. `set_budgets` applies this rule with `untimed=True`. The next `Speed` run sets its budget under the rule above.
-# The CI figures come from `Speed` run 38345248975. Its CPU was the AMD Ryzen 9 7950X3D 16-Core Processor.
+# A function that CI hasn't timed yet has four times its Mac cost, and at least 0.5. `set_budgets` applies this rule with `untimed=True`. The next CI run that logs costs, a push's `Test` run or a `Speed` run, sets its budget under the rule above.
+# The CI figures come from the `Test` and `Speed` runs that last set each budget. Every one ran on the AMD Ryzen 9 7950X3D 16-Core Processor.
 [f64]
 Exp	15
 Expm1	18

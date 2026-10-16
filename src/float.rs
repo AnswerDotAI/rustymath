@@ -56,9 +56,9 @@ pub(crate) mod sealed {
     macro_rules! nan_items { ($($t:ty),+) => {$( impl Item for $t { #[inline(always)] fn has_nan(self) -> bool { self.is_nan() } } )+} }
     nan_items!(f32, f64, half::f16, Complex<f32>, Complex<f64>);
     macro_rules! exact_items { ($($t:ty),+) => {$( impl Item for $t { #[inline(always)] fn has_nan(self) -> bool { false } } )+} }
-    exact_items!(i8, i16, i32, i64, u8, u16, u32, u64, bool, std::cmp::Ordering);
+    exact_items!(u8, i16, i32, i64, bool, char, std::cmp::Ordering);
     macro_rules! sealed { ($($t:ty),+) => {$( impl Sealed for $t {} )+} }
-    sealed!(i8, i16, i32, i64, u8, u16, u32, u64);
+    sealed!(i8, i16, i32, i64, u8, u16, u32);
     impl<T: super::Native> Sealed for Complex<T> {}
 
     pub trait Core: Copy {

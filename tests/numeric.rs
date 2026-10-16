@@ -1,29 +1,27 @@
 pub mod support;
 
 mod arith {
-    use rustymath::Overflowing;
+    use rustymath::{Abs, Add, Binary, Multiply, Sign, Subtract, Unary};
 
-    /// Each operation at type `$t`, on every pair of edge values, against the exact result in `i128`: the wrapped result, and whether it fits.
+    /// The integer forms of the arithmetic objects at type `$t`, on every pair of edge values, against the exact result in `i128`. Each form fails where that doesn't fit `$t`.
     macro_rules! check {
         ($($t:ty),+) => {$({
             let edges: Vec<$t> = [<$t>::MIN, <$t>::MAX, 0, 1, 2, 3, 7].into_iter().chain([-1i128, -2, -3].map(|v| v as $t))
                 .chain([<$t>::MIN / 2, <$t>::MAX / 2, <$t>::MAX - 1, <$t>::MIN.wrapping_add(1)]).collect();
-            let exact = |r: i128| (r as $t, <$t>::try_from(r).is_ok());
+            let fits = |r: i128| <$t>::try_from(r).ok();
             for &x in &edges {
                 for &y in &edges {
                     let (a, b) = (x as i128, y as i128);
-                    assert_eq!(x.plus(y), exact(a + b), "{x} + {y}");
-                    assert_eq!(x.minus(y), exact(a - b), "{x} - {y}");
-                    assert_eq!(x.times(y), exact(a * b), "{x} × {y}");
+                    assert_eq!((Add.checked(x, y), Subtract.checked(x, y), Multiply.checked(x, y)), (fits(a + b), fits(a - b), fits(a * b)), "{x} and {y}");
                 }
-                assert_eq!(x.magnitude(), exact((x as i128).abs()), "|{x}|");
-                assert_eq!(x.sign() as i128, (x as i128).signum(), "sign {x}");
+                assert_eq!(Unary::<$t>::checked(&Abs, x), fits((x as i128).abs()), "|{x}|");
+                assert_eq!(Sign.one(x) as i128, (x as i128).signum(), "sign {x}");
             }
         })+};
     }
 
     #[test]
-    fn overflowing_matches_exact_arithmetic() { check!(i8, i16, i32, i64, u8, u16, u32, u64); }
+    fn integer_forms_match_exact_arithmetic() { check!(u8, i16, i32, i64); }
 }
 
 mod convert {
@@ -166,7 +164,7 @@ mod integer {
     use num_bigint::BigInt;
     use rustymath::integer::*;
     use rustymath::{
-        Abs, Arg, Binary, Binom, Pow, Sign, Unary, tolerant::{Ceil, Equal, Floor, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue}
+        Abs, Arg, Binary, Binom, Pow, Sign, Unary, tolerant::{Ceil, Equal, Floor, Gcd, Greater, GreaterEqual, Lcm, LessEqual, NotEqual, Residue}
     };
 
     /// Integers that exercise overflow and sign: the extremes, small numbers, powers of two and random bits.
@@ -245,12 +243,6 @@ mod integer {
             assert!(Residue(t).many(Arg::One(d), Arg::Many(&ys16), ys16.len(), &mut out));
             assert_eq!(out, ys16.iter().map(|&y| residue(d.into(), y.into()) as i16).collect::<Vec<_>>());
         }
-        let ys16u: Vec<u16> = (0..=u16::MAX).collect();
-        for d in [2u16, 3, 1000, u16::MAX] {
-            let mut out = Vec::new();
-            assert!(Residue(t).many(Arg::One(d), Arg::Many(&ys16u), ys16u.len(), &mut out));
-            assert_eq!(out, ys16u.iter().map(|&y| y % d).collect::<Vec<_>>());
-        }
         let mut out = vec![5];
         let ok = Gcd(t).many(Arg::Many(&xs), Arg::Many(&ys), xs.len(), &mut out);
         assert_eq!(ok, xs.iter().zip(&ys).all(|(&x, &y)| gcd(x, y).is_some()));
@@ -264,29 +256,16 @@ mod integer {
     #[test]
     fn other_widths() {
         let t = rustymath::tolerant::Tolerance::DEFAULT;
-        // Every pair of `i8`s agrees with the `i64` functions where the result fits, and fails where it doesn't.
-        for x in i8::MIN..=i8::MAX {
-            for y in i8::MIN..=i8::MAX {
+        // Every pair of `u8`s agrees with the `i64` functions where the result fits, and fails where it doesn't.
+        for x in 0..=u8::MAX {
+            for y in 0..=u8::MAX {
                 let (a, b) = (i64::from(x), i64::from(y));
-                let fit = |r: Option<i64>| r.and_then(|r| i8::try_from(r).ok());
-                assert_eq!(Binary::<i8>::checked(&Gcd(t), x, y), fit(gcd(a, b)), "gcd({x}, {y})");
-                assert_eq!(Binary::<i8>::checked(&Lcm(t), x, y), fit(lcm(a, b)), "lcm({x}, {y})");
-                assert_eq!(Binary::<i8>::checked(&Pow, x, y), fit(power(a, b)), "power({x}, {y})");
+                let fit = |r: Option<i64>| r.and_then(|r| u8::try_from(r).ok());
+                assert_eq!(Binary::<u8>::checked(&Gcd(t), x, y), fit(gcd(a, b)), "gcd({x}, {y})");
+                assert_eq!(Binary::<u8>::checked(&Lcm(t), x, y), fit(lcm(a, b)), "lcm({x}, {y})");
+                assert_eq!(Binary::<u8>::checked(&Pow, x, y), fit(power(a, b)), "power({x}, {y})");
                 assert_eq!(i64::from(Residue(t).one(x, y)), residue(a, b), "residue({x}, {y})");
             }
-        }
-        // `u64`s, some beyond `i64::MAX`, against exact arithmetic.
-        let big = [0, 1, 2, 3, 12, 18, 1 << 32, 1 << 63, (1 << 63) + 1, u64::MAX - 1, u64::MAX];
-        for &x in &big {
-            for &y in &big {
-                let (a, b) = (u128::from(x), u128::from(y));
-                let g = num_integer::Integer::gcd(&a, &b);
-                assert_eq!(u128::from(Gcd(t).one(x, y)), g, "gcd({x}, {y})");
-                assert_eq!(Binary::<u64>::checked(&Lcm(t), x, y), if g == 0 { Some(0) } else { u64::try_from(a / g * b).ok() }, "lcm({x}, {y})");
-                assert_eq!(Residue(t).one(x, y), if x == 0 { y } else { y % x }, "residue({x}, {y})");
-                assert_eq!((Equal(t).one(x, y), Less(t).one(x, y)), (x == y, x < y), "comparisons of {x} and {y}");
-            }
-            for y in 0..70u64 { assert_eq!(Binary::<u64>::checked(&Pow, x, y), BigInt::from(x).pow(y as u32).try_into().ok(), "power({x}, {y})"); }
         }
         // Integers compare exactly, however close they are within the tolerance.
         let (n, m) = (1_000_000_000_000_000i64, 1_000_000_000_000_001i64);
@@ -295,7 +274,7 @@ mod integer {
             [false, true, false, true, true]
         );
         assert_eq!((Floor(t).one(m), Ceil(t).one(-m), Floor(t).one(true)), (m, -m, true));
-        assert_eq!((Abs.one(i8::MIN), Abs.one(-5i16), Abs.one(7u8), Abs.one(false)), (i8::MIN, 5, 7, false));
+        assert_eq!((Unary::<i16>::checked(&Abs, i16::MIN), Abs.one(-5i16), Abs.one(7u8), Abs.one(false)), (None, 5, 7, false));
         assert_eq!((Sign.one(-9i32), Sign.one(0i64), Sign.one(200u8)), (-1, 0, 1));
     }
 }
@@ -380,6 +359,43 @@ mod number_theory {
     }
 }
 
+mod operation {
+    use rustymath::agreement::{Agreement, Mapping};
+    use rustymath::buffer::{Buffer, ComplexWidth, DType, FloatWidth, Width};
+    use rustymath::layout::Layout;
+    use rustymath::{kernels, reduce};
+    #[test]
+    fn kernels_follow_forms() {
+        let (b, i16, i64, f16, f32, f64, c64) = (DType::Boolean, DType::Integer(Width::I16), DType::Integer(Width::I64), DType::Float(FloatWidth::F16),
+            DType::Float(FloatWidth::F32), DType::Float(FloatWidth::F64), DType::Complex(ComplexWidth::F32));
+        // `Exp` has real and complex forms, so Booleans and integers compute in the narrowest float that holds them exactly, but at least `f32`, and characters have no kernel.
+        let exp = kernels!(Unary rustymath::Exp);
+        assert_eq!([b, i16, i64, f16, f32, c64].map(|d| exp.computes(d)), [Some(f32), Some(f32), Some(f64), Some(f16), Some(f32), Some(c64)]);
+        assert_eq!(exp.computes(DType::Character), None);
+        // `Add` has integer forms, so Booleans compute as `i64`.
+        assert_eq!(kernels!(Binary rustymath::Add).computes(b), Some(i64));
+        // `Cis` has `f32` and `f64` forms only, so `f16` widens to `f32`.
+        assert_eq!(kernels!(Unary rustymath::Cis).computes(f16), Some(f32));
+        // A value names its object too. `Equal` has integer, real and complex forms.
+        assert_eq!(kernels!(Binary of rustymath::tolerant::Equal(rustymath::tolerant::Tolerance::DEFAULT)).computes(b), Some(i64));
+        // A sum of a narrow integer type has its own fold, whose totals are `i64`.
+        let sum = kernels!(Fold reduce::Sum);
+        let (totals, ok) = sum.fold(&reduce::Sum, Buffer::Integers(rustymath::buffer::IntBuf::I16(vec![1, 2, 3, 4])).view(), [2, 2, 1]).unwrap();
+        assert!(ok && matches!(totals, Buffer::Integers(rustymath::buffer::IntBuf::I64(ref t)) if *t == [3, 7]));
+        // An integer argument to `Exp` casts to `f64`, and broadcasting pairs a scalar with every item.
+        let x = Buffer::Integers(rustymath::buffer::IntBuf::I64(vec![0, 1]));
+        let (r, _) = exp.unary(&rustymath::Exp, x.view(), &Mapping::Linear(1), 2).unwrap();
+        assert!(matches!(r, Buffer::Floats(rustymath::buffer::FloatBuf::F64(ref v)) if v[0] == 1.0 && (v[1] - std::f64::consts::E).abs() < 1e-15));
+        let (two, row) = (Layout::from([1usize].as_slice()), Layout::from([3usize].as_slice()));
+        let agreement = Agreement::new(&two, &row).unwrap();
+        let (s, ok) = kernels!(Binary rustymath::Add).binary(&rustymath::Add, Buffer::Booleans(vec![true]).view(), Buffer::Booleans(vec![true, false, true]).view(), &agreement).unwrap();
+        assert!(ok && matches!(s, Buffer::Integers(rustymath::buffer::IntBuf::I64(ref v)) if *v == [2, 1, 2]));
+        // An integer result that doesn't fit fails.
+        let big = Buffer::Integers(rustymath::buffer::IntBuf::I64(vec![i64::MAX]));
+        assert!(!kernels!(Binary rustymath::Add).binary(&rustymath::Add, big.view(), big.view(), &Agreement::new(&two, &two).unwrap()).unwrap().1);
+    }
+}
+
 mod optimize {
     use rustymath::optimize::*;
     use std::convert::Infallible;
@@ -447,8 +463,8 @@ mod optimize {
         let choices = solving.into_iter().chain(least_squares).map(|(task, n)| Method::choose(task, n, false)).collect::<Vec<_>>();
         assert_eq!(choices, [Brent, LevenbergMarquardt, Gmres, Minres, Minres]);
         assert_eq!(
-            Options::<f64> { method: Some(Cg), ..Default::default() }.check(Task::Minimize { gradient: false }, 2),
-            Err("that method solves equations, and doesn't minimize")
+            Options::<f64> { method: Some(Cg), ..Default::default() }.check(Task::Minimize { gradient: false }, 2).unwrap_err().message,
+            "that method solves equations, and doesn't minimize"
         );
         // A search that runs out of evaluations returns its best point so far, unconverged.
         let found = minimize(&mut rosenbrock, &[-1.2, 1.0], &Options { evaluations: Some(25), ..Default::default() }).unwrap();
@@ -466,9 +482,9 @@ mod optimize {
         assert!(found.converged && off(&found.x, &[0.5, 0.0]) < 1e-6, "{found:?}");
         // Reversed bounds, and a tolerance that isn't a positive number, are errors that a binding reports.
         let reversed = Options { bounds: Some(Bounds { lower: &[1.0], upper: &[0.0] }), ..Default::default() };
-        assert_eq!(reversed.check(Task::Minimize { gradient: false }, 1), Err("each lower limit must be at most its upper limit"));
+        assert_eq!(reversed.check(Task::Minimize { gradient: false }, 1).unwrap_err().message, "each lower limit must be at most its upper limit");
         assert_eq!(
-            Options { tolerance: Some(0.0), ..Default::default() }.check(Task::Minimize { gradient: false }, 1), Err("the tolerance must be a positive number")
+            Options { tolerance: Some(0.0), ..Default::default() }.check(Task::Minimize { gradient: false }, 1).unwrap_err().message, "the tolerance must be a positive number"
         );
     }
 
@@ -610,7 +626,7 @@ mod optimize {
         assert!(!found.converged && found.evaluations == 6, "{found:?}");
         assert_eq!(solved(&mut |_: &[f64], _: &mut [f64]| Err::<(), _>("stopped"), &[0.0, 0.0], 2, &options), Err("stopped"));
         let bounded = Options { bounds: Some(Bounds { lower: &[0.0; 2], upper: &[1.0; 2] }), ..options };
-        assert_eq!(bounded.check(Task::Solve { residuals: 5 }, 2), Err("Levenberg–Marquardt takes no bounds"));
+        assert_eq!(bounded.check(Task::Solve { residuals: 5 }, 2).unwrap_err().message, "Levenberg–Marquardt takes no bounds");
     }
 
     /// A uniform number from -0.5 to 0.5, the `i`th of a fixed sequence.
@@ -666,7 +682,7 @@ mod optimize {
             let found = solve_linear(&mut a, &y, &vec![0.0; k], &Options { method, ..tight }).unwrap();
             assert!(found.converged && off(&found.x, &best) < 1e-8, "{method:?}: {found:?}");
         }
-        assert_eq!(Options::<f64>::default().check(Task::Linear { equations: m, adjoint: false }, k), Err("least squares needs products with the transpose"));
+        assert_eq!(Options::<f64>::default().check(Task::Linear { equations: m, adjoint: false }, k).unwrap_err().message, "least squares needs products with the transpose");
         // A right-hand side of zeros gives zeros, from any start.
         let found = solve_linear(&mut product(&spd, n), &zeros, &b, &tight).unwrap();
         assert!(found.converged && found.x == zeros, "{found:?}");

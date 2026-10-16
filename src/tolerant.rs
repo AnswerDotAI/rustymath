@@ -559,7 +559,7 @@ impl<F: Float> Near<F> {
 }
 
 /// The order key of each float, in one pass that vectorises. Exact searches hash these keys, because f32 searches ran about 6% slower when each lookup computed its own key.
-fn order_keys<F: Float>(x: &[F]) -> Vec<F::OrderKey> { x.iter().map(|v| v.order_key()).collect() }
+pub(crate) fn order_keys<F: Float>(x: &[F]) -> Vec<F::OrderKey> { x.iter().map(|v| v.order_key()).collect() }
 
 /// The magnitude below which each whole number equals no other whole number within tolerance `t`, nor do floats equal to different whole numbers equal each other: 1/(4t), or 2^53 for a tolerance of 0. It is never above 2^53, below which an `f64` holds every whole number.
 pub fn whole_limit(t: impl Tolerant) -> f64 { (0.25 / t.value()).min(9_007_199_254_740_992.0) }

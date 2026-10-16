@@ -1,96 +1,140 @@
-//! rustymath's `polynomial` module under the names of `numpy.polynomial.polynomial`. The wrappers in `python/rustymath/polynomial.py` give each argument a contiguous float or complex array. Root finding computes in complex128.
-use half::f16;
-use numpy::{
-    Complex32, Complex64, PyArray1, PyArrayDescrMethods, PyReadonlyArray0, PyReadonlyArray1, PyReadwriteArrayDyn, PyUntypedArray, PyUntypedArrayMethods,
-};
+//! rustymath's `polynomial` module under the names of `numpy.polynomial.polynomial`. Each function converts its data arguments to one dtype, as `convert` does. Booleans, `u8` and `i16` compute as `f32`, wider integers as `f64`, and `float16` computes as `float32` and rounds its result back. Root finding computes in `complex128`, and gives `complex64` roots for `float16`, `float32` and `complex64` coefficients.
+use crate::array::give;
+use crate::convert::{convert, one};
+use crate::functions::missing;
+use crate::integer::radix;
 use pyo3::prelude::*;
+use rustymath::array::Array as Core;
+use rustymath::buffer::{Buffer, DType, Element};
+use rustymath::error::{Error, Kind};
+use rustymath::layout::Layout;
+use rustymath::num_complex::Complex64;
 use rustymath::polynomial;
+use rustymath_buffer::py_err;
 
-/// Runs `$body` with `$t` as the element type of `$a`, a float or complex array.
-macro_rules! numbers {
-    ($a:expr, $t:ident => $body:expr) => {
-        match $a.dtype().char() {
-            b'F' => { type $t = Complex32; $body }
-            b'D' => { type $t = Complex64; $body }
-            _ => { floats!($a, $t => $body) }
-        }
+/// The dtype that `function` computes in for arguments of `dtype`, and the dtype of its result, as `DType::inexact` gives them.
+fn working(function: &str, dtype: DType) -> PyResult<(DType, DType)> { dtype.inexact().ok_or_else(|| missing(function, dtype)) }
+
+/// `data` as an array of `layout`, in the dtype `result`.
+fn finished<T: Element>(layout: Layout, data: Vec<T>, result: DType) -> PyResult<Core> {
+    let buffer = T::buffer(data);
+    let buffer = if buffer.dtype() == result { buffer } else { Buffer::cast(buffer.view(), result).map_err(py_err)? };
+    Core::new(layout, buffer).map_err(py_err)
+}
+
+/// A vector of `data`, in the dtype `result`.
+fn vector_of<T: Element>(data: Vec<T>, result: DType) -> PyResult<Core> { finished(Layout::from([data.len()].as_slice()), data, result) }
+
+/// A Rank error unless `layout` is a vector of `what`.
+fn vector(layout: &Layout, what: &str) -> PyResult<()> {
+    if layout.shape().len() == 1 { Ok(()) } else { Err(py_err(Error::new(Kind::Rank, format!("{what} must be a vector")))) }
+}
+
+/// A Rank error unless the leading coefficient, of `layout`, is scalar.
+fn leading(layout: &Layout) -> PyResult<()> {
+    if layout.shape().is_empty() { Ok(()) } else { Err(py_err(Error::new(Kind::Rank, "the leading coefficient must be scalar"))) }
+}
+
+/// The polynomial `c` at each item of `x`, by Horner's rule.
+#[pyfunction]
+pub fn polyval<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, c: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let call = convert(&[x, c])?;
+    let (xs, cs) = (&call.args[0], &call.args[1]);
+    vector(&cs.layout(), "the coefficients")?;
+    let (work, result) = working("polyval", xs.view().dtype())?;
+    let core = match work {
+        DType::Float(w) => rustymath::with_float_width!(w, F => {
+            let (c, mut y) = (cs.items::<F>()?, xs.items::<F>()?.into_owned());
+            polynomial::evaluate(&c, &mut y);
+            finished(xs.layout(), y, result)?
+        }),
+        _ => rustymath::with_inexact!(work, T => {
+            let c = cs.items::<T>()?;
+            finished(xs.layout(), xs.items::<T>()?.iter().map(|x| polynomial::value(&c, x)).collect(), result)?
+        }),
     };
+    give(py, core, xs.scalar)
 }
 
-/// Replaces each item of `x` with the value there of the polynomial `c`.
+/// `m` times the product of `x - r` over the roots `r` at each item of `x`, without forming the coefficients.
 #[pyfunction]
-pub fn polyval(x: &Bound<'_, PyUntypedArray>, c: &Bound<'_, PyUntypedArray>) -> PyResult<()> {
-    if x.dtype().kind() == b'c' {
-        numbers!(x, T => {
-            let c = c.extract::<PyReadonlyArray1<T>>()?;
-            let c = c.as_slice()?;
-            let mut x = x.extract::<PyReadwriteArrayDyn<T>>()?;
-            for v in x.as_slice_mut()? { *v = polynomial::value(c, v); }
-            Ok(())
-        })
-    } else {
-        floats!(x, F => {
-            polynomial::evaluate(c.extract::<PyReadonlyArray1<F>>()?.as_slice()?, x.extract::<PyReadwriteArrayDyn<F>>()?.as_slice_mut()?);
-            Ok(())
-        })
-    }
+#[pyo3(signature = (x, roots, m=None))]
+pub fn polyvalfromroots<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, roots: &Bound<'py, PyAny>, m: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+    let unit = 1i64.into_pyobject(py)?;
+    let call = convert(&[x, roots, m.unwrap_or(unit.as_any())])?;
+    let (xs, rs, ms) = (&call.args[0], &call.args[1], &call.args[2]);
+    vector(&rs.layout(), "the roots")?;
+    leading(&ms.layout())?;
+    let (work, result) = working("polyvalfromroots", xs.view().dtype())?;
+    let core = rustymath::with_inexact!(work, T => {
+        let (roots, m) = (rs.items::<T>()?, ms.items::<T>()?[0]);
+        finished(xs.layout(), xs.items::<T>()?.iter().map(|x| polynomial::factored(&m, &roots, x)).collect(), result)?
+    });
+    give(py, core, xs.scalar)
 }
 
-/// Replaces each item of `x` with `m` times the product of its differences from `roots`.
+/// The roots of `c` as complex numbers, sorted by real part, then imaginary part, from the eigenvalues of its companion matrix. With real coefficients, a real root has an imaginary part of exactly 0. Where the eigenvalue solver doesn't converge, each root is NaN.
 #[pyfunction]
-pub fn polyvalfromroots(x: &Bound<'_, PyUntypedArray>, roots: &Bound<'_, PyUntypedArray>, m: &Bound<'_, PyUntypedArray>) -> PyResult<()> {
-    numbers!(x, T => {
-        let roots = roots.extract::<PyReadonlyArray1<T>>()?;
-        let roots = roots.as_slice()?;
-        let m = m.extract::<PyReadonlyArray0<T>>()?.as_array()[()];
-        let mut x = x.extract::<PyReadwriteArrayDyn<T>>()?;
-        for v in x.as_slice_mut()? { *v = polynomial::factored(&m, roots, v); }
-        Ok(())
-    })
-}
-
-/// The roots of the polynomial `c`. Where the eigenvalue solver doesn't converge, each root is NaN and NumPy reports "invalid value".
-#[pyfunction]
-pub fn polyroots<'py>(py: Python<'py>, c: PyReadonlyArray1<'py, Complex64>) -> PyResult<Bound<'py, PyArray1<Complex64>>> {
-    let c = c.as_slice()?;
-    let roots = match polynomial::roots(c) {
-        Some(roots) => roots, None => { crate::report_invalid(py, c"polyroots")?; vec![Complex64::new(f64::NAN, f64::NAN); polynomial::trimmed(c).len() - 1] }
-    };
-    Ok(PyArray1::from_vec(py, roots))
+pub fn polyroots<'py>(py: Python<'py>, c: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let cs = one(c)?;
+    vector(&cs.layout(), "the coefficients")?;
+    let dtype = cs.view().dtype();
+    if dtype == DType::Character { return Err(missing("polyroots", dtype)); }
+    let result = dtype.complex();
+    let c = cs.items::<Complex64>()?;
+    let roots = polynomial::roots(&c).unwrap_or_else(|| vec![Complex64::new(f64::NAN, f64::NAN); polynomial::trimmed(&c).len().saturating_sub(1)]);
+    give(py, vector_of(roots, result)?, false)
 }
 
 /// The polynomial with roots `roots` and leading coefficient `m`.
 #[pyfunction]
-pub fn polyfromroots<'py>(roots: &Bound<'py, PyUntypedArray>, m: &Bound<'py, PyUntypedArray>) -> PyResult<Bound<'py, PyAny>> {
-    numbers!(roots, T => {
-        let r = roots.extract::<PyReadonlyArray1<T>>()?;
-        let m = m.extract::<PyReadonlyArray0<T>>()?.as_array()[()];
-        Ok(PyArray1::from_vec(roots.py(), polynomial::from_roots(m, r.as_slice()?)).into_any())
-    })
+#[pyo3(signature = (roots, m=None))]
+pub fn polyfromroots<'py>(py: Python<'py>, roots: &Bound<'py, PyAny>, m: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+    let unit = 1i64.into_pyobject(py)?;
+    let call = convert(&[roots, m.unwrap_or(unit.as_any())])?;
+    let (rs, ms) = (&call.args[0], &call.args[1]);
+    vector(&rs.layout(), "the roots")?;
+    leading(&ms.layout())?;
+    let (work, result) = working("polyfromroots", rs.view().dtype())?;
+    let core = rustymath::with_inexact!(work, T => vector_of(polynomial::from_roots(ms.items::<T>()?[0], &rs.items::<T>()?), result)?);
+    give(py, core, false)
 }
 
-/// The derivative of the polynomial `c`.
+/// The derivative of `c`. A constant's derivative is empty, which is the zero polynomial.
 #[pyfunction]
-pub fn polyder<'py>(c: &Bound<'py, PyUntypedArray>) -> PyResult<Bound<'py, PyAny>> {
-    numbers!(c, T => Ok(PyArray1::from_vec(c.py(), polynomial::derivative(c.extract::<PyReadonlyArray1<T>>()?.as_slice()?)).into_any()))
+pub fn polyder<'py>(py: Python<'py>, c: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let cs = one(c)?;
+    vector(&cs.layout(), "the coefficients")?;
+    let (work, result) = working("polyder", cs.view().dtype())?;
+    let core = rustymath::with_inexact!(work, T => vector_of(polynomial::derivative(&cs.items::<T>()?), result)?);
+    give(py, core, false)
 }
 
-/// Decodes consecutive cells of digits in the mixed radix `bases`. The Python wrapper checks their lengths and restores the shape.
+/// The value of each last-axis vector of `digits` in the mixed radix `bases`, by Horner's rule. The first base is unused.
 #[pyfunction]
-pub fn polydecode<'py>(bases: &Bound<'py, PyUntypedArray>, digits: &Bound<'py, PyUntypedArray>) -> PyResult<Bound<'py, PyAny>> {
-    numbers!(bases, T => {
-        let (bases, digits) = (bases.extract::<PyReadonlyArray1<T>>()?, digits.extract::<PyReadonlyArray1<T>>()?);
-        Ok(PyArray1::from_vec(bases.py(), polynomial::decode(bases.as_slice()?, digits.as_slice()?)).into_any())
-    })
+pub fn polydecode<'py>(py: Python<'py>, bases: &Bound<'py, PyAny>, digits: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let call = convert(&[bases, digits])?;
+    let (bs, ds) = (&call.args[0], &call.args[1]);
+    let d = ds.layout();
+    radix(bs.layout().shape(), d.shape())?;
+    let (work, result) = working("decode", bs.view().dtype())?;
+    let layout = d.axes(0..d.shape().len() - 1);
+    let core = rustymath::with_inexact!(work, T => finished(layout, polynomial::decode(&bs.items::<T>()?, &ds.items::<T>()?), result)?);
+    let reduced = core.layout().shape().is_empty();
+    give(py, core, reduced)
 }
 
-/// The polynomial of degree `deg` that fits the points `(x, y)` by least squares.
+/// The coefficients, in ascending order, of the polynomial of degree `deg` that fits the points by least squares. Where fewer than `deg + 1` distinct points fix it, it's the fit whose coefficients have the least norm.
 #[pyfunction]
-pub fn polyfit<'py>(x: &Bound<'py, PyUntypedArray>, y: &Bound<'py, PyUntypedArray>, deg: usize) -> PyResult<Bound<'py, PyAny>> {
-    floats!(x, F => {
-        let (x, y) = (x.extract::<PyReadonlyArray1<F>>()?, y.extract::<PyReadonlyArray1<F>>()?);
-        Ok(PyArray1::from_vec(x.py(), polynomial::fit(x.as_slice()?, y.as_slice()?, deg)).into_any())
-    })
+pub fn polyfit<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>, deg: usize) -> PyResult<Bound<'py, PyAny>> {
+    let call = convert(&[x, y])?;
+    let (xs, ys) = (&call.args[0], &call.args[1]);
+    vector(&xs.layout(), "the x coordinates")?;
+    if xs.layout().shape() != ys.layout().shape() { return Err(py_err(Error::new(Kind::Length, "polyfit needs one y for each x"))); }
+    let (work, result) = working("polyfit", xs.view().dtype())?;
+    let DType::Float(w) = work else { return Err(missing("polyfit", work)) };
+    let core = rustymath::with_float_width!(w, F => vector_of(polynomial::fit(&xs.items::<F>()?, &ys.items::<F>()?, deg), result)?);
+    give(py, core, false)
 }
 
 /// Adds this module's functions to `m`.

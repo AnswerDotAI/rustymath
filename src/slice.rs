@@ -1,6 +1,5 @@
 //! Slice forms of rustymath's functions. Each function object, such as [`Pow`], has a scalar form `one` and a slice form `many`. Both run code that rustymath compiles once for each item type, inside its own crate. A caller's build settings can't change that code, and rustymath's speed test times what callers run. An edit to a function's body rebuilds only rustymath.
 use crate::float::{Float, sealed::{Forms, Item}};
-use half::f16;
 use num_complex::Complex;
 use std::mem::MaybeUninit;
 
@@ -52,13 +51,11 @@ macro_rules! arities {
             /// `one`, or `None` where the item fails, as `many` reports.
             fn checked(&self, $($x: T),+) -> Option<Self::Out>;
         }
-        arities!(@concrete $name, $n, ($($x),+): f16, f32, f64, Complex<f32>, Complex<f64>, i8, i16, i32, i64, u8, u16, u32, u64, bool);
+        crate::element_types!((arities) @types $name, $n, ($($x),+));
     )+};
-    (@concrete $name:ident, $n:literal, $args:tt: $e:ty $(, $rest:ty)*) => {
+    (@types $name:ident, $n:literal, $args:tt [$($dtype:ident: $d:tt $e:ty),+]) => {$(
         arities!(@impl $name, $n, $args, $e);
-        arities!(@concrete $name, $n, $args: $($rest),*);
-    };
-    (@concrete $name:ident, $n:literal, $args:tt:) => {};
+    )+};
     (@impl $name:ident, $n:literal, ($($x:ident),+), $e:ty) => {
         impl<K: Forms<$e, $n>> $name<$e> for K {
             type Out = <K as Forms<$e, $n>>::Out;
@@ -185,7 +182,7 @@ macro_rules! each {
     };
 }
 
-/// Writes a function object's forms, compiled inside rustymath. The list names the item types, such as `Complex<f32>` or `i64`. `real` stands for `f32` and `f64`, and also writes an `f16` form, which runs the `f32` form and narrows its outputs. `=> T` makes the output type `T` in place of the item type: for each listed type, or after `real` for every float type. The object is the first argument of the item body, and its items the bracketed ones. The body gives an output, an `Option` of one, or a [`Total`] output, as [`Outcome`] says. A `many` body replaces the default slice form, which runs the item body through [`each!`]. Its arguments are the object, the bracketed `Arg`s, the number of results, and the slots it writes them into.
+/// Writes a function object's forms, compiled inside rustymath. The list names the item types, such as `Complex<f32>` or `i64`. `real` stands for `f32` and `f64`, and also writes an `f16` form, which runs the `f32` form and narrows its outputs. `=> T` makes the output type `T` in place of the item type: for each listed type, or after `real` for every float type. The object is the first argument of the item body, and its items the bracketed ones. The body gives an output, an `Option` of one, or a [`Total`] output, as [`Outcome`] says. A `many` body replaces the default slice form, which runs the item body through [`each!`]. Its arguments are the object, the bracketed `Arg`s, the number of results, and the slots it writes them into. Attributes before the object, such as `#[inline]`, go on its scalar forms, `scalar` and `checked_scalar`, so that a caller in another crate can inline a small form into its own loop over items.
 ///
 /// A function object is a concrete type, never a generic one, so that its forms compile here. Settings that choose a loop, such as whether a tolerance is 0, are read once per call inside `many`, which then runs `each!`.
 ///
@@ -197,25 +194,27 @@ macro_rules! each {
 ///     many |k, [x, y], n, out| with_tolerance!(k.0, |t| each!([x, y], n, out, |[x, y]| t.less(x, y))));
 /// ```
 macro_rules! forms {
-    ($object:ident at real $(=> $o:ty)? : |$k:pat_param, $args:tt| $body:expr $(, many |$mk:pat_param, $margs:tt, $n:ident, $out:ident| $many:expr)?) => {
-        forms!(@types $object, $k, $args, $body, [$((|$mk, $margs, $n, $out| $many))?], [f32 $(=> $o)?, f64 $(=> $o)?]);
-        forms!(@half $object, forms!(@out half::f16 $(, $o)?), forms!(@narrow $($o)?), $args);
+    ($(#[$m:meta])* $object:ident at real $(=> $o:ty)? : |$k:pat_param, $args:tt| $body:expr $(, many |$mk:pat_param, $margs:tt, $n:ident, $out:ident| $many:expr)?) => {
+        forms!(@types [$(#[$m])*], $object, $k, $args, $body, [$((|$mk, $margs, $n, $out| $many))?], [f32 $(=> $o)?, f64 $(=> $o)?]);
+        forms!(@half [$(#[$m])*], $object, forms!(@out half::f16 $(, $o)?), forms!(@narrow $($o)?), $args);
     };
-    ($object:ident at $($e:ty $(=> $o:ty)?),+ : |$k:pat_param, $args:tt| $body:expr $(, many |$mk:pat_param, $margs:tt, $n:ident, $out:ident| $many:expr)?) => {
-        forms!(@types $object, $k, $args, $body, [$((|$mk, $margs, $n, $out| $many))?], [$($e $(=> $o)?),+]);
+    ($(#[$m:meta])* $object:ident at $($e:ty $(=> $o:ty)?),+ : |$k:pat_param, $args:tt| $body:expr $(, many |$mk:pat_param, $margs:tt, $n:ident, $out:ident| $many:expr)?) => {
+        forms!(@types [$(#[$m])*], $object, $k, $args, $body, [$((|$mk, $margs, $n, $out| $many))?], [$($e $(=> $o)?),+]);
     };
     // One type at a time, so that the optional `many` group, which repeats on its own, needn't sit inside the types' repetition.
-    (@types $object:ident, $k:pat_param, $args:tt, $body:expr, $many:tt, [$e:ty $(=> $o:ty)? $(, $($rest:tt)+)?]) => {
-        forms!(@concrete $object, $e, forms!(@out $e $(, $o)?), $k, $args, $body, $many);
-        $(forms!(@types $object, $k, $args, $body, $many, [$($rest)+]);)?
+    (@types $attrs:tt, $object:ident, $k:pat_param, $args:tt, $body:expr, $many:tt, [$e:ty $(=> $o:ty)? $(, $($rest:tt)+)?]) => {
+        forms!(@concrete $attrs, $object, $e, forms!(@out $e $(, $o)?), $k, $args, $body, $many);
+        $(forms!(@types $attrs, $object, $k, $args, $body, $many, [$($rest)+]);)?
     };
-    (@concrete $object:ident, $e:ty, $o:ty, $k:pat_param, [$($x:ident),+], $body:expr, $many:tt) => {
+    (@concrete [$(#[$m:meta])*], $object:ident, $e:ty, $o:ty, $k:pat_param, [$($x:ident),+], $body:expr, $many:tt) => {
         impl crate::float::sealed::Forms<$e, { forms!(@n $($x),+) }> for $object {
             type Out = $o;
+            $(#[$m])*
             fn scalar(&self, [$($x),+]: [$e; forms!(@n $($x),+)]) -> $o {
                 let $k = self;
                 crate::slice::Outcome::<$o>::value($body)
             }
+            $(#[$m])*
             fn checked_scalar(&self, [$($x),+]: [$e; forms!(@n $($x),+)]) -> Option<$o> {
                 let $k = self;
                 let (r, ok) = crate::slice::Outcome::<$o>::judged($body, [$($x),+]);
@@ -236,12 +235,14 @@ macro_rules! forms {
             $many
         }
     };
-    (@half $object:ident, $o:ty, $narrow:expr, [$($x:ident),+]) => {
+    (@half [$(#[$m:meta])*], $object:ident, $o:ty, $narrow:expr, [$($x:ident),+]) => {
         impl crate::float::sealed::Forms<half::f16, { forms!(@n $($x),+) }> for $object {
             type Out = $o;
+            $(#[$m])*
             fn scalar(&self, x: [half::f16; forms!(@n $($x),+)]) -> $o {
                 ($narrow)(crate::float::sealed::Forms::<f32, { forms!(@n $($x),+) }>::scalar(self, x.map(half::f16::to_f32)))
             }
+            $(#[$m])*
             fn checked_scalar(&self, x: [half::f16; forms!(@n $($x),+)]) -> Option<$o> {
                 crate::float::sealed::Forms::<f32, { forms!(@n $($x),+) }>::checked_scalar(self, x.map(half::f16::to_f32)).map($narrow)
             }

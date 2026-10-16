@@ -6,15 +6,15 @@
 
 `cg`, `minres` and `gmres` solve a square linear system by conjugate gradients, MINRES and restarted GMRES, and `lsmr` gives a least-squares solution through MINRES on the normal equations, which gives LSMR's iterates. They take `A` as an array, or as anything with a `shape` and a `matvec` method, plus `rmatvec` for `lsmr`, such as SciPy's `LinearOperator`. Each takes a preconditioner `M`, an approximation to the inverse of `A`, or of `A.T @ A` for `lsmr`.
 
-A float32 or float16 start, or `b` for the linear solvers, computes in float32, and anything else in float64. An exception from a function stops the search and reaches the caller."""
+The functions get their points as rustymath arrays. A float32 or float16 start, or `b` for the linear solvers, computes in float32, and anything else in float64. An exception from a function stops the search and reaches the caller."""
 from typing import NamedTuple
-import numpy as np
-from ._core import optimize as _o
-from ._checks import _named
+from math import inf
+from ._core import Array, optimize as _o
+from ._naming import _named
 
 class OptimizeResult(NamedTuple):
     "What `minimize` found: the best point it evaluated, the function's value there, the number of evaluations, and whether the method's stopping test passed before the evaluations ran out"
-    x: np.ndarray
+    x: Array
     fun: float
     nfev: int
     success: bool
@@ -27,22 +27,18 @@ class RootResults(NamedTuple):
 
 class LeastSquaresResult(NamedTuple):
     "What `least_squares` found: the best point it evaluated, half the sum of the squared residuals there, the number of evaluations, and whether the method's stopping test passed before the evaluations ran out"
-    x: np.ndarray
+    x: Array
     cost: float
     nfev: int
     success: bool
 
 class LinearResult(NamedTuple):
     "What a linear solver found: its last iterate, the norm of `b - A @ x` there, the number of products with `A` and its transpose, and whether the residual fell within tolerance"
-    x: np.ndarray
+    x: Array
     normr: float
     nmatvec: int
     success: bool
 
-def _floats(x):
-    "`x` flattened, as a contiguous float32 vector where it holds float16 or float32 numbers, and float64 otherwise"
-    x = np.ravel(x)
-    return np.ascontiguousarray(x, np.float32 if x.dtype in (np.float16, np.float32) else np.float64)
 
 def minimize(
     fun, # Function of a 1-D array that returns a float
@@ -55,16 +51,11 @@ def minimize(
     vectorized=False # Whether `fun` takes points as the columns of a 2-D array and returns one value for each, as SciPy's `differential_evolution` calls it
 ):
     "The minimum of `fun` from `x0`, as an `OptimizeResult`"
-    x0 = _floats(x0)
-    limits = None
-    if bounds is not None:
-        pairs = np.array([(-np.inf if lo is None else lo, np.inf if hi is None else hi) for lo, hi in bounds], x0.dtype).reshape(-1, 2)
-        limits = np.ascontiguousarray(pairs[:, 0]), np.ascontiguousarray(pairs[:, 1])
+    limits = None if bounds is None else ([-inf if lo is None else lo for lo, _ in bounds], [inf if hi is None else hi for _, hi in bounds])
     options = dict(options or {})
     maxfev, popsize, seed = options.pop('maxfev', None), options.pop('popsize', None), options.pop('seed', 0)
     if options: raise TypeError(f"minimize has no option {', '.join(options)}")
-    population = None if popsize is None else popsize * x0.size
-    return OptimizeResult(*_o.minimize(fun, x0, method, jac, limits, tol, maxfev, population, seed, vectorized))
+    return OptimizeResult(*_o.minimize(fun, x0, method, jac, limits, tol, maxfev, popsize, seed, vectorized))
 
 def root_scalar(
     f, # Function of a float that returns a float
@@ -86,15 +77,9 @@ def least_squares(
     max_nfev=None # The most evaluations of `fun`; None for 1000 for each variable, plus 1000
 ):
     "The least-squares solution of `fun(x) = 0` from `x0` by Levenberg–Marquardt, as a `LeastSquaresResult`"
-    x0 = _floats(x0)
     x, norm, nfev, success = _o.least_squares(fun, x0, jac, tol, max_nfev)
     return LeastSquaresResult(x, norm * norm / 2, nfev, success)
 
-def _operator(A):
-    "`A`, as an array unless it has a `shape`, with its product with a vector, and its transpose's where it has one"
-    A = A if hasattr(A, 'shape') else np.asarray(A)
-    if hasattr(A, 'matvec'): return A, A.matvec, getattr(A, 'rmatvec', None)
-    return A, (lambda v: A @ v), (lambda u: A.T @ u)
 
 def _krylov(name, method, transpose, doc):
     "The linear solver `name`, which runs `method`, on the normal equations where `transpose`"
@@ -106,12 +91,7 @@ def _krylov(name, method, transpose, doc):
         maxiter=None, # The most iterations, as SciPy counts them: restart cycles of up to 20 steps for `gmres`, and steps for the others, where `lsmr`'s each take a product with `A` and one with its transpose; None for 20 products for each unknown, plus 20
         M=None # Preconditioner, an approximation to the inverse of `A`, or of `A.T @ A` for `lsmr`, as an array or anything with `matvec`. It must be symmetric positive definite for all but `gmres`, which applies it on the right, where SciPy's applies it on the left
     ):
-        A, matvec, rmatvec = _operator(A)
-        if transpose and rmatvec is None: raise TypeError(f"{name} needs `A.rmatvec`")
-        msolve = None if M is None else _operator(M)[1]
-        b = _floats(b)
-        x0 = np.zeros(A.shape[1], b.dtype) if x0 is None else np.ascontiguousarray(np.ravel(x0), b.dtype)
-        return LinearResult(*_o.linear(matvec, b, x0, method, rmatvec if transpose else None, msolve, rtol, maxiter))
+        return LinearResult(*_o.linear(A, b, x0, method, transpose, name, M, rtol, maxiter))
     return _named(solve, name, doc)
 
 cg = _krylov('cg', 'cg', False, "The solution of `A @ x = b` for a symmetric positive definite `A` by conjugate gradients, as a `LinearResult`")

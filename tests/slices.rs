@@ -199,7 +199,7 @@ mod reductions {
         let prods: Vec<i64> = (0..101).map(|i| { if i % 10 == 3 { 2 } else if i % 3 == 0 { -1 } else { 1 } }).collect();
         let at = |f: fn(i64) -> f64| (sums.iter().map(|&v| f(v)).collect::<Vec<_>>(), prods.iter().map(|&v| f(v)).collect::<Vec<_>>());
         exact(&sums, &prods, |t, v| t.checked_add(v), |t, v| t.checked_mul(v), 0, 1);
-        let (s, p): (Vec<i8>, Vec<i8>) = (sums.iter().map(|&v| v as i8).collect(), prods.iter().map(|&v| v as i8).collect());
+        let (s, p): (Vec<i16>, Vec<i16>) = (sums.iter().map(|&v| v as i16).collect(), prods.iter().map(|&v| v as i16).collect());
         exact(&s, &p, |t, v| t.checked_add(v.into()), |t, v| t.checked_mul(v.into()), 0, 1);
         let (s, p) = at(|v| v as f64);
         exact(&s, &p, |t, v| Some(t + v), |t, v| Some(t * v), 0.0, 1.0);
@@ -244,10 +244,6 @@ mod reductions {
         cummax(&[1.0, 3.0, f64::NAN, 5.0, 2.0, 1.0], None, &mut out);
         assert!(out.iter().zip([1.0, 3.0, 3.0, 5.0, 5.0, 5.0]).all(|(&got, want)| got.is_nan() || got == want), "{out:?}");
         assert_eq!((sum(&[i64::MAX, 1]), sum(&[i64::MAX, 1, -2]), prod(&[i64::MAX, 2])), ((i64::MIN, false), (i64::MAX - 1, true), (-2, false)));
-        assert_eq!((sum(&[u64::MAX, 1]), prod(&[1u64 << 32, 1 << 32]), sum(&[u64::MAX, 0])), ((0, false), (0, false), (u64::MAX, true)));
-        let mut out = Vec::new();
-        assert!(!cumsum(&[u64::MAX, 1, 5], None, &mut out));
-        assert_eq!(out, [u64::MAX, 0, 5]);
         assert!(!cumsum(&[i64::MAX, 1], None, &mut Vec::new()));
         assert!(!cumprod(&[i32::MAX, i32::MAX, i32::MAX], None, &mut Vec::new()));
         let mut out = vec![7.0];

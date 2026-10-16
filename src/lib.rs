@@ -4,10 +4,15 @@
 mod slice;
 mod arc;
 mod arith;
+pub mod agreement;
+pub mod array;
+#[macro_use]
+pub mod buffer;
 mod complex;
 pub mod convert;
 mod dd;
 pub mod distribution;
+pub mod error;
 pub mod exact;
 mod exp;
 mod field;
@@ -16,9 +21,11 @@ pub mod gather;
 mod hyperbolic;
 pub mod integer;
 mod lambert;
+pub mod layout;
 pub mod linalg;
 mod ln;
 pub mod number_theory;
+pub mod operation;
 pub mod optimize;
 pub mod parallel;
 mod parts;
@@ -29,13 +36,16 @@ pub mod reduce;
 pub mod search;
 mod special;
 mod sqrts;
+pub mod structure;
 mod table;
 pub mod tolerant;
 mod trig;
 #[cfg(accelerate)]
 mod vforce;
 
-pub use arith::{Add, Multiply, Overflowing, Subtract};
+pub use arith::{Add, Divide, Multiply, Subtract};
+/// The crates whose types compact buffers hold, which the exported width macros name.
+pub use {half, num_complex};
 pub use complex::{Cis, divide};
 pub use float::{FUSED, Float, Native};
 pub use ln::Logb;

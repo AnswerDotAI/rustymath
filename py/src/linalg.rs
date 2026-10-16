@@ -1,555 +1,643 @@
-//! rustymath's `linalg` module as NumPy generalized ufuncs, which `python/rustymath/linalg.py` wraps. A loop runs once for each matrix of a stack. It borrows contiguous core matrices and copies strided or float16 matrices into worker-local row-major buffers, calls rustymath, then writes the results through the outputs' strides, rounded to the loop's type. complex64 and complex128 matrices compute at their own width. Results that are always real, such as singular values, have the real type of the loop's width. A matrix that fails gets NaN results and makes the loop report NumPy's "invalid value", as a failing item of any rustymath ufunc does.
+//! rustymath's `linalg` module as Python functions, which `python/rustymath/linalg.py` wraps. Each takes stacks of matrices in its arguments' last two axes, or a right-hand side vector in its last axis. The axes before those form each argument's frame. Frames pair as rustymath broadcasts, through [`Frames`]: axes with the same name first, then the rest from the front. The cells of a stack split across rustymath's threads, and Ctrl-C stops a call between cells.
 //!
-//! A core dimension can't be the smaller of two others. Each function whose results have `min(m, n)` rows or items therefore registers twice: once for `m ≤ n`, with a name ending `_m`, and once for `m ≥ n`, ending `_n`. One loop serves both.
-use std::slice;
-use std::{borrow::Cow, convert::Infallible, ffi::{c_char, c_void}, marker::PhantomData, mem::{align_of, size_of}};
-
-use half::f16;
-use num_complex::Complex;
-use num_traits::{Float as _, NumAssignRef, Zero as _};
-use numpy::npyffi::{NPY_TYPES, npy_intp};
-use numpy::{PyArray1, PyArrayDescrMethods, PyArrayMethods, PyReadonlyArray2, PyUntypedArray, PyUntypedArrayMethods};
+//! float32, float64, complex64 and complex128 matrices compute at their own width. float16 matrices compute in float32, with results rounded to float16. Booleans and integers compute in the float that `DType::inexact` gives them, float32 for Booleans, `u8` and `i16` and float64 for `i32` and `i64`, except in the matrix products, where integers compute in int64 and raise `OverflowError` for a result that doesn't fit. Results that are always real, such as singular values, take the real dtype of the matrices' width, and a general matrix's eigenvalues the complex dtype. A matrix that `cholesky`, `eigh`, `eig` or their value-only forms can't factor gives NaN results.
+use rustymath::num_complex::Complex;
+use num_traits::{Float as _, Zero as _};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use rustymath::Float;
-use rustymath::linalg::{self, AndOr, Factor, Inner, LuRef, LuWork, MaxPlus, MinPlus, OrAnd, PlusEqual, PlusNotEqual, PlusTimes, Scalar, SvdRef};
+use rustymath::agreement::{Frames, Mapping};
+use rustymath::array::Array as Core;
+use rustymath::buffer::{Buffer, DType, Element, FloatWidth, View, Width};
+use rustymath::error::{Error, Kind};
+use rustymath::layout::{Lanes, Layout};
+use rustymath::linalg::{self, AndOr, Lu, LuWork, MaxPlus, MinPlus, OrAnd, PlusEqual, PlusNotEqual, PlusTimes, Scalar, Svd};
+use rustymath::parallel::stack;
+use rustymath::operation::{Kernels, ProductKernel};
+use rustymath_buffer::py_err;
 
-use crate::{Code, Loop, NONE, fe, parallel::{overlaps, separate}};
+use crate::array::give;
+use crate::convert::{Call, Items, convert};
+use crate::functions::missing;
 
-/// A generalized ufunc loop.
-type Ufunc = unsafe extern "C" fn(*mut *mut c_char, *mut npy_intp, *mut npy_intp, *mut c_void);
+/// A matrix function's data arguments at one dtype, the dtype that it computes in, and the dtype that its results take.
+struct Stack<'py> { call: Call<'py>, compute: DType, store: DType }
 
-/// One argument of a loop: its NumPy type, its width in bytes, the positions of its core dimensions among the loop's, and the position of its first core stride among the loop's.
-struct Arg { code: c_char, width: usize, shape: Vec<usize>, at: usize }
+impl<'py> Stack<'py> {
+    /// Converts `args` for `function`, which computes in the dtype that `DType::inexact` gives and stores its results in the other. Characters raise.
+    fn new(function: &str, args: &[&Bound<'py, PyAny>]) -> PyResult<Self> {
+        let call = convert(args)?;
+        let dtype = call.args[0].view().dtype();
+        let (compute, store) = dtype.inexact().ok_or_else(|| missing(function, dtype))?;
+        Ok(Self { call, compute, store })
+    }
 
-/// A loop's number of inputs, its number of core dimensions and its arguments, derived once from the registered dtype loop and signature.
-struct MatrixLoop { nin: usize, ndims: usize, args: Vec<Arg> }
+    /// Argument `k`'s layout.
+    fn layout(&self, k: usize) -> Layout { self.call.args[k].layout() }
 
-impl MatrixLoop {
-    /// The number of core strides that NumPy passes: one for each core dimension of each argument.
-    fn strides(&self) -> usize { self.args.iter().map(|a| a.shape.len()).sum() }
+    /// Argument `k`'s items at the computing dtype.
+    fn items(&self, k: usize) -> PyResult<Items<'_>> { self.call.args[k].at(self.compute) }
+}
 
-    /// Whether conservative byte bounds prove that no two of the `n` matrices write the same bytes: each output's matrices are separate, and so are different outputs. Inputs need no check, because NumPy copies any input that an output overlaps before it calls the loop.
-    fn independent(&self, pointers: &[usize], dims: &[usize], outer: &[npy_intp], core: &[npy_intp], n: usize) -> bool {
-        let spans: Option<Vec<_>> = self.args.iter().zip(pointers).zip(outer).skip(self.nin).map(|((arg, &p), &outer)| {
-            let axes: Vec<_> = arg.shape.iter().zip(&core[arg.at..]).map(|(&d, &s)| (dims[d], s)).collect();
-            separate(p, arg.width, &axes, n, outer)
-        }).collect();
-        spans.is_some_and(|s| (1..s.len()).all(|i| (0..i).all(|j| !overlaps(&s[i], &s[j]))))
+/// The frames of arguments with these layouts, each with its number of axes in a cell.
+fn framed(args: &[(&Layout, usize)]) -> PyResult<Frames> { Frames::new(args).map_err(py_err) }
+
+/// The rows and columns of the matrices in `layout`. A Rank error for fewer than two axes.
+fn matrix(function: &str, layout: &Layout) -> PyResult<[usize; 2]> {
+    match *layout.shape() {
+        [.., m, n] => Ok([m, n]),
+        _ => Err(py_err(Error::new(Kind::Rank, format!("{function} needs matrices, with at least two axes")))),
     }
 }
 
-/// Registers the generalized ufunc `name`, with `counts` inputs and outputs, and gives each of its `loops` the `MatrixLoop` that the loop's types and `signature` describe.
-fn register(m: &Bound<'_, PyModule>, name: &str, doc: &str, counts: [usize; 2], signature: &str, loops: Vec<Loop>) -> PyResult<()> {
-    let mut dimensions = Vec::new();
-    let shapes: Vec<Vec<usize>> = signature.split('(').skip(1).map(|s| {
-        s.split(')').next().unwrap().split(',').filter(|d| !d.is_empty()).map(|d| {
-            let d = d.trim_end_matches('?');
-            if let Some(i) = dimensions.iter().position(|&v| v == d) { i } else { dimensions.push(d); dimensions.len() - 1 }
-        }).collect()
-    }).collect();
-    fn code_width<T: Code>() -> (c_char, usize) { (T::CODE as c_char, size_of::<T>()) }
-    let widths = [
-        code_width::<f16>(), code_width::<f32>(), code_width::<f64>(), code_width::<Complex<f32>>(), code_width::<Complex<f64>>(), code_width::<bool>(),
-        code_width::<i64>(),
-    ];
-    let data = loops.iter().map(|(_, codes)| {
-        let mut at = 0;
-        let args = codes.iter().zip(&shapes).map(|(&code, shape)| {
-            let width = widths.iter().find(|&&(t, _)| t == code).unwrap().1;
-            at += shape.len();
-            Arg { code, width, shape: shape.clone(), at: at - shape.len() }
-        }).collect();
-        Box::into_raw(Box::new(MatrixLoop { nin: counts[0], ndims: dimensions.len(), args })).cast::<c_void>()
-    }).collect();
-    crate::register(m, name, doc, counts, NONE, Some(signature), loops, Some(data))
+/// The size of `function`'s square matrices. A Length error for a matrix that isn't square.
+fn square(function: &str, [m, n]: [usize; 2]) -> PyResult<usize> {
+    if m == n { Ok(n) } else { Err(py_err(Error::new(Kind::Length, format!("{function} needs square matrices, not {m} by {n}")))) }
 }
 
-/// A loop's element type, and `W`, the type rustymath computes it in.
-trait Stored: Code + numpy::Element {
-    type W: Copy;
-    fn load(self) -> Self::W;
-    fn store(w: Self::W) -> Self;
-    fn borrow(_: &[Self]) -> Option<&[Self::W]> { None }
+/// The cell axes of a right-hand side with `layout`, its number of columns, and whether it's one vector, beside matrices of `rows` rows. A Length error where its rows differ.
+fn rhs(function: &str, layout: &Layout, rows: usize) -> PyResult<(usize, usize, bool)> {
+    let (core, r, k) = match *layout.shape() {
+        [] => return Err(py_err(Error::new(Kind::Rank, format!("{function} needs a right-hand side with at least one axis")))),
+        [r] => (1, r, 1),
+        [.., r, k] => (2, r, k),
+    };
+    if r != rows { return Err(py_err(Error::new(Kind::Length, format!("{function}'s right-hand side has {r} rows, not {rows}")))); }
+    Ok((core, k, core == 1))
 }
 
-impl Stored for f16 {
-    type W = f32;
-    fn load(self) -> f32 { self.working() }
-    fn store(w: f32) -> f16 { f16::from_working(w) }
+/// The cell axes of a solution: `rows`, then the right-hand side's columns unless it's a vector.
+fn solution(rows: Layout, rhs: &Layout, vector: bool) -> Layout {
+    let r = rhs.shape().len();
+    if vector { rows } else { rows.concat(&rhs.axes(r - 1..r)) }
 }
 
-macro_rules! itself {
-    ($($t:ty),+) => {$(impl Stored for $t {
-        type W = $t;
-        fn load(self) -> $t { self }
-        fn store(w: $t) -> $t { w }
-        fn borrow(x: &[Self]) -> Option<&[Self]> { Some(x) }
-    })+};
-}
-itself!(f32, f64, Complex<f32>, Complex<f64>, bool, i64);
-
-/// The real type that the item type `E` computes in, or computes its parts in: `f32` for `float16`, `float32` and `complex64`.
-type Part<E> = <<E as Stored>::W as Scalar>::Real;
-
-/// A float loop's element type: `float16`, `float32`, `float64`, `complex64` or `complex128`, which rustymath factors in its working type.
-trait Item: Stored<W: Factor> {
-    /// The element type of results that are always real, such as singular values: the real type of the same width.
-    type Real: Stored<W = Part<Self>>;
-    /// The element type of results that are always complex, such as a general matrix's eigenvalues: the complex type of the same width.
-    type Complex: Stored<W = Complex<Part<Self>>>;
-}
-macro_rules! items {
-    ($($t:ty: $real:ty, $complex:ty;)+) => {$(impl Item for $t { type Real = $real; type Complex = $complex; })+};
-}
-items! {
-    f16: f16, Complex<f32>;
-    f32: f32, Complex<f32>;
-    f64: f64, Complex<f64>;
-    Complex<f32>: f32, Complex<f32>;
-    Complex<f64>: f64, Complex<f64>;
+/// `items`, of an argument of `layout`, read so that its axis `axis` pairs by key with axis `along` of `with`, as [`Mapping::contract`] pairs them. Axes without keys pair by position. A Length error where both have keys and they differ.
+fn paired<'a>(items: Items<'a>, layout: &Layout, axis: usize, with: &Layout, along: usize, function: &str) -> PyResult<Items<'a>> {
+    let contracted = Mapping::contract(with, along, layout, axis).map_err(|_| py_err(Error::new(Kind::Length, format!("{function} needs the same keys on the axes it pairs"))))?;
+    let Mapping::Positions(p) = contracted else { return Ok(items) };
+    let lanes = Lanes::new(layout.shape(), axis).map_err(py_err)?;
+    let [outer, _, inner] = lanes.dims();
+    let offsets: Vec<i64> = (0..outer).flat_map(|i| p.iter().flat_map(move |&j| (0..inner).map(move |k| lanes.offset(i, j, k) as i64))).collect();
+    Ok(Items::Cast(Buffer::gathered(items.view(), &offsets)))
 }
 
-/// One matrix of a loop's stack: the core matrix of each argument at position `i`.
-struct Cell<'a> { layout: &'a MatrixLoop, pointers: &'a [usize], outer: &'a [npy_intp], core: &'a [npy_intp], dims: &'a [usize], i: usize }
-
-impl Cell<'_> {
-    /// The loop's core dimensions, in the order that the signature first names them.
-    fn dims<const N: usize>(&self) -> [usize; N] { self.dims.try_into().expect("a loop's number of core dimensions") }
-
-    /// Argument `k`, which holds items of type `code`: its address, its row and item strides in bytes, and its rows and columns. A vector is a matrix of one column, and a scalar one of one item.
-    fn matrix(&self, k: usize, code: NPY_TYPES) -> (*mut c_char, [npy_intp; 2], [usize; 2]) {
-        let arg = &self.layout.args[k];
-        assert_eq!(arg.code, code as c_char, "argument {k} holds the loop's type");
-        let (p, s) = ((self.pointers[k] as *mut c_char).wrapping_offset(self.i as isize * self.outer[k]), &self.core[arg.at..]);
-        match arg.shape[..] { [r, c] => (p, [s[0], s[1]], [self.dims[r], self.dims[c]]), [r] => (p, [s[0], 0], [self.dims[r], 1]), _ => (p, [0, 0], [1, 1]) }
-    }
-
-    /// Input `k`, row by row in `T`'s working type.
-    fn read<'c, T: Stored + 'c>(&'c self, k: usize) -> Cow<'c, [T::W]> {
-        assert!(k < self.layout.nin, "argument {k} is an input");
-        let (p, s, size) = self.matrix(k, T::CODE);
-        // SAFETY: NumPy passes each argument's matrices at these addresses and strides, with items of the registered types.
-        unsafe { read::<T>(p, s, size) }
-    }
-
-    /// Writes `x`, which holds output `k` row by row, through `f`.
-    fn write<W: Copy, O: Code>(&self, k: usize, x: &[W], f: impl Fn(W) -> O) {
-        assert!(k >= self.layout.nin, "argument {k} is an output");
-        let (p, s, size) = self.matrix(k, O::CODE);
-        // SAFETY: as for `read`. No input overlaps this matrix, and no other matrix writes to it.
-        unsafe { write(x, p, s, size, f) }
-    }
-}
-
-/// A generalized ufunc's work on each matrix of a stack, at the loop's element type `E`.
-trait Gufunc<E> {
-    /// The scratch value that the matrices which run in turn on one thread share, such as an `LuWork`.
-    type S: Default;
-    /// Reads `c`'s inputs, writes its outputs, and gives whether the matrix succeeded.
-    fn each(c: &Cell<'_>, s: &mut Self::S) -> bool;
-}
-
-/// The loop that runs `G` on each matrix of a stack. Where no two matrices write the same bytes, rustymath's `stack_with` splits the stack across threads. Otherwise the matrices run in turn on this thread.
-unsafe extern "C" fn looped<G: Gufunc<E>, E>(args: *mut *mut c_char, dims: *mut npy_intp, steps: *mut npy_intp, data: *mut c_void) {
-    let incoming = unsafe { fe::fetestexcept(fe::REPORTED) };
-    let layout = unsafe { &*data.cast::<MatrixLoop>() };
-    let nargs = layout.args.len();
-    let (n, outer, core) = unsafe { (*dims as usize, slice::from_raw_parts(steps, nargs), slice::from_raw_parts(steps.add(nargs), layout.strides())) };
-    let dims: Vec<usize> = unsafe { slice::from_raw_parts(dims.add(1), layout.ndims) }.iter().map(|&d| d as usize).collect();
-    let pointers: Vec<usize> = unsafe { slice::from_raw_parts(args, nargs) }.iter().map(|&p| p as usize).collect();
-    let each = |i, _: &mut [()], s: &mut G::S| G::each(&Cell { layout, pointers: &pointers, outer, core, dims: &dims, i }, s);
-    let ok = if n > 1 && layout.independent(&pointers, &dims, outer, core, n) {
-        let Ok((_, ok)) = rustymath::parallel::stack_with(n, 0, &each, || Ok::<_, Infallible>(()));
-        ok
-    } else { let mut s = G::S::default(); (0..n).fold(true, |ok, i| each(i, &mut [], &mut s) & ok) };
-    unsafe { fe::finish(incoming, if ok { 0 } else { fe::INVALID }); }
-}
-
-/// The `rows`×`cols` matrix at `p`, whose rows lie `rs` bytes apart and items `cs` bytes apart, row by row in `E`'s working type.
-unsafe fn read<'a, E: Stored + 'a>(p: *mut c_char, [rs, cs]: [npy_intp; 2], [rows, cols]: [usize; 2]) -> Cow<'a, [E::W]> {
-    let len = rows * cols;
-    if len == 0 { return Cow::Borrowed(&[]); }
-    if (cols == 1 || cs == size_of::<E>() as isize) && (rows == 1 || rs == (cols * size_of::<E>()) as isize) && (p as usize).is_multiple_of(align_of::<E>()) {
-        if let Some(x) = E::borrow(unsafe { slice::from_raw_parts(p.cast::<E>(), len) }) { return Cow::Borrowed(x); }
-    }
-    let mut x = Vec::with_capacity(rows * cols);
-    for i in 0..rows as isize { for j in 0..cols as isize { x.push(unsafe { (p.offset(i * rs + j * cs) as *const E).read_unaligned() }.load()) } }
-    Cow::Owned(x)
-}
-
-/// Writes the `rows`×`cols` matrix `x`, held row by row, through `f` to `p`, whose rows lie `rs` bytes apart and items `cs` bytes apart. A vector is a matrix of one column, and a scalar one of one item.
-unsafe fn write<W: Copy, O>(x: &[W], p: *mut c_char, [rs, cs]: [npy_intp; 2], [rows, cols]: [usize; 2], f: impl Fn(W) -> O) {
-    for i in 0..rows {
-        for j in 0..cols { unsafe { (p.offset(i as isize * rs + j as isize * cs) as *mut O).write_unaligned(f(x[i * cols + j])) } }
-    }
-}
+/// The `per` items of cell `at` in `x`.
+fn at<T>(x: &[T], at: usize, per: usize) -> &[T] { &x[at * per..][..per] }
 
 /// `n` NaNs, the results of a matrix that fails.
-fn nans<W: Scalar>(n: usize) -> Vec<W> { vec![W::from_real(W::Real::nan()); n] }
+fn nans<T: Scalar>(n: usize) -> Vec<T> { vec![T::from_real(T::Real::nan()); n] }
 
-/// `n` complex NaNs, the complex results of a matrix of item type `E` that fails.
-fn complex_nans<E: Item>(n: usize) -> Vec<Complex<Part<E>>> { vec![Complex::new(Part::<E>::nan(), Part::<E>::nan()); n] }
-
-/// Runs `f` on the LU factorization in the first two inputs: the `n`×`n` packed factors, transposed as the `lu` gufunc writes them, and the positions of the `n` rows. `None` where a position is out of range.
-fn with_lu<E: Item, R>(c: &Cell<'_>, n: usize, f: impl FnOnce(LuRef<'_, E::W>) -> R) -> Option<R> {
-    let (factors, perm) = (c.read::<E>(0), c.read::<i64>(1));
-    let perm: Vec<usize> = perm.iter().map(|&i| i as usize).collect();
-    perm.iter().all(|&i| i < n).then(|| f(LuRef::new(n, &factors, &perm)))
+/// `f` of each cell of `frames`, in order. The cells split across rustymath's threads, with scratch `S` that a thread's cells share. Ctrl-C stops the call between cells.
+fn run<R: Send, S: Default>(py: Python<'_>, frames: &Frames, f: impl Fn(usize, &mut S) -> R + Sync) -> PyResult<Vec<R>> {
+    let cells = stack(frames.count, 1, &|i: usize, out: &mut [Option<R>], s: &mut S| out[0] = Some(f(i, s)), || py.check_signals())?;
+    Ok(cells.into_iter().map(|c| c.expect("`stack` writes every cell")).collect())
 }
 
-/// Runs `f` on the thin SVD of an `m`×`n` matrix in the first three inputs: U, the singular values and V.
-fn with_svd<E: Item, R>(c: &Cell<'_>, [m, n]: [usize; 2], f: impl FnOnce(SvdRef<'_, E::W>) -> R) -> R {
-    f(SvdRef::new([m, n], &c.read::<E>(0), &c.read::<E::Real>(1), &c.read::<E>(2)))
+/// An array of `buffer`'s items, the cells of `frame` in order, each with the axes `cell`, at the dtype `store`. A cell axis keeps the keys and name of the argument axis it indexes, where it has one.
+fn stored(buffer: Buffer, frame: &Layout, cell: impl Into<Layout>, store: DType) -> PyResult<Core> {
+    let buffer = if buffer.dtype() == store { buffer } else { Buffer::cast(buffer.view(), store).map_err(py_err)? };
+    Core::new(frame.concat(&cell.into()), buffer).map_err(py_err)
 }
 
-/// Defines each listed generalized ufunc's work on one matrix as a unit type, for every float and complex element type `E`. `Name(c, s: S) { body }` runs `body` with the matrix's `Cell` `c` and the shared scratch value `s` of type `S`.
-macro_rules! gufunc_types {
-    ($($(#[$doc:meta])* $name:ident($c:ident, $s:tt: $S:ty) $body:block)+) => {$(
-        $(#[$doc])*
-        struct $name;
-        impl<E: Item> Gufunc<E> for $name {
-            type S = $S;
-            fn each($c: &Cell<'_>, $s: &mut $S) -> bool $body
+/// [`stored`] for `items`.
+fn array<T: Element>(items: Vec<T>, frame: &Layout, cell: impl Into<Layout>, store: DType) -> PyResult<Core> { stored(T::buffer(items), frame, cell, store) }
+
+/// `core` as a Python result: a Python number where it has no axes.
+fn result(py: Python<'_>, core: Core) -> PyResult<Bound<'_, PyAny>> {
+    let scalar = core.layout().shape().is_empty();
+    give(py, core, scalar)
+}
+
+/// The int64 dtype of row positions, ranks and counts.
+const I64: DType = DType::Integer(Width::I64);
+
+/// The solution `x` of `a @ x == b` for each matrix `a` and right-hand side `b`, a vector or matrices. A square `a` with no negligible LU pivot solves through LU, with no cutoff. Any other `a` gives the least-squares solution with the least norm.
+#[pyfunction]
+fn solve<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, b: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let s = Stack::new("solve", &[a, b])?;
+    let (la, lb) = (s.layout(0), s.layout(1));
+    let (ra, rb) = (la.shape().len(), lb.shape().len());
+    let [m, n] = matrix("solve", &la)?;
+    let (core, k, vector) = rhs("solve", &lb, m)?;
+    let frames = framed(&[(&la, 2), (&lb, core)])?;
+    rustymath::with_inexact!(s.compute, T => {
+        let (ai, bi) = (s.items(0)?, paired(s.items(1)?, &lb, rb - core, &la, ra - 2, "solve")?);
+        let (a, b) = (ai.of::<T>(), bi.of::<T>());
+        let x = run(py, &frames, |i, w: &mut LuWork<T>| w.solve(at(a, frames.cell(0, i), m * n), at(b, frames.cell(1, i), m * k), [m, n], k))?;
+        result(py, array(x.concat(), &frames.layout, solution(la.axes(ra - 1..ra), &lb, vector), s.store)?)
+    })
+}
+
+/// The least-squares solution `x` of `a @ x == b` with the least norm, and `a`'s singular values in descending order, for each matrix `a` and right-hand side `b`, a vector or matrices.
+#[pyfunction]
+fn lstsq<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, b: &Bound<'py, PyAny>) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+    let s = Stack::new("lstsq", &[a, b])?;
+    let (la, lb) = (s.layout(0), s.layout(1));
+    let (ra, rb) = (la.shape().len(), lb.shape().len());
+    let [m, n] = matrix("lstsq", &la)?;
+    let (core, k, vector) = rhs("lstsq", &lb, m)?;
+    let frames = framed(&[(&la, 2), (&lb, core)])?;
+    rustymath::with_inexact!(s.compute, T => {
+        let (ai, bi) = (s.items(0)?, paired(s.items(1)?, &lb, rb - core, &la, ra - 2, "lstsq")?);
+        let (a, b) = (ai.of::<T>(), bi.of::<T>());
+        let (x, sv): (Vec<_>, Vec<_>) = run(py, &frames, |i, _: &mut ()| linalg::lstsq(at(a, frames.cell(0, i), m * n), at(b, frames.cell(1, i), m * k), [m, n], k))?.into_iter().unzip();
+        Ok((result(py, array(x.concat(), &frames.layout, solution(la.axes(ra - 1..ra), &lb, vector), s.store)?)?,
+            result(py, array(sv.concat(), &frames.layout, [m.min(n)], s.store.real())?)?))
+    })
+}
+
+/// The pseudoinverse of each matrix. A square matrix with no negligible LU pivot gives its inverse through LU, with no cutoff. Any other gives the pseudoinverse with `lstsq`'s cutoff.
+#[pyfunction]
+fn pinv<'py>(py: Python<'py>, a: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let s = Stack::new("pinv", &[a])?;
+    let la = s.layout(0);
+    let ra = la.shape().len();
+    let [m, n] = matrix("pinv", &la)?;
+    let frames = framed(&[(&la, 2)])?;
+    rustymath::with_inexact!(s.compute, T => {
+        let ai = s.items(0)?;
+        let a = ai.of::<T>();
+        let x = run(py, &frames, |i, w: &mut LuWork<T>| {
+            let mut out = vec![T::zero(); m * n];
+            w.pinv_into(at(a, frames.cell(0, i), m * n), [m, n], &mut out);
+            out
+        })?;
+        result(py, array(x.concat(), &frames.layout, la.axes([ra - 1, ra - 2].into_iter()), s.store)?)
+    })
+}
+
+/// The determinant of each square matrix, from its LU factorization.
+#[pyfunction]
+fn det<'py>(py: Python<'py>, a: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let s = Stack::new("det", &[a])?;
+    let la = s.layout(0);
+    let n = square("det", matrix("det", &la)?)?;
+    let frames = framed(&[(&la, 2)])?;
+    rustymath::with_inexact!(s.compute, T => {
+        let ai = s.items(0)?;
+        let a = ai.of::<T>();
+        let d = run(py, &frames, |i, w: &mut LuWork<T>| w.factor(at(a, frames.cell(0, i), n * n), n).determinant())?;
+        result(py, array(d, &frames.layout, Layout::EMPTY, s.store)?)
+    })
+}
+
+/// The sign of each square matrix's determinant, and the natural logarithm of its magnitude, which can't overflow. A singular matrix gives sign 0 and logarithm -inf.
+#[pyfunction]
+fn slogdet<'py>(py: Python<'py>, a: &Bound<'py, PyAny>) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+    let s = Stack::new("slogdet", &[a])?;
+    let la = s.layout(0);
+    let n = square("slogdet", matrix("slogdet", &la)?)?;
+    let frames = framed(&[(&la, 2)])?;
+    rustymath::with_inexact!(s.compute, T => {
+        let ai = s.items(0)?;
+        let a = ai.of::<T>();
+        let (sign, log): (Vec<_>, Vec<_>) = run(py, &frames, |i, w: &mut LuWork<T>| w.factor(at(a, frames.cell(0, i), n * n), n).log_determinant())?.into_iter().unzip();
+        Ok((result(py, array(sign, &frames.layout, Layout::EMPTY, s.store)?)?, result(py, array(log, &frames.layout, Layout::EMPTY, s.store.real())?)?))
+    })
+}
+
+/// The packed LU factors of each square matrix, with partial pivoting, and the positions of its rows. The factors are in rustymath's order: row `j` holds column `j` of the packed matrix. Row `i` of `l @ u` is row `p[i]` of the matrix.
+#[pyfunction]
+fn lu<'py>(py: Python<'py>, a: &Bound<'py, PyAny>) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+    let s = Stack::new("lu", &[a])?;
+    let la = s.layout(0);
+    let n = square("lu", matrix("lu", &la)?)?;
+    let frames = framed(&[(&la, 2)])?;
+    rustymath::with_inexact!(s.compute, T => {
+        let ai = s.items(0)?;
+        let a = ai.of::<T>();
+        let (factors, p): (Vec<_>, Vec<_>) = run(py, &frames, |i, w: &mut LuWork<T>| {
+            let f = w.factor(at(a, frames.cell(0, i), n * n), n);
+            (f.factors.to_vec(), f.perm.iter().map(|&r| r as i64).collect::<Vec<_>>())
+        })?.into_iter().unzip();
+        Ok((result(py, array(factors.concat(), &frames.layout, [n, n], s.store)?)?, result(py, array(p.concat(), &frames.layout, [n], I64)?)?))
+    })
+}
+
+/// LU factors as [`lu`] gives them, and their row positions: the factors' stack, with any further arguments at their dtype, the size of each matrix, both layouts, and the positions.
+struct Factored<'py> { stack: Stack<'py>, n: usize, factors: Layout, positions: Layout, p: Vec<usize> }
+
+impl<'py> Factored<'py> {
+    /// The factors `f` and row positions `p` for `function`, with `rest` at the factors' dtype. Row positions that aren't integers raise. An Index error for a row position outside 0 to the matrices' size.
+    fn new(function: &str, f: &Bound<'py, PyAny>, p: &Bound<'py, PyAny>, rest: &[&Bound<'py, PyAny>]) -> PyResult<Self> {
+        let stack = Stack::new(function, &[&[f], rest].concat())?;
+        let factors = stack.layout(0);
+        let n = square(function, matrix(function, &factors)?)?;
+        let call = convert(&[p])?;
+        let positions = call.args[0].layout();
+        if positions.shape().last() != Some(&n) {
+            return Err(py_err(Error::new(Kind::Length, format!("{function} needs {n} row positions for each matrix"))));
         }
-    )+};
+        let p = call.args[0].items::<i64>()?.iter().map(|&r| usize::try_from(r).ok().filter(|&r| r < n)).collect::<Option<Vec<_>>>()
+            .ok_or_else(|| py_err(Error::new(Kind::Index, format!("{function} needs row positions from 0 to {}", n.saturating_sub(1)))))?;
+        Ok(Self { stack, n, factors, positions, p })
+    }
 }
 
-gufunc_types! {
-    /// `solve`: rustymath's `solve` of `a x = b`, for an `m`×`n` matrix `a` and an `m`×`k` matrix `b`.
-    Solve(c, work: LuWork<E::W>) {
-        let [m, n, k] = c.dims();
-        c.write(2, &work.solve(&c.read::<E>(0), &c.read::<E>(1), [m, n], k), E::store);
-        true
-    }
-    /// `pinv`: rustymath's `pinv` of an `m`×`n` matrix, which is `n`×`m`.
-    Pinv(c, scratch: (LuWork<E::W>, Vec<E::W>)) {
-        let ([m, n], (work, x)) = (c.dims(), scratch);
-        x.resize(m * n, E::W::zero());
-        work.pinv_into(&c.read::<E>(0), [m, n], x);
-        c.write(1, x, E::store);
-        true
-    }
-    /// `det`: the determinant of an `m`×`m` matrix, from its LU factorization.
-    Det(c, work: LuWork<E::W>) {
-        let [m] = c.dims();
-        c.write(1, &[work.factor(&c.read::<E>(0), m).determinant()], E::store);
-        true
-    }
-    /// `slogdet`: the sign of the determinant of an `m`×`m` matrix and the natural logarithm of its magnitude, as `Lu::log_determinant` gives them.
-    Slogdet(c, work: LuWork<E::W>) {
-        let [m] = c.dims();
-        let (sign, log) = work.factor(&c.read::<E>(0), m).log_determinant();
-        c.write(1, &[sign], E::store);
-        c.write(2, &[log], E::Real::store);
-        true
-    }
-    /// `lu`: the packed LU factors of an `m`×`m` matrix and the positions of its rows. NumPy holds the factors transposed: their rows are rustymath's columns.
-    Lu(c, work: LuWork<E::W>) {
-        let [m] = c.dims();
-        let f = work.factor(&c.read::<E>(0), m);
-        c.write(1, f.factors, E::store);
-        c.write(2, f.perm, |i| i as i64);
-        true
-    }
-    /// `lu_solve`: `x` with `a x = b`, from the packed LU factors and row positions of an `m`×`m` matrix `a`.
-    LuSolve(c, _: ()) {
-        let [n, k] = c.dims();
-        let x = with_lu::<E, _>(c, n, |lu| lu.solve(&c.read::<E>(2), k));
-        let ok = x.is_some();
-        c.write(3, &x.unwrap_or_else(|| nans(n * k)), E::store);
-        ok
-    }
-    /// `lu_inverse`: the inverse of an `m`×`m` matrix, from its packed LU factors and row positions.
-    LuInverse(c, _: ()) {
-        let [n] = c.dims();
-        let x = with_lu::<E, _>(c, n, |lu| lu.inverse());
-        let ok = x.is_some();
-        c.write(2, &x.unwrap_or_else(|| nans(n * n)), E::store);
-        ok
-    }
-    /// `lu_slogdet`: the sign of an `m`×`m` matrix's determinant and the natural logarithm of its magnitude, from its packed LU factors and row positions.
-    LuSlogdet(c, _: ()) {
-        let [n] = c.dims();
-        let r = with_lu::<E, _>(c, n, |lu| lu.log_determinant());
-        let (sign, log) = r.unwrap_or((E::W::from_real(Part::<E>::nan()), Part::<E>::nan()));
-        c.write(2, &[sign], E::store);
-        c.write(3, &[log], E::Real::store);
-        r.is_some()
-    }
-    /// `lu_det`: the determinant of an `m`×`m` matrix, from its packed LU factors and row positions.
-    LuDet(c, _: ()) {
-        let [n] = c.dims();
-        let det = with_lu::<E, _>(c, n, |lu| lu.determinant());
-        c.write(2, &[det.unwrap_or(E::W::from_real(Part::<E>::nan()))], E::store);
-        det.is_some()
-    }
-    /// `cholesky`: the lower triangular L with L Lᴴ = a, for a positive definite `m`×`m` matrix `a`, reading only its lower triangle.
-    Cholesky(c, _: ()) {
-        let [m] = c.dims();
-        let l = linalg::cholesky(&c.read::<E>(0), m);
-        let ok = l.is_some();
-        c.write(1, &l.unwrap_or_else(|| nans(m * m)), E::store);
-        ok
-    }
-    /// `qr_m` and `qr_n`: the thin QR factorization of an `m`×`n` matrix.
-    Qr(c, _: ()) {
-        let [m, n] = c.dims();
-        let (q, r) = linalg::qr(&c.read::<E>(0), [m, n]);
-        c.write(1, &q, E::store);
-        c.write(2, &r, E::store);
-        true
-    }
-    /// `qr_complete`: the complete QR factorization of an `m`×`n` matrix.
-    QrComplete(c, _: ()) {
-        let [m, n] = c.dims();
-        let (q, r) = linalg::qr_complete(&c.read::<E>(0), [m, n]);
-        c.write(1, &q, E::store);
-        c.write(2, &r, E::store);
-        true
-    }
-    /// `svd_m` and `svd_n`: the thin SVD of an `m`×`n` matrix, as U, which is `m`×`p`, the `p` singular values in descending order, and V, which is `n`×`p`, where `p` is the smaller of `m` and `n`.
-    Svd(c, _: ()) {
-        let [m, n] = c.dims();
-        let f = linalg::svd(&c.read::<E>(0), [m, n]);
-        c.write(1, &f.u, E::store);
-        c.write(2, &f.s, E::Real::store);
-        c.write(3, &f.v, E::store);
-        true
-    }
-    /// `truncated_svd`: an approximation to the first `k` singular values of an `m`×`n` matrix and their vectors, as U, which is `m`×`k`, the values in descending order, and V, which is `n`×`k`. The outputs set `k`. A `k` above `m` or `n` gives NaN results.
-    TruncatedSvd(c, _: ()) {
-        let [m, n, k] = c.dims();
-        let ok = k <= m.min(n);
-        let (u, values, v) = if ok {
-            let f = linalg::truncated_svd(&c.read::<E>(0), [m, n], k);
+/// `x` with `a @ x == b`, from the packed LU factors `factors` and row positions `p` of each matrix `a`, as `lu` gives them, without factoring again or applying a cutoff.
+#[pyfunction]
+fn lu_solve<'py>(py: Python<'py>, factors: &Bound<'py, PyAny>, p: &Bound<'py, PyAny>, b: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let f = Factored::new("lu_solve", factors, p, &[b])?;
+    let (n, lb) = (f.n, f.stack.layout(1));
+    let (core, k, vector) = rhs("lu_solve", &lb, n)?;
+    let frames = framed(&[(&f.factors, 2), (&f.positions, 1), (&lb, core)])?;
+    rustymath::with_inexact!(f.stack.compute, T => {
+        let (fi, bi) = (f.stack.items(0)?, f.stack.items(1)?);
+        let (a, b, p) = (fi.of::<T>(), bi.of::<T>(), &f.p);
+        let x = run(py, &frames, |i, _: &mut ()| {
+            Lu::new(n, at(a, frames.cell(0, i), n * n), at(p, frames.cell(1, i), n)).solve(at(b, frames.cell(2, i), n * k), k)
+        })?;
+        result(py, array(x.concat(), &frames.layout, solution(Layout::from([n]), &lb, vector), f.stack.store)?)
+    })
+}
+
+/// The inverse of each matrix, from its packed LU factors and row positions, as `lu` gives them.
+#[pyfunction]
+fn lu_inverse<'py>(py: Python<'py>, factors: &Bound<'py, PyAny>, p: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let f = Factored::new("lu_inverse", factors, p, &[])?;
+    let n = f.n;
+    let frames = framed(&[(&f.factors, 2), (&f.positions, 1)])?;
+    rustymath::with_inexact!(f.stack.compute, T => {
+        let fi = f.stack.items(0)?;
+        let (a, p) = (fi.of::<T>(), &f.p);
+        let x = run(py, &frames, |i, _: &mut ()| Lu::new(n, at(a, frames.cell(0, i), n * n), at(p, frames.cell(1, i), n)).inverse())?;
+        result(py, array(x.concat(), &frames.layout, [n, n], f.stack.store)?)
+    })
+}
+
+/// The determinant of each matrix, from its packed LU factors and row positions, as `lu` gives them.
+#[pyfunction]
+fn lu_det<'py>(py: Python<'py>, factors: &Bound<'py, PyAny>, p: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let f = Factored::new("lu_det", factors, p, &[])?;
+    let n = f.n;
+    let frames = framed(&[(&f.factors, 2), (&f.positions, 1)])?;
+    rustymath::with_inexact!(f.stack.compute, T => {
+        let fi = f.stack.items(0)?;
+        let (a, p) = (fi.of::<T>(), &f.p);
+        let d = run(py, &frames, |i, _: &mut ()| Lu::new(n, at(a, frames.cell(0, i), n * n), at(p, frames.cell(1, i), n)).determinant())?;
+        result(py, array(d, &frames.layout, Layout::EMPTY, f.stack.store)?)
+    })
+}
+
+/// The sign of each matrix's determinant and the natural logarithm of its magnitude, from its packed LU factors and row positions, as `lu` gives them.
+#[pyfunction]
+fn lu_slogdet<'py>(py: Python<'py>, factors: &Bound<'py, PyAny>, p: &Bound<'py, PyAny>) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+    let f = Factored::new("lu_slogdet", factors, p, &[])?;
+    let n = f.n;
+    let frames = framed(&[(&f.factors, 2), (&f.positions, 1)])?;
+    rustymath::with_inexact!(f.stack.compute, T => {
+        let fi = f.stack.items(0)?;
+        let (a, p) = (fi.of::<T>(), &f.p);
+        let (sign, log): (Vec<_>, Vec<_>) = run(py, &frames, |i, _: &mut ()| {
+            Lu::new(n, at(a, frames.cell(0, i), n * n), at(p, frames.cell(1, i), n)).log_determinant()
+        })?.into_iter().unzip();
+        Ok((result(py, array(sign, &frames.layout, Layout::EMPTY, f.stack.store)?)?, result(py, array(log, &frames.layout, Layout::EMPTY, f.stack.store.real())?)?))
+    })
+}
+
+/// The unit lower triangle `l` or the upper triangle `u` of each matrix's packed LU factors, as `lu` gives them.
+fn triangle<'py>(py: Python<'py>, function: &str, factors: &Bound<'py, PyAny>, lower: bool) -> PyResult<Bound<'py, PyAny>> {
+    let s = Stack::new(function, &[factors])?;
+    let lf = s.layout(0);
+    let n = square(function, matrix(function, &lf)?)?;
+    let frames = framed(&[(&lf, 2)])?;
+    rustymath::with_inexact!(s.compute, T => {
+        let fi = s.items(0)?;
+        let a = fi.of::<T>();
+        let x = run(py, &frames, |i, _: &mut ()| {
+            let f = Lu::new(n, at(a, frames.cell(0, i), n * n), &[][..]);
+            if lower { f.lower() } else { f.upper() }
+        })?;
+        result(py, array(x.concat(), &frames.layout, [n, n], s.store)?)
+    })
+}
+
+/// The unit lower triangle of each matrix's packed LU factors, as `lu` gives them.
+#[pyfunction]
+fn lu_lower<'py>(py: Python<'py>, factors: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { triangle(py, "lu_lower", factors, true) }
+
+/// The upper triangle of each matrix's packed LU factors, as `lu` gives them.
+#[pyfunction]
+fn lu_upper<'py>(py: Python<'py>, factors: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { triangle(py, "lu_upper", factors, false) }
+
+/// The lower triangular `l` with `l @ l.conj().mT == a` for each Hermitian positive definite matrix `a`, reading only `a`'s lower triangle.
+#[pyfunction]
+fn cholesky<'py>(py: Python<'py>, a: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let s = Stack::new("cholesky", &[a])?;
+    let la = s.layout(0);
+    let n = square("cholesky", matrix("cholesky", &la)?)?;
+    let frames = framed(&[(&la, 2)])?;
+    rustymath::with_inexact!(s.compute, T => {
+        let ai = s.items(0)?;
+        let a = ai.of::<T>();
+        let l = run(py, &frames, |i, _: &mut ()| linalg::cholesky(at(a, frames.cell(0, i), n * n), n).unwrap_or_else(|| nans(n * n)))?;
+        result(py, array(l.concat(), &frames.layout, [n, n], s.store)?)
+    })
+}
+
+/// The QR factorization `(q, r)` of each matrix, with `r`'s diagonal real and never negative. With `complete`, `q` is square and `r` as tall as the matrix.
+#[pyfunction]
+#[pyo3(signature = (a, complete=false))]
+fn qr<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, complete: bool) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+    let s = Stack::new("qr", &[a])?;
+    let la = s.layout(0);
+    let [m, n] = matrix("qr", &la)?;
+    let rows = if complete { m } else { m.min(n) };
+    let frames = framed(&[(&la, 2)])?;
+    rustymath::with_inexact!(s.compute, T => {
+        let ai = s.items(0)?;
+        let a = ai.of::<T>();
+        let (q, r): (Vec<_>, Vec<_>) = run(py, &frames, |i, _: &mut ()| {
+            let x = at(a, frames.cell(0, i), m * n);
+            if complete { linalg::qr_complete(x, [m, n]) } else { linalg::qr(x, [m, n]) }
+        })?.into_iter().unzip();
+        Ok((result(py, array(q.concat(), &frames.layout, [m, rows], s.store)?)?, result(py, array(r.concat(), &frames.layout, [rows, n], s.store)?)?))
+    })
+}
+
+/// The thin SVD of each matrix: `u`, the singular values `s` in descending order, and `v`, with `a == u @ (s[..., None] * v.conj().mT)`. With `rank`, only the `rank` largest singular values and their vectors, or fewer for a smaller matrix, from Halko, Martinsson and Tropp's randomized range finder.
+#[pyfunction]
+#[pyo3(signature = (a, rank=None))]
+fn svd<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, rank: Option<usize>) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+    let s = Stack::new("svd", &[a])?;
+    let la = s.layout(0);
+    let [m, n] = matrix("svd", &la)?;
+    let k = rank.map_or(m.min(n), |r| r.min(m).min(n));
+    let frames = framed(&[(&la, 2)])?;
+    rustymath::with_inexact!(s.compute, T => {
+        let ai = s.items(0)?;
+        let a = ai.of::<T>();
+        let cells = run(py, &frames, |i, _: &mut ()| {
+            let x = at(a, frames.cell(0, i), m * n);
+            let f = if rank.is_some() { linalg::truncated_svd(x, [m, n], k) } else { linalg::svd(x, [m, n]) };
             (f.u, f.s, f.v)
-        } else { (nans(m * k), nans(k), nans(n * k)) };
-        c.write(1, &u, E::store);
-        c.write(2, &values, E::Real::store);
-        c.write(3, &v, E::store);
-        ok
-    }
-    /// `svd_solve`: the least-norm `x` with `a x = b`, from the thin SVD factors of an `m`×`n` matrix `a`.
-    SvdSolve(c, _: ()) {
-        let [m, _, n, k] = c.dims();
-        c.write(4, &with_svd::<E, _>(c, [m, n], |svd| svd.solve(&c.read::<E>(3), k)), E::store);
-        true
-    }
-    /// `svd_pinv`: the pseudoinverse of an `m`×`n` matrix, from its thin SVD factors.
-    SvdPinv(c, _: ()) {
-        let [m, _, n] = c.dims();
-        c.write(3, &with_svd::<E, _>(c, [m, n], |svd| svd.pseudoinverse()), E::store);
-        true
-    }
-    /// `svdvals_m` and `svdvals_n`: the singular values of an `m`×`n` matrix, in descending order.
-    Svdvals(c, _: ()) {
-        let [m, n] = c.dims();
-        c.write(1, &linalg::singular_values(&c.read::<E>(0), [m, n]), E::Real::store);
-        true
-    }
-    /// `rank`: rustymath's `rank` of an `m`×`n` matrix.
-    Rank(c, _: ()) {
-        let [m, n] = c.dims();
-        c.write(1, &[linalg::rank(&c.read::<E>(0), [m, n]) as i64], |r| r);
-        true
-    }
-    /// `lstsq_m` and `lstsq_n`: the least-squares solution `x` of `a x = b` with the least norm, for an `m`×`n` matrix `a` and an `m`×`k` matrix `b`, and `a`'s singular values in descending order.
-    Lstsq(c, _: ()) {
-        let [m, n, k] = c.dims();
-        let (x, sv) = linalg::lstsq(&c.read::<E>(0), &c.read::<E>(1), [m, n], k);
-        c.write(2, &x, E::store);
-        c.write(3, &sv, E::Real::store);
-        true
-    }
-    /// `eigh`: the eigenvalues of a symmetric or Hermitian `m`×`m` matrix in ascending order, and its unit eigenvectors in columns, reading only its lower triangle.
-    Eigh(c, _: ()) {
-        let [m] = c.dims();
-        let f = linalg::eigh(&c.read::<E>(0), m);
-        let ok = f.is_some();
-        let (w, v) = f.map_or_else(|| (nans(m), nans(m * m)), |f| (f.values, f.vectors));
-        c.write(1, &w, E::Real::store);
-        c.write(2, &v, E::store);
-        ok
-    }
-    /// `eigvalsh`: the eigenvalues of a symmetric or Hermitian `m`×`m` matrix in ascending order, reading only its lower triangle.
-    Eigvalsh(c, _: ()) {
-        let [m] = c.dims();
-        let w = linalg::hermitian_eigenvalues(&c.read::<E>(0), m);
-        let ok = w.is_some();
-        c.write(1, &w.unwrap_or_else(|| nans(m)), E::Real::store);
-        ok
-    }
-    /// `eig`: the eigenvalues of an `m`×`m` matrix, and its unit eigenvectors in columns, both complex.
-    Eig(c, _: ()) {
-        let [m] = c.dims();
-        let f = linalg::eig(&c.read::<E>(0), m);
-        let ok = f.is_some();
-        let (w, v) = f.map_or_else(|| (complex_nans::<E>(m), complex_nans::<E>(m * m)), |f| (f.values, f.vectors));
-        c.write(1, &w, E::Complex::store);
-        c.write(2, &v, E::Complex::store);
-        ok
-    }
-    /// `eigvals`: the eigenvalues of an `m`×`m` matrix, as complex numbers.
-    Eigvals(c, _: ()) {
-        let [m] = c.dims();
-        let w = linalg::eigenvalues(&c.read::<E>(0), m);
-        let ok = w.is_some();
-        c.write(1, &w.unwrap_or_else(|| complex_nans::<E>(m)), E::Complex::store);
-        ok
-    }
+        })?;
+        let (mut u, mut sv, mut v) = (Vec::new(), Vec::new(), Vec::new());
+        for (cu, cs, cv) in cells { u.extend(cu); sv.extend(cs); v.extend(cv); }
+        Ok((result(py, array(u, &frames.layout, [m, k], s.store)?)?, result(py, array(sv, &frames.layout, [k], s.store.real())?)?,
+            result(py, array(v, &frames.layout, [n, k], s.store)?)?))
+    })
 }
 
-/// `permanent`: Ryser's permanent for floating and complex matrices.
-struct Permanent;
-impl<E: Item> Gufunc<E> for Permanent where E::W: NumAssignRef {
-    type S = ();
-    fn each(c: &Cell<'_>, _: &mut ()) -> bool {
-        let [n] = c.dims();
-        let value = if n < 64 { linalg::exact::permanent(&c.read::<E>(0), n) } else { E::W::from_real(Part::<E>::nan()) };
-        c.write(1, &[value], E::store);
-        n < 64
+/// Thin SVD factors as [`svd`] gives them: the stack of `u`, `v` and any further arguments, the singular values, the size of each matrix and of its values, and the layouts.
+struct Factors<'py> { stack: Stack<'py>, values: Call<'py>, size: [usize; 2], p: usize, layouts: [Layout; 3] }
+
+impl<'py> Factors<'py> {
+    /// The factors `u`, `s` and `v` for `function`, with `rest` at their dtype. A Length error where their shapes don't fit together.
+    fn new(function: &str, u: &Bound<'py, PyAny>, s: &Bound<'py, PyAny>, v: &Bound<'py, PyAny>, rest: &[&Bound<'py, PyAny>]) -> PyResult<Self> {
+        let stack = Stack::new(function, &[&[u, v], rest].concat())?;
+        let (lu, lv) = (stack.layout(0), stack.layout(1));
+        let ([m, p], [n, q]) = (matrix(function, &lu)?, matrix(function, &lv)?);
+        let values = convert(&[s])?;
+        let ls = values.args[0].layout();
+        if p != q || ls.shape().last() != Some(&p) {
+            return Err(py_err(Error::new(Kind::Length, format!("{function} needs u and v with as many columns as s has values"))));
+        }
+        Ok(Self { stack, values, size: [m, n], p, layouts: [lu, ls, lv] })
     }
+
+    /// The singular values at the real dtype of the factors' computing width, or a narrower real dtype that widens to it. A dtype that would narrow raises.
+    fn values(&self) -> PyResult<Items<'_>> { self.values.args[0].at(self.stack.compute.real()) }
 }
 
-fn row_reduce<'py, E: Item>(py: Python<'py>, a: PyReadonlyArray2<'py, E>, columns: Option<usize>) -> PyResult<Bound<'py, PyAny>> where E::W: NumAssignRef {
-    let shape = a.shape();
-    let f = linalg::exact::echelon_with(a.as_array().iter().map(|&x| x.load()).collect(), [shape[0], shape[1]], columns.unwrap_or(shape[1]), || {
-        py.check_signals()
-    })?;
-    let rows = PyArray1::from_vec(py, f.rows.into_iter().map(E::store).collect()).reshape([f.pivots.len(), shape[1]])?;
-    let pivots = PyArray1::from_vec(py, f.pivots.into_iter().map(|i| i as isize).collect());
-    let determinant = PyArray1::from_vec(py, vec![E::store(f.determinant)]).get_item(0)?;
-    Ok((rows, pivots, determinant).into_pyobject(py)?.into_any())
+/// The least-norm least-squares solution `x` of `a @ x == b`, from the thin SVD factors `u`, `s` and `v` of each matrix `a`, as `svd` gives them, using `lstsq`'s cutoff.
+#[pyfunction]
+fn svd_solve<'py>(py: Python<'py>, u: &Bound<'py, PyAny>, s: &Bound<'py, PyAny>, v: &Bound<'py, PyAny>, b: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let f = Factors::new("svd_solve", u, s, v, &[b])?;
+    let ([m, n], p, lb) = (f.size, f.p, f.stack.layout(2));
+    let (core, k, vector) = rhs("svd_solve", &lb, m)?;
+    let [lu, ls, lv] = &f.layouts;
+    let (ru, rv, rb) = (lu.shape().len(), lv.shape().len(), lb.shape().len());
+    let frames = framed(&[(lu, 2), (ls, 1), (lv, 2), (&lb, core)])?;
+    rustymath::with_inexact!(f.stack.compute, T => {
+        let (ui, si, vi, bi) = (f.stack.items(0)?, f.values()?, f.stack.items(1)?, paired(f.stack.items(2)?, &lb, rb - core, lu, ru - 2, "svd_solve")?);
+        let (u, sv, v, b) = (ui.of::<T>(), si.of::<<T as Scalar>::Real>(), vi.of::<T>(), bi.of::<T>());
+        let x = run(py, &frames, |i, _: &mut ()| {
+            Svd::<T, _, _>::new([m, n], at(u, frames.cell(0, i), m * p), at(sv, frames.cell(1, i), p), at(v, frames.cell(2, i), n * p)).solve(at(b, frames.cell(3, i), m * k), k)
+        })?;
+        result(py, array(x.concat(), &frames.layout, solution(lv.axes(rv - 2..rv - 1), &lb, vector), f.stack.store)?)
+    })
 }
 
-/// Row reduction of one matrix. Pivoting uses the first nonzero item, as in the exact-field algorithm.
+/// The pseudoinverse of each matrix, from its thin SVD factors `u`, `s` and `v`, as `svd` gives them, using `lstsq`'s cutoff.
+#[pyfunction]
+fn svd_pinv<'py>(py: Python<'py>, u: &Bound<'py, PyAny>, s: &Bound<'py, PyAny>, v: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let f = Factors::new("svd_pinv", u, s, v, &[])?;
+    let ([m, n], p) = (f.size, f.p);
+    let [lu, ls, lv] = &f.layouts;
+    let (ru, rv) = (lu.shape().len(), lv.shape().len());
+    let frames = framed(&[(lu, 2), (ls, 1), (lv, 2)])?;
+    rustymath::with_inexact!(f.stack.compute, T => {
+        let (ui, si, vi) = (f.stack.items(0)?, f.values()?, f.stack.items(1)?);
+        let (u, sv, v) = (ui.of::<T>(), si.of::<<T as Scalar>::Real>(), vi.of::<T>());
+        let x = run(py, &frames, |i, _: &mut ()| {
+            Svd::<T, _, _>::new([m, n], at(u, frames.cell(0, i), m * p), at(sv, frames.cell(1, i), p), at(v, frames.cell(2, i), n * p)).pseudoinverse()
+        })?;
+        result(py, array(x.concat(), &frames.layout, lv.axes(rv - 2..rv - 1).concat(&lu.axes(ru - 2..ru - 1)), f.stack.store)?)
+    })
+}
+
+/// The singular values of each matrix, in descending order.
+#[pyfunction]
+fn svdvals<'py>(py: Python<'py>, a: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let s = Stack::new("svdvals", &[a])?;
+    let la = s.layout(0);
+    let [m, n] = matrix("svdvals", &la)?;
+    let frames = framed(&[(&la, 2)])?;
+    rustymath::with_inexact!(s.compute, T => {
+        let ai = s.items(0)?;
+        let a = ai.of::<T>();
+        let sv = run(py, &frames, |i, _: &mut ()| linalg::singular_values(at(a, frames.cell(0, i), m * n), [m, n]))?;
+        result(py, array(sv.concat(), &frames.layout, [m.min(n)], s.store.real())?)
+    })
+}
+
+/// The rank of each matrix: how many singular values exceed machine epsilon times the larger side times the largest, as `lstsq` counts them.
+#[pyfunction]
+fn matrix_rank<'py>(py: Python<'py>, a: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let s = Stack::new("matrix_rank", &[a])?;
+    let la = s.layout(0);
+    let [m, n] = matrix("matrix_rank", &la)?;
+    let frames = framed(&[(&la, 2)])?;
+    rustymath::with_inexact!(s.compute, T => {
+        let ai = s.items(0)?;
+        let a = ai.of::<T>();
+        let r = run(py, &frames, |i, _: &mut ()| linalg::rank(at(a, frames.cell(0, i), m * n), [m, n]) as i64)?;
+        result(py, array(r, &frames.layout, Layout::EMPTY, I64)?)
+    })
+}
+
+/// The eigenvalues of each square matrix, in the order of its Schur form, and its unit eigenvectors in columns, both complex. A real matrix's complex pair comes as the one with a positive imaginary part, then its conjugate.
+#[pyfunction]
+fn eig<'py>(py: Python<'py>, a: &Bound<'py, PyAny>) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+    let s = Stack::new("eig", &[a])?;
+    let la = s.layout(0);
+    let n = square("eig", matrix("eig", &la)?)?;
+    let frames = framed(&[(&la, 2)])?;
+    rustymath::with_inexact!(s.compute, T => {
+        let ai = s.items(0)?;
+        let a = ai.of::<T>();
+        let nan = Complex::new(<T as Scalar>::Real::nan(), <T as Scalar>::Real::nan());
+        let (w, v): (Vec<_>, Vec<_>) = run(py, &frames, |i, _: &mut ()| {
+            linalg::eig(at(a, frames.cell(0, i), n * n), n).map_or_else(|| (vec![nan; n], vec![nan; n * n]), |f| (f.values, f.vectors))
+        })?.into_iter().unzip();
+        Ok((result(py, array(w.concat(), &frames.layout, [n], s.store.complex())?)?, result(py, array(v.concat(), &frames.layout, [n, n], s.store.complex())?)?))
+    })
+}
+
+/// The complex eigenvalues of each square matrix, in the order `eig` gives them.
+#[pyfunction]
+fn eigvals<'py>(py: Python<'py>, a: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let s = Stack::new("eigvals", &[a])?;
+    let la = s.layout(0);
+    let n = square("eigvals", matrix("eigvals", &la)?)?;
+    let frames = framed(&[(&la, 2)])?;
+    rustymath::with_inexact!(s.compute, T => {
+        let ai = s.items(0)?;
+        let a = ai.of::<T>();
+        let nan = Complex::new(<T as Scalar>::Real::nan(), <T as Scalar>::Real::nan());
+        let w = run(py, &frames, |i, _: &mut ()| linalg::eigenvalues(at(a, frames.cell(0, i), n * n), n).unwrap_or_else(|| vec![nan; n]))?;
+        result(py, array(w.concat(), &frames.layout, [n], s.store.complex())?)
+    })
+}
+
+/// The eigenvalues of each Hermitian matrix in ascending order, and its unit eigenvectors in columns, reading only the matrix's lower triangle.
+#[pyfunction]
+fn eigh<'py>(py: Python<'py>, a: &Bound<'py, PyAny>) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+    let s = Stack::new("eigh", &[a])?;
+    let la = s.layout(0);
+    let n = square("eigh", matrix("eigh", &la)?)?;
+    let frames = framed(&[(&la, 2)])?;
+    rustymath::with_inexact!(s.compute, T => {
+        let ai = s.items(0)?;
+        let a = ai.of::<T>();
+        let (w, v): (Vec<_>, Vec<_>) = run(py, &frames, |i, _: &mut ()| {
+            linalg::eigh(at(a, frames.cell(0, i), n * n), n).map_or_else(|| (nans::<T>(n).into_iter().map(|x| x.re()).collect(), nans::<T>(n * n)), |f| (f.values, f.vectors))
+        })?.into_iter().unzip();
+        Ok((result(py, array(w.concat(), &frames.layout, [n], s.store.real())?)?, result(py, array(v.concat(), &frames.layout, [n, n], s.store)?)?))
+    })
+}
+
+/// The eigenvalues of each Hermitian matrix in ascending order, reading only the matrix's lower triangle.
+#[pyfunction]
+fn eigvalsh<'py>(py: Python<'py>, a: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let s = Stack::new("eigvalsh", &[a])?;
+    let la = s.layout(0);
+    let n = square("eigvalsh", matrix("eigvalsh", &la)?)?;
+    let frames = framed(&[(&la, 2)])?;
+    rustymath::with_inexact!(s.compute, T => {
+        let ai = s.items(0)?;
+        let a = ai.of::<T>();
+        let w = run(py, &frames, |i, _: &mut ()| linalg::hermitian_eigenvalues(at(a, frames.cell(0, i), n * n), n).unwrap_or_else(|| vec![<T as Scalar>::Real::nan(); n]))?;
+        result(py, array(w.concat(), &frames.layout, [n], s.store.real())?)
+    })
+}
+
+/// The permanent of each square matrix, by Ryser's exponential-time formula. A ValueError for 64 rows or more.
+#[pyfunction]
+fn permanent<'py>(py: Python<'py>, a: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let s = Stack::new("permanent", &[a])?;
+    let la = s.layout(0);
+    let n = square("permanent", matrix("permanent", &la)?)?;
+    if n >= 64 { return Err(PyValueError::new_err(format!("permanent takes fewer than 64 rows, not {n}"))); }
+    let frames = framed(&[(&la, 2)])?;
+    rustymath::with_inexact!(s.compute, T => {
+        let ai = s.items(0)?;
+        let a = ai.of::<T>();
+        let x = run(py, &frames, |i, _: &mut ()| linalg::exact::permanent(at(a, frames.cell(0, i), n * n), n))?;
+        result(py, array(x, &frames.layout, Layout::EMPTY, s.store)?)
+    })
+}
+
+/// The reduced row echelon form of one matrix: its nonzero rows, its pivot columns and the signed product of its pivots. With `columns`, it reduces only that many leading columns. It pivots on the first nonzero item, with no tolerance, so the decompositions give numerically stable solves of floats.
 #[pyfunction]
 #[pyo3(signature = (a, columns=None))]
-fn echelon<'py>(py: Python<'py>, a: &Bound<'py, PyUntypedArray>, columns: Option<usize>) -> PyResult<Bound<'py, PyAny>> {
-    match a.dtype().char() {
-        b'e' => row_reduce(py, a.extract::<PyReadonlyArray2<f16>>()?, columns), b'f' => row_reduce(py, a.extract::<PyReadonlyArray2<f32>>()?, columns),
-        b'd' => row_reduce(py, a.extract::<PyReadonlyArray2<f64>>()?, columns), b'F' => row_reduce(py, a.extract::<PyReadonlyArray2<Complex<f32>>>()?, columns),
-        b'D' => row_reduce(py, a.extract::<PyReadonlyArray2<Complex<f64>>>()?, columns),
-        _ => Err(pyo3::exceptions::PyTypeError::new_err("echelon takes real or complex matrices"))
+fn echelon<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, columns: Option<usize>) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+    let s = Stack::new("echelon", &[a])?;
+    let la = s.layout(0);
+    let &[m, n] = la.shape() else { return Err(py_err(Error::new(Kind::Rank, "echelon takes one matrix"))) };
+    let columns = columns.unwrap_or(n);
+    if columns > n { return Err(PyValueError::new_err(format!("echelon can reduce at most the matrix's {n} columns, not {columns}"))); }
+    rustymath::with_inexact!(s.compute, T => {
+        let ai = s.items(0)?;
+        let f = linalg::exact::echelon_with(ai.of::<T>().to_vec(), [m, n], columns, || py.check_signals())?;
+        let r = f.pivots.len();
+        let pivots = f.pivots.into_iter().map(|c| c as i64).collect();
+        Ok((result(py, array(f.rows, &Layout::EMPTY, [r, n], s.store)?)?, result(py, array(pivots, &Layout::EMPTY, [r], I64)?)?,
+            result(py, array(vec![f.determinant], &Layout::EMPTY, Layout::EMPTY, s.store)?)?))
+    })
+}
+
+/// A matrix product's arguments: their items, with the right one's contracted axis in the left one's key order, their frames and sizes `[n, k, m]`, the result's cell axes, and the name its errors use.
+struct Product<'a, 'py> { py: Python<'py>, args: [View<'a>; 2], frames: &'a Frames, size: [usize; 3], cell: &'a Layout, name: &'a str }
+
+impl<'py> Product<'_, 'py> {
+    /// The products through `P`, at the dtype that its `kernels` compute in. Integer results, counts included, are int64. float16 matrices give float16 results, and other results keep their kernels' dtype. An Overflow error for an integer result that doesn't fit int64.
+    fn run<P: Default>(&self, kernels: Kernels<ProductKernel<P>>) -> PyResult<Bound<'py, PyAny>> {
+        let [x, y] = self.args;
+        let mut stopped = None;
+        let products = kernels.product(&P::default(), [x, y], self.frames, self.size, &mut || self.py.check_signals().map_err(|e| stopped = Some(e)).is_ok());
+        let (buffer, ok) = match (products, stopped) {
+            (Some(p), _) => p,
+            (None, Some(e)) => return Err(e),
+            (None, None) => return Err(missing(self.name, x.dtype())),
+        };
+        if !ok { return Err(py_err(Error::new(Kind::Overflow, format!("an integer result of {} doesn't fit int64", self.name)))); }
+        let half = DType::Float(FloatWidth::F16);
+        let store = match buffer.dtype() { DType::Integer(_) => I64, DType::Float(_) if x.dtype() == half => half, d => d };
+        result(self.py, stored(buffer, &self.frames.layout, self.cell.clone(), store)?)
     }
 }
 
-/// `matmul` and the other matrix products: `P`'s inner product of an `n`×`k` matrix and a `k`×`m` matrix.
-struct Product<P>(PhantomData<P>);
-impl<P: Default + Inner<E::W, Out = E::W>, E: Stored> Gufunc<E> for Product<P> {
-    type S = ();
-    fn each(c: &Cell<'_>, _: &mut ()) -> bool {
-        let [n, k, m] = c.dims();
-        c.write(2, &P::default().inner(&c.read::<E>(0), &c.read::<E>(1), [n, k, m]), E::store);
-        true
+/// The inner product `pair` of each pair of matrices, as APL's `f.g` takes it: `plus_times`, `max_plus`, `min_plus`, `or_and`, `and_or`, `plus_equal` or `plus_not_equal`. A vector on the left acts as one row, and a vector on the right as one column, and the result leaves that axis out. Two Boolean arguments of `plus_times` give `or_and`. Integers compute in int64, and the counts of `plus_equal` and `plus_not_equal` are int64. `name` names the product in errors.
+#[pyfunction]
+#[pyo3(signature = (pair, x1, x2, name=None))]
+pub fn product<'py>(py: Python<'py>, pair: &str, x1: &Bound<'py, PyAny>, x2: &Bound<'py, PyAny>, name: Option<&str>) -> PyResult<Bound<'py, PyAny>> {
+    let name = name.unwrap_or(pair);
+    let call = convert(&[x1, x2])?;
+    let dtype = call.args[0].view().dtype();
+    let (l1, l2) = (call.args[0].layout(), call.args[1].layout());
+    let side = |l: &Layout| match l.shape().len() {
+        0 => Err(py_err(Error::new(Kind::Rank, format!("{name} needs matrices or vectors, with at least one axis")))),
+        1 => Ok(1),
+        _ => Ok(2),
+    };
+    let (c1, c2) = (side(&l1)?, side(&l2)?);
+    let (s1, s2, r1, r2) = (l1.shape(), l2.shape(), l1.shape().len(), l2.shape().len());
+    let (n, k) = if c1 == 1 { (1, s1[0]) } else { (s1[r1 - 2], s1[r1 - 1]) };
+    let (j, m) = if c2 == 1 { (s2[0], 1) } else { (s2[r2 - 2], s2[r2 - 1]) };
+    if k != j { return Err(py_err(Error::new(Kind::Length, format!("{name} needs as many columns on the left as rows on the right, not {k} and {j}")))); }
+    let frames = framed(&[(&l1, c1), (&l2, c2)])?;
+    let y = paired(Items::Own(call.args[1].view()), &l2, r2 - c2, &l1, r1 - 1, name)?;
+    let cell = l1.axes(r1 - c1..r1).contracted(&l2.axes(r2 - c2..r2));
+    let p = Product { py, args: [call.args[0].view(), y.view()], frames: &frames, size: [n, k, m], cell: &cell, name };
+    match pair {
+        "plus_times" if dtype == DType::Boolean => p.run(rustymath::kernels!(Product OrAnd)),
+        "plus_times" => p.run(rustymath::kernels!(Product PlusTimes)),
+        "max_plus" => p.run(rustymath::kernels!(Product MaxPlus)),
+        "min_plus" => p.run(rustymath::kernels!(Product MinPlus)),
+        "or_and" => p.run(rustymath::kernels!(Product OrAnd)),
+        "and_or" => p.run(rustymath::kernels!(Product AndOr)),
+        "plus_equal" => p.run(rustymath::kernels!(Product PlusEqual)),
+        "plus_not_equal" => p.run(rustymath::kernels!(Product PlusNotEqual)),
+        _ => Err(PyValueError::new_err(format!("no inner product is named {pair:?}"))),
     }
 }
 
-/// `add_equal` and `add_not_equal`: `P`'s count over each row of an `n`×`k` matrix and column of a `k`×`m` matrix, as int64.
-struct Count<P>(PhantomData<P>);
-impl<P: Default + Inner<E::W, Out: Copy + Into<i64>>, E: Stored> Gufunc<E> for Count<P> {
-    type S = ();
-    fn each(c: &Cell<'_>, _: &mut ()) -> bool {
-        let [n, k, m] = c.dims();
-        c.write(2, &P::default().inner(&c.read::<E>(0), &c.read::<E>(1), [n, k, m]), Into::<i64>::into);
-        true
-    }
-}
+/// The matrix product of `x1` and `x2`. A vector on the left acts as one row, and a vector on the right as one column, and the result leaves that axis out. Booleans give whether some `k` has both `x1[i, k]` and `x2[k, j]`. Integers compute in int64, and raise `OverflowError` for a result that doesn't fit.
+#[pyfunction]
+pub fn matmul<'py>(py: Python<'py>, x1: &Bound<'py, PyAny>, x2: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { product(py, "plus_times", x1, x2, Some("matmul")) }
 
-/// The type of one argument of a loop: the loop's element type, the real or complex type of the same width, or int64.
-#[derive(Clone, Copy)]
-enum Kind { E, R, C, I }
-
-/// The loop `f` at element type `E`, whose arguments have the types `kinds`.
-fn entry<E: Item>(f: Ufunc, kinds: &[Kind]) -> Loop {
-    (Some(f), kinds.iter().map(|k| {
-        (match k { Kind::E => E::CODE, Kind::R => E::Real::CODE, Kind::C => E::Complex::CODE, Kind::I => i64::CODE }) as c_char
-    }).collect())
-}
-
-/// `P`'s product loops at float16, float32 and float64.
-fn float_products<P: Default + Inner<f32, Out = f32> + Inner<f64, Out = f64>>() -> Vec<Loop> {
-    let kinds = [Kind::E; 3];
-    vec![entry::<f16>(looped::<Product<P>, f16>, &kinds), entry::<f32>(looped::<Product<P>, f32>, &kinds), entry::<f64>(looped::<Product<P>, f64>, &kinds)]
-}
-
-/// `P`'s product loop at int64, whose arithmetic wraps.
-fn integer_product<P: Default + Inner<i64, Out = i64>>() -> Loop { (Some(looped::<Product<P>, i64> as Ufunc), vec![i64::CODE as c_char; 3]) }
-
-/// `P`'s count loops at int64, float16, float32 and float64, each giving int64 counts.
-fn counts<P: Default + Inner<i64, Out = i64> + Inner<f32, Out = i32> + Inner<f64, Out = i64>>() -> Vec<Loop> {
-    let entry = |f: Ufunc, t: NPY_TYPES| (Some(f), vec![t as c_char, t as c_char, i64::CODE as c_char]);
-    vec![
-        entry(looped::<Count<P>, i64>, i64::CODE), entry(looped::<Count<P>, f16>, f16::CODE), entry(looped::<Count<P>, f32>, f32::CODE),
-        entry(looped::<Count<P>, f64>, f64::CODE),
-    ]
-}
-
-/// Registers each generalized ufunc in `m`, with loops at float16, float32, float64, complex64 and complex128. `$nin` counts its inputs, and `$kind` gives the type of each argument, inputs first.
-macro_rules! gufuncs {
-    ($m:expr; $($name:literal $signature:literal: $nin:literal => [$($kind:ident),+] = $f:ident, $doc:literal;)+) => {$({
-        let kinds = [$(Kind::$kind),+];
-        let loops = vec![
-            entry::<f16>(looped::<$f, f16>, &kinds), entry::<f32>(looped::<$f, f32>, &kinds), entry::<f64>(looped::<$f, f64>, &kinds),
-            entry::<Complex<f32>>(looped::<$f, Complex<f32>>, &kinds), entry::<Complex<f64>>(looped::<$f, Complex<f64>>, &kinds),
-        ];
-        register($m, $name, $doc, [$nin, kinds.len() - $nin], $signature, loops)?;
-    })+};
-}
-
-/// The signature of a matrix product. As in `numpy.matmul`, a vector on the left is one row, and a vector on the right one column.
-const PRODUCT: &str = "(n?,k),(k,m?)->(n?,m?)";
-
-/// Adds the generalized ufuncs to the submodule `m`.
+/// Adds the linear algebra functions to the submodule `m`.
 pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    gufuncs! { m;
-        "solve" "(m,n),(m,k)->(n,k)": 2 => [E, E, E] = Solve, "x with a x = b for each matrix a and matrix b, through LU with no cutoff where a is square with no negligible pivot, and otherwise the least-squares solution with the least norm.";
-        "pinv" "(m,n)->(n,m)": 1 => [E, E] = Pinv, "The pseudoinverse of each matrix. A square matrix with no negligible LU pivot gives its inverse through LU, with no cutoff.";
-        "det" "(m,m)->()": 1 => [E, E] = Det, "The determinant of each square matrix.";
-        "slogdet" "(m,m)->(),()": 1 => [E, E, R] = Slogdet, "The sign of each square matrix's determinant, and the logarithm of its magnitude.";
-        "lu" "(m,m)->(m,m),(m)": 1 => [E, E, I] = Lu, "Packed LU factors and the row positions of each square matrix. The factors are transposed, because rustymath stores them column by column.";
-        "lu_solve" "(m,m),(m),(m,k)->(m,k)": 3 => [E, I, E, E] = LuSolve, "Solve from transposed packed LU factors, as `lu` gives them, without refactoring.";
-        "lu_inverse" "(m,m),(m)->(m,m)": 2 => [E, I, E] = LuInverse, "Inverse from transposed packed LU factors, as `lu` gives them, without refactoring.";
-        "lu_det" "(m,m),(m)->()": 2 => [E, I, E] = LuDet, "Determinant from transposed packed LU factors, as `lu` gives them.";
-        "lu_slogdet" "(m,m),(m)->(),()": 2 => [E, I, E, R] = LuSlogdet, "Sign and log magnitude of a determinant from transposed packed LU factors, as `lu` gives them.";
-        "cholesky" "(m,m)->(m,m)": 1 => [E, E] = Cholesky, "The lower triangular Cholesky factor of each positive definite matrix.";
-        "qr_m" "(m,n)->(m,m),(m,n)": 1 => [E, E, E] = Qr, "Q and R of each matrix with no more rows than columns.";
-        "qr_n" "(m,n)->(m,n),(n,n)": 1 => [E, E, E] = Qr, "Q and R of each matrix with no more columns than rows.";
-        "qr_complete" "(m,n)->(m,m),(m,n)": 1 => [E, E, E] = QrComplete, "The complete Q and R of each matrix.";
-        "svd_m" "(m,n)->(m,m),(m),(n,m)": 1 => [E, E, R, E] = Svd, "The thin SVD of each matrix with no more rows than columns.";
-        "svd_n" "(m,n)->(m,n),(n),(n,n)": 1 => [E, E, R, E] = Svd, "The thin SVD of each matrix with no more columns than rows.";
-        "truncated_svd" "(m,n)->(m,k),(k),(n,k)": 1 => [E, E, R, E] = TruncatedSvd, "An approximation to the first k singular values and vectors of each matrix, by a randomized range finder. The outputs set k, which can't exceed either side.";
-        "svd_solve" "(m,p),(p),(n,p),(m,k)->(n,k)": 4 => [E, R, E, E, E] = SvdSolve, "Least-norm solve from thin SVD factors, without refactoring.";
-        "svd_pinv" "(m,p),(p),(n,p)->(n,m)": 3 => [E, R, E, E] = SvdPinv, "Pseudoinverse from thin SVD factors, without refactoring.";
-        "svdvals_m" "(m,n)->(m)": 1 => [E, R] = Svdvals, "The singular values of each matrix with no more rows than columns.";
-        "svdvals_n" "(m,n)->(n)": 1 => [E, R] = Svdvals, "The singular values of each matrix with no more columns than rows.";
-        "rank" "(m,n)->()": 1 => [E, I] = Rank, "The rank of each matrix.";
-        "lstsq_m" "(m,n),(m,k)->(n,k),(m)": 2 => [E, E, E, R] = Lstsq, "The least-norm least-squares solution for each matrix with no more rows than columns.";
-        "lstsq_n" "(m,n),(m,k)->(n,k),(n)": 2 => [E, E, E, R] = Lstsq, "The least-norm least-squares solution for each matrix with no more columns than rows.";
-        "eigh" "(m,m)->(m),(m,m)": 1 => [E, R, E] = Eigh, "The eigenvalues and eigenvectors of each symmetric or Hermitian matrix.";
-        "eigvalsh" "(m,m)->(m)": 1 => [E, R] = Eigvalsh, "The eigenvalues of each symmetric or Hermitian matrix.";
-        "eig" "(m,m)->(m),(m,m)": 1 => [E, C, C] = Eig, "The complex eigenvalues and eigenvectors of each square matrix.";
-        "eigvals" "(m,m)->(m)": 1 => [E, C] = Eigvals, "The complex eigenvalues of each square matrix.";
-        "permanent" "(m,m)->()": 1 => [E, E] = Permanent, "The permanent of each square matrix, by Ryser's exponential-time formula.";
-    }
-    m.add_function(wrap_pyfunction!(echelon, m)?)?;
-    let or_and = (Some(looped::<Product<OrAnd>, bool> as Ufunc), vec![NPY_TYPES::NPY_BOOL as c_char; 3]);
-    let and_or = (Some(looped::<Product<AndOr>, bool> as Ufunc), vec![NPY_TYPES::NPY_BOOL as c_char; 3]);
-    register(m, "logical_and_or", "Whether every k has either a[i,k] or b[k,j].", [2, 1], PRODUCT, vec![and_or])?;
-    let complex = [Kind::E; 3];
-    let complex = vec![
-        entry::<Complex<f32>>(looped::<Product<PlusTimes>, Complex<f32>>, &complex),
-        entry::<Complex<f64>>(looped::<Product<PlusTimes>, Complex<f64>>, &complex),
-    ];
-    register(
-        m, "matmul", "The matrix product of each pair of matrices, or for Booleans, whether some k has both a[i,k] and b[k,j]. Integers wrap on overflow.",
-        [2, 1], PRODUCT, [vec![or_and, integer_product::<PlusTimes>()], float_products::<PlusTimes>(), complex].concat())?;
-    register(
-        m, "maximum_add", "The max-plus product of each pair of real matrices: the greatest a[i,k] + b[k,j].", [2, 1], PRODUCT,
-        [vec![integer_product::<MaxPlus>()], float_products::<MaxPlus>()].concat())?;
-    register(
-        m, "minimum_add", "The min-plus product of each pair of real matrices: the least a[i,k] + b[k,j].", [2, 1], PRODUCT,
-        [vec![integer_product::<MinPlus>()], float_products::<MinPlus>()].concat())?;
-    register(m, "add_equal", "The number of k where a[i,k] equals b[k,j], for each pair of real matrices.", [2, 1], PRODUCT, counts::<PlusEqual>())?;
-    register(m, "add_not_equal", "The number of k where a[i,k] differs from b[k,j], for each pair of real matrices.", [2, 1], PRODUCT, counts::<PlusNotEqual>())
+    for f in [
+        wrap_pyfunction!(solve, m)?, wrap_pyfunction!(lstsq, m)?, wrap_pyfunction!(pinv, m)?, wrap_pyfunction!(det, m)?, wrap_pyfunction!(slogdet, m)?,
+        wrap_pyfunction!(lu, m)?, wrap_pyfunction!(lu_solve, m)?, wrap_pyfunction!(lu_inverse, m)?, wrap_pyfunction!(lu_det, m)?, wrap_pyfunction!(lu_slogdet, m)?,
+        wrap_pyfunction!(lu_lower, m)?, wrap_pyfunction!(lu_upper, m)?, wrap_pyfunction!(cholesky, m)?, wrap_pyfunction!(qr, m)?, wrap_pyfunction!(svd, m)?,
+        wrap_pyfunction!(svd_solve, m)?, wrap_pyfunction!(svd_pinv, m)?, wrap_pyfunction!(svdvals, m)?, wrap_pyfunction!(matrix_rank, m)?, wrap_pyfunction!(eig, m)?,
+        wrap_pyfunction!(eigvals, m)?, wrap_pyfunction!(eigh, m)?, wrap_pyfunction!(eigvalsh, m)?, wrap_pyfunction!(permanent, m)?, wrap_pyfunction!(echelon, m)?,
+        wrap_pyfunction!(product, m)?, wrap_pyfunction!(matmul, m)?,
+    ] { m.add_function(f)?; }
+    Ok(())
 }
+

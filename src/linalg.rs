@@ -82,9 +82,9 @@ pub fn transpose_into<S: Copy, D>(src: &[S], ls: usize, dst: &mut [D], ld: usize
 pub trait Inner<T> {
     /// The type of each result.
     type Out: Copy;
-    /// The `m`×`n` inner product of `a`, an `m`×`k` matrix, and `b`, a `k`×`n` matrix, both row-major, as a row-major matrix. `size` is `[m, k, n]`. Where `k` is 0, each result is the identity of `f`. Integer arithmetic wraps, as NumPy's does.
+    /// The `m`×`n` inner product of `a`, an `m`×`k` matrix, and `b`, a `k`×`n` matrix, both row-major, as a row-major matrix. `size` is `[m, k, n]`. Where `k` is 0, each result is the identity of `f`. An integer result that doesn't fit its type panics, where `checked` gives `None`.
     fn inner(&self, a: &[T], b: &[T], size: [usize; 3]) -> Vec<Self::Out>;
-    /// `inner`, or `None` where an integer result could overflow, for callers that keep integers exact. A result it gives is the exact value. Floats never give `None`.
+    /// `inner`, or `None` where an integer result doesn't fit its type, for callers that keep integers exact or report overflow. A result it gives is the exact value. Floats never give `None`.
     fn checked(&self, a: &[T], b: &[T], size: [usize; 3]) -> Option<Vec<Self::Out>> { Some(self.inner(a, b, size)) }
     /// `inner`, written into `out`, which holds `m`×`n` items.
     fn inner_into(&self, a: &[T], b: &[T], size: [usize; 3], out: &mut [Self::Out]) { out.copy_from_slice(&self.inner(a, b, size)) }
@@ -216,6 +216,7 @@ fn packed<const NOT: bool>(a: &[bool], b: &[bool], [m, k, n]: [usize; 3]) -> Vec
     }
     c
 }
+/// The pairs at `i64`, which `tiered` runs only where every value that a product forms fits `i64`, so their wrapping operations never wrap.
 impl Pair<i64> for PlusTimes {
     type Out = i64;
     const UNIT: i64 = 0;
@@ -239,6 +240,25 @@ impl Pair<i64> for MinPlus {
     fn g(a: i64, b: i64) -> i64 { a.wrapping_add(b) }
     #[inline(always)]
     fn f(x: i64, y: i64) -> i64 { x.min(y) }
+}
+/// The pairs at `i128`, which `checked` uses where a result could pass `i64`. Each step of `+.×` checks that its running total fits 128 bits.
+impl Pair<i128> for PlusTimes {
+    type Out = Option<i128>;
+    const UNIT: Option<i128> = Some(0);
+    fn g(a: i128, b: i128) -> Option<i128> { a.checked_mul(b) }
+    fn f(x: Option<i128>, y: Option<i128>) -> Option<i128> { x?.checked_add(y?) }
+}
+impl Pair<i128> for MaxPlus {
+    type Out = Option<i128>;
+    const UNIT: Option<i128> = Some(i128::MIN);
+    fn g(a: i128, b: i128) -> Option<i128> { a.checked_add(b) }
+    fn f(x: Option<i128>, y: Option<i128>) -> Option<i128> { Some(x?.max(y?)) }
+}
+impl Pair<i128> for MinPlus {
+    type Out = Option<i128>;
+    const UNIT: Option<i128> = Some(i128::MAX);
+    fn g(a: i128, b: i128) -> Option<i128> { a.checked_add(b) }
+    fn f(x: Option<i128>, y: Option<i128>) -> Option<i128> { Some(x?.min(y?)) }
 }
 macro_rules! counts {
     ($($t:ty => $out:ty),+) => {$(
@@ -392,17 +412,18 @@ differences!(i64 => i64, i32 => i32, i16 => i16, f64 => i64, f32 => i32);
 /// The largest magnitude among the items of `x`.
 fn magnitude(x: &[i64]) -> u128 { u128::from(x.iter().fold(0, |m, v| m.max(v.unsigned_abs()))) }
 
-/// The integer inner products of the float pairs. Each computes at the narrowest item type that holds every value the product forms exactly: `f32` where none exceeds 2^24 in magnitude, `f64` where all lie below 2^51, and otherwise `i64` with wrapping arithmetic. The float paths run the float kernels and give the integers that wrapping arithmetic gives. `$bound` gives the largest magnitude that a product can form, from the largest magnitudes in `a` and `b` and from `k`.
+/// The integer inner products of the float pairs. Each computes at the narrowest item type that holds every value the product forms exactly: `f32` where none exceeds 2^24 in magnitude, `f64` where all lie below 2^51, `i64` where all fit it, and otherwise 128 bits through `wide`. `$bound` gives the largest magnitude that a product can form, from the largest magnitudes in `a` and `b` and from `k`. `checked` gives `None` where a result doesn't fit `i64`, and `inner` panics there.
 macro_rules! integers {
     ($($object:ident: $bound:expr;)+) => {$(
         impl Inner<i64> for $object {
             type Out = i64;
             fn inner(&self, a: &[i64], b: &[i64], size: [usize; 3]) -> Vec<i64> {
-                tiered(self, a, b, size, $bound(magnitude(a), magnitude(b), size[1] as u128))
+                self.checked(a, b, size).expect("an integer inner product fits i64")
             }
             fn checked(&self, a: &[i64], b: &[i64], size: [usize; 3]) -> Option<Vec<i64>> {
                 let bound = $bound(magnitude(a), magnitude(b), size[1] as u128);
-                (bound <= i64::MAX as u128).then(|| tiered(self, a, b, size, bound))
+                if bound <= i64::MAX as u128 { return Some(tiered(self, a, b, size, bound)); }
+                wide::<Self>(a, b, size)
             }
         }
     )+};
@@ -411,6 +432,15 @@ integers! {
     PlusTimes: |a: u128, b: u128, k: u128| a.saturating_mul(b).saturating_mul(k);
     MaxPlus: |a: u128, b: u128, _| a + b;
     MinPlus: |a: u128, b: u128, _| a + b;
+}
+
+/// `P`'s inner product of `a` and `b`, computed in 128 bits through `P`'s [`Pair`] at `i128`. `None` where a result doesn't fit `i64`, or where a running total doesn't fit 128 bits.
+fn wide<P: Pair<i128, Out = Option<i128>>>(a: &[i64], b: &[i64], [m, k, n]: [usize; 3]) -> Option<Vec<i64>> {
+    (0..m * n).map(|c| {
+        let (i, j) = (c / n, c % n);
+        let total = (0..k).fold(P::UNIT, |t, p| P::step(t, a[i * k + p].into(), b[p * n + j].into()))?;
+        i64::try_from(total).ok()
+    }).collect()
 }
 
 /// `integers!`'s inner product of `pair`, whose values never exceed `bound` in magnitude.

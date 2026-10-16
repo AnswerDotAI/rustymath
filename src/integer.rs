@@ -1,6 +1,6 @@
 //! Functions of `i64`s: greatest common divisor, least common multiple, binomial coefficients, powers, square roots and residues. Each gives `None` where its result isn't an `i64`. Their function objects are the ones that floats and complex numbers use: [`Gcd`], [`Lcm`] and [`Residue`] from [`tolerant`](crate::tolerant), whose integer forms ignore the tolerance they hold, and [`Binom`] and [`Pow`]. A slice form appends results to a vector and reports whether every item fitted. [`Divisor`] divides many integers by one, with multiplications in place of division instructions. `Residue`'s slice form uses one where every item has the same divisor. For types of 16 bits or fewer it multiplies 32-bit integers instead, which vectorizes.
 //!
-//! `Gcd`, `Lcm`, `Pow` and `Residue` also take every narrower integer type, which they compute through these functions. Their `u64` forms have functions of their own, because a `u64` can exceed `i64::MAX`. A result that doesn't fit its type fails. The tolerant comparisons, [`Floor`] and [`Ceil`] take every integer type exactly, ignoring the tolerance. [`Abs`] and [`Sign`] take every integer type through [`Overflowing`](crate::Overflowing): `Abs` of a signed type's least value wraps to itself, as NumPy's does. `Floor`, `Ceil` and `Abs` keep Booleans as they are.
+//! `Gcd`, `Lcm`, `Binom`, `Pow` and `Residue` also take the narrower integer types of compact buffers, `u8`, `i16` and `i32`, which they compute through these functions. A result that doesn't fit its type fails. The tolerant comparisons, [`Floor`] and [`Ceil`] take each of these integer types exactly, ignoring the tolerance. [`Abs`] and [`Sign`] take them through the integer arithmetic of the `arith` module, and `Abs` of a signed type's least value fails. `Floor`, `Ceil` and `Abs` keep Booleans as they are.
 use crate::{Abs, Arg, Binom, Pow, tolerant::{Ceil, Equal, Floor, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue}};
 use strength_reduce::StrengthReducedU64;
 
@@ -20,9 +20,6 @@ fn unsigned_gcd(mut a: u64, mut b: u64) -> u64 {
     }
 }
 
-/// The least common multiple of x and y, which is 0 where either is 0. `None` where it is beyond `u64`.
-fn unsigned_lcm(x: u64, y: u64) -> Option<u64> { if x == 0 || y == 0 { Some(0) } else { (x / unsigned_gcd(x, y)).checked_mul(y) } }
-
 /// The least common multiple of x and y, with the sign of x × y. It is 0 where either is 0.
 pub fn lcm(x: i64, y: i64) -> Option<i64> { if x == 0 || y == 0 { return Some(0); } (x / gcd(x, y)?).checked_mul(y) }
 
@@ -36,9 +33,6 @@ pub fn binom(n: i64, k: i64) -> Option<i64> {
     let c = choose(top, k.min(top - k), 1 << 63)? as i128;
     i64::try_from(if negative { -c } else { c }).ok()
 }
-
-/// The unsigned binomial coefficient, with the full range of `u64` results.
-fn unsigned_binom(n: u64, k: u64) -> Option<u64> { if k > n { Some(0) } else { choose(n, k.min(n - k), u64::MAX) } }
 
 /// C(n, k) for 0 ≤ k ≤ n, through C(n, i + 1) = C(n, i) (n - i) / (i + 1), whose division is exact. Each step's product fits a `u128`. A coefficient beyond the caller's largest representable magnitude stops the steps.
 fn choose(n: u64, k: u64, limit: u64) -> Option<u64> {
@@ -55,10 +49,8 @@ pub fn power(x: i64, y: i64) -> Option<i64> {
     }
 }
 
-/// x^y, where 0^0 is 1. `None` where it is beyond `u64`.
-fn unsigned_power(x: u64, y: u64) -> Option<u64> { match x { 0 => Some(u64::from(y == 0)), 1 => Some(1), _ => x.checked_pow(u32::try_from(y).ok()?) } }
-
 /// The residue of y modulo x, y - x⌊y/x⌋, which takes the sign of x. A zero x gives y. Every residue fits an `i64`.
+#[inline]
 pub fn residue(x: i64, y: i64) -> i64 { if x == 0 { y } else { floored(y.wrapping_rem(x), x) } }
 
 /// `r`, a remainder of a division by x with the dividend's sign, moved to x's sign.
@@ -124,32 +116,27 @@ pub fn decode(bases: &[i64], digits: &[i64]) -> Option<Vec<i64>> {
     digits.chunks(bases.len()).map(|d| (1..d.len()).try_fold(d[0], |v, k| v.checked_mul(bases[k])?.checked_add(d[k]))).collect()
 }
 
-forms!(Gcd at i64: |_, [x, y]| gcd(x, y));
-forms!(Lcm at i64: |_, [x, y]| lcm(x, y));
-forms!(Binom at i64: |_, [n, k]| binom(n, k));
-forms!(Pow at i64: |_, [x, y]| power(x, y));
+forms!(#[inline] Gcd at i64: |_, [x, y]| gcd(x, y));
+forms!(#[inline] Lcm at i64: |_, [x, y]| lcm(x, y));
+forms!(#[inline] Binom at i64: |_, [n, k]| binom(n, k));
+forms!(#[inline] Pow at i64: |_, [x, y]| power(x, y));
 forms!(
-    Residue at i64: |_, [x, y]| residue(x, y), many |_, [x, y], n, out| if let Arg::One(d) = x && let Some(d) = Divisor::new(d) {
+    #[inline] Residue at i64: |_, [x, y]| residue(x, y), many |_, [x, y], n, out| if let Arg::One(d) = x && let Some(d) = Divisor::new(d) {
         each!([y], n, out, |[y]| d.residue(y))
     } else {
         each!([x, y], n, out, |[x, y]| residue(x, y))
     }
 );
-forms!(Gcd at u64: |_, [x, y]| unsigned_gcd(x, y));
-forms!(Lcm at u64: |_, [x, y]| unsigned_lcm(x, y));
-forms!(Binom at u64: |_, [n, k]| unsigned_binom(n, k));
-forms!(Pow at u64: |_, [x, y]| unsigned_power(x, y));
-forms!(Residue at u64: |_, [x, y]| if x == 0 { y } else { y % x });
 
 /// The narrower types' forms of `Gcd`, `Lcm`, `Binom`, `Pow` and `Residue`, which compute at `i64`. A result that doesn't fit the type fails, as one beyond `i64` does. Every residue fits.
 macro_rules! narrower {
     ($($t:ty),+) => {$(
-        forms!(Gcd at $t: |_, [x, y]| gcd(x.into(), y.into()).and_then(|r| <$t>::try_from(r).ok()));
-        forms!(Lcm at $t: |_, [x, y]| lcm(x.into(), y.into()).and_then(|r| <$t>::try_from(r).ok()));
-        forms!(Binom at $t: |_, [n, k]| binom(n.into(), k.into()).and_then(|r| <$t>::try_from(r).ok()));
-        forms!(Pow at $t: |_, [x, y]| power(x.into(), y.into()).and_then(|r| <$t>::try_from(r).ok()));
+        forms!(#[inline] Gcd at $t: |_, [x, y]| gcd(x.into(), y.into()).and_then(|r| <$t>::try_from(r).ok()));
+        forms!(#[inline] Lcm at $t: |_, [x, y]| lcm(x.into(), y.into()).and_then(|r| <$t>::try_from(r).ok()));
+        forms!(#[inline] Binom at $t: |_, [n, k]| binom(n.into(), k.into()).and_then(|r| <$t>::try_from(r).ok()));
+        forms!(#[inline] Pow at $t: |_, [x, y]| power(x.into(), y.into()).and_then(|r| <$t>::try_from(r).ok()));
         forms!(
-            Residue at $t: |_, [x, y]| residue(x.into(), y.into()) as $t,
+            #[inline] Residue at $t: |_, [x, y]| residue(x.into(), y.into()) as $t,
             many |_, [x, y], n, out| if let Arg::One(d) = x && <$t>::BITS <= 16 && let Some(s) = Short::new(d.into()) {
                 each!([y], n, out, |[y]| s.residue(y.into()) as $t)
             } else if let Arg::One(d) = x && let Some(d) = Divisor::new(d.into()) {
@@ -160,12 +147,12 @@ macro_rules! narrower {
         );
     )+};
 }
-narrower!(i8, i16, i32, u8, u16, u32);
+narrower!(u8, i16, i32);
 
-/// `$object`'s forms at every integer type, with Boolean outputs where `=> bool` says so.
+/// `$object`'s forms at each integer type of compact buffers, with Boolean outputs where `=> bool` says so.
 macro_rules! every_width {
     ($object:ident $(=> $o:ty)?: $($body:tt)+) => {
-        forms!($object at i8 $(=> $o)?, i16 $(=> $o)?, i32 $(=> $o)?, i64 $(=> $o)?, u8 $(=> $o)?, u16 $(=> $o)?, u32 $(=> $o)?, u64 $(=> $o)?: $($body)+);
+        forms!($object at u8 $(=> $o)?, i16 $(=> $o)?, i32 $(=> $o)?, i64 $(=> $o)?: $($body)+);
     };
 }
 every_width!(Equal => bool: |_, [x, y]| x == y);
@@ -174,6 +161,6 @@ every_width!(Less => bool: |_, [x, y]| x < y);
 every_width!(LessEqual => bool: |_, [x, y]| x <= y);
 every_width!(Greater => bool: |_, [x, y]| x > y);
 every_width!(GreaterEqual => bool: |_, [x, y]| x >= y);
-forms!(Floor at i8, i16, i32, i64, u8, u16, u32, u64, bool: |_, [x]| x);
-forms!(Ceil at i8, i16, i32, i64, u8, u16, u32, u64, bool: |_, [x]| x);
+forms!(Floor at u8, i16, i32, i64, bool: |_, [x]| x);
+forms!(Ceil at u8, i16, i32, i64, bool: |_, [x]| x);
 forms!(Abs at bool: |_, [x]| x);

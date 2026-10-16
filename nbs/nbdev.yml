@@ -4,7 +4,7 @@ project:
 website:
   title: "rustymath"
   site-url: "https://answerdotai.github.io/rustymath"
-  description: "Fast maths functions for f16, f32 and f64 in plain Rust."
+  description: "Maths in plain Rust, from fast f16, f32 and f64 functions to exact rationals."
   repo-branch: main
   repo-url: "https://github.com/AnswerDotAI/rustymath"
 

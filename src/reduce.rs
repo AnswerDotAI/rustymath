@@ -1,5 +1,5 @@
 //! Reductions and scans over a contiguous slice: sums, products, maximums and minimums, and their running versions. Each compiles inside rustymath once for each item type. A float sum or product may combine the items in any order, which lets its loop vectorize, so its last bits can differ from a sum taken item by item. Beside a NaN item, a float maximum or minimum gives either NaN or the greatest or least other item, depending on the target and the loop. An empty slice gives -∞ or ∞. `f16` items compute in `f32`. Their sum or product is an `f32` total. An integer sum or product computes at `i64`, or at `u64` for `u64` items. Where it doesn't fit, it wraps, and reports that it doesn't fit, as the running versions do.
-use crate::{Float, Native, Overflowing, float::sealed::{Core, Folds}, parallel, slice::{CHUNK, appended}};
+use crate::{Float, Native, arith::Overflowing, float::sealed::{Core, Folds}, parallel, slice::{CHUNK, appended}};
 use half::f16;
 use num_complex::Complex;
 use std::ops::Range;
@@ -71,14 +71,14 @@ pub fn minimum<F: Float>(x: F, y: F) -> F { F::from_working(Core::minimum(x.work
 #[derive(Clone, Copy, Debug)]
 pub struct Maximum;
 forms!(Maximum at real: |_, [x, y]| crate::slice::Total(maximum(x, y)));
-forms!(Maximum at i8, i16, i32, i64, u8, u16, u32, u64: |_, [x, y]| x.max(y));
+forms!(Maximum at u8, i16, i32, i64: |_, [x, y]| x.max(y));
 forms!(Maximum at bool: |_, [x, y]| x | y);
 
 /// [`minimum`] as a function object, which also takes integers and Booleans. The minimum of two Booleans is their `and`.
 #[derive(Clone, Copy, Debug)]
 pub struct Minimum;
 forms!(Minimum at real: |_, [x, y]| crate::slice::Total(minimum(x, y)));
-forms!(Minimum at i8, i16, i32, i64, u8, u16, u32, u64: |_, [x, y]| x.min(y));
+forms!(Minimum at u8, i16, i32, i64: |_, [x, y]| x.min(y));
 forms!(Minimum at bool: |_, [x, y]| x & y);
 
 /// A reduction by [`Sum`], [`Product`], [`Max`], [`Min`], [`Xor`], [`Xnor`] or [`SumAs`], implemented inside rustymath once for each item type it takes. `slice` folds a whole slice of consecutive items, in any order, `merge` combines the folds of two neighbouring runs, and `scan` gives the running folds. [`along`], [`fold_into`] and [`scan_along`] fold along an axis whose items aren't consecutive. [`Sum`] and [`Product`] take floats, integers and complex numbers. [`Max`] and [`Min`] take floats, integers and Booleans, [`Xor`] and [`Xnor`] take Booleans, and [`SumAs`] takes Booleans and integers. An `f16` reduction computes in `f32`. A sum or product of `f16`s gives an `f32` total, for its caller to round once.
@@ -124,6 +124,8 @@ pub struct Xor;
 /// The fold of Booleans by `==`: true where an even number of them are false.
 #[derive(Clone, Copy, Debug)]
 pub struct Xnor;
+forms!(Xor at bool: |_, [x, y]| x != y);
+forms!(Xnor at bool: |_, [x, y]| x == y);
 
 /// `x` folded by `add` from `unit`, through as many running results as `slice::running` gives, which `merge` combines at the end.
 #[inline(always)]
@@ -458,17 +460,6 @@ fn wide_sum(x: &[i64]) -> (i64, bool) {
     (total as i64, i64::try_from(total).is_ok())
 }
 
-/// The sum of `u64`s, wrapped, and whether it fits. Each item splits into its high and low 32 bits. Neither half's sum can overflow `u64` within 2^31 items, and both sums vectorize.
-#[inline(always)]
-fn unsigned_sum(x: &[u64]) -> (u64, bool) {
-    let halves = |c: &[u64]| folded(c, (0u64, 0u64), |(h, l), v| (h + (v >> 32), l + (v & 0xFFFF_FFFF)), |(h, l), (g, m)| (h + g, l + m));
-    let total: u128 = x.chunks(1 << 31).map(|c| {
-        let (h, l) = halves(c);
-        (u128::from(h) << 32) + u128::from(l)
-    }).sum();
-    (total as u64, total <= u128::from(u64::MAX))
-}
-
 /// The running sums of `x` from `start` at `i64`, wrapped, and whether every one fits. A sum overflows where its sign differs from both its arguments' signs, as `Overflowing::plus` tests it. The loop gathers those sign bits in one word and tests it once at the end. A bool for each step, as `Overflowing::plus` gives, measured 7% slower.
 #[inline(always)]
 fn signed_cumsum<T: Copy + Into<i64>>(x: &[T], start: i64, out: &mut Vec<i64>) -> bool {
@@ -485,10 +476,6 @@ fn signed_cumsum<T: Copy + Into<i64>>(x: &[T], start: i64, out: &mut Vec<i64>) -
     })
 }
 
-/// The running sums of `x` from `start`, wrapped, and whether every one fits.
-#[inline(always)]
-fn unsigned_cumsum(x: &[u64], start: u64, out: &mut Vec<u64>) -> bool { checked_scan(x, start, out, u64::plus) }
-
 /// Appends the running totals of `x` from `start` by `op`, which gives each total wrapped and whether it fits, and gives whether every total fits. Each step waits only for the wrapped total before it.
 #[inline(always)]
 fn checked_scan<T: Copy + Into<S>, S: Copy>(x: &[T], start: S, out: &mut Vec<S>, op: impl Fn(S, S) -> (S, bool)) -> bool {
@@ -503,48 +490,44 @@ fn checked_scan<T: Copy + Into<S>, S: Copy>(x: &[T], start: S, out: &mut Vec<S>,
     })
 }
 
-/// [`Sum`] and [`Product`] for each integer type, at `$wide`: `i64`, or `u64` for `u64` items. `$sum` sums a slice, and `$cumsum` gives running sums. Each step and product wraps through [`Overflowing`], which also tests whether it fits.
+/// [`Sum`] and [`Product`] for each integer type of compact buffers, at `i64`. `$sum` sums a slice. Each step and product wraps through [`Overflowing`], which also tests whether it fits.
 macro_rules! integers {
-    ($($t:ty => $wide:ty: $sum:ident, $cumsum:ident),+) => {$(
+    ($($t:ty: $sum:ident),+) => {$(
         impl Reduction<$t> for Sum {
-            type Total = $wide;
+            type Total = i64;
             #[inline(always)]
-            fn unit() -> $wide { 0 }
+            fn unit() -> i64 { 0 }
             #[inline(always)]
-            fn step(acc: $wide, x: $t) -> $wide { acc.plus(x.into()).0 }
+            fn step(acc: i64, x: $t) -> i64 { acc.plus(x.into()).0 }
             #[inline(always)]
-            fn checked(acc: $wide, x: $t) -> ($wide, bool) { acc.plus(x.into()) }
+            fn checked(acc: i64, x: $t) -> (i64, bool) { acc.plus(x.into()) }
             #[inline(always)]
-            fn merge(a: $wide, b: $wide) -> ($wide, bool) { a.plus(b) }
+            fn merge(a: i64, b: i64) -> (i64, bool) { a.plus(b) }
             #[inline]
-            fn slice(x: &[$t]) -> ($wide, bool) { $sum(x) }
+            fn slice(x: &[$t]) -> (i64, bool) { $sum(x) }
             #[inline]
-            fn scan(x: &[$t], start: Option<$wide>, out: &mut Vec<$wide>) -> bool { $cumsum(x, start.unwrap_or(0), out) }
+            fn scan(x: &[$t], start: Option<i64>, out: &mut Vec<i64>) -> bool { signed_cumsum(x, start.unwrap_or(0), out) }
         }
         impl Reduction<$t> for Product {
-            type Total = $wide;
+            type Total = i64;
             #[inline(always)]
-            fn unit() -> $wide { 1 }
+            fn unit() -> i64 { 1 }
             #[inline(always)]
-            fn step(acc: $wide, x: $t) -> $wide { acc.times(x.into()).0 }
+            fn step(acc: i64, x: $t) -> i64 { acc.times(x.into()).0 }
             #[inline(always)]
-            fn checked(acc: $wide, x: $t) -> ($wide, bool) { acc.times(x.into()) }
+            fn checked(acc: i64, x: $t) -> (i64, bool) { acc.times(x.into()) }
             #[inline(always)]
-            fn merge(a: $wide, b: $wide) -> ($wide, bool) { a.times(b) }
+            fn merge(a: i64, b: i64) -> (i64, bool) { a.times(b) }
             #[inline]
-            fn slice(x: &[$t]) -> ($wide, bool) {
-                x.iter().fold((1 as $wide, true), |(p, ok), &v| { let (q, fits) = p.times(v.into()); (q, ok & fits) })
+            fn slice(x: &[$t]) -> (i64, bool) {
+                x.iter().fold((1 as i64, true), |(p, ok), &v| { let (q, fits) = p.times(v.into()); (q, ok & fits) })
             }
             #[inline]
-            fn scan(x: &[$t], start: Option<$wide>, out: &mut Vec<$wide>) -> bool { checked_scan(x, start.unwrap_or(1), out, <$wide>::times) }
+            fn scan(x: &[$t], start: Option<i64>, out: &mut Vec<i64>) -> bool { checked_scan(x, start.unwrap_or(1), out, <i64>::times) }
         }
     )+};
 }
-integers!(
-    i8 => i64: small_sum, signed_cumsum, i16 => i64: small_sum, signed_cumsum, i32 => i64: narrow_sum, signed_cumsum,
-    i64 => i64: wide_sum, signed_cumsum, u8 => i64: small_sum, signed_cumsum, u16 => i64: small_sum, signed_cumsum,
-    u32 => i64: narrow_sum, signed_cumsum, u64 => u64: unsigned_sum, unsigned_cumsum
-);
+integers!(u8: small_sum, i16: small_sum, i32: narrow_sum, i64: wide_sum);
 
 /// [`Max`] and [`Min`] for each integer type and Booleans: `$lowest` and `$highest` are their units, and `$max` and `$min` their steps. Their steps on Booleans are `or` and `and`, as [`Maximum`] and [`Minimum`] compute them.
 macro_rules! extremes {
@@ -572,7 +555,7 @@ macro_rules! extremes {
         extremes!(@one Min, $t, $highest, $min);
     )+};
 }
-extremes!(integers i8, i16, i32, i64, u8, u16, u32, u64);
+extremes!(integers i16, i32, i64, u8, u16, u32, u64);
 /// [`Max`], [`Min`], [`Xor`] and [`Xnor`] on Booleans: `or`, `and`, `!=` and `==`. Each one's scan is the scan of its truth table through [`Logical`].
 macro_rules! booleans {
     ($($r:ident: $unit:expr, |$a:ident, $b:ident| $step:expr, $table:expr;)+) => {$(
@@ -897,7 +880,7 @@ macro_rules! terms {
         }
     )+};
 }
-terms!(i8, i16, i32, i64, u8, u16, u32, u64);
+terms!(i16, i32, i64, u8);
 
 /// An integer type that sums [`Term`]s, wrapping where a sum doesn't fit: `u8`, `i16`, `i32` or `i64`. A caller picks one that holds every sum it needs. A count of fewer than 256 Booleans fits a byte, which takes an eighth of the memory of an `i64`.
 pub trait Tally: Copy + Default + Send + Sync {
@@ -1003,7 +986,7 @@ macro_rules! alternating_integers {
         }
     )+};
 }
-alternating_integers!(i8 => i32, 1 << 15; i16 => i32, 1 << 15; u8 => i32, 1 << 15; u16 => i32, 1 << 15; i32 => i64, 1 << 31; u32 => i64, 1 << 31; i64 => i128, 1 << 31);
+alternating_integers!(i16 => i32, 1 << 15; u8 => i32, 1 << 15; i32 => i64, 1 << 31; i64 => i128, 1 << 31);
 
 impl<F: Native> Alternating<F> for Product {
     type Total = F;

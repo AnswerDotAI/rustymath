@@ -1,144 +1,224 @@
-//! Exact arithmetic on Python integers and `fractions.Fraction`. The Python wrapper owns array shapes; these functions convert flat inputs once, compute with BigRational, and return flat Fraction lists. Long operations poll for Ctrl-C.
-use num_bigint::BigInt;
+//! Exact arithmetic on Python integers and `fractions.Fraction`. An argument is an `int`, a `Fraction`, nested lists or tuples of them, or a buffer of integers or Booleans, such as a NumPy array. Results are Fractions, in nested lists for arrays. Elementwise functions pair their arguments' axes as rustymath broadcasts them: axes with the same name first, then the rest from the front. Matrix functions take one matrix, not stacks. Long operations poll for Ctrl-C.
+use crate::convert::{Arg, Collect, walked};
+use crate::integer::radix;
 use num_rational::BigRational;
-use num_traits::ToPrimitive;
-use pyo3::{exceptions::{PyOverflowError, PyTypeError, PyValueError}, prelude::*, types::PyList};
+use num_traits::{One, ToPrimitive};
+use pyo3::{exceptions::{PyOverflowError, PyTypeError, PyValueError}, prelude::*, sync::PyOnceLock, types::{PyComplex, PyFloat, PyInt, PyType}};
+use rustymath::agreement::Agreement;
+use rustymath::error::{Error, Kind};
+use rustymath::layout::Layout;
 use rustymath::{exact, linalg::exact as matrix, polynomial};
+use rustymath_buffer::{py_err, read};
 
 type R = BigRational;
 
 /// Python's `fractions.Fraction`.
-fn fraction(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> { py.import("fractions")?.getattr("Fraction") }
-
-fn rational(x: &Bound<'_, PyAny>, fraction: &Bound<'_, PyAny>) -> PyResult<R> {
-    if let Ok(n) = x.extract::<BigInt>() { return Ok(R::from_integer(n)); }
-    if x.is_instance(fraction)? { return Ok(R::new(x.getattr("numerator")?.extract()?, x.getattr("denominator")?.extract()?)); }
-    Err(PyTypeError::new_err("exact arithmetic takes integers and fractions.Fraction, not floats"))
+fn fraction(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
+    static FRACTION: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+    FRACTION.import(py, "fractions", "Fraction")
 }
 
-fn read(x: &Bound<'_, PyAny>) -> PyResult<Vec<R>> {
-    let py = x.py();
+fn inexact() -> PyErr { PyTypeError::new_err("exact arithmetic takes integers and fractions.Fraction, not floats") }
+
+/// One part of nested exact values: one value, or the integers of a buffer.
+struct Rationals(Vec<R>);
+
+impl Collect for Rationals {
+    fn int(n: i128) -> Self { Self(vec![R::from_integer(n.into())]) }
+    fn piece(obj: &Bound<'_, PyAny>) -> PyResult<Option<(Self, Vec<usize>)>> {
+        if let Some(r) = read(obj)? {
+            if !r.view().is_empty() && !r.view().dtype().is_integral() { return Err(inexact()); }
+            let shape = r.shape().to_vec();
+            return Ok(Some((Self(Arg::from(r).items::<i64>()?.iter().map(|&n| R::from_integer(n.into())).collect()), shape)));
+        }
+        let value = if obj.is_instance_of::<PyInt>() {
+            R::from_integer(obj.extract()?)
+        } else if obj.is_instance(fraction(obj.py())?)? {
+            R::new(obj.getattr("numerator")?.extract()?, obj.getattr("denominator")?.extract()?)
+        } else if obj.is_instance_of::<PyFloat>() || obj.is_instance_of::<PyComplex>() {
+            return Err(inexact());
+        } else {
+            return Ok(None);
+        };
+        Ok(Some((Self(vec![value]), vec![])))
+    }
+}
+
+/// The layout and values of `x`.
+fn values(x: &Bound<'_, PyAny>) -> PyResult<(Layout, Vec<R>)> {
+    let (layout, pieces) = walked::<Rationals>(x)?;
+    Ok((layout, pieces.into_iter().flat_map(|p| p.0).collect()))
+}
+
+/// The shape and values of `x`, after checking that it has `axes` axes, or raising `expected`.
+fn shaped(x: &Bound<'_, PyAny>, axes: usize, expected: &str) -> PyResult<(Vec<usize>, Vec<R>)> {
+    let (layout, items) = values(x)?;
+    if layout.shape().len() != axes { return Err(py_err(Error::new(Kind::Rank, expected.to_owned()))); }
+    Ok((layout.shape().to_vec(), items))
+}
+
+fn vector(x: &Bound<'_, PyAny>) -> PyResult<Vec<R>> { Ok(shaped(x, 1, "expected a vector")?.1) }
+
+fn matrix_of(a: &Bound<'_, PyAny>) -> PyResult<([usize; 2], Vec<R>)> {
+    let (shape, a) = shaped(a, 2, "expected a matrix")?;
+    Ok(([shape[0], shape[1]], a))
+}
+
+fn square(a: &Bound<'_, PyAny>) -> PyResult<(usize, Vec<R>)> {
+    let ([m, n], a) = matrix_of(a)?;
+    if m != n { return Err(py_err(Error::new(Kind::Length, "expected a square matrix"))); }
+    Ok((n, a))
+}
+
+/// The multiplier `m`, 1 where it isn't given.
+fn multiplier(m: Option<&Bound<'_, PyAny>>) -> PyResult<R> {
+    let Some(m) = m else { return Ok(R::one()) };
+    Ok(shaped(m, 0, "m must be a scalar")?.1.pop().expect("a scalar has one value"))
+}
+
+/// `items` as Fractions, nested in lists by `shape`, or one Fraction where `shape` is empty.
+fn output<'py>(py: Python<'py>, shape: &[usize], items: Vec<R>) -> PyResult<Bound<'py, PyAny>> {
     let fraction = fraction(py)?;
-    x.try_iter()?.enumerate().map(|(i, x)| {
+    let items = each(py, items, |x| fraction.call1((x.numer().clone(), x.denom().clone())))?;
+    rustymath_buffer::nested(py, shape, &|i| Ok(items[i].clone()))
+}
+
+/// `f` on each of `items`, checking for Ctrl-C every 1024 items.
+fn each<T, U>(py: Python<'_>, items: impl IntoIterator<Item = T>, mut f: impl FnMut(T) -> PyResult<U>) -> PyResult<Vec<U>> {
+    items.into_iter().enumerate().map(|(i, x)| {
         if i % 1024 == 0 { py.check_signals()?; }
-        rational(&x?, &fraction)
+        f(x)
     }).collect()
 }
 
-fn output<'py>(py: Python<'py>, xs: Vec<R>) -> PyResult<Bound<'py, PyList>> {
-    let fraction = fraction(py)?;
-    let xs = xs.into_iter().enumerate().map(|(i, x)| {
-        if i % 1024 == 0 { py.check_signals()?; }
-        fraction.call1((x.numer().clone(), x.denom().clone()))
-    }).collect::<PyResult<Vec<_>>>()?;
-    PyList::new(py, xs)
+/// `f` on each pair of items of `x` and `y`, broadcast together.
+fn binary<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>, mut f: impl FnMut(&R, &R) -> PyResult<R>) -> PyResult<Bound<'py, PyAny>> {
+    let ((lx, x), (ly, y)) = (values(x)?, values(y)?);
+    let agreement = Agreement::new(&lx, &ly).map_err(py_err)?;
+    let fill = || py_err(Error::new(Kind::Domain, "exact arithmetic has no fill for a missing key"));
+    let out = each(py, 0..agreement.len, |i| f(&x[agreement.left.get(i).ok_or_else(fill)?], &y[agreement.right.get(i).ok_or_else(fill)?]))?;
+    output(py, agreement.layout.shape(), out)
 }
 
-fn binary<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>, mut f: impl FnMut(&R, &R) -> PyResult<R>) -> PyResult<Bound<'py, PyList>> {
-    let (x, y) = (read(x)?, read(y)?);
-    if x.len() != y.len() { return Err(PyValueError::new_err("inputs must have the same number of items")); }
-    output(py, x.iter().zip(&y).enumerate().map(|(i, (x, y))| {
-        if i % 1024 == 0 { py.check_signals()?; }
-        f(x, y)
-    }).collect::<PyResult<_>>()?)
+/// `f` on each item of `x`, in `x`'s shape.
+fn pointwise<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, f: impl FnMut(&R) -> PyResult<R>) -> PyResult<Bound<'py, PyAny>> {
+    let (layout, x) = values(x)?;
+    output(py, layout.shape(), each(py, &x, f)?)
 }
 
+/// The nonnegative rational gcd of `x` and `y`.
 #[pyfunction]
-fn gcd<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyList>> { binary(py, x, y, |x, y| Ok(exact::gcd(x, y))) }
+fn gcd<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { binary(py, x, y, |x, y| Ok(exact::gcd(x, y))) }
 
+/// The rational lcm of `x` and `y`, with the sign of `x*y`.
 #[pyfunction]
-fn lcm<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyList>> { binary(py, x, y, |x, y| Ok(exact::lcm(x, y))) }
+fn lcm<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { binary(py, x, y, |x, y| Ok(exact::lcm(x, y))) }
 
+/// `x` modulo `y`, with `y`'s sign. A zero `y` gives `x`.
 #[pyfunction]
-fn remainder<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyList>> {
-    binary(py, x, y, |x, y| Ok(exact::residue(y, x)))
-}
+fn remainder<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { binary(py, x, y, |x, y| Ok(exact::residue(y, x))) }
 
+/// The binomial coefficient `n` choose `k`, for a rational `n` and a whole `k` that fits `i64`.
 #[pyfunction]
-fn binom<'py>(py: Python<'py>, n: &Bound<'py, PyAny>, k: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyList>> {
+fn binom<'py>(py: Python<'py>, n: &Bound<'py, PyAny>, k: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     binary(py, n, k, |n, k| {
         if !k.is_integer() { return Err(PyValueError::new_err("binom needs a whole k")); }
-        let k = k.to_integer().to_i64().ok_or_else(|| PyOverflowError::new_err("binom needs k to fit in int64"))?;
+        let k = k.to_integer().to_i64().ok_or_else(|| PyOverflowError::new_err("binom needs k to fit i64"))?;
         exact::binom_with(n, k, || py.check_signals())
     })
 }
 
-fn read_matrix(a: &Bound<'_, PyAny>, m: usize, n: usize) -> PyResult<Vec<R>> {
-    let a = read(a)?;
-    if a.len() != m * n { return Err(PyValueError::new_err("matrix shape does not match its items")); }
-    Ok(a)
+/// The least-norm least-squares solution of `a @ x = b`, for a matrix `a` and a vector or matrix `b` with a row for each row of `a`.
+#[pyfunction]
+fn solve<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, b: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let ([m, n], a) = matrix_of(a)?;
+    let (layout, b) = values(b)?;
+    let (k, shape) = match *layout.shape() {
+        [r] if r == m => (1, vec![n]),
+        [r, k] if r == m => (k, vec![n, k]),
+        _ => return Err(py_err(Error::new(Kind::Length, "b must be a vector or a matrix with a row for each row of a"))),
+    };
+    output(py, &shape, matrix::solve_with(&a, &b, [m, n], k, || py.check_signals())?)
 }
 
+/// The pseudoinverse of the matrix `a`, which is its inverse where `a` is square and nonsingular.
 #[pyfunction]
-fn solve<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, b: &Bound<'py, PyAny>, m: usize, n: usize, k: usize) -> PyResult<Bound<'py, PyList>> {
-    output(py, matrix::solve_with(&read_matrix(a, m, n)?, &read_matrix(b, m, k)?, [m, n], k, || py.check_signals())?)
+fn pinv<'py>(py: Python<'py>, a: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let ([m, n], a) = matrix_of(a)?;
+    output(py, &[n, m], matrix::pinv_with(&a, [m, n], || py.check_signals())?)
 }
 
+/// The determinant of a square matrix.
 #[pyfunction]
-fn pinv<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, m: usize, n: usize) -> PyResult<Bound<'py, PyList>> {
-    output(py, matrix::pinv_with(&read_matrix(a, m, n)?, [m, n], || py.check_signals())?)
+fn det<'py>(py: Python<'py>, a: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let (n, a) = square(a)?;
+    output(py, &[], vec![matrix::determinant_with(&a, n, || py.check_signals())?])
 }
 
+/// The permanent of a square matrix of fewer than 64 rows, in exponential time. Ctrl-C cancels it.
 #[pyfunction]
-fn det<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, n: usize) -> PyResult<Bound<'py, PyList>> {
-    output(py, vec![matrix::determinant_with(&read_matrix(a, n, n)?, n, || py.check_signals())?])
-}
-
-#[pyfunction]
-fn permanent<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, n: usize) -> PyResult<Bound<'py, PyList>> {
+fn permanent<'py>(py: Python<'py>, a: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let (n, a) = square(a)?;
     if n >= 64 { return Err(PyValueError::new_err("permanent needs fewer than 64 rows")); }
-    output(py, vec![matrix::permanent_with(&read_matrix(a, n, n)?, n, || py.check_signals())?])
+    output(py, &[], vec![matrix::permanent_with(&a, n, || py.check_signals())?])
 }
 
+/// The reduced row echelon form of the matrix `a`, with its zero rows left out, the pivot columns, and the signed product of the pivots before scaling. Pivots come from the first `columns` columns, or from every column where `columns` isn't given.
 #[pyfunction]
-fn echelon<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, m: usize, n: usize, columns: usize) -> PyResult<(Bound<'py, PyList>, Vec<usize>, Bound<'py, PyList>)> {
-    if columns > n { return Err(PyValueError::new_err("columns cannot exceed the matrix width")); }
-    let e = matrix::echelon_with(read_matrix(a, m, n)?, [m, n], columns, || py.check_signals())?;
-    Ok((output(py, e.rows)?, e.pivots, output(py, vec![e.determinant])?))
+#[pyo3(signature = (a, columns=None))]
+fn echelon<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, columns: Option<usize>) -> PyResult<(Bound<'py, PyAny>, Vec<usize>, Bound<'py, PyAny>)> {
+    let ([m, n], a) = matrix_of(a)?;
+    let columns = columns.unwrap_or(n);
+    if columns > n { return Err(PyValueError::new_err("columns can't exceed the matrix's width")); }
+    let e = matrix::echelon_with(a, [m, n], columns, || py.check_signals())?;
+    Ok((output(py, &[e.pivots.len(), n], e.rows)?, e.pivots, output(py, &[], vec![e.determinant])?))
 }
 
+/// The polynomial with coefficients `c`, a vector in ascending order, at each item of `x`.
 #[pyfunction]
-fn polyval<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, c: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyList>> {
-    let (x, c) = (read(x)?, read(c)?);
-    output(py, x.iter().enumerate().map(|(i, x)| {
-        if i % 1024 == 0 { py.check_signals()?; }
-        polynomial::value_with(&c, x, || py.check_signals())
-    }).collect::<PyResult<_>>()?)
+fn polyval<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, c: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let c = vector(c)?;
+    pointwise(py, x, |x| polynomial::value_with(&c, x, || py.check_signals()))
 }
 
+/// The coefficients of `m` times the product of `x - root` over the vector `roots`.
 #[pyfunction]
-fn polyfromroots<'py>(py: Python<'py>, roots: &Bound<'py, PyAny>, m: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyList>> {
-    let fraction = fraction(py)?;
-    output(py, polynomial::from_roots_with(rational(m, &fraction)?, &read(roots)?, || py.check_signals())?)
+#[pyo3(signature = (roots, m=None))]
+fn polyfromroots<'py>(py: Python<'py>, roots: &Bound<'py, PyAny>, m: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+    let c = polynomial::from_roots_with(multiplier(m)?, &vector(roots)?, || py.check_signals())?;
+    output(py, &[c.len()], c)
 }
 
+/// The coefficients of the derivative of the polynomial with coefficients `c`. A constant's derivative has none.
 #[pyfunction]
-fn polyder<'py>(py: Python<'py>, c: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyList>> {
-    output(py, polynomial::derivative_with(&read(c)?, || py.check_signals())?)
+fn polyder<'py>(py: Python<'py>, c: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let d = polynomial::derivative_with(&vector(c)?, || py.check_signals())?;
+    output(py, &[d.len()], d)
 }
 
+/// `m` times the product of `x - root` over the vector `roots`, at each item of `x`.
 #[pyfunction]
-fn polyvalfromroots<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, roots: &Bound<'py, PyAny>, m: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyList>> {
-    let fraction = fraction(py)?;
-    let (x, roots, m) = (read(x)?, read(roots)?, rational(m, &fraction)?);
-    output(py, x.iter().enumerate().map(|(i, x)| {
-        if i % 1024 == 0 { py.check_signals()?; }
-        polynomial::factored_with(&m, &roots, x, || py.check_signals())
-    }).collect::<PyResult<_>>()?)
+#[pyo3(signature = (x, roots, m=None))]
+fn polyvalfromroots<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, roots: &Bound<'py, PyAny>, m: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+    let (roots, m) = (vector(roots)?, multiplier(m)?);
+    pointwise(py, x, |x| polynomial::factored_with(&m, &roots, x, || py.check_signals()))
 }
 
+/// The mixed-radix value of each vector of digits along the last axis of `digits`. `bases` is a nonempty vector with one base for each digit, and its first base is unused.
 #[pyfunction]
-fn decode<'py>(py: Python<'py>, bases: &Bound<'py, PyAny>, digits: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyList>> {
-    let (bases, digits) = (read(bases)?, read(digits)?);
-    if bases.is_empty() || digits.len() % bases.len() != 0 { return Err(PyValueError::new_err("decode needs one digit for each base")); }
+fn decode<'py>(py: Python<'py>, bases: &Bound<'py, PyAny>, digits: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let ((lb, bases), (ld, digits)) = (values(bases)?, values(digits)?);
+    radix(lb.shape(), ld.shape())?;
     let mut out = Vec::with_capacity(digits.len() / bases.len());
     for group in digits.chunks(bases.len().saturating_mul(1024)) {
         py.check_signals()?;
         out.extend(polynomial::decode(&bases, group));
     }
-    output(py, out)
+    let shape = ld.shape();
+    output(py, &shape[..shape.len() - 1], out)
 }
 
+/// Adds this module's functions to `m`.
 pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
     for f in [
         wrap_pyfunction!(gcd, m)?, wrap_pyfunction!(lcm, m)?, wrap_pyfunction!(remainder, m)?, wrap_pyfunction!(binom, m)?, wrap_pyfunction!(solve, m)?,
@@ -147,3 +227,4 @@ pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
     ] { m.add_function(f)?; }
     Ok(())
 }
+

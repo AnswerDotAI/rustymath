@@ -1,0 +1,14 @@
+[package]
+name = "rustymath-buffer"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+description = "The Python buffer protocol for rustymath's compact buffers, shared by rustymath's and basedpl's Python extensions."
+repository = "https://github.com/AnswerDotAI/rustymath"
+
+[lib]
+test = false
+
+[dependencies]
+rustymath = { path = "..", version = ">=0.1.24, <1", default-features = false }
+pyo3 = ">=0.29"

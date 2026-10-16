@@ -1,6 +1,6 @@
 [workspace]
-members = ["py"]
-default-members = [".", "py"]
+members = ["buffer", "py"]
+default-members = [".", "buffer", "py"]
 
 [workspace.package]
 version = "0.1.24"

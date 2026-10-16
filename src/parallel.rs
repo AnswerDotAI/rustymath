@@ -120,6 +120,12 @@ pub fn stack_with<B: Default + Send, S: Default, E>(
     Ok((out, ok))
 }
 
+/// [`stack_with`] for a `write` that always succeeds: the output alone.
+pub fn stack<B: Default + Send, S: Default, E>(
+    count: usize, per: usize, write: &(dyn Fn(usize, &mut [B], &mut S) + Sync), check: impl FnMut() -> Result<(), E>) -> Result<Vec<B>, E> {
+    Ok(stack_with(count, per, &|i, cell, scratch| { write(i, cell, scratch); true }, check)?.0)
+}
+
 /// Appends `n` items to `out`, and gives whether every call of `write` said `true`. `write(range, slots)` fills `slots` with the items in `range`, in order. The calls split across threads as [`split`] splits a call, in units of `unit` items. A call that leaves any of its slots unfilled panics, and `out` keeps its length.
 pub fn extended<B: Copy + Send>(out: &mut Vec<B>, n: usize, unit: usize, write: &(dyn Fn(Range<usize>, &mut Slots<'_, B>) -> bool + Sync)) -> bool {
     crate::slice::appended(out, n, |slots| split(slots, unit, &|start, slots| filled(slots, |slots| write(start..start + slots.slots.len(), slots))))

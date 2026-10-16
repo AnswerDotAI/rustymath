@@ -1,4 +1,4 @@
-//! Addition, subtraction and multiplication as function objects, at every float, complex and integer type, and the integer arithmetic they run. No result fails. An integer result wraps to its type, as Rust's wrapping arithmetic and NumPy's integer arrays do.
+//! Addition, subtraction and multiplication as function objects, at every float and complex type and at the integer types of compact buffers, `u8`, `i16`, `i32` and `i64`, division at every float and complex type, and the integer arithmetic they run. A float or complex result never fails. An integer result that doesn't fit its type fails.
 use crate::{Abs, Sign, float::sealed::Sealed, slice::Total};
 use num_complex::Complex;
 
@@ -11,16 +11,22 @@ pub struct Subtract;
 /// x × y.
 #[derive(Clone, Copy, Debug)]
 pub struct Multiply;
+/// x ÷ y, at every float and complex type. Complex numbers divide by [`divide`](crate::divide).
+#[derive(Clone, Copy, Debug)]
+pub struct Divide;
 
-forms!(Add at real: |_, [x, y]| Total(x + y));
-forms!(Subtract at real: |_, [x, y]| Total(x - y));
-forms!(Multiply at real: |_, [x, y]| Total(x * y));
-forms!(Add at Complex<f32>, Complex<f64>: |_, [x, y]| Total(x + y));
-forms!(Subtract at Complex<f32>, Complex<f64>: |_, [x, y]| Total(x - y));
-forms!(Multiply at Complex<f32>, Complex<f64>: |_, [x, y]| Total(x * y));
+// The float and complex forms are `#[inline]`, as the integer forms are, so that a caller's own loop over items, such as a fold's, inlines them.
+forms!(#[inline] Add at real: |_, [x, y]| Total(x + y));
+forms!(#[inline] Subtract at real: |_, [x, y]| Total(x - y));
+forms!(#[inline] Multiply at real: |_, [x, y]| Total(x * y));
+forms!(#[inline] Add at Complex<f32>, Complex<f64>: |_, [x, y]| Total(x + y));
+forms!(#[inline] Subtract at Complex<f32>, Complex<f64>: |_, [x, y]| Total(x - y));
+forms!(#[inline] Multiply at Complex<f32>, Complex<f64>: |_, [x, y]| Total(x * y));
+forms!(#[inline] Divide at real: |_, [x, y]| Total(x / y));
+forms!(#[inline] Divide at Complex<f32>, Complex<f64>: |_, [x, y]| Total(crate::divide(x, y)));
 
 /// An integer type's arithmetic. Each operation that can overflow gives its result wrapped to the type, and whether that is the exact result, so that a caller with exact integers can take another path. The tests have no branch, so a loop of them vectorizes. The one exception is a 64-bit product, because no vector instruction gives its 128-bit result. [`Add`], [`Subtract`], [`Multiply`], [`Abs`](crate::Abs) and [`Sign`](crate::Sign) run these on slices.
-pub trait Overflowing: Copy + Sealed {
+pub(crate) trait Overflowing: Copy + Sealed {
     /// x + y.
     fn plus(self, y: Self) -> (Self, bool);
     /// x - y.
@@ -59,7 +65,7 @@ macro_rules! signed {
     )+};
 }
 signed!(
-    i8: |x, y| wide_product!(i8, i16, x, y), i16: |x, y| wide_product!(i16, i32, x, y), i32: |x, y| wide_product!(i32, i64, x, y),
+    i16: |x, y| wide_product!(i16, i32, x, y), i32: |x, y| wide_product!(i32, i64, x, y),
     i64: |x, y| { let (p, over) = x.overflowing_mul(y); (p, !over) }
 );
 
@@ -80,19 +86,20 @@ macro_rules! unsigned {
         }
     )+};
 }
-unsigned!(
-    u8: |x, y| wide_product!(u8, u16, x, y), u16: |x, y| wide_product!(u16, u32, x, y), u32: |x, y| wide_product!(u32, u64, x, y),
-    u64: |x, y| { let (p, over) = x.overflowing_mul(y); (p, !over) }
-);
+unsigned!(u8: |x, y| wide_product!(u8, u16, x, y));
 
-/// Each integer type's forms of the arithmetic objects, which keep [`Overflowing`]'s wrapped results and never fail.
+/// The result of an [`Overflowing`] operation where it fits its type, or `None` where it overflowed.
+#[inline(always)]
+fn fitted<T>((r, fits): (T, bool)) -> Option<T> { fits.then_some(r) }
+
+/// Each integer type's forms of the arithmetic objects. A result that doesn't fit the type fails, as [`Overflowing`] reports it. The forms are `#[inline]`, so that a caller's loop over items inlines them.
 macro_rules! integer_forms {
     ($($t:ty),+) => {$(
-        forms!(Add at $t: |_, [x, y]| Total(x.plus(y).0));
-        forms!(Subtract at $t: |_, [x, y]| Total(x.minus(y).0));
-        forms!(Multiply at $t: |_, [x, y]| Total(x.times(y).0));
-        forms!(Abs at $t: |_, [x]| Total(x.magnitude().0));
-        forms!(Sign at $t: |_, [x]| Total(x.sign()));
+        forms!(#[inline] Add at $t: |_, [x, y]| fitted(x.plus(y)));
+        forms!(#[inline] Subtract at $t: |_, [x, y]| fitted(x.minus(y)));
+        forms!(#[inline] Multiply at $t: |_, [x, y]| fitted(x.times(y)));
+        forms!(#[inline] Abs at $t: |_, [x]| fitted(x.magnitude()));
+        forms!(#[inline] Sign at $t: |_, [x]| Total(x.sign()));
     )+};
 }
-integer_forms!(i8, i16, i32, i64, u8, u16, u32, u64);
+integer_forms!(u8, i16, i32, i64);

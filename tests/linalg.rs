@@ -81,25 +81,30 @@ mod products {
     }
 
     #[test]
-    fn integer_products_match_wrapping_folds() {
-        // Each pair of scales for `a` and `b` reaches one path. `+.×` runs at f32, f64, then i64 twice, the last time overflowing. `⌈.+` and `⌊.+` run at f32 twice, then f64, then i64, overflowing. Odd scales give products that a narrower path would round, where a power of two would keep them exact.
+    fn integer_products_match_exact_folds() {
+        // Each pair of scales for `a` and `b` reaches one path. `+.×` runs at f32, f64, i64, then in 128 bits, overflowing. `⌈.+` and `⌊.+` run at f32 twice, then f64, then in 128 bits, overflowing. Odd scales give products that a narrower path would round, where a power of two would keep them exact. `checked` gives `None` only where a result doesn't fit `i64`, and `inner` gives the same results elsewhere.
         let scales = [(1, 1), (4097, 4093), ((1 << 22) + 1, (1 << 22) + 3), ((1 << 59) + 1, (1 << 60) + 1)];
         for (sa, sb) in scales {
             for size @ [m, k, n] in [[0, 3, 4], [3, 0, 4], [3, 4, 0], [5, 7, 9], [MC + 3, KC + 5, 37]] {
                 let a: Vec<i64> = (0..m * k).map(|i| ((i * 7 % 17) as i64 - 8) * sa).collect();
                 let b: Vec<i64> = (0..k * n).map(|i| ((i * 5 % 13) as i64 - 6) * sb).collect();
                 let overflows = sa > 1 << 59 && !a.is_empty() && !b.is_empty();
-                let products = folded(&a, &b, size, 0i64, |s, x, y| s.wrapping_add(x.wrapping_mul(y)));
-                assert_eq!(PlusTimes.inner(&a, &b, size), products);
-                assert_eq!(PlusTimes.checked(&a, &b, size), (!overflows).then_some(products));
-                let maxima = folded(&a, &b, size, i64::MIN, |s, x, y| s.max(x.wrapping_add(y)));
-                assert_eq!(MaxPlus.inner(&a, &b, size), maxima);
-                assert_eq!(MaxPlus.checked(&a, &b, size), (!overflows).then_some(maxima));
-                let minima = folded(&a, &b, size, i64::MAX, |s, x, y| s.min(x.wrapping_add(y)));
-                assert_eq!(MinPlus.inner(&a, &b, size), minima);
-                assert_eq!(MinPlus.checked(&a, &b, size), (!overflows).then_some(minima));
+                let products = (!overflows).then(|| folded(&a, &b, size, 0i64, |s, x, y| s + x * y));
+                assert_eq!(PlusTimes.checked(&a, &b, size), products);
+                if let Some(products) = products { assert_eq!(PlusTimes.inner(&a, &b, size), products); }
+                let exact = |unit: i64, step: fn(i128, i128) -> i128| {
+                    folded(&a, &b, size, i128::from(unit), |s, x, y| step(s, i128::from(x) + i128::from(y))).into_iter().map(|t| i64::try_from(t).ok()).collect::<Option<Vec<_>>>()
+                };
+                let maxima = exact(i64::MIN, i128::max);
+                assert_eq!(MaxPlus.checked(&a, &b, size), maxima);
+                if let Some(maxima) = maxima { assert_eq!(MaxPlus.inner(&a, &b, size), maxima); }
+                let minima = exact(i64::MAX, i128::min);
+                assert_eq!(MinPlus.checked(&a, &b, size), minima);
+                if let Some(minima) = minima { assert_eq!(MinPlus.inner(&a, &b, size), minima); }
             }
         }
+        let ([a, b], size) = ([1i64 << 40, -(1 << 40)], [1, 2, 1]);
+        assert_eq!(PlusTimes.checked(&[a, b], &[1 << 30, 1 << 30], size), Some(vec![0]), "products beyond i64 whose sum fits");
     }
 
     #[test]
