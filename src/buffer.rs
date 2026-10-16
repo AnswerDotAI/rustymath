@@ -58,6 +58,8 @@ macro_rules! buffers {
             #[inline]
             fn of(view: View<'_>) -> Option<&[Self]> { match view { View::$outer($view::$variant(v)) => Some(v), _ => None } }
             #[inline]
+            fn of_mut(buffer: &mut Buffer) -> Option<&mut [Self]> { match buffer { Buffer::$outer($owned::$variant(v)) => Some(v), _ => None } }
+            #[inline]
             fn view(items: &[Self]) -> View<'_> { View::$outer($view::$variant(items)) }
             #[inline]
             fn buffer(data: Vec<Self>) -> Buffer { Buffer::$outer($owned::$variant(data)) }
@@ -79,6 +81,8 @@ macro_rules! single {
             const DTYPE: DType = DType::$dtype;
             #[inline]
             fn of(view: View<'_>) -> Option<&[Self]> { match view { View::$variant(v) => Some(v), _ => None } }
+            #[inline]
+            fn of_mut(buffer: &mut Buffer) -> Option<&mut [Self]> { match buffer { Buffer::$variant(v) => Some(v), _ => None } }
             #[inline]
             fn view(items: &[Self]) -> View<'_> { View::$variant(items) }
             #[inline]
@@ -136,20 +140,6 @@ macro_rules! width_macros {
 width_macros!($ with_ints: Ints, with_width: Width { ; U8 => [u8], I16 => [i16], I32 => [i32], I64 => [i64] });
 width_macros!($ with_floats: Floats, with_float_width: FloatWidth { F16 => [$ crate::half::f16]; F32 => [f32], F64 => [f64] });
 width_macros!($ with_complexes: Complexes, with_complex_width: ComplexWidth { ; F32 => [$ crate::num_complex::Complex32], F64 => [$ crate::num_complex::Complex64] });
-
-/// Runs `$body` with the type `$t` standing for the element type of `$dtype`, a [`DType`].
-#[macro_export]
-macro_rules! with_dtype {
-    ($dtype:expr, $t:ident => $body:expr) => {
-        match $dtype {
-            $crate::buffer::DType::Boolean => { type $t = bool; $body }
-            $crate::buffer::DType::Integer(w) => $crate::with_width!(w, $t => $body),
-            $crate::buffer::DType::Float(w) => $crate::with_float_width!(w, $t => $body),
-            $crate::buffer::DType::Complex(w) => $crate::with_complex_width!(w, $t => $body),
-            $crate::buffer::DType::Character => { type $t = char; $body }
-        }
-    };
-}
 
 /// Runs `$body` with `$t` standing for the element type of `$dtype`, a computing dtype that [`DType::inexact`] gives: a 32- or 64-bit float, or a complex number. Any other dtype panics.
 #[macro_export]
@@ -342,6 +332,20 @@ macro_rules! dtypes {
 }
 element_types!((dtypes));
 
+/// Writes the flat dtype dispatch from the element table, without a second width/type list.
+macro_rules! dtype_macro {
+    ($d:tt [$($name:ident: ($($dtype:tt)+) $t:ty),+]) => {
+        /// Runs the body with its type name standing for the element type of the dtype.
+        #[macro_export]
+        macro_rules! with_dtype {
+            ($d dtype:expr, $d t:ident => $d body:expr) => {
+                match $d dtype { $($($dtype)+ => { type $d t = $t; $d body }),+ }
+            };
+        }
+    };
+}
+element_types!((dtype_macro) $);
+
 /// Items of one element type.
 #[derive(Clone, Debug)]
 pub enum Buffer { Booleans(Vec<bool>), Integers(IntBuf), Floats(FloatBuf), Complexes(ComplexBuf), Characters(Vec<char>) }
@@ -435,6 +439,8 @@ pub trait Element: Copy + Send + Sync {
     const DTYPE: DType;
     /// The items of `view`, when they have this type.
     fn of(view: View<'_>) -> Option<&[Self]>;
+    /// The writable items of `buffer`, when they have this type. The allocation and length don't change.
+    fn of_mut(buffer: &mut Buffer) -> Option<&mut [Self]>;
     /// `items` as a view.
     fn view(items: &[Self]) -> View<'_>;
     /// A buffer that holds `data`.
@@ -559,6 +565,18 @@ fn boolean(view: View<'_>, i: usize) -> Result<bool, Error> {
 }
 
 impl Buffer {
+    /// Flattened positions whose item differs from its type's fill (zero, false or a space).
+    pub fn nonzero(view: View<'_>) -> Vec<usize> {
+        with_dtype!(view.dtype(), T => T::of(view).expect("matching dtype").iter().enumerate().filter_map(|(i, &x)| (x != T::FILL).then_some(i)).collect())
+    }
+    /// Copies a structural walk, using the type's fill for missing positions and whole-slice copies for contiguous runs.
+    pub fn walked(view: View<'_>, steps: &[crate::gather::Steps]) -> Self {
+        with_dtype!(view.dtype(), T => {
+            let mut out = Vec::with_capacity(steps.iter().map(crate::gather::Steps::len).product());
+            crate::gather::walk(&mut out, T::of(view).expect("matching dtype"), 0, steps, T::FILL, crate::gather::Same);
+            T::buffer(out)
+        })
+    }
     /// A new buffer holding the items of `view` in `range`.
     pub fn copied(view: View<'_>, range: std::ops::Range<usize>) -> Self {
         let mut b = Self::with_capacity(view.dtype(), range.len());

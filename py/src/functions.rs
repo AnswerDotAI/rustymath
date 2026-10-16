@@ -15,7 +15,9 @@ use rustymath::buffer::{Buffer, ComplexWidth, DType, Element, FloatWidth, Source
 use rustymath::error::{Error, Kind};
 use rustymath::layout::{position, Lanes, Layout};
 use rustymath::operation::{BinaryKernel, FoldKernel, Kernels, ScanKernel, TernaryKernel, UnaryKernel};
-use rustymath::tolerant::{Ceil, Equal, Floor, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue, Tolerance};
+use rustymath::linalg::Scalar;
+use rustymath::stats;
+use rustymath::tolerant::{Ceil, Equal, Floor, FloorDivide, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue, Tolerance};
 use rustymath::{Flipped, kernels, reduce, with_ints};
 use rustymath_buffer::{name, py_err};
 
@@ -65,6 +67,22 @@ pub enum Axes {
     One(Axis),
     #[pyo3(annotation = "tuple")]
     Many(Vec<Axis>),
+}
+
+impl Axes {
+    fn positions(&self, layout: &Layout) -> PyResult<Vec<usize>> {
+        let mut axes = match self {
+            Self::One(a) => vec![a.of(layout)?],
+            Self::Many(axes) => axes.iter().map(|a| a.of(layout)).collect::<PyResult<_>>()?,
+        };
+        axes.sort_unstable();
+        axes.dedup();
+        Ok(axes)
+    }
+}
+
+fn axes_of(axis: Option<&Axes>, layout: &Layout) -> PyResult<Vec<usize>> {
+    axis.map_or_else(|| Ok((0..layout.shape().len()).collect()), |a| a.positions(layout))
 }
 
 /// Running a function object's kernels on a call's Python arguments, for each arity.
@@ -119,12 +137,10 @@ fn fold<'py, R>(py: Python<'py>, function: &str, kernels: &Kernels<FoldKernel<R>
 fn totals<R>(function: &str, kernels: &Kernels<FoldKernel<R>>, r: &R, view: View<'_>, mut layout: Layout, axis: Option<&Axes>) -> PyResult<Option<Core>> {
     let mut steps: Vec<Option<usize>> = match axis {
         None => vec![None],
-        Some(Axes::One(a)) => vec![Some(a.of(&layout)?)],
-        Some(Axes::Many(axes)) => axes.iter().map(|a| a.of(&layout).map(Some)).collect::<PyResult<_>>()?,
+        Some(axes) => axes.positions(&layout)?.into_iter().map(Some).collect(),
     };
     // The last axis first, so that each later position still names its axis.
     steps.sort_unstable_by(|a, b| b.cmp(a));
-    steps.dedup();
     let mut buffer: Option<Buffer> = None;
     for step in steps {
         let view = buffer.as_ref().map_or(view, Buffer::view);
@@ -188,6 +204,40 @@ const REAL: &[DType] = &[DType::Float(FloatWidth::F16), DType::Float(FloatWidth:
 const COMPLEX: &[DType] = &[DType::Complex(ComplexWidth::F32), DType::Complex(ComplexWidth::F64)];
 
 functions! {
+    /// Bitwise AND, logical for Booleans.
+    bitwise_and(x, y) = rustymath::BitAnd;
+    /// Bitwise OR, logical for Booleans.
+    bitwise_or(x, y) = rustymath::BitOr;
+    /// Bitwise XOR, logical for Booleans.
+    bitwise_xor(x, y) = rustymath::BitXor;
+    /// Bitwise complement, logical negation for Booleans.
+    bitwise_not(x) = rustymath::BitNot;
+    /// Shift left, discarding high bits. The count must be below the item width.
+    left_shift(x, y) = rustymath::LeftShift;
+    /// Shift right, preserving signed integers' sign bit. The count must be below the item width.
+    right_shift(x, y) = rustymath::RightShift;
+    /// Convert radians to degrees.
+    degrees(x) = rustymath::Scale(180.0 / ::std::f64::consts::PI);
+    /// Convert degrees to radians.
+    radians(x) = rustymath::Scale(::std::f64::consts::PI / 180.0);
+    /// Whether x has a NaN part.
+    isnan(x) = rustymath::Isnan;
+    /// Whether every part of x is finite.
+    isfinite(x) = rustymath::Isfinite;
+    /// Whether x has an infinite part.
+    isinf(x) = rustymath::Isinf;
+    /// The real part of x, with real numbers unchanged.
+    real(x) = rustymath::Real;
+    /// The imaginary part of x, zero for real numbers.
+    imag(x) = rustymath::Imag;
+    /// The complex conjugate of x, with real numbers unchanged.
+    conj(x) = rustymath::Conj;
+    /// Rounding toward zero, with whole numbers unchanged.
+    trunc(x) = rustymath::Trunc;
+    /// Rounding to the nearest whole number, with ties to even.
+    rint(x) = rustymath::Rint;
+    /// Clip x between lower and upper bounds, in one pass. The bounds broadcast as other arguments do.
+    clip(x, lower, upper) = rustymath::Clip;
     /// e^x.
     exp(x) = rustymath::Exp;
     /// e^x - 1, without the loss of digits near 0 that `exp(x) - 1` has.
@@ -320,6 +370,8 @@ functions! {
     ceil(x; ct) = Ceil(ct);
     /// The remainder of x divided by y, with the sign of y. A zero y gives x, by APL's rule. For floats, a quotient within relative tolerance `ct` of a whole number counts as whole, giving 0.
     remainder(x, y; ct) = Flipped(Residue(ct));
+    /// The floor of x / y. For floats, a quotient within relative tolerance `ct` of a whole number gives that number, where `remainder` gives 0. Integer division is exact, and fails on a zero divisor or an overflowing quotient.
+    floor_divide(x, y; ct) = FloorDivide(ct);
     /// The greatest common divisor of x and y, never negative for integers and floats. Each remainder step of floats and complex numbers uses relative tolerance `ct`.
     gcd(x, y; ct) = Gcd(ct);
     /// The least common multiple of x and y, with the sign of x y. Each remainder step of floats uses relative tolerance `ct`.
@@ -410,10 +462,142 @@ fn logical_scan<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, table: [[bool; 2]; 
     give(py, Core::new(layout, Buffer::Booleans(out)).map_err(py_err)?, false)
 }
 
+enum Summary { Mean, Variance(usize), Std(usize), Norm(f64) }
+
+/// Shared conversion, axis preparation and wrapping for statistical reductions. Numerical loops live in `rustymath::stats`.
+fn summary<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, axis: Option<Axes>, how: Summary) -> PyResult<Bound<'py, PyAny>> {
+    let x = one(x)?;
+    let layout = x.layout();
+    let axes = stats::Axes::new(&layout, &axes_of(axis.as_ref(), &layout)?).map_err(py_err)?;
+    let compute = x.view().dtype().inexact().ok_or_else(|| missing("statistics", x.view().dtype()))?.0;
+    let items = x.at(compute)?;
+    let out = rustymath::with_inexact!(compute, T => {
+        let data = axes.read(items.of::<T>());
+        match how {
+            Summary::Mean => T::buffer(stats::mean(&data, axes.dims)),
+            Summary::Variance(ddof) => <T as Scalar>::Real::buffer(stats::variance(&data, axes.dims, ddof)),
+            Summary::Std(ddof) => <T as Scalar>::Real::buffer(stats::stddev(&data, axes.dims, ddof)),
+            Summary::Norm(p) => <T as Scalar>::Real::buffer(stats::norm(&data, axes.dims, p)),
+        }
+    });
+    let scalar = axes.layout.shape().is_empty();
+    give(py, Core::new(axes.layout, out).map_err(py_err)?, scalar)
+}
+
+/// Arithmetic mean over every axis, or the axes given by positions or names. Float16 accumulates and returns float32.
+#[pyfunction]
+#[pyo3(signature = (x, axis=None))]
+pub(crate) fn mean<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, axis: Option<Axes>) -> PyResult<Bound<'py, PyAny>> { summary(py, x, axis, Summary::Mean) }
+
+/// Two-pass variance, real for complex data, with denominator item count minus ddof. A nonpositive denominator gives NaN.
+#[pyfunction]
+#[pyo3(signature = (x, axis=None, ddof=0))]
+pub(crate) fn var<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, axis: Option<Axes>, ddof: usize) -> PyResult<Bound<'py, PyAny>> { summary(py, x, axis, Summary::Variance(ddof)) }
+
+/// The square root of var, over the same axes and with the same ddof.
+#[pyfunction]
+#[pyo3(signature = (x, axis=None, ddof=0))]
+pub(crate) fn std<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, axis: Option<Axes>, ddof: usize) -> PyResult<Bound<'py, PyAny>> { summary(py, x, axis, Summary::Std(ddof)) }
+
+/// Elementwise p-norm over the selected axes. ord=0 counts nonzeros; ±inf gives the greatest/least magnitude. This is not a matrix-induced norm.
+#[pyfunction]
+#[pyo3(signature = (x, axis=None, ord=2.0))]
+pub(crate) fn norm<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, axis: Option<Axes>, ord: f64) -> PyResult<Bound<'py, PyAny>> {
+    if ord.is_nan() { return Err(PyValueError::new_err("norm's ord cannot be NaN")); }
+    summary(py, x, axis, Summary::Norm(ord))
+}
+
+/// Weighted average over the selected axes. Weights broadcast by the ordinary leading-axis/keyed-axis rules. Without weights, this is mean.
+#[pyfunction]
+#[pyo3(signature = (x, axis=None, weights=None))]
+pub(crate) fn average<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, axis: Option<Axes>, weights: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+    let Some(weights) = weights else { return mean(py, x, axis) };
+    let call = convert(&[x, weights])?;
+    let (x, w) = (&call.args[0], &call.args[1]);
+    let agreement = Agreement::new(&x.layout(), &w.layout()).map_err(py_err)?;
+    let axes = stats::Axes::new(&agreement.layout, &axes_of(axis.as_ref(), &agreement.layout)?).map_err(py_err)?;
+    let compute = x.view().dtype().inexact().ok_or_else(|| missing("average", x.view().dtype()))?.0;
+    let (x, w) = (x.at(compute)?, w.at(compute)?);
+    let out = rustymath::with_inexact!(compute, T => T::buffer(stats::average(x.of::<T>(), w.of::<T>(), &axes, [&agreement.left, &agreement.right])));
+    let scalar = axes.layout.shape().is_empty();
+    give(py, Core::new(axes.layout, out).map_err(py_err)?, scalar)
+}
+
+fn covariance<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, rowvar: bool, ddof: usize, correlation: bool) -> PyResult<Bound<'py, PyAny>> {
+    let x = one(x)?;
+    let layout = x.layout();
+    let (size, rowvar, output) = match *layout.shape() {
+        [] => ([1, 1], true, Layout::EMPTY),
+        [n] => ([1, n], true, Layout::EMPTY),
+        [rows, cols] => {
+            let variables = layout.axes([usize::from(!rowvar)].into_iter());
+            ([rows, cols], rowvar, variables.concat(&variables).unique_names())
+        },
+        _ => return Err(PyValueError::new_err("covariance takes a vector or a matrix")),
+    };
+    let compute = x.view().dtype().inexact().ok_or_else(|| missing("covariance", x.view().dtype()))?.0;
+    let items = x.at(compute)?;
+    let out = rustymath::with_inexact!(compute, T => T::buffer(stats::covariance(items.of::<T>(), size, rowvar, ddof, correlation)));
+    let scalar = output.shape().is_empty();
+    give(py, Core::new(output, out).map_err(py_err)?, scalar)
+}
+
+/// Covariance of variables in the rows of a matrix, or columns with rowvar=False. A vector gives its variance.
+#[pyfunction]
+#[pyo3(signature = (x, rowvar=true, ddof=1))]
+pub(crate) fn cov<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, rowvar: bool, ddof: usize) -> PyResult<Bound<'py, PyAny>> { covariance(py, x, rowvar, ddof, false) }
+
+/// Correlation of variables in the rows of a matrix, or columns with rowvar=False. Constant variables give NaN.
+#[pyfunction]
+#[pyo3(signature = (x, rowvar=true))]
+pub(crate) fn corrcoef<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, rowvar: bool) -> PyResult<Bound<'py, PyAny>> { covariance(py, x, rowvar, 0, true) }
+
+/// Histogram counts and edges. bins is a positive count (10 by default), or strictly increasing edges. `range` sets the span of a bin count. Explicit edges take no `range`. The final bin includes its upper edge; out-of-range values and NaNs are ignored.
+#[pyfunction]
+#[pyo3(signature = (x, bins=None, range=None))]
+pub(crate) fn histogram<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, bins: Option<&Bound<'py, PyAny>>, range: Option<(f64, f64)>) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+    let count = bins.map_or(Ok(10), |b| b.extract::<usize>());
+    let edges = if count.is_err() { bins } else { None };
+    if edges.is_some() && range.is_some() { return Err(PyValueError::new_err("histogram's range applies to a bin count, not to explicit edges")); }
+    let call = convert(&[Some(x), edges].into_iter().flatten().collect::<Vec<_>>())?;
+    let dtype = call.args[0].view().dtype();
+    let compute = dtype.inexact().filter(|(d, _)| !matches!(d, DType::Complex(_))).ok_or_else(|| missing("histogram", dtype))?.0;
+    let x = call.args[0].at(compute)?;
+    let explicit = call.args.get(1).map(|a| a.at(compute)).transpose()?;
+    let (counts, edges) = rustymath::with_float_width!(kernel match compute { DType::Float(w) => w, _ => unreachable!() }, F => Some({
+        let data = F::of(x.view()).expect("histogram computes at a float width");
+        let edges = match explicit.as_ref() {
+            Some(e) => e.of::<F>().to_vec(),
+            None => stats::histogram_edges(data, count.unwrap_or(10), range).map_err(py_err)?,
+        };
+        (stats::histogram(data, &edges).map_err(py_err)?, F::buffer(edges))
+    })).expect("histogram computes in float32 or float64");
+    let counts = give(py, Core::new(Layout::from([counts.len()]), i64::buffer(counts)).map_err(py_err)?, false)?;
+    let edges = give(py, Core::new(Layout::from([edges.len()]), edges).map_err(py_err)?, false)?;
+    Ok((counts, edges))
+}
+
+/// Decimal rounding to nearest, with ties to even. Negative precisions round to tens, hundreds and so on.
+#[pyfunction]
+#[pyo3(signature = (x, decimals=0))]
+pub(crate) fn round<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, decimals: i32) -> PyResult<Bound<'py, PyAny>> {
+    let k = rustymath::Round::new(decimals);
+    kernels!(Unary of k).apply(py, "round", &k, &[x])
+}
+
 /// Adds the elementwise functions, reductions and scans to `m`.
 pub fn add_to(m: &Bound<'_, PyModule>) -> PyResult<()> {
     add_elementwise(m)?;
     add_reductions(m)?;
     m.add_function(wrap_pyfunction!(minmax, m)?)?;
-    m.add_function(wrap_pyfunction!(logical_scan, m)?)
+    m.add_function(wrap_pyfunction!(logical_scan, m)?)?;
+    m.add_function(wrap_pyfunction!(mean, m)?)?;
+    m.add_function(wrap_pyfunction!(average, m)?)?;
+    m.add_function(wrap_pyfunction!(var, m)?)?;
+    m.add_function(wrap_pyfunction!(self::std, m)?)?;
+    m.add_function(wrap_pyfunction!(norm, m)?)?;
+    m.add_function(wrap_pyfunction!(cov, m)?)?;
+    m.add_function(wrap_pyfunction!(corrcoef, m)?)?;
+    m.add_function(wrap_pyfunction!(histogram, m)?)?;
+    m.add_function(wrap_pyfunction!(round, m)?)
 }

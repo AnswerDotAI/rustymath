@@ -15,6 +15,34 @@ pub struct Multiply;
 #[derive(Clone, Copy, Debug)]
 pub struct Divide;
 
+macro_rules! bitwise {
+    ($($(#[doc = $doc:literal])* $name:ident [$($x:ident),+] $body:expr;)+) => {$(
+        $(#[doc = $doc])*
+        #[derive(Clone, Copy, Debug)]
+        pub struct $name;
+        forms!($name at bool, u8, i16, i32, i64: |_, [$($x),+]| $body);
+    )+};
+}
+bitwise! {
+    /// Bitwise AND, or logical AND of Booleans.
+    BitAnd [x, y] x & y;
+    /// Bitwise OR, or logical OR of Booleans.
+    BitOr [x, y] x | y;
+    /// Bitwise XOR, or logical XOR of Booleans.
+    BitXor [x, y] x ^ y;
+    /// Bitwise complement, or logical negation of a Boolean.
+    BitNot [x] !x;
+}
+
+/// Left shift, discarding high bits. A negative count or one at least the item width fails.
+#[derive(Clone, Copy, Debug)]
+pub struct LeftShift;
+/// Right shift, retaining the sign bit for signed integers. A negative count or one at least the item width fails.
+#[derive(Clone, Copy, Debug)]
+pub struct RightShift;
+forms!(LeftShift at u8, i16, i32, i64: |_, [x, y]| u32::try_from(y).ok().and_then(|y| x.checked_shl(y)));
+forms!(RightShift at u8, i16, i32, i64: |_, [x, y]| u32::try_from(y).ok().and_then(|y| x.checked_shr(y)));
+
 // The float and complex forms are `#[inline]`, as the integer forms are, so that a caller's own loop over items, such as a fold's, inlines them.
 forms!(#[inline] Add at real: |_, [x, y]| Total(x + y));
 forms!(#[inline] Subtract at real: |_, [x, y]| Total(x - y));

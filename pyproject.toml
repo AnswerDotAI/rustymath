@@ -41,3 +41,4 @@ testpaths = ["tests"]
 [tool.nbdev]
 lib_path = "python/rustymath"
 put_version_in_init = false
+custom_sidebar = true

@@ -5,11 +5,12 @@ mod slice;
 mod arc;
 mod arith;
 pub mod agreement;
-pub mod array;
 #[macro_use]
 pub mod buffer;
+pub mod array;
 mod complex;
 pub mod convert;
+pub mod create;
 mod dd;
 pub mod distribution;
 pub mod error;
@@ -35,6 +36,7 @@ pub mod random;
 pub mod reduce;
 pub mod search;
 mod special;
+pub mod stats;
 mod sqrts;
 pub mod structure;
 mod table;
@@ -43,13 +45,13 @@ mod trig;
 #[cfg(accelerate)]
 mod vforce;
 
-pub use arith::{Add, Divide, Multiply, Subtract};
+pub use arith::{Add, Divide, Multiply, Subtract, BitAnd, BitOr, BitXor, BitNot, LeftShift, RightShift};
 /// The crates whose types compact buffers hold, which the exported width macros name.
 pub use {half, num_complex};
 pub use complex::{Cis, divide};
 pub use float::{FUSED, Float, Native};
 pub use ln::Logb;
-pub use parts::{Abs, Angle, Sign};
+pub use parts::{Abs, Angle, Sign, Isnan, Isfinite, Isinf, Real, Imag, Conj, Trunc, Rint, Clip, Scale, Round};
 pub use pow::{Pow, Root};
 pub use slice::{Arg, Binary, CHUNK, Flipped, Ternary, Unary, pairs};
 pub use special::{Erfc, Erfcinv, Erfinv};

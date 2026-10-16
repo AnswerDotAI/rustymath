@@ -1,4 +1,4 @@
-## Using rustymath from Rust
+# Using rustymath from Rust
 
 Add rustymath to your `Cargo.toml`:
 
@@ -36,6 +36,21 @@ let mut squares = Vec::new();
 Pow.many(Arg::Many(&[1.5, 2.0, 3.0]), Arg::One(2.0), 3, &mut squares); // squares: [2.25, 4.0, 9.0]
 ```
 
+[`kernels!`](https://docs.rs/rustymath/latest/rustymath/macro.kernels.html) gives an object's kernels as function pointers, one at each dtype where the object has a form, for code that chooses a dtype at run time. Its documentation gives the forms it takes. `Kernels::computes` gives the dtype that an argument computes in. `Kernels::unary`, `binary`, `ternary`, `fold`, `scan` and `product` cast an argument there and run the kernel:
+
+```rust
+use rustymath::buffer::{DType, FloatWidth, Width};
+use rustymath::tolerant::{Equal, Tolerance};
+use rustymath::{kernels, reduce::Sum, Exp};
+
+let exp = kernels!(Unary Exp);
+assert_eq!(exp.computes(DType::Integer(Width::I32)), Some(DType::Float(FloatWidth::F64)));
+let equal = kernels!(Binary of Equal(Tolerance::new(1e-14).unwrap()));
+assert!(equal.at(DType::Float(FloatWidth::F64)).is_some());
+let sum = kernels!(Fold Sum);
+assert_eq!(sum.computes(DType::Boolean), Some(DType::Integer(Width::I64)));
+```
+
 Use the slice forms of `Sin`, `Cos` and `Tan` for arrays. They reduce each item by multiples of π with a few multiply-adds, then give the rare items beyond 2^23 at f64, or 2^20 at f32, an exact reduction in integer arithmetic. The free `sin` takes a branch for those items. That branch stops a loop that calls it from vectorizing.
 
 `atan2(y, x)` and its object `Atan2` give the angle of the point (x, y), from -π to π. `y` comes first, as in `f64::atan2`.
@@ -44,7 +59,7 @@ The complex slice forms of `Exp`, `Ln`, `Pow`, `Sin`, `Cos`, `Sinh` and `Cosh` v
 
 `divide(x, y)` divides complex numbers, inline in the caller's loop, as the free functions do. Two real arguments divide as reals, so a real zero divisor gives ±∞ or NaN with an imaginary part of 0. Its formula's |y|² overflows beyond about 1e154 at f64 and 1e19 at f32.
 
-### Tolerant comparison
+## Tolerant comparison
 
 The `tolerant` module has APL's tolerant comparison: x equals y when |x - y| is less than the tolerance times the larger of |x| and |y|. Its objects, such as `Equal`, `Less`, `Floor`, `Residue` and `Gcd`, each hold a `Tolerance`. With `Tolerance::EXACT`, a slice form runs a loop of plain IEEE comparisons, chosen once per call.
 
@@ -55,7 +70,7 @@ let mut same = Vec::new();
 Equal(Tolerance::DEFAULT).many(Arg::Many(&[0.3, 0.1 + 0.2, 0.31]), Arg::One(0.3), 3, &mut same); // same: [true, true, false]
 ```
 
-### Other modules
+## Other modules
 
 - `number_theory`: primality, factorisation, next and previous primes, Euler's totient, and the enumeration and counting of primes, on a `u64`, a `u128` or a `BigUint`. Each computes in the narrowest of those that holds the value. A function that can run for a long time also has a `_with` version, whose extra argument is a check that can stop it. `factorial` gives n! as a `BigUint`.
 - `optimize`: `minimize` finds the minimum of a function of an `f32` or `f64` slice, by Brent's method for one variable, Nelder–Mead, Powell's conjugate directions, L-BFGS with a gradient, or differential evolution within bounds. `solve` finds a zero of a function that gives a slice, or its least-squares solution, by Brent's method for one equation in one variable and Levenberg–Marquardt otherwise. `solve_linear` solves a linear system, or its least squares, through the matrix's products with vectors, by conjugate gradients, MINRES or restarted GMRES, with an optional preconditioner. `solve_affine` solves f(x) = 0 for an affine function the same way, through its values alone. `Method::choose` picks a method where the caller doesn't. Functions are `Objective`s and `Mapping`s: closures that return a `Result`, whose error stops the search, or types that also give a gradient, vector–Jacobian products or batches of points.
@@ -65,13 +80,16 @@ Equal(Tolerance::DEFAULT).many(Arg::Many(&[0.3, 0.1 + 0.2, 0.31]), Arg::One(0.3)
 - `exact`: `residue`, `gcd`, `lcm` and `binom` of exact rationals, at any integer type, such as `BigRational`. `linalg::exact` solves matrices of them.
 - `distribution`: sixteen distributions. The objects `Pdf`, `Cdf` and `Quantile` hold a distribution and evaluate it over a slice. Each distribution also samples from a seeded generator.
 - `array`: `Array`, a `Layout` paired with the `Buffer` that holds one item for each of its positions, in row-major order.
+- `create`: filled arrays and integer or floating ranges, evenly spaced values and logarithmically spaced values.
+- `stats`: means, two-pass variance and standard deviation, weighted averages, elementwise p-norms, covariance, correlation and histograms. `Axes` prepares reductions over selected axes. Complex variance and norms return real values.
+- `search`: exact search and classification, stable counting/radix sorting, partitioning and quantiles. `select` places requested ranks without ordering the intervening runs. View-based entry points share the supported dtypes with BasedPL and Python. Ordering compares floats exactly, equates signed zeros and puts NaNs last ascending.
 - `buffer`: compact buffers. `Buffer` holds items of one element type, and `View` borrows them. `DType` names the type: Booleans, integers of four widths (`Width`), floats of three (`FloatWidth`), complex numbers of two (`ComplexWidth`), or characters. `DType::common` gives the dtype that NumPy promotes two dtypes to, and `DType::inexact` the dtype that a function of floats computes in. `IntBuf`, `FloatBuf` and `ComplexBuf` hold one family's widths, with the views `Ints`, `Floats` and `Complexes`. The macros `with_ints!`, `with_floats!` and `with_complexes!` run code on a view's slice, and `with_width!`, `with_float_width!` and `with_complex_width!` on a width's element type. `with_dtype!` runs code on a `DType`'s element type. `Element` gives each element type's fill, and `of`, `view` and `buffer` move between its slices and a `View` or a `Buffer`. `Source` reads an item of one type as another.
 - `error`: `Error`, which the functions on arrays return, with its `Kind` (Length, Rank, Index, Limit, Domain or Overflow) and a message.
 - `layout`: array shapes, axis keys and names, and their limits. `Shape` holds an array's axis lengths. `Keys` names the positions on one axis. `Layout` pairs a shape with keys and a name for each axis. `Layout::axis_named` finds an axis by its name. `position` gives the position among an axis's length that an index gives, counting from the end when it's negative. `Lanes` describes an array's items as lanes along one axis, with the `offset` of each item and the `dims` that rustymath's axis functions take. `element_count` and `generated_len` count an array's items, within `MAX_RANK` axes and `MAX_GENERATED_ELEMENTS` items. `strides` gives the distance between neighbouring items along each axis.
 - `agreement`: broadcasting by BPL's rule. `Agreement::new` pairs the axes of two layouts: axes with the same name first, then the rest from the front. An axis of length 1 repeats along its partner, and an axis that both layouts key takes the union of their keys. The result is the paired layout and a `Mapping` for each argument, which gives the argument's offset for each result position. `blocks` runs a kernel over two slices through an agreement, passing contiguous runs whole, and `expanded` reads one argument's items for a range of result positions. `Agreement` is generic over its layout type, so a caller can carry its own data on layouts through `map_layout`. `Frames` pairs the frames of any number of arguments to a function of their trailing axes, such as the matrices of a stack, and gives each argument's cell for each cell of the result.
 - `random`: rolls and deals that fill a slice from one generator.
 - `gather`: copying a slice's items into a buffer by position: `cycle`, `repeat`, `compress` by a mask, `take` at indices, `windows`, `walk` along a pattern of `Steps` with fills, and `scatter` at offsets, each applying the caller's conversion to each item. `walk` also takes `Same`, which copies whole slices of one type. `Steps::reach` gives the source offset of one item of a walk, and `Steps::run` the offset of a run of items that lie in order in the source.
-- `structure`: plans for structural operations. A `Plan` holds the result's `Layout` and the `Steps` that `walk` reads it by. `take` takes or drops items, `rotate` rotates or reverses an axis, with one count or one for each lane, `transpose` sends axes to new positions, and `catenate` gives the layout of two arrays joined along an axis. `Windows` plans windows over leading axes, with fill around padded axes, and each window of a stencil. Each plan checks its arguments. Keys and names follow their positions.
+- `structure`: plans for structural operations. A `Plan` holds the result's `Layout` and the `Steps` that `walk` reads it by. `select` applies independent axis selectors for positions, ranges, index arrays and inserted axes. Index arrays with axis names pair by name, and `index_positions` lets them read fill outside their axis. `take` takes or drops items, `rotate` rotates or reverses an axis, with one count or one for each lane, `transpose` sends axes to new positions, and `catenate` gives the layout of two arrays joined along an axis. `Windows` plans windows over leading axes, with fill around padded axes, and each window of a stencil. Each plan checks its arguments. Keys and names follow their positions.
 - `convert`: `int` converts a whole float to an integer type. It gives `None` outside the type's range, and for `i64` and `u32` beyond a magnitude of 2^51 - 1. `float` converts an integer to the nearest float. Loops that call either vectorize on every target. AVX2 and wasm lack a vector instruction between `f64` and 64-bit integers. On those targets a loop that converts with `as` runs one item at a time.
 
 The special functions `gamma`, `lgamma`, `erf`, `erfc`, their inverses, the incomplete gamma and beta functions and Lambert W have free functions and objects at the crate root, as the elementary functions do.

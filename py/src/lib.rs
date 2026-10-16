@@ -5,6 +5,7 @@ use rustymath::tolerant::{Tolerance, Tolerant};
 
 mod array;
 mod convert;
+mod create;
 mod distribution;
 mod exact;
 mod functions;
@@ -13,7 +14,9 @@ mod linalg;
 mod number_theory;
 mod optimize;
 mod polynomial;
+mod random;
 mod search;
+mod structure;
 
 /// Sets the thread limit for calls made on this thread, returning its previous setting. 0 restores the default, 1 runs serially.
 #[pyfunction]
@@ -32,11 +35,13 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_function(f)?;
     }
     array::add(m)?;
+    create::add(m)?;
+    structure::add(m)?;
     polynomial::add(m)?;
     search::add(m)?;
     for (name, add) in [
         ("number_theory", number_theory::add as fn(&Bound<'_, PyModule>) -> PyResult<()>), ("distribution", distribution::add), ("linalg", linalg::add),
-        ("exact", exact::add), ("integer", integer::add), ("optimize", optimize::add),
+        ("exact", exact::add), ("integer", integer::add), ("optimize", optimize::add), ("random", random::add),
     ] {
         let sub = PyModule::new(m.py(), name)?;
         add(&sub)?;

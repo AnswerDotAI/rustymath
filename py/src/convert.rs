@@ -2,7 +2,7 @@
 use crate::array::Array;
 use rustymath::half::f16;
 use rustymath::num_complex::{Complex32, Complex64};
-use pyo3::exceptions::{PySystemError, PyTypeError};
+use pyo3::exceptions::{PySystemError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyComplex, PyDict, PyFloat, PyInt, PyList, PyRange, PyString, PyTuple};
 use rustymath::array::Array as Core;
@@ -13,6 +13,11 @@ use rustymath::with_dtype;
 use rustymath_buffer::{Read, name, py_err, read};
 use std::borrow::Cow;
 use std::sync::Arc;
+
+/// The shared compact dtype named `name`, or a Python argument error.
+pub fn dtype(name: &str) -> PyResult<DType> {
+    rustymath_buffer::named(name).ok_or_else(|| PyValueError::new_err(format!("unknown dtype {name:?}")))
+}
 
 /// One data argument, converted, and whether it was a Python scalar, as `scalar` tests.
 pub struct Arg<'py> { source: Source<'py>, pub scalar: bool }
@@ -337,8 +342,8 @@ fn build(layout: Layout, pieces: &[Piece], dtype: DType) -> PyResult<Core> {
     Core::new(layout, buffer).map_err(py_err)
 }
 
-/// Converts a call's data arguments to one dtype.
-pub fn convert<'py>(args: &[&Bound<'py, PyAny>]) -> PyResult<Call<'py>> {
+/// Converts arguments together, optionally at a constructor's explicit dtype.
+fn convert_at<'py>(args: &[&Bound<'py, PyAny>], forced: Option<DType>) -> PyResult<Call<'py>> {
     let mut strong = None;
     let pending = args.iter().map(|a| classify(a, &mut strong)).collect::<PyResult<Vec<_>>>()?;
     let mut weak: Option<DType> = None;
@@ -351,16 +356,34 @@ pub fn convert<'py>(args: &[&Bound<'py, PyAny>]) -> PyResult<Call<'py>> {
             if weak.is_none_or(|w| d.kind() > w.kind()) { weak = Some(d); }
         }
     }
-    let target = target(strong, weak)?;
+    let inferred = target(strong, weak)?;
+    let target = forced.unwrap_or(inferred);
     // Every array and nested buffer widens to `strong`, so this one check guards the casts here and in `build`.
-    if let Some(s) = strong.filter(|&s| !s.widens_to(target)) { return Err(PySystemError::new_err(format!("internal error: promotion would narrow {} to {}", name(s), name(target)))); }
-    let args = pending.into_iter().map(|p| match p {
-        Pending::Array(a) if a.view().dtype() == target => Ok(a),
-        Pending::Array(a) => Core::new(a.layout(), Buffer::cast(a.view(), target).map_err(py_err)?).map(|c| Arg { source: Source::Owned(c), scalar: false }).map_err(py_err),
-        Pending::Values(layout, pieces, scalar) => build(layout, &pieces, target).map(|c| Arg { source: Source::Owned(c), scalar }),
+    if forced.is_none() && let Some(s) = strong.filter(|&s| !s.widens_to(target)) {
+        return Err(PySystemError::new_err(format!("internal error: promotion would narrow {} to {}", name(s), name(target))));
+    }
+    let args = pending.into_iter().map(|p| {
+        let a = match p {
+            Pending::Array(a) => a,
+            Pending::Values(layout, pieces, scalar) => {
+                // Leaf readers narrow within a kind. Lowering a kind uses the shared whole-buffer cast's truncation/validation rules.
+                let at = if target.kind() < inferred.kind() { inferred } else { target };
+                Arg { source: Source::Owned(build(layout, &pieces, at)?), scalar }
+            }
+        };
+        if a.view().dtype() == target { return Ok(a); }
+        Core::new(a.layout(), Buffer::cast(a.view(), target).map_err(py_err)?).map(|c| Arg { source: Source::Owned(c), scalar: a.scalar }).map_err(py_err)
     }).collect::<PyResult<Vec<_>>>()?;
     Ok(Call { args })
 }
 
+/// Converts a call's data arguments to their promoted dtype.
+pub fn convert<'py>(args: &[&Bound<'py, PyAny>]) -> PyResult<Call<'py>> { convert_at(args, None) }
+
 /// Converts one data argument.
 pub fn one<'py>(x: &Bound<'py, PyAny>) -> PyResult<Arg<'py>> { Ok(convert(&[x])?.args.into_iter().next().expect("one argument gives one")) }
+
+/// Converts one argument to an explicit dtype, constructing Python values there and borrowing matching arrays.
+pub fn one_at<'py>(x: &Bound<'py, PyAny>, dtype: DType) -> PyResult<Arg<'py>> {
+    Ok(convert_at(&[x], Some(dtype))?.args.into_iter().next().expect("one argument gives one"))
+}

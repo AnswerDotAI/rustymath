@@ -186,7 +186,7 @@ macro_rules! each {
 ///
 /// A function object is a concrete type, never a generic one, so that its forms compile here. Settings that choose a loop, such as whether a tolerance is 0, are read once per call inside `many`, which then runs `each!`.
 ///
-/// ```ignore
+/// ```text
 /// forms!(Sqrt at real: |_, [x]| x.sqrt());
 /// forms!(Abs at Complex<f32> => f32, Complex<f64> => f64: |_, [z]| p::hypot::<_, { crate::FUSED }>(z.re, z.im));
 /// forms!(Gcd at i64: |_, [x, y]| gcd(x, y));

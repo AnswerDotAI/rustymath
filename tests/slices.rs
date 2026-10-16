@@ -420,6 +420,25 @@ mod search {
     use rustymath::search::*;
 
     #[test]
+    fn selected_order() {
+        use rustymath::buffer::{Element, View};
+        let x: Vec<i64> = (0..1000).map(|i| (i * 37 % 13) - 6).collect();
+        for down in [false, true] {
+            let order = view_grade(i64::view(&x), down).unwrap();
+            assert_eq!(i64::vec(view_sort(i64::view(&x), down).unwrap()).unwrap(), order.iter().map(|&i| x[i as usize]).collect::<Vec<_>>());
+            for range in [0..10, 495..505, 999..1000] {
+                let selected = select_positions(x.len(), range.clone(), |a, b| if down { x[b].cmp(&x[a]) } else { x[a].cmp(&x[b]) });
+                assert_eq!(selected, order[range]);
+            }
+        }
+        let mut x = [9., 1., 5., 3., 7.];
+        assert_eq!(quantiles(&mut x, &[0., 0.25, 0.5, 1.]).unwrap(), [1., 3., 5., 9.]);
+        assert!(quantiles(&mut x, &[1.5]).is_err() && quantiles(&mut x, &[f64::NAN]).is_err());
+        let part = view_partition(View::Floats(rustymath::buffer::Floats::F64(&[f64::NAN, -0., 0., 3.])), 1).unwrap();
+        assert_eq!(f64::of(part.view()).unwrap()[1], 0.);
+    }
+
+    #[test]
     fn search_and_sort() {
         let x = [30, 10, 20, 10];
         assert_eq!(index_of(&x, &[10, 40]), [1, 4]);

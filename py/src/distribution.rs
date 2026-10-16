@@ -2,13 +2,24 @@
 use crate::array::{core, give};
 use crate::functions::Apply;
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyFloat};
-use rand::{SeedableRng, rngs::StdRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use rustymath::{distribution::{self as dist, standard::*}, kernels, layout::generated_len};
 use rustymath_buffer::py_err;
 
 /// A probability distribution, with a density, a cumulative distribution, a quantile function and a sampler.
 #[pyclass(module = "rustymath.distribution", frozen)]
-pub struct Distribution(dist::Distribution);
+pub struct Distribution(pub(crate) dist::Distribution);
+
+/// The common sampler for fresh-seed distribution calls and persistent generators.
+pub(crate) fn sampled<'py>(py: Python<'py>, distribution: dist::Distribution, rng: &mut impl Rng, size: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+    let Some(size) = size else { return Ok(PyFloat::new(py, distribution.sample(rng)).into_any()) };
+    let shape = crate::create::shape(size)?;
+    let n = generated_len(&shape).map_err(py_err)?;
+    let mut out = Vec::with_capacity(n);
+    out.resize(n, 0.0);
+    distribution.samples(rng, &mut out);
+    give(py, core(out, &shape)?, false)
+}
 
 #[pymethods]
 impl Distribution {
@@ -25,11 +36,7 @@ impl Distribution {
     #[pyo3(signature = (size=None, seed=None))]
     fn sample<'py>(&self, py: Python<'py>, size: Option<&Bound<'py, PyAny>>, seed: Option<u64>) -> PyResult<Bound<'py, PyAny>> {
         let mut rng = seed.map_or_else(rand::make_rng::<StdRng>, StdRng::seed_from_u64);
-        let Some(size) = size else { return Ok(PyFloat::new(py, self.0.sample(&mut rng)).into_any()) };
-        let shape = size.extract::<usize>().map(|n| vec![n]).or_else(|_| size.extract::<Vec<usize>>())?;
-        let mut out = vec![0.0; generated_len(&shape).map_err(py_err)?];
-        self.0.samples(&mut rng, &mut out);
-        give(py, core(out, &shape)?, false)
+        sampled(py, self.0, &mut rng, size)
     }
 
     /// Whether the distribution's values are whole numbers.

@@ -1,9 +1,10 @@
 //! Search and sort over slices of keys. A key is an item read as a whole number (`Key`), or an unsigned word whose order is the order you want (`RadixKey`). `Float::order_key` gives each float such a word, as wide as the float. Positions take 32 bits inside these functions, so a slice holds at most `u32::MAX` items. `tolerant` builds its searches over floats on these functions.
 //!
 //! `index_of`, `classes` and `firsts` index the first position of each key. `index_of` passes over `x` once for each item of `y` when `y` has at most `SCANNED` items. The index is a table when the keys span at most twice the slice's length, or 1024, and a hash map otherwise. `numbered` numbers the classes in order of first position, with each one's size. `grouped_keys` numbers them the same way from a table of keys, with each one's positions, and `class_counts` gives only their sizes. `counts` counts the items with each key in such a table. `sort_rows` sorts keys that span such a table by counting them. It sorts other keys with an LSD radix sort that skips any byte that is the same in every key. With several threads, the sort splits each pass of more than `RADIX_PIECE` keys across them, and `index_of` splits its lookups.
-use crate::{Float, buffer::{DType, Element, View}, tolerant::{self, Tolerance}};
+use crate::{Float, buffer::{Buffer, DType, Element, View}, error::{Error, Kind}, tolerant::{self, Tolerance}};
 use hashbrown::{HashMap, hash_map::Entry};
 use std::{hash::Hash, mem::MaybeUninit, ops::Not};
+use std::cmp::Ordering;
 
 /// An item as a whole number: a Boolean's 0 or 1, an integer, a character's code point, or an order key. Two items match exactly when their keys are equal. A 64-bit unsigned key wraps to a negative number, which keeps keys distinct.
 pub trait Key: Copy + Send + Sync + Eq + Ord + Hash {
@@ -704,6 +705,27 @@ pub fn view_index_of<E>(x: View<'_>, y: View<'_>, t: Tolerance, check: impl FnMu
     key_pairs!(x, y, |x, y| Ok(index_of(x, y)))
 }
 
+/// Set operations retain first-occurrence order, matching as classification and membership do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Set { Union, Intersection, Difference }
+
+/// Unique values of a set operation on two views of one dtype. Shared searches do all matching; gathered output has no keys or names. `None` for unsupported pairs.
+pub fn view_set<E>(x: View<'_>, y: View<'_>, how: Set, t: Tolerance, mut check: impl FnMut() -> Result<(), E>) -> Option<Result<Buffer, E>> {
+    if x.dtype() != y.dtype() { return None; }
+    let mut joined = Buffer::with_capacity(x.dtype(), if how == Set::Union { x.len() + y.len() } else { 0 });
+    let values = if how == Set::Union {
+        joined.extend_from(x, 0..x.len()); joined.extend_from(y, 0..y.len()); joined.view()
+    } else { x };
+    let firsts = match view_firsts(values, t, &mut check)? { Ok(firsts) => firsts, Err(e) => return Some(Err(e)) };
+    let matches = if how == Set::Union { None } else {
+        match view_index_of(y, values, t, &mut check)? { Ok(found) => Some(found), Err(e) => return Some(Err(e)) }
+    };
+    let positions: Vec<u32> = firsts.iter().enumerate().filter_map(|(i, &first)| {
+        (first && matches.as_ref().is_none_or(|found| ((found[i] as usize) < y.len()) == (how == Set::Intersection))).then_some(i as u32)
+    }).collect();
+    Some(Ok(Buffer::gathered(values, &positions)))
+}
+
 /// For each item of `values`, the number of `boundaries` at or below it, as [`bins`] counts them: for Booleans, integers or characters of one kind, with integers of different widths read as `i64`, and for floats of one width by their order keys. `None` for other pairs.
 pub fn view_bins(boundaries: View<'_>, values: View<'_>) -> Option<Vec<u32>> {
     if let (DType::Float(w), true) = (boundaries.dtype(), boundaries.dtype() == values.dtype()) {
@@ -735,3 +757,233 @@ pub fn view_order_keys(x: View<'_>) -> Option<Vec<u64>> {
 
 /// Each item's [`OrderKey`], widened to 64 bits.
 fn widened<T: OrderKey>(x: &[T]) -> Vec<u64> { x.iter().map(|&v| v.order_key().into()).collect() }
+
+/// Runs an ordered operation at the view's item width. Complex numbers have no ordering.
+macro_rules! ordered_view {
+    ($view:expr, |$x:ident, $key:ident| $body:expr) => {
+        Some(match $view {
+            View::Booleans($x) => { let $key = OrderKey::order_key; $body },
+            View::Characters($x) => { let $key = OrderKey::order_key; $body },
+            View::Integers(ints) => with_ints!(ints, |$x| { let $key = OrderKey::order_key; $body }),
+            View::Floats(floats) => with_floats!(floats, |$x| { let $key = Float::order_key; $body }),
+            View::Complexes(_) => return None,
+        })
+    };
+}
+
+/// Stable positions that order a vector. Equal items keep their original positions, including signed zeros and NaNs.
+pub fn view_grade(x: View<'_>, down: bool) -> Option<Vec<u32>> {
+    fn grade<T: Copy + Sync, K: RadixKey>(x: &[T], down: bool, key: impl Fn(T) -> K + Sync) -> Vec<u32> {
+        let mut keys = Vec::with_capacity(x.len());
+        crate::pairs(crate::Arg::Many(x), crate::Arg::One(()), x.len(), &mut keys,
+            move |v, ()| (if down { !key(v) } else { key(v) }, true));
+        sort_rows(x.len(), vec![keys])
+    }
+    ordered_view!(x, |x, key| grade(x, down, key))
+}
+
+/// A counting sort with no position buffer, when the items span a small table. Extra writes avoid one unpredictable branch per sparse count.
+fn spread<T: Element + Key>(x: &[T], down: bool) -> Option<Buffer> {
+    if x.len() < 256 { return None; }
+    let (min, counts) = counts(x)?;
+    let mut sorted = vec![T::FILL; x.len() + 4];
+    let mut at = 0;
+    let mut write = |(k, &c): (usize, &usize)| {
+        let v = T::from_key(min + k as i64).unwrap_or(T::FILL);
+        sorted[at..at + 4].fill(v);
+        if c > 4 { sorted[at + 4..at + c].fill(v); }
+        at += c;
+    };
+    if down { counts.iter().enumerate().rev().for_each(&mut write); }
+    else { counts.iter().enumerate().for_each(&mut write); }
+    sorted.truncate(x.len());
+    Some(T::buffer(sorted))
+}
+
+/// A sorted vector, counting Boolean/integer/character values directly where possible, otherwise gathering its stable grade.
+pub fn view_sort(x: View<'_>, down: bool) -> Option<Buffer> {
+    let counted = match x {
+        View::Booleans(x) => spread(x, down), View::Characters(x) => spread(x, down),
+        View::Integers(ints) => with_ints!(ints, |x| spread(x, down)), _ => None,
+    };
+    counted.or_else(|| Some(Buffer::gathered(x, &view_grade(x, down)?)))
+}
+
+/// Sorts each lane through the shared stack scheduler, retaining the direct counting path for values.
+pub fn view_sort_along(x: View<'_>, dims @ [outer, _, inner]: [usize; 3], down: bool) -> Option<Buffer> {
+    if outer * inner == 1 { return view_sort(x, down); }
+    if matches!(x, View::Complexes(_)) { return None; }
+    Some(with_dtype!(x.dtype(), T => T::buffer(map_lanes::<_, _, ()>(T::of(x).unwrap(), dims, dims[1], |lane, out, _| {
+        let sorted = view_sort(T::view(lane), down).unwrap();
+        out.copy_from_slice(T::of(sorted.view()).unwrap());
+    }))))
+}
+
+/// Places each of the sorted, distinct `ranks` at its sorted position, leaving the runs between them unordered. Ranks must be below `x.len()`.
+/// Selecting the middle requested rank first partitions disjoint runs for the remaining ranks; one rank takes linear time.
+pub fn select<T>(x: &mut [T], ranks: &[usize], compare: impl Fn(&T, &T) -> Ordering + Copy) {
+    fn within<T>(x: &mut [T], ranks: &[usize], base: usize, compare: impl Fn(&T, &T) -> Ordering + Copy) {
+        if ranks.is_empty() { return; }
+        let middle = ranks.len() / 2;
+        let rank = ranks[middle] - base;
+        let (before, _, after) = x.select_nth_unstable_by(rank, compare);
+        within(before, &ranks[..middle], base, compare);
+        within(after, &ranks[middle + 1..], base + rank + 1, compare);
+    }
+    within(x, ranks, 0, compare);
+}
+
+/// A copy with `rank` at its sorted position. Other items are partitioned around it, not sorted. `None` for complex numbers.
+pub fn view_partition(x: View<'_>, rank: usize) -> Option<Buffer> {
+    fn partition<T: Element, K: Ord>(x: &[T], rank: usize, key: impl Fn(T) -> K + Copy) -> Buffer {
+        let mut out = x.to_vec();
+        select(&mut out, &[rank], |a, b| key(*a).cmp(&key(*b)));
+        T::buffer(out)
+    }
+    ordered_view!(x, |x, key| partition(x, rank, key))
+}
+
+/// Positions partitioned around `rank`. Equal values need not keep their original order.
+pub fn view_argpartition(x: View<'_>, rank: usize) -> Option<Vec<u32>> {
+    let keys = view_order_keys(x)?;
+    let mut out: Vec<u32> = (0..x.len() as u32).collect();
+    select(&mut out, &[rank], |&a, &b| keys[a as usize].cmp(&keys[b as usize]));
+    Some(out)
+}
+
+/// Partitions each lane directly in its output buffer. Index partitioning compares the original native-width values and writes i64 positions.
+pub fn view_partition_along(x: View<'_>, dims: [usize; 3], rank: usize, indices: bool) -> Option<Buffer> {
+    fn run<T: Element + Default, K: Ord>(x: &[T], dims: [usize; 3], rank: usize, indices: bool, key: impl Fn(T) -> K + Copy + Sync) -> Buffer {
+        if indices { i64::buffer(map_lanes::<_, _, ()>(x, dims, dims[1], |lane, out, _| {
+            for (i, p) in out.iter_mut().enumerate() { *p = i as i64; }
+            select(out, &[rank], |a, b| key(lane[*a as usize]).cmp(&key(lane[*b as usize])));
+        })) } else { T::buffer(map_lanes::<_, _, ()>(x, dims, dims[1], |lane, out, _| {
+            out.copy_from_slice(lane);
+            select(out, &[rank], |a, b| key(*a).cmp(&key(*b)));
+        })) }
+    }
+    ordered_view!(x, |x, key| run(x, dims, rank, indices, key))
+}
+
+/// Only `range` of a stable grade, by selection followed by sorting the requested run. Original positions break ties because taking from a stable grade observes them.
+pub fn select_positions(n: usize, range: std::ops::Range<usize>, compare: impl Fn(usize, usize) -> Ordering + Copy) -> Vec<u32> {
+    if range.is_empty() { return Vec::new(); }
+    let compare = |&a: &u32, &b: &u32| compare(a as usize, b as usize).then_with(|| a.cmp(&b));
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    let ranks = if range.start == range.end - 1 { vec![range.start] } else { vec![range.start, range.end - 1] };
+    select(&mut order, &ranks, compare);
+    let mut selected = order[range].to_vec();
+    selected.sort_unstable_by(compare);
+    selected
+}
+
+/// The first minimum or maximum position of each lane, without gathering lanes or allocating a result per lane. Comparisons use sorting's NaN-last order.
+pub fn view_argextremes(x: View<'_>, [outer, len, inner]: [usize; 3], down: bool) -> Option<Vec<i64>> {
+    fn extremes<T: Copy + Sync, K: Ord>(x: &[T], [outer, len, inner]: [usize; 3], down: bool, key: impl Fn(T) -> K + Sync) -> Vec<i64> {
+        let mut out = Vec::with_capacity(outer * inner);
+        crate::parallel::extended(&mut out, outer * inner, (crate::CHUNK / len.max(1)).max(1), &|range, slots| {
+            slots.fill(range.len(), |slots| {
+                for (lane, slot) in range.zip(slots) {
+                    let start = lane / inner * len * inner + lane % inner;
+                    let (mut best, mut at) = (key(x[start]), 0);
+                    for j in 1..len {
+                        let k = key(x[start + j * inner]);
+                        if if down { k > best } else { k < best } { best = k; at = j; }
+                    }
+                    slot.write(at as i64);
+                }
+                true
+            });
+            true
+        });
+        out
+    }
+    if len == 0 { return None; }
+    ordered_view!(x, |x, key| extremes(x, [outer, len, inner], down, key))
+}
+
+/// Requested order statistics and interpolation weights, shared by every lane of a quantile call.
+struct Quantiles { points: Vec<(usize, usize, f64)>, ranks: Vec<usize> }
+
+impl Quantiles {
+    /// The plan for `probabilities` of `len` items. A probability outside `[0, 1]`, or NaN, gives a Domain error.
+    fn new(len: usize, probabilities: &[f64]) -> Result<Self, Error> {
+        if !probabilities.iter().all(|q| (0.0..=1.0).contains(q)) { return Err(Error::new(Kind::Domain, "quantile probabilities must be between zero and one")); }
+        let points: Vec<_> = probabilities.iter().map(|&q| {
+            let p = q * len.saturating_sub(1) as f64;
+            (p.floor() as usize, p.ceil() as usize, p.fract())
+        }).collect();
+        let mut ranks: Vec<_> = points.iter().flat_map(|&(lo, hi, _)| [lo, hi]).collect();
+        ranks.sort_unstable();
+        ranks.dedup();
+        Ok(Self { points, ranks })
+    }
+
+    fn apply<T: Copy, F: Float>(&self, x: &mut [T], out: &mut [F], compare: impl Fn(&T, &T) -> Ordering + Copy, read: impl Fn(T) -> F::Working) {
+        if x.is_empty() { out.fill(F::nan()); return; }
+        select(x, &self.ranks, compare);
+        for (out, &(lo, hi, weight)) in out.iter_mut().zip(&self.points) {
+            let a = read(x[lo]);
+            *out = F::from_working(if lo == hi { a } else {
+                let weight = F::Working::narrow(weight);
+                a * (F::Working::narrow(1.0) - weight) + read(x[hi]) * weight
+            });
+        }
+    }
+}
+
+/// Linear-interpolated quantiles of `x`. Selection keeps the input width; f16 interpolation computes in f32. Empty inputs give NaN. A probability outside `[0, 1]`, or NaN, gives a Domain error.
+pub fn quantiles<F: Float>(x: &mut [F], probabilities: &[f64]) -> Result<Vec<F>, Error> {
+    let mut out = vec![F::nan(); probabilities.len()];
+    Quantiles::new(x.len(), probabilities)?.apply(x, &mut out, |a, b| a.order_key().cmp(&b.order_key()), Float::working);
+    Ok(out)
+}
+
+/// Quantiles of each lane, with a leading probability axis. Integers select exactly before converting the selected values to f64; floats keep their width. `None` for complex numbers, which have no order. A probability outside `[0, 1]`, or NaN, gives a Domain error.
+pub fn view_quantiles_along(x: View<'_>, dims @ [outer, _, inner]: [usize; 3], probabilities: &[f64]) -> Result<Option<Buffer>, Error> {
+    use crate::buffer::Source;
+    fn run<T: Element, F: Element + Float + Default, K: Ord>(x: &[T], dims: [usize; 3], plan: &Quantiles, key: impl Fn(T) -> K + Copy + Sync,
+        read: impl Fn(T) -> F::Working + Sync) -> Vec<F> {
+        map_lanes::<_, _, Vec<T>>(x, dims, plan.points.len(), |lane, out, work| {
+            work.clear();
+            work.extend_from_slice(lane);
+            plan.apply(work, out, |a, b| key(*a).cmp(&key(*b)), &read);
+        })
+    }
+    fn floats<F: Element + Float + Default>(x: &[F], dims: [usize; 3], plan: &Quantiles) -> Buffer {
+        F::buffer(run::<_, F, _>(x, dims, plan, Float::order_key, Float::working))
+    }
+    let plan = Quantiles::new(dims[1], probabilities)?;
+    let items = match x {
+        View::Booleans(x) => f64::buffer(run::<_, f64, _>(x, dims, &plan, OrderKey::order_key, Source::<f64>::read)),
+        View::Integers(ints) => with_ints!(ints, |x| f64::buffer(run::<_, f64, _>(x, dims, &plan, OrderKey::order_key, Source::<f64>::read))),
+        View::Floats(x) => with_floats!(x, |x| floats(x, dims, &plan)), _ => return Ok(None),
+    };
+    let count = probabilities.len();
+    Ok(Some(if count > 1 && outer > 1 {
+        let plan = crate::structure::transpose(&crate::layout::Layout::from([outer, count, inner]), &[1, 0, 2]).expect("valid quantile axes");
+        Buffer::walked(items.view(), &plan.steps)
+    } else { items }))
+}
+
+/// Maps lanes through the shared stack scheduler. Each callback fills its output slice and reuses its scratch. Only strided inputs need a gathered lane.
+fn map_lanes<T: Copy + Sync, U: Element + Default, S: Default>(x: &[T], [outer, len, inner]: [usize; 3], width: usize,
+    map: impl Fn(&[T], &mut [U], &mut S) + Sync) -> Vec<U> {
+    if outer * inner * width == 0 { return Vec::new(); }
+    let out = crate::parallel::stack::<U, (Vec<T>, S), std::convert::Infallible>(outer * inner, width, &|lane, out, (input, work)| {
+        let (o, i) = (lane / inner, lane % inner);
+        let input = if inner == 1 { &x[o * len..(o + 1) * len] } else {
+            input.clear();
+            input.extend((0..len).map(|j| x[(o * len + j) * inner + i]));
+            &input[..]
+        };
+        map(input, out, work);
+    }, || Ok(())).unwrap();
+    if inner == 1 || width == 1 { return out; }
+    let mut transposed = Vec::with_capacity(out.len());
+    transposed.resize(out.len(), U::FILL);
+    for o in 0..outer {
+        crate::linalg::transpose_into(&out[o * inner * width..][..inner * width], width, &mut transposed[o * inner * width..][..inner * width], inner, [inner, width], |x| x);
+    }
+    transposed
+}

@@ -2,3 +2,12 @@ website:
   sidebar:
     contents:
       - index.ipynb
+      - arrays.ipynb
+      - math.ipynb
+      - search.ipynb
+      - random.ipynb
+      - linalg.ipynb
+      - optimize.ipynb
+      - exact.ipynb
+      - text: Using rustymath from Rust
+        href: rust.qmd

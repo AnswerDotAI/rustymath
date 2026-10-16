@@ -54,6 +54,17 @@ def test_python_values():
     with pytest.raises(KeyError): t['c']
     with pytest.raises(IndexError): m[2]
 
+def test_repr_precision():
+    for dtype, text in (('f16', '1.23'), ('f32', '1.23457'), ('f64', '1.2345679')):
+        a = rm.array([1.234567891234, -0.0], dtype=dtype)
+        assert f'[{text}, -0.0]' in repr(a) and a.tolist() == np.array([1.234567891234, -0.0], dtype=DTYPES[dtype]).tolist()
+    for dtype, text in (('c64', '(1.23457+2.34568j)'), ('c128', '(1.2345679+2.3456789j)')):
+        assert text in repr(rm.array([1.234567891234 + 2.345678912345j], dtype=dtype))
+    roots = [1.000000000000002+0j, complex(1.9999999999999984, -0.0), 3.0000000000000036+0j]
+    a = rm.array(roots)
+    assert '[(1+0j), (2-0j), (3+0j)]' in repr(a) and a.tolist() == roots
+    assert '[1.2345679e-20, 1.2345679e+20]' in repr(rm.array([1.234567891e-20, 1.234567891e20]))
+
 def test_methods():
     m = rm.array([[1, 2], [3, 4]])
     t = rm.array({'a': [1, 2], 'b': [3, 4]})

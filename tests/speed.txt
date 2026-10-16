@@ -62,6 +62,12 @@ linalg::MinPlus	300
 linalg::PlusEqual	280
 linalg::PlusTimes at i64	160
 linalg::PlusEqual at i64	280
+search::view_sort_along	560
+search::view_sort_along long lanes	420
+search::view_partition_along	66
+search::view_quantiles_along	130
+stats::variance	8.9
+stats::average	330
 linalg::Lu::solve	110
 linalg::Lu::inverse	300
 linalg::cholesky	56
@@ -136,6 +142,12 @@ linalg::MinPlus	300
 linalg::PlusEqual	290
 linalg::PlusTimes at i64	82
 linalg::PlusEqual at i64	83
+search::view_sort_along	670
+search::view_sort_along long lanes	480
+search::view_partition_along	140
+search::view_quantiles_along	270
+stats::variance	9.7
+stats::average	650
 linalg::Lu::solve	140
 linalg::Lu::inverse	420
 linalg::cholesky	81

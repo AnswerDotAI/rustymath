@@ -123,12 +123,28 @@ fn binary_at<K: Binary<T, Out: Element> + Sync, T: Element>(k: &K, x: View<'_>, 
     (<<K as Binary<T>>::Out as Element>::buffer(out), ok)
 }
 
-/// Ranges of results run in parallel. Each range reads its three arguments' items through both agreements into buffers, a chunk at a time.
+/// A contiguous or constant argument through two mappings, without an expansion buffer.
+#[inline]
+fn direct<'a, T: Element>(data: &'a [T], mapping: &Mapping, parent: &Mapping) -> Option<Arg<'a, T>> {
+    match (parent, mapping) {
+        (Mapping::Single, _) => Some(Arg::One(mapping.get(0).map_or(T::FILL, |i| data[i]))),
+        (Mapping::Linear(1), Mapping::Single) => Some(Arg::One(data[0])),
+        (Mapping::Linear(1), Mapping::Linear(1)) => Some(Arg::Many(data)),
+        _ => None,
+    }
+}
+
+/// Contiguous/constant arguments go to the slice form directly. Other mappings expand in chunks within parallel ranges.
 fn ternary_at<K: Ternary<T, Out: Element> + Sync, T: Element>(k: &K, [x, y, z]: [View<'_>; 3], first: &Agreement, second: &Agreement) -> (Buffer, bool) {
     let (x, y, z) = (items::<T>(x), items::<T>(y), items::<T>(z));
     let read = |data: &[T], at: Option<usize>| at.map_or(T::FILL, |j| data[j]);
     let mut out = Vec::with_capacity(second.len);
-    let ok = extended(&mut out, second.len, CHUNK, &|range, slots| {
+    let direct = if second.len == 0 { None } else {
+        direct(x, &first.left, &second.left).zip(direct(y, &first.right, &second.left))
+            .zip(direct(z, &second.right, &Mapping::Linear(1)))
+    };
+    let ok = if let Some(((x, y), z)) = direct { k.many(x, y, z, second.len, &mut out) }
+    else { extended(&mut out, second.len, CHUNK, &|range, slots| {
         let mut bufs = [Vec::new(), Vec::new(), Vec::new()];
         chunks(range, |start, n| {
             bufs.iter_mut().for_each(Vec::clear);
@@ -140,7 +156,7 @@ fn ternary_at<K: Ternary<T, Out: Element> + Sync, T: Element>(k: &K, [x, y, z]: 
             }
             k.many_into(Arg::Many(&bufs[0]), Arg::Many(&bufs[1]), Arg::Many(&bufs[2]), n, slots)
         })
-    });
+    }) };
     (<<K as Ternary<T>>::Out as Element>::buffer(out), ok)
 }
 
@@ -214,12 +230,6 @@ pub mod probe {
 }
 
 /// The [`Kernels`](crate::operation::Kernels) of a function object or reduction: `Unary`, `Binary` or `Ternary` for a function object of that arity, `Fold` or `Scan` for a [`Reduction`](crate::reduce::Reduction), and `Product` for a matrix product's [`Inner`](crate::linalg::Inner) pair. Name the object by its type, or by a value after `of`. Each kernel's test resolves where the macro expands, so the type must be concrete there. In generic code the tests see only the type parameter's bounds, not the impls of the type it later stands for, so a kernel that the bounds don't promise comes out as `None`, with no error.
-///
-/// ```ignore
-/// let exp = rustymath::kernels!(Unary rustymath::Exp);
-/// let equal = rustymath::kernels!(Binary of rustymath::tolerant::Equal(tolerance));
-/// let sum = rustymath::kernels!(Fold rustymath::reduce::Sum);
-/// ```
 #[macro_export]
 macro_rules! kernels {
     ($arity:ident of $k:expr) => {{

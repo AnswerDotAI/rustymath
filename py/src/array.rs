@@ -1,13 +1,12 @@
 //! The `rustymath.Array` class: a rustymath [`Array`](rustymath::array::Array) that readers of the buffer protocol, such as NumPy, can view without a copy.
 use crate::functions;
-use pyo3::exceptions::{PyIndexError, PyKeyError, PyTypeError, PyValueError};
-use pyo3::types::{PyComplex, PyString, PyTuple};
+use pyo3::exceptions::PyTypeError;
+use pyo3::types::{PyComplex, PyTuple};
 use pyo3::{IntoPyObjectExt, ffi, prelude::*};
 use pyo3::pyclass::CompareOp;
 use rustymath::array::Array as Core;
-use rustymath::buffer::{Buffer, DType, Element, FloatWidth, Source, View};
-use rustymath::layout::{Layout, element_count, strides};
-use rustymath_buffer::{export, geometry, item, name, named, nested, py_err};
+use rustymath::buffer::{Buffer, DType, Element, FloatWidth, View};
+use rustymath_buffer::{export, geometry, item, name, nested, py_err};
 use std::ffi::c_int;
 use std::sync::Arc;
 
@@ -39,35 +38,82 @@ fn operand<'py>(py: Python<'py>, result: PyResult<Bound<'py, PyAny>>) -> PyResul
     match result { Err(e) if e.is_instance_of::<PyTypeError>(py) => Ok(not_implemented(py)), r => r }
 }
 
-/// The position on `axis` of `layout` that `key` gives: an integer, counting from the end when negative, or the name of a key.
-fn position(layout: &Layout, axis: usize, key: &Bound<'_, PyAny>) -> PyResult<usize> {
-    let n = layout.shape()[axis];
-    if let Ok(name) = key.cast::<PyString>() {
-        let name = name.to_str()?;
-        return layout.keys(axis).and_then(|k| k.position(name)).ok_or_else(|| PyKeyError::new_err(name.to_owned()));
-    }
-    let k: i64 = key.extract()?;
-    rustymath::layout::position(k, n).ok_or_else(|| PyIndexError::new_err(format!("position {k} is outside an axis of length {n}")))
-}
-
-/// Item `i` of `view` as the repr shows it: a 16- or 32-bit float, or each part of a complex number with 32-bit parts, as the shortest decimal that rounds back to it at its own width.
+/// Item `i` rounded for display, without changing the stored value or scalar conversions.
 fn shown<'py>(py: Python<'py>, view: View<'_>, i: usize) -> PyResult<Bound<'py, PyAny>> {
     match view {
-        View::Floats(v) => shortest(v.get(i), v.tag()).into_bound_py_any(py),
-        View::Complexes(v) => { let (z, w) = (v.get(i), v.tag().into()); Ok(PyComplex::from_doubles(py, shortest(z.re, w), shortest(z.im, w)).into_any()) }
+        View::Floats(v) => display_float(v.get(i), v.tag()).into_bound_py_any(py),
+        View::Complexes(v) => { let (z, w) = (v.get(i), v.tag().into()); Ok(PyComplex::from_doubles(py, display_float(z.re, w), display_float(z.im, w)).into_any()) }
         _ => item(py, view, i),
     }
 }
 
-/// The shortest decimal that rounds to `x` at `width`, read as an `f64`.
-fn shortest(x: f64, width: FloatWidth) -> f64 {
-    if width == FloatWidth::F64 || !x.is_finite() { return x; }
-    rustymath::with_float_width!(width, F => (0..17).map(|p| format!("{x:.p$e}").parse().expect("Rust reads the floats it writes"))
-        .find(|&y: &f64| Source::<F>::read(y) == Source::<F>::read(x)).unwrap_or(x))
+/// Round to the width's display precision, retaining Python's scalar repr and scientific notation.
+fn display_float(x: f64, width: FloatWidth) -> f64 {
+    if x == 0.0 || !x.is_finite() { return x; }
+    let digits = match width { FloatWidth::F16 => 3, FloatWidth::F32 => 6, FloatWidth::F64 => 8 };
+    let p = digits - 1;
+    format!("{x:.p$e}").parse().expect("Rust reads the floats it writes")
 }
 
-#[pymethods]
-impl Array {
+/// Method aliases live beside their signatures; all computation stays in the function bindings.
+macro_rules! array_methods {
+    (folds [$($fold:ident),*] scans [$($scan:ident),*] parts [$($part:ident),*] ddof [$($ddof:ident),*] search_axes [$($search:ident),*]
+        copies [$($copy:ident => $copy_fn:ident),*]
+        operators [$($forward:ident, $reverse:ident => $operator:ident),*]
+        calls [$($(#[$call_meta:meta])* $call:ident($($call_arg:ident: $call_type:ty),*) => $call_module:ident::$call_fn:ident;)*]
+        arrays [$($(#[$array_meta:meta])* $array:ident($($array_arg:ident: $array_type:ty),*) => $array_fn:ident;)*]
+        { $($body:tt)* }) => {
+        // PyO3 emits unsafe wrapper items beside the impl; scope its generated glue's lint allowance here.
+        #[allow(unsafe_op_in_unsafe_fn)]
+        mod methods {
+            use super::*;
+            #[pymethods]
+            impl Array {
+            $($body)*
+            $(#[pyo3(signature = (axis=None))]
+            fn $fold<'py>(slf: &Bound<'py, Self>, axis: Option<functions::Axes>) -> PyResult<Bound<'py, PyAny>> { functions::$fold(slf.py(), slf, axis) })*
+            $(#[pyo3(signature = (axis=None))]
+            fn $scan<'py>(slf: &Bound<'py, Self>, axis: Option<functions::Axis>) -> PyResult<Bound<'py, PyAny>> { functions::$scan(slf.py(), slf, axis) })*
+            $(#[getter]
+            fn $part<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> { functions::$part(slf.py(), slf) })*
+            $(#[pyo3(signature = (axis=None, ddof=0))]
+            fn $ddof<'py>(slf: &Bound<'py, Self>, axis: Option<functions::Axes>, ddof: usize) -> PyResult<Bound<'py, PyAny>> { functions::$ddof(slf.py(), slf, axis, ddof) })*
+            $(#[pyo3(signature = (axis=None))]
+            fn $search<'py>(slf: &Bound<'py, Self>, axis: Option<functions::Axis>) -> PyResult<Bound<'py, PyAny>> { crate::search::$search(slf.py(), slf, axis) })*
+            $(fn $copy(slf: &Bound<'_, Self>) -> PyResult<Array> { crate::structure::$copy_fn(slf.as_any()) })*
+            $(fn $forward<'py>(slf: &Bound<'py, Self>, y: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(slf.py(), functions::$operator(slf.py(), slf, y)) }
+            fn $reverse<'py>(slf: &Bound<'py, Self>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(slf.py(), functions::$operator(slf.py(), x, slf)) })*
+            $($(#[$call_meta])*
+            fn $call<'py>(slf: &Bound<'py, Self>, $($call_arg: $call_type),*) -> PyResult<Bound<'py, PyAny>> { crate::$call_module::$call_fn(slf.py(), slf, $($call_arg),*) })*
+            $($(#[$array_meta])*
+            fn $array<'py>(slf: &Bound<'py, Self>, $($array_arg: $array_type),*) -> PyResult<Array> { crate::structure::$array_fn(slf.as_any(), $($array_arg),*) })*
+            }
+        }
+    };
+}
+
+array_methods! { folds [sum, prod, max, min, all, any, mean] scans [cumsum, cumprod] parts [real, imag] ddof [var, std] search_axes [argmin, argmax, median]
+    copies [ravel => ravel, flatten => ravel]
+    operators [__add__, __radd__ => add, __sub__, __rsub__ => subtract, __mul__, __rmul__ => multiply, __truediv__, __rtruediv__ => divide,
+        __and__, __rand__ => bitwise_and, __or__, __ror__ => bitwise_or, __xor__, __rxor__ => bitwise_xor,
+        __lshift__, __rlshift__ => left_shift, __rshift__, __rrshift__ => right_shift]
+    calls [
+        conj() => functions::conj;
+        #[pyo3(signature = (decimals=0))] round(decimals: i32) => functions::round;
+        clip(lower: &Bound<'py, PyAny>, upper: &Bound<'py, PyAny>) => functions::clip;
+        #[pyo3(signature = (axis=None, weights=None))] average(axis: Option<functions::Axes>, weights: Option<&Bound<'py, PyAny>>) => functions::average;
+        #[pyo3(signature = (axis=None, ord=2.0))] norm(axis: Option<functions::Axes>, ord: f64) => functions::norm;
+        #[pyo3(signature = (axis=crate::search::LAST_AXIS, descending=false))] sort(axis: Option<functions::Axis>, descending: bool) => search::sort;
+        #[pyo3(signature = (kth, axis=crate::search::LAST_AXIS))] partition(kth: i64, axis: Option<functions::Axis>) => search::partition;
+        #[pyo3(signature = (kth, axis=crate::search::LAST_AXIS))] argpartition(kth: i64, axis: Option<functions::Axis>) => search::argpartition;
+        #[pyo3(signature = (q, axis=None))] quantile(q: &Bound<'py, PyAny>, axis: Option<functions::Axis>) => search::quantile;
+    ]
+    arrays [
+        #[pyo3(signature = (axes=None))] transpose(axes: Option<Vec<functions::Axis>>) => transpose;
+        swapaxes(axis1: functions::Axis, axis2: functions::Axis) => swapaxes;
+        #[pyo3(signature = (axis=None))] squeeze(axis: Option<functions::Axes>) => squeeze;
+        #[pyo3(signature = (indices, axis=None))] take(indices: &Bound<'py, PyAny>, axis: Option<functions::Axis>) => take;
+    ] {
     #[getter]
     fn dtype(&self) -> &'static str { name(self.core.dtype()) }
     #[getter]
@@ -91,23 +137,24 @@ impl Array {
     fn __len__(&self) -> PyResult<usize> {
         self.core.layout().shape().first().copied().ok_or_else(|| PyTypeError::new_err("a rank-0 array has no length"))
     }
-    /// The item at one position or key on each leading axis, given alone or as a tuple: a Python scalar when every axis is given, and otherwise the cell they select, as a new array.
+    /// Independent axis selection by integers, keys, slices, masks or index arrays. `None` inserts an axis and `...` keeps omitted axes. The result is a compact copy, or a Python scalar when no axes remain.
     fn __getitem__<'py>(&self, py: Python<'py>, key: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
-        let layout = self.core.layout();
-        let keys: Vec<_> = match key.cast::<PyTuple>() { Ok(t) => t.iter().collect(), Err(_) => vec![key.clone()] };
-        let rank = layout.shape().len();
-        if keys.len() > rank { return Err(PyIndexError::new_err(format!("an array of rank {rank} takes at most {rank} positions"))); }
-        let steps = strides(layout.shape());
-        let start = keys.iter().enumerate().map(|(a, k)| Ok(position(layout, a, k)? * steps[a])).sum::<PyResult<usize>>()?;
-        if keys.len() == rank { return item(py, self.core.view(), start); }
-        let cell: usize = layout.shape()[keys.len()..].iter().product();
-        give(py, Core::new(layout.axes(keys.len()..rank), Buffer::copied(self.core.view(), start..start + cell)).map_err(py_err)?, false)
+        let plan = crate::structure::selection(self.core.layout(), key)?;
+        if plan.layout.shape().is_empty() { return item(py, self.core.view(), rustymath::gather::Steps::reach(0, &plan.steps, 0).expect("selection has no fills")); }
+        give(py, self.core.gather(&plan).map_err(py_err)?, false)
+    }
+    /// Writes through the same independent selection as indexing, broadcasting from the front. Repeated targets take the last assigned item. The allocation and shape don't change.
+    fn __setitem__(slf: &Bound<'_, Self>, key: &Bound<'_, PyAny>, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        let plan = crate::structure::selection(slf.try_borrow()?.core.layout(), key)?;
+        // Finish reading/copying first: `value` can be this array, or a buffer that views its items.
+        let source = crate::convert::one(value)?.into_core()?;
+        slf.try_borrow_mut()?.core.assign(&plan, &source).map_err(py_err)
     }
     /// The items as nested lists of Python scalars, or one Python scalar for a rank-0 array.
     fn tolist<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> { rustymath_buffer::tolist(py, self.core.view(), self.core.layout().shape()) }
     /// A copy at `dtype`, a name such as `"f64"`, keeping keys and names. Items convert as `Buffer::cast` converts them: floats to integers truncate toward zero, a value that doesn't fit raises `OverflowError`, and a complex number with an imaginary part, or any conversion to or from characters, raises `ValueError`.
     fn astype(&self, dtype: &str) -> PyResult<Array> {
-        let to = named(dtype).ok_or_else(|| PyValueError::new_err(format!("unknown dtype {dtype:?}")))?;
+        let to = crate::convert::dtype(dtype)?;
         let buffer = Buffer::cast(self.core.view(), to).map_err(py_err)?;
         Ok(Array::new(Core::new(self.core.layout().clone(), buffer).map_err(py_err)?))
     }
@@ -118,30 +165,14 @@ impl Array {
             1 if shape.get_item(0)?.extract::<isize>().is_err() => shape.get_item(0)?.extract()?,
             _ => shape.extract()?,
         };
-        let n = self.core.len();
-        let mut sizes = lengths.iter().map(|&l| if l == -1 { Ok(1) } else { usize::try_from(l).map_err(|_| PyValueError::new_err(format!("a length can't be {l}"))) }).collect::<PyResult<Vec<usize>>>()?;
-        let mut free = lengths.iter().enumerate().filter(|&(_, &l)| l == -1).map(|(a, _)| a);
-        if let Some(a) = free.next() {
-            if free.next().is_some() { return Err(PyValueError::new_err("only one length can be -1")); }
-            let known = element_count(&sizes).map_err(py_err)?;
-            if known == 0 || n % known != 0 { return Err(PyValueError::new_err(format!("no length for -1 fits {n} items"))); }
-            sizes[a] = n / known;
-        }
-        element_count(&sizes).map_err(py_err)?;
-        Ok(Array::new(Core::new(Layout::from(sizes), Buffer::copied(self.core.view(), 0..n)).map_err(py_err)?))
+        crate::structure::reshaped(self.core.view(), &lengths)
     }
-    fn __add__<'py>(slf: &Bound<'py, Self>, y: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(slf.py(), functions::add(slf.py(), slf, y)) }
-    fn __radd__<'py>(slf: &Bound<'py, Self>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(slf.py(), functions::add(slf.py(), x, slf)) }
-    fn __sub__<'py>(slf: &Bound<'py, Self>, y: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(slf.py(), functions::subtract(slf.py(), slf, y)) }
-    fn __rsub__<'py>(slf: &Bound<'py, Self>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(slf.py(), functions::subtract(slf.py(), x, slf)) }
-    fn __mul__<'py>(slf: &Bound<'py, Self>, y: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(slf.py(), functions::multiply(slf.py(), slf, y)) }
-    fn __rmul__<'py>(slf: &Bound<'py, Self>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(slf.py(), functions::multiply(slf.py(), x, slf)) }
-    fn __truediv__<'py>(slf: &Bound<'py, Self>, y: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(slf.py(), functions::divide(slf.py(), slf, y)) }
-    fn __rtruediv__<'py>(slf: &Bound<'py, Self>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(slf.py(), functions::divide(slf.py(), x, slf)) }
     fn __matmul__<'py>(slf: &Bound<'py, Self>, y: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(slf.py(), crate::linalg::matmul(slf.py(), slf, y)) }
     fn __rmatmul__<'py>(slf: &Bound<'py, Self>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(slf.py(), crate::linalg::matmul(slf.py(), x, slf)) }
     fn __mod__<'py>(slf: &Bound<'py, Self>, y: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(slf.py(), functions::remainder(slf.py(), slf, y, None)) }
     fn __rmod__<'py>(slf: &Bound<'py, Self>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(slf.py(), functions::remainder(slf.py(), x, slf, None)) }
+    fn __floordiv__<'py>(slf: &Bound<'py, Self>, y: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(slf.py(), functions::floor_divide(slf.py(), slf, y, None)) }
+    fn __rfloordiv__<'py>(slf: &Bound<'py, Self>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(slf.py(), functions::floor_divide(slf.py(), x, slf, None)) }
     fn __pow__<'py>(slf: &Bound<'py, Self>, y: &Bound<'py, PyAny>, modulo: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         if !modulo.is_none() { return Ok(not_implemented(slf.py())) }
         operand(slf.py(), functions::power(slf.py(), slf, y))
@@ -151,35 +182,15 @@ impl Array {
         operand(slf.py(), functions::power(slf.py(), x, slf))
     }
     fn __neg__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> { functions::subtract(slf.py(), &0.into_bound_py_any(slf.py())?, slf) }
+    fn __invert__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> { functions::bitwise_not(slf.py(), slf) }
     fn __abs__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> { functions::absolute(slf.py(), slf) }
     fn __richcmp__<'py>(slf: &Bound<'py, Self>, y: &Bound<'py, PyAny>, op: CompareOp) -> PyResult<Bound<'py, PyAny>> {
         let compare = match op { CompareOp::Eq => functions::equal, CompareOp::Ne => functions::not_equal, CompareOp::Lt => functions::less, CompareOp::Le => functions::less_equal, CompareOp::Gt => functions::greater, CompareOp::Ge => functions::greater_equal };
         operand(slf.py(), compare(slf.py(), slf, y, None))
     }
-    /// `rustymath.sum` of this array.
-    #[pyo3(signature = (axis=None))]
-    fn sum<'py>(slf: &Bound<'py, Self>, axis: Option<functions::Axes>) -> PyResult<Bound<'py, PyAny>> { functions::sum(slf.py(), slf, axis) }
-    /// `rustymath.prod` of this array.
-    #[pyo3(signature = (axis=None))]
-    fn prod<'py>(slf: &Bound<'py, Self>, axis: Option<functions::Axes>) -> PyResult<Bound<'py, PyAny>> { functions::prod(slf.py(), slf, axis) }
-    /// `rustymath.max` of this array.
-    #[pyo3(signature = (axis=None))]
-    fn max<'py>(slf: &Bound<'py, Self>, axis: Option<functions::Axes>) -> PyResult<Bound<'py, PyAny>> { functions::max(slf.py(), slf, axis) }
-    /// `rustymath.min` of this array.
-    #[pyo3(signature = (axis=None))]
-    fn min<'py>(slf: &Bound<'py, Self>, axis: Option<functions::Axes>) -> PyResult<Bound<'py, PyAny>> { functions::min(slf.py(), slf, axis) }
-    /// `rustymath.all` of this array.
-    #[pyo3(signature = (axis=None))]
-    fn all<'py>(slf: &Bound<'py, Self>, axis: Option<functions::Axes>) -> PyResult<Bound<'py, PyAny>> { functions::all(slf.py(), slf, axis) }
-    /// `rustymath.any` of this array.
-    #[pyo3(signature = (axis=None))]
-    fn any<'py>(slf: &Bound<'py, Self>, axis: Option<functions::Axes>) -> PyResult<Bound<'py, PyAny>> { functions::any(slf.py(), slf, axis) }
-    /// `rustymath.cumsum` of this array.
-    #[pyo3(signature = (axis=None))]
-    fn cumsum<'py>(slf: &Bound<'py, Self>, axis: Option<functions::Axis>) -> PyResult<Bound<'py, PyAny>> { functions::cumsum(slf.py(), slf, axis) }
-    /// `rustymath.cumprod` of this array.
-    #[pyo3(signature = (axis=None))]
-    fn cumprod<'py>(slf: &Bound<'py, Self>, axis: Option<functions::Axis>) -> PyResult<Bound<'py, PyAny>> { functions::cumprod(slf.py(), slf, axis) }
+    #[getter]
+    #[pyo3(name = "T")]
+    fn transposed(slf: &Bound<'_, Self>) -> PyResult<Array> { crate::structure::transpose(slf.as_any(), None) }
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         let mut text = format!("Array({}, dtype={}", nested(py, self.core.layout().shape(), &|i| shown(py, self.core.view(), i))?.repr()?, self.dtype());
         let layout = self.core.layout();
@@ -196,12 +207,14 @@ impl Array {
         // SAFETY: the object owns its items, shape and strides, and keeps them while `owner`, which the export holds, lives.
         unsafe { export(view, flags, &owner, dtype, data, len, &this.shape, &this.strides, readonly) }
     }
-}
+} }
 
 /// A new array holding a copy of `x`: a `rustymath.Array`, any object that exports a buffer, such as a NumPy array, or nested Python values.
 #[pyfunction]
-fn array(x: &Bound<'_, PyAny>) -> PyResult<Array> {
-    Ok(Array::new(crate::convert::one(x)?.into_core()?))
+#[pyo3(signature = (x, dtype=None))]
+fn array(x: &Bound<'_, PyAny>, dtype: Option<&str>) -> PyResult<Array> {
+    let value = match dtype { Some(d) => crate::convert::one_at(x, crate::convert::dtype(d)?)?.into_core()?, None => crate::convert::one(x)?.into_core()? };
+    Ok(Array::new(value))
 }
 
 pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {

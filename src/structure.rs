@@ -1,12 +1,166 @@
 //! Plans for structural operations: take and drop, rotate and reverse, windows, transpose and catenate. A plan gives the result's layout, and `Steps` that read the result's items from the argument's items in order. `gather::walk` copies a compact array by a plan, and basedpl copies its other arrays by the same plan. Each plan checks its arguments.
 use crate::error::{Error, Kind};
 use crate::gather::Steps;
-use crate::layout::{agreed, generated_len, strides, Keys, Lanes, Layout};
+use crate::layout::{agreed, generated_len, position, strides, Keys, Lanes, Layout};
 use std::sync::Arc;
 
 /// A structural result's layout, and the steps that read its items from the argument. The steps' lengths multiply to the result's item count, outermost first. One entry can cover several result axes.
 #[derive(Clone, Debug)]
 pub struct Plan { pub layout: Layout, pub steps: Vec<Steps> }
+
+/// One independent axis selector. Positions are zero-based and already normalized; a range can walk backwards. An index array replaces its axis by the axes of its layout, and a position of `None` reads the caller's fill. `NewAxis` inserts a length-one axis without consuming an input axis.
+#[derive(Clone, Debug)]
+pub enum Selector { At(usize), Range { start: usize, len: usize, step: isize }, Indices { layout: Layout, positions: Vec<Option<usize>> }, NewAxis }
+
+impl Selector {
+    /// The whole of an axis of length `len`.
+    pub fn all(len: usize) -> Self { Selector::Range { start: 0, len, step: 1 } }
+}
+
+/// Selects each axis independently, keeping unmentioned trailing axes. Scalar selectors remove their axis. An index array with axis names gives the result its own axes, with their names and any keys it has. A named vector without keys keeps the selected positions' keys. An axis whose name an earlier index array's axis has pairs with that axis, as named axes pair in arithmetic, and both read one position along it. An unnamed vector keeps the selected positions' keys and the axis name, and an unnamed index array of another rank has plain axes.
+pub fn select(layout: &Layout, selectors: &[Selector]) -> Result<Plan, Error> {
+    let (shape, stride) = (layout.shape(), strides(layout.shape()));
+    // Each selector's steps, scaled to the argument's items, with the result axes they run along.
+    let (mut axis, mut result, mut parts, mut paired) = (0, Layout::EMPTY, Vec::<(Steps, Vec<usize>)>::new(), false);
+    let mut named: Vec<(Arc<str>, usize)> = Vec::new();
+    for selector in selectors {
+        let rank = result.shape().len();
+        if matches!(selector, Selector::NewAxis) {
+            result = result.concat(&Layout::from([1]));
+            parts.push((Steps::along(1, 0), vec![rank]));
+            continue;
+        }
+        let Some(&size) = shape.get(axis) else { return Err(Error::new(Kind::Index, "too many axis selectors")) };
+        let positions = match selector {
+            &Selector::At(i) => Steps::Stride { start: i, len: 1, step: 0 },
+            &Selector::Range { start, len, step } => Steps::Stride { start, len, step },
+            Selector::Indices { layout: within, positions } => {
+                if generated_len(within.shape())? != positions.len() { return Err(Error::new(Kind::Length, "index array shape doesn't fit its positions")); }
+                Steps::Table(positions.clone())
+            }
+            Selector::NewAxis => unreachable!(),
+        };
+        let valid = match &positions {
+            Steps::Stride { start, len, step } => *len == 0 || *start < size && start.checked_add_signed(step.saturating_mul((*len - 1) as isize)).is_some_and(|i| i < size),
+            _ => positions.offsets().all(|i| i.is_none_or(|i| i < size)),
+        };
+        if !valid { return Err(Error::new(Kind::Index, "axis selector is outside its axis")); }
+        let mut along = Vec::new();
+        if !matches!(selector, Selector::At(_)) {
+            // Check selected keys even when the result drops them, as BPL selection does.
+            let selected = layout.select(axis, positions.offsets())?;
+            match selector {
+                Selector::Indices { layout: within, .. } if within.names().iter().any(Option::is_some) => {
+                    for a in 0..within.shape().len() {
+                        // A vector without keys of its own keeps the keys at the positions it selects, as an unnamed vector does.
+                        let mine = if within.shape().len() == 1 && within.keys(0).is_none() { within.clone().with_keys(vec![selected.keys(axis).cloned()])? } else { within.axes(a..a + 1) };
+                        let Some(&(_, r)) = within.name(a).and_then(|n| named.iter().find(|(m, _)| m == n)) else {
+                            let r = result.shape().len();
+                            if let Some(n) = within.name(a) { named.push((n.clone(), r)); }
+                            result = result.concat(&mine);
+                            along.push(r);
+                            continue;
+                        };
+                        let (keys, theirs) = (result.keys(r), mine.keys(0));
+                        if result.shape()[r] != within.shape()[a] || keys.zip(theirs).is_some_and(|(k, t)| k != t) {
+                            return Err(Error::new(Kind::Length, "index arrays disagree on an axis they both name"));
+                        }
+                        if keys.is_none() && theirs.is_some() {
+                            let mut all = result.all_keys();
+                            all[r] = theirs.cloned();
+                            result = result.with_keys(all)?;
+                        }
+                        along.push(r);
+                        paired = true;
+                    }
+                }
+                Selector::Indices { layout: within, .. } if within.shape().len() != 1 => {
+                    along.extend(rank..rank + within.shape().len());
+                    result = result.concat(&Layout::from(within.shape().to_vec()));
+                }
+                _ => {
+                    along.push(rank);
+                    result = result.concat(&selected.axes(axis..axis + 1));
+                }
+            }
+        }
+        let s = stride[axis];
+        parts.push((match positions {
+            Steps::Stride { start, len, step } => Steps::Stride { start: start * s, len, step: step * s as isize },
+            Steps::Table(mut positions) => { for i in positions.iter_mut().flatten() { *i *= s; } Steps::Table(positions) }
+            _ => unreachable!("selectors use ranges or explicit positions"),
+        }, along));
+        axis += 1;
+    }
+    let mut steps = if paired { vec![Steps::Table(paired_offsets(result.shape(), &parts)?)] } else { parts.into_iter().map(|(s, _)| s).collect() };
+    result = result.concat(&layout.axes(axis..shape.len()));
+    steps.extend((axis..shape.len()).map(|a| Steps::along(shape[a], stride[a])));
+    generated_len(result.shape())?;
+    Ok(Plan { layout: result, steps })
+}
+
+/// The argument's offset for each item of the selected axes, of lengths `dims`, as one table. Each item sums one offset from each of `parts`, read at the coordinates of the result axes that part runs along. A part's fill makes the item a fill.
+fn paired_offsets(dims: &[usize], parts: &[(Steps, Vec<usize>)]) -> Result<Vec<Option<usize>>, Error> {
+    let len = generated_len(dims)?;
+    let (mut coords, mut table) = (vec![0; dims.len()], Vec::with_capacity(len));
+    for _ in 0..len {
+        table.push(parts.iter().try_fold(0, |sum, (steps, along)| steps.get(along.iter().fold(0, |j, &r| j * dims[r] + coords[r])).map(|o| sum + o)));
+        for r in (0..dims.len()).rev() {
+            coords[r] += 1;
+            if coords[r] < dims[r] { break; }
+            coords[r] = 0;
+        }
+    }
+    Ok(table)
+}
+
+/// [`select`] with `selector` on `axis` and every other axis whole. A `NewAxis` goes in before `axis`.
+pub fn select_axis(layout: &Layout, axis: usize, selector: Selector) -> Result<Plan, Error> {
+    let selectors: Vec<_> = layout.shape().iter().take(axis).map(|&len| Selector::all(len)).chain([selector]).collect();
+    select(layout, &selectors)
+}
+
+/// The positions that index values give along an axis of length `size`. Without axis names, a negative value counts back from the end, and a value outside the axis is an Index error. A named index array reads the caller's fill outside its axis instead, as `None`, and never counts back from the end.
+pub fn index_positions(values: impl IntoIterator<Item = i64>, size: usize, named: bool) -> Result<Vec<Option<usize>>, Error> {
+    values.into_iter().map(|n| if named { Ok(usize::try_from(n).ok().filter(|&i| i < size)) } else {
+        position(n, size).map(Some).ok_or_else(|| Error::new(Kind::Index, format!("position {n} is outside an axis of length {size}")))
+    }).collect()
+}
+
+/// Repeats each cell along `axis` by its count: one nonnegative count, or one per position. Repeating a keyed position is an error, as it is for selection.
+pub fn repeat(layout: &Layout, axis: usize, counts: &[i64]) -> Result<Plan, Error> {
+    let lanes = Lanes::new(layout.shape(), axis)?;
+    if counts.len() != 1 && counts.len() != lanes.len { return Err(Error::new(Kind::Length, "repeat needs one count or one per axis position")); }
+    let count = |i: usize| usize::try_from(counts[if counts.len() == 1 { 0 } else { i }]).map_err(|_| Error::new(Kind::Domain, "repeat counts must be nonnegative"));
+    if counts.len() == 1 { count(0)?; }
+    let len = (0..lanes.len).try_fold(0usize, |n, i| n.checked_add(count(i)?).ok_or_else(|| Error::new(Kind::Limit, "repeat length overflow")))?;
+    let mut shape = layout.shape().to_vec();
+    shape[axis] = len;
+    generated_len(&shape)?;
+    if counts.len() == 1 && layout.keys(axis).is_none() {
+        let result = Layout::from(shape).with_keys(layout.all_keys())?.inherit_names(layout.names().to_vec());
+        return Ok(Plan { layout: result, steps: vec![Steps::along(lanes.outer, lanes.len * lanes.inner), Steps::along(lanes.len, lanes.inner), Steps::along(count(0)?, 0), Steps::along(lanes.inner, 1)] });
+    }
+    let positions = (0..lanes.len).flat_map(|i| std::iter::repeat_n(Some(i), count(i).expect("validated counts"))).collect::<Vec<_>>();
+    let result = layout.select(axis, positions.iter().copied())?;
+    Ok(Plan { layout: result, steps: vec![Steps::along(lanes.outer, lanes.len * lanes.inner), Steps::Table(positions.into_iter().map(|i| i.map(|i| i * lanes.inner)).collect()), Steps::along(lanes.inner, 1)] })
+}
+
+/// Pads every axis by `(before, after)` positions, filled with the item type's fill. Existing axis keys remain on their positions.
+pub fn pad(layout: &Layout, widths: &[(usize, usize)]) -> Result<Plan, Error> {
+    if widths.len() != layout.shape().len() { return Err(Error::new(Kind::Rank, "padding needs one pair for each axis")); }
+    let stride = strides(layout.shape());
+    let mut result = layout.clone();
+    let mut steps = Vec::new();
+    for (axis, (&size, &(before, after))) in layout.shape().iter().zip(widths).enumerate() {
+        let len = size.checked_add(before).and_then(|n| n.checked_add(after)).ok_or_else(|| Error::new(Kind::Limit, "padding length overflow"))?;
+        let positions = Steps::Clipped { start: -(before as i128), len, size, stride: 1 };
+        result = result.select(axis, positions.offsets())?;
+        steps.push(Steps::Clipped { start: -(before as i128), len, size, stride: stride[axis] });
+    }
+    generated_len(result.shape())?;
+    Ok(Plan { layout: result, steps })
+}
 
 /// Takes `count` items along `axis` for each `(axis, count)` in `counts`, or drops them when `take` is false. A negative count works from the end. A take past an end reads fill there. A later count for the same axis replaces an earlier one.
 pub fn take(layout: &Layout, counts: &[(usize, i64)], take: bool) -> Result<Plan, Error> {
@@ -190,6 +344,28 @@ pub fn transpose(layout: &Layout, axes: &[usize]) -> Result<Plan, Error> {
     for (&axis, step) in axes.iter().zip(strides(source)) { stride[axis] += step; }
     let steps = shape.iter().zip(&stride).map(|(&len, &stride)| Steps::along(len, stride)).collect();
     Ok(Plan { layout: regrouped(layout, shape, &sources, &[])?, steps })
+}
+
+/// Where diagonal `offset` of a matrix of `rows` by `cols` starts, as a row and a column, and its length. A positive offset starts further along the columns. A negative one starts further down the rows.
+pub fn diagonal_span(offset: i64, [rows, cols]: [usize; 2]) -> (usize, usize, usize) {
+    let (row, col) = if offset < 0 { (offset.unsigned_abs().min(rows as u64) as usize, 0) } else { (0, (offset as u64).min(cols as u64) as usize) };
+    (row, col, (rows - row).min(cols - col))
+}
+
+/// A diagonal of two distinct axes, moved to the last result axis. Positive offsets start further along `axes[1]`; negative ones along `axes[0]`.
+pub fn diagonal(layout: &Layout, axes: [usize; 2], offset: i64) -> Result<Plan, Error> {
+    let [a, b] = axes;
+    let shape = layout.shape();
+    if a == b || a >= shape.len() || b >= shape.len() { return Err(Error::new(Kind::Index, "a diagonal needs two distinct axes")); }
+    let (row, col, n) = diagonal_span(offset, [shape[a], shape[b]]);
+    let selected = layout.select(a, (row..row + n).map(Some))?.select(b, (col..col + n).map(Some))?;
+    let remaining: Vec<_> = (0..shape.len()).filter(|&i| i != a && i != b).collect();
+    let result: Vec<_> = remaining.iter().map(|&i| shape[i]).chain([n]).collect();
+    let sources: Vec<_> = remaining.iter().map(|&i| vec![i]).chain([vec![a, b]]).collect();
+    let stride = strides(shape);
+    let mut steps: Vec<_> = remaining.iter().map(|&i| Steps::along(shape[i], stride[i])).collect();
+    steps.push(Steps::Stride { start: row * stride[a] + col * stride[b], len: n, step: (stride[a] + stride[b]) as isize });
+    Ok(Plan { layout: regrouped(&selected, result, &sources, &[])?, steps })
 }
 
 /// A layout of `shape` whose axis `i` comes from `layout`'s axes `sources[i]`, as a transpose sends them. An axis with no sources is new, as a split or a merge makes it. A result axis keeps the keys its sources agree on when each source has its length. It keeps the name they agree on, unless `names[i]` gives one.

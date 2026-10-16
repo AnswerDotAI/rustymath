@@ -1,4 +1,4 @@
-//! How fast each function object's slice form runs on 65,536 inputs. The slice form is the code that callers such as basedpl and the Python package run. `speed.txt` gives each function a budget at f64 and at f32, in copies of the same number of items: the most time it may take, as a multiple of the time to copy those items. Each row's copy is timed just before the row, as basedpl's speed test times each case's copy. A loop that stops vectorizing takes several times as long and goes over budget. Where the standard library has the function, its time item by item is measured too, for the README's table, but sets no limit. The rows `Pow.one` and `Root.one` time the scalar forms pair by pair, as a caller with one value at a time runs them. The inner products multiply 256×256 matrices, whose results hold the same number of items. The decompositions factor 256×256 real matrices and 128×128 complex ones, and `lstsq` solves a 4096×16 real one. Each of these counts copies of as many items as its matrix holds. The test fails listing every cost over its budget, as its width, name, cost and budget, in the form that `basedpl.bpltests.logged_costs` reads. With `RUSTYMATH_COSTS` set, as in `RUSTYMATH_COSTS=1 cargo test --test speed`, the test writes the README's table, then every cost in that form, straight to stderr. The test harness captures `println!` output from a passing test, but not these lines. CI's `Test` and `Speed` workflows set it. The test holds the machine's timing lock while it runs, as `timing_lock` describes.
+//! How fast each function object's slice form runs on 65,536 inputs. The slice form is the code that callers such as basedpl and the Python package run. `speed.txt` gives each function a budget at f64 and at f32, in copies of the same number of items: the most time it may take, as a multiple of the time to copy those items. Each row's copy is timed just before the row, as basedpl's speed test times each case's copy. A loop that stops vectorizing takes several times as long and goes over budget. Where the standard library has the function, its time item by item is measured too, for the README's table, but sets no limit. The rows `Pow.one` and `Root.one` time the scalar forms pair by pair, as a caller with one value at a time runs them. The inner products multiply 256×256 matrices, whose results hold the same number of items. The decompositions factor 256×256 real matrices and 128×128 complex ones, and `lstsq` solves a 4096×16 real one. Sorts, partitions, medians and variances run along the rows of a 256×256 matrix. One sort runs along two lanes of 32,768. A weighted average reduces the first and last axes of a 16×64×64 array. Each of these counts copies of as many items as its matrix holds. The test fails listing every cost over its budget, as its width, name, cost and budget, in the form that `basedpl.bpltests.logged_costs` reads. With `RUSTYMATH_COSTS` set, as in `RUSTYMATH_COSTS=1 cargo test --test speed`, the test writes the README's table, then every cost in that form, straight to stderr. The test harness captures `println!` output from a passing test, but not these lines. CI's `Test` and `Speed` workflows set it. The test holds the machine's timing lock while it runs, as `timing_lock` describes.
 use rand::seq::SliceRandom;
 use rustymath::*;
 use std::{collections::HashMap, hint::black_box, io::Write, ops::Neg, time::Instant};
@@ -295,6 +295,35 @@ fn inner_products(units: &Units<f64, f32>) -> [Costed; 6] {
     ]
 }
 
+/// Orderings and statistics along the rows of a 256×256 matrix, a sort along two lanes of 32,768, and a weighted average over the first and last axes of a 16×64×64 array.
+fn orderings(units: &Units<f64, f32>) -> [Costed; 6] {
+    use buffer::{Floats, View};
+    let (x64, x32) = widths(-1.0, 1.0, GOLDEN, N);
+    let (w64, w32) = widths(0.0, 1.0, SILVER, N);
+    let rows = [256, 256, 1];
+    let run = |k: &dyn Fn(usize)| fastest(N, |r| k(r));
+    macro_rules! copies {
+        (|$x:ident| $body:expr) => {
+            units.costs(|| run(&|r| { let $x = View::Floats(Floats::F64(set(&x64, r))); black_box($body); }),
+                || run(&|r| { let $x = View::Floats(Floats::F32(set(&x32, r))); black_box($body); }))
+        };
+    }
+    let layout = layout::Layout::from([16, 64, 64]);
+    let axes = stats::Axes::new(&layout, &[0, 2]).unwrap();
+    let agreement = agreement::Agreement::new(&layout, &layout).unwrap();
+    let mappings = [&agreement.left, &agreement.right];
+    [
+        ("search::view_sort_along", copies!(|x| search::view_sort_along(x, rows, false))),
+        ("search::view_sort_along long lanes", copies!(|x| search::view_sort_along(x, [2, N / 2, 1], false))),
+        ("search::view_partition_along", copies!(|x| search::view_partition_along(x, rows, 128, false))),
+        ("search::view_quantiles_along", copies!(|x| search::view_quantiles_along(x, rows, &[0.5]).unwrap())),
+        ("stats::variance", units.costs(|| run(&|r| { black_box(stats::variance(set(&x64, r), rows, 0)); }),
+            || run(&|r| { black_box(stats::variance(set(&x32, r), rows, 0)); }))),
+        ("stats::average", units.costs(|| run(&|r| { black_box(stats::average(set(&x64, r), set(&w64, r), &axes, mappings)); }),
+            || run(&|r| { black_box(stats::average(set(&x32, r), set(&w32, r), &axes, mappings)); }))),
+    ]
+}
+
 /// Decompositions of 256×256 real matrices and 128×128 complex ones, and a least-squares solution for a 4096×16 real matrix. Each cost counts copies of as many items as the matrix holds. `s` is symmetric positive definite, and `h` is Hermitian.
 fn decompositions(units: &Units<f64, f32>, complex_units: &Units<num_complex::Complex<f64>, num_complex::Complex<f32>>) -> Vec<Costed> {
     use linalg::*;
@@ -439,7 +468,7 @@ fn speed() {
         time_slice(N, |k, out| { negate(black_box(set(&x32, k)), out); polynomial::evaluate(c32, out) })
     }, || time(&x32, |x| horner(c32, x))));
     let costed: Vec<Costed> = compared.iter().map(|&(name, _, costs)| (name, costs)).chain(special(&units)).chain(complex(&complex_units))
-        .chain(inner_products(&units)).chain(decompositions(&units, &complex_units)).collect();
+        .chain(inner_products(&units)).chain(orderings(&units)).chain(decompositions(&units, &complex_units)).collect();
     let print_all = std::env::var_os("RUSTYMATH_COSTS").is_some();
     let mut stderr = std::io::stderr();
     if print_all {

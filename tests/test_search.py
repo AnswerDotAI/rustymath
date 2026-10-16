@@ -1,5 +1,14 @@
 import numpy as np, pytest, rustymath as rm
 
+def test_set_operations_retain_first_occurrences():
+    x, y = [3, 1, 3, 2], [2, 4, 2]
+    assert rm.union1d(x, y).tolist() == [3, 1, 2, 4]
+    assert rm.intersect1d(x, y).tolist() == [2] and rm.setdiff1d(x, y).tolist() == [3, 1]
+    assert rm.union1d([], y).tolist() == [2, 4] and rm.intersect1d(x, []).shape == (0,)
+    assert rm.setdiff1d('abac', 'b').tolist() == ['a', 'c']
+    assert rm.intersect1d([1., 2.], [1. + 1e-14]).tolist() == [1.]
+    assert rm.intersect1d([1., 2.], [1. + 1e-14], ct=0).shape == (0,)
+
 def test_sort_and_bins():
     s = rm.search
     for dt in [np.bool_, np.uint8, np.int16, np.int64, np.float16, np.float32, np.float64]:
@@ -32,6 +41,44 @@ def test_counts_and_groups():
         assert np.array_equal(s.bincount(x, minlength=5), np.bincount(np.asarray(x, np.int64), minlength=5))
     for args in [([-1],), ([0.5],), ([[1, 2]],), ([1], -1)]:
         with pytest.raises(ValueError): s.bincount(*args)
+
+def test_selection_and_statistics(threads):
+    s = rm.search
+    for dt in [np.bool_, np.uint8, np.int16, np.int64, np.float16, np.float32, np.float64]:
+        a = np.array([[8, 2, 4, 2, 6], [1, 7, 5, 9, 3]], dt)
+        for axis in [0, 1, None]:
+            expected = np.sort(a, axis=axis)
+            assert np.array_equal(s.sort(a, axis=axis), expected)
+            assert np.array_equal(s.sort(a, axis=axis, descending=True), np.flip(expected, axis=axis))
+            assert np.array_equal(s.argmin(a, axis=axis), np.argmin(a, axis=axis))
+            assert np.array_equal(s.argmax(a, axis=axis), np.argmax(a, axis=axis))
+            assert np.allclose(s.median(a, axis=axis), np.median(a, axis=axis))
+            if dt != np.bool_: assert np.allclose(s.quantile(a, [0, 0.25, 0.5, 1], axis=axis), np.quantile(a, [0, 0.25, 0.5, 1], axis=axis))
+            source = a.ravel() if axis is None else a
+            actual_axis = 0 if axis is None else axis
+            for rank in [0, -1]:
+                p = np.asarray(s.partition(a, rank, axis=axis))
+                order = np.asarray(s.argpartition(a, rank, axis=axis))
+                assert np.array_equal(np.take(p, rank, axis=actual_axis), np.take(expected, rank, axis=actual_axis))
+                assert np.array_equal(np.sort(p, axis=actual_axis), expected)
+                assert np.array_equal(np.take_along_axis(source, order, axis=actual_axis), p)
+    assert s.sort(list('cab')).tolist() == ['a', 'b', 'c']
+    keyed = rm.array({'b': 2, 'a': 1})
+    assert s.sort(keyed).keys == (('a', 'b'),)
+    rows = rm.array({'b': [2, 1], 'a': [1, 2]})
+    rows.names = ('row', 'column')
+    sorted_rows = s.sort(rows, axis='row')
+    assert sorted_rows.keys == (None, None) and sorted_rows.names == rows.names
+    assert s.quantile([8, 2, 4, 6], 0.5) == 5 and np.isnan(s.median([]))
+    rows = np.arange(4096 * 7, dtype=np.float32).reshape(4096, 7)[:, ::-1]
+    for f, expected in [(s.argmin, np.full(4096, 6)), (s.median, np.arange(4096) * 7 + 3)]:
+        result = np.asarray(f(rows, axis=1))
+        assert np.array_equal(result, expected)
+    assert np.asarray(s.quantile(rows, [0.25, 0.5], axis=1)).dtype == np.float32
+    assert np.array_equal(s.argpartition([2**62 + 1, 2**62], 0), [1, 0])
+    assert np.array_equal(s.argsort([0., -0., np.nan, np.nan]), [0, 1, 2, 3])
+    for f, args in [(s.partition, ([1], 1)), (s.argmin, ([],)), (s.quantile, ([1], -0.1)), (s.sort, ([1j],))]:
+        with pytest.raises((ValueError, IndexError)): f(*args)
 
 def test_tolerant_search():
     a = np.random.default_rng(0).integers(0, 50, (20, 30))

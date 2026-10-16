@@ -64,6 +64,11 @@ eigh = _named(lambda a: Eigen(*_g.eigh(a)), 'eigh', _g.eigh.__doc__)
 svd = _named(lambda a, rank=None: Svd(*_g.svd(a, rank)), 'svd', _g.svd.__doc__)
 echelon = _named(lambda a, columns=None: Echelon(*_g.echelon(a, columns)), 'echelon', _g.echelon.__doc__)
 
+def cond(a):
+    "The 2-norm condition number, the largest singular value divided by the smallest"
+    s = svdvals(a)
+    return _core.divide(_core.max(s, axis=-1), _core.min(s, axis=-1))
+
 _PAIRS = {('add', 'multiply'): 'plus_times', ('maximum', 'add'): 'max_plus', ('minimum', 'add'): 'min_plus',
     ('logical_or', 'logical_and'): 'or_and', ('logical_and', 'logical_or'): 'and_or', ('add', 'equal'): 'plus_equal', ('add', 'not_equal'): 'plus_not_equal'}
 

@@ -10,6 +10,9 @@ use rustymath::layout::{Layout, generated_len};
 use rustymath::search::{self, Key, Numbered};
 use rustymath_buffer::py_err;
 
+pub const LAST_AXIS: Option<Axis> = Some(Axis::Position(-1));
+pub const FIRST_AXIS: Option<Axis> = Some(Axis::Position(0));
+
 /// `positions` as an `i64` array of `layout`.
 fn positions(layout: Layout, positions: impl IntoIterator<Item = usize>) -> PyResult<Core> {
     Core::new(layout, i64::buffer(positions.into_iter().map(|p| p as i64).collect())).map_err(py_err)
@@ -62,6 +65,19 @@ pub fn isin<'py>(py: Python<'py>, element: &Bound<'py, PyAny>, test_elements: &B
     give(py, Core::new(ys.layout(), bool::buffer(found.into_iter().map(|p| (p as usize) < n).collect())).map_err(py_err)?, ys.scalar)
 }
 
+#[pyfunction]
+#[pyo3(signature = (x, y, how, ct=None))]
+fn _set<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>, how: &str, ct: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+    let how = match how { "union" => search::Set::Union, "intersection" => search::Set::Intersection, "difference" => search::Set::Difference,
+        _ => return Err(py_err(Error::new(Kind::Domain, "unknown set operation"))), };
+    let call = convert(&[x, y])?;
+    let [x, y] = [call.args[0].view(), call.args[1].view()];
+    generated_len(&[x.len().saturating_add(y.len())]).map_err(py_err)?;
+    let values = search::view_set(x, y, how, tolerance(ct)?, || py.check_signals()).ok_or_else(|| missing("set operation", x.dtype()))??;
+    let n = values.len();
+    give(py, Core::new([n].into(), values).map_err(py_err)?, false)
+}
+
 /// The size of each class of flattened `x`, in order of first position.
 #[pyfunction]
 #[pyo3(signature = (x, *, ct=None))]
@@ -104,14 +120,105 @@ fn sorted<'py>(py: Python<'py>, function: &str, keys: &[Arg<'_>], axis: Option<A
 
 /// Stable positions that sort `a` along `axis`, the last axis by default, as in NumPy. `axis=None` sorts along the flattened `a`.
 #[pyfunction]
-#[pyo3(signature = (a, axis=Some(Axis::Position(-1))), text_signature = "(a, axis=-1)")]
+#[pyo3(signature = (a, axis=LAST_AXIS), text_signature = "(a, axis=-1)")]
 pub fn argsort<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, axis: Option<Axis>) -> PyResult<Bound<'py, PyAny>> {
     sorted(py, "argsort", &[one(a)?], axis)
 }
 
+#[derive(Clone, Copy)]
+enum Ordering { Sort(bool), Partition(i64, bool), Extreme(bool) }
+
+/// Runs one vector operation along the selected axis. Only the Python axis and rank arguments are decoded here.
+fn ordered<'py>(py: Python<'py>, name: &str, a: &Bound<'py, PyAny>, axis: Option<Axis>, how: Ordering) -> PyResult<Bound<'py, PyAny>> {
+    let x = one(a)?;
+    let view = x.view();
+    if matches!(view, View::Complexes(_)) { return Err(missing(name, view.dtype())); }
+    let layout = if x.layout().shape().is_empty() { Layout::from([1]) } else { x.layout() };
+    let position = axis.as_ref().map(|a| a.of(&layout)).transpose()?;
+    let (dims @ [outer, n, inner], mut layout) = along_axis(layout, view.len(), axis)?;
+    let rank = if let Ordering::Partition(k, _) = how {
+        rustymath::layout::position(k, n).ok_or_else(|| py_err(Error::new(Kind::Index, "partition rank is outside the axis")))?
+    } else { 0 };
+    if matches!(how, Ordering::Extreme(_)) && n == 0 { return Err(py_err(Error::new(Kind::Length, "an empty axis has no minimum or maximum"))); }
+    if let Some(a) = position.filter(|&a| layout.keys(a).is_some()) {
+        let order = if outer * inner == 1 { match how {
+            Ordering::Sort(down) => search::view_grade(view, down),
+            Ordering::Partition(_, false) => search::view_argpartition(view, rank), _ => None,
+        }} else { None };
+        if let Some(order) = order {
+            let layout = layout.select(a, order.iter().map(|&p| Some(p as usize))).map_err(py_err)?;
+            return give(py, Core::new(layout, Buffer::gathered(view, &order)).map_err(py_err)?, false);
+        }
+        let mut keys = layout.all_keys();
+        keys[a] = None;
+        layout = layout.with_keys(keys).map_err(py_err)?;
+    }
+    let result = match how {
+        Ordering::Sort(down) => search::view_sort_along(view, dims, down).unwrap(),
+        Ordering::Partition(_, indices) => search::view_partition_along(view, dims, rank, indices).unwrap(),
+        Ordering::Extreme(down) => i64::buffer(search::view_argextremes(view, dims, down).unwrap()),
+    };
+    let layout = if matches!(how, Ordering::Extreme(_)) { position.map_or(Layout::EMPTY, |a| layout.axes((0..layout.shape().len()).filter(move |&i| i != a))) } else { layout };
+    give(py, Core::new(layout, result).map_err(py_err)?, matches!(how, Ordering::Extreme(_)) && position.is_none())
+}
+
+macro_rules! order_functions {
+    ($($(#[doc = $doc:literal])* $name:ident($($arg:ident: $t:ty),*) = $how:expr, $axis:expr;)+) => {$(
+        $(#[doc = $doc])*
+        #[pyfunction]
+        #[pyo3(signature = (a, $($arg,)* axis=$axis))]
+        pub fn $name<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, $($arg: $t,)* axis: Option<Axis>) -> PyResult<Bound<'py, PyAny>> {
+            ordered(py, stringify!($name), a, axis, $how)
+        }
+    )+};
+}
+
+/// Values sorted along `axis`, the last axis by default. `axis=None` sorts the flattened input. Equal values keep their order; NaNs sort last ascending and first descending.
+#[pyfunction]
+#[pyo3(signature = (a, axis=LAST_AXIS, *, descending=false))]
+pub fn sort<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, axis: Option<Axis>, descending: bool) -> PyResult<Bound<'py, PyAny>> {
+    ordered(py, "sort", a, axis, Ordering::Sort(descending))
+}
+
+order_functions! {
+    /// Values partitioned around `kth`, with neither side sorted. Negative ranks count from the end.
+    partition(kth: i64) = Ordering::Partition(kth, false), LAST_AXIS;
+    /// Positions partitioned around `kth`, with neither side sorted. Equal values need not keep their original order.
+    argpartition(kth: i64) = Ordering::Partition(kth, true), LAST_AXIS;
+    /// The first position of the minimum, along `axis` or in the flattened array. Uses sorting's exact NaN-last ordering.
+    argmin() = Ordering::Extreme(false), None;
+    /// The first position of the maximum, along `axis` or in the flattened array. Uses sorting's exact NaN-last ordering.
+    argmax() = Ordering::Extreme(true), None;
+}
+
+/// Quantiles along `axis` or in flattened `a`, by selecting the required ranks and interpolating linearly. A vector of probabilities adds a leading axis. NaN counts as the largest value, as in sorting.
+#[pyfunction]
+#[pyo3(signature = (a, q, axis=None))]
+pub fn quantile<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, q: &Bound<'py, PyAny>, axis: Option<Axis>) -> PyResult<Bound<'py, PyAny>> {
+    let (x, q) = (one(a)?, one(q)?);
+    if q.layout().shape().len() > 1 { return Err(py_err(Error::new(Kind::Rank, "quantile probabilities must be a scalar or vector"))); }
+    let probabilities = q.items::<f64>()?;
+    let layout = x.layout();
+    let position = axis.as_ref().map(|a| a.of(&layout)).transpose()?;
+    let (dims, _) = along_axis(layout.clone(), x.view().len(), axis)?;
+    let items = search::view_quantiles_along(x.view(), dims, &probabilities).map_err(py_err)?.ok_or_else(|| missing("quantile", x.view().dtype()))?;
+    let frame = position.map_or(Layout::EMPTY, |a| layout.axes((0..layout.shape().len()).filter(move |&i| i != a)));
+    let layout = if q.layout().shape().is_empty() { frame } else { q.layout().concat(&frame) };
+    let out = Core::new(layout, items).map_err(py_err)?;
+    give(py, out, position.is_none() && q.layout().shape().is_empty())
+}
+
+/// The middle value, or the mean of the two middle values, without fully sorting the input. NaN counts as the largest value, as in sorting.
+#[pyfunction]
+#[pyo3(signature = (a, axis=None))]
+pub fn median<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, axis: Option<Axis>) -> PyResult<Bound<'py, PyAny>> {
+    use pyo3::IntoPyObject;
+    quantile(py, a, &0.5f64.into_pyobject(py)?.into_any(), axis)
+}
+
 /// Stable positions that sort equally shaped `keys` along `axis`, the last axis by default, with the last key primary, as in NumPy. `axis=None` sorts along the flattened keys. Each key keeps its own dtype.
 #[pyfunction]
-#[pyo3(signature = (keys, axis=Some(Axis::Position(-1))), text_signature = "(keys, axis=-1)")]
+#[pyo3(signature = (keys, axis=LAST_AXIS), text_signature = "(keys, axis=-1)")]
 pub fn lexsort<'py>(py: Python<'py>, keys: Vec<Bound<'py, PyAny>>, axis: Option<Axis>) -> PyResult<Bound<'py, PyAny>> {
     sorted(py, "lexsort", &keys.iter().map(one).collect::<PyResult<Vec<_>>>()?, axis)
 }
@@ -159,7 +266,9 @@ pub fn bincount<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, minlength: i64) -> 
 pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
     for f in [
         wrap_pyfunction!(unique, m)?, wrap_pyfunction!(index, m)?, wrap_pyfunction!(isin, m)?, wrap_pyfunction!(counts, m)?, wrap_pyfunction!(group_indices, m)?,
-        wrap_pyfunction!(argsort, m)?, wrap_pyfunction!(lexsort, m)?, wrap_pyfunction!(searchsorted, m)?, wrap_pyfunction!(bincount, m)?,
+        wrap_pyfunction!(argsort, m)?, wrap_pyfunction!(sort, m)?, wrap_pyfunction!(partition, m)?, wrap_pyfunction!(argpartition, m)?,
+        wrap_pyfunction!(argmin, m)?, wrap_pyfunction!(argmax, m)?, wrap_pyfunction!(median, m)?, wrap_pyfunction!(quantile, m)?,
+        wrap_pyfunction!(lexsort, m)?, wrap_pyfunction!(searchsorted, m)?, wrap_pyfunction!(bincount, m)?, wrap_pyfunction!(_set, m)?,
     ] { m.add_function(f)?; }
     Ok(())
 }
