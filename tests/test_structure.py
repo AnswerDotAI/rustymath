@@ -56,6 +56,10 @@ def test_shape_operations_are_compact_copies():
     b = a.T
     b[0, 0, 0] = 99
     assert a[0, 0, 0] == 0
+    for source, shape in ((np.array(7), (3, 17)), (np.arange(3), (3, 64)), (np.arange(17)[None], (3, 17)),
+        (np.arange(6).reshape(2, 1, 3), (2, 4, 3)), (np.array([]), (0, 3))):
+        expected = np.broadcast_to(source.reshape(source.shape + (1,) * (len(shape) - source.ndim)), shape)
+        assert np.array_equal(rm.broadcast_to(source, shape), expected)
     with pytest.raises(ValueError): rm.squeeze(a, axis=0)
     with pytest.raises(ValueError): rm.transpose(a, (0, 0, 1))
 
@@ -98,6 +102,9 @@ def test_diagonals_triangles_and_conveniences():
     assert rm.broadcast_to(keyed[:, 0], (2, 3)).tolist() == [[1] * 3, [3] * 3]
     assert rm.broadcast_to([1, 2], (2, 3)).tolist() == [[1] * 3, [2] * 3]
     for n in (0, 1, 2, 5): assert np.array_equal(rm.diff(a, n, axis=1), np.diff(a, n, axis=1))
+    for shape in ((7, 2), (2, 3, 4), (3, 1), (3, 0)):
+        x = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+        for axis in range(x.ndim): assert np.array_equal(rm.diff(x, axis=axis), np.diff(x, axis=axis))
     assert rm.diff([True, True, False]).tolist() == [False, True]
     assert rm.diff(keyed, axis='row').keys == (('b',), None) and rm.ptp(a) == np.ptp(a)
     with pytest.raises(OverflowError): rm.diff(np.array([0, 255], np.uint8)[::-1])

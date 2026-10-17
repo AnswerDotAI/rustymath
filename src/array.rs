@@ -82,10 +82,13 @@ impl Array {
         let buffer = with_dtype!(source.dtype(), T => {
             let data = T::of(source).expect("matching dtype");
             let mut out = Vec::with_capacity(agreement.len);
-            crate::parallel::extended(&mut out, agreement.len, crate::CHUNK, &|range, slots| slots.fill(range.len(), |slots| {
-                for (i, slot) in range.zip(slots) { slot.write(agreement.right.get(i).map_or(T::FILL, |j| data[j])); }
+            crate::agreement::block(data, &agreement.right, agreement.len, &mut out, |items, n, slots| {
+                match items {
+                    crate::Arg::One(item) => { slots.fill(n, |slots| { slots.fill(std::mem::MaybeUninit::new(item)); true }); }
+                    crate::Arg::Many(items) => slots.copy(items),
+                }
                 true
-            }));
+            });
             T::buffer(out)
         });
         Self::new(agreement.layout, buffer)

@@ -176,6 +176,10 @@ mod integer {
 
     #[test]
     fn gcd_lcm_power_residue() {
+        assert_eq!(sum_bounds([-2, 3], 4, Some(10), false), Some([2, 22]));
+        assert_eq!(sum_bounds([-2, 3], 4, None, true), Some([-16, 14]));
+        assert_eq!((product_bounds([-3, 2], [-5, 7]), product_bounds([i64::MAX, i64::MAX], [2, 2])), (Some([-21, 15]), None));
+        assert_eq!(sum_bounds([i64::MIN, i64::MAX], 2, None, false), None);
         // Hours, minutes and seconds; a base of 0 that takes what remains; and a quotient that leaves `i64`.
         assert_eq!((encode(&[24, 60, 60], &[3661, 86399]), encode(&[0, 10], &[123])), (Some(vec![1, 1, 1, 23, 59, 59]), Some(vec![12, 3])));
         assert_eq!((encode(&[-1], &[i64::MIN]), decode(&[24, 60, 60], &[1, 1, 1, 23, 59, 59])), (None, Some(vec![3661, 86399])));
@@ -380,7 +384,7 @@ mod operation {
         assert_eq!(kernels!(Binary of rustymath::tolerant::Equal(rustymath::tolerant::Tolerance::DEFAULT)).computes(b), Some(i64));
         // A sum of a narrow integer type has its own fold, whose totals are `i64`.
         let sum = kernels!(Fold reduce::Sum);
-        let (totals, ok) = sum.fold(&reduce::Sum, Buffer::Integers(rustymath::buffer::IntBuf::I16(vec![1, 2, 3, 4])).view(), [2, 2, 1]).unwrap();
+        let (totals, ok) = sum.run(&reduce::Sum, Buffer::Integers(rustymath::buffer::IntBuf::I16(vec![1, 2, 3, 4])).view(), [2, 2, 1], None).unwrap();
         assert!(ok && matches!(totals, Buffer::Integers(rustymath::buffer::IntBuf::I64(ref t)) if *t == [3, 7]));
         // An integer argument to `Exp` casts to `f64`, and broadcasting pairs a scalar with every item.
         let x = Buffer::Integers(rustymath::buffer::IntBuf::I64(vec![0, 1]));
@@ -393,6 +397,19 @@ mod operation {
         // An integer result that doesn't fit fails.
         let big = Buffer::Integers(rustymath::buffer::IntBuf::I64(vec![i64::MAX]));
         assert!(!kernels!(Binary rustymath::Add).binary(&rustymath::Add, big.view(), big.view(), &Agreement::new(&two, &two).unwrap()).unwrap().1);
+        let data = Buffer::Integers(rustymath::buffer::IntBuf::I16(vec![10, 2, 3]));
+        let (scan, ok) = kernels!(LeftScan rustymath::Subtract).run(&rustymath::Subtract, data.view(), [1, 3, 1], None).unwrap();
+        assert!(ok && matches!(scan, Buffer::Integers(rustymath::buffer::IntBuf::I16(ref v)) if *v == [10, 8, 5]));
+        let seed = Buffer::Integers(rustymath::buffer::IntBuf::I64(vec![100]));
+        let (scan, ok) = kernels!(Scan reduce::Sum).run(&reduce::Sum, data.view(), [1, 3, 1], Some(seed.view())).unwrap();
+        assert!(ok && matches!(scan, Buffer::Integers(rustymath::buffer::IntBuf::I64(ref v)) if *v == [110, 112, 115]));
+        // Ordered folds keep a local total for consecutive lanes, and read a differently typed tail in the computing dtype.
+        let right = kernels!(RightFold rustymath::Subtract);
+        let (fold, ok) = right.run(&rustymath::Subtract, data.view(), [1, 3, 1], Some(seed.view())).unwrap();
+        assert!(ok && matches!(fold, Buffer::Integers(rustymath::buffer::IntBuf::I16(ref v)) if *v == [-89]));
+        // A failed scalar step retains its actual value and the healthy lanes in the raw kernel result.
+        let (fold, ok) = kernels!(RightFold rustymath::Pow).run(&rustymath::Pow, Buffer::Floats(rustymath::buffer::FloatBuf::F64(vec![-1., 1., 0.5, 2.])).view(), [1, 2, 2], None).unwrap();
+        assert!(!ok && matches!(fold, Buffer::Floats(rustymath::buffer::FloatBuf::F64(ref v)) if v[0].is_nan() && v[1] == 1.));
     }
 }
 

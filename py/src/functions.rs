@@ -14,7 +14,7 @@ use rustymath::array::Array as Core;
 use rustymath::buffer::{Buffer, ComplexWidth, DType, Element, FloatWidth, Source, View};
 use rustymath::error::{Error, Kind};
 use rustymath::layout::{position, Lanes, Layout};
-use rustymath::operation::{BinaryKernel, FoldKernel, Kernels, ScanKernel, TernaryKernel, UnaryKernel};
+use rustymath::operation::{AccumulationKernel, BinaryKernel, Kernels, TernaryKernel, UnaryKernel};
 use rustymath::linalg::Scalar;
 use rustymath::stats;
 use rustymath::tolerant::{Ceil, Equal, Floor, FloorDivide, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue, Tolerance};
@@ -108,9 +108,13 @@ fn binary<'py, K>(kernels: &Kernels<BinaryKernel<K>>, py: Python<'py>, function:
     let call = convert(args)?;
     let (x, y) = (call.args[0].view(), call.args[1].view());
     let agreement = Agreement::new(&call.args[0].layout(), &call.args[1].layout()).map_err(py_err)?;
-    let (buffer, ok) = kernels.binary(k, x, y, &agreement).ok_or_else(|| missing(function, x.dtype()))?;
-    if let Some(message) = domain.filter(|_| !ok && negative(y)) { return Err(py_err(Error::new(Kind::Domain, message.to_owned()))); }
-    give(py, Core::new(agreement.layout, fitted(function, (buffer, ok))?).map_err(py_err)?, call.scalar())
+    let result = kernels.binary(k, x, y, &agreement).ok_or_else(|| missing(function, x.dtype()))?;
+    give(py, Core::new(agreement.layout, checked_binary(function, result, y, domain)?).map_err(py_err)?, call.scalar())
+}
+
+fn checked_binary(function: &str, result: (Buffer, bool), y: View<'_>, domain: Option<&str>) -> PyResult<Buffer> {
+    if let Some(message) = domain.filter(|_| !result.1 && negative(y)) { return Err(py_err(Error::new(Kind::Domain, message.to_owned()))); }
+    fitted(function, result)
 }
 
 impl<K> Apply<K> for Kernels<TernaryKernel<K>> {
@@ -125,7 +129,7 @@ impl<K> Apply<K> for Kernels<TernaryKernel<K>> {
 }
 
 /// `r`'s totals of `x` over the axes that `axis` names: every axis for `None`, or one axis or a tuple of them. A total over every axis is a Python number.
-fn fold<'py, R>(py: Python<'py>, function: &str, kernels: &Kernels<FoldKernel<R>>, r: &R, x: &Bound<'py, PyAny>, axis: Option<Axes>) -> PyResult<Bound<'py, PyAny>> {
+fn fold<'py, R>(py: Python<'py>, function: &str, kernels: &Kernels<AccumulationKernel<R>>, r: &R, x: &Bound<'py, PyAny>, axis: Option<Axes>) -> PyResult<Bound<'py, PyAny>> {
     let x = one(x)?;
     let totals = totals(function, kernels, r, x.view(), x.layout(), axis.as_ref())?;
     let core = match totals { Some(core) => core, None => x.into_core()? };
@@ -134,7 +138,7 @@ fn fold<'py, R>(py: Python<'py>, function: &str, kernels: &Kernels<FoldKernel<R>
 }
 
 /// `r`'s totals of `view`, which has `layout`, over the axes that `axis` names, as [`fold`] takes them. `None` where `axis` is an empty tuple, which leaves the argument as it is.
-fn totals<R>(function: &str, kernels: &Kernels<FoldKernel<R>>, r: &R, view: View<'_>, mut layout: Layout, axis: Option<&Axes>) -> PyResult<Option<Core>> {
+fn totals<R>(function: &str, kernels: &Kernels<AccumulationKernel<R>>, r: &R, view: View<'_>, mut layout: Layout, axis: Option<&Axes>) -> PyResult<Option<Core>> {
     let mut steps: Vec<Option<usize>> = match axis {
         None => vec![None],
         Some(axes) => axes.positions(&layout)?.into_iter().map(Some).collect(),
@@ -148,7 +152,7 @@ fn totals<R>(function: &str, kernels: &Kernels<FoldKernel<R>>, r: &R, view: View
             None => ([1, view.len(), 1], Layout::EMPTY),
             Some(a) => (Lanes::new(layout.shape(), a).map_err(py_err)?.dims(), layout.axes((0..layout.shape().len()).filter(|&i| i != a))),
         };
-        let result = kernels.fold(r, view, along).ok_or_else(|| missing(function, view.dtype()))?;
+        let result = kernels.run(r, view, along, None).ok_or_else(|| missing(function, view.dtype()))?;
         buffer = Some(fitted(function, result)?);
         layout = next;
     }
@@ -164,15 +168,57 @@ pub(crate) fn along_axis(layout: Layout, len: usize, axis: Option<Axis>) -> PyRe
 }
 
 /// `r`'s running totals of `x` along `axis`, or along the flattened `x` for `None`.
-fn scan<'py, R>(py: Python<'py>, function: &str, kernels: &Kernels<ScanKernel<R>>, r: &R, x: &Bound<'py, PyAny>, axis: Option<Axis>) -> PyResult<Bound<'py, PyAny>> {
+fn scan<'py, R>(py: Python<'py>, function: &str, kernels: &Kernels<AccumulationKernel<R>>, r: &R, x: &Bound<'py, PyAny>, axis: Option<Axis>) -> PyResult<Bound<'py, PyAny>> {
     let call = convert(&[x])?;
     let x = call.args[0].view();
     let (along, layout) = along_axis(call.args[0].layout(), x.len(), axis)?;
-    let result = kernels.scan(r, x, along).ok_or_else(|| missing(function, x.dtype()))?;
+    let result = kernels.run(r, x, along, None).ok_or_else(|| missing(function, x.dtype()))?;
     give(py, Core::new(layout, fitted(function, result)?).map_err(py_err)?, false)
 }
 
-/// Each function object as a Python function, in one entry: its name, its arguments, with `; ct` for a tolerance keyword, and the object, which `ct` can make. `only` limits its kernels to the dtypes it lists. With two arguments, `negative` gives the message that [`binary`] raises for a failed integer result beside a negative second argument.
+/// Bulk products, folds and scans at the same dtypes as their elementwise functions.
+pub(crate) struct NativeBinary {
+    pub apply: for<'a, 'b> fn(View<'a>, View<'b>, &Agreement) -> PyResult<Buffer>,
+    pub fold: for<'a, 'b> fn(View<'a>, [usize; 3], Option<View<'b>>) -> PyResult<Buffer>,
+    pub scan: for<'a, 'b> fn(View<'a>, [usize; 3], Option<View<'b>>) -> PyResult<Buffer>,
+}
+
+pub(crate) fn native_binary(name: &str) -> PyResult<&'static NativeBinary> {
+    NATIVE_BINARIES.iter().flatten().find(|(n, _)| *n == name).map(|(_, b)| b)
+        .ok_or_else(|| PyValueError::new_err(format!("{name:?} isn't a native binary function")))
+}
+
+/// The native functions that have specialized associative reductions and scans.
+macro_rules! known_reduction {
+    ($name:expr, $run:ident) => {
+        match $name {
+            "add" => $run!(reduce::Sum), "multiply" => $run!(reduce::Product),
+            "maximum" => $run!(reduce::Max), "minimum" => $run!(reduce::Min),
+            "logical_or" => $run!(reduce::Max, only &[DType::Boolean]), "logical_and" => $run!(reduce::Min, only &[DType::Boolean]),
+            "logical_xor" => $run!(reduce::Xor), "logical_xnor" => $run!(reduce::Xnor),
+            _ => None,
+        }
+    };
+}
+
+/// Known associative functions keep their bulk reductions and their existing empty identities.
+fn reduction_fold(name: &str, x: View<'_>, dims: [usize; 3], tail: Option<View<'_>>) -> Option<PyResult<(Buffer, bool)>> {
+    macro_rules! run { ($r:expr $(, only $only:expr)?) => {{
+        let r = $r;
+        Some(kernels!(Fold of r)$(.only($only))?.run(&r, x, dims, tail).ok_or_else(|| missing(name, x.dtype())))
+    }}; }
+    known_reduction!(name, run)
+}
+
+fn reduction_scan(name: &str, x: View<'_>, dims: [usize; 3], start: Option<View<'_>>) -> Option<PyResult<(Buffer, bool)>> {
+    macro_rules! run { ($r:expr $(, only $only:expr)?) => {{
+        let r = $r;
+        Some(kernels!(Scan of r)$(.only($only))?.run(&r, x, dims, start).ok_or_else(|| missing(name, x.dtype())))
+    }}; }
+    known_reduction!(name, run)
+}
+
+/// Each function object as a Python function, in one entry: its name, its arguments, with `; ct` for a tolerance keyword, and the object, which `ct` can make. `only` limits its kernels to the dtypes it lists. With two arguments, `negative` gives the message that [`binary`] raises for a failed integer result beside a negative second argument. The same entries supply native inner-product callbacks.
 macro_rules! functions {
     ($($(#[doc = $doc:literal])+ $name:ident($($x:ident),+ $(; $ct:ident)?) = $k:expr $(, only $only:expr)? $(, negative $negative:literal)?;)+) => {
         $(
@@ -186,12 +232,42 @@ macro_rules! functions {
                 functions!(@apply kernels, py, $name, k, [$($x),+] $(, $negative)?)
             }
         )+
+        static NATIVE_BINARIES: &[Option<(&str, NativeBinary)>] = &[
+            $(functions!(@native $name, [$($x),+], [$($ct)?], $k $(, only $only)? $(, negative $negative)?)),+
+        ];
         /// Adds the elementwise functions to `m`.
         fn add_elementwise(m: &Bound<'_, PyModule>) -> PyResult<()> {
             $(m.add_function(wrap_pyfunction!($name, m)?)?;)+
+            m.add("_binary_names", NATIVE_BINARIES.iter().flatten().map(|(name, _)| *name).collect::<Vec<_>>())?;
             Ok(())
         }
     };
+    (@native $name:ident, [$x:ident, $y:ident], [$($ct:ident)?], $k:expr $(, only $only:expr)? $(, negative $negative:literal)?) => {
+        Some((stringify!($name), NativeBinary {
+            apply: |x, y, agreement| {
+                $(let $ct = Tolerance::DEFAULT;)?
+                let k = $k;
+                let result = kernels!(Binary of k)$(.only($only))?.binary(&k, x, y, agreement).ok_or_else(|| missing(stringify!($name), x.dtype()))?;
+                checked_binary(stringify!($name), result, y, None$(.or(Some($negative)))?)
+            },
+            fold: |x, dims, tail| {
+                $(let $ct = Tolerance::DEFAULT;)?
+                let k = $k;
+                let result = if let Some(result) = reduction_fold(stringify!($name), x, dims, tail) { result? }
+                else if dims[1] == 0 { return Err(PyValueError::new_err(format!("{} has no identity for an empty inner product", stringify!($name)))); }
+                else { kernels!(RightFold of k)$(.only($only))?.run(&k, x, dims, tail).ok_or_else(|| missing(stringify!($name), x.dtype()))? };
+                fitted(stringify!($name), result)
+            },
+            scan: |x, dims, start| {
+                $(let $ct = Tolerance::DEFAULT;)?
+                let k = $k;
+                let result = if let Some(result) = reduction_scan(stringify!($name), x, dims, start) { result? }
+                else { kernels!(LeftScan of k)$(.only($only))?.run(&k, x, dims, start).ok_or_else(|| missing(stringify!($name), x.dtype()))? };
+                fitted(stringify!($name), result)
+            },
+        }))
+    };
+    (@native $name:ident, [$($x:ident),+], $($rest:tt)*) => { None };
     (@apply $kernels:ident, $py:ident, $name:ident, $k:ident, $args:tt) => { $kernels.apply($py, stringify!($name), &$k, &$args) };
     (@apply $kernels:ident, $py:ident, $name:ident, $k:ident, $args:tt, $negative:literal) => { binary(&$kernels, $py, stringify!($name), &$k, &$args, Some($negative)) };
     (@kernels [$x:ident] $k:ident) => { kernels!(Unary of $k) };
@@ -462,6 +538,18 @@ fn logical_scan<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, table: [[bool; 2]; 
     give(py, Core::new(layout, Buffer::Booleans(out)).map_err(py_err)?, false)
 }
 
+#[pyfunction]
+#[pyo3(signature = (function, x, axis=None, start=None))]
+fn _accumulate<'py>(py: Python<'py>, function: &str, x: &Bound<'py, PyAny>, axis: Option<Axis>, start: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+    let call = convert(&[Some(x), start].into_iter().flatten().collect::<Vec<_>>())?;
+    let x = &call.args[0];
+    let start = call.args.get(1);
+    if start.is_some_and(|s| !s.layout().shape().is_empty()) { return Err(PyValueError::new_err("start must be a scalar")); }
+    let (dims, layout) = along_axis(x.layout(), x.view().len(), axis)?;
+    let result = (native_binary(function)?.scan)(x.view(), dims, start.map(|s| s.view()))?;
+    give(py, Core::new(layout, result).map_err(py_err)?, false)
+}
+
 enum Summary { Mean, Variance(usize), Std(usize), Norm(f64) }
 
 /// Shared conversion, axis preparation and wrapping for statistical reductions. Numerical loops live in `rustymath::stats`.
@@ -591,6 +679,7 @@ pub fn add_to(m: &Bound<'_, PyModule>) -> PyResult<()> {
     add_reductions(m)?;
     m.add_function(wrap_pyfunction!(minmax, m)?)?;
     m.add_function(wrap_pyfunction!(logical_scan, m)?)?;
+    m.add_function(wrap_pyfunction!(_accumulate, m)?)?;
     m.add_function(wrap_pyfunction!(mean, m)?)?;
     m.add_function(wrap_pyfunction!(average, m)?)?;
     m.add_function(wrap_pyfunction!(var, m)?)?;

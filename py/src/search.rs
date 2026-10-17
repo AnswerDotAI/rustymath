@@ -101,8 +101,8 @@ pub fn group_indices<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, ct: Option<f64
 /// Stable positions that sort equally shaped `keys` along `axis`, with the last key primary, or along the flattened keys with no axis. A rank-0 key sorts as one item, as in NumPy.
 fn sorted<'py>(py: Python<'py>, function: &str, keys: &[Arg<'_>], axis: Option<Axis>) -> PyResult<Bound<'py, PyAny>> {
     let layout = keys.first().map(Arg::layout).filter(|l| keys.iter().all(|k| k.layout().shape() == l.shape())).ok_or_else(|| py_err(Error::new(Kind::Length, format!("{function} needs one or more equally shaped keys"))))?;
-    let words = keys.iter().rev().map(|k| search::view_order_keys(k.view()).ok_or_else(|| missing(function, k.view().dtype()))).collect::<PyResult<Vec<_>>>()?;
-    let total = words[0].len();
+    for k in keys { if matches!(k.view(), View::Complexes(_)) { return Err(missing(function, k.view().dtype())); } }
+    let total = keys[0].view().len();
     let layout = if layout.shape().is_empty() { Layout::from([total].as_slice()) } else { layout };
     let ([outer, n, inner], layout) = along_axis(layout, total, axis)?;
     let mut order = vec![0; total];
@@ -110,8 +110,9 @@ fn sorted<'py>(py: Python<'py>, function: &str, keys: &[Arg<'_>], axis: Option<A
         for o in 0..outer {
             for i in 0..inner {
                 let at = |j: usize| (o * n + j) * inner + i;
-                let columns = words.iter().map(|w| (0..n).map(|j| w[at(j)]).collect()).collect();
-                for (j, p) in search::sort_rows(n, columns).into_iter().enumerate() { order[at(j)] = p as usize; }
+                let columns = keys.iter().rev().map(|k| (k.view(), at(0), inner));
+                let grade = search::view_lexgrade(n, columns, false).ok_or_else(|| missing(function, keys[0].view().dtype()))?;
+                for (j, p) in grade.into_iter().enumerate() { order[at(j)] = p as usize; }
             }
         }
     }

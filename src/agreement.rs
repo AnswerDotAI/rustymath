@@ -191,14 +191,23 @@ const SHORT_CYCLED: usize = 16;
 #[inline]
 pub fn each_block(len: usize, n: usize, mut f: impl FnMut(usize, usize) -> bool) -> bool { (0..len.div_ceil(n)).all(|k| f(k, n.min(len - k * n))) }
 
-/// Runs `leaf` over a frame of `len` items that one argument lays out through `mapping`, appending its results to `out` in order, and gives whether every call succeeded. Ranges of the frame run in parallel, and `leaf` writes each range's results into its slots. A contiguous argument goes to `leaf` a whole range at a time. Other mappings expand `CHUNK` items at a time into a buffer for each range.
+/// Runs `leaf` over a frame of `len` items that one argument lays out through `mapping`, appending its results to `out` in order, and gives whether every call succeeded. Ranges of the frame run in parallel, and `leaf` writes each range's results into its slots. Contiguous arguments and long enough broadcast blocks go to `leaf` whole, as in [`blocks`]. Other mappings expand `CHUNK` items at a time into a buffer for each range.
 #[inline]
 pub fn block<Y: Element, B: Copy + Send>(
     y: &[Y], mapping: &Mapping, len: usize, out: &mut Vec<B>, leaf: impl Fn(Arg<'_, Y>, usize, &mut Slots<'_, B>) -> bool + Sync) -> bool {
     extended(out, len, CHUNK, &|range, slots| {
-        if let Mapping::Linear(1) = mapping { return leaf(Arg::Many(&y[range.clone()]), range.len(), slots); }
-        let mut ys = Vec::new();
-        chunks(range, |at, n| leaf(expanded(mapping, y, at, n, &mut ys), n, slots))
+        use {Arg::*, Mapping::*};
+        if range.is_empty() { return true; }
+        match *mapping {
+            Single => leaf(One(y[0]), range.len(), slots),
+            Linear(1) => leaf(Many(&y[range.clone()]), range.len(), slots),
+            Linear(r) if r >= SHORT_REPEATED => periods(range, r, |k, p| leaf(One(y[k]), p.len(), slots)),
+            Tiled(m) if m >= SHORT_CYCLED => periods(range, m, |k, p| leaf(Many(&y[p.start - k * m..p.end - k * m]), p.len(), slots)),
+            _ => {
+                let mut ys = Vec::new();
+                chunks(range, |at, n| leaf(expanded(mapping, y, at, n, &mut ys), n, slots))
+            }
+        }
     })
 }
 

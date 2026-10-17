@@ -74,7 +74,10 @@ def test_methods():
     assert rm.array([1.5]).astype('c128').tolist() == [1.5 + 0j] and m.astype('i64').tolist() == m.tolist()
     assert rm.array([1.7, -1.7]).astype('i64').tolist() == [1, -1] and rm.array([5]).astype('i16').tolist() == [5] and rm.array([2 + 0j]).astype('u8').tolist() == [2]
     assert rm.array([0, 1]).astype('bool').tolist() == rm.array([0.0, 1.0]).astype('bool').tolist() == [False, True] and rm.array([1 + 2j]).astype('c64').dtype == 'c64'
-    for x, dtype in ((300, 'u8'), (2**40, 'i32'), (float('nan'), 'i64'), (float('inf'), 'i16'), (2, 'bool'), (0.5, 'bool'), (1.5, 'bool'), (1e19, 'i64')):
+    for source, values, targets in (('u8', [0, 255], ('i16', 'i32', 'i64')), ('i16', [-32768, 32767], ('i32', 'i64')), ('i32', [-2**31, 2**31-1], ('i64',))):
+        a = rm.array(values, dtype=source)
+        for target in targets: assert a.astype(target).tolist() == a.astype(target).astype(source).tolist() == values
+    for x, dtype in ((-1, 'u8'), (300, 'u8'), (2**40, 'i32'), (float('nan'), 'i64'), (float('inf'), 'i16'), (2, 'bool'), (0.5, 'bool'), (1.5, 'bool'), (1e19, 'i64')):
         with pytest.raises(OverflowError): rm.array([x]).astype(dtype)
     with pytest.raises(ValueError, match='imaginary'): rm.array([1 + 1j]).astype('f64')
     with pytest.raises(ValueError, match='characters'): rm.array('ab').astype('i64')

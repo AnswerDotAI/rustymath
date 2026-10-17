@@ -22,7 +22,12 @@ from ._core import average, corrcoef, cov, histogram, mean, norm, std, var
 from ._core import (argwhere, concatenate, expand_dims, flatten, flip, nonzero, pad, ravel, repeat, reshape, roll, split, squeeze, stack, swapaxes, take,
     transpose, where)
 from .structure import diag, diagonal, eye, identity, tril, triu, trace, diff, ptp, broadcast_to
+from ._naming import _binary_name
 Generator, default_rng = random.Generator, random.default_rng
+
+def accumulate(f, x, axis=None, start=None):
+    "Left-to-right running results of a native binary function, along the flattened input or one axis by position/name. A scalar start precedes each lane without adding an output item. Comparisons retain the input's computing dtype, reading each later result as 0 or 1; ordinary arithmetic promotion and overflow rules apply"
+    return _core._accumulate(_binary_name(f), x, axis, start)
 
 for _m in (distribution, number_theory): sys.modules[f'{__name__}.{_m.__name__}'] = _m
 

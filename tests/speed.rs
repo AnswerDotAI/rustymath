@@ -1,4 +1,5 @@
 //! How fast each function object's slice form runs on 65,536 inputs. The slice form is the code that callers such as basedpl and the Python package run. `speed.txt` gives each function a budget at f64 and at f32, in copies of the same number of items: the most time it may take, as a multiple of the time to copy those items. Each row's copy is timed just before the row, as basedpl's speed test times each case's copy. A loop that stops vectorizing takes several times as long and goes over budget. Where the standard library has the function, its time item by item is measured too, for the comparison table in `src/lib.md`, but sets no limit. The rows `Pow.one` and `Root.one` time the scalar forms pair by pair, as a caller with one value at a time runs them. The inner products multiply 256×256 matrices, whose results hold the same number of items. The decompositions factor 256×256 real matrices and 128×128 complex ones, and `lstsq` solves a 4096×16 real one. Sorts, partitions, medians and variances run along the rows of a 256×256 matrix. One sort runs along two lanes of 32,768. A weighted average reduces the first and last axes of a 16×64×64 array. Each of these counts copies of as many items as its matrix holds. The test fails listing every cost over its budget, as its width, name, cost and budget, in the form that `basedpl.bpltests.logged_costs` reads. With `RUSTYMATH_COSTS` set, as in `RUSTYMATH_COSTS=1 cargo test --test speed`, the test writes that table, then every cost in that form, straight to stderr. The test harness captures `println!` output from a passing test, but not these lines. CI's `Test` and `Speed` workflows set it. The test holds the machine's timing lock while it runs, as `timing_lock` describes.
+//! Array guards time f32 differences on length-2 lanes and on one long vector, and a compact broadcast repeating each input 64 times. Safe i32-to-i64 widening counts i64 copies. These rows use only the demonstrated dtypes.
 use rand::seq::SliceRandom;
 use rustymath::*;
 use std::{collections::HashMap, hint::black_box, io::Write, ops::Neg, time::Instant};
@@ -324,6 +325,29 @@ fn orderings(units: &Units<f64, f32>) -> [Costed; 6] {
     ]
 }
 
+/// Allocated array results at the demonstrated dtypes. Differences and widening count copies of `N` input items; broadcasting counts `N` output items.
+fn arrays(unit: &Unit<f32>) -> [(&'static str, &'static str, f64); 4] {
+    use array::Array;
+    use buffer::{Buffer, DType, Floats, Ints, View, Width};
+    use layout::Layout;
+    let x: Vec<f32> = (0..RUNS * N).map(|i| i as f32).collect();
+    let integers: Vec<i32> = (0..RUNS * N).map(|i| i as i32).collect();
+    let differences = |layout: &Layout, axis| unit.beside(|| fastest(N, |r| {
+        black_box(Array::differences(layout, View::Floats(Floats::F32(black_box(set(&x, r)))), axis).unwrap());
+    })).1;
+    let source = Layout::from([N / 64]);
+    [
+        ("f32", "Array::differences short lanes", differences(&Layout::from([N / 2, 2]), 1)),
+        ("f32", "Array::differences", differences(&Layout::from([N]), 0)),
+        ("f32", "Array::broadcasted", unit.beside(|| fastest(N, |r| {
+            black_box(Array::broadcasted(&source, View::Floats(Floats::F32(black_box(&set(&x, r)[..N / 64]))), &[N / 64, 64]).unwrap());
+        })).1),
+        ("i64", "Buffer::cast i32", Unit::new(1i64).beside(|| fastest(N, |r| {
+            black_box(Buffer::cast(View::Integers(Ints::I32(black_box(set(&integers, r)))), DType::Integer(Width::I64)).unwrap());
+        })).1),
+    ]
+}
+
 /// Decompositions of 256×256 real matrices and 128×128 complex ones, and a least-squares solution for a 4096×16 real matrix. Each cost counts copies of as many items as the matrix holds. `s` is symmetric positive definite, and `h` is Hermitian.
 fn decompositions(units: &Units<f64, f32>, complex_units: &Units<num_complex::Complex<f64>, num_complex::Complex<f32>>) -> Vec<Costed> {
     use linalg::*;
@@ -373,7 +397,7 @@ fn decompositions(units: &Units<f64, f32>, complex_units: &Units<num_complex::Co
     ]
 }
 
-/// The budget of each function at each width, keyed by `(width, name)`. Each section of `text` starts with a width in brackets, and each line under it holds a name and its budget, separated by a tab. Lines that start with `#` are comments.
+/// The budget of each function at each item type, keyed by `(type, name)`. Each section of `text` starts with a type in brackets, and each line under it holds a name and its budget, separated by a tab. Lines that start with `#` are comments.
 fn budgets(text: &str) -> HashMap<(&str, &str), f64> {
     let mut width = "";
     text.lines().filter(|line| !line.is_empty() && !line.starts_with('#')).filter_map(|line| {
@@ -467,8 +491,10 @@ fn speed() {
     }, || time(&x64, |x| horner(c64, x)), || {
         time_slice(N, |k, out| { negate(black_box(set(&x32, k)), out); polynomial::evaluate(c32, out) })
     }, || time(&x32, |x| horner(c32, x))));
-    let costed: Vec<Costed> = compared.iter().map(|&(name, _, costs)| (name, costs)).chain(special(&units)).chain(complex(&complex_units))
-        .chain(inner_products(&units)).chain(orderings(&units)).chain(decompositions(&units, &complex_units)).collect();
+    let costed: Vec<_> = compared.iter().map(|&(name, _, costs)| (name, costs)).chain(special(&units)).chain(complex(&complex_units))
+        .chain(inner_products(&units)).chain(orderings(&units)).chain(decompositions(&units, &complex_units))
+        .flat_map(|(name, costs)| ["f64", "f32"].into_iter().zip(costs).map(move |(width, cost)| (width, name, cost)))
+        .chain(arrays(&units.1)).collect();
     let print_all = std::env::var_os("RUSTYMATH_COSTS").is_some();
     let mut stderr = std::io::stderr();
     if print_all {
@@ -478,17 +504,15 @@ fn speed() {
     }
     let budgets = budgets(include_str!("speed.txt"));
     let mut failures = Vec::new();
-    for &(name, costs) in &costed {
-        for (width, cost) in ["f64", "f32"].into_iter().zip(costs) {
-            let budget = budgets.get(&(width, name)).copied();
-            let line = match budget {
-                Some(budget) => format!("{width} {name}: {cost:.2}, budget {budget}"), None => format!("{width} {name}: {cost:.2}, with no budget in speed.txt")
-            };
-            if print_all { writeln!(stderr, "{line}").unwrap(); }
-            if budget.is_none_or(|budget| cost > budget) { failures.push(line); }
-        }
+    for &(width, name, cost) in &costed {
+        let budget = budgets.get(&(width, name)).copied();
+        let line = match budget {
+            Some(budget) => format!("{width} {name}: {cost:.2}, budget {budget}"), None => format!("{width} {name}: {cost:.2}, with no budget in speed.txt")
+        };
+        if print_all { writeln!(stderr, "{line}").unwrap(); }
+        if budget.is_none_or(|budget| cost > budget) { failures.push(line); }
     }
-    for &(width, name) in budgets.keys().filter(|&&(_, name)| !costed.iter().any(|&(n, _)| n == name)) {
+    for &(width, name) in budgets.keys().filter(|&&(w, n)| !costed.iter().any(|&(width, name, _)| (width, name) == (w, n))) {
         failures.push(format!("{width} {name} has a budget in speed.txt, but the test doesn't time it"));
     }
     assert!(failures.is_empty(), "{failures:#?}");

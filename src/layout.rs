@@ -32,6 +32,16 @@ pub fn strides(shape: &[usize]) -> Vec<usize> {
     strides
 }
 
+/// Each axis's coordinate of flat position `flat`, from the last axis to the first. `flat` must be within the shape.
+#[inline]
+pub fn coordinates(mut flat: usize, shape: &[usize]) -> impl Iterator<Item = (usize, usize)> + '_ {
+    shape.iter().enumerate().rev().map(move |(axis, &len)| {
+        let coordinate = flat % len;
+        flat /= len;
+        (axis, coordinate)
+    })
+}
+
 /// The position among `len` that `n` gives, counting from the end when negative. `None` outside the range.
 #[inline]
 pub fn position(n: i64, len: usize) -> Option<usize> {

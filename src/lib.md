@@ -36,7 +36,7 @@ let mut squares = Vec::new();
 Pow.many(Arg::Many(&[1.5, 2.0, 3.0]), Arg::One(2.0), 3, &mut squares); // squares: [2.25, 4.0, 9.0]
 ```
 
-[`kernels!`](https://docs.rs/rustymath/latest/rustymath/macro.kernels.html) gives an object's kernels as function pointers, one at each dtype where the object has a form, for code that chooses a dtype at run time. Its documentation gives the forms it takes. `Kernels::computes` gives the dtype that an argument computes in. `Kernels::unary`, `binary`, `ternary`, `fold`, `scan` and `product` cast an argument there and run the kernel:
+[`kernels!`](https://docs.rs/rustymath/latest/rustymath/macro.kernels.html) gives an object's kernels as function pointers, one at each dtype where the object has a form, for code that chooses a dtype at run time. Its documentation gives the forms it takes. `Kernels::computes` gives the dtype that an argument computes in. `Kernels::unary`, `binary`, `ternary`, `run` and `product` cast an argument there and run the kernel. `run` executes the accumulation selected by the `Fold`, `Scan`, `RightFold` or `LeftScan` probe:
 
 ```rust
 use rustymath::buffer::{DType, FloatWidth, Width};

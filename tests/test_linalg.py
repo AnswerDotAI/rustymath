@@ -66,9 +66,30 @@ def test_permanent_and_echelon():
 def test_and_or_product():
     a = np.array([[1, 0, 1], [0, 1, 0]], bool)
     b = np.array([[0, 1], [1, 0], [0, 0]], bool)
-    product = rm.linalg.semiring(rm.logical_and, rm.logical_or)
+    product = rm.linalg.inner(rm.logical_and, rm.logical_or)
     assert np.array_equal(product(a, b), np.all(a[:, :, None] | b[None], axis=1))
     assert product(np.empty((2, 0), bool), np.empty((0, 3), bool)).all()
+
+def test_general_inner(threads):
+    inner = rm.linalg.inner
+    a, b = np.arange(24.).reshape(2, 3, 4), np.arange(8.).reshape(4, 2)
+    terms = a[..., None] - b
+    assert np.array_equal(inner(rm.add, rm.subtract)(a, b), terms.sum(axis=-2))
+    half = inner(rm.add, rm.subtract)(a.astype(np.float16), b.astype(np.float16))
+    assert half.dtype == 'f16' and np.array_equal(half, terms.sum(axis=-2))
+    counts = inner(rm.add, rm.less)(a, b)
+    assert A(counts).dtype == np.int64 and np.array_equal(counts, (a[..., None] < b).sum(axis=-2))
+    # Right association must survive the bounded term blocks.
+    v = np.arange(1., 20_001)
+    assert inner(rm.subtract, rm.multiply)(v, np.ones_like(v)) == -10_000
+    assert inner(rm.subtract, rm.multiply)([1., 2, 3, 4], [1., 1, 1, 1]) == -2
+    singleton = inner(rm.less, rm.add)([[2.]], [[3.]])
+    assert singleton.dtype == 'f64' and singleton.tolist() == [[5.]]
+    assert inner(rm.add, rm.subtract)(np.empty((2, 0)), np.empty((0, 3))).tolist() == [[0.] * 3] * 2
+    with pytest.raises(ValueError, match='no identity'): inner(rm.power, rm.add)(np.empty((2, 0)), np.empty((0, 3)))
+    def add(x, y): return x + y
+    for f in [np.add, add, rm.sin]:
+        with pytest.raises(ValueError, match='native binary'): inner(f, rm.add)
 
 @pytest.mark.parametrize('kind', [float, complex])
 def test_linalg(kind):
@@ -117,14 +138,14 @@ def test_linalg(kind):
         # complex64 computes at its own width, with real results, such as singular values, in float32.
         eye = np.eye(3, dtype=np.complex64)
         assert A(la.pinv(eye)).dtype == np.complex64 and A(la.svd(eye).s).dtype == np.float32 and A(la.slogdet(eye[None])[1]).dtype == np.float32
-        with pytest.raises(ValueError, match="doesn't take"): la.semiring(rm.maximum, rm.add)(a, b)
+        with pytest.raises(ValueError, match="doesn't take"): la.inner(rm.maximum, rm.add)(a, b)
         return
     # Min-plus products give shortest paths, and or-and products give reachability.
     d = np.array([[0, 3, np.inf], [np.inf, 0, 1], [2, np.inf, 0]])
-    assert np.array_equal(la.semiring(rm.minimum, rm.add)(d, d), np.min(d[:, :, None] + d[None], axis=1))
-    assert np.allclose(la.semiring(rm.maximum, rm.add)(a, b), np.max(a[..., :, :, None] + b[..., None, :, :], axis=-2))
+    assert np.array_equal(la.inner(rm.minimum, rm.add)(d, d), np.min(d[:, :, None] + d[None], axis=1))
+    assert np.allclose(la.inner(rm.maximum, rm.add)(a, b), np.max(a[..., :, :, None] + b[..., None, :, :], axis=-2))
     g = rng.random((6, 6)) < 0.3
-    assert np.array_equal(rm.matmul(g, g), np.matmul(g, g)) and np.array_equal(la.semiring(rm.logical_or, rm.logical_and)(g, g), np.matmul(g, g))
+    assert np.array_equal(rm.matmul(g, g), np.matmul(g, g)) and np.array_equal(la.inner(rm.logical_or, rm.logical_and)(g, g), np.matmul(g, g))
     # float16 computes in float32 and rounds back.
     assert A(la.pinv(np.eye(3, dtype=np.float16))).dtype == np.float16 and A(la.svd(np.eye(3, dtype=np.float32)).s).dtype == np.float32
     # Integer products compute in int64. An int16 argument converts to it, so these sums of 3 million don't overflow.
@@ -132,13 +153,13 @@ def test_linalg(kind):
     assert A(rm.matmul(i16, i16.T)).dtype == np.int64 and (rm.matmul(i16, i16.T) == 3_000_000).all()
     # Integer max-plus and min-plus products, and the counts of equal and unequal items, match NumPy's results built item by item.
     n, p = rng.integers(-5, 5, (5, 7)), rng.integers(-5, 5, (7, 4))
-    assert np.array_equal(la.semiring(rm.maximum, rm.add)(n, p), np.max(n[:, :, None] + p[None], axis=1))
-    assert np.array_equal(la.semiring(rm.minimum, rm.add)(n, p), np.min(n[:, :, None] + p[None], axis=1))
+    assert np.array_equal(la.inner(rm.maximum, rm.add)(n, p), np.max(n[:, :, None] + p[None], axis=1))
+    assert np.array_equal(la.inner(rm.minimum, rm.add)(n, p), np.min(n[:, :, None] + p[None], axis=1))
     equal = (n[:, :, None] == p[None]).sum(axis=1)
-    assert np.array_equal(la.semiring(rm.add, rm.equal)(n, p), equal) and np.array_equal(la.semiring(rm.add, rm.not_equal)(n, p), 7 - equal)
-    assert np.array_equal(la.semiring(rm.add, rm.equal)(n / 2, p / 2), equal)
+    assert np.array_equal(la.inner(rm.add, rm.equal)(n, p), equal) and np.array_equal(la.inner(rm.add, rm.not_equal)(n, p), 7 - equal)
+    assert np.array_equal(la.inner(rm.add, rm.equal)(n / 2, p / 2), equal)
     # NumPy's ufuncs aren't rustymath's functions.
-    with pytest.raises(ValueError): la.semiring(np.add, np.multiply)
+    with pytest.raises(ValueError): la.inner(np.add, np.multiply)
     # An integer product that doesn't fit int64 raises: 2^62 times 4 is 2^64.
     with pytest.raises(OverflowError): rm.matmul([[2**62]], [[4]])
     # A matrix that can't be factored gives NaN, with no warning.
@@ -150,6 +171,7 @@ def test_keyed_axes():
     # Contracted axes with keys pair by key, as rustymath broadcasts, and results keep the keys of the argument axes they index.
     la, v = rm.linalg, rm.array({'a': 1, 'b': 2})
     assert v @ rm.array({'b': 10, 'a': 20}) == 40
+    assert la.inner(rm.add, rm.subtract)(v, rm.array({'b': 10, 'a': 20})) == -27
     m = rm.array({'x': {'a': 1., 'b': 2}, 'y': {'a': 3., 'b': 4}})
     mv = m @ rm.array({'b': 10., 'a': 20})
     assert mv.tolist() == [40, 100] and mv.keys == (('x', 'y'),)
@@ -177,7 +199,7 @@ def test_matrix_layouts(threads):
         x, y = (a > 0).astype(dtype), (b > 0).astype(dtype)
         assert np.array_equal(rm.linalg.matmul(x, y), x @ y)
     x, y = (a > 0).astype(np.float16), (b > 0).astype(np.float16)
-    counts = rm.linalg.semiring(rm.add, rm.equal)(x, y)
+    counts = rm.linalg.inner(rm.add, rm.equal)(x, y)
     assert A(counts).dtype == np.int64 and np.array_equal(counts, np.sum(x[..., None] == y[None, None], axis=-2))
     spd = a @ a.swapaxes(-1, -2) + np.eye(8)
     assert np.allclose(rm.linalg.slogdet(spd)[1], np.linalg.slogdet(spd).logabsdet)

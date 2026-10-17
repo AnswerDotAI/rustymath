@@ -1,4 +1,4 @@
-//! Inner products of row-major matrices. The inner product `f.g` of an `m`×`k` matrix `a` and a `k`×`n` matrix `b` is the `m`×`n` matrix whose item at row `i` and column `j` folds `f` over `g(a[i][p], b[p][j])` for each `p`. `+.×` is the matrix product. The `f` of each pair is associative, and the loops combine its steps in whatever order suits them. A float result can therefore differ in its last bits from a fold taken in order.
+//! Inner products of row-major matrices. The inner product `f.g` of an `m`×`k` matrix `a` and a `k`×`n` matrix `b` is the `m`×`n` matrix whose item at row `i` and column `j` folds `f` over `g(a[i][p], b[p][j])` for each `p`. `+.×` is the matrix product. The specialized pairs have associative `f`, and their loops combine its steps in whatever order suits them. A float result can therefore differ in its last bits from a fold taken in order. [`inner_with`] runs other native pairs through bounded term blocks and a caller's right fold, which preserves the association of non-associative functions.
 //!
 //! The loops follow GotoBLAS and BLIS. Packing copies a block of each argument into a contiguous buffer sized for a cache level. The blocking reuses each buffer while it is in cache. A micro-kernel computes a small tile of the result in registers, one step of `p` at a time. A micro-kernel in plain Rust vectorizes through LLVM's SLP vectorizer, which the builds of rustymath and basedpl turn on at opt-level 2. It vectorizes only tiles of up to 32 items, too few to keep the multiply-add units busy. On AArch64, in wasm and on x86-64 with AVX2 and FMA, the float pairs run micro-kernels on explicit vectors instead. Their maximum and minimum are each target's own instruction: `fmax` on AArch64, `max` in wasm and `maxpd` on x86-64. On AArch64 and in wasm a NaN term makes a result NaN. On x86-64 only a NaN first term makes a result NaN. Later NaN terms are skipped. Targets without these vectors run the plain kernels.
 //!
@@ -13,6 +13,7 @@ use std::{mem::MaybeUninit, sync::LazyLock};
 #[cfg(accelerate)]
 mod accelerate;
 mod factor;
+mod inner;
 mod scalar;
 // The platform's own BLAS and LAPACK, which every `Tiled` type implements: Accelerate on macOS, and none elsewhere.
 #[cfg(accelerate)]
@@ -45,6 +46,7 @@ macro_rules! dispatch {
 }
 pub mod exact;
 pub use factor::*;
+pub use inner::inner_with;
 pub use scalar::Scalar;
 
 /// The `n`×`n` identity matrix.

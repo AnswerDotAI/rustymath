@@ -4,6 +4,20 @@
 use crate::{Abs, Arg, Binom, Pow, tolerant::{Ceil, Equal, Floor, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue, FloorDivide}};
 use strength_reduce::StrengthReducedU64;
 
+/// Bounds for every prefix sum of up to `len` items in `[lo, hi]`, from `start` or 0. With `subtract`, also bounds `2×first - prefix_sum`. `None` where the bounds leave `i64`.
+pub fn sum_bounds([lo, hi]: [i64; 2], len: usize, start: Option<i64>, subtract: bool) -> Option<[i64; 2]> {
+    let (lo, hi, len, s) = (i128::from(lo), i128::from(hi), len as i128, i128::from(start.unwrap_or(0)));
+    let (mut least, mut most) = (s + lo.min(len * lo), s + hi.max(len * hi));
+    if subtract { (least, most) = (least.min(2 * lo - most), most.max(2 * hi - least)); }
+    Some([i64::try_from(least).ok()?, i64::try_from(most).ok()?])
+}
+
+/// Bounds for products of one item in each inclusive range, or `None` where an endpoint product leaves `i64`.
+pub fn product_bounds([a, b]: [i64; 2], [c, d]: [i64; 2]) -> Option<[i64; 2]> {
+    let corners = [i128::from(a) * i128::from(c), i128::from(a) * i128::from(d), i128::from(b) * i128::from(c), i128::from(b) * i128::from(d)];
+    Some([i64::try_from(*corners.iter().min()?).ok()?, i64::try_from(*corners.iter().max()?).ok()?])
+}
+
 /// The greatest common divisor of x and y, which is never negative. `gcd(0, 0)` is 0. `None` only where it is 2^63, as for `gcd(i64::MIN, 0)`.
 pub fn gcd(x: i64, y: i64) -> Option<i64> { i64::try_from(unsigned_gcd(x.unsigned_abs(), y.unsigned_abs())).ok() }
 

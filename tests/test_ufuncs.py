@@ -211,6 +211,27 @@ def test_minmax_and_truth_table_scan():
     assert rm.logical_scan(np.empty((2, 0), bool), xor, axis=-1).shape == (2, 0)
     with pytest.raises(IndexError, match='axis'): rm.logical_scan(b, xor, axis=2)
 
+def test_native_accumulation():
+    for dtype in [np.int16, np.float16, np.float32, np.float64, np.complex64]:
+        x = np.arange(1, 7, dtype=dtype).reshape(2, 3)[:, ::-1]
+        for name in ['add', 'subtract', 'multiply', 'divide']:
+            for axis in [None, 0, -1]:
+                a = x.ravel() if axis is None else x
+                want = getattr(np, name).accumulate(a, axis=0 if axis is None else axis, dtype=np.float32 if dtype == np.float16 else None)
+                assert np.allclose(rm.accumulate(getattr(rm, name), x, axis), want, rtol=1e-3)
+    x = rm.array({'a': [3., 2, 1], 'b': [6., 5, 4]})
+    x.names = ('row', 'column')
+    result = rm.accumulate(rm.subtract, x, 'column', start=10)
+    assert result.tolist() == [[7., 5, 4], [4., -1, -5]] and result.keys == x.keys and result.names == x.names
+    assert rm.accumulate(rm.add, [1, 2, 3], start=10).tolist() == [11, 13, 16]
+    assert rm.accumulate(rm.less, [3, 2, 1]).tolist() == [3, 0, 1]
+    assert rm.accumulate(rm.less, [3, 2, 1], start=1).tolist() == [1, 1, 0]
+    assert rm.accumulate(rm.logical_xor, [True, False, True], start=True).tolist() == [False, False, True]
+    assert rm.accumulate(rm.subtract, np.empty((2, 0)), axis=-1).shape == (2, 0)
+    with pytest.raises(OverflowError): rm.accumulate(rm.add, [2**62] * 3)
+    for f, start in [(np.add, None), (lambda a, b: a + b, None), (rm.add, [1])]:
+        with pytest.raises(ValueError): rm.accumulate(f, [1, 2], start=start)
+
 def test_elementwise_layouts(threads):
     x = np.linspace(0.1, 1, 262_147)
     for view in [x, x[::2], x[::-1], np.broadcast_to(0.5, x.shape)]:

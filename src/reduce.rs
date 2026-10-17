@@ -1,5 +1,5 @@
 //! Reductions and scans over a contiguous slice: sums, products, maximums and minimums, and their running versions. Each compiles inside rustymath once for each item type. A float sum or product may combine the items in any order, which lets its loop vectorize, so its last bits can differ from a sum taken item by item. Beside a NaN item, a float maximum or minimum gives either NaN or the greatest or least other item, depending on the target and the loop. An empty slice gives -∞ or ∞. `f16` items compute in `f32`. Their sum or product is an `f32` total. An integer sum or product computes at `i64`, or at `u64` for `u64` items. Where it doesn't fit, it wraps, and reports that it doesn't fit, as the running versions do.
-use crate::{Float, Native, arith::Overflowing, float::sealed::{Core, Folds}, parallel, slice::{CHUNK, appended}};
+use crate::{Arg, Float, Native, arith::Overflowing, float::sealed::{Core, Folds}, parallel, slice::{CHUNK, appended}};
 use half::f16;
 use num_complex::Complex;
 use std::ops::Range;
@@ -631,6 +631,48 @@ pub fn along<T: Copy + Sync, R: Reduction<T>>(data: &[T], shape: [usize; 3]) -> 
     (totals, fits)
 }
 
+/// [`along`], followed by each lane's already-folded right `tail`. Associative reductions keep their vectorized folds and may regroup items across this boundary.
+pub fn along_with_tail<T: Copy + Sync, R: Reduction<T>>(data: &[T], dims: [usize; 3], tail: Option<&[R::Total]>) -> (Vec<R::Total>, bool) {
+    let (mut totals, mut ok) = along::<T, R>(data, dims);
+    if let Some(tail) = tail {
+        assert_eq!(tail.len(), totals.len(), "one tail per lane");
+        for (total, &tail) in totals.iter_mut().zip(tail) { let (next, fits) = R::merge(*total, tail); *total = next; ok &= fits; }
+    }
+    (totals, ok)
+}
+
+/// Folds each lane of `[outer, len, inner]` from the right: `x0 f (x1 f (...))`. A `tail` supplies the already-folded items to the right of each lane, in the input type. Otherwise each lane needs at least two items. `cast` reads a running result as the next step's right argument, as a Boolean comparison result reads as 0 or 1. A failed step gives `None`.
+#[inline]
+pub fn right_fold<T: Copy, O: Copy>(data: &[T], [outer, len, inner]: [usize; 3], tail: Option<&[T]>, f: impl Fn(T, T) -> Option<O>, cast: impl Fn(O) -> T) -> Option<Vec<O>> {
+    assert_eq!(data.len(), outer * len * inner, "the data must fill its dimensions");
+    assert!(inner == 0 || if tail.is_some() { len > 0 } else { len >= 2 }, "a right fold needs two items or a tail");
+    if let Some(tail) = tail { assert_eq!(tail.len(), outer * inner, "one tail per lane"); }
+    let mut result = Vec::with_capacity(outer * inner);
+    if outer * inner == 0 { return Some(result); }
+    if inner == 1 {
+        for (i, lane) in data.chunks_exact(len).enumerate() {
+            let (last, first) = match tail { Some(tail) => (tail[i], len - 1), None => (lane[len - 1], len - 2) };
+            let mut total = f(lane[first], last)?;
+            for &x in lane[..first].iter().rev() { total = f(x, cast(total))?; }
+            result.push(total);
+        }
+        return Some(result);
+    }
+    for i in 0..outer {
+        let row = |j: usize| &data[(i * len + j) * inner..(i * len + j + 1) * inner];
+        let (last, first) = match tail {
+            Some(tail) => (&tail[i * inner..(i + 1) * inner], len - 1),
+            None => (row(len - 1), len - 2),
+        };
+        let start = result.len();
+        for (&x, &y) in row(first).iter().zip(last) { result.push(f(x, y)?); }
+        for j in (0..first).rev() {
+            for (value, &x) in result[start..].iter_mut().zip(row(j)) { *value = f(x, cast(*value))?; }
+        }
+    }
+    Some(result)
+}
+
 /// Folds an array of shape `[outer, len, inner]` by `R` into `totals`, the folds of its lanes along the middle axis, and gives whether every fold fits. `run(range, fold)` produces the array's items in `range` in order, and hands each block of them to `fold` with the position of its first item. The array folds in one piece for each of this thread's [`parallel::threads`], each of at least [`piece_size`] items. On one thread it folds as one piece. A lane that one piece holds folds as [`fold_into`] folds it. A lane that crosses pieces folds its part in each piece, and those folds merge.
 pub fn fold_pieces<T: Copy, R: Reduction<T>>(
     totals: &mut [R::Total], dims: [usize; 3], run: &(dyn Fn(Range<usize>, &mut dyn FnMut(usize, &[T])) + Sync)) -> bool {
@@ -857,6 +899,119 @@ pub fn scan_along<T: Copy, R: Reduction<T>>(data: &[T], dims: [usize; 3], start:
     rows_scan(data, dims, out, |lane, o| R::scan(lane, start, o), |x| start.map_or_else(|| R::one(x), |s| R::checked(s, x)), R::checked)
 }
 
+/// Appends the ordered left scan of each lane of `[outer, len, inner]`. Without a seed, the first item is unchanged. A failed step reports `false`; the remaining output is still initialized.
+#[inline]
+pub fn left_scan<T: Copy>(data: &[T], dims: [usize; 3], seed: Option<T>, f: impl Fn(T, T) -> Option<T>, out: &mut Vec<T>) -> bool {
+    let step = |a, b| f(a, b).map_or((a, false), |v| (v, true));
+    let first = |x| seed.map_or((x, true), |s| step(s, x));
+    rows_scan(data, dims, out, |lane, out| {
+        let (total, ok) = first(lane[0]);
+        out.push(total);
+        checked_scan(&lane[1..], total, out, step) & ok
+    }, first, step)
+}
+
+/// Applies a bulk function to adjacent rows along the middle axis of `[outer, len, inner]`. `first` writes or omits each lane's first row; `combine` receives the borrowed previous and next rows. Both append to `out` and report whether their results fit.
+#[inline]
+pub fn adjacent<T: Copy, O>(data: &[T], [outer, len, inner]: [usize; 3], out: &mut Vec<O>,
+    first: impl Fn(&[T], &mut Vec<O>) -> bool, combine: impl Fn(&[T], &[T], &mut Vec<O>) -> bool) -> bool {
+    assert_eq!(data.len(), outer * len * inner, "the data must fill its dimensions");
+    if data.is_empty() { return true; }
+    data.chunks(len * inner).fold(true, |ok, lane| {
+        let rest = lane.len() - inner;
+        first(&lane[..inner], out) & combine(&lane[..rest], &lane[inner..], out) & ok
+    })
+}
+
+/// A scan whose result after the first item is Boolean. `both` appends comparisons of a running total with items; `zero` and `one` read the two possible totals in the input type. `starts` supplies each lane's first Boolean result for a seeded scan. Without it, each lane's first result is a placeholder for the caller to replace with the original item.
+pub fn comparison_scan<T: Copy>(data: &[T], [_, len, inner]: [usize; 3], starts: Option<&[bool]>, zero: T, one: T,
+    both: &dyn Fn(Arg<'_, T>, &[T], &mut Vec<bool>) -> bool) -> (Vec<bool>, bool) {
+    let (mut bits, mut low, mut high) = (Vec::with_capacity(data.len()), Vec::new(), Vec::new());
+    let (mut heads, mut seconds, mut pair) = (Vec::new(), Vec::new(), Vec::new());
+    if data.is_empty() { return (bits, true); }
+    let (fixed, mut ok) = (1 + usize::from(starts.is_none()), true);
+    let at_both = |xs: &[T], low: &mut Vec<bool>, high: &mut Vec<bool>| {
+        low.clear(); high.clear();
+        both(Arg::One(zero), xs, low) & both(Arg::One(one), xs, high)
+    };
+    if inner == 1 && len > 0 && len <= fixed {
+        if let Some(starts) = starts { return (starts.to_vec(), true); }
+        bits.resize(data.len(), false);
+        if len == 2 {
+            let (firsts, seconds): (Vec<T>, Vec<T>) = data.chunks_exact(2).map(|p| (p[0], p[1])).unzip();
+            ok &= both(Arg::Many(&firsts), &seconds, &mut pair);
+            for (r, &v) in bits[1..].iter_mut().step_by(2).zip(&pair) { *r = v; }
+        }
+        return (bits, ok);
+    }
+    if len > 0 && inner == 1 {
+        let mut total = false;
+        for (at, xs) in (0..).step_by(CHUNK).zip(data.chunks(CHUNK)) {
+            ok &= at_both(xs, &mut low, &mut high);
+            let first = (fixed - 1 + len - at % len) % len;
+            let count = xs.len().saturating_sub(first).div_ceil(len);
+            let restarts = match starts {
+                Some(starts) => &starts[(at + first) / len..][..count],
+                None => {
+                    heads.clear(); seconds.clear(); pair.clear();
+                    if count > 0 {
+                        let base = at + first - 1;
+                        heads.extend((0..count).map(|i| data[base + i * len]));
+                        seconds.extend((0..count).map(|i| data[base + i * len + 1]));
+                        ok &= both(Arg::Many(&heads), &seconds, &mut pair);
+                    }
+                    &pair[..]
+                }
+            };
+            chosen(total, &low, &high, len, first, restarts, &mut bits);
+            total = bits[bits.len() - 1];
+        }
+    } else if len > 0 {
+        let rows = (CHUNK / inner).max(1);
+        for (first, span) in (0..).step_by(rows).zip(data.chunks(rows * inner)) {
+            let span_rows = first..first + span.len() / inner;
+            if span_rows.clone().any(|r| r % len >= fixed) { ok &= at_both(span, &mut low, &mut high); }
+            pair.clear();
+            if starts.is_none() {
+                let row = |r: usize| &data[r * inner..(r + 1) * inner];
+                let mut second = span_rows.clone().filter(|r| r % len == 1);
+                if span.len() == inner { if let Some(r) = second.next() { ok &= both(Arg::Many(row(r - 1)), row(r), &mut pair); } } else {
+                    heads.clear(); seconds.clear();
+                    for r in second { heads.extend_from_slice(row(r - 1)); seconds.extend_from_slice(row(r)); }
+                    ok &= both(Arg::Many(&heads), &seconds, &mut pair);
+                }
+            }
+            let mut pairs = pair.chunks(inner);
+            for (j, r) in span_rows.enumerate() {
+                match (r % len, starts) {
+                    (0, Some(starts)) => bits.extend_from_slice(&starts[r / len * inner..(r / len + 1) * inner]),
+                    (0, None) => bits.extend(std::iter::repeat_n(false, inner)),
+                    (1, None) => bits.extend_from_slice(pairs.next().expect("a pair for each lane's second row")),
+                    _ => {
+                        let before = bits.len() - inner;
+                        bits.extend_from_within(before..);
+                        let (lo, hi) = (&low[j * inner..(j + 1) * inner], &high[j * inner..(j + 1) * inner]);
+                        for ((t, &l), &h) in bits[before + inner..].iter_mut().zip(lo).zip(hi) { *t = (*t & h) | (!*t & l); }
+                    }
+                }
+            }
+        }
+    }
+    (bits, ok)
+}
+
+/// The terms whose running sums give ordered subtraction: each lane's first row unchanged and the rest negated, or every row negated after a seed. `read` can widen the items before negating them.
+pub fn negated_tail<T: Copy, S: Copy + std::ops::Neg<Output = S>>(data: &[T], [_, len, inner]: [usize; 3], seeded: bool, read: impl Fn(T) -> S) -> Vec<S> {
+    let mut out = Vec::with_capacity(data.len());
+    if data.is_empty() { return out; }
+    let keep = if seeded { 0 } else { inner };
+    for lane in data.chunks(len * inner) {
+        out.extend(lane[..keep].iter().map(|&x| read(x)));
+        out.extend(lane[keep..].iter().map(|&x| -read(x)));
+    }
+    out
+}
+
 /// An item that sums into any [`Tally`]: a Boolean, as 0 or 1, or an integer.
 pub trait Term: Copy {
     /// `self` as a term of a sum in `C`. An integer wider than `C` keeps its low bits, which leaves exact every sum that fits `C`.
@@ -886,6 +1041,8 @@ terms!(i16, i32, i64, u8);
 pub trait Tally: Copy + Default + Send + Sync {
     /// `self + y`, wrapping.
     fn add(self, y: Self) -> Self;
+    /// `self - y`, wrapping.
+    fn subtract(self, y: Self) -> Self;
     /// The low bits of `n`.
     fn low(n: i64) -> Self;
 }
@@ -894,6 +1051,8 @@ macro_rules! tallies {
         impl Tally for $t {
             #[inline(always)]
             fn add(self, y: $t) -> $t { self.wrapping_add(y) }
+            #[inline(always)]
+            fn subtract(self, y: $t) -> $t { self.wrapping_sub(y) }
             #[inline(always)]
             fn low(n: i64) -> $t { n as $t }
         }
@@ -918,12 +1077,31 @@ impl<T: Term, C: Tally> Reduction<T> for SumAs<C> {
     fn scan(x: &[T], start: Option<C>, out: &mut Vec<C>) -> bool { grouped(x, start, out, T::term, C::add, |t| t); true }
 }
 
+/// Ordered subtraction scans of consecutive lanes of `len` items, written at a width the caller has proved holds every result. They use the fast prefix sum, then `2×first - sum`, with wrapping intermediates. No widened input copy is needed.
+#[inline]
+pub fn subtract_sums<T: Term, C: Tally>(data: &[T], len: usize, out: &mut Vec<C>) {
+    if data.is_empty() { return; }
+    let start = out.len();
+    scan_along::<T, SumAs<C>>(data, [data.len() / len, len, 1], None, out);
+    for (lane, totals) in data.chunks(len).zip(out[start..].chunks_mut(len)) {
+        let first: C = lane[0].term();
+        let twice = first.add(first);
+        for total in totals { *total = twice.subtract(*total); }
+    }
+}
+
 /// The right fold of a slice by the inverse of a reduction, through pairs of items: `-` for [`Sum`], and `÷` for [`Product`]. The fold `x0 - (x1 - (x2 - …))` is the sum of the pairs' differences, and `x0 ÷ (x1 ÷ (x2 ÷ …))` is the product of the pairs' ratios, each with the last item where it has no pair. Both combine the pairs in any order, as sums and products do.
 pub trait Alternating<T> {
     /// The type of the fold: the item type, or `i64` for integers.
     type Total;
     /// The right fold of `x` by the inverse, 0 or 1 for an empty slice, and whether it fits. An integer fold fits where it is within `i64`. A quotient of floats doesn't fit where a running product or the result reaches zero, a subnormal number, an infinity or NaN. The right fold taken item by item may still be finite there.
     fn alternating(x: &[T]) -> (Self::Total, bool);
+}
+
+/// Alternating folds of consecutive lanes, retaining [`Alternating`]'s slice kernels. Gives `None` where a lane's result doesn't fit.
+#[inline]
+pub fn alternating_lanes<T: Copy, R: Alternating<T>>(data: &[T], len: usize) -> Option<Vec<R::Total>> {
+    data.chunks(len.max(1)).map(|lane| match R::alternating(lane) { (total, true) => Some(total), _ => None }).collect()
 }
 
 /// The fold by `merge` from `unit` of the pairs of `x`, each combined into a total by `pair`, and then of the item left over where `x` has an odd length, combined by `last`.

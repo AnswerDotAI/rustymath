@@ -17,7 +17,7 @@ use rustymath_buffer::py_err;
 
 use crate::array::give;
 use crate::convert::{Call, Items, convert};
-use crate::functions::missing;
+use crate::functions::{missing, native_binary};
 
 /// A matrix function's data arguments at one dtype, the dtype that it computes in, and the dtype that its results take.
 struct Stack<'py> { call: Call<'py>, compute: DType, store: DType }
@@ -583,17 +583,50 @@ impl<'py> Product<'_, 'py> {
             (None, None) => return Err(missing(self.name, x.dtype())),
         };
         if !ok { return Err(py_err(Error::new(Kind::Overflow, format!("an integer result of {} doesn't fit int64", self.name)))); }
+        self.finish(buffer)
+    }
+
+    fn finish(&self, buffer: Buffer) -> PyResult<Bound<'py, PyAny>> {
+        let x = self.args[0];
         let half = DType::Float(FloatWidth::F16);
         let store = match buffer.dtype() { DType::Integer(_) => I64, DType::Float(_) if x.dtype() == half => half, d => d };
         result(self.py, stored(buffer, &self.frames.layout, self.cell.clone(), store)?)
     }
+
+    fn generic(&self, f: &str, g: &str) -> PyResult<Bound<'py, PyAny>> {
+        let (f, g) = (native_binary(f)?, native_binary(g)?);
+        let dtype = self.args[0].dtype();
+        let compute = match dtype { DType::Integer(_) => I64, DType::Float(FloatWidth::F16) => DType::Float(FloatWidth::F32), d => d };
+        let wide = if dtype != compute {
+            Some([Buffer::cast(self.args[0], compute).map_err(py_err)?, Buffer::cast(self.args[1], compute).map_err(py_err)?])
+        } else { None };
+        let [x, y] = wide.as_ref().map_or(self.args, |a| a.each_ref().map(Buffer::view));
+        let [n, k, m] = self.size;
+        if k == 0 {
+            let empty = rustymath::agreement::Agreement { layout: Layout::EMPTY, len: 0, left: Mapping::Single, right: Mapping::Single };
+            let terms = (g.apply)(x, y, &empty)?;
+            return self.finish((f.fold)(terms.view(), [self.frames.count * n, 0, m], None)?);
+        }
+        let (frames, size) = (self.frames, self.size);
+        let parts = run(self.py, frames, |i, _: &mut ()| {
+            let (a, b) = (frames.cell(0, i), frames.cell(1, i));
+            linalg::inner_with(x.slice(a * n * k..(a + 1) * n * k), y.slice(b * k * m..(b + 1) * k * m), size, g.apply, f.fold)
+        })?;
+        let mut parts = parts.into_iter();
+        let mut out = parts.next().unwrap_or_else(|| linalg::inner_with(x.slice(0..0), y.slice(0..0), [0, k, 0], g.apply, f.fold))?;
+        for part in parts {
+            let part = part?;
+            assert!(out.extend_from(part.view(), 0..part.len()), "native inner-product cells have one dtype");
+        }
+        self.finish(out)
+    }
 }
 
-/// The inner product `pair` of each pair of matrices, as APL's `f.g` takes it: `plus_times`, `max_plus`, `min_plus`, `or_and`, `and_or`, `plus_equal` or `plus_not_equal`. A vector on the left acts as one row, and a vector on the right as one column, and the result leaves that axis out. Two Boolean arguments of `plus_times` give `or_and`. Integers compute in int64, and the counts of `plus_equal` and `plus_not_equal` are int64. `name` names the product in errors.
+/// The inner product of native binary functions named `f` and `g`, on vectors, matrices or broadcast stacks. Recognized pairs use specialized kernels; other pairs apply `g` in bounded blocks and fold `f` from the right. `name` names the product in errors.
 #[pyfunction]
-#[pyo3(signature = (pair, x1, x2, name=None))]
-pub fn product<'py>(py: Python<'py>, pair: &str, x1: &Bound<'py, PyAny>, x2: &Bound<'py, PyAny>, name: Option<&str>) -> PyResult<Bound<'py, PyAny>> {
-    let name = name.unwrap_or(pair);
+#[pyo3(signature = (f, g, x1, x2, name=None))]
+pub fn product<'py>(py: Python<'py>, f: &str, g: &str, x1: &Bound<'py, PyAny>, x2: &Bound<'py, PyAny>, name: Option<&str>) -> PyResult<Bound<'py, PyAny>> {
+    let name = name.unwrap_or("inner");
     let call = convert(&[x1, x2])?;
     let dtype = call.args[0].view().dtype();
     let (l1, l2) = (call.args[0].layout(), call.args[1].layout());
@@ -611,22 +644,22 @@ pub fn product<'py>(py: Python<'py>, pair: &str, x1: &Bound<'py, PyAny>, x2: &Bo
     let y = paired(Items::Own(call.args[1].view()), &l2, r2 - c2, &l1, r1 - 1, name)?;
     let cell = l1.axes(r1 - c1..r1).contracted(&l2.axes(r2 - c2..r2));
     let p = Product { py, args: [call.args[0].view(), y.view()], frames: &frames, size: [n, k, m], cell: &cell, name };
-    match pair {
-        "plus_times" if dtype == DType::Boolean => p.run(rustymath::kernels!(Product OrAnd)),
-        "plus_times" => p.run(rustymath::kernels!(Product PlusTimes)),
-        "max_plus" => p.run(rustymath::kernels!(Product MaxPlus)),
-        "min_plus" => p.run(rustymath::kernels!(Product MinPlus)),
-        "or_and" => p.run(rustymath::kernels!(Product OrAnd)),
-        "and_or" => p.run(rustymath::kernels!(Product AndOr)),
-        "plus_equal" => p.run(rustymath::kernels!(Product PlusEqual)),
-        "plus_not_equal" => p.run(rustymath::kernels!(Product PlusNotEqual)),
-        _ => Err(PyValueError::new_err(format!("no inner product is named {pair:?}"))),
+    match (f, g) {
+        ("add", "multiply") if dtype == DType::Boolean => p.run(rustymath::kernels!(Product OrAnd)),
+        ("add", "multiply") => p.run(rustymath::kernels!(Product PlusTimes)),
+        ("maximum", "add") => p.run(rustymath::kernels!(Product MaxPlus)),
+        ("minimum", "add") => p.run(rustymath::kernels!(Product MinPlus)),
+        ("logical_or", "logical_and") => p.run(rustymath::kernels!(Product OrAnd)),
+        ("logical_and", "logical_or") => p.run(rustymath::kernels!(Product AndOr)),
+        ("add", "equal") => p.run(rustymath::kernels!(Product PlusEqual)),
+        ("add", "not_equal") => p.run(rustymath::kernels!(Product PlusNotEqual)),
+        _ => p.generic(f, g),
     }
 }
 
 /// The matrix product of `x1` and `x2`. A vector on the left acts as one row, and a vector on the right as one column, and the result leaves that axis out. Booleans give whether some `k` has both `x1[i, k]` and `x2[k, j]`. Integers compute in int64, and raise `OverflowError` for a result that doesn't fit.
 #[pyfunction]
-pub fn matmul<'py>(py: Python<'py>, x1: &Bound<'py, PyAny>, x2: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { product(py, "plus_times", x1, x2, Some("matmul")) }
+pub fn matmul<'py>(py: Python<'py>, x1: &Bound<'py, PyAny>, x2: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { product(py, "add", "multiply", x1, x2, Some("matmul")) }
 
 /// Adds the linear algebra functions to the submodule `m`.
 pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {

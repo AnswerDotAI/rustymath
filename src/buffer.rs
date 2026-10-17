@@ -403,7 +403,11 @@ impl Buffer {
 // Buffers are equal when they hold the same items. Numbers of one kind compare by value across widths. Buffers of different kinds are never equal.
 impl PartialEq for Buffer { fn eq(&self, other: &Self) -> bool { self.view() == other.view() } }
 
-impl View<'_> {
+impl<'a> View<'a> {
+    /// Borrows a consecutive range without copying or changing its dtype.
+    pub fn slice(self, range: std::ops::Range<usize>) -> Self {
+        with_dtype!(self.dtype(), T => T::view(&T::of(self).expect("the view has its dtype")[range]))
+    }
     #[inline]
     pub fn len(self) -> usize {
         match self { Self::Booleans(v) => v.len(), Self::Integers(v) => v.len(), Self::Floats(v) => v.len(), Self::Complexes(v) => v.len(), Self::Characters(v) => v.len() }
@@ -449,7 +453,7 @@ pub trait Element: Copy + Send + Sync {
     fn vec(buffer: Buffer) -> Option<Vec<Self>>;
 }
 
-/// An item that reads as type `A`: a Boolean as a number, an integer as a float or a complex number, a float as a float of another width or a complex number, and a complex number as one of the other width.
+/// An item that reads as type `A`: a Boolean as a number, an integer as a wider integer, a float or a complex number, a float as a float of another width or a complex number, and a complex number as one of the other width.
 pub trait Source<A>: Element {
     fn read(self) -> A;
     /// `items` as `A` with no copy, where the items already have type `A`.
@@ -467,13 +471,13 @@ macro_rules! truth {
     )+};
 }
 truth!(u8, i16, i32, i64);
-/// A narrower integer reads as an `i64` exactly.
+/// A narrower integer reads as a wider one exactly.
 macro_rules! wider {
-    ($($s:ty),+) => {$(
-        impl Source<i64> for $s { #[inline] fn read(self) -> i64 { self.into() } }
-    )+};
+    ($($s:ty => $($a:ty),+);+) => {$($(
+        impl Source<$a> for $s { #[inline] fn read(self) -> $a { self.into() } }
+    )+)+};
 }
-wider!(u8, i16, i32);
+wider!(u8 => i16, i32, i64; i16 => i32, i64; i32 => i64);
 /// An integer reads as a float through `convert`, whose conversions vectorize on every target.
 macro_rules! numbers {
     ($($s:ty),+) => {$(
@@ -605,6 +609,10 @@ impl Buffer {
         Ok(match (dtype, view) {
             (DType::Character, _) | (_, View::Characters(_)) => return Err(Error::new(Kind::Domain, "characters convert only to characters")),
             (DType::Integer(w), View::Booleans(v)) => with_width!(w, A => A::buffer(read_all::<A, bool>(v))),
+            (DType::Integer(Width::I64), View::Integers(v)) => i64::buffer(with_ints!(v, |x| read_all(x))),
+            (DType::Integer(Width::I32), View::Integers(Ints::I16(v))) => i32::buffer(read_all(v)),
+            (DType::Integer(Width::I32), View::Integers(Ints::U8(v))) => i32::buffer(read_all(v)),
+            (DType::Integer(Width::I16), View::Integers(Ints::U8(v))) => i16::buffer(read_all(v)),
             (DType::Integer(w), _) => with_width!(w, A => A::buffer((0..n).map(|i| integer(view, i).and_then(|k| A::try_from(k).map_err(|_| overflow(k)))).collect::<Result<_, _>>()?)),
             (DType::Boolean, _) => Self::Booleans((0..n).map(|i| boolean(view, i)).collect::<Result<_, _>>()?),
             (DType::Float(w), View::Complexes(v)) => with_float_width!(w, A => A::buffer((0..n).map(|i| real_part(v.get(i)).map(Source::<A>::read)).collect::<Result<_, _>>()?)),

@@ -178,6 +178,7 @@ mod reductions {
     use half::f16;
     use num_complex::Complex;
     use rustymath::reduce::*;
+    use rustymath::{Arg, Binary, tolerant::{Less, Tolerance}};
 
     /// Each reduction and scan against the same taken item by item, in order: sums and running sums of `sums`, and the product of `prods`. Their items keep every sum and product exact at every width, so any grouping gives the same result.
     fn exact<T: Copy + PartialEq + std::fmt::Debug, S: Copy + PartialEq + std::fmt::Debug>(
@@ -280,7 +281,7 @@ mod reductions {
     /// Folds and scans along the middle axis against the same taken lane by lane, item by item, for lanes of consecutive items and otherwise, short and long, and empty. Folding in blocks of 13 splits lanes at many offsets. Booleans fold by each of their reductions, and an `i64` sum that wraps reports it, along a lane and down the rows.
     #[test]
     fn axes_match_lane_by_lane() {
-        for shape in [[3, 37, 5], [15, 37, 1], [4, 3, 2], [2, 0, 3], [2, 200, 1], [70, 3, 1], [5, 64, 1], [65, 1, 1], [3, 50, 2]] {
+        for shape in [[3, 37, 5], [15, 37, 1], [4, 3, 2], [2, 0, 3], [2, 200, 1], [70, 3, 1], [5, 64, 1], [65, 1, 1], [70, 2, 1], [3, 50, 2], [2, 5000, 1], [1, 5000, 2]] {
             let [outer, len, inner] = shape;
             let x: Vec<i64> = (0..outer * len * inner).map(|i| (i * 37 % 101) as i64 - 50).collect();
             let sums: Vec<i64> = lanes_of(&x, shape).iter().map(|l| l.iter().sum()).collect();
@@ -301,6 +302,35 @@ mod reductions {
             let mut out = Vec::new();
             assert!(scan_along::<i64, Sum>(&x, shape, Some(10), &mut out));
             assert_eq!(out, want, "{shape:?}");
+            let mut ordered = Vec::new();
+            assert!(left_scan(&x, shape, Some(10), i64::checked_add, &mut ordered));
+            assert_eq!(ordered, want, "{shape:?}");
+            ordered.clear();
+            assert!(left_scan(&x, shape, None, i64::checked_sub, &mut ordered));
+            if inner == 1 {
+                let mut subtractions = Vec::new();
+                subtract_sums::<_, i64>(&x, len, &mut subtractions);
+                assert_eq!(subtractions, ordered, "{shape:?}");
+            }
+            let negated = negated_tail(&x, shape, false, |x| x);
+            let mut transformed = Vec::new();
+            scan_along::<i64, Sum>(&negated, shape, None, &mut transformed);
+            assert_eq!(transformed, ordered, "{shape:?}");
+            let mut differences = Vec::new();
+            assert!(adjacent(&x, shape, &mut differences, |_, _| true, |before, next, out| {
+                out.extend(next.iter().zip(before).map(|(&a, &b)| a - b)); true
+            }));
+            let want: Vec<_> = x.chunks((len * inner).max(1)).flat_map(|lane| lane[inner..].iter().zip(lane).map(|(&a, &b)| a - b)).collect();
+            assert_eq!(differences, want, "{shape:?}");
+            for seed in [None, Some(10)] {
+                ordered.clear();
+                assert!(left_scan(&x, shape, seed, |a, b| Some(i64::from(a < b)), &mut ordered));
+                let starts = seed.map(|s| x.chunks((len * inner).max(1)).flat_map(|lane| lane[..inner].iter().map(move |&v| s < v)).collect::<Vec<_>>());
+                let (bits, ok) = comparison_scan(&x, shape, starts.as_deref(), 0, 1,
+                    &|t, xs, out| Less(Tolerance::EXACT).many(t, Arg::Many(xs), xs.len(), out));
+                assert!(ok && bits.len() == ordered.len());
+                assert!(bits.iter().zip(&ordered).enumerate().all(|(i, (&bit, &v))| seed.is_none() && i % (len * inner) < inner || i64::from(bit) == v), "{shape:?} {seed:?}");
+            }
             // `SumAs`'s running sums of Booleans and of narrow integers match `Sum`'s, which run at 64 bits.
             let wide = |items: Vec<i64>, start: Option<i64>| {
                 let mut out = Vec::new();
@@ -365,6 +395,7 @@ mod reductions {
         assert!(!along::<i64, Sum>(&[i64::MAX, 1], [1, 2, 1]).1);
         assert!(!along::<i64, Sum>(&[i64::MAX, 0, 1, 0], [1, 2, 2]).1);
         assert!(!scan_along::<i64, Sum>(&[i64::MAX, 0, 1, 0], [1, 2, 2], None, &mut Vec::new()));
+        assert!(!left_scan(&[i64::MAX, 1], [1, 2, 1], None, i64::checked_add, &mut Vec::new()));
     }
 
     /// Folds that run in pieces, of long lanes and of single matrices down their columns, and folds of many short lanes or groups, which split across threads, match the sums taken lane by lane, on one thread and on four.
@@ -408,6 +439,7 @@ mod reductions {
             assert_eq!(<Product as Alternating<Complex<f64>>>::alternating(&pz), (Complex::new(q, 0.0), true));
         }
         assert!(!<Sum as Alternating<i64>>::alternating(&[i64::MAX, -1]).1);
+        assert_eq!(alternating_lanes::<_, Sum>(&[1i64, 2, 3, 4, 5, 6], 3), Some(vec![2, 5]));
         // The pairs' ratios alternate between 1e200 and 1e-200, so the right fold is 1. Each running product takes every 16th ratio, or every 8th in wasm, so half of them overflow and half underflow.
         let x: Vec<f64> = (0..256).map(|i| if (i % 4 == 0) | (i % 4 == 3) { 1e200 } else { 1.0 }).collect();
         assert_eq!(right(&x, 1.0, |a, b| a / b), 1.0);
@@ -440,6 +472,7 @@ mod search {
 
     #[test]
     fn search_and_sort() {
+        use rustymath::{buffer::Element, tolerant::Tolerance, Float};
         let x = [30, 10, 20, 10];
         assert_eq!(index_of(&x, &[10, 40]), [1, 4]);
         // More than `SCANNED` needles build the index in place of scanning.
@@ -498,6 +531,34 @@ mod search {
         let wide = [-70000, 5, 5, 90000];
         let values = [-80000, -70000, 0, 5, 6, 90000, 95000];
         assert_eq!(bins(&wide, &values), values.iter().map(|&v| wide.partition_point(|&b| b <= v) as u32).collect::<Vec<_>>());
+        // Heterogeneous, strided columns share native-width key construction, with a single comparison sort for small tables and radix passes for larger ones.
+        for n in [32, 300] {
+            let rows: Vec<i16> = (0..n).flat_map(|i| [i as i16 % 9 - 4, 0, i as i16 % 5]).collect();
+            let second: Vec<f32> = (0..n).map(|i| if i % 19 == 0 { f32::NAN } else { (i % 17) as f32 / 7. }).collect();
+            for down in [false, true] {
+                let mut expected: Vec<u32> = (0..n as u32).collect();
+                expected.sort_by_key(|&i| { let k = (rows[i as usize * 3].order_key(), second[i as usize].order_key()); if down { (!k.0, !k.1) } else { k } });
+                let order = view_lexgrade(n, [(i16::view(&rows), 0, 3), (f32::view(&second), 0, 1)].into_iter(), down).unwrap();
+                assert_eq!(order, expected);
+                let ranks = inverse_permutation(order.iter().map(|&i| i as usize));
+                for (rank, &position) in order.iter().enumerate() { assert_eq!(ranks[position as usize], rank as u32); }
+            }
+        }
+        let x = [1u8, 2, 1];
+        assert_eq!(view_index_of(u8::view(&x), f64::view(&[1., 256., -1., 2.]), Tolerance::DEFAULT, || Ok::<_, ()>(())).unwrap().unwrap(), [0, 3, 3, 1]);
+        assert!(view_index_of(u8::view(&x), f64::view(&[1. + 1e-15]), Tolerance::DEFAULT, || Ok::<_, ()>(())).is_none());
+        let groups = Grouped::new(vec![0, 1], &[0, 1, 0]);
+        assert_eq!(groups.fold::<_, rustymath::reduce::Sum>(&[i64::MAX, 2, 1]), (vec![i64::MIN, 2], false));
+        assert_eq!(find_with(&[2], &[2, 3], |i, j| Ok::<_, ()>([1, 2][i] == [1, 2, 1, 1, 2, 3][j])).unwrap(), [true, false, false, true, false, false]);
+        assert_eq!(view_find(i16::view(&[1, 2]), &[2], u8::view(&[1, 2, 1, 1, 2, 3]), &[2, 3], Tolerance::EXACT), Some(vec![true, false, false, true, false, false]));
+        assert_eq!(view_find(bool::view(&[true, false]), &[2], bool::view(&[true, false, true]), &[3], Tolerance::EXACT), Some(vec![true, false, false]));
+        assert_eq!(view_find(char::view(&['a']), &[1], char::view(&['b', 'a']), &[2], Tolerance::EXACT), Some(vec![false, true]));
+        for (t, first) in [(Tolerance::DEFAULT, true), (Tolerance::EXACT, false)] {
+            assert_eq!(view_find(f32::view(&[1., f32::NAN]), &[2], f64::view(&[1. + 1e-15, f64::NAN, 1., f64::NAN]), &[4], t), Some(vec![first, false, true, false]));
+        }
+        assert!(view_find(u8::view(&[1]), &[1], f64::view(&[1.]), &[1], Tolerance::DEFAULT).is_none());
+        for size in [4, 1_000_000] { assert_eq!(occurrences(&[1, 2, 1, 3, 1], size), Some((vec![0, 0, 1, 0, 2], 3))); }
+        assert_eq!((occurrences(&[1, 2, 3], 4), occurrences(&[], 0)), (None, None));
     }
 
     /// Over more than one 65,536-key piece, the radix sort's passes and the lookups split across threads and give one thread's results. Equal keys keep their order of position.

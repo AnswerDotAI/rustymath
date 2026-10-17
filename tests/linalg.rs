@@ -12,6 +12,49 @@ fn adjoint<T: Scalar>(a: &[T], m: usize, n: usize) -> Vec<T> { transpose(a, m, n
 mod products {
     use super::*;
 
+    #[test]
+    fn native_inner_pairs_keep_right_folds_and_bounded_terms() {
+        use rustymath::{buffer::Element, kernels, tolerant::{Equal, Greater, Tolerance}};
+        macro_rules! inner {
+            ($f:expr, $g:expr, $a:expr, $b:expr, $size:expr) => {{
+                let (f, g) = ($f, $g);
+                let (fk, gk) = (kernels!(RightFold of f), kernels!(Binary of g));
+                let checked = |(buffer, ok)| if ok { Ok(buffer) } else { Err(()) };
+                inner_with($a, $b, $size,
+                    |x, y, agreement| { assert!(agreement.len <= rustymath::CHUNK); checked(gk.binary(&g, x, y, agreement).unwrap()) },
+                    |x, dims, tail| checked(fk.run(&f, x, dims, tail).unwrap()),
+                )
+            }};
+        }
+        let [m, k, n] = [2, rustymath::CHUNK + 3, 3];
+        let a = (0..m * k).map(|i| (i % 7) as i64 - 3).collect::<Vec<_>>();
+        let b = (0..k * n).map(|i| (i % 5) as i64 - 2).collect::<Vec<_>>();
+        let out = inner!(rustymath::Subtract, rustymath::Multiply, i64::view(&a), i64::view(&b), [m, k, n]).unwrap();
+        let expected = (0..m * n).map(|ij| (0..k - 1).rev().fold(a[ij / n * k + k - 1] * b[(k - 1) * n + ij % n], |t, p| a[ij / n * k + p] * b[p * n + ij % n] - t)).collect::<Vec<_>>();
+        assert_eq!(i64::of(out.view()).unwrap(), expected);
+        let out = inner!(Equal(Tolerance::EXACT), rustymath::Add, i64::view(&a), i64::view(&b), [m, k, n]).unwrap();
+        let expected = (0..m * n).map(|ij| {
+            let term = |p| a[ij / n * k + p] + b[p * n + ij % n];
+            let t = term(k - 2) == term(k - 1);
+            (0..k - 2).rev().fold(t, |t, p| term(p) == i64::from(t))
+        }).collect::<Vec<_>>();
+        assert_eq!(bool::of(out.view()).unwrap(), expected);
+        let wide = vec![1i64; 3 * (rustymath::CHUNK + 1)];
+        let out = inner!(rustymath::Subtract, rustymath::Multiply, i64::view(&[1, 2, 3]), i64::view(&wide), [1, 3, rustymath::CHUNK + 1]).unwrap();
+        assert!(i64::of(out.view()).unwrap().iter().all(|&x| x == 2));
+        let out = inner!(rustymath::Add, Greater(Tolerance::EXACT), i64::view(&[2, 3, 4]), i64::view(&[1, 5, 2]), [1, 3, 1]).unwrap();
+        assert_eq!(i64::of(out.view()).unwrap(), [2]);
+        let out = inner!(Equal(Tolerance::EXACT), rustymath::Subtract, i64::view(&[3]), i64::view(&[2, 1]), [1, 1, 2]).unwrap();
+        assert_eq!(i64::of(out.view()).unwrap(), [1, 2]);
+        assert!(inner!(rustymath::Pow, rustymath::Add, f64::view(&[-1., 0.5]), f64::view(&[0., 2., 0., 1.5]), [1, 2, 2]).is_err());
+        assert!(inner!(rustymath::Add, rustymath::Multiply, i64::view(&[i64::MAX, 1]), i64::view(&[2, 2]), [1, 2, 1]).is_err());
+        assert!(inner!(rustymath::Add, rustymath::Multiply, i64::view(&[]), i64::view(&[2, 2]), [0, 2, 1]).unwrap().is_empty());
+        let sum = kernels!(Fold rustymath::reduce::Sum);
+        let (out, ok) = sum.run(&rustymath::reduce::Sum, bool::view(&[true, false]), [1, 2, 1], Some(i64::view(&[7]))).unwrap();
+        assert!(ok && i64::of(out.view()).unwrap() == [8]);
+        assert!(!sum.run(&rustymath::reduce::Sum, i64::view(&[i64::MAX]), [1, 1, 1], Some(i64::view(&[1]))).unwrap().1);
+    }
+
     /// An inner product taken in order, item by item.
     fn folded<T: Copy, O: Copy>(a: &[T], b: &[T], [m, k, n]: [usize; 3], unit: O, step: impl Fn(O, T, T) -> O) -> Vec<O> {
         (0..m * n).map(|ij| (0..k).fold(unit, |acc, p| step(acc, a[ij / n * k + p], b[p * n + ij % n]))).collect()

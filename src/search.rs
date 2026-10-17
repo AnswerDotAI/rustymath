@@ -1,9 +1,9 @@
 //! Search and sort over slices of keys. A key is an item read as a whole number (`Key`), or an unsigned word whose order is the order you want (`RadixKey`). `Float::order_key` gives each float such a word, as wide as the float. Positions take 32 bits inside these functions, so a slice holds at most `u32::MAX` items. `tolerant` builds its searches over floats on these functions.
 //!
 //! `index_of`, `classes` and `firsts` index the first position of each key. `index_of` passes over `x` once for each item of `y` when `y` has at most `SCANNED` items. The index is a table when the keys span at most twice the slice's length, or 1024, and a hash map otherwise. `numbered` numbers the classes in order of first position, with each one's size. `grouped_keys` numbers them the same way from a table of keys, with each one's positions, and `class_counts` gives only their sizes. `counts` counts the items with each key in such a table. `sort_rows` sorts keys that span such a table by counting them. It sorts other keys with an LSD radix sort that skips any byte that is the same in every key. With several threads, the sort splits each pass of more than `RADIX_PIECE` keys across them, and `index_of` splits its lookups.
-use crate::{Float, buffer::{Buffer, DType, Element, View}, error::{Error, Kind}, tolerant::{self, Tolerance}};
+use crate::{Float, buffer::{Buffer, DType, Element, Floats, View}, error::{Error, Kind}, tolerant::{self, Tolerance}};
 use hashbrown::{HashMap, hash_map::Entry};
-use std::{hash::Hash, mem::MaybeUninit, ops::Not};
+use std::{convert::Infallible, hash::Hash, mem::MaybeUninit, ops::Not};
 use std::cmp::Ordering;
 
 /// An item as a whole number: a Boolean's 0 or 1, an integer, a character's code point, or an order key. Two items match exactly when their keys are equal. A 64-bit unsigned key wraps to a negative number, which keeps keys distinct.
@@ -211,6 +211,70 @@ pub fn numbered(classes: &[u32]) -> Numbered {
     Numbered { firsts, numbers, counts }
 }
 
+/// Whether `offsets` are dense enough to use a table over the `size` positions they fall below.
+pub fn dense_offsets(offsets: &[usize], size: usize) -> bool { size <= 8 * offsets.len() }
+
+/// For each offset, how many preceding offsets equal it, and the largest occurrence count. `None` when none repeats. Every offset must be below `size`.
+pub fn occurrences(offsets: &[usize], size: usize) -> Option<(Vec<u32>, usize)> {
+    let next = |seen: &mut u32| { *seen += 1; *seen - 1 };
+    let counts: Vec<u32> = if dense_offsets(offsets, size) {
+        if offsets.len() <= size {
+            let (mut taken, mut repeated) = (vec![0u64; size.div_ceil(64)], 0);
+            for &o in offsets {
+                let (word, bit) = (&mut taken[o / 64], 1 << (o % 64));
+                repeated |= *word & bit;
+                *word |= bit;
+            }
+            if repeated == 0 { return None; }
+        }
+        let mut seen = vec![0u32; size];
+        offsets.iter().map(|&o| next(&mut seen[o])).collect()
+    } else { let mut seen = HashMap::new(); offsets.iter().map(|&o| next(seen.entry(o).or_insert(0))).collect() };
+    let rounds = counts.iter().fold(0, |most, &c| most.max(c + 1));
+    (rounds > 1).then_some((counts, rounds as usize))
+}
+
+/// Inverts a permutation: each input position's rank in `order`. Every position must occur exactly once.
+pub fn inverse_permutation(order: impl ExactSizeIterator<Item = usize>) -> Vec<u32> {
+    let mut ranks = vec![0; order.len()];
+    for (rank, position) in order.enumerate() { ranks[position] = rank as u32; }
+    ranks
+}
+
+/// Marks where `pattern_shape` fits within `shape` and every pattern item matches. Shapes describe compact row-major buffers; `same` compares their flat positions. A lower-rank pattern has leading axes of length one.
+#[inline]
+pub fn find_with<E>(pattern_shape: &[usize], shape: &[usize], mut same: impl FnMut(usize, usize) -> Result<bool, E>) -> Result<Vec<bool>, E> {
+    let mut out = vec![false; shape.iter().product()];
+    if pattern_shape.len() > shape.len() { return Ok(out); }
+    let mut pattern = vec![1; shape.len() - pattern_shape.len()];
+    pattern.extend_from_slice(pattern_shape);
+    let strides = crate::layout::strides(shape);
+    let offsets: Vec<usize> = (0..pattern.iter().product()).map(|i| crate::layout::coordinates(i, &pattern).map(|(a, c)| c * strides[a]).sum()).collect();
+    for (flat, matched) in out.iter_mut().enumerate() {
+        if crate::layout::coordinates(flat, shape).any(|(a, c)| pattern[a] > shape[a] - c) { continue; }
+        *matched = true;
+        for (i, &offset) in offsets.iter().enumerate() { if !same(i, flat + offset)? { *matched = false; break; } }
+    }
+    Ok(out)
+}
+
+/// Marks occurrences of a compact pattern in a compact target, with the shapes and geometry of [`find_with`]. Booleans, integers and characters of one kind match exactly, and floats of any widths match within `t`, including NaN with NaN. `None` for other dtype pairs.
+pub fn view_find(pattern: View<'_>, pattern_shape: &[usize], target: View<'_>, shape: &[usize], t: Tolerance) -> Option<Vec<bool>> {
+    #[inline]
+    fn find(pattern_shape: &[usize], shape: &[usize], mut same: impl FnMut(usize, usize) -> bool) -> Vec<bool> {
+        let Ok(found) = find_with(pattern_shape, shape, |i, j| Ok::<_, Infallible>(same(i, j)));
+        found
+    }
+    use tolerant::Tolerant;
+    Some(match (pattern, target) {
+        (View::Booleans(x), View::Booleans(y)) => find(pattern_shape, shape, |i, j| x[i] == y[j]),
+        (View::Integers(x), View::Integers(y)) => find(pattern_shape, shape, |i, j| x.get(i) == y.get(j)),
+        (View::Characters(x), View::Characters(y)) => find(pattern_shape, shape, |i, j| x[i] == y[j]),
+        (View::Floats(x), View::Floats(y)) => find(pattern_shape, shape, |i, j| t.matches(x.get(i), y.get(j))),
+        _ => return None,
+    })
+}
+
 /// The number of items in each class of `x`, in order of the classes' first positions, as `numbered` counts them. Keys that span a table take `counts`, then a pass for first positions that stops once it has found every key `x` holds, with nothing written for each item.
 #[inline(never)]
 pub fn class_counts<K: Key>(x: &[K]) -> Vec<usize> {
@@ -355,6 +419,22 @@ impl Grouped {
         })
     }
 
+    /// Folds each nonempty group of `data` in position order by `R`, and whether every fold fits.
+    #[inline]
+    pub fn fold<T: Copy, R: crate::reduce::Reduction<T>>(&self, data: &[T]) -> (Vec<R::Total>, bool) {
+        let mut fits = true;
+        let totals = self.each().map(|rows| {
+            let (mut total, mut ok) = R::one(data[rows[0] as usize]);
+            for &r in &rows[1..] {
+                let (t, k) = R::checked(total, data[r as usize]);
+                (total, ok) = (t, ok && k);
+            }
+            fits &= ok;
+            total
+        }).collect();
+        (totals, fits)
+    }
+
     /// The positions of each class in a buffer of its own. Two classes already have theirs. More are copied from the buffer they share.
     pub fn into_classes(self) -> Vec<Vec<u32>> { if self.buffers.len() == self.sizes.len() { return self.buffers; } self.each().map(<[u32]>::to_vec).collect() }
 }
@@ -458,24 +538,32 @@ fn parted<const P: usize, T: Copy>(items: &[T], n: usize, group: impl Fn(T) -> u
     (positions, sizes)
 }
 
-/// The rows of an `n`-row table in ascending order, comparing entries column by column from the first. Rows that compare equal keep their order of position. `columns` holds each column's `n` keys, whose unsigned order is the order you want. A caller fills them from its items in a pass that vectorizes. Fewer than 256 rows take a comparison sort. One column whose keys `tabled` allows takes a counting sort. Other tables take the radix sort once for each column, from the last, which sorts the last column's keys in place. Positions are `u32`s, as a slice holds at most `u32::MAX` items.
+/// The first row count at which sorting uses radix passes rather than comparisons.
+const RADIX_FROM: usize = 256;
+
+/// The rows of an `n`-row table in ascending order, comparing entries column by column from the first. Rows that compare equal keep their order of position. `columns` holds each column's `n` keys, whose unsigned order is the order you want. A caller fills them from its items in a pass that vectorizes. Fewer than 256 rows take a comparison sort. One column whose keys `tabled` allows takes a counting sort. Other tables take the radix sort once for each column, from the last. Positions are `u32`s, as a slice holds at most `u32::MAX` items.
 #[inline(never)]
-pub fn sort_rows<K: RadixKey>(n: usize, mut columns: Vec<Vec<K>>) -> Vec<u32> {
-    if n < 256 {
+pub fn sort_rows<K: RadixKey>(n: usize, columns: Vec<Vec<K>>) -> Vec<u32> {
+    if n < RADIX_FROM {
         let mut order: Vec<u32> = (0..n as u32).collect();
         order.sort_by(|&a, &b| columns.iter().map(|c| c[a as usize].cmp(&c[b as usize])).find(|o| o.is_ne()).unwrap_or(std::cmp::Ordering::Equal));
         return order;
     }
     if let [keys] = &columns[..] && let Some(order) = counted(keys) { return order; }
-    let Some(mut keys) = columns.pop() else { return (0..n as u32).collect() };
     let mut order: Vec<u32> = (0..n as u32).collect();
+    if columns.is_empty() { return order; }
     let mut spare = (vec![K::default(); n], vec![0; n]);
-    loop {
-        radix(&mut keys, &mut order, &mut spare);
-        let Some(column) = columns.pop() else { break };
-        for (k, &i) in keys.iter_mut().zip(&order) { *k = column[i as usize] }
-    }
+    for (c, mut keys) in columns.into_iter().rev().enumerate() { radix_column(&mut keys, &mut order, &mut spare, c == 0); }
     order
+}
+
+/// Adds one more significant key column to a stable order, using the existing radix pass and its scratch.
+fn radix_column<K: RadixKey>(keys: &mut Vec<K>, order: &mut Vec<u32>, spare: &mut (Vec<K>, Vec<u32>), first: bool) {
+    if !first {
+        for (key, &i) in spare.0.iter_mut().zip(order.iter()) { *key = keys[i as usize]; }
+        std::mem::swap(keys, &mut spare.0);
+    }
+    radix(keys, order, spare);
 }
 
 /// The order of one column's `keys` by counting, when `table_size` allows their range. Equal keys keep their order. Each key's place follows the places of all smaller keys. The range of the first 256 keys rules out most keys that span too wide a range, such as floats', before a pass over all of them.
@@ -493,7 +581,7 @@ fn counted<K: RadixKey>(keys: &[K]) -> Option<Vec<u32>> {
 pub(crate) fn sorted<K: RadixKey>(mut keys: Vec<K>) -> (Vec<K>, Vec<u32>) {
     let n = keys.len();
     let mut order: Vec<u32> = (0..n as u32).collect();
-    if n < 256 { order.sort_by_key(|&i| keys[i as usize]); return (order.iter().map(|&i| keys[i as usize]).collect(), order); }
+    if n < RADIX_FROM { order.sort_by_key(|&i| keys[i as usize]); return (order.iter().map(|&i| keys[i as usize]).collect(), order); }
     radix(&mut keys, &mut order, &mut (vec![K::default(); n], vec![0; n]));
     (keys, order)
 }
@@ -697,12 +785,23 @@ pub fn view_grouped<E>(x: View<'_>, t: Tolerance, check: impl FnMut() -> Result<
     Some(view_classes(x, t, check)?.map(|classes| { let Numbered { firsts, numbers, .. } = numbered(&classes); Grouped::new(firsts, &numbers) }))
 }
 
-/// For each item of `y`, the first position in `x` of an item that matches it, or the length of `x` where none does: exactly for Booleans, integers or characters of one kind, with integers of different widths read as `i64`, and within `t` for floats of one width, calling `check` as it goes. `None` for other pairs.
+/// For each item of `y`, the first position in `x` of an item that matches it, or the length of `x` where none does: exactly for Booleans, integers or characters of one kind, with integers of different widths read as `i64`, and within `t` for floats of one width, calling `check` as it goes. An integer haystack also takes `f64` needles when every needle is exactly whole and below [`tolerant::whole_limit`]. `None` for other pairs.
 pub fn view_index_of<E>(x: View<'_>, y: View<'_>, t: Tolerance, check: impl FnMut() -> Result<(), E>) -> Option<Result<Vec<u32>, E>> {
     if let (DType::Float(w), true) = (x.dtype(), x.dtype() == y.dtype()) {
         return with_float_width!(w, F => Some(crate::with_tolerance!(t, |t| tolerant::index_of_with(t, F::of(x)?, F::of(y)?, check))));
     }
+    if let (View::Integers(x), View::Floats(Floats::F64(y))) = (x, y) {
+        return with_ints!(x, |x| whole_needles(x, y, t).map(Ok));
+    }
     key_pairs!(x, y, |x, y| Ok(index_of(x, y)))
+}
+
+/// Exact whole float needles small enough that tolerance cannot equate them with another integer. Other needles decline this integer fast path.
+fn whole_needles<K: Key>(x: &[K], y: &[f64], t: Tolerance) -> Option<Vec<u32>> {
+    let limit = tolerant::whole_limit(t);
+    let whole: Vec<i64> = y.iter().map(|&v| (v.fract() == 0.0 && v.abs() < limit).then_some(v as i64)).collect::<Option<_>>()?;
+    let mut found = index_of(x, &whole.iter().filter_map(|&n| K::from_key(n)).collect::<Vec<_>>()).into_iter();
+    Some(whole.iter().map(|&n| K::from_key(n).and_then(|_| found.next()).unwrap_or(x.len() as u32)).collect())
 }
 
 /// Set operations retain first-occurrence order, matching as classification and membership do.
@@ -744,20 +843,6 @@ pub fn view_bins_below(boundaries: View<'_>, values: View<'_>) -> Option<Vec<u32
     Some(bins(&a, &v).into_iter().map(|p| n - p).collect())
 }
 
-/// Each item's order key, widened to 64 bits: [`OrderKey::order_key`] for Booleans, integers and characters, and [`Float::order_key`] for floats. Within one dtype, their unsigned order is the items' order, with every NaN last. `None` for complex numbers.
-pub fn view_order_keys(x: View<'_>) -> Option<Vec<u64>> {
-    Some(match x {
-        View::Booleans(x) => widened(x),
-        View::Characters(x) => widened(x),
-        View::Integers(ints) => with_ints!(ints, |x| widened(x)),
-        View::Floats(f) => with_floats!(f, |x| x.iter().map(|&v| v.order_key().into()).collect()),
-        View::Complexes(_) => return None,
-    })
-}
-
-/// Each item's [`OrderKey`], widened to 64 bits.
-fn widened<T: OrderKey>(x: &[T]) -> Vec<u64> { x.iter().map(|&v| v.order_key().into()).collect() }
-
 /// Runs an ordered operation at the view's item width. Complex numbers have no ordering.
 macro_rules! ordered_view {
     ($view:expr, |$x:ident, $key:ident| $body:expr) => {
@@ -771,15 +856,46 @@ macro_rules! ordered_view {
     };
 }
 
+/// Each item's order key, widened to 64 bits. Within one dtype, their unsigned order is the items' order, with every NaN last. `None` for complex numbers.
+pub fn view_order_keys(x: View<'_>) -> Option<Vec<u64>> {
+    ordered_view!(x, |x, key| x.iter().map(|&v| key(v).word()).collect())
+}
+
 /// Stable positions that order a vector. Equal items keep their original positions, including signed zeros and NaNs.
 pub fn view_grade(x: View<'_>, down: bool) -> Option<Vec<u32>> {
-    fn grade<T: Copy + Sync, K: RadixKey>(x: &[T], down: bool, key: impl Fn(T) -> K + Sync) -> Vec<u32> {
-        let mut keys = Vec::with_capacity(x.len());
-        crate::pairs(crate::Arg::Many(x), crate::Arg::One(()), x.len(), &mut keys,
-            move |v, ()| (if down { !key(v) } else { key(v) }, true));
-        sort_rows(x.len(), vec![keys])
+    ordered_view!(x, |x, key| sort_rows(x.len(), vec![order_column(x, x.len(), 0, 1, down, key, |k| k)]))
+}
+
+/// Stable lexicographic order of `n` rows, with columns in primary-first order. Each column is a compact view, its first key's offset and the step between keys. Columns can have different dtypes; radix keys keep each column's item width. `None` for complex keys.
+pub fn view_lexgrade<'a>(n: usize, columns: impl Iterator<Item = (View<'a>, usize, usize)>, down: bool) -> Option<Vec<u32>> {
+    let columns: Vec<_> = columns.collect();
+    if let [(view, start, step)] = columns[..] {
+        return ordered_view!(view, |x, key| sort_rows(n, vec![order_column(x, n, start, step, down, key, |k| k)]));
     }
-    ordered_view!(x, |x, key| grade(x, down, key))
+    if n < RADIX_FROM {
+        // One comparison sort is faster than sorting once per column. This small table needs no width-dispatch representation.
+        let columns = columns.into_iter().map(|(view, start, step)| ordered_view!(view, |x, key| order_column(x, n, start, step, down, key, |k| k.word()))).collect::<Option<Vec<_>>>()?;
+        return Some(sort_rows(n, columns));
+    }
+    let (mut order, mut positions) = ((0..n as u32).collect::<Vec<_>>(), vec![0; n]);
+    for (c, (view, start, step)) in columns.into_iter().rev().enumerate() {
+        ordered_view!(view, |x, key| {
+            let mut keys = order_column(x, n, start, step, down, key, |k| k);
+            let mut spare = (vec![Default::default(); n], std::mem::take(&mut positions));
+            radix_column(&mut keys, &mut order, &mut spare, c == 0);
+            positions = spare.1;
+        })?;
+    }
+    Some(order)
+}
+
+/// One column's order keys, contiguous or strided. A contiguous pass uses the same vectorized/threaded loop as vector grading.
+fn order_column<T: Copy + Sync, K: RadixKey, O: Send>(x: &[T], n: usize, start: usize, step: usize, down: bool, key: impl Fn(T) -> K + Sync, convert: impl Fn(K) -> O + Sync) -> Vec<O> {
+    let key = move |v| convert(if down { !key(v) } else { key(v) });
+    if step != 1 { return (0..n).map(|i| key(x[start + i * step])).collect(); }
+    let mut keys = Vec::with_capacity(n);
+    crate::pairs(crate::Arg::Many(&x[start..start + n]), crate::Arg::One(()), n, &mut keys, move |v, ()| (key(v), true));
+    keys
 }
 
 /// A counting sort with no position buffer, when the items span a small table. Extra writes avoid one unpredictable branch per sparse count.

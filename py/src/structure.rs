@@ -243,9 +243,13 @@ pub fn pad(x: &Bound<'_, PyAny>, pad_width: &Bound<'_, PyAny>) -> PyResult<Array
 /// The coordinates of `x`'s nonzero items, one row of axis positions for each item, and the number of rows.
 fn nonzero_rows(x: &Arg<'_>) -> (usize, Vec<i64>) {
     let positions = Buffer::nonzero(x.view());
-    let shape = x.layout().shape().to_vec();
-    let stride = rustymath::layout::strides(&shape);
-    (positions.len(), positions.iter().flat_map(|&i| shape.iter().zip(&stride).map(move |(&n, &s)| ((i / s) % n) as i64)).collect())
+    let layout = x.layout();
+    let rank = layout.shape().len();
+    let mut rows = vec![0; positions.len() * rank];
+    for (row, &i) in positions.iter().enumerate() {
+        for (axis, coordinate) in rustymath::layout::coordinates(i, layout.shape()) { rows[row * rank + axis] = coordinate as i64; }
+    }
+    (positions.len(), rows)
 }
 
 #[pyfunction]
