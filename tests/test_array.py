@@ -10,12 +10,25 @@ def test_numpy_views_share_items():
         assert a.dtype == name and a.shape == (3,)
         v = np.asarray(a)
         assert v.dtype == np.dtype(dt) and (v == x).all()
-        if name in ('bool', 'char'): assert not v.flags.writeable
-        else:
-            v[0] = v[1]
-            assert a[0] == x[1]
+        assert not v.flags.writeable
+        with pytest.raises(ValueError): v[0] = v[1]
+        a[0] = a[1]
+        assert a[0] == x[1] and np.array_equal(v, x)
     v = np.asarray(rm.array(np.float32(2.5)))
     assert v.shape == () and v.dtype == np.float32 and v == 2.5
+    a = rm.arange(24).reshape(4, 6)
+    base = np.asarray(a)
+    for view, expected in ((a.T, base.T), (a[::-1], base[::-1]), (a[:, ::2], base[:, ::2]), (a[1:3], base[1:3])):
+        exported = np.asarray(view)
+        assert np.shares_memory(exported, base) and exported.strides == expected.strides
+        assert np.array_equal(exported, expected) and view.tolist() == expected.tolist()
+        compact = view.compact()
+        assert not np.shares_memory(np.asarray(compact), base) and compact.tolist() == view.tolist()
+    view = a[::-1]
+    snapshot = np.asarray(view)
+    a[0, 0] = 99
+    view[0, 0] = 88
+    assert a[3, 0] == 18 and view[3, 0] == 0 and snapshot[0, 0] == 18 and base[0, 0] == 0
 
 def test_array_copies_and_reads_any_layout():
     x = np.arange(12.).reshape(3, 4)
@@ -85,7 +98,7 @@ def test_methods():
     v = rm.array(range(6))
     r = v.reshape(2, 3)
     assert r.shape == (2, 3) and v.reshape((3, -1)).shape == (3, 2) and v.reshape([6]).tolist() == v.tolist() and t.reshape(4).keys == (None,)
-    np.asarray(r)[0, 0] = 9
+    r[0, 0] = 9
     assert v[0] == 0
     with pytest.raises(ValueError): v.reshape(-1, -1)
     with pytest.raises(ValueError): v.reshape(4, -1)
@@ -98,6 +111,8 @@ def test_methods():
     for names in (('city',), ('a', 'a')):
         with pytest.raises(ValueError): s.names = names
     assert '[0.1]' in repr(rm.array([0.1]).astype('f32')) and '[0.1]' in repr(rm.array([0.1]).astype('f16')) and '(0.1+0.2j)' in repr(rm.array([0.1 + 0.2j]).astype('c64'))
+    # Cast only selected items, not invalid values elsewhere in the shared base.
+    assert rm.array([float('nan'), 2.5])[1:].astype('i64').tolist() == [2]
 
 def test_operators_and_reductions():
     a, m = rm.array([1, 2, 3]), rm.array([[1, 2, 3], [4, 5, 6]])

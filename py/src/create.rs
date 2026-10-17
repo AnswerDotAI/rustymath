@@ -15,7 +15,7 @@ fn layout(size: &Bound<'_, PyAny>) -> PyResult<Layout> { Ok(Layout::from(shape(s
 
 fn cast(core: Core, dtype: Option<&str>) -> PyResult<Array> {
     let Some(dtype) = dtype else { return Ok(Array::new(core)) };
-    let (layout, buffer) = core.into_parts();
+    let (layout, buffer) = core.into_compact();
     let dtype = convert::dtype(dtype)?;
     let buffer = if buffer.dtype() == dtype { buffer } else { Buffer::cast(buffer.view(), dtype).map_err(py_err)? };
     Ok(Array::new(Core::new(layout, buffer).map_err(py_err)?))
@@ -33,7 +33,7 @@ fn _full(shape: &Bound<'_, PyAny>, value: &Bound<'_, PyAny>, dtype: Option<&str>
         return Ok(Array::new(with_dtype!(dtype, T => rustymath::create::full(layout, T::view(&[T::FILL]))).map_err(py_err)?));
     }
     let value = match dtype { Some(dtype) => convert::one_at(value, dtype)?, None => convert::one(value)? };
-    Ok(Array::new(rustymath::create::full(layout, value.view()).map_err(py_err)?))
+    Ok(Array::new(rustymath::create::full(layout, value.at(value.view().dtype())?.view()).map_err(py_err)?))
 }
 
 /// Values separated by `step`, including `start` and excluding `stop`. With only one bound, `start` is zero.

@@ -89,6 +89,8 @@ enum Items { Lent(Held), Owned(Buffer) }
 impl Read {
     pub fn shape(&self) -> &[usize] { &self.shape }
     pub fn dtype(&self) -> DType { self.dtype }
+    /// Whether reading made a compact copy that [`Self::into_buffer`] can move without copying again.
+    pub fn is_owned(&self) -> bool { matches!(self.items, Items::Owned(_)) }
     pub fn view(&self) -> View<'_> {
         match &self.items {
             Items::Owned(b) => b.view(),
@@ -165,38 +167,45 @@ pub fn read(obj: &Bound<'_, PyAny>) -> PyResult<Option<Read>> {
     Ok(Some(Read { shape, len: n, dtype, items }))
 }
 
-/// The `shape` and C-order byte strides that [`export`] takes, for items of `dtype` laid out in `shape`. A class keeps both while it can be exported.
+/// The `shape` and C-order byte strides that [`export`] takes, for items of `dtype` laid out in `shape`. Keep both alive for each export.
 pub fn geometry(dtype: DType, shape: &[usize]) -> (Box<[isize]>, Box<[isize]>) {
     let size = layout(dtype).0;
     (shape.iter().map(|&n| n as isize).collect(), rustymath::layout::strides(shape).iter().map(|&s| (s * size) as isize).collect())
 }
 
-/// Fills `view` for a class's `__getbuffer__` with the `len` items of `dtype` at `data`, under `shape` and the byte `strides`. `owner` must keep the items, `shape` and `strides` valid while it lives. Only the parts that `flags` requests are filled. A request to write to a read-only export, or for Fortran order of items in more than one dimension, raises `BufferError`.
+/// Fills `view` for a class's `__getbuffer__` with the `len` logical items of `dtype` under `shape` and signed byte `strides`. `data` points to the first logical item. Keep storage and geometry valid until release. Only the parts that `flags` requests are filled. Unsupported write or contiguity requests raise `BufferError`.
 ///
 /// # Safety
-/// `view` must be the `Py_buffer` that CPython passed to `__getbuffer__`, and `data` must point to `len` items of `dtype`.
+/// `view` must be the `Py_buffer` that CPython passed to `__getbuffer__`, and every address reached by the geometry must hold a valid item of `dtype`.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn export(
     view: *mut ffi::Py_buffer, flags: c_int, owner: &Bound<'_, PyAny>, dtype: DType, data: *mut u8, len: usize, shape: &[isize], strides: &[isize], readonly: bool,
 ) -> PyResult<()> {
     if view.is_null() { return Err(PyBufferError::new_err("no Py_buffer to fill")); }
     if readonly && flags & ffi::PyBUF_WRITABLE != 0 { return Err(PyBufferError::new_err("the array is read-only")); }
-    if flags & ffi::PyBUF_F_CONTIGUOUS == ffi::PyBUF_F_CONTIGUOUS && shape.iter().filter(|&&n| n > 1).count() > 1 {
-        return Err(PyBufferError::new_err("the array's items are in C order"));
-    }
     let size = layout(dtype).0;
     let nd = flags & ffi::PyBUF_ND == ffi::PyBUF_ND;
-    let v = unsafe { &mut *view };
-    v.obj = owner.clone().into_ptr();
+    let mut v = ffi::Py_buffer::new();
     v.buf = data.cast();
     v.len = (len * size) as ffi::Py_ssize_t;
     v.itemsize = size as ffi::Py_ssize_t;
     v.readonly = c_int::from(readonly);
     v.format = if flags & ffi::PyBUF_FORMAT != 0 { entry(dtype).1.as_ptr().cast_mut() } else { ptr::null_mut() };
-    v.ndim = if nd { shape.len() as c_int } else { 1 };
-    v.shape = if nd && !shape.is_empty() { shape.as_ptr().cast_mut() } else { ptr::null_mut() };
-    v.strides = if flags & ffi::PyBUF_STRIDES == ffi::PyBUF_STRIDES && !shape.is_empty() { strides.as_ptr().cast_mut() } else { ptr::null_mut() };
+    v.ndim = shape.len() as c_int;
+    v.shape = shape.as_ptr().cast_mut();
+    v.strides = strides.as_ptr().cast_mut();
+    let strided = flags & ffi::PyBUF_STRIDES == ffi::PyBUF_STRIDES;
+    for (flag, order) in [(ffi::PyBUF_C_CONTIGUOUS, b'C'), (ffi::PyBUF_F_CONTIGUOUS, b'F'), (ffi::PyBUF_ANY_CONTIGUOUS, b'A')] {
+        if (flags & flag == flag || order == b'C' && !strided) && unsafe { ffi::PyBuffer_IsContiguous(&v, order as c_char) } == 0 {
+            return Err(PyBufferError::new_err("the array doesn't have the requested contiguous layout"));
+        }
+    }
+    v.obj = owner.clone().into_ptr();
+    if !nd { v.ndim = 1; }
+    if !nd || shape.is_empty() { v.shape = ptr::null_mut(); }
+    if !strided || shape.is_empty() { v.strides = ptr::null_mut(); }
     v.suboffsets = ptr::null_mut();
     v.internal = ptr::null_mut();
+    unsafe { *view = v; }
     Ok(())
 }

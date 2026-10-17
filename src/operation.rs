@@ -7,6 +7,7 @@
 //!
 //! A character, or a number with none of these, has no kernel.
 use crate::agreement::{Agreement, Frames, Mapping, chunks, map1, map2};
+use crate::array::ArrayView;
 use crate::buffer::{Buffer, DType, Element, Source, View, Width};
 use crate::reduce::{Reduction, scan_along};
 use crate::slice::{Arg, Binary, CHUNK, Ternary, Unary};
@@ -59,26 +60,41 @@ fn cast<'a>(x: View<'a>, dtype: DType, cast: &'a mut Option<Buffer>) -> View<'a>
 }
 
 impl<K> Kernels<UnaryKernel<K>> {
-    /// `k` at each of `len` positions, which read `x` through `mapping`, and whether every result succeeded. `None` where `k` has no kernel for `x`'s dtype.
-    pub fn unary(&self, k: &K, x: View<'_>, mapping: &Mapping, len: usize) -> Option<(Buffer, bool)> {
+    /// `k` on the logical items of `x`, and whether every result succeeded. `None` where `k` has no kernel for `x`'s dtype.
+    pub fn unary(&self, k: &K, x: ArrayView<'_>) -> Option<(Buffer, bool)> {
         let (kernel, at) = self.chosen(x.dtype())?;
-        Some(kernel(k, cast(x, at, &mut None), mapping, len))
+        if at == x.dtype() { return Some(kernel(k, x.storage(), x.mapping(), x.len())); }
+        Some(kernel(k, x.cast(at).expect("computing dtype").view(), &Mapping::Linear(1), x.len()))
     }
+}
+
+/// Keeps an ordinary compact call's agreement borrowed; only changed input mappings need a new one.
+fn remapped(a: &Agreement, left: Option<Mapping>, right: Option<Mapping>) -> Option<Agreement> {
+    (left.is_some() || right.is_some()).then(|| Agreement {
+        layout: a.layout.clone(), len: a.len, left: left.unwrap_or_else(|| a.left.clone()), right: right.unwrap_or_else(|| a.right.clone()),
+    })
 }
 
 impl<K> Kernels<BinaryKernel<K>> {
     /// `k` on `x` and `y`, which share a dtype and pair as `agreement` says, and whether every result succeeded. `None` where `k` has no kernel for their dtype.
-    pub fn binary(&self, k: &K, x: View<'_>, y: View<'_>, agreement: &Agreement) -> Option<(Buffer, bool)> {
+    pub fn binary(&self, k: &K, x: ArrayView<'_>, y: ArrayView<'_>, agreement: &Agreement) -> Option<(Buffer, bool)> {
         let (kernel, at) = self.chosen(x.dtype())?;
-        Some(kernel(k, cast(x, at, &mut None), cast(y, at, &mut None), agreement))
+        let (x, left) = x.mapped(&agreement.left, agreement.layout.shape(), at);
+        let (y, right) = y.mapped(&agreement.right, agreement.layout.shape(), at);
+        let changed = remapped(agreement, left, right);
+        Some(kernel(k, x.view(), y.view(), changed.as_ref().unwrap_or(agreement)))
     }
 }
 
 impl<K> Kernels<TernaryKernel<K>> {
     /// `k` on three arguments of one dtype, paired as [`TernaryKernel`] describes, and whether every result succeeded. `None` where `k` has no kernel for their dtype.
-    pub fn ternary(&self, k: &K, [x, y, z]: [View<'_>; 3], first: &Agreement, second: &Agreement) -> Option<(Buffer, bool)> {
+    pub fn ternary(&self, k: &K, [x, y, z]: [ArrayView<'_>; 3], first: &Agreement, second: &Agreement) -> Option<(Buffer, bool)> {
         let (kernel, at) = self.chosen(x.dtype())?;
-        Some(kernel(k, [cast(x, at, &mut None), cast(y, at, &mut None), cast(z, at, &mut None)], first, second))
+        let (x, left) = x.mapped(&first.left, first.layout.shape(), at);
+        let (y, right) = y.mapped(&first.right, first.layout.shape(), at);
+        let (z, last) = z.mapped(&second.right, second.layout.shape(), at);
+        let (one, two) = (remapped(first, left, right), remapped(second, None, last));
+        Some(kernel(k, [x.view(), y.view(), z.view()], one.as_ref().unwrap_or(first), two.as_ref().unwrap_or(second)))
     }
 }
 
@@ -215,7 +231,7 @@ pub mod probe {
         /// The probe for `k`'s type, for a [`kernels!`](crate::kernels) given a value.
         pub const fn of(_: &K) -> Self { Self(PhantomData) }
     }
-    /// The arities that `kernels!` names.
+    /// The operations that `kernels!` names.
     pub enum Unary {}
     pub enum Binary {}
     pub enum Ternary {}

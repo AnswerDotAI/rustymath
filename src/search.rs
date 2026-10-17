@@ -1078,7 +1078,7 @@ pub fn view_quantiles_along(x: View<'_>, dims @ [outer, _, inner]: [usize; 3], p
     let count = probabilities.len();
     Ok(Some(if count > 1 && outer > 1 {
         let plan = crate::structure::transpose(&crate::layout::Layout::from([outer, count, inner]), &[1, 0, 2]).expect("valid quantile axes");
-        Buffer::walked(items.view(), &plan.steps)
+        Buffer::walked(items.view(), 0, &plan.steps, items.len())
     } else { items }))
 }
 

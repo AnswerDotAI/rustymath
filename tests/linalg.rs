@@ -21,7 +21,11 @@ mod products {
                 let (fk, gk) = (kernels!(RightFold of f), kernels!(Binary of g));
                 let checked = |(buffer, ok)| if ok { Ok(buffer) } else { Err(()) };
                 inner_with($a, $b, $size,
-                    |x, y, agreement| { assert!(agreement.len <= rustymath::CHUNK); checked(gk.binary(&g, x, y, agreement).unwrap()) },
+                    |x, y, agreement| {
+                        use rustymath::{array::ArrayView, layout::Layout};
+                        assert!(agreement.len <= rustymath::CHUNK);
+                        checked(gk.binary(&g, ArrayView::compact(&Layout::from([x.len()]), x), ArrayView::compact(&Layout::from([y.len()]), y), agreement).unwrap())
+                    },
                     |x, dims, tail| checked(fk.run(&f, x, dims, tail).unwrap()),
                 )
             }};

@@ -5,7 +5,7 @@
 
 Rustymath provides fast elementary and special functions, statistics, searching and sorting, random sampling, linear algebra, optimization, polynomials and exact arithmetic in Rust and Python. It is the numerical core of [BasedPL](https://answerdotai.github.io/basedpl/).
 
-The Python package needs no NumPy. Its eager operations return compact arrays and use the same broadcasting, selection and tolerant-comparison rules as the shared Rust core. For richer array notation, operators and fusion, use BasedPL.
+The Python package needs no NumPy. Its eager operations use the same broadcasting, selection and tolerant-comparison rules as the shared Rust core. For richer array notation, operators and fusion, use BasedPL.
 
 Elementary float functions target four units in the last place (ulps). Rustymath prioritizes speed over last-bit agreement and reproducibility.
 

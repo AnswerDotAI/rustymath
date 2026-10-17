@@ -5,8 +5,8 @@ use rustymath::num_complex::{Complex32, Complex64};
 use pyo3::exceptions::{PySystemError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyComplex, PyDict, PyFloat, PyInt, PyList, PyRange, PyString, PyTuple};
-use rustymath::array::Array as Core;
-use rustymath::buffer::{Buffer, ComplexWidth, DType, Element, FloatWidth, View, Width};
+use rustymath::array::{Array as Core, ArrayView};
+use rustymath::buffer::{Buffer, ComplexWidth, DType, Element, FloatWidth, Items, Width};
 use rustymath::error::{Error, Kind};
 use rustymath::layout::{Keys, Layout, element_count, generated_len};
 use rustymath::with_dtype;
@@ -25,56 +25,55 @@ pub struct Arg<'py> { source: Source<'py>, pub scalar: bool }
 /// Where an argument's items are.
 enum Source<'py> {
     /// The items of an object that exports a buffer, such as a NumPy array.
-    Read(Read),
+    Read { read: Read, layout: Layout },
     /// A `rustymath.Array`, borrowed.
     Array(PyRef<'py, Array>),
-    /// Python values, or an array converted to another dtype.
+    /// Python values, copied foreign storage, or an array converted to another dtype.
     Owned(Core),
 }
 
 impl From<Read> for Arg<'_> {
-    fn from(r: Read) -> Self { Self { source: Source::Read(r), scalar: false } }
+    fn from(read: Read) -> Self {
+        let layout = Layout::from(read.shape());
+        let source = if read.is_owned() { Source::Owned(Core::new(layout, read.into_buffer()).expect("buffer shape")) } else { Source::Read { read, layout } };
+        Self { source, scalar: false }
+    }
 }
 
 impl Arg<'_> {
-    pub fn view(&self) -> View<'_> {
-        match &self.source { Source::Read(r) => r.view(), Source::Array(a) => a.core().view(), Source::Owned(c) => c.view() }
+    pub fn view(&self) -> ArrayView<'_> {
+        match &self.source { Source::Read { read, layout } => ArrayView::compact(layout, read.view()), Source::Array(a) => a.core().view(), Source::Owned(c) => c.view() }
     }
-    pub fn layout(&self) -> Layout {
-        match &self.source { Source::Read(r) => Layout::from(r.shape()), Source::Array(a) => a.core().layout().clone(), Source::Owned(c) => c.layout().clone() }
-    }
+    pub fn layout(&self) -> Layout { self.view().layout().clone() }
     /// The argument as an owned array. Only borrowed items are copied.
     pub fn into_core(self) -> PyResult<Core> {
         match self.source {
-            Source::Read(r) => { let layout = Layout::from(r.shape()); Core::new(layout, r.into_buffer()).map_err(py_err) }
+            Source::Read { read, layout } => Core::new(layout, read.into_buffer()).map_err(py_err),
             Source::Array(a) => Ok(a.core().clone()),
             Source::Owned(c) => Ok(c),
         }
     }
+    /// Selects before taking ownership: foreign items gather directly, while Rustymath arrays can share affine views.
+    pub fn selected(&self, plan: &rustymath::structure::Plan) -> PyResult<Core> {
+        match &self.source {
+            Source::Read { read, .. } => Core::gathered(read.view(), plan),
+            Source::Array(a) => a.core().selected(plan),
+            Source::Owned(c) => c.selected(plan),
+        }.map_err(py_err)
+    }
     /// The items at `dtype`, borrowed where the argument already has it, and otherwise widened. An empty argument converts to any dtype. It raises where the argument's dtype doesn't widen to `dtype`, as [`DType::widens_to`] decides.
     pub fn at(&self, dtype: DType) -> PyResult<Items<'_>> {
         let view = self.view();
-        if view.dtype() == dtype { return Ok(Items::Own(view)); }
-        if view.is_empty() { return Ok(Items::Cast(with_dtype!(dtype, T => T::buffer(Vec::new())))); }
-        if !view.dtype().widens_to(dtype) { return Err(py_err(Error::new(Kind::Domain, format!("{} doesn't widen to {}", name(view.dtype()), name(dtype))))); }
-        Buffer::cast(view, dtype).map(Items::Cast).map_err(py_err)
+        if view.is_empty() && view.dtype() != dtype { return Ok(Items::Owned(Buffer::with_capacity(dtype, 0))); }
+        if !view.is_empty() && !view.dtype().widens_to(dtype) { return Err(py_err(Error::new(Kind::Domain, format!("{} doesn't widen to {}", name(view.dtype()), name(dtype))))); }
+        view.cast(dtype).map_err(py_err)
     }
     /// The items in row-major order as `T`, widened as [`Arg::at`] widens them: borrowed where the argument already has `T`'s dtype, and otherwise the widened copy.
     pub fn items<T: Element>(&self) -> PyResult<Cow<'_, [T]>> {
-        Ok(match self.at(T::DTYPE)? { Items::Own(v) => Cow::Borrowed(T::of(v).expect("items at their own element type")), Items::Cast(b) => Cow::Owned(T::vec(b).expect("items at their own element type")) })
+        Ok(self.at(T::DTYPE)?.items())
     }
     /// The items in row-major order as `T`, converted as [`Buffer::cast`] converts them, narrowing included.
-    pub fn cast<T: Element>(&self) -> PyResult<Vec<T>> { Ok(T::vec(Buffer::cast(self.view(), T::DTYPE).map_err(py_err)?).expect("a cast gives its dtype")) }
-}
-
-/// Items at one dtype: an argument's own, borrowed, or a widened copy.
-pub enum Items<'a> { Own(View<'a>), Cast(Buffer) }
-
-impl Items<'_> {
-    /// The items' view.
-    pub fn view(&self) -> View<'_> { match self { Self::Own(v) => *v, Self::Cast(b) => b.view() } }
-    /// The items as `T`, the element type of their dtype.
-    pub fn of<T: Element>(&self) -> &[T] { T::of(self.view()).expect("items at their own element type") }
+    pub fn cast<T: Element>(&self) -> PyResult<Vec<T>> { Ok(self.view().items::<T>().map_err(py_err)?.into_owned()) }
 }
 
 /// A call's data arguments, at one dtype.
@@ -303,10 +302,10 @@ fn classify<'py>(obj: &Bound<'py, PyAny>, strong: &mut Option<DType>) -> PyResul
     let source = if let Ok(a) = obj.cast::<Array>() {
         Some(Source::Array(a.try_borrow()?))
     } else if let Some(r) = read(obj)? {
-        Some(Source::Read(r))
+        Some(Arg::from(r).source)
     } else if obj.hasattr("__array__")? {
         let a = obj.call_method0("__array__")?;
-        Some(Source::Read(read(&a)?.ok_or_else(|| PyTypeError::new_err("__array__ gave an object without a buffer"))?))
+        Some(Arg::from(read(&a)?.ok_or_else(|| PyTypeError::new_err("__array__ gave an object without a buffer"))?).source)
     } else {
         None
     };
@@ -372,7 +371,9 @@ fn convert_at<'py>(args: &[&Bound<'py, PyAny>], forced: Option<DType>) -> PyResu
             }
         };
         if a.view().dtype() == target { return Ok(a); }
-        Core::new(a.layout(), Buffer::cast(a.view(), target).map_err(py_err)?).map(|c| Arg { source: Source::Owned(c), scalar: a.scalar }).map_err(py_err)
+        let items = a.view().cast(target).map_err(py_err)?;
+        let Items::Owned(buffer) = items else { unreachable!("different dtypes need a cast") };
+        Core::new(a.layout(), buffer).map(|c| Arg { source: Source::Owned(c), scalar: a.scalar }).map_err(py_err)
     }).collect::<PyResult<Vec<_>>>()?;
     Ok(Call { args })
 }

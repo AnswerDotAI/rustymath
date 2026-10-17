@@ -346,6 +346,11 @@ macro_rules! dtype_macro {
 }
 element_types!((dtype_macro) $);
 
+impl DType {
+    /// The bytes that one item of this dtype takes.
+    pub fn bytes(self) -> usize { with_dtype!(self, T => std::mem::size_of::<T>()) }
+}
+
 /// Items of one element type.
 #[derive(Clone, Debug)]
 pub enum Buffer { Booleans(Vec<bool>), Integers(IntBuf), Floats(FloatBuf), Complexes(ComplexBuf), Characters(Vec<char>) }
@@ -353,6 +358,21 @@ pub enum Buffer { Booleans(Vec<bool>), Integers(IntBuf), Floats(FloatBuf), Compl
 /// A buffer's items, borrowed in their element type.
 #[derive(Clone, Copy, Debug)]
 pub enum View<'a> { Booleans(&'a [bool]), Integers(Ints<'a>), Floats(Floats<'a>), Complexes(Complexes<'a>), Characters(&'a [char]) }
+
+/// Compact items at one dtype, borrowed or prepared by gathering and conversion.
+pub enum Items<'a> { Borrowed(View<'a>), Owned(Buffer) }
+
+impl<'a> Items<'a> {
+    pub fn view(&self) -> View<'_> { match self { Self::Borrowed(v) => *v, Self::Owned(b) => b.view() } }
+    pub fn of<T: Element>(&self) -> &[T] { T::of(self.view()).expect("items at their own element type") }
+    /// Unpacks typed items, without allocating or converting again.
+    pub fn items<T: Element>(self) -> Cow<'a, [T]> {
+        match self {
+            Self::Borrowed(v) => Cow::Borrowed(T::of(v).expect("items at their own element type")),
+            Self::Owned(b) => Cow::Owned(T::vec(b).expect("items at their own element type")),
+        }
+    }
+}
 
 impl Buffer {
     /// An empty buffer of `dtype`, with room for `capacity` items.
@@ -529,9 +549,17 @@ pub fn read_all<A: Element, S: Source<A>>(items: &[S]) -> Vec<A> {
 }
 
 /// The real items of `view` read as `A`, or `None` for complex numbers or characters.
-fn reals<A: Element>(view: View<'_>) -> Option<Vec<A>>
+fn reals<A: Element>(view: View<'_>, mapping: &crate::agreement::Mapping, n: usize) -> Option<Vec<A>>
 where bool: Source<A>, u8: Source<A>, i16: Source<A>, i32: Source<A>, i64: Source<A>, half::f16: Source<A>, f32: Source<A>, f64: Source<A> {
-    Some(match view { View::Booleans(v) => read_all(v), View::Integers(v) => with_ints!(v, |x| read_all(x)), View::Floats(v) => with_floats!(v, |x| read_all(x)), _ => return None })
+    Some(match view { View::Booleans(v) => read_as(v, mapping, n), View::Integers(v) => with_ints!(v, |x| read_as(x, mapping, n)), View::Floats(v) => with_floats!(v, |x| read_as(x, mapping, n)), _ => return None })
+}
+
+/// Gathers source items in blocks, then converts each block contiguously.
+fn read_as<A: Element, S: Source<A>>(items: &[S], mapping: &crate::agreement::Mapping, n: usize) -> Vec<A> {
+    if matches!(mapping, crate::agreement::Mapping::Linear(1)) { return read_all(&items[..n]); }
+    let mut out = Vec::with_capacity(n);
+    crate::agreement::block(items, mapping, n, &mut out, |x, n, slots| slots.pairs(x, crate::Arg::One(()), n, |x, ()| (x.read(), true)));
+    out
 }
 
 /// An Overflow error for a value `x` that doesn't fit the dtype it converts to.
@@ -573,11 +601,11 @@ impl Buffer {
     pub fn nonzero(view: View<'_>) -> Vec<usize> {
         with_dtype!(view.dtype(), T => T::of(view).expect("matching dtype").iter().enumerate().filter_map(|(i, &x)| (x != T::FILL).then_some(i)).collect())
     }
-    /// Copies a structural walk, using the type's fill for missing positions and whole-slice copies for contiguous runs.
-    pub fn walked(view: View<'_>, steps: &[crate::gather::Steps]) -> Self {
+    /// Copies the first `n` items of a structural walk from `base`, using the type's fill for missing positions and whole-slice copies for contiguous runs.
+    pub fn walked(view: View<'_>, base: usize, steps: &[crate::gather::Steps], n: usize) -> Self {
         with_dtype!(view.dtype(), T => {
-            let mut out = Vec::with_capacity(steps.iter().map(crate::gather::Steps::len).product());
-            crate::gather::walk(&mut out, T::of(view).expect("matching dtype"), 0, steps, T::FILL, crate::gather::Same);
+            let mut out = Vec::with_capacity(n);
+            crate::gather::walk_range(&mut out, T::of(view).expect("matching dtype"), base, steps, T::FILL, 0, n, crate::gather::Same);
             T::buffer(out)
         })
     }
@@ -604,21 +632,28 @@ impl Buffer {
     }
     /// The items of `view` at `dtype`. Matching dtypes copy. Otherwise each item converts as [`Source`] reads it, and conversions to a narrower dtype follow these rules. A float converts to an integer by truncating toward zero. A value that doesn't fit its target gives an Overflow error, as do NaN, infinities and anything but exactly 0 or 1 for Booleans. A complex number converts to a real dtype only when its imaginary part is zero, and otherwise gives a Domain error. Characters convert only to characters.
     pub fn cast(view: View<'_>, dtype: DType) -> Result<Self, Error> {
-        if view.dtype() == dtype { return Ok(Self::copied(view, 0..view.len())); }
-        let n = view.len();
+        Self::cast_mapped(view, &crate::agreement::Mapping::Linear(1), view.len(), dtype)
+    }
+    /// Shared conversion dispatch for compact and mapped logical items. Unselected storage never participates in checked conversion.
+    pub(crate) fn cast_mapped(view: View<'_>, mapping: &crate::agreement::Mapping, n: usize, dtype: DType) -> Result<Self, Error> {
+        if view.dtype() == dtype {
+            if matches!(mapping, crate::agreement::Mapping::Linear(1)) { return Ok(Self::copied(view, 0..n)); }
+            if let crate::agreement::Mapping::Steps { base, steps } = mapping { return Ok(Self::walked(view, *base, steps, n)); }
+            return Ok(with_dtype!(dtype, T => T::buffer(read_as::<T, T>(T::of(view).expect("matching dtype"), mapping, n))));
+        }
         Ok(match (dtype, view) {
             (DType::Character, _) | (_, View::Characters(_)) => return Err(Error::new(Kind::Domain, "characters convert only to characters")),
-            (DType::Integer(w), View::Booleans(v)) => with_width!(w, A => A::buffer(read_all::<A, bool>(v))),
-            (DType::Integer(Width::I64), View::Integers(v)) => i64::buffer(with_ints!(v, |x| read_all(x))),
-            (DType::Integer(Width::I32), View::Integers(Ints::I16(v))) => i32::buffer(read_all(v)),
-            (DType::Integer(Width::I32), View::Integers(Ints::U8(v))) => i32::buffer(read_all(v)),
-            (DType::Integer(Width::I16), View::Integers(Ints::U8(v))) => i16::buffer(read_all(v)),
-            (DType::Integer(w), _) => with_width!(w, A => A::buffer((0..n).map(|i| integer(view, i).and_then(|k| A::try_from(k).map_err(|_| overflow(k)))).collect::<Result<_, _>>()?)),
-            (DType::Boolean, _) => Self::Booleans((0..n).map(|i| boolean(view, i)).collect::<Result<_, _>>()?),
-            (DType::Float(w), View::Complexes(v)) => with_float_width!(w, A => A::buffer((0..n).map(|i| real_part(v.get(i)).map(Source::<A>::read)).collect::<Result<_, _>>()?)),
-            (DType::Float(w), v) => with_float_width!(w, A => A::buffer(reals::<A>(v).expect("cast handles complex numbers and characters first"))),
-            (DType::Complex(w), View::Complexes(v)) => with_complex_width!(w, A => A::buffer(with_complexes!(v, |x| read_all(x)))),
-            (DType::Complex(w), v) => with_complex_width!(w, A => A::buffer(reals::<A>(v).expect("cast handles characters first"))),
+            (DType::Integer(w), View::Booleans(v)) => with_width!(w, A => A::buffer(read_as::<A, bool>(v, mapping, n))),
+            (DType::Integer(Width::I64), View::Integers(v)) => i64::buffer(with_ints!(v, |x| read_as(x, mapping, n))),
+            (DType::Integer(Width::I32), View::Integers(Ints::I16(v))) => i32::buffer(read_as(v, mapping, n)),
+            (DType::Integer(Width::I32), View::Integers(Ints::U8(v))) => i32::buffer(read_as(v, mapping, n)),
+            (DType::Integer(Width::I16), View::Integers(Ints::U8(v))) => i16::buffer(read_as(v, mapping, n)),
+            (DType::Integer(w), _) => with_width!(w, A => A::buffer((0..n).map(|i| mapping.get(i).map_or(Ok(0), |j| integer(view, j)).and_then(|k| A::try_from(k).map_err(|_| overflow(k)))).collect::<Result<_, _>>()?)),
+            (DType::Boolean, _) => Self::Booleans((0..n).map(|i| mapping.get(i).map_or(Ok(false), |j| boolean(view, j))).collect::<Result<_, _>>()?),
+            (DType::Float(w), View::Complexes(v)) => with_float_width!(w, A => A::buffer((0..n).map(|i| mapping.get(i).map_or(Ok(0.), |j| real_part(v.get(j))).map(Source::<A>::read)).collect::<Result<_, _>>()?)),
+            (DType::Float(w), v) => with_float_width!(w, A => A::buffer(reals::<A>(v, mapping, n).expect("cast handles complex numbers and characters first"))),
+            (DType::Complex(w), View::Complexes(v)) => with_complex_width!(w, A => A::buffer(with_complexes!(v, |x| read_as(x, mapping, n)))),
+            (DType::Complex(w), v) => with_complex_width!(w, A => A::buffer(reals::<A>(v, mapping, n).expect("cast handles characters first"))),
         })
     }
 }

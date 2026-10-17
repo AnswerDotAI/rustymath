@@ -7,7 +7,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rustymath::agreement::{Frames, Mapping};
 use rustymath::array::Array as Core;
-use rustymath::buffer::{Buffer, DType, Element, FloatWidth, View, Width};
+use rustymath::buffer::{Buffer, DType, Element, FloatWidth, Items, View, Width};
 use rustymath::error::{Error, Kind};
 use rustymath::layout::{Lanes, Layout};
 use rustymath::linalg::{self, AndOr, Lu, LuWork, MaxPlus, MinPlus, OrAnd, PlusEqual, PlusNotEqual, PlusTimes, Scalar, Svd};
@@ -16,7 +16,7 @@ use rustymath::operation::{Kernels, ProductKernel};
 use rustymath_buffer::py_err;
 
 use crate::array::give;
-use crate::convert::{Call, Items, convert};
+use crate::convert::{Call, convert};
 use crate::functions::{missing, native_binary};
 
 /// A matrix function's data arguments at one dtype, the dtype that it computes in, and the dtype that its results take.
@@ -78,7 +78,7 @@ fn paired<'a>(items: Items<'a>, layout: &Layout, axis: usize, with: &Layout, alo
     let lanes = Lanes::new(layout.shape(), axis).map_err(py_err)?;
     let [outer, _, inner] = lanes.dims();
     let offsets: Vec<i64> = (0..outer).flat_map(|i| p.iter().flat_map(move |&j| (0..inner).map(move |k| lanes.offset(i, j, k) as i64))).collect();
-    Ok(Items::Cast(Buffer::gathered(items.view(), &offsets)))
+    Ok(Items::Owned(Buffer::gathered(items.view(), &offsets)))
 }
 
 /// The `per` items of cell `at` in `x`.
@@ -641,9 +641,10 @@ pub fn product<'py>(py: Python<'py>, f: &str, g: &str, x1: &Bound<'py, PyAny>, x
     let (j, m) = if c2 == 1 { (s2[0], 1) } else { (s2[r2 - 2], s2[r2 - 1]) };
     if k != j { return Err(py_err(Error::new(Kind::Length, format!("{name} needs as many columns on the left as rows on the right, not {k} and {j}")))); }
     let frames = framed(&[(&l1, c1), (&l2, c2)])?;
-    let y = paired(Items::Own(call.args[1].view()), &l2, r2 - c2, &l1, r1 - 1, name)?;
+    let x = call.args[0].at(dtype)?;
+    let y = paired(call.args[1].at(dtype)?, &l2, r2 - c2, &l1, r1 - 1, name)?;
     let cell = l1.axes(r1 - c1..r1).contracted(&l2.axes(r2 - c2..r2));
-    let p = Product { py, args: [call.args[0].view(), y.view()], frames: &frames, size: [n, k, m], cell: &cell, name };
+    let p = Product { py, args: [x.view(), y.view()], frames: &frames, size: [n, k, m], cell: &cell, name };
     match (f, g) {
         ("add", "multiply") if dtype == DType::Boolean => p.run(rustymath::kernels!(Product OrAnd)),
         ("add", "multiply") => p.run(rustymath::kernels!(Product PlusTimes)),

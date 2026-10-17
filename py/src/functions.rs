@@ -9,8 +9,8 @@ use crate::array::give;
 use crate::convert::{convert, one};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use rustymath::agreement::{Agreement, Mapping};
-use rustymath::array::Array as Core;
+use rustymath::agreement::Agreement;
+use rustymath::array::{Array as Core, ArrayView};
 use rustymath::buffer::{Buffer, ComplexWidth, DType, Element, FloatWidth, Source, View};
 use rustymath::error::{Error, Kind};
 use rustymath::layout::{position, Lanes, Layout};
@@ -93,9 +93,9 @@ pub trait Apply<K> {
 impl<K> Apply<K> for Kernels<UnaryKernel<K>> {
     fn apply<'py>(&self, py: Python<'py>, function: &str, k: &K, args: &[&Bound<'py, PyAny>]) -> PyResult<Bound<'py, PyAny>> {
         let call = convert(args)?;
-        let (x, layout) = (call.args[0].view(), call.args[0].layout());
-        let result = self.unary(k, x, &Mapping::Linear(1), x.len()).ok_or_else(|| missing(function, x.dtype()))?;
-        give(py, Core::new(layout, fitted(function, result)?).map_err(py_err)?, call.scalar())
+        let x = call.args[0].view();
+        let result = self.unary(k, x).ok_or_else(|| missing(function, x.dtype()))?;
+        give(py, Core::new(x.layout().clone(), fitted(function, result)?).map_err(py_err)?, call.scalar())
     }
 }
 
@@ -107,13 +107,15 @@ impl<K> Apply<K> for Kernels<BinaryKernel<K>> {
 fn binary<'py, K>(kernels: &Kernels<BinaryKernel<K>>, py: Python<'py>, function: &str, k: &K, args: &[&Bound<'py, PyAny>], domain: Option<&str>) -> PyResult<Bound<'py, PyAny>> {
     let call = convert(args)?;
     let (x, y) = (call.args[0].view(), call.args[1].view());
-    let agreement = Agreement::new(&call.args[0].layout(), &call.args[1].layout()).map_err(py_err)?;
+    let agreement = Agreement::new(x.layout(), y.layout()).map_err(py_err)?;
     let result = kernels.binary(k, x, y, &agreement).ok_or_else(|| missing(function, x.dtype()))?;
     give(py, Core::new(agreement.layout, checked_binary(function, result, y, domain)?).map_err(py_err)?, call.scalar())
 }
 
-fn checked_binary(function: &str, result: (Buffer, bool), y: View<'_>, domain: Option<&str>) -> PyResult<Buffer> {
-    if let Some(message) = domain.filter(|_| !result.1 && negative(y)) { return Err(py_err(Error::new(Kind::Domain, message.to_owned()))); }
+fn checked_binary(function: &str, result: (Buffer, bool), y: ArrayView<'_>, domain: Option<&str>) -> PyResult<Buffer> {
+    if let Some(message) = domain.filter(|_| !result.1) {
+        if negative(y.cast(y.dtype()).map_err(py_err)?.view()) { return Err(py_err(Error::new(Kind::Domain, message.to_owned()))); }
+    }
     fitted(function, result)
 }
 
@@ -121,8 +123,8 @@ impl<K> Apply<K> for Kernels<TernaryKernel<K>> {
     fn apply<'py>(&self, py: Python<'py>, function: &str, k: &K, args: &[&Bound<'py, PyAny>]) -> PyResult<Bound<'py, PyAny>> {
         let call = convert(args)?;
         let views = [0, 1, 2].map(|i| call.args[i].view());
-        let first = Agreement::new(&call.args[0].layout(), &call.args[1].layout()).map_err(py_err)?;
-        let second = Agreement::new(&first.layout, &call.args[2].layout()).map_err(py_err)?;
+        let first = Agreement::new(views[0].layout(), views[1].layout()).map_err(py_err)?;
+        let second = Agreement::new(&first.layout, views[2].layout()).map_err(py_err)?;
         let result = self.ternary(k, views, &first, &second).ok_or_else(|| missing(function, views[0].dtype()))?;
         give(py, Core::new(second.layout, fitted(function, result)?).map_err(py_err)?, call.scalar())
     }
@@ -131,7 +133,8 @@ impl<K> Apply<K> for Kernels<TernaryKernel<K>> {
 /// `r`'s totals of `x` over the axes that `axis` names: every axis for `None`, or one axis or a tuple of them. A total over every axis is a Python number.
 fn fold<'py, R>(py: Python<'py>, function: &str, kernels: &Kernels<AccumulationKernel<R>>, r: &R, x: &Bound<'py, PyAny>, axis: Option<Axes>) -> PyResult<Bound<'py, PyAny>> {
     let x = one(x)?;
-    let totals = totals(function, kernels, r, x.view(), x.layout(), axis.as_ref())?;
+    let items = x.at(x.view().dtype())?;
+    let totals = totals(function, kernels, r, items.view(), x.layout(), axis.as_ref())?;
     let core = match totals { Some(core) => core, None => x.into_core()? };
     let scalar = core.layout().shape().is_empty();
     give(py, core, scalar)
@@ -170,7 +173,8 @@ pub(crate) fn along_axis(layout: Layout, len: usize, axis: Option<Axis>) -> PyRe
 /// `r`'s running totals of `x` along `axis`, or along the flattened `x` for `None`.
 fn scan<'py, R>(py: Python<'py>, function: &str, kernels: &Kernels<AccumulationKernel<R>>, r: &R, x: &Bound<'py, PyAny>, axis: Option<Axis>) -> PyResult<Bound<'py, PyAny>> {
     let call = convert(&[x])?;
-    let x = call.args[0].view();
+    let items = call.args[0].at(call.args[0].view().dtype())?;
+    let x = items.view();
     let (along, layout) = along_axis(call.args[0].layout(), x.len(), axis)?;
     let result = kernels.run(r, x, along, None).ok_or_else(|| missing(function, x.dtype()))?;
     give(py, Core::new(layout, fitted(function, result)?).map_err(py_err)?, false)
@@ -247,8 +251,9 @@ macro_rules! functions {
             apply: |x, y, agreement| {
                 $(let $ct = Tolerance::DEFAULT;)?
                 let k = $k;
-                let result = kernels!(Binary of k)$(.only($only))?.binary(&k, x, y, agreement).ok_or_else(|| missing(stringify!($name), x.dtype()))?;
-                checked_binary(stringify!($name), result, y, None$(.or(Some($negative)))?)
+                let (xl, yl) = (Layout::from([x.len()]), Layout::from([y.len()]));
+                let result = kernels!(Binary of k)$(.only($only))?.binary(&k, ArrayView::compact(&xl, x), ArrayView::compact(&yl, y), agreement).ok_or_else(|| missing(stringify!($name), x.dtype()))?;
+                checked_binary(stringify!($name), result, ArrayView::compact(&yl, y), None$(.or(Some($negative)))?)
             },
             fold: |x, dims, tail| {
                 $(let $ct = Tolerance::DEFAULT;)?
@@ -502,7 +507,8 @@ reductions! {
 #[pyo3(signature = (x, axis=None))]
 fn minmax<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, axis: Option<Axes>) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
     let x = one(x)?;
-    let (view, layout) = (x.view(), x.layout());
+    let items = x.at(x.view().dtype())?;
+    let (view, layout) = (items.view(), x.layout());
     let ends = match axis { None => extremes(view), Some(_) => None };
     let [lo, hi] = match ends {
         Some(ends) => ends.map(|b| Core::new(Layout::EMPTY, b).expect("one item has a rank-0 layout")),
@@ -530,7 +536,8 @@ fn extremes(x: View<'_>) -> Option<[Buffer; 2]> {
 #[pyo3(signature = (x, table, axis=None, start=None))]
 fn logical_scan<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, table: [[bool; 2]; 2], axis: Option<Axis>, start: Option<bool>) -> PyResult<Bound<'py, PyAny>> {
     let call = convert(&[x])?;
-    let x = call.args[0].view();
+    let items = call.args[0].at(call.args[0].view().dtype())?;
+    let x = items.view();
     let View::Booleans(items) = x else { return Err(missing("logical_scan", x.dtype())) };
     let (along, layout) = along_axis(call.args[0].layout(), items.len(), axis)?;
     let mut out = Vec::with_capacity(items.len());
@@ -546,7 +553,8 @@ fn _accumulate<'py>(py: Python<'py>, function: &str, x: &Bound<'py, PyAny>, axis
     let start = call.args.get(1);
     if start.is_some_and(|s| !s.layout().shape().is_empty()) { return Err(PyValueError::new_err("start must be a scalar")); }
     let (dims, layout) = along_axis(x.layout(), x.view().len(), axis)?;
-    let result = (native_binary(function)?.scan)(x.view(), dims, start.map(|s| s.view()))?;
+    let (items, start) = (x.at(x.view().dtype())?, start.map(|s| s.at(s.view().dtype())).transpose()?);
+    let result = (native_binary(function)?.scan)(items.view(), dims, start.as_ref().map(|s| s.view()))?;
     give(py, Core::new(layout, result).map_err(py_err)?, false)
 }
 

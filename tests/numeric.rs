@@ -364,7 +364,8 @@ mod number_theory {
 }
 
 mod operation {
-    use rustymath::agreement::{Agreement, Mapping};
+    use rustymath::agreement::Agreement;
+    use rustymath::array::ArrayView;
     use rustymath::buffer::{Buffer, ComplexWidth, DType, FloatWidth, Width};
     use rustymath::layout::Layout;
     use rustymath::{kernels, reduce};
@@ -388,15 +389,16 @@ mod operation {
         assert!(ok && matches!(totals, Buffer::Integers(rustymath::buffer::IntBuf::I64(ref t)) if *t == [3, 7]));
         // An integer argument to `Exp` casts to `f64`, and broadcasting pairs a scalar with every item.
         let x = Buffer::Integers(rustymath::buffer::IntBuf::I64(vec![0, 1]));
-        let (r, _) = exp.unary(&rustymath::Exp, x.view(), &Mapping::Linear(1), 2).unwrap();
+        let (r, _) = exp.unary(&rustymath::Exp, ArrayView::compact(&Layout::from([2]), x.view())).unwrap();
         assert!(matches!(r, Buffer::Floats(rustymath::buffer::FloatBuf::F64(ref v)) if v[0] == 1.0 && (v[1] - std::f64::consts::E).abs() < 1e-15));
         let (two, row) = (Layout::from([1usize].as_slice()), Layout::from([3usize].as_slice()));
         let agreement = Agreement::new(&two, &row).unwrap();
-        let (s, ok) = kernels!(Binary rustymath::Add).binary(&rustymath::Add, Buffer::Booleans(vec![true]).view(), Buffer::Booleans(vec![true, false, true]).view(), &agreement).unwrap();
+        let (s, ok) = kernels!(Binary rustymath::Add).binary(&rustymath::Add, ArrayView::compact(&two, rustymath::buffer::View::Booleans(&[true])), ArrayView::compact(&row, rustymath::buffer::View::Booleans(&[true, false, true])), &agreement).unwrap();
         assert!(ok && matches!(s, Buffer::Integers(rustymath::buffer::IntBuf::I64(ref v)) if *v == [2, 1, 2]));
         // An integer result that doesn't fit fails.
         let big = Buffer::Integers(rustymath::buffer::IntBuf::I64(vec![i64::MAX]));
-        assert!(!kernels!(Binary rustymath::Add).binary(&rustymath::Add, big.view(), big.view(), &Agreement::new(&two, &two).unwrap()).unwrap().1);
+        let big = ArrayView::compact(&two, big.view());
+        assert!(!kernels!(Binary rustymath::Add).binary(&rustymath::Add, big, big, &Agreement::new(&two, &two).unwrap()).unwrap().1);
         let data = Buffer::Integers(rustymath::buffer::IntBuf::I16(vec![10, 2, 3]));
         let (scan, ok) = kernels!(LeftScan rustymath::Subtract).run(&rustymath::Subtract, data.view(), [1, 3, 1], None).unwrap();
         assert!(ok && matches!(scan, Buffer::Integers(rustymath::buffer::IntBuf::I16(ref v)) if *v == [10, 8, 5]));
@@ -410,6 +412,77 @@ mod operation {
         // A failed scalar step retains its actual value and the healthy lanes in the raw kernel result.
         let (fold, ok) = kernels!(RightFold rustymath::Pow).run(&rustymath::Pow, Buffer::Floats(rustymath::buffer::FloatBuf::F64(vec![-1., 1., 0.5, 2.])).view(), [1, 2, 2], None).unwrap();
         assert!(!ok && matches!(fold, Buffer::Floats(rustymath::buffer::FloatBuf::F64(ref v)) if v[0].is_nan() && v[1] == 1.));
+    }
+
+    #[test]
+    fn logical_views_compose_prepare_and_run() {
+        use rustymath::{agreement::Mapping, buffer::Element, gather::Steps};
+        let (shape, data) = (Layout::from([3, 2]), [0., 1., 2., 3., 4., 5.]);
+        let transpose = Mapping::Steps { base: 0, steps: vec![Steps::along(3, 1), Steps::along(2, 3)] };
+        let x = ArrayView::new(&shape, f64::view(&data), &transpose);
+        assert!(x.contiguous().is_none());
+        assert_eq!(x.items::<f64>().unwrap().as_ref(), &[0., 3., 1., 4., 2., 5.]);
+        assert_eq!(transpose.affine(shape.shape()), Some((0, vec![1, 3])));
+        let reversed = Mapping::Steps { base: 0, steps: vec![Steps::Stride { start: 4, len: 3, step: -2 }, Steps::along(2, 1)] };
+        let composed = transpose.compose(&reversed, shape.shape(), shape.shape()).unwrap();
+        assert_eq!(ArrayView::new(&shape, f64::view(&data), &composed).items::<f64>().unwrap().as_ref(), &[2., 5., 1., 4., 0., 3.]);
+        let compact = ArrayView::compact(&shape, f64::view(&data));
+        let (sum, ok) = kernels!(Binary rustymath::Add).binary(&rustymath::Add, x, compact, &Agreement::new(&shape, &shape).unwrap()).unwrap();
+        assert!(ok); assert_eq!(f64::of(sum.view()).unwrap(), &[0., 4., 3., 7., 6., 10.]);
+        let (one, two) = (Agreement::new(&shape, &Layout::EMPTY).unwrap(), Agreement::new(&shape, &Layout::EMPTY).unwrap());
+        let args = [x, ArrayView::compact(&Layout::EMPTY, f64::view(&[1.])), ArrayView::compact(&Layout::EMPTY, f64::view(&[4.]))];
+        let (clipped, ok) = kernels!(Ternary rustymath::Clip).ternary(&rustymath::Clip, args, &one, &two).unwrap();
+        assert!(ok); assert_eq!(f64::of(clipped.view()).unwrap(), &[1., 3., 1., 4., 2., 4.]);
+        // A nonseparable position map falls back to one compact preparation before broadcasting.
+        let row = Layout::from([3]);
+        let positions = Mapping::Positions(vec![5, 0, 3]);
+        let row_view = ArrayView::new(&row, f64::view(&data), &positions);
+        let (sum, _) = kernels!(Binary rustymath::Add).binary(&rustymath::Add, row_view, compact, &Agreement::new(&row, &shape).unwrap()).unwrap();
+        assert_eq!(f64::of(sum.view()).unwrap(), &[5., 6., 2., 3., 7., 8.]);
+        // Checked casts inspect only selected items; a compact subrange borrows its exact storage.
+        let sub = Mapping::Steps { base: 1, steps: vec![Steps::along(3, 1)] };
+        let selected = ArrayView::new(&row, f64::view(&[f64::NAN, 1., 2., 3., f64::INFINITY]), &sub);
+        assert_eq!(selected.items::<i16>().unwrap().as_ref(), &[1, 2, 3]);
+        assert_eq!(selected.contiguous().unwrap().as_ptr(), selected.storage().as_ptr().wrapping_add(8));
+        let strided = Mapping::Steps { base: 0, steps: vec![Steps::Stride { start: 4, len: 3, step: -2 }] };
+        assert_eq!(ArrayView::new(&row, f64::view(&[1., f64::NAN, 2., f64::INFINITY, 3.]), &strided).items::<i16>().unwrap().as_ref(), &[3, 2, 1]);
+        let prefix = Layout::from([2]);
+        let prefix = ArrayView::new(&prefix, f64::view(&[1., f64::NAN, 2., f64::INFINITY, 3.]), &strided);
+        assert_eq!(prefix.items::<f64>().unwrap().as_ref(), &[3., 2.]);
+        assert_eq!(prefix.items::<i16>().unwrap().as_ref(), &[3, 2]);
+        let empty = Layout::from([0, 3]);
+        assert!(ArrayView::new(&empty, f64::view(&data), &transpose).items::<f64>().unwrap().is_empty());
+        assert!(Mapping::Linear(2).affine(&[3]).is_none());
+        let table = |items| Mapping::Steps { base: 2, steps: vec![Steps::Table(items)] };
+        assert_eq!(table(vec![Some(3)]).affine(&[1]), Some((5, vec![0])));
+        assert_eq!(table(vec![Some(3), None]).affine(&[0]), Some((0, vec![0])));
+        assert!(table(vec![Some(3), None]).affine(&[2]).is_none() && table(vec![None]).affine(&[1]).is_none());
+    }
+
+    #[test]
+    fn owned_views_share_detach_and_release_their_base() {
+        use rustymath::{array::Array, buffer::Element, structure::{self, Selector}};
+        let mut base = Array::new([2, 3].into(), i64::buffer((0..6).collect())).unwrap();
+        let transposed = base.selected(&structure::transpose(base.layout(), &[1, 0]).unwrap()).unwrap();
+        assert_eq!(base.view().storage().as_ptr(), transposed.view().storage().as_ptr());
+        assert_eq!(transposed.view().items::<i64>().unwrap().as_ref(), &[0, 3, 1, 4, 2, 5]);
+        let reshaped = base.reshape([6].into()).unwrap();
+        assert_eq!(base.view().storage().as_ptr(), reshaped.view().storage().as_ptr());
+        let mut tail = reshaped.selected(&structure::select_axis(reshaped.layout(), 0, Selector::Range { start: 2, len: 3, step: 1 }).unwrap()).unwrap();
+        assert_eq!(tail.view().storage().len(), 6);
+        let compact = tail.compact();
+        assert_eq!(compact.view().storage().len(), 3);
+        assert_eq!(compact.view().items::<i64>().unwrap().as_ref(), &[2, 3, 4]);
+        let (_, moved) = tail.clone().into_compact();
+        assert_eq!(moved.len(), 3);
+        i64::of_mut(base.make_mut()).unwrap()[2] = 20;
+        assert_eq!(tail.view().items::<i64>().unwrap().as_ref(), &[2, 3, 4]);
+        let scalar = Array::new(Layout::EMPTY, i64::buffer(vec![99])).unwrap();
+        tail.assign(&structure::select_axis(tail.layout(), 0, Selector::At(1)).unwrap(), &scalar).unwrap();
+        assert_eq!(tail.view().items::<i64>().unwrap().as_ref(), &[2, 99, 4]);
+        assert_eq!(reshaped.view().items::<i64>().unwrap().as_ref(), &[0, 1, 2, 3, 4, 5]);
+        assert_eq!(Array::differences(transposed.view(), 1).unwrap().view().items::<i64>().unwrap().as_ref(), &[3, 3, 3]);
+        assert_eq!(transposed.reshape([6].into()).unwrap().view().items::<i64>().unwrap().as_ref(), &[0, 3, 1, 4, 2, 5]);
     }
 }
 

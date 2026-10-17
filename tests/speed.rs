@@ -327,20 +327,20 @@ fn orderings(units: &Units<f64, f32>) -> [Costed; 6] {
 
 /// Allocated array results at the demonstrated dtypes. Differences and widening count copies of `N` input items; broadcasting counts `N` output items.
 fn arrays(unit: &Unit<f32>) -> [(&'static str, &'static str, f64); 4] {
-    use array::Array;
+    use array::{Array, ArrayView};
     use buffer::{Buffer, DType, Floats, Ints, View, Width};
     use layout::Layout;
     let x: Vec<f32> = (0..RUNS * N).map(|i| i as f32).collect();
     let integers: Vec<i32> = (0..RUNS * N).map(|i| i as i32).collect();
     let differences = |layout: &Layout, axis| unit.beside(|| fastest(N, |r| {
-        black_box(Array::differences(layout, View::Floats(Floats::F32(black_box(set(&x, r)))), axis).unwrap());
+        black_box(Array::differences(ArrayView::compact(layout, View::Floats(Floats::F32(black_box(set(&x, r))))), axis).unwrap());
     })).1;
     let source = Layout::from([N / 64]);
     [
         ("f32", "Array::differences short lanes", differences(&Layout::from([N / 2, 2]), 1)),
         ("f32", "Array::differences", differences(&Layout::from([N]), 0)),
         ("f32", "Array::broadcasted", unit.beside(|| fastest(N, |r| {
-            black_box(Array::broadcasted(&source, View::Floats(Floats::F32(black_box(&set(&x, r)[..N / 64]))), &[N / 64, 64]).unwrap());
+            black_box(Array::broadcasted(ArrayView::compact(&source, View::Floats(Floats::F32(black_box(&set(&x, r)[..N / 64])))), &[N / 64, 64]).unwrap());
         })).1),
         ("i64", "Buffer::cast i32", Unit::new(1i64).beside(|| fastest(N, |r| {
             black_box(Buffer::cast(View::Integers(Ints::I32(black_box(set(&integers, r)))), DType::Integer(Width::I64)).unwrap());

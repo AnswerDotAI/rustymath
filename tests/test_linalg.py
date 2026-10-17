@@ -203,6 +203,11 @@ def test_matrix_layouts(threads):
     assert A(counts).dtype == np.int64 and np.array_equal(counts, np.sum(x[..., None] == y[None, None], axis=-2))
     spd = a @ a.swapaxes(-1, -2) + np.eye(8)
     assert np.allclose(rm.linalg.slogdet(spd)[1], np.linalg.slogdet(spd).logabsdet)
+    for dtype in ('f32', 'f64'):
+        m = rm.array(b, dtype=dtype)
+        for view in (m.T, m[::-1], m[:, ::2]):
+            dense = view.compact()
+            assert np.allclose(view.T @ view, dense.T @ dense, rtol=1e-5, atol=1e-6)
 
 def test_matrix_failures(threads):
     a = np.broadcast_to(np.eye(3), (2, 64, 3, 3)).copy()

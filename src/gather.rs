@@ -233,20 +233,28 @@ impl Steps {
         }
         Some(offset)
     }
-    /// The offset of the first of items `start..start + n` of what `steps` reach from `base`, where those items are consecutive in the source within one forward run of the innermost entry, so that a reader can take them in place.
+    /// The first source offset and stride of items `start..start + n`, where they form one regular run. Singleton axes disappear and neighbouring strides can form one run. Clipped and rotated reads must stay within their valid, unwrapped part.
     #[inline]
-    pub fn run(base: usize, steps: &[Self], start: usize, n: usize) -> Option<usize> {
-        let (last, outer) = steps.split_last()?;
-        let len = last.len();
-        if len == 0 || start % len + n > len { return None; }
-        let (q, i) = (start / len, start % len);
-        let inner = match *last {
-            Self::Stride { start: s, step: 1, .. } => s + i,
-            Self::Clipped { start: s, size, stride: 1, .. } if s + i as i128 >= 0 && s + (i + n) as i128 <= size as i128 => (s + i as i128) as usize,
-            Self::Rotated { shift, len, stride: 1 } if (shift + i) % len + n <= len => (shift + i) % len,
-            _ => return None,
-        };
-        Self::reach(base + inner, outer, q)
+    pub fn run(base: usize, steps: &[Self], start: usize, n: usize) -> Option<(usize, isize)> {
+        if n == 0 { return None; }
+        let (mut width, mut stride) = (1usize, None);
+        for axis in steps.iter().rev() {
+            let len = axis.len();
+            if len == 0 { return None; }
+            if len == 1 { axis.get(0)?; continue; }
+            let (i, end) = ((start / width) % len, ((start + n - 1) / width) % len);
+            let fits = start % (width * len) + n <= width * len;
+            let step = match *axis {
+                Self::Stride { step, .. } => step,
+                Self::Clipped { start: s, size, stride, .. } if fits && s + i as i128 >= 0 && s + (end + 1) as i128 <= size as i128 => stride as isize,
+                Self::Rotated { shift, stride, .. } if fits && (shift + i) % len + end - i < len => stride as isize,
+                _ => return None,
+            };
+            if let Some(s) = stride { if step != s * width as isize { return None; } } else { stride = Some(step); }
+            width *= len;
+            if fits { return Some((Self::reach(base, steps, start)?, stride.unwrap())); }
+        }
+        (n == 1).then(|| (Self::reach(base, steps, start).expect("singleton run has no fill"), 1))
     }
     /// Whether this entry repeats an offset or gives a fill. Applying an element-wise function to the items it reads, in place of reading the function's results, would then compute an item more than once, or apply the function to a fill.
     pub fn spreads(&self) -> bool {
@@ -354,11 +362,13 @@ pub trait Convert<S: Copy, D> {
     fn reversed(&self, d: &mut Vec<D>, s: &[S]) { d.extend(s.iter().rev().map(|&x| self.one(x))) }
 }
 impl<S: Copy, D, F: Fn(S) -> D> Convert<S, D> for F {
+    #[inline]
     fn one(&self, x: S) -> D { self(x) }
 }
 /// A [`Convert`] for a source and result of one type, which copies whole slices with no conversion of each item, so that the copies vectorize.
 pub struct Same;
 impl<T: Copy> Convert<T, T> for Same {
+    #[inline]
     fn one(&self, x: T) -> T { x }
     fn slice(&self, d: &mut Vec<T>, s: &[T]) { d.extend_from_slice(s) }
     fn reversed(&self, d: &mut Vec<T>, s: &[T]) { d.extend(s.iter().rev().copied()) }
@@ -373,7 +383,10 @@ pub fn walk<S: Copy, D: Clone>(out: &mut Vec<D>, s: &[S], base: usize, steps: &[
 
 /// Items `from..from + n` of what [`walk`] gives for the same arguments, appended to `out`. Whole runs of the innermost axis copy as `walk` copies them, so a range in the middle of a long axis costs no more per item than the whole walk.
 pub fn walk_range<S: Copy, D: Clone>(out: &mut Vec<D>, s: &[S], base: usize, steps: &[Steps], fill: S, from: usize, n: usize, conv: impl Convert<S, D>) {
-    range_into(out, s, &conv, fill, base, steps, from, n)
+    if let Some((start, step)) = Steps::run(base, steps, from, n) {
+        let run = Steps::Stride { start, len: n, step };
+        walk_into(out, s, &conv, fill, 0, &[Cow::Borrowed(&run)]);
+    } else { range_into(out, s, &conv, fill, base, steps, from, n) }
 }
 
 /// `walk_range` over `steps`: a partial row at each end recurses into the next axis, and the whole rows between them walk as one box.
@@ -453,7 +466,20 @@ fn walk_into<S: Copy, D: Clone, C: Convert<S, D>>(d: &mut Vec<D>, s: &[S], conv:
         Steps::Stride { start, len, step: 1 } => conv.slice(d, &s[start..start + len]),
         Steps::Stride { start, len, step: -1 } => conv.reversed(d, &s[start + 1 - len..=start]),
         Steps::Stride { start, len, step: 0 } => d.extend(std::iter::repeat_n(conv.one(s[start]), len)),
-        Steps::Stride { start, len, step } if step > 0 => { let (s, step) = (&s[start..], step as usize); d.extend((0..len).map(move |j| conv.one(s[j * step]))) }
+        Steps::Stride { start, len, step } => {
+            let end = start.checked_add_signed(step.checked_mul((len - 1) as isize).expect("stride fits")).expect("run stays in the source");
+            assert!(start < s.len() && end < s.len(), "run stays in the source");
+            crate::slice::appended(d, len, |slots| {
+                let item = std::convert::identity(#[inline(always)] |i: usize, slot: &mut MaybeUninit<D>| {
+                    // SAFETY: both endpoints were checked; every i is within the run.
+                    slot.write(conv.one(unsafe { *s.get_unchecked(start.wrapping_add_signed(step * i as isize)) }));
+                });
+                // Fixed blocks expose independent strided loads to SLP.
+                let (blocks, tail) = slots.as_chunks_mut::<4>();
+                for (i, block) in blocks.iter_mut().enumerate() { for (j, slot) in block.iter_mut().enumerate() { item(i * 4 + j, slot); } }
+                for (j, slot) in tail.iter_mut().enumerate() { item(blocks.len() * 4 + j, slot); }
+            });
+        }
         Steps::Rotated { shift, len, stride: 1 } => {
             conv.slice(d, &s[shift..len]);
             conv.slice(d, &s[..shift]);

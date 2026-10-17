@@ -239,6 +239,13 @@ def test_elementwise_layouts(threads):
     # Arguments pair their leading axes, so a vector pairs with the rows of a matrix.
     m = x[:6].reshape(2, 3)
     assert np.allclose(rm.add(m, [10, 20]), m + np.array([[10], [20]]))
+    for dtype in ('f32', 'f64'):
+        a = rm.array(m, dtype=dtype)
+        for view in (a.T, a[::-1], a[:, ::2]):
+            dense = view.compact()
+            for f in (rm.exp, rm.sum, rm.cumsum, rm.mean, rm.sort): assert np.allclose(f(view), f(dense))
+            assert np.allclose(view + view, dense + dense) and np.allclose(rm.clip(view, 0.2, 0.8), rm.clip(dense, 0.2, 0.8))
+            assert np.array_equal(rm.where(view > 0.5, view, -view), rm.where(dense > 0.5, dense, -dense))
 
 def test_parallel_errors(threads):
     x = np.ones(262_147)

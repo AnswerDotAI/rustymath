@@ -7,7 +7,7 @@ use crate::{
 use std::ops::Range;
 
 /// How one argument's items lay out over a result: the argument's offset for each result position.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Mapping {
     /// One item, which every position reads.
     Single,
@@ -22,12 +22,58 @@ pub enum Mapping {
 }
 
 impl Mapping {
+    /// This mapping as one entry per axis of `shape`, or `None` where offsets aren't axis-separable.
+    pub fn entries(&self, shape: &[usize]) -> Option<(usize, Vec<Steps>)> {
+        if shape.contains(&0) { return Some((0, shape.iter().map(|&n| Steps::along(n, 0)).collect())); }
+        if let Self::Steps { base, steps } = self {
+            let (offset, steps) = Steps::per_axis(steps, shape)?;
+            return Some((base + offset, steps));
+        }
+        if matches!(self, Self::Positions(_)) { return None; }
+        if let Self::Linear(period) | Self::Tiled(period) = *self {
+            let n: usize = shape.iter().product();
+            if period < n && period != 1 && !shape.iter().rev().scan(1, |p, &n| { *p *= n; Some(*p) }).any(|p| p == period) { return None; }
+        }
+        let base = self.get(0)?;
+        let steps = shape.iter().zip(strides(shape)).map(|(&len, stride)| {
+            Some(Steps::Stride { start: 0, len, step: if len > 1 { self.get(stride)? as isize - base as isize } else { 0 } })
+        }).collect::<Option<_>>()?;
+        Some((base, steps))
+    }
+    /// Reads of a logical array of `shape` through `outer`, then through this mapping to its storage.
+    pub fn through(&self, outer: &[Steps], shape: &[usize]) -> Option<Self> {
+        if outer.iter().any(|s| s.len() == 0) { return Some(Self::Linear(1)); }
+        if matches!(self, Self::Linear(1)) { return Some(Self::Steps { base: 0, steps: outer.to_vec() }); }
+        let (base, inner) = self.entries(shape)?;
+        let (base, steps) = Steps::through(outer, shape, base, &inner)?;
+        Some(Self::Steps { base, steps })
+    }
+    /// `outer` maps `frame` to a logical array of `shape`; this maps that array to storage. Unsupported compositions return `None`.
+    pub fn compose(&self, outer: &Self, shape: &[usize], frame: &[usize]) -> Option<Self> {
+        if frame.contains(&0) { return Some(Self::Linear(1)); }
+        if matches!(self, Self::Linear(1)) { return Some(outer.clone()); }
+        if matches!(outer, Self::Linear(1)) { return Some(self.clone()); }
+        let (base, steps) = outer.entries(frame)?;
+        if base != 0 { return None; }
+        self.through(&steps, shape)
+    }
+    /// First item offset and signed item strides, where the mapping is affine over `shape`.
+    pub fn affine(&self, shape: &[usize]) -> Option<(usize, Vec<isize>)> {
+        // Reject non-affine entries before `per_axis` clones their tables. Singleton offsets and empty shapes remain affine.
+        if !shape.contains(&0) && let Self::Steps { steps, .. } = self
+            && steps.iter().any(|s| s.len() > 1 && !matches!(s, Steps::Stride { .. })) { return None; }
+        let (mut base, steps) = self.entries(shape)?;
+        let strides = steps.iter().map(|s| match *s {
+            Steps::Stride { start, step, .. } => { base += start; Some(step) }, _ => None,
+        }).collect::<Option<_>>()?;
+        Some((base, strides))
+    }
     /// The offset for position `i`. Panics where the mapping gives a fill.
     #[inline]
     pub fn index(&self, i: usize) -> usize { self.get(i).expect("positional mapping") }
-    /// The offset of the first of items `start..start + n` where they read consecutive items, within one forward run of a `Steps` mapping's innermost entry, so that a reader can take them in place.
+    /// The first offset and stride of items `start..start + n`, where a `Steps` mapping reads one regular run.
     #[inline]
-    pub fn run(&self, start: usize, n: usize) -> Option<usize> {
+    pub fn run(&self, start: usize, n: usize) -> Option<(usize, isize)> {
         let Self::Steps { base, steps } = self else { return None };
         Steps::run(*base, steps, start, n)
     }
@@ -277,10 +323,8 @@ pub fn map2<A: Element, X: Source<A>, Y: Source<A>, B: Copy + Send, L>(x: &[X], 
 /// Items `start..start + n` of the frame that `mapping` lays `data` over, read as `A`. A mapping that doesn't read `data` in order expands into `spread`, and items of another type convert into `buf`.
 #[inline]
 pub fn read_mapped<'a, A: Element, X: Source<A>>(mapping: &Mapping, data: &'a [X], start: usize, n: usize, spread: &'a mut Vec<X>, buf: &'a mut Vec<A>) -> Arg<'a, A> {
-    match expanded(mapping, data, start, n, spread) {
-        Arg::Many(s) => match X::borrowed(s) { Some(s) => Arg::Many(s), None => Arg::Many(s).converted(0, n, buf, X::read) },
-        one => one.converted(0, n, buf, X::read),
-    }
+    if let Some(data) = X::borrowed(data) { return expanded(mapping, data, start, n, buf); }
+    expanded(mapping, data, start, n, spread).converted(0, n, buf, X::read)
 }
 
 /// Items `start..start + n` of an argument that `mapping` lays out over the frame. A single item, a contiguous run, and items within one repeat or one cycle need no copy. Others copy into `buf`. A repeated item finds its source by a strength-reduced division, which multiplies in place of dividing. A cycled argument writes one period, then copies what it has written until `buf` is full. A `Steps` mapping reads a forward run in place through `run`, and copies anything else through `walk_range`.
@@ -289,7 +333,7 @@ pub fn expanded<'a, A: Element>(mapping: &Mapping, data: &'a [A], start: usize, 
         Mapping::Single => return Arg::One(data[0]), Mapping::Linear(1) => return Arg::Many(&data[start..start + n]),
         Mapping::Linear(r) if n <= r - start % r => return Arg::One(data[start / r]),
         Mapping::Steps { base, ref steps } => {
-            if let Some(o) = mapping.run(start, n) { return Arg::Many(&data[o..o + n]); }
+            if let Some((o, 1)) = mapping.run(start, n) { return Arg::Many(&data[o..o + n]); }
             buf.clear();
             walk_range(buf, data, base, steps, A::FILL, start, n, Same);
             return Arg::Many(&buf[..n]);

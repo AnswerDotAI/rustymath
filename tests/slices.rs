@@ -835,6 +835,8 @@ mod gather {
         let s: Vec<i64> = (0..600).collect();
         let cases = [
             (0, vec![along(3, 20), along(20, 1)]),
+            (2, vec![along(11, 3)]),
+            (2, vec![Steps::Stride { start: 30, len: 11, step: -3 }]),
             (0, vec![along(3, 20), Steps::Stride { start: 19, len: 20, step: -1 }]),
             (0, vec![along(2, 50), Steps::Rotated { shift: 7, len: 30, stride: 1 }]),
             (0, vec![along(2, 50), Steps::Clipped { start: -3, len: 40, size: 30, stride: 1 }]),
@@ -852,7 +854,16 @@ mod gather {
                 assert_eq!(part, whole[from..from + n]);
             }
         }
-        assert_eq!((Steps::run(0, &cases[0].1, 3, 5), Steps::run(0, &cases[0].1, 18, 5)), (Some(3), None));
+        assert_eq!((Steps::run(0, &cases[0].1, 3, 5), Steps::run(0, &cases[0].1, 18, 5)), (Some((3, 1)), Some((18, 1))));
+        assert_eq!(Steps::run(0, &[along(30, 2), along(1, 0)], 3, 20), Some((6, 2)));
+        for (base, steps) in &cases {
+            let len: usize = steps.iter().map(Steps::len).product();
+            for from in 0..len.min(20) { for n in 1..=(len - from).min(20) {
+                if let Some((first, step)) = Steps::run(*base, steps, from, n) {
+                    for i in 0..n { assert_eq!(Steps::reach(*base, steps, from + i), first.checked_add_signed(step * i as isize)); }
+                }
+            } }
+        }
     }
     /// A composed walk reads what walking one walk and then the other reads. `spreads` and `rereads` find walks that read an item more than once or read a fill.
     #[test]

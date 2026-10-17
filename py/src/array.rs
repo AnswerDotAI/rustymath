@@ -4,27 +4,27 @@ use pyo3::exceptions::PyTypeError;
 use pyo3::types::{PyComplex, PyTuple};
 use pyo3::{IntoPyObjectExt, ffi, prelude::*};
 use pyo3::pyclass::CompareOp;
-use rustymath::array::Array as Core;
-use rustymath::buffer::{Buffer, DType, Element, FloatWidth, View};
-use rustymath_buffer::{export, geometry, item, name, nested, py_err};
+use rustymath::array::{Array as Core, ArrayView};
+use rustymath::buffer::{Buffer, Element, FloatWidth, Items, View};
+use rustymath_buffer::{export, item, name, nested, py_err};
 use std::ffi::c_int;
 use std::sync::Arc;
 
-/// An array of one dtype, with a shape, and optional keys and names for its axes. NumPy and other readers of the buffer protocol can view and write its items without a copy.
+/// An array of one dtype, with a shape, and optional keys and names for its axes. Buffer readers receive read-only snapshots of its items.
 #[pyclass(name = "Array", module = "rustymath")]
-pub struct Array { core: Core, shape: Box<[isize]>, strides: Box<[isize]> }
+pub struct Array { core: Core }
+
+/// Keeps one export's exact allocation and geometry alive across assignment to its Python owner.
+struct Export { core: Core, shape: Box<[isize]>, strides: Box<[isize]> }
 
 impl Array {
-    pub fn new(core: Core) -> Self {
-        let (shape, strides) = geometry(core.dtype(), core.layout().shape());
-        Self { core, shape, strides }
-    }
+    pub fn new(core: Core) -> Self { Self { core } }
     pub fn core(&self) -> &Core { &self.core }
 }
 
 /// `core` as a Python object: with `scalar`, a rank-0 result is a Python number, and anything else is a `rustymath.Array`. A function passes `scalar` where every argument was a Python scalar, and where its result covers the whole of its arguments, as a reduction of a whole array or one decoded vector of digits does.
 pub fn give(py: Python<'_>, core: Core, scalar: bool) -> PyResult<Bound<'_, PyAny>> {
-    if scalar && core.layout().shape().is_empty() { item(py, core.view(), 0) } else { Ok(Bound::new(py, Array::new(core))?.into_any()) }
+    if scalar && core.layout().shape().is_empty() { item(py, core.view().contiguous().expect("one owned item is contiguous"), 0) } else { Ok(Bound::new(py, Array::new(core))?.into_any()) }
 }
 
 /// `items` as a rustymath array of `shape`, with no keys or names.
@@ -39,11 +39,12 @@ fn operand<'py>(py: Python<'py>, result: PyResult<Bound<'py, PyAny>>) -> PyResul
 }
 
 /// Item `i` rounded for display, without changing the stored value or scalar conversions.
-fn shown<'py>(py: Python<'py>, view: View<'_>, i: usize) -> PyResult<Bound<'py, PyAny>> {
-    match view {
+fn shown<'py>(py: Python<'py>, view: ArrayView<'_>, i: usize) -> PyResult<Bound<'py, PyAny>> {
+    let i = view.mapping().get(i).expect("owned views have no fills");
+    match view.storage() {
         View::Floats(v) => display_float(v.get(i), v.tag()).into_bound_py_any(py),
         View::Complexes(v) => { let (z, w) = (v.get(i), v.tag().into()); Ok(PyComplex::from_doubles(py, display_float(z.re, w), display_float(z.im, w)).into_any()) }
-        _ => item(py, view, i),
+        view => item(py, view, i),
     }
 }
 
@@ -119,31 +120,30 @@ array_methods! { folds [sum, prod, max, min, all, any, mean] scans [cumsum, cump
     #[getter]
     fn shape<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> { PyTuple::new(py, self.core.layout().shape()) }
     #[getter]
-    fn ndim(&self) -> usize { self.shape.len() }
+    fn ndim(&self) -> usize { self.core.layout().shape().len() }
     #[getter]
     fn size(&self) -> usize { self.core.len() }
     /// For each axis, `None`, or the name of each position, which is `None` where a position has no name.
     #[getter]
     fn keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
         let layout = self.core.layout();
-        let axes = (0..self.shape.len()).map(|a| layout.keys(a).map(|k| PyTuple::new(py, k.names().iter().map(|n| n.as_deref()))).transpose()).collect::<PyResult<Vec<_>>>()?;
+        let axes = (0..self.ndim()).map(|a| layout.keys(a).map(|k| PyTuple::new(py, k.names().iter().map(|n| n.as_deref()))).transpose()).collect::<PyResult<Vec<_>>>()?;
         PyTuple::new(py, axes)
     }
     /// For each axis, its name or `None`. Assign one name or `None` for each axis to rename the axes, or `()` to remove every name.
     #[getter]
-    fn names<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> { PyTuple::new(py, (0..self.shape.len()).map(|a| self.core.layout().name(a).map(|n| &**n))) }
+    fn names<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> { PyTuple::new(py, (0..self.ndim()).map(|a| self.core.layout().name(a).map(|n| &**n))) }
     #[setter]
     fn set_names(&mut self, names: Vec<Option<String>>) -> PyResult<()> { self.core.set_names(names.into_iter().map(|n| n.map(Arc::from)).collect()).map_err(py_err) }
     fn __len__(&self) -> PyResult<usize> {
         self.core.layout().shape().first().copied().ok_or_else(|| PyTypeError::new_err("a rank-0 array has no length"))
     }
-    /// Independent axis selection by integers, keys, slices, masks or index arrays. `None` inserts an axis and `...` keeps omitted axes. The result is a compact copy, or a Python scalar when no axes remain.
+    /// Independent axis selection by integers, keys, slices, masks or index arrays. `None` inserts an axis and `...` keeps omitted axes. Basic slices share storage, with independent value semantics. No remaining axes gives a Python scalar.
     fn __getitem__<'py>(&self, py: Python<'py>, key: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let plan = crate::structure::selection(self.core.layout(), key)?;
-        if plan.layout.shape().is_empty() { return item(py, self.core.view(), rustymath::gather::Steps::reach(0, &plan.steps, 0).expect("selection has no fills")); }
-        give(py, self.core.gather(&plan).map_err(py_err)?, false)
+        give(py, self.core.selected(&plan).map_err(py_err)?, true)
     }
-    /// Writes through the same independent selection as indexing, broadcasting from the front. Repeated targets take the last assigned item. The allocation and shape don't change.
+    /// Writes through the same independent selection as indexing, broadcasting from the front. Repeated targets take the last assigned item. Other arrays and existing buffer exports keep their values.
     fn __setitem__(slf: &Bound<'_, Self>, key: &Bound<'_, PyAny>, value: &Bound<'_, PyAny>) -> PyResult<()> {
         let plan = crate::structure::selection(slf.try_borrow()?.core.layout(), key)?;
         // Finish reading/copying first: `value` can be this array, or a buffer that views its items.
@@ -151,21 +151,26 @@ array_methods! { folds [sum, prod, max, min, all, any, mean] scans [cumsum, cump
         slf.try_borrow_mut()?.core.assign(&plan, &source).map_err(py_err)
     }
     /// The items as nested lists of Python scalars, or one Python scalar for a rank-0 array.
-    fn tolist<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> { rustymath_buffer::tolist(py, self.core.view(), self.core.layout().shape()) }
+    fn tolist<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let view = self.core.view();
+        nested(py, view.layout().shape(), &|i| item(py, view.storage(), view.mapping().get(i).expect("owned views have no fills")))
+    }
     /// A copy at `dtype`, a name such as `"f64"`, keeping keys and names. Items convert as `Buffer::cast` converts them: floats to integers truncate toward zero, a value that doesn't fit raises `OverflowError`, and a complex number with an imaginary part, or any conversion to or from characters, raises `ValueError`.
     fn astype(&self, dtype: &str) -> PyResult<Array> {
         let to = crate::convert::dtype(dtype)?;
-        let buffer = Buffer::cast(self.core.view(), to).map_err(py_err)?;
+        let buffer = match self.core.view().cast(to).map_err(py_err)? { Items::Borrowed(v) => Buffer::copied(v, 0..v.len()), Items::Owned(b) => b };
         Ok(Array::new(Core::new(self.core.layout().clone(), buffer).map_err(py_err)?))
     }
-    /// A copy under a new shape, given as integers or as one sequence. One length can be -1, which takes the length that fits the items. Keys and names don't carry over.
+    /// Compact items without retaining a larger base allocation. Small views otherwise keep their whole base alive. Keys and names are preserved.
+    fn compact(&self) -> Array { Array::new(self.core.compact()) }
+    /// A new shape, given as integers or as one sequence. Compact inputs share storage with independent value semantics; other layouts copy. One length can be -1. Keys and names don't carry over.
     #[pyo3(signature = (*shape))]
     fn reshape(&self, shape: &Bound<'_, PyTuple>) -> PyResult<Array> {
         let lengths: Vec<isize> = match shape.len() {
             1 if shape.get_item(0)?.extract::<isize>().is_err() => shape.get_item(0)?.extract()?,
             _ => shape.extract()?,
         };
-        crate::structure::reshaped(self.core.view(), &lengths)
+        crate::structure::reshaped(&self.core, &lengths)
     }
     fn __matmul__<'py>(slf: &Bound<'py, Self>, y: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(slf.py(), crate::linalg::matmul(slf.py(), slf, y)) }
     fn __rmatmul__<'py>(slf: &Bound<'py, Self>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(slf.py(), crate::linalg::matmul(slf.py(), x, slf)) }
@@ -200,12 +205,22 @@ array_methods! { folds [sum, prod, max, min, all, any, mean] scans [cumsum, cump
     }
     unsafe fn __getbuffer__(slf: Bound<'_, Self>, view: *mut ffi::Py_buffer, flags: c_int) -> PyResult<()> {
         let owner = slf.clone().into_any();
-        let mut this = slf.borrow_mut();
-        let (dtype, len, data) = (this.core.dtype(), this.core.len(), this.core.as_mut_ptr());
-        // A NumPy view of another dtype could write a byte other than 0 or 1 into a `bool`, or a surrogate into a `char`, so those two export read-only.
-        let readonly = matches!(dtype, DType::Boolean | DType::Character);
-        // SAFETY: the object owns its items, shape and strides, and keeps them while `owner`, which the export holds, lives.
-        unsafe { export(view, flags, &owner, dtype, data, len, &this.shape, &this.strides, readonly) }
+        let mut core = slf.borrow().core.clone();
+        let affine = |core: &Core| core.view().mapping().affine(core.layout().shape());
+        let (offset, strides) = affine(&core).unwrap_or_else(|| { core = core.compact(); affine(&core).expect("compact storage is affine") });
+        let size = core.dtype().bytes();
+        let shape = core.layout().shape().iter().map(|&n| n as isize).collect();
+        let strides = strides.into_iter().map(|s| s * size as isize).collect();
+        let data = unsafe { core.view().storage().as_ptr().add(offset * size) }.cast_mut();
+        let pin = Box::new(Export { core, shape, strides });
+        // SAFETY: the pin owns the allocation and geometry until __releasebuffer__, independently of the mutable Python owner.
+        unsafe { export(view, flags, &owner, pin.core.dtype(), data, pin.core.len(), &pin.shape, &pin.strides, true)?; }
+        unsafe { (*view).internal = Box::into_raw(pin).cast(); }
+        Ok(())
+    }
+    unsafe fn __releasebuffer__(_slf: Bound<'_, Self>, view: *mut ffi::Py_buffer) {
+        // SAFETY: __getbuffer__ publishes exactly one pin for each successful export.
+        unsafe { drop(Box::from_raw((*view).internal.cast::<Export>())); (*view).internal = std::ptr::null_mut(); }
     }
 } }
 
