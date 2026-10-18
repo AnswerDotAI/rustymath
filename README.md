@@ -29,7 +29,7 @@ Functions take Python numbers, nested lists, rustymath arrays or buffer exporter
 rm.add([[1, 2, 3], [4, 5, 6]], [10, 20])
 ```
 
-    Array([[11, 12, 13], [24, 25, 26]], dtype=i64)
+    Array([[11, 12, 13], [24, 25, 26]], dtype=int64)
 
 [Arrays and indexing](https://answerdotai.github.io/rustymath/arrays.html) covers construction, dtypes, selection, reshaping, axis names, keys and interoperability.
 
@@ -41,7 +41,7 @@ Real and complex functions operate on whole arrays. Float comparisons use a rela
 rm.exp([0., 1, 2]), rm.equal(0.1 + 0.2, 0.3)
 ```
 
-    (Array([1.0, 2.7182818, 7.3890561], dtype=f64), True)
+    (Array([1.0, 2.7182818, 7.3890561], dtype=float64), True)
 
 [Maths and statistics](https://answerdotai.github.io/rustymath/math.html) covers elementary and special functions, reductions, scans, statistics and tolerant comparison.
 
@@ -53,7 +53,7 @@ rm.exp([0., 1, 2]), rm.equal(0.1 + 0.2, 0.3)
 rm.unique([3, 1, 3, 2])
 ```
 
-    Unique(values=Array([3, 1, 2], dtype=i64), firsts=Array([0, 1, 3], dtype=i64), numbers=Array([0, 1, 0, 2], dtype=i64), counts=Array([2, 1, 1], dtype=i64))
+    Unique(values=Array([3, 1, 2], dtype=int64), firsts=Array([0, 1, 3], dtype=int64), numbers=Array([0, 1, 0, 2], dtype=int64), counts=Array([2, 1, 1], dtype=int64))
 
 [Searching, sorting and selection](https://answerdotai.github.io/rustymath/search.html) distinguishes tolerant matching from exact ordering.
 
@@ -66,8 +66,8 @@ normal = rm.distribution.normal()
 normal.cdf([-1.96, 0, 1.96]), normal.sample(3, seed=0)
 ```
 
-    (Array([0.024997895, 0.5, 0.9750021], dtype=f64),
-     Array([0.11623959, -0.78285485, -2.3346353], dtype=f64))
+    (Array([0.024997895, 0.5, 0.9750021], dtype=float64),
+     Array([0.11623959, -0.78285485, -2.3346353], dtype=float64))
 
 [Random numbers and distributions](https://answerdotai.github.io/rustymath/random.html) covers sampling and probability functions.
 
@@ -79,7 +79,7 @@ Solve real or complex systems, including least-norm solutions for singular or no
 rm.linalg.solve([[4., 1], [1, 3]], [1., 2])
 ```
 
-    Array([0.090909091, 0.63636364], dtype=f64)
+    Array([0.090909091, 0.63636364], dtype=float64)
 
 [Linear algebra](https://answerdotai.github.io/rustymath/linalg.html) covers matrix products, reusable factorizations, decompositions and least squares.
 
@@ -103,7 +103,7 @@ Polynomial coefficients start from the constant term. Number-theory functions ac
 rm.polynomial.polyroots([-6, 11, -6, 1]), rm.number_theory.factor(2**64 + 1)
 ```
 
-    (Array([(1+0j), (2-0j), (3+0j)], dtype=c128),
+    (Array([(1+0j), (2-0j), (3+0j)], dtype=complex128),
      [(274177, 1), (67280421310721, 1)])
 
 [Polynomials, exact arithmetic and number theory](https://answerdotai.github.io/rustymath/exact.html) includes rational matrix solves and calculations with [`fractions.Fraction`](https://docs.python.org/3/library/fractions.html#fractions.Fraction).
