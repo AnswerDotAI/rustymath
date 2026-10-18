@@ -1,34 +1,34 @@
-# The budgets that `test_speed.py` checks, for rustymath's Python API. Each section starts with an item type in brackets. Each line under it holds a Python expression and its budget, separated by a tab. The expression names the arrays that `test_speed.py` makes. A budget counts copies of 65,536 items of the section's type, the number of items in each case's main input.
-# A budget is twice the most the case has cost on a Mac and on CI's runner, and at least 0.5. `basedpl.bpltests.set_budgets` rewrites the budgets under this rule.
-# A case that CI hasn't timed yet has four times its Mac cost, and at least 0.5. `set_budgets` applies this rule with `untimed=True`. The next CI run that logs costs sets its budget under the rule above.
+# The budgets that `test_speed.py` checks, for rustymath's Python API. Each section starts with an item type in brackets. Each line under it holds a Python expression and its two native budgets, separated by tabs: first for macOS on Apple silicon, where matrix products and decompositions run on Accelerate, then for Linux on CI's x86 runner, where they run on rustymath's own kernels. `rm.timing().column` picks the budget a machine checks. The expression names the arrays that `test_speed.py` makes. A budget counts copies of 65,536 items of the section's type, the number of items in each case's main input.
+# The macOS budget is twice the most the case has cost on a Mac. The Linux budget is twice the most it has cost on CI's runner. Each is at least 0.5. `basedpl.bpltests.set_budgets` rewrites each budget from the runs on its own platform.
+# A case that CI hasn't timed yet has a Linux budget of four times its Mac cost with rustymath's own kernels, timed with `native=True`, and at least 0.5. `set_budgets` applies this rule with `untimed=True`. The next CI run that logs costs sets its Linux budget under the rule above.
 [float64]
-x+y	6.3
-x*2	4.1
--x	4.2
-rm.exp(x)	29
-rm.sum(x)	2
-rm.cumsum(x)	5
-m+row	5.2
-m.T+m	14
-rm.sum(m.T, axis=0)	2.9
-rm.max(m.T, axis=1)	3
-rm.sum(x[::-1])	2.3
-rm.minmax(m.T)	4.6
-x[::-1]+1	6
-x[::2]+y[::2]	9.7
-a@b	160
-a.T@b	150
-a[::-1]@b	150
-x[idx]	50
-m[r, c]	180
-rm.at(rm.add, x, idx, y)	86
-rm.sort(x)	360
-rm.correlate(img, k)	39
-rm.convolve(x, kern)	50
-rm.overlap_add(frames, 32)	7.5
-rm.array(xn)	3.1
-np.asarray(x)	0.5
+x+y	3	3.2
+x*2	2.1	2
+-x	2.1	2.1
+rm.exp(x)	15	14
+rm.sum(x)	1.3	1.1
+rm.cumsum(x)	2.5	3.2
+m+row	2.6	2.6
+m.T+m	7	6.8
+rm.sum(m.T, axis=0)	1.4	1.4
+rm.max(m.T, axis=1)	1.8	1.6
+rm.sum(x[::-1])	1.2	1.2
+rm.minmax(m.T)	2.2	2.2
+x[::-1]+1	3.3	3.2
+x[::2]+y[::2]	4.9	4.9
+a@b	27	160
+a.T@b	24	150
+a[::-1]@b	27	150
+x[idx]	12	12
+m[r, c]	26	26
+rm.at(rm.add, x, idx, y)	26	26
+rm.sort(x)	180	180
+rm.correlate(img, k)	19	19
+rm.convolve(x, kern)	25	28
+rm.overlap_add(frames, 32)	3.7	3.7
+rm.array(xn)	1.5	3.7
+np.asarray(x)	0.5	0.5
 [float32]
-xf+yf	6.1
-rm.exp(xf)	23
-rm.sum(xf)	2.2
+xf+yf	2.9	3.3
+rm.exp(xf)	9.8	12
+rm.sum(xf)	1.2	1.2

@@ -397,12 +397,14 @@ fn decompositions(units: &Units<f64, f32>, complex_units: &Units<num_complex::Co
     ]
 }
 
-/// The budget of each function at each item type, keyed by `(type, name)`. Each section of `text` starts with a type in brackets, and each line under it holds a name and its budget, separated by a tab. Lines that start with `#` are comments.
+/// This machine's budget of each function at each item type, keyed by `(type, name)`. Each section of `text` starts with a type in brackets, and each line under it holds a name and its two native budgets, separated by tabs. `timing::NATIVE_COLUMN` picks the budget this machine checks. Lines that start with `#` are comments.
 fn budgets(text: &str) -> HashMap<(&str, &str), f64> {
     let mut width = "";
     text.lines().filter(|line| !line.is_empty() && !line.starts_with('#')).filter_map(|line| {
         if let Some(w) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) { width = w; return None; }
-        let (name, budget) = line.split_once('\t').expect("a budget line holds a name, a tab and a budget");
+        let mut fields = line.split('\t');
+        let name = fields.next().expect("a budget line starts with a name");
+        let budget = fields.nth(rustymath::timing::NATIVE_COLUMN).expect("a budget line holds a name and two budgets, separated by tabs");
         Some(((width, name), budget.parse().expect("a budget is a number")))
     }).collect()
 }

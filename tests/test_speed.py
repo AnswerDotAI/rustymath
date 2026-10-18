@@ -17,12 +17,14 @@ def arrays():
         r=rm.array(rng.integers(0, 256, N)), c=rm.array(rng.integers(0, 256, N)))
 
 def budgets():
-    "Each case in `speed_python.txt` as `(section, code, budget)`, with the budget as written."
-    section, cases = None, []
+    "Each case in `speed_python.txt` as `(section, code, budget)`, with the native budget that `rm.timing().column` picks for this machine, as written."
+    section, cases, column = None, [], rm.timing().column
     for line in Path(__file__).with_name('speed_python.txt').read_text().splitlines():
         if not line or line.startswith('#'): continue
         if line.startswith('['): section = line.strip('[]')
-        else: cases.append((section, *line.split('\t')))
+        else:
+            code, *native = line.split('\t')
+            cases.append((section, code, native[column]))
     return cases
 
 def fastest(run):

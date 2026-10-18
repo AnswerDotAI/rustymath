@@ -23,6 +23,9 @@ pub fn shared() -> io::Result<Hold> { hold(true) }
 /// The pauses, in seconds, before each retry in `retried`. All of a case's runs together take a fraction of a millisecond, and one disturbance on a shared machine can last that long.
 pub const RETRY_PAUSES: [f64; 2] = [0.1, 1.0];
 
+/// Which of a budget file's two native budgets this machine's speed tests check: 0, for macOS on Apple silicon, where matrix products run on Accelerate, or 1, for Linux on CI's x86 runner and every other system.
+pub const NATIVE_COLUMN: usize = if cfg!(target_os = "macos") { 0 } else { 1 };
+
 /// The failures of a timing test that still fail after every retry. After each pause in `RETRY_PAUSES`, `retime` gets the failures and the pause, times them again, prints the retry and gives those that still fail. A speed test calls it after timing every case.
 pub fn retried<T>(mut failures: Vec<T>, mut retime: impl FnMut(Vec<T>, f64) -> Vec<T>) -> Vec<T> {
     for pause in RETRY_PAUSES {
