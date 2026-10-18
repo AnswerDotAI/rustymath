@@ -13,7 +13,7 @@ authors = [{name = "Jeremy Howard", email = "github@jhoward.fastmail.fm"}]
 classifiers = ["Programming Language :: Rust", "Programming Language :: Python :: Implementation :: CPython"]
 
 [project.optional-dependencies]
-dev = ["fastship>=0.0.11", "fastws-cli>=0.0.25", "maturin>=1.0,<2.0", "pytest", "nbdev", "numpy", "scipy"]
+dev = ["fastship>=0.0.11", "fastws-cli>=0.0.26", "maturin>=1.0,<2.0", "pytest", "nbdev", "numpy", "scipy"]
 
 [project.urls]
 Homepage = "https://github.com/AnswerDotAI/rustymath"

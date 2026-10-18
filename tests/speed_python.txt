@@ -1,0 +1,34 @@
+# The budgets that `test_speed.py` checks, for rustymath's Python API. Each section starts with an item type in brackets. Each line under it holds a Python expression and its budget, separated by a tab. The expression names the arrays that `test_speed.py` makes. A budget counts copies of 65,536 items of the section's type, the number of items in each case's main input.
+# A budget is twice the most the case has cost on a Mac and on CI's runner, and at least 0.5. `basedpl.bpltests.set_budgets` rewrites the budgets under this rule.
+# A case that CI hasn't timed yet has four times its Mac cost, and at least 0.5. `set_budgets` applies this rule with `untimed=True`. The next CI run that logs costs sets its budget under the rule above.
+[float64]
+x+y	6.3
+x*2	4.1
+-x	4.2
+rm.exp(x)	29
+rm.sum(x)	2
+rm.cumsum(x)	5
+m+row	5.2
+m.T+m	14
+rm.sum(m.T, axis=0)	2.9
+rm.max(m.T, axis=1)	3
+rm.sum(x[::-1])	2.3
+rm.minmax(m.T)	4.6
+x[::-1]+1	6
+x[::2]+y[::2]	9.7
+a@b	53
+a.T@b	48
+a[::-1]@b	53
+x[idx]	50
+m[r, c]	180
+rm.at(rm.add, x, idx, y)	86
+rm.sort(x)	360
+rm.correlate(img, k)	39
+rm.convolve(x, kern)	50
+rm.overlap_add(frames, 32)	7.5
+rm.array(xn)	3.1
+np.asarray(x)	0.5
+[float32]
+xf+yf	6.1
+rm.exp(xf)	23
+rm.sum(xf)	2.2

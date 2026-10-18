@@ -10,11 +10,11 @@ def full(shape, value, dtype=None):
     "An array of `shape` filled with one value"
     return _core._full(shape, value, dtype)
 
-def zeros(shape, dtype='f64'):
+def zeros(shape, dtype='float64'):
     "An array filled with the dtype's zero, or spaces for characters"
     return _core._full(shape, None, dtype)
 
-def ones(shape, dtype='f64'):
+def ones(shape, dtype='float64'):
     "An array filled with ones"
     return _core._full(shape, 1, dtype)
 

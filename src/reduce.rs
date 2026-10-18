@@ -1,5 +1,5 @@
 //! Reductions and scans over a contiguous slice: sums, products, maximums and minimums, and their running versions. Each compiles inside rustymath once for each item type. A float sum or product may combine the items in any order, which lets its loop vectorize, so its last bits can differ from a sum taken item by item. Beside a NaN item, a float maximum or minimum gives either NaN or the greatest or least other item, depending on the target and the loop. An empty slice gives -∞ or ∞. `f16` items compute in `f32`. Their sum or product is an `f32` total. An integer sum or product computes at `i64`, or at `u64` for `u64` items. Where it doesn't fit, it wraps, and reports that it doesn't fit, as the running versions do.
-use crate::{Arg, Float, Native, arith::Overflowing, float::sealed::{Core, Folds}, parallel, slice::{CHUNK, appended}};
+use crate::{Arg, Float, Native, agreement::{Mapping, expanded_items}, arith::Overflowing, buffer::{Element, View}, float::sealed::{Core, Folds}, gather::Steps, layout::Lanes, parallel, slice::{CHUNK, appended}};
 use half::f16;
 use num_complex::Complex;
 use std::ops::Range;
@@ -81,7 +81,7 @@ forms!(Minimum at real: |_, [x, y]| crate::slice::Total(minimum(x, y)));
 forms!(Minimum at u8, i16, i32, i64: |_, [x, y]| x.min(y));
 forms!(Minimum at bool: |_, [x, y]| x & y);
 
-/// A reduction by [`Sum`], [`Product`], [`Max`], [`Min`], [`Xor`], [`Xnor`] or [`SumAs`], implemented inside rustymath once for each item type it takes. `slice` folds a whole slice of consecutive items, in any order, `merge` combines the folds of two neighbouring runs, and `scan` gives the running folds. [`along`], [`fold_into`] and [`scan_along`] fold along an axis whose items aren't consecutive. [`Sum`] and [`Product`] take floats, integers and complex numbers. [`Max`] and [`Min`] take floats, integers and Booleans, [`Xor`] and [`Xnor`] take Booleans, and [`SumAs`] takes Booleans and integers. An `f16` reduction computes in `f32`. A sum or product of `f16`s gives an `f32` total, for its caller to round once.
+/// A reduction by [`Sum`], [`Product`], [`Max`], [`Min`], [`Xor`], [`Xnor`] or [`SumAs`], implemented inside rustymath once for each item type it takes. `slice` folds a whole slice of consecutive items, in any order, `merge` combines the folds of two neighbouring runs, and `scan` gives the running folds. [`along`], [`fold_into`] and [`scan_along`] fold along an axis whose items aren't consecutive. [`Sum`] and [`Product`] take floats, integers and complex numbers. [`Max`] and [`Min`] take floats, integers and Booleans, [`Xor`] and [`Xnor`] take Booleans, and [`SumAs`] takes Booleans and integers. An `f16` reduction computes in `f32`. A sum or product of `f16`s gives an `f32` total, for its caller to round once. A total that doesn't fit its type fails, with its value wrapped to that type.
 pub trait Reduction<T> {
     /// The type of a fold: the item type, `i64` for a sum or product of integers narrower than 64 bits, `f32` for a sum or product of `f16`s, or the `C` of [`SumAs`].
     type Total: Copy + Send + Sync;
@@ -112,10 +112,10 @@ pub struct Sum;
 /// [`prod`] as a [`Reduction`].
 #[derive(Clone, Copy, Debug)]
 pub struct Product;
-/// [`max`] as a [`Reduction`]. Its step on floats is [`maximum`] of the item and the total, which a NaN item leaves unchanged.
+/// [`max`] as a [`Reduction`]. Its scalar step on floats is [`maximum`] of the item and the total, which a NaN item leaves unchanged. Vectorized folds on some targets, such as AArch64, keep a NaN instead. A fold beside NaN therefore gives NaN or the greatest other item, depending on the target and the lane's length.
 #[derive(Clone, Copy, Debug)]
 pub struct Max;
-/// [`min`] as a [`Reduction`]. Its step on floats is [`minimum`] of the item and the total, which a NaN item leaves unchanged.
+/// [`min`] as a [`Reduction`]. Its scalar step on floats is [`minimum`] of the item and the total, which a NaN item leaves unchanged. Vectorized folds on some targets, such as AArch64, keep a NaN instead. A fold beside NaN therefore gives NaN or the least other item, depending on the target and the lane's length.
 #[derive(Clone, Copy, Debug)]
 pub struct Min;
 /// The fold of Booleans by `!=`: true where an odd number of them are true.
@@ -639,6 +639,144 @@ pub fn along_with_tail<T: Copy + Sync, R: Reduction<T>>(data: &[T], dims: [usize
         for (total, &tail) in totals.iter_mut().zip(tail) { let (next, fits) = R::merge(*total, tail); *total = next; ok &= fits; }
     }
     (totals, ok)
+}
+
+/// Items of an array that [`along_mapped`] reads through a mapping at a time. A fold along an earlier axis steps strips of columns down each block's rows. A block of 4096 items holds too few rows of a 1024-column matrix for that to pay. Larger blocks also cost a strided read's walk less for each item.
+const MAPPED: usize = 1 << 16;
+
+/// [`along`] of the array of `shape` that `mapping` lays `data` over, folding axis `axis`, without building that array: its totals, whether they all fit, and the tables that read the totals in the order of the array's other axes, where they come in another order. A reduction combines each lane's items in any order. Where the array reads a contiguous block of `data` with its axes in another order, as [`Mapping::block`] finds, the block folds in its own order, as [`Block::fold`] plans it, and its totals keep the block's order. A caller can then copy them through the tables, or read them through the tables as another view. Otherwise the array is read [`MAPPED`] items at a time through [`expanded_items`], and folds as [`fold_pieces`] folds it.
+pub fn along_mapped<T: Element, R: Reduction<T>>(data: &[T], mapping: &Mapping, shape: &[usize], axis: usize) -> (Vec<R::Total>, bool, Option<Vec<Steps>>) {
+    if let Some(block) = mapping.block(shape) {
+        let (dims, order) = block.fold(Some(axis));
+        let (totals, fits) = along::<T, R>(&data[block.range.clone()], dims);
+        return (totals, fits, order);
+    }
+    let dims = Lanes::new(shape, axis).expect("the folded axis is within the shape").dims();
+    let mut totals = vec![R::unit(); dims[0] * dims[2]];
+    if dims[1] == 0 || totals.is_empty() { return (totals, true, None); }
+    let fits = fold_pieces::<T, R>(&mut totals, dims, &|range, fold| {
+        let mut buf = Vec::new();
+        for at in range.clone().step_by(MAPPED) { fold(at, expanded_items(mapping, data, at, MAPPED.min(range.end - at), &mut buf)); }
+    });
+    (totals, fits, None)
+}
+
+/// The widest window that [`sliding`] folds directly, one pass for each of its rows. Wider windows take van Herk-Gil-Werman.
+const DIRECT: usize = 8;
+
+/// The fold of the one item `x`, clearing `ok` where it doesn't fit.
+#[inline(always)]
+fn one_of<T, R: Reduction<T>>(x: T, ok: &mut bool) -> R::Total { let (t, fits) = R::one(x); *ok &= fits; t }
+
+/// `total` combined with the item `x`, clearing `ok` where it doesn't fit.
+#[inline(always)]
+fn step_of<T, R: Reduction<T>>(total: R::Total, x: T, ok: &mut bool) -> R::Total { let (t, fits) = R::checked(total, x); *ok &= fits; t }
+
+/// The folds `a` and `b` of neighbouring runs combined, clearing `ok` where the result doesn't fit.
+#[inline(always)]
+fn merge_of<T, R: Reduction<T>>(a: R::Total, b: R::Total, ok: &mut bool) -> R::Total { let (t, fits) = R::merge(a, b); *ok &= fits; t }
+
+/// Van Herk-Gil-Werman's folds of the windows of `width` rows in `lane`, rows of `inner` items, into `folds`. `suffix` holds the lane's block suffixes, and `row` carries one row's running fold. `ONE` fixes `inner` at 1, which compiles each loop over a row's items to scalar code.
+#[inline(always)]
+fn hgw<T: Copy, R: Reduction<T>, const ONE: bool>(lane: &[T], folds: &mut [R::Total], suffix: &mut [R::Total], row: &mut [R::Total], width: usize, inner: usize, ok: &mut bool) {
+    let inner = if ONE { 1 } else { inner };
+    // A local row of one item stays in a register, where a row in memory would put a store and a load in each step's chain.
+    let mut one = [R::unit()];
+    let row = if ONE { &mut one[..] } else { &mut row[..inner] };
+    for (b, block) in lane.chunks(width * inner).enumerate() {
+        let (start, last) = (b * width * inner, block.len() - inner);
+        // Each row's suffix folds it with the rest of its block, from the block's last row back to its first.
+        let s = &mut suffix[start..start + block.len()];
+        for j in 0..inner { row[j] = one_of::<T, R>(block[last + j], ok); s[last + j] = row[j]; }
+        for k in (0..last).step_by(inner).rev() { for j in 0..inner { row[j] = merge_of::<T, R>(one_of::<T, R>(block[k + j], ok), row[j], ok); s[k + j] = row[j]; } }
+        // Each row's prefix folds the block up to it. The first block's whole prefix is the first window.
+        for j in 0..inner { row[j] = one_of::<T, R>(block[j], ok); }
+        if b == 0 {
+            for k in (inner..block.len()).step_by(inner) { for j in 0..inner { row[j] = step_of::<T, R>(row[j], block[k + j], ok); } }
+            folds[..inner].copy_from_slice(row);
+            continue;
+        }
+        // In a later block, row `i` ends the window that starts `i + 1` rows into the block before: the fold of that block's suffix there and this prefix.
+        let from = start + inner - width * inner;
+        let (windows, earlier) = (&mut folds[from..from + block.len()], &suffix[from..from + block.len()]);
+        for j in 0..inner { windows[j] = merge_of::<T, R>(earlier[j], row[j], ok); }
+        for k in (inner..block.len()).step_by(inner) {
+            for j in 0..inner {
+                row[j] = step_of::<T, R>(row[j], block[k + j], ok);
+                windows[k + j] = merge_of::<T, R>(earlier[k + j], row[j], ok);
+            }
+        }
+        // A window that starts this block is the whole block, which the prefix holds once its last row is in.
+        if block.len() == width * inner { folds[start..start + inner].copy_from_slice(row); }
+    }
+}
+
+/// The folds by `R` of each window of `width` neighbouring rows along the middle axis of `data`, an array of shape `[outer, len, inner]` held row by row. The result has shape `[outer, len - width + 1, inner]`, with whether every fold fits. Each fold combines its window's items in order. A window of at most [`DIRECT`] rows folds directly. A wider one takes van Herk-Gil-Werman's method: each lane splits into blocks of `width` rows, and each window is the fold of one block's suffix and the next block's prefix, so an item costs the same whatever the width.
+pub fn sliding<T: Copy, R: Reduction<T>>(data: &[T], [outer, len, inner]: [usize; 3], width: usize) -> (Vec<R::Total>, bool) {
+    assert_eq!(data.len(), outer * len * inner, "the data must fill its dimensions");
+    assert!((1..=len.max(1)).contains(&width), "a window lies within its lane");
+    let count = (len + 1).saturating_sub(width);
+    if outer * count * inner == 0 { return (Vec::new(), true); }
+    let mut out = vec![R::unit(); outer * count * inner];
+    let mut ok = true;
+    let lanes = data.chunks_exact(len * inner).zip(out.chunks_exact_mut(count * inner));
+    if width <= DIRECT {
+        for (lane, folds) in lanes {
+            for (t, &x) in folds.iter_mut().zip(lane) { *t = one_of::<T, R>(x, &mut ok); }
+            for i in 1..width {
+                for (t, &x) in folds.iter_mut().zip(&lane[i * inner..]) { *t = step_of::<T, R>(*t, x, &mut ok); }
+            }
+        }
+        return (out, ok);
+    }
+    let (mut suffix, mut prefix) = (vec![R::unit(); len * inner], vec![R::unit(); inner]);
+    for (lane, folds) in lanes {
+        if inner == 1 { hgw::<T, R, true>(lane, folds, &mut suffix, &mut prefix, width, inner, &mut ok) }
+        else { hgw::<T, R, false>(lane, folds, &mut suffix, &mut prefix, width, inner, &mut ok) }
+    }
+    (out, ok)
+}
+
+/// A reduction that picks one of its items, as [`Max`] and [`Min`] do, over pairs of an item and its row. Each fold keeps the row of the first item that gives it.
+struct Pick<R>(std::marker::PhantomData<R>);
+
+impl<T: Copy + PartialEq + Send + Sync, R: Reduction<T, Total = T>> Reduction<(T, usize)> for Pick<R> {
+    type Total = (T, usize);
+    #[inline(always)]
+    fn unit() -> (T, usize) { (R::unit(), 0) }
+    #[inline(always)]
+    fn one((x, row): (T, usize)) -> ((T, usize), bool) { ((R::one(x).0, row), true) }
+    #[inline(always)]
+    fn step(acc: (T, usize), x: (T, usize)) -> (T, usize) { Self::merge(acc, Self::one(x).0).0 }
+    /// The earlier fold `a` where it gives the fold of both, and `b` where `b`'s item is beyond it.
+    #[inline(always)]
+    fn merge(a: (T, usize), b: (T, usize)) -> ((T, usize), bool) { (if R::merge(a.0, b.0).0 == a.0 { a } else { b }, true) }
+    fn slice(x: &[(T, usize)]) -> ((T, usize), bool) { (x.iter().fold(Self::unit(), |t, &v| Self::step(t, v)), true) }
+    fn scan(x: &[(T, usize)], start: Option<(T, usize)>, out: &mut Vec<(T, usize)>) -> bool {
+        let mut total = start;
+        for &v in x { let t = total.map_or_else(|| Self::one(v).0, |t| Self::step(t, v)); out.push(t); total = Some(t); }
+        true
+    }
+}
+
+/// The row of the first item in each window of `width` rows that gives the window's fold by `R`, for a reduction that picks one of its items, as [`Max`] and [`Min`] do. The result has [`sliding`]'s shape, and each row counts from the start of its lane. A window whose items all leave the fold at `R::unit()`, as NaN items do for a float maximum, gives its first row.
+pub fn sliding_picks<T: Copy + PartialEq + Send + Sync, R: Reduction<T, Total = T>>(data: &[T], shape: [usize; 3], width: usize) -> Vec<usize> {
+    let [_, len, inner] = shape;
+    let pairs: Vec<(T, usize)> = data.iter().enumerate().map(|(k, &x)| (x, k / inner.max(1) % len.max(1))).collect();
+    sliding::<(T, usize), Pick<R>>(&pairs, shape, width).0.into_iter().map(|(_, row)| row).collect()
+}
+
+/// [`sliding_picks`] of the items of `x` at their own type, by [`Max`], or by [`Min`] where `max` is false. `None` for complex numbers and characters, which have no order.
+pub fn view_sliding_picks(x: View<'_>, dims: [usize; 3], width: usize, max: bool) -> Option<Vec<usize>> {
+    fn picks<T: Copy + PartialEq + Send + Sync>(x: &[T], dims: [usize; 3], width: usize, max: bool) -> Vec<usize> where Max: Reduction<T, Total = T>, Min: Reduction<T, Total = T> {
+        if max { sliding_picks::<T, Max>(x, dims, width) } else { sliding_picks::<T, Min>(x, dims, width) }
+    }
+    Some(match x {
+        View::Booleans(x) => picks(x, dims, width, max),
+        View::Integers(x) => with_ints!(x, |x| picks(x, dims, width, max)),
+        View::Floats(x) => with_floats!(x, |x| picks(x, dims, width, max)),
+        _ => return None,
+    })
 }
 
 /// Folds each lane of `[outer, len, inner]` from the right: `x0 f (x1 f (...))`. A `tail` supplies the already-folded items to the right of each lane, in the input type. Otherwise each lane needs at least two items. `cast` reads a running result as the next step's right argument, as a Boolean comparison result reads as 0 or 1. A failed step gives `None`.

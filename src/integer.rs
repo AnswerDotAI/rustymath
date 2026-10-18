@@ -56,10 +56,27 @@ fn choose(n: u64, k: u64, limit: u64) -> Option<u64> {
     })
 }
 
-/// x^y. 0^0 is 1. `None` for a negative y beside an x other than 1 or -1, where the power isn't a whole number.
-pub fn power(x: i64, y: i64) -> Option<i64> {
+/// x^y. 0^0 is 1. `None` where the power doesn't fit an `i64`, and for a negative y beside an x other than 1 or -1, where the power isn't a whole number.
+pub fn power(x: i64, y: i64) -> Option<i64> { let (p, exact) = wrapped_power(x, y); exact.then_some(p) }
+
+/// x^y wrapped to `i64`, and whether that is the exact power, by repeated squaring. A negative y beside an x other than 1 or -1 gives 0, which isn't the power.
+pub(crate) fn wrapped_power(x: i64, y: i64) -> (i64, bool) {
     match x {
-        1 => Some(1), -1 => Some(if y % 2 == 0 { 1 } else { -1 }), _ if y < 0 => None, 0 => Some(i64::from(y == 0)), _ => x.checked_pow(u32::try_from(y).ok()?)
+        1 => (1, true),
+        -1 => (if y % 2 == 0 { 1 } else { -1 }, true),
+        _ if y < 0 => (0, false),
+        0 => (i64::from(y == 0), true),
+        _ => {
+            // A square that overflows makes the power inexact only where a later bit of y multiplies it in.
+            let (mut base, mut e, mut p, mut exact, mut base_exact) = (x, y as u64, 1i64, true, true);
+            loop {
+                if e & 1 == 1 { let (q, over) = p.overflowing_mul(base); (p, exact) = (q, exact & base_exact & !over); }
+                e >>= 1;
+                if e == 0 { break (p, exact) }
+                let (b, over) = base.overflowing_mul(base);
+                (base, base_exact) = (b, base_exact & !over);
+            }
+        }
     }
 }
 
@@ -133,7 +150,7 @@ pub fn decode(bases: &[i64], digits: &[i64]) -> Option<Vec<i64>> {
 forms!(#[inline] Gcd at i64: |_, [x, y]| gcd(x, y));
 forms!(#[inline] Lcm at i64: |_, [x, y]| lcm(x, y));
 forms!(#[inline] Binom at i64: |_, [n, k]| binom(n, k));
-forms!(#[inline] Pow at i64: |_, [x, y]| power(x, y));
+forms!(#[inline] Pow at i64: |_, [x, y]| wrapped_power(x, y));
 forms!(
     #[inline] Residue at i64: |_, [x, y]| residue(x, y), many |_, [x, y], n, out| if let Arg::One(d) = x && let Some(d) = Divisor::new(d) {
         each!([y], n, out, |[y]| d.residue(y))
@@ -142,13 +159,13 @@ forms!(
     }
 );
 
-/// The narrower types' forms of `Gcd`, `Lcm`, `Binom`, `Pow` and `Residue`, which compute at `i64`. A result that doesn't fit the type fails, as one beyond `i64` does. Every residue fits.
+/// The narrower types' forms of `Gcd`, `Lcm`, `Binom`, `Pow` and `Residue`, which compute at `i64`. A result that doesn't fit the type fails, as one beyond `i64` does. A power that fails holds the power wrapped to the type. Every residue fits.
 macro_rules! narrower {
     ($($t:ty),+) => {$(
         forms!(#[inline] Gcd at $t: |_, [x, y]| gcd(x.into(), y.into()).and_then(|r| <$t>::try_from(r).ok()));
         forms!(#[inline] Lcm at $t: |_, [x, y]| lcm(x.into(), y.into()).and_then(|r| <$t>::try_from(r).ok()));
         forms!(#[inline] Binom at $t: |_, [n, k]| binom(n.into(), k.into()).and_then(|r| <$t>::try_from(r).ok()));
-        forms!(#[inline] Pow at $t: |_, [x, y]| power(x.into(), y.into()).and_then(|r| <$t>::try_from(r).ok()));
+        forms!(#[inline] Pow at $t: |_, [x, y]| { let (p, exact) = wrapped_power(x.into(), y.into()); (p as $t, exact && <$t>::try_from(p).is_ok()) });
         forms!(
             #[inline] Residue at $t: |_, [x, y]| residue(x.into(), y.into()) as $t,
             many |_, [x, y], n, out| if let Arg::One(d) = x && <$t>::BITS <= 16 && let Some(s) = Short::new(d.into()) {

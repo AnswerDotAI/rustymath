@@ -35,11 +35,14 @@ mod pow;
 pub mod random;
 pub mod reduce;
 pub mod search;
+pub mod signal;
 mod special;
 pub mod stats;
 mod sqrts;
 pub mod structure;
 mod table;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod timing;
 pub mod tolerant;
 mod trig;
 #[cfg(accelerate)]
@@ -53,7 +56,7 @@ pub use float::{FUSED, Float, Native};
 pub use ln::Logb;
 pub use parts::{Abs, Angle, Sign, Isnan, Isfinite, Isinf, Real, Imag, Conj, Trunc, Rint, Clip, Scale, Round};
 pub use pow::{Pow, Root};
-pub use slice::{Arg, Binary, CHUNK, Flipped, Ternary, Unary, pairs};
+pub use slice::{Arg, Binary, CHUNK, Flipped, Results, Ternary, Unary, pairs};
 pub use special::{Erfc, Erfcinv, Erfinv};
 pub use sqrts::Sqrt;
 pub use trig::{Cos, Sin, Tan};

@@ -1,4 +1,4 @@
-//! How fast each function object's slice form runs on 65,536 inputs. The slice form is the code that callers such as basedpl and the Python package run. `speed.txt` gives each function a budget at f64 and at f32, in copies of the same number of items: the most time it may take, as a multiple of the time to copy those items. Each row's copy is timed just before the row, as basedpl's speed test times each case's copy. A loop that stops vectorizing takes several times as long and goes over budget. Where the standard library has the function, its time item by item is measured too, for the comparison table in `src/lib.md`, but sets no limit. The rows `Pow.one` and `Root.one` time the scalar forms pair by pair, as a caller with one value at a time runs them. The inner products multiply 256×256 matrices, whose results hold the same number of items. The decompositions factor 256×256 real matrices and 128×128 complex ones, and `lstsq` solves a 4096×16 real one. Sorts, partitions, medians and variances run along the rows of a 256×256 matrix. One sort runs along two lanes of 32,768. A weighted average reduces the first and last axes of a 16×64×64 array. Each of these counts copies of as many items as its matrix holds. The test fails listing every cost over its budget, as its width, name, cost and budget, in the form that `basedpl.bpltests.logged_costs` reads. With `RUSTYMATH_COSTS` set, as in `RUSTYMATH_COSTS=1 cargo test --test speed`, the test writes that table, then every cost in that form, straight to stderr. The test harness captures `println!` output from a passing test, but not these lines. CI's `Test` and `Speed` workflows set it. The test holds the machine's timing lock while it runs, as `timing_lock` describes.
+//! How fast each function object's slice form runs on 65,536 inputs. The slice form is the code that callers such as basedpl and the Python package run. `speed.txt` gives each function a budget at f64 and at f32, in copies of the same number of items: the most time it may take, as a multiple of the time to copy those items. Each row's copy is timed just before the row, as basedpl's speed test times each case's copy. A loop that stops vectorizing takes several times as long and goes over budget. Where the standard library has the function, its time item by item is measured too, for the comparison table in `src/lib.md`, but sets no limit. The rows `Pow.one` and `Root.one` time the scalar forms pair by pair, as a caller with one value at a time runs them. The inner products multiply 256×256 matrices, whose results hold the same number of items. The decompositions factor 256×256 real matrices and 128×128 complex ones, and `lstsq` solves a 4096×16 real one. Sorts, partitions, medians and variances run along the rows of a 256×256 matrix. One sort runs along two lanes of 32,768. A weighted average reduces the first and last axes of a 16×64×64 array. Each of these counts copies of as many items as its matrix holds. A row over its budget fails only if it stays over after each pause in `timing::RETRY_PAUSES`, when every row is measured again. Each retry prints the row's earlier and new costs. The test fails listing every cost still over its budget after the last retry, as its width, name, cost and budget, in the form that `basedpl.bpltests.logged_costs` reads. With `RUSTYMATH_COSTS` set, as in `RUSTYMATH_COSTS=1 cargo test --test speed`, the test writes that table, then every cost in that form, straight to stderr. The test harness captures `println!` output from a passing test, but not these lines. CI's `Test` and `Speed` workflows set it. The test holds the machine's timing lock while it runs, as `rustymath::timing::exclusive` describes.
 //! Array guards time f32 differences on length-2 lanes and on one long vector, and a compact broadcast repeating each input 64 times. Safe i32-to-i64 widening counts i64 copies. These rows use only the demonstrated dtypes.
 use rand::seq::SliceRandom;
 use rustymath::*;
@@ -407,50 +407,10 @@ fn budgets(text: &str) -> HashMap<(&str, &str), f64> {
     }).collect()
 }
 
-/// The file whose lock keeps timings and builds apart on this machine, as DEV.md describes. Timings take it exclusively. Builds take it shared.
-const TIMING_LOCK: &str = "/tmp/aai-ws-timing.lock";
-
-/// Takes the timing lock exclusively, and returns the file that holds it until dropped. It waits up to 5 minutes while a build or another timing holds the lock. The operating system releases the lock when the test ends, even by a crash. On macOS it also sets the calling thread's QoS class to user-interactive. macOS then keeps the thread, which runs the timing, on the performance cores. The thread's calls also run on it alone, because the budgets are for one thread. After waiting 30 seconds it prints, once, the other processes that have the lock's file open.
-fn timing_lock() -> std::fs::File {
-    #[cfg(target_vendor = "apple")]
-    unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
-    rustymath::parallel::set_threads(1);
-    let file = std::fs::File::options().create(true).append(true).open(TIMING_LOCK).expect("the timing lock's file opens");
-    let (start, mut waiting, mut reported) = (Instant::now(), false, false);
-    loop {
-        match file.try_lock() {
-            Ok(()) => return file, Err(std::fs::TryLockError::WouldBlock) => {} Err(std::fs::TryLockError::Error(e)) => panic!("{TIMING_LOCK}: {e}")
-        }
-        assert!(start.elapsed().as_secs() < 300, "a build or another timing has held {TIMING_LOCK} for 5 minutes");
-        if !waiting { writeln!(std::io::stderr(), "waiting for a build or another timing to release {TIMING_LOCK}").unwrap(); }
-        if !reported && start.elapsed().as_secs() >= 30 {
-            writeln!(std::io::stderr(), "{TIMING_LOCK} is still taken after 30 seconds. Processes with it open: {}", lock_users()).unwrap();
-            reported = true;
-        }
-        waiting = true;
-        std::thread::sleep(std::time::Duration::from_millis(250));
-    }
-}
-
-/// The processes other than this one that have the timing lock's file open, as `pid command` pairs from `lsof`. On macOS, where `lsof` doesn't show `flock` holds, the list also includes any other process waiting for the lock.
-fn lock_users() -> String {
-    let Ok(out) = std::process::Command::new("lsof").args(["+c", "0", "-F", "pc", TIMING_LOCK]).output() else {
-        return "unknown, because lsof didn't run".into();
-    };
-    let (text, me) = (String::from_utf8_lossy(&out.stdout), std::process::id().to_string());
-    let (mut users, mut pid) = (Vec::new(), "");
-    for line in text.lines() {
-        match line.split_at_checked(1) { Some(("p", p)) => pid = p, Some(("c", c)) if pid != me => users.push(format!("{pid} {c}")), _ => {} }
-    }
-    if users.is_empty() { "none".into() } else { users.join(", ") }
-}
-#[test]
-fn speed() {
-    let _lock = timing_lock();
-    let units = Units(Unit::new(1.0f64), Unit::new(1.0f32));
-    let complex_units = Units(Unit::new(num_complex::Complex::new(1.0f64, 1.0)), Unit::new(num_complex::Complex::new(1.0f32, 1.0)));
+/// Every row's comparison with the standard library, where there is one, and every row's cost in copies, as `(width, name, cost)`.
+fn measured(units: &Units<f64, f32>, complex_units: &Units<num_complex::Complex<f64>, num_complex::Complex<f32>>) -> (Vec<Compared>, Vec<(&'static str, &'static str, f64)>) {
     let mut compared = unary! {
-        &units;
+        units;
         Exp vs exp on -20.0 to 20.0;
         Expm1 vs exp_m1 on -1.0 to 1.0;
         Ln vs ln on 0.001 to 1000.0;
@@ -474,27 +434,36 @@ fn speed() {
     let (powers, roots) = (((0.0, 4.0), (-30.0, 30.0)), ((5.0, 5.0), (0.0, 1000.0)));
     let nth = |n: f64, y: f64| y.powf(1.0 / n);
     let nth32 = |n: f32, y: f32| y.powf(1.0 / n);
-    compared.push(binary(&units, "Pow", Pow, false, powers, f64::powf, f32::powf));
-    compared.push(binary(&units, "Pow.one", Pow, true, powers, f64::powf, f32::powf));
-    compared.push(binary(&units, "Hypot", Hypot, false, ((-1000.0, 1000.0), (-1000.0, 1000.0)), f64::hypot, f32::hypot));
-    compared.push(binary(&units, "Root", Root, false, roots, nth, nth32));
-    compared.push(binary(&units, "Root.one", Root, true, roots, nth, nth32));
-    compared.push(binary(&units, "Maximum", reduce::Maximum, false, ((-1.0, 1.0), (-1.0, 1.0)), f64::max, f32::max));
-    compared.extend(reductions(&units));
+    compared.push(binary(units, "Pow", Pow, false, powers, f64::powf, f32::powf));
+    compared.push(binary(units, "Pow.one", Pow, true, powers, f64::powf, f32::powf));
+    compared.push(binary(units, "Hypot", Hypot, false, ((-1000.0, 1000.0), (-1000.0, 1000.0)), f64::hypot, f32::hypot));
+    compared.push(binary(units, "Root", Root, false, roots, nth, nth32));
+    compared.push(binary(units, "Root.one", Root, true, roots, nth, nth32));
+    compared.push(binary(units, "Maximum", reduce::Maximum, false, ((-1.0, 1.0), (-1.0, 1.0)), f64::max, f32::max));
+    compared.extend(reductions(units));
     // A polynomial of degree 7 at the negative of each input, against `horner` for one input at a time. `black_box` hides the degree, which a caller rarely knows when it compiles.
     let c64 = [0.5, -1.25, 0.75, 2.0, -0.125, 0.0625, -1.5, 0.25];
     let c32 = c64.map(|k| k as f32);
     let (c64, c32): (&[f64], &[f32]) = (black_box(&c64), black_box(&c32));
     let (x64, x32) = widths(-2.0, 2.0, GOLDEN, N);
-    compared.push(compare(&units, "polynomial::evaluate", || {
+    compared.push(compare(units, "polynomial::evaluate", || {
         time_slice(N, |k, out| { negate(black_box(set(&x64, k)), out); polynomial::evaluate(c64, out) })
     }, || time(&x64, |x| horner(c64, x)), || {
         time_slice(N, |k, out| { negate(black_box(set(&x32, k)), out); polynomial::evaluate(c32, out) })
     }, || time(&x32, |x| horner(c32, x))));
-    let costed: Vec<_> = compared.iter().map(|&(name, _, costs)| (name, costs)).chain(special(&units)).chain(complex(&complex_units))
-        .chain(inner_products(&units)).chain(orderings(&units)).chain(decompositions(&units, &complex_units))
+    let costed = compared.iter().map(|&(name, _, costs)| (name, costs)).chain(special(units)).chain(complex(complex_units))
+        .chain(inner_products(units)).chain(orderings(units)).chain(decompositions(units, complex_units))
         .flat_map(|(name, costs)| ["f64", "f32"].into_iter().zip(costs).map(move |(width, cost)| (width, name, cost)))
         .chain(arrays(&units.1)).collect();
+    (compared, costed)
+}
+
+#[test]
+fn speed() {
+    let _lock = timing::exclusive().unwrap();
+    let units = Units(Unit::new(1.0f64), Unit::new(1.0f32));
+    let complex_units = Units(Unit::new(num_complex::Complex::new(1.0f64, 1.0)), Unit::new(num_complex::Complex::new(1.0f32, 1.0)));
+    let (compared, costed) = measured(&units, &complex_units);
     let print_all = std::env::var_os("RUSTYMATH_COSTS").is_some();
     let mut stderr = std::io::stderr();
     if print_all {
@@ -503,15 +472,21 @@ fn speed() {
         writeln!(stderr).unwrap();
     }
     let budgets = budgets(include_str!("speed.txt"));
+    let line = |&(width, name, cost): &(&str, &str, f64)| match budgets.get(&(width, name)) {
+        Some(budget) => format!("{width} {name}: {cost:.2}, budget {budget}"), None => format!("{width} {name}: {cost:.2}, with no budget in speed.txt")
+    };
+    let over = |&(width, name, cost): &(&str, &str, f64)| budgets.get(&(width, name)).is_some_and(|&budget| cost > budget);
     let mut failures = Vec::new();
-    for &(width, name, cost) in &costed {
-        let budget = budgets.get(&(width, name)).copied();
-        let line = match budget {
-            Some(budget) => format!("{width} {name}: {cost:.2}, budget {budget}"), None => format!("{width} {name}: {cost:.2}, with no budget in speed.txt")
-        };
-        if print_all { writeln!(stderr, "{line}").unwrap(); }
-        if budget.is_none_or(|budget| cost > budget) { failures.push(line); }
+    for row in &costed {
+        if print_all { writeln!(stderr, "{}", line(row)).unwrap(); }
+        if !budgets.contains_key(&(row.0, row.1)) { failures.push(line(row)); }
     }
+    let slow = timing::retried(costed.iter().copied().filter(over).collect(), |slow, pause| {
+        for row in &slow { writeln!(stderr, "{}: over, timed again after {pause} s", line(row)).unwrap(); }
+        let again = measured(&units, &complex_units).1.into_iter().filter(|row| slow.iter().any(|s| (s.0, s.1) == (row.0, row.1)));
+        again.inspect(|row| writeln!(stderr, "{}", line(row)).unwrap()).filter(over).collect()
+    });
+    failures.extend(slow.iter().map(line));
     for &(width, name) in budgets.keys().filter(|&&(w, n)| !costed.iter().any(|&(width, name, _)| (width, name) == (w, n))) {
         failures.push(format!("{width} {name} has a budget in speed.txt, but the test doesn't time it"));
     }

@@ -23,7 +23,7 @@ fn selector(layout: &Layout, axis: usize, obj: &Bound<'_, PyAny>) -> PyResult<Se
         if let Ok(i) = obj.extract::<i64>() { return Ok(Selector::At(at(i, size)?)); }
     }
     if let Ok(names) = obj.extract::<Vec<String>>() {
-        let positions = names.iter().map(|n| key(layout, axis, n).map(Some)).collect::<PyResult<Vec<_>>>()?;
+        let positions = names.iter().map(|n| key(layout, axis, n)).collect::<PyResult<Vec<_>>>()?;
         return Ok(Selector::Indices { layout: Layout::from([positions.len()]), positions });
     }
     let indices = convert::one(obj)?;
@@ -31,12 +31,11 @@ fn selector(layout: &Layout, axis: usize, obj: &Bound<'_, PyAny>) -> PyResult<Se
     let (within, positions) = match items.view() {
         View::Booleans(mask) => {
             if indices.layout().shape() != [size] { return Err(PyIndexError::new_err("a Boolean selector must be a vector matching its axis")); }
-            let positions: Vec<_> = mask.iter().enumerate().filter_map(|(i, &b)| b.then_some(Some(i))).collect();
+            let positions: Vec<_> = mask.iter().enumerate().filter_map(|(i, &b)| b.then_some(i)).collect();
             (Layout::from([positions.len()]), positions)
         }
-        View::Integers(items) => {
-            let named = indices.layout().names().iter().any(Option::is_some);
-            (indices.layout().clone(), structure::index_positions((0..items.len()).map(|i| items.get(i)), size, named).map_err(py_err)?)
+        View::Integers(_) => {
+            (indices.layout().clone(), structure::positions(items.view(), size).map_err(py_err)?)
         }
         _ if indices.view().is_empty() => (indices.layout().clone(), vec![]),
         _ => return Err(PyTypeError::new_err("an axis selector must be an integer, key, slice, Boolean mask or integer array")),
@@ -44,26 +43,39 @@ fn selector(layout: &Layout, axis: usize, obj: &Bound<'_, PyAny>) -> PyResult<Se
     Ok(Selector::Indices { layout: within, positions })
 }
 
-/// Decodes brackets once; the same plan serves reads and assignment.
+/// Decodes brackets once; the same plan serves reads and assignment. A selector with one axis name addresses the axis with that name, and the others take the remaining axes in order, as `structure::addressed` gives them.
 pub fn selection(layout: &Layout, index: &Bound<'_, PyAny>) -> PyResult<Plan> {
     let parts: Vec<_> = match index.cast::<PyTuple>() { Ok(t) => t.iter().collect(), Err(_) => vec![index.clone()] };
-    let ellipsis = index.py().Ellipsis();
+    let (ellipsis, rank) = (index.py().Ellipsis(), layout.shape().len());
     let used = parts.iter().filter(|p| !p.is_none() && !p.is(&ellipsis)).count();
-    if used > layout.shape().len() { return Err(PyIndexError::new_err("too many axis selectors")); }
+    if used > rank { return Err(PyIndexError::new_err("too many axis selectors")); }
     if parts.iter().filter(|p| p.is(&ellipsis)).count() > 1 { return Err(PyIndexError::new_err("only one ellipsis is allowed")); }
-    let (mut axis, mut selectors) = (0, Vec::new());
+    // Each written selector, or `None` for an axis that the ellipsis stands for, with the number of new axes before it.
+    let (mut written, mut new) = (Vec::new(), 0);
     for p in parts {
-        if p.is_none() { selectors.push(Selector::NewAxis); }
-        else if p.is(&ellipsis) {
-            for _ in 0..layout.shape().len() - used { selectors.push(Selector::all(layout.shape()[axis])); axis += 1; }
-        } else { selectors.push(selector(layout, axis, &p)?); axis += 1; }
+        if p.is_none() { new += 1; }
+        else if p.is(&ellipsis) { for _ in used..rank { written.push((None, std::mem::take(&mut new))); } }
+        else { written.push((Some(p), std::mem::take(&mut new))); }
     }
-    structure::select(layout, &selectors).map_err(py_err)
+    let names: Vec<Option<String>> = written.iter().map(|(p, _)| p.as_ref().and_then(|p| p.cast::<Array>().ok()).and_then(|a| structure::sole_name(a.borrow().core().layout()).map(str::to_owned))).collect();
+    let claims: Vec<_> = names.iter().map(|n| (n.as_deref(), 1)).collect();
+    let axes = structure::addressed(layout, &claims).map_err(py_err)?;
+    let mut order: Vec<_> = (0..written.len()).collect();
+    order.sort_by_key(|&k| axes[k]);
+    let (mut selectors, mut next) = (Vec::with_capacity(rank), 0);
+    for k in order {
+        selectors.extend((next..axes[k]).map(|a| Selector::all(layout.shape()[a])));
+        selectors.extend(std::iter::repeat_n(Selector::NewAxis, written[k].1));
+        selectors.push(match &written[k].0 { Some(p) => selector(layout, axes[k], p)?, None => Selector::all(layout.shape()[axes[k]]) });
+        next = axes[k] + 1;
+    }
+    selectors.extend(std::iter::repeat_n(Selector::NewAxis, new));
+    structure::select(layout, selectors, true).map_err(py_err)
 }
 
 fn planned(arg: Arg<'_>, build: impl FnOnce(&Layout) -> Result<Plan, Error>) -> PyResult<Array> {
     let plan = build(arg.view().layout()).map_err(py_err)?;
-    Ok(Array::new(arg.selected(&plan)?))
+    Ok(Array::new(arg.selected(plan)?))
 }
 /// The layout that `axis` refers to, and the axis's position: `x`'s own layout, or the flattened layout and its one axis when `axis` is `None`.
 fn along(x: &Arg<'_>, axis: Option<Axis>) -> PyResult<(Layout, usize)> {
@@ -135,7 +147,7 @@ pub fn squeeze(x: &Bound<'_, PyAny>, axis: Option<Axes>) -> PyResult<Array> {
     };
     if axes.iter().any(|&a| layout.shape()[a] != 1) { return Err(PyValueError::new_err("squeeze axes must have length one")); }
     let selectors = layout.shape().iter().enumerate().map(|(a, &n)| if axes.contains(&a) { Selector::At(0) } else { Selector::all(n) }).collect::<Vec<_>>();
-    planned(x, |layout| structure::select(layout, &selectors))
+    planned(x, |layout| structure::select(layout, selectors, false))
 }
 
 /// Gathers independent positions on one axis, or on the flattened input without `axis`.
@@ -173,7 +185,7 @@ pub fn flip(x: &Bound<'_, PyAny>, axis: Option<Axis>) -> PyResult<Array> {
     let selectors: Vec<_> = layout.shape().iter().enumerate().map(|(a, &n)| if selected.is_none_or(|s| s == a) {
         Selector::Range { start: n.saturating_sub(1), len: n, step: -1 }
     } else { Selector::all(n) }).collect();
-    planned(x, |layout| structure::select(layout, &selectors))
+    planned(x, |layout| structure::select(layout, selectors, false))
 }
 
 /// Joins arrays along `axis`, the first by default. `axis=None` joins the flattened arrays.
@@ -219,7 +231,7 @@ pub fn split(x: &Bound<'_, PyAny>, sections: &Bound<'_, PyAny>, axis: Option<Axi
     points.into_iter().chain([size]).map(|end| {
         let plan = structure::select_axis(&layout, a, Selector::Range { start, len: end.saturating_sub(start), step: 1 }).map_err(py_err)?;
         start = end;
-        Ok(Array::new(x.selected(&plan)?))
+        Ok(Array::new(x.selected(plan)?))
     }).collect()
 }
 

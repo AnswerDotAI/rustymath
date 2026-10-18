@@ -1,8 +1,8 @@
 //! Broadcasting: pairing the axes of two layouts, and reading each argument's items in the order of the result.
 //!
-//! Axes with the same name pair first. The remaining axes pair from the front, so a vector pairs with the rows of a matrix. An axis of length 1 repeats along its partner. Where both arguments key an axis, the result's keys are their union, and an item that one argument lacks reads as its type's fill.
+//! Axes with the same name pair first. The remaining axes pair from the front unless their names conflict, so a vector pairs with the rows of a matrix. Two names conflict when they differ and are both hidden or both visible. A hidden name, which starts with `_`, meets a visible one as if that axis were unnamed, and the result keeps the visible name. An axis of length 1 repeats along its partner. Where both arguments key an axis, the result's keys are their union, and an item that one argument lacks reads as its type's fill.
 use crate::{
-    buffer::{Element, Source}, error::{Error, Kind}, gather::{walk_range, Same, Steps}, layout::{generated_len, strides, Layout}, parallel::{extended, Slots}, Arg, Binary, Unary, CHUNK
+    buffer::{Element, Source}, error::{Error, Kind}, gather::{walk_range, Same, Steps}, layout::{generated_len, hidden, names_conflict, strides, Layout}, parallel::{extended, Slots}, Arg, Binary, Unary, CHUNK
 };
 use std::ops::Range;
 
@@ -19,6 +19,42 @@ pub enum Mapping {
     Positions(Vec<usize>),
     /// The offsets that one entry for each result axis, outermost first, reach from `base`. An axis the input broadcasts along has step 0, and a `None` offset gives a fill.
     Steps { base: usize, steps: Vec<Steps> },
+}
+
+/// A contiguous block of storage that a view reads, each item once, with the block's axes in another order and some of them backwards. [`Mapping::block`] finds one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Block {
+    /// The items of storage that the view reads.
+    pub range: Range<usize>,
+    /// The block's shape, outermost axis first, leaving out the view's axes of length 1.
+    pub dims: Vec<usize>,
+    /// For each axis of the view, the block axis it walks and whether it walks backwards. `None` for an axis of length 1.
+    pub axes: Vec<Option<(usize, bool)>>,
+}
+
+impl Block {
+    /// How a reduction folds the view over its axis `axis`, or over every item for `None`, by folding the block in its own order: the `[outer, len, inner]` dimensions to fold the block's items along their middle, and the tables that read the totals in the order of the view's other axes, where they come in another order. A reduction combines a lane's items in any order, so these totals are the view's.
+    pub fn fold(&self, axis: Option<usize>) -> ([usize; 3], Option<Vec<Steps>>) {
+        let Some(axis) = axis else { return ([1, self.range.len(), 1], None) };
+        let folded = self.axes[axis].map(|(b, _)| b);
+        let dims = &self.dims;
+        let around = match folded {
+            Some(f) => [dims[..f].iter().product(), dims[f], dims[f + 1..].iter().product()],
+            None => [self.range.len(), 1, 1],
+        };
+        // Each other axis of the view reads the totals along its block axis.
+        let rest: Vec<usize> = dims.iter().enumerate().filter(|&(b, _)| Some(b) != folded).map(|(_, &n)| n).collect();
+        let stride = strides(&rest);
+        let steps: Vec<Steps> = self.axes.iter().enumerate().filter(|&(a, _)| a != axis).map(|(_, kept)| match *kept {
+            None => Steps::along(1, 0),
+            Some((b, back)) => {
+                let b = b - usize::from(folded.is_some_and(|f| b > f));
+                let (len, step) = (rest[b], stride[b] as isize);
+                if back { Steps::Stride { start: (len - 1) * stride[b], len, step: -step } } else { Steps::Stride { start: 0, len, step } }
+            }
+        }).collect();
+        (around, (!Steps::in_order(&steps)).then_some(steps))
+    }
 }
 
 impl Mapping {
@@ -43,7 +79,6 @@ impl Mapping {
     /// Reads of a logical array of `shape` through `outer`, then through this mapping to its storage.
     pub fn through(&self, outer: &[Steps], shape: &[usize]) -> Option<Self> {
         if outer.iter().any(|s| s.len() == 0) { return Some(Self::Linear(1)); }
-        if matches!(self, Self::Linear(1)) { return Some(Self::Steps { base: 0, steps: outer.to_vec() }); }
         let (base, inner) = self.entries(shape)?;
         let (base, steps) = Steps::through(outer, shape, base, &inner)?;
         Some(Self::Steps { base, steps })
@@ -57,16 +92,35 @@ impl Mapping {
         if base != 0 { return None; }
         self.through(&steps, shape)
     }
-    /// First item offset and signed item strides, where the mapping is affine over `shape`.
+    /// First item offset and signed item strides, where the mapping is affine over `shape`: each axis reads one regular run with no fill, as [`Steps::affine`] decides.
     pub fn affine(&self, shape: &[usize]) -> Option<(usize, Vec<isize>)> {
         // Reject non-affine entries before `per_axis` clones their tables. Singleton offsets and empty shapes remain affine.
         if !shape.contains(&0) && let Self::Steps { steps, .. } = self
-            && steps.iter().any(|s| s.len() > 1 && !matches!(s, Steps::Stride { .. })) { return None; }
-        let (mut base, steps) = self.entries(shape)?;
-        let strides = steps.iter().map(|s| match *s {
-            Steps::Stride { start, step, .. } => { base += start; Some(step) }, _ => None,
-        }).collect::<Option<_>>()?;
-        Some((base, strides))
+            && steps.iter().any(|s| s.len() > 1 && s.affine().is_none()) { return None; }
+        let (base, steps) = self.entries(shape)?;
+        let (mut first, mut strides) = (base, Vec::with_capacity(steps.len()));
+        for s in &steps {
+            let (start, step) = s.affine()?;
+            first = first.wrapping_add(start);
+            strides.push(step);
+        }
+        Some((first, strides))
+    }
+    /// The contiguous block of storage that the mapping reads over `shape`, each item once, where the block's axes come in another order or run backwards: as a transpose, a reversal or windows that don't overlap read their source. `None` where the mapping skips, repeats or fills an item.
+    pub fn block(&self, shape: &[usize]) -> Option<Block> {
+        if shape.contains(&0) { return None; }
+        let (first, strides) = self.affine(shape)?;
+        let mut walked: Vec<usize> = (0..shape.len()).filter(|&a| shape[a] > 1).collect();
+        walked.sort_by_key(|&a| std::cmp::Reverse(strides[a].unsigned_abs()));
+        let mut size = 1;
+        for &a in walked.iter().rev() {
+            if strides[a].unsigned_abs() != size { return None; }
+            size *= shape[a];
+        }
+        let start = walked.iter().filter(|&&a| strides[a] < 0).try_fold(first, |s, &a| s.checked_sub(strides[a].unsigned_abs() * (shape[a] - 1)))?;
+        let mut axes = vec![None; shape.len()];
+        for (b, &a) in walked.iter().enumerate() { axes[a] = Some((b, strides[a] < 0)); }
+        Some(Block { range: start..start + size, dims: walked.iter().map(|&a| shape[a]).collect(), axes })
     }
     /// The offset for position `i`. Panics where the mapping gives a fill.
     #[inline]
@@ -113,12 +167,20 @@ impl Mapping {
         let mut source = 1;
         for (a, (&len, &b)) in shape.iter().zip(axes).enumerate().rev() {
             steps[b] = match (input.keys(a), result.keys(b)) {
-                (Some(src), Some(dst)) if src != dst => Steps::Table(src.align(dst).into_iter().map(|p| p.map(|p| p * source)).collect()),
+                (Some(src), Some(dst)) if src != dst => Steps::table(src.align(dst).into_iter().map(|p| p.map_or(Steps::FILL, |p| p * source)).collect()),
                 _ => Steps::Stride { start: 0, len: output[b], step: if len == 1 { 0 } else { source as isize } },
             };
             source *= len;
         }
         Self::Steps { base: 0, steps }
+    }
+    /// The fewest items in a block of a read through this mapping, where its innermost axis skips items, as a transpose's does: as many whole rows as a cache line holds items of `size` bytes, up to `LINE_BLOCK` items. The rows of such a block then share each fetch of a line. 0 where the innermost axis reads adjacent items or one item.
+    pub fn line_block(&self, size: usize) -> usize {
+        let Self::Steps { steps, .. } = self else { return 0 };
+        match steps.iter().rev().find(|s| s.len() > 1) {
+            Some(inner) if inner.skips() => (inner.len() * (LINE / size).max(1)).min(LINE_BLOCK),
+            _ => 0,
+        }
     }
 }
 
@@ -135,23 +197,22 @@ impl Agreement {
             let map = |l: &Layout| if len > 1 && l.shape() == shape { Mapping::Linear(1) } else { Mapping::Single };
             return Ok(Self { layout: Layout::from(shape.to_vec()), len, left: map(left), right: map(right) });
         }
-        let (nx, ny) = (left.shape().len(), right.shape().len());
-        let xa: Vec<_> = (0..nx).collect();
-        if left.names().is_empty() && right.names().is_empty() { return Self::mapped(left, right, &xa, &(0..ny).collect::<Vec<_>>()); }
-        let mut ya: Vec<_> = (0..ny).map(|b| right.name(b).and_then(|n| (0..nx).find(|&a| left.name(a) == Some(n)))).collect();
-        let remaining_left: Vec<_> = (0..nx).filter(|a| !ya.contains(&Some(*a))).collect();
-        let remaining_right: Vec<_> = (0..ny).filter(|&b| ya[b].is_none()).collect();
-        for (a, b) in remaining_left.into_iter().zip(remaining_right) { if left.name(a).is_none() || right.name(b).is_none() { ya[b] = Some(a); } }
-        let mut next = nx;
-        let ya = ya.into_iter().map(|a| {
-            a.unwrap_or_else(|| {
-                let axis = next;
-                next += 1;
-                axis
-            })
-        }).collect::<Vec<_>>();
-        Self::mapped(left, right, &xa, &ya)
+        Self::paired(left, right, &Self::paired_axes(left, right, true))
     }
+    /// For each axis of `right`, the axis of `left` that it pairs with, or a new axis after `left`'s. Axes with the same name pair first. With `positional`, the remaining axes then pair from the front where their names don't conflict, as [`Agreement::new`] pairs them.
+    pub fn paired_axes(left: &Layout, right: &Layout, positional: bool) -> Vec<usize> {
+        let (nx, ny) = (left.shape().len(), right.shape().len());
+        let mut ya: Vec<_> = (0..ny).map(|b| right.name(b).and_then(|n| (0..nx).find(|&a| left.name(a) == Some(n)))).collect();
+        if positional {
+            let remaining_left: Vec<_> = (0..nx).filter(|a| !ya.contains(&Some(*a))).collect();
+            let remaining_right: Vec<_> = (0..ny).filter(|&b| ya[b].is_none()).collect();
+            for (a, b) in remaining_left.into_iter().zip(remaining_right) { if !names_conflict(left.name(a).map(|n| &**n), right.name(b).map(|n| &**n)) { ya[b] = Some(a); } }
+        }
+        let mut next = nx;
+        ya.into_iter().map(|a| a.unwrap_or_else(|| { next += 1; next - 1 })).collect()
+    }
+    /// Pairs each axis of `right` with the axis of `left` that `axes` gives, where an axis past `left`'s is a new one.
+    pub fn paired(left: &Layout, right: &Layout, axes: &[usize]) -> Result<Self, Error> { Self::mapped(left, right, &(0..left.shape().len()).collect::<Vec<_>>(), axes) }
     /// Pairs each axis of the argument with fewer axes with the axis of the other that `axes` names.
     pub fn with_axes(left: &Layout, right: &Layout, axes: &[usize]) -> Result<Self, Error> {
         if left.shape().len() < right.shape().len() { Self::mapped(left, right, axes, &(0..right.shape().len()).collect::<Vec<_>>()) }
@@ -170,13 +231,14 @@ impl Agreement {
             let (x, y) = (xa.iter().position(|&a| a == axis), ya.iter().position(|&a| a == axis));
             let (nx, ny) = (x.map_or(1, |a| left.shape()[a]), y.map_or(1, |a| right.shape()[a]));
             let (kx, ky) = (x.and_then(|a| left.keys(a)), y.and_then(|a| right.keys(a)));
-            names[axis] = x.and_then(|a| left.name(a)).or_else(|| y.and_then(|a| right.name(a))).cloned();
+            let (lx, ly) = (x.and_then(|a| left.name(a)), y.and_then(|a| right.name(a)));
+            names[axis] = match (lx, ly) { (Some(l), Some(r)) if hidden(l) && !hidden(r) => Some(r), _ => lx.or(ly) }.cloned();
             if let (Some(x), Some(y)) = (kx, ky) {
                 let key = x.union(y)?;
                 shape[axis] = key.len();
                 keys[axis] = Some(key);
             } else {
-                let n = if nx == ny || ny == 1 { nx } else if nx == 1 { ny } else { return Err(Kind::Length.into()); };
+                let n = if nx == ny || ny == 1 { nx } else if nx == 1 { ny } else { return Err(Error::new(Kind::Length, format!("lengths {nx} and {ny} don't agree"))); };
                 shape[axis] = n;
                 keys[axis] = kx.filter(|_| nx == n).or(ky.filter(|_| ny == n)).cloned();
             }
@@ -232,12 +294,16 @@ fn item<A: Element>(mapping: &Mapping, data: &[A], i: usize) -> A { mapping.get(
 const SHORT_REPEATED: usize = 6;
 /// The shortest broadcast block that runs as one call, where an argument cycles and no argument repeats its items. A shorter block expands into a chunk buffer, which measured faster than a call for each block of up to 12 items.
 const SHORT_CYCLED: usize = 16;
+/// Bytes in a cache line on the Apple processors that rustymath is tuned on. An x86-64 line holds half as many.
+pub(crate) const LINE: usize = 128;
+/// The most items in a block of whole rows from [`Mapping::line_block`].
+const LINE_BLOCK: usize = 1 << 16;
 
 /// `f` on each block of `n` of a frame's `len` items, with the block's number and length, until a call fails. Gives whether every call succeeded. After a failure, the caller discards every block's results.
 #[inline]
 pub fn each_block(len: usize, n: usize, mut f: impl FnMut(usize, usize) -> bool) -> bool { (0..len.div_ceil(n)).all(|k| f(k, n.min(len - k * n))) }
 
-/// Runs `leaf` over a frame of `len` items that one argument lays out through `mapping`, appending its results to `out` in order, and gives whether every call succeeded. Ranges of the frame run in parallel, and `leaf` writes each range's results into its slots. Contiguous arguments and long enough broadcast blocks go to `leaf` whole, as in [`blocks`]. Other mappings expand `CHUNK` items at a time into a buffer for each range.
+/// Runs `leaf` over a frame of `len` items that one argument lays out through `mapping`, appending its results to `out` in order, and gives whether every call succeeded. Ranges of the frame run in parallel, and `leaf` writes each range's results into its slots. Contiguous arguments and long enough broadcast blocks go to `leaf` whole, as in [`blocks`]. Other mappings expand a run of items at a time, as `chunks` sizes it, into a buffer for each range.
 #[inline]
 pub fn block<Y: Element, B: Copy + Send>(
     y: &[Y], mapping: &Mapping, len: usize, out: &mut Vec<B>, leaf: impl Fn(Arg<'_, Y>, usize, &mut Slots<'_, B>) -> bool + Sync) -> bool {
@@ -251,13 +317,13 @@ pub fn block<Y: Element, B: Copy + Send>(
             Tiled(m) if m >= SHORT_CYCLED => periods(range, m, |k, p| leaf(Many(&y[p.start - k * m..p.end - k * m]), p.len(), slots)),
             _ => {
                 let mut ys = Vec::new();
-                chunks(range, |at, n| leaf(expanded(mapping, y, at, n, &mut ys), n, slots))
+                chunks(range, &[(mapping, size_of::<Y>())], |at, n| leaf(expanded(mapping, y, at, n, &mut ys), n, slots))
             }
         }
     })
 }
 
-/// Runs `leaf` over the frame of `agreement`, appending its results to `out` in order, and gives whether every call succeeded. Ranges of the frame run in parallel, and `leaf` writes each range's results into its slots. Within a range, contiguous arguments and long enough broadcast blocks go to `leaf` whole: an item beside a slice, or two slices. Shorter blocks and other mappings expand `CHUNK` items at a time into buffers for each range.
+/// Runs `leaf` over the frame of `agreement`, appending its results to `out` in order, and gives whether every call succeeded. Ranges of the frame run in parallel, and `leaf` writes each range's results into its slots. Within a range, contiguous arguments and long enough broadcast blocks go to `leaf` whole: an item beside a slice, or two slices. Shorter blocks and other mappings expand a run of items at a time, as `chunks` sizes it, into buffers for each range.
 #[inline]
 pub fn blocks<X: Element, Y: Element, B: Copy + Send, L>(
     x: &[X], y: &[Y], agreement: &Agreement<L>, out: &mut Vec<B>, leaf: impl Fn(Arg<'_, X>, Arg<'_, Y>, usize, &mut Slots<'_, B>) -> bool + Sync) -> bool {
@@ -284,7 +350,7 @@ fn paired<X: Element, Y: Element, B>(
         (Tiled(m), Linear(1)) if *m >= SHORT_CYCLED => periods(range, *m, |k, p| leaf(Many(&x[p.start - k * m..p.end - k * m]), Many(&y[p.clone()]), p.len(), out)),
         _ => {
             let (mut xs, mut ys) = (Vec::new(), Vec::new());
-            chunks(range, |at, n| leaf(expanded(left, x, at, n, &mut xs), expanded(right, y, at, n, &mut ys), n, out))
+            chunks(range, &[(left, size_of::<X>()), (right, size_of::<Y>())], |at, n| leaf(expanded(left, x, at, n, &mut xs), expanded(right, y, at, n, &mut ys), n, out))
         }
     }
 }
@@ -294,29 +360,30 @@ fn periods(range: Range<usize>, p: usize, mut f: impl FnMut(usize, Range<usize>)
     (range.start / p..range.end.div_ceil(p)).fold(true, |ok, k| f(k, range.start.max(k * p)..range.end.min(k * p + p)) & ok)
 }
 
-/// `f` on each run of up to `CHUNK` positions of `range`, with the run's first position and length. Gives whether every call succeeded. It calls `f` on every run even after a failure, so that every slot gets written.
-pub(crate) fn chunks(range: Range<usize>, mut f: impl FnMut(usize, usize) -> bool) -> bool {
-    range.clone().step_by(CHUNK).fold(true, |ok, at| f(at, CHUNK.min(range.end - at)) & ok)
+/// `f` on each run of positions of `range`, with the run's first position and length. A run holds `CHUNK` positions, or more where one of `reads`, each a mapping with the size of the items it reads, asks for whole rows through `Mapping::line_block`. Gives whether every call succeeded. It calls `f` on every run even after a failure, so that every slot gets written.
+pub(crate) fn chunks(range: Range<usize>, reads: &[(&Mapping, usize)], mut f: impl FnMut(usize, usize) -> bool) -> bool {
+    let len = reads.iter().fold(CHUNK, |n, &(mapping, size)| n.max(mapping.line_block(size)));
+    range.clone().step_by(len).fold(true, |ok, at| f(at, len.min(range.end - at)) & ok)
 }
 
-/// `f` on the frame of `len` items that one argument lays out through `mapping`, with the argument's items read as `A`, appended to `out`. Gives whether every result succeeded. Ranges of the frame run in parallel. Items that already have type `A` go to `f` as [`block`] passes them. Items of another type convert `CHUNK` at a time into buffers for each range.
+/// `f` on the frame of `len` items that one argument lays out through `mapping`, with the argument's items read as `A`, appended to `out`. Gives whether every result succeeded. Ranges of the frame run in parallel. Items that already have type `A` go to `f` as [`block`] passes them. Items of another type convert a run at a time, as `chunks` sizes it, into buffers for each range.
 #[inline]
 pub fn map1<A: Element, Y: Source<A>, B: Copy + Send>(y: &[Y], mapping: &Mapping, len: usize, f: &(impl Unary<A, Out = B> + Sync), out: &mut Vec<B>) -> bool {
     if let Some(y) = Y::borrowed(y) { return block(y, mapping, len, out, |y, n, o| f.many_into(y, n, o)); }
     extended(out, len, CHUNK, &|range, slots| {
         let (mut ye, mut ys) = (Vec::new(), Vec::new());
-        chunks(range, |at, n| f.many_into(read_mapped(mapping, y, at, n, &mut ye, &mut ys), n, slots))
+        chunks(range, &[(mapping, size_of::<Y>())], |at, n| f.many_into(read_mapped(mapping, y, at, n, &mut ye, &mut ys), n, slots))
     })
 }
 
-/// `f` on the frame of `agreement`, with both arguments' items read as `A`, appended to `out`. Gives whether every result succeeded. Ranges of the frame run in parallel. Where both arguments' items already have type `A`, `f` takes them as [`blocks`] passes them. Otherwise `f` takes `CHUNK` pairs at a time, converted into buffers for each range.
+/// `f` on the frame of `agreement`, with both arguments' items read as `A`, appended to `out`. Gives whether every result succeeded. Ranges of the frame run in parallel. Where both arguments' items already have type `A`, `f` takes them as [`blocks`] passes them. Otherwise `f` takes a run of pairs at a time, as `chunks` sizes it, converted into buffers for each range.
 #[inline]
 pub fn map2<A: Element, X: Source<A>, Y: Source<A>, B: Copy + Send, L>(x: &[X], y: &[Y], agreement: &Agreement<L>, f: &(impl Binary<A, Out = B> + Sync), out: &mut Vec<B>) -> bool {
     if let (Some(x), Some(y)) = (X::borrowed(x), Y::borrowed(y)) { return blocks(x, y, agreement, out, |x, y, n, o| f.many_into(x, y, n, o)); }
     let (left, right) = (&agreement.left, &agreement.right);
     extended(out, agreement.len, CHUNK, &|range, slots| {
         let (mut xe, mut ye, mut xs, mut ys) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        chunks(range, |at, n| f.many_into(read_mapped(left, x, at, n, &mut xe, &mut xs), read_mapped(right, y, at, n, &mut ye, &mut ys), n, slots))
+        chunks(range, &[(left, size_of::<X>()), (right, size_of::<Y>())], |at, n| f.many_into(read_mapped(left, x, at, n, &mut xe, &mut xs), read_mapped(right, y, at, n, &mut ye, &mut ys), n, slots))
     })
 }
 
@@ -327,11 +394,22 @@ pub fn read_mapped<'a, A: Element, X: Source<A>>(mapping: &Mapping, data: &'a [X
     expanded(mapping, data, start, n, spread).converted(0, n, buf, X::read)
 }
 
+/// The one item that every position in `start..start + n` reads, where `mapping` repeats a single item over all of them. `None` where the positions read more than one item.
+fn single<A: Copy>(mapping: &Mapping, data: &[A], start: usize, n: usize) -> Option<A> {
+    match *mapping { Mapping::Single => Some(data[0]), Mapping::Linear(r) if r != 1 && n <= r - start % r => Some(data[start / r]), _ => None }
+}
+
+/// Items `start..start + n` of an argument that `mapping` lays out, read as `expanded` reads them but always as a slice of all `n` items. A repeated item fills `buf`.
+pub fn expanded_items<'a, A: Element>(mapping: &Mapping, data: &'a [A], start: usize, n: usize, buf: &'a mut Vec<A>) -> &'a [A] {
+    if let Some(x) = single(mapping, data, start, n) { buf.clear(); buf.resize(n, x); return buf; }
+    match expanded(mapping, data, start, n, buf) { Arg::Many(items) => items, Arg::One(_) => unreachable!("`single` gives every repeated item") }
+}
+
 /// Items `start..start + n` of an argument that `mapping` lays out over the frame. A single item, a contiguous run, and items within one repeat or one cycle need no copy. Others copy into `buf`. A repeated item finds its source by a strength-reduced division, which multiplies in place of dividing. A cycled argument writes one period, then copies what it has written until `buf` is full. A `Steps` mapping reads a forward run in place through `run`, and copies anything else through `walk_range`.
 pub fn expanded<'a, A: Element>(mapping: &Mapping, data: &'a [A], start: usize, n: usize, buf: &'a mut Vec<A>) -> Arg<'a, A> {
+    if let Some(x) = single(mapping, data, start, n) { return Arg::One(x); }
     match *mapping {
-        Mapping::Single => return Arg::One(data[0]), Mapping::Linear(1) => return Arg::Many(&data[start..start + n]),
-        Mapping::Linear(r) if n <= r - start % r => return Arg::One(data[start / r]),
+        Mapping::Linear(1) => return Arg::Many(&data[start..start + n]),
         Mapping::Steps { base, ref steps } => {
             if let Some((o, 1)) = mapping.run(start, n) { return Arg::Many(&data[o..o + n]); }
             buf.clear();

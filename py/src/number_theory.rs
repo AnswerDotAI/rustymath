@@ -47,7 +47,7 @@ pub fn primes(py: Python<'_>, start: u64, stop: Option<u64>) -> PyResult<Bound<'
     let mut found = nt::Primes::new(start);
     let mut out = Vec::new();
     while let Some(p) = found.next_with(|| py.check_signals())?.filter(|&p| p < stop) {
-        out.push(i64::try_from(p).map_err(|_| PyOverflowError::new_err(format!("the prime {p} doesn't fit i64")))?);
+        out.push(i64::try_from(p).map_err(|_| PyOverflowError::new_err(format!("the prime {p} doesn't fit int64")))?);
     }
     let len = out.len();
     give(py, core(out, &[len])?, false)

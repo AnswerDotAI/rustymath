@@ -76,7 +76,7 @@ def test_general_inner(threads):
     terms = a[..., None] - b
     assert np.array_equal(inner(rm.add, rm.subtract)(a, b), terms.sum(axis=-2))
     half = inner(rm.add, rm.subtract)(a.astype(np.float16), b.astype(np.float16))
-    assert half.dtype == 'f16' and np.array_equal(half, terms.sum(axis=-2))
+    assert half.dtype == 'float16' and np.array_equal(half, terms.sum(axis=-2))
     counts = inner(rm.add, rm.less)(a, b)
     assert A(counts).dtype == np.int64 and np.array_equal(counts, (a[..., None] < b).sum(axis=-2))
     # Right association must survive the bounded term blocks.
@@ -84,7 +84,7 @@ def test_general_inner(threads):
     assert inner(rm.subtract, rm.multiply)(v, np.ones_like(v)) == -10_000
     assert inner(rm.subtract, rm.multiply)([1., 2, 3, 4], [1., 1, 1, 1]) == -2
     singleton = inner(rm.less, rm.add)([[2.]], [[3.]])
-    assert singleton.dtype == 'f64' and singleton.tolist() == [[5.]]
+    assert singleton.dtype == 'float64' and singleton.tolist() == [[5.]]
     assert inner(rm.add, rm.subtract)(np.empty((2, 0)), np.empty((0, 3))).tolist() == [[0.] * 3] * 2
     with pytest.raises(ValueError, match='no identity'): inner(rm.power, rm.add)(np.empty((2, 0)), np.empty((0, 3)))
     def add(x, y): return x + y
@@ -203,11 +203,14 @@ def test_matrix_layouts(threads):
     assert A(counts).dtype == np.int64 and np.array_equal(counts, np.sum(x[..., None] == y[None, None], axis=-2))
     spd = a @ a.swapaxes(-1, -2) + np.eye(8)
     assert np.allclose(rm.linalg.slogdet(spd)[1], np.linalg.slogdet(spd).logabsdet)
-    for dtype in ('f32', 'f64'):
-        m = rm.array(b, dtype=dtype)
+    s = rng.normal(size=(3, 8, 5))
+    for dtype in ('float32', 'float64', 'complex64', 'complex128'):
+        m, st = rm.array(b, dtype=dtype), rm.array(s, dtype=dtype)
         for view in (m.T, m[::-1], m[:, ::2]):
             dense = view.compact()
             assert np.allclose(view.T @ view, dense.T @ dense, rtol=1e-5, atol=1e-6)
+        for p, q in [(m[:, 1] @ m, b[:, 1] @ b), (m.T @ m[:, 1], b.T @ b[:, 1]), (rm.swapaxes(st, -1, -2) @ st, s.swapaxes(-1, -2) @ s), (st[:, ::-1] @ m.T, s[:, ::-1] @ b.T)]:
+            assert np.allclose(p, q, rtol=1e-5, atol=1e-5)
 
 def test_matrix_failures(threads):
     a = np.broadcast_to(np.eye(3), (2, 64, 3, 3)).copy()

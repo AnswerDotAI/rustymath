@@ -38,9 +38,9 @@ def test_exact_polynomials():
 def test_polynomial():
     from numpy.polynomial import polynomial as P
     c, x = [2.0, -3.0, 1.0], np.linspace(-2, 3, 50)
-    assert rm.polynomial.polyval(2.0, [1, 2, 3]) == 17 and rm.polynomial.polyval(np.float32(x), np.float32(c)).dtype == 'f32'
+    assert rm.polynomial.polyval(2.0, [1, 2, 3]) == 17 and rm.polynomial.polyval(np.float32(x), np.float32(c)).dtype == 'float32'
     assert np.allclose(rm.polynomial.polyval(x.reshape(5, 10), c), P.polyval(x, c).reshape(5, 10))
-    assert np.allclose(rm.polynomial.polyroots(c), [1, 2]) and rm.polynomial.polyroots(np.float16(c)).dtype == 'c64'
+    assert np.allclose(rm.polynomial.polyroots(c), [1, 2]) and rm.polynomial.polyroots(np.float16(c)).dtype == 'complex64'
     assert np.allclose(rm.polynomial.polyroots([1.0, 0, 1]), [-1j, 1j]) and len(rm.polynomial.polyroots([5.0])) == 0
     # Each root is NaN where the eigenvalue solver fails, as it does on NaN coefficients.
     with np.errstate(all='raise'):
@@ -73,7 +73,7 @@ def test_polynomial_fields():
     assert p.polyval(1j, [1, 2j]) == -1 and p.polyvalfromroots(3, [], m=2) == 2
     assert p.polyfromroots([], m=3).tolist() == [3] and p.polyval([np.inf], [2, 0]).tolist() == [2]
     with pytest.raises(ValueError, match='scalar'): p.polyfromroots([1, 2], m=[1, 2])
-    with pytest.raises(ValueError, match="polyfit doesn't take c128"): p.polyfit([1j, 2j], [1, 2], 1)
+    with pytest.raises(ValueError, match="polyfit doesn't take complex128"): p.polyfit([1j, 2j], [1, 2], 1)
 
 def test_mixed_radix():
     bases, values = [0, 24, 60], np.array([[1563, 3064], [-1, 0]])
@@ -84,8 +84,8 @@ def test_mixed_radix():
     assert rm.exact.decode(bases, [[1, 2, 3], [2, 3, 4]]) == [F(1563), F(3064)]
     digits = np.array([[[1, 2, 3], [2, 3, 4]], [[3, 4, 5], [4, 5, 6]]], np.float32)
     got = rm.polynomial.decode(np.array([0, 24, 60], np.float32), digits[:, ::-1])
-    assert got.dtype == 'f32' and np.array_equal(got, ((digits[..., 0] * 24 + digits[..., 1]) * 60 + digits[..., 2])[:, ::-1])
-    assert rm.polynomial.decode(np.complex64([0, 1j]), np.complex64([[2, 3]])).dtype == 'c64'
+    assert got.dtype == 'float32' and np.array_equal(got, ((digits[..., 0] * 24 + digits[..., 1]) * 60 + digits[..., 2])[:, ::-1])
+    assert rm.polynomial.decode(np.complex64([0, 1j]), np.complex64([[2, 3]])).dtype == 'complex64'
     assert rm.polynomial.decode([0, 10], np.empty((0, 2))).shape == (0,)
     for decode in [rm.integer.decode, rm.polynomial.decode, rm.exact.decode]:
         for bases, digits in [([], []), ([[1, 2]], [1, 2]), ([1, 2], [1]), ([1, 2], 1)]:

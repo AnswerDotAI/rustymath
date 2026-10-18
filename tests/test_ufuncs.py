@@ -1,5 +1,6 @@
 import math
 import numpy as np, pytest, rustymath as rm
+from numpy.lib.stride_tricks import sliding_window_view as windows
 
 A = np.asarray
 
@@ -21,7 +22,7 @@ def test_elementwise():
     assert ulps(rm.arctan2(x, x - 0.5), np.arctan2(x, x - 0.5)).max() <= 4
     assert ulps(rm.root(3, x[::7]), np.cbrt(x[::7])).max() <= 4
     # A Python scalar gives a Python number, and an array of rank 0, NumPy scalars included, gives one of its dtype.
-    assert isinstance(rm.exp(1), float) and rm.exp(np.float32(1)).dtype == 'f32' and rm.exp(np.float32(1)).shape == ()
+    assert isinstance(rm.exp(1), float) and rm.exp(np.float32(1)).dtype == 'float32' and rm.exp(np.float32(1)).shape == ()
     # Booleans and integers compute in the narrowest float that holds them exactly, but at least float32, and lists convert.
     assert [A(rm.exp(np.array([0, 1], t))).dtype for t in (np.bool_, np.uint8, np.int16, np.int32, np.int64)] == [np.float32] * 3 + [np.float64] * 2
     assert A(rm.exp([0, 1])).dtype == np.float64 and np.allclose(rm.exp([0, 1]), [1, np.e])
@@ -44,12 +45,13 @@ def test_complex():
 
 def test_integers():
     a, b = np.arange(-30, 30), np.arange(1, 61)[::-1] - 25
-    assert (A(rm.gcd(a, b)) == np.gcd(a, b)).all() and (A(rm.lcm(a, b)) == np.sign(a * b) * np.lcm(a, b)).all() and rm.gcd(a, b).dtype == 'i64'
+    assert (A(rm.gcd(a, b)) == np.gcd(a, b)).all() and (A(rm.lcm(a, b)) == np.sign(a * b) * np.lcm(a, b)).all() and rm.gcd(a, b).dtype == 'int64'
     assert (A(rm.remainder(a, b + 100)) == np.remainder(a, b + 100)).all()
-    assert (A(rm.power(a, 3)) == a**3).all() and rm.power(a, 3).dtype == 'i64'
-    # An integer result that doesn't fit raises, and a negative integer exponent has no integer power.
-    with pytest.raises(OverflowError): rm.power(np.int64(10), 30)
+    assert (A(rm.power(a, 3)) == a**3).all() and rm.power(a, 3).dtype == 'int64'
+    # An integer power that doesn't fit wraps, as NumPy's does. A negative exponent has no integer power beside a base other than 1 or -1, whatever other pairs give.
+    assert rm.power(np.array([10, 3]), 30).tolist() == np.power(np.array([10, 3]), 30).tolist() and rm.power(np.array([3], np.uint8), 6).tolist() == [729 % 256]
     with pytest.raises(ValueError, match='negative'): rm.power(np.array([2, 3]), np.array([1, -1]))
+    assert rm.power(np.array([1, 2]), np.array([-1, 63])).tolist() == [1, -2**63]
     # Each integer width keeps its type.
     for t in [np.uint8, np.int16, np.int32, np.int64]:
         x, y = np.arange(1, 12).astype(t), np.arange(12, 1, -1).astype(t)
@@ -60,25 +62,25 @@ def test_integers():
             got, want = A(getattr(rm, name)(x)), getattr(np, name)(x)
             assert got.dtype == want.dtype and (got == want).all(), (name, t)
         assert A(rm.equal(x, y)).dtype == bool and (A(rm.less(x, y)) == (x < y)).all(), t
-        with pytest.raises(OverflowError): rm.add(np.array([np.iinfo(t).max], t), np.array([1], t))
+        assert rm.add(np.array([np.iinfo(t).max], t), np.array([1], t)).tolist() == [np.iinfo(t).min], t
     # Integers compare exactly, where float64 would round them to one value.
     assert not rm.equal(10**15, 10**15 + 1) and rm.less(2**62, 2**62 + 1)
     # A Python float beside integers promotes them to float64, and the comparison then uses the tolerance.
     assert A(rm.add(np.arange(3, dtype=np.int16), 0.5)).dtype == np.float64
     assert rm.equal(np.arange(3), 1 + 1e-15).tolist() == [False, True, False]
-    # Arrays of different dtypes promote as NumPy's do. NumPy's other integer widths have no rustymath dtype.
-    for t, u in [(np.int16, np.int32), (np.bool_, np.uint8), (np.uint8, np.float16), (np.int16, np.float16), (np.int32, np.float32), (np.float64, np.complex64)]:
+    # Arrays of different dtypes promote to the higher kind, wide enough for both. An integer beside a float takes the float's dtype, as in JAX, where NumPy widens the float. NumPy's other integer widths have no rustymath dtype.
+    for t, u, want in [(np.int16, np.int32, np.int32), (np.bool_, np.uint8, np.uint8), (np.uint8, np.float16, np.float16), (np.int16, np.float16, np.float16), (np.int32, np.float32, np.float32), (np.float64, np.complex64, np.complex128)]:
         x, y = np.arange(3).astype(t), np.arange(3).astype(u)
-        assert A(rm.add(x, y)).dtype == np.result_type(x, y), (t, u)
+        assert A(rm.add(x, y)).dtype == want, (t, u)
     with pytest.raises(ValueError): rm.add(np.arange(3, dtype=np.uint64), 1)
-    # A signed type's least value has no magnitude of its type.
-    with pytest.raises(OverflowError): rm.absolute(np.array([-32768], np.int16))
+    # A signed type's least value has no magnitude of its type, and wraps to itself.
+    assert rm.absolute(np.array([-32768], np.int16)).tolist() == [-32768]
     p, q = np.array([True, True, False, False]), np.array([True, False, True, False])
     for name in ['maximum', 'minimum', 'logical_and', 'logical_or', 'logical_xor', 'logical_xnor']:
         got, want = A(getattr(rm, name)(p, q)), getattr(np, 'equal' if name == 'logical_xnor' else name)(p, q)
         assert got.dtype == bool and (got == want).all(), name
     # Booleans add and multiply as int64. Logical functions take only Booleans.
-    assert rm.add(p, q).tolist() == [2, 1, 1, 0] and rm.multiply(p, q).dtype == 'i64'
+    assert rm.add(p, q).tolist() == [2, 1, 1, 0] and rm.multiply(p, q).dtype == 'int64'
     with pytest.raises(ValueError): rm.logical_and([1, 2], [3, 4])
     assert A(rm.floor(p)).dtype == bool and A(rm.absolute(p)).dtype == bool
 
@@ -93,9 +95,9 @@ def test_reductions(threads):
     most = rm.max(v)
     assert np.isnan(most) or most == 5
     assert rm.max(x[::7]) == x[::7].max() and rm.min(x) == x.min() and rm.minimum(np.nan, 1.0) == 1 and np.isnan(rm.minimum(1.0, np.nan))
-    # Integers and Booleans sum as int64, and a total that doesn't fit raises.
+    # Integers and Booleans sum as int64, and a total that doesn't fit wraps.
     assert rm.sum(np.array([100, 100], np.uint8)) == 200 and rm.sum([True, True, False]) == 2
-    with pytest.raises(OverflowError): rm.sum(np.full(3, 2**62))
+    assert rm.sum(np.full(3, 2**62)) == np.full(3, 2**62).sum()
     assert rm.max(np.array([3, -7, 5], np.int16)) == 5
     b = np.random.default_rng(0).integers(0, 2, (17, 1001)).astype(bool)
     for axis in [0, 1]:
@@ -116,6 +118,15 @@ def test_reductions(threads):
     factors = 1 + (x - 1.5) * 1e-5
     assert np.isclose(rm.prod(factors), factors.prod())
     assert rm.max(x[::-2]) == x[-1] and rm.min(x) == x[0]
+    # A view that reads a block of its storage, such as a transpose, a reversal or swapped axes, folds the block in place. Its totals come back in the view's order.
+    s = np.random.default_rng(1).random((3, 4, 5))
+    t, n = rm.array(s), rm.array(np.arange(60).reshape(3, 4, 5))
+    for view, ref in [(t.T, s.T), (t[::-1, :, ::-1], s[::-1, :, ::-1]), (rm.swapaxes(t, 0, 2), s.swapaxes(0, 2))]:
+        for axis in [None, 0, 1, 2, (0, 2)]:
+            assert np.allclose(rm.sum(view, axis=axis), ref.sum(axis)) and np.array_equal(A(rm.max(view, axis=axis)), ref.max(axis))
+            assert np.array_equal(A(rm.minmax(view, axis=axis)[0]), ref.min(axis))
+    assert np.array_equal(A(rm.sum(rm.swapaxes(n, 0, 2), axis=1)), np.arange(60).reshape(3, 4, 5).swapaxes(0, 2).sum(1))
+    assert np.array_equal(A(rm.any(rm.array(b).T, axis=0)), b.T.any(0))
 
 def test_tolerant():
     assert rm.equal(0.1 + 0.2, 0.3) and not rm.equal(0.1 + 0.2, 0.3, ct=0)
@@ -147,7 +158,7 @@ def test_special():
     z = x[::10] + 1j * x[::-10]
     assert np.allclose(rm.loggamma(z), special.loggamma(z)) and np.allclose(rm.gamma(z), special.gamma(z))
     # A real argument to `loggamma` computes as complex, and `gammaln` takes only reals.
-    assert rm.loggamma(x).dtype == 'c128' and np.allclose(rm.loggamma(x), special.loggamma(x))
+    assert rm.loggamma(x).dtype == 'complex128' and np.allclose(rm.loggamma(x), special.loggamma(x))
     with pytest.raises(ValueError): rm.gammaln(z)
 
 def test_distribution():
@@ -228,9 +239,29 @@ def test_native_accumulation():
     assert rm.accumulate(rm.less, [3, 2, 1], start=1).tolist() == [1, 1, 0]
     assert rm.accumulate(rm.logical_xor, [True, False, True], start=True).tolist() == [False, False, True]
     assert rm.accumulate(rm.subtract, np.empty((2, 0)), axis=-1).shape == (2, 0)
-    with pytest.raises(OverflowError): rm.accumulate(rm.add, [2**62] * 3)
+    assert rm.accumulate(rm.add, [2**62] * 3).tolist() == np.cumsum([2**62] * 3).tolist()
     for f, start in [(np.add, None), (lambda a, b: a + b, None), (rm.add, [1])]:
         with pytest.raises(ValueError): rm.accumulate(f, [1, 2], start=start)
+    # Each window of a sliding fold matches the same reduction of that window alone, narrow or wide, with each fold keyed as its window's first item.
+    x = np.random.default_rng(0).random((6, 40))
+    for f, g in [(rm.add, np.sum), (rm.multiply, np.prod), (rm.maximum, np.max), (rm.minimum, np.min)]:
+        for width, axis in [(3, -1), (12, -1), (4, 0)]:
+            assert np.allclose(rm.sliding(f, x, width, axis), g(windows(x, width, axis=axis), axis=-1))
+    assert rm.sliding(rm.add, np.arange(10), 4).tolist() == windows(np.arange(10), 4).sum(-1).tolist()
+    assert rm.sliding(rm.logical_or, [False, True, False, False], 2).tolist() == [True, True, False]
+    assert rm.sliding(rm.maximum, rm.array({'a': 1., 'b': 3, 'c': 2}), 2).keys == (('a', 'b'),)
+    # `sliding_argmax` and `sliding_argmin` give the position along the axis of each window's first maximum or minimum.
+    ties = np.random.default_rng(1).integers(0, 4, (6, 40))
+    for data in [x, ties, ties.astype(np.float16), ties > 1]:
+        for width, axis in [(3, -1), (12, -1), (4, 0)]:
+            w = windows(data, width, axis=axis)
+            starts = np.indices(w.shape[:-1])[axis]
+            assert np.array_equal(A(rm.sliding_argmax(data, width, axis)), w.argmax(-1) + starts)
+            assert np.array_equal(A(rm.sliding_argmin(data, width, axis)), w.argmin(-1) + starts)
+    assert rm.sliding_argmax([1., np.nan, 0.], 2).tolist() == [0, 2]
+    for width in [0, 41]:
+        with pytest.raises(ValueError, match='window'): rm.sliding(rm.add, x, width)
+    with pytest.raises(ValueError): rm.sliding(rm.subtract, x, 3)
 
 def test_elementwise_layouts(threads):
     x = np.linspace(0.1, 1, 262_147)
@@ -239,7 +270,7 @@ def test_elementwise_layouts(threads):
     # Arguments pair their leading axes, so a vector pairs with the rows of a matrix.
     m = x[:6].reshape(2, 3)
     assert np.allclose(rm.add(m, [10, 20]), m + np.array([[10], [20]]))
-    for dtype in ('f32', 'f64'):
+    for dtype in ('float32', 'float64'):
         a = rm.array(m, dtype=dtype)
         for view in (a.T, a[::-1], a[:, ::2]):
             dense = view.compact()
@@ -250,9 +281,9 @@ def test_elementwise_layouts(threads):
 def test_parallel_errors(threads):
     x = np.ones(262_147)
     x[-1] = -1
-    powers = np.full(len(x), 3, np.int64)
-    powers[-1] = 63
-    with pytest.raises(OverflowError): rm.power(np.full(len(x), 2, np.int64), powers)
+    counts = np.full(len(x), 3, np.int64)
+    counts[-1] = 64
+    with pytest.raises(OverflowError): rm.left_shift(np.ones(len(x), np.int64), counts)
     y = A(rm.log(x))
     assert np.isnan(y[-1]) and np.allclose(y[:-1], 0)
     assert np.isnan(A(rm.log(np.full(len(x), np.nan)))).all()

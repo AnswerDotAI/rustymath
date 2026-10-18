@@ -1,4 +1,4 @@
-//! Errors from rustymath's functions on arrays. Each error has a kind, and a message for the reader that can be empty.
+//! Errors from rustymath's functions on arrays. Each error has a kind, and a message that says what went wrong.
 use std::borrow::Cow;
 
 /// What went wrong.
@@ -28,16 +28,8 @@ impl Error {
     pub fn new(kind: Kind, message: impl Into<Cow<'static, str>>) -> Self { Self { kind, message: message.into() } }
 }
 
-/// An error of `kind` with no message.
-impl From<Kind> for Error {
-    fn from(kind: Kind) -> Self { Self::new(kind, "") }
-}
-
-/// The message, or the kind's name when the message is empty.
 impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.message.is_empty() { write!(f, "{:?}", self.kind) } else { f.write_str(&self.message) }
-    }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.message) }
 }
 
 impl std::error::Error for Error {}

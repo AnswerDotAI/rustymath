@@ -99,22 +99,58 @@ pub trait Tolerant: Copy + Send + Sync {
         if y == 0.0 { return F::narrow(x); }
         let whole = x.fract() == 0.0 && y.fract() == 0.0 && x * y < 1e14 && self.value() <= Tolerance::DEFAULT.value();
         if let Some(g) = whole.then(|| crate::integer::gcd(int(x)?, int(y)?)).flatten() { return float(g); }
-        let scale = BigRational::from_float(x).unwrap();
-        let ratio = &scale / BigRational::from_float(y).unwrap();
-        let tolerance = BigRational::from_float(self.value()).unwrap() * &ratio;
-        let (mut n, mut d) = ratio.clone().into_raw();
-        let (mut p0, mut p1) = (BigInt::from(0), BigInt::from(1));
-        let (mut q0, mut q1) = (BigInt::from(1), BigInt::from(0));
-        loop {
-            let a = &n / &d;
-            (p0, p1) = (p1.clone(), &a * &p1 + p0);
-            (q0, q1) = (q1.clone(), &a * &q1 + q0);
-            if (BigRational::new(p1.clone(), q1.clone()) - &ratio).abs() <= tolerance {
-                return F::narrow((scale / BigRational::from_integer(p1)).to_f64().unwrap());
-            }
-            (n, d) = (d.clone(), n % d);
-        }
+        let (t, (nx, dy)) = (self.value(), ratio_parts(x, y));
+        if let Some(g) = fixed_gcd(x, y, nx, dy, t) { return F::narrow(g); }
+        // The same walk on big integers, where the test `|p·d − q·n| ≤ t·n·q` is exact for `t = m·2^e`.
+        let (n, d) = (BigInt::from(nx.0) << nx.1, BigInt::from(dy.0) << dy.1);
+        let (m, e, _) = num_traits::Float::integer_decode(t);
+        let p = convergents(n.clone(), d.clone(), |p, q| {
+            let (gap, bound) = ((p * &d - q * &n).abs(), BigInt::from(m) * &n * q);
+            let within = gap.is_zero() || m != 0 && if e >= 0 { gap <= bound << e as usize } else { gap << (-e) as usize <= bound };
+            within.then(|| p.clone())
+        });
+        F::narrow((BigRational::from_float(x).unwrap() / BigRational::from_integer(p)).to_f64().unwrap())
     }
+}
+
+/// `x / y`, for finite positive `x` and `y`, as `n / d` with `n = mx·2^sx` and `d = my·2^sy`: odd mantissas, with the larger exponent's excess as a shift on its side.
+fn ratio_parts(x: f64, y: f64) -> ((u64, u32), (u64, u32)) {
+    let odd = |v: f64| { let (m, e, _) = num_traits::Float::integer_decode(v); (m >> m.trailing_zeros(), i32::from(e) + m.trailing_zeros() as i32) };
+    let ((mx, ex), (my, ey)) = (odd(x), odd(y));
+    if ex >= ey { ((mx, (ex - ey) as u32), (my, 0)) } else { ((mx, 0), (my, (ey - ex) as u32)) }
+}
+
+/// Walks the convergents `p/q` of the continued fraction of `n/d`, for `n, d > 0`, and gives `done`'s answer for the first convergent where it gives one. The last convergent is `n/d` itself, so `done` must answer there at the latest.
+fn convergents<I: num_traits::Num + Clone, R>(n: I, d: I, mut done: impl FnMut(&I, &I) -> Option<R>) -> R {
+    let (mut a, mut b) = (n, d);
+    let (mut p0, mut p1, mut q0, mut q1) = (I::zero(), I::one(), I::one(), I::zero());
+    loop {
+        let k = a.clone() / b.clone();
+        let p = k.clone() * p1.clone() + p0;
+        p0 = std::mem::replace(&mut p1, p);
+        let q = k * q1.clone() + q0;
+        q0 = std::mem::replace(&mut q1, q);
+        if let Some(answer) = done(&p1, &q1) { return answer; }
+        let r = a % b.clone();
+        (a, b) = (b, r);
+    }
+}
+
+/// [`Tolerant::gcd`]'s walk at tolerance `t`, in fixed width, for finite `x ≥ y > 0` whose ratio has the parts that `ratio_parts` gives. It applies where both parts fit in 64 bits. Every convergent is then below 2^64, and every product below 2^128. `None` where the parts don't fit, where a step's test is too close to decide in floats, or where the result needs a division by an integer above 2^53. The exact walk decides those, so both give the same result.
+fn fixed_gcd(x: f64, y: f64, (mx, sx): (u64, u32), (my, sy): (u64, u32), t: f64) -> Option<f64> {
+    let shifted = |m: u64, s: u32| (m.leading_zeros() >= s).then(|| m << s);
+    let (n, d) = (shifted(mx, sx)?, shifted(my, sy)?);
+    convergents(n, d, |&p, &q| {
+        // `|p/q − n/d| ≤ t·n/d`, multiplied through by `q·d`. The float estimates decide unless they lie within 1e-15 of each other.
+        let gap = (u128::from(p) * u128::from(d)).abs_diff(u128::from(q) * u128::from(n));
+        let bound = t * (u128::from(n) * u128::from(q)) as f64;
+        let within = if gap == 0 { true } else if bound < 0.5 { false } else {
+            let g = gap as f64;
+            if g <= bound * (1.0 - 1e-15) { true } else if g >= bound * (1.0 + 1e-15) { false } else { return Some(None) }
+        };
+        // The result is `x / p`, which IEEE division rounds as the exact walk does while `p` is below 2^53. An exact end has `x / p = y / q`, with the smaller `q`.
+        within.then(|| if p <= 1 << 53 { Some(x / p as f64) } else if gap == 0 && q <= 1 << 53 { Some(y / q as f64) } else { None })
+    })
 }
 
 /// The larger of `a` and `b`. A NaN argument makes the caller's comparison false, whichever one this returns. wasm SIMD has an instruction for this choice. It has none for `max`, which must return the number beside a NaN.

@@ -5,7 +5,7 @@
 //! A product large enough splits its rows across the threads that [`crate::parallel::set_threads`] sets. On macOS, Accelerate computes real and complex plus-times products instead. `Tiled` also sends the decompositions' triangular solves, SVDs and Hermitian eigen decompositions to it, and the general eigen decompositions of real matrices from `accelerate::GEEV_FROM` rows. macOS builds with the `native` feature also compile rustymath's own kernels, and `RUSTYMATH_NATIVE=1` selects them for the whole process.
 //!
 //! The private module `factor` holds decompositions of real and complex matrices, whose blocked updates run on these loops. This module re-exports its public items, and [`Scalar`], the trait of the item types they take. [`transpose_into`] transposes a matrix through 8×8 tiles.
-use crate::{Float, convert, float::{FUSED, sealed::Core}, parallel, slice};
+use crate::{Float, agreement::{Mapping, expanded_items}, buffer::Element, convert, float::{FUSED, sealed::Core}, parallel, slice};
 use num_complex::Complex;
 use num_traits::{One, Zero};
 use std::{mem::MaybeUninit, sync::LazyLock};
@@ -96,6 +96,11 @@ pub trait Inner<T> {
             match o { Orientation::Normal => std::borrow::Cow::Borrowed(x), Orientation::Transpose => (0..rows * cols).map(|ij| x[ij % cols * rows + ij / cols]).collect() }
         }
         self.inner(&oriented(a, oa, [m, k]), &oriented(b, ob, [k, n]), [m, k, n])
+    }
+    /// `inner_ops` of operands whose items come through mappings, as [`Mapped`] describes. This default reads each operand whole, then calls `inner_ops`. Float and complex `PlusTimes` read an operand that isn't held in order one block of its stored rows at a time and multiply each block as it's read. Only one block of that operand then exists at once.
+    fn inner_mapped(&self, a: Mapped<'_, T>, b: Mapped<'_, T>, orientations: [Orientation; 2], size @ [m, k, n]: [usize; 3]) -> Vec<Self::Out> where T: Element {
+        let (mut ab, mut bb) = (Vec::new(), Vec::new());
+        self.inner_ops(a.read(0, m * k, &mut ab), b.read(0, k * n, &mut bb), orientations, size)
     }
 }
 
@@ -469,6 +474,31 @@ pub(crate) enum Op { Normal, Transpose, Adjoint, Conjugate }
 /// Whether an operand of [`Inner::inner_ops`] holds its matrix as stored or transposed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Orientation { Normal, Transpose }
+/// A row-major matrix whose items `mapping` reads from `data`, as [`expanded_items`] lays an argument over a frame. [`Inner::inner_mapped`] takes its operands this way. A matrix held in order has `Mapping::Linear(1)`.
+#[derive(Clone, Copy)]
+pub struct Mapped<'a, T> { pub data: &'a [T], pub mapping: &'a Mapping }
+
+impl<'a, T: Element> Mapped<'a, T> {
+    /// The matrix in orientation `o`, with no copy, where the mapping reads its stored matrix at positive strides, one of them 1: row by row, or column by column as a transpose. `None` for any other mapping.
+    fn matrix(&self, o: Orientation, [rows, cols]: [usize; 2]) -> Option<Matrix<'a, T>> {
+        let [r, c] = if o == Orientation::Normal { [rows, cols] } else { [cols, rows] };
+        let (first, strides) = self.mapping.affine(&[r, c])?;
+        // An axis of length 1 reads one item, so any stride serves it. A single row whose columns are strided reads as a transposed column.
+        let sc = if c == 1 { 1 } else { strides[1] };
+        let sr = if r > 1 { strides[0] } else if sc == 1 { c as isize } else { 1 };
+        let data = self.data.get(first..)?;
+        let stored = match (sr, sc) {
+            (s, 1) if s >= c as isize => Matrix::rows(data, s as usize),
+            (1, s) if s >= r as isize => Matrix { data, ld: s as usize, op: Op::Transpose },
+            _ => return None,
+        };
+        Some(if o == Orientation::Normal { stored } else { stored.transpose() })
+    }
+    /// Whether [`Inner::inner_mapped`] reads this matrix where it lies, in orientation `o` with `size` rows and columns, rather than one block at a time.
+    pub fn in_place(&self, o: Orientation, size: [usize; 2]) -> bool { self.matrix(o, size).is_some() }
+    /// Items `start..start + n` of the matrix, as [`expanded_items`] reads them.
+    fn read<'b>(&'b self, start: usize, n: usize, buf: &'b mut Vec<T>) -> &'b [T] { expanded_items(self.mapping, self.data, start, n, buf) }
+}
 #[derive(Clone, Copy)]
 pub(crate) enum Side { Left, Right }
 /// The stored triangle, before applying the matrix view's transpose or adjoint.
@@ -486,10 +516,13 @@ impl<'a, T: Copy> Matrix<'a, T> {
         }, ..self }
     }
     /// Starts at a row and column in the logical orientation.
-    #[cfg(native)]
     pub fn offset(self, row: usize, col: usize) -> Self {
         let at = if self.op.transposed() { col * self.ld + row } else { row * self.ld + col };
         Self { data: &self.data[at..], ..self }
+    }
+    /// The `rows`×`cols` matrix that an operand of [`Inner::inner_ops`] gives in orientation `o`. A transposed operand stores the `cols`×`rows` matrix, row-major.
+    pub fn oriented(data: &'a [T], o: Orientation, [rows, cols]: [usize; 2]) -> Self {
+        match o { Orientation::Normal => Self::rows(data, cols), Orientation::Transpose => Self { data, ld: rows, op: Op::Transpose } }
     }
     /// Checks the stored extent once, before any foreign call.
     fn check(self, mut rows: usize, mut cols: usize) {
@@ -598,6 +631,85 @@ fn gemm<T: Tiled>(c: &mut [T], ldc: usize, a: Matrix<'_, T>, b: Matrix<'_, T>, [
     dispatch!(accelerate::product(c, ldc, a, b, [m, k, n], alpha, beta, part), native_gemm(c, ldc, a, b, [m, k, n], alpha, beta, part))
 }
 
+/// How many items [`blocked`] reads at a time from an operand that isn't held in order, rounded to whole stored rows. A block this size stays in cache while its product runs.
+const BLOCK_ITEMS: usize = 1 << 18;
+
+/// Calls `f` on each block of an operand's stored rows, `[rows, cols]` as stored, with the block's first row, its number of rows and its items. A block holds about [`BLOCK_ITEMS`] items, in whole rows.
+fn blocks<T: Element>(op: Mapped<'_, T>, [rows, cols]: [usize; 2], mut f: impl FnMut(usize, usize, &[T])) {
+    let (step, mut block) = ((BLOCK_ITEMS / cols).max(1), Vec::new());
+    for first in (0..rows).step_by(step) {
+        let len = step.min(rows - first);
+        f(first, len, op.read(first * cols, len * cols, &mut block));
+    }
+}
+
+/// The most rows of the result that [`by_columns`] computes at once. Each column of `a` adds into them while they stay in cache.
+const COLUMN_ROWS: usize = 4096;
+/// The fewest adjacent rows of `a` that [`by_columns`] reads at once. Shorter runs cost more in loop overhead than gathering saves.
+const COLUMN_RUN: usize = 64;
+
+/// `+.×` of `a` and a vector `b`, where each row of `a` starts one item after the row before it in storage, as the windows of a vector or a single-channel image do. Each column of `a` is then a run of storage. The result is computed a run of rows at a time, by adding each column of `a`, read where it lies and scaled by its item of `b`. `a` is never gathered. `None` where `a`'s mapping doesn't split into entries for its rows and entries for its columns, or where its rows aren't adjacent in runs of at least [`COLUMN_RUN`].
+fn by_columns<T: Tiled + Element>(a: Mapped<'_, T>, b: Mapped<'_, T>, oa: Orientation, [m, k]: [usize; 2]) -> Option<Vec<T>> {
+    use crate::gather::Steps;
+    let Mapping::Steps { base, steps } = a.mapping else { return None };
+    if m * k == 0 { return None; }
+    // The entries of the stored matrix's leading axis come first, and give its first `lead` items.
+    let lead = if oa == Orientation::Normal { m } else { k };
+    let (mut split, mut size) = (0, 1);
+    while size < lead && split < steps.len() { size *= steps[split].len(); split += 1; }
+    if size != lead { return None; }
+    let (outer, inner) = steps.split_at(split);
+    let (rows, cols) = if oa == Orientation::Normal { (outer, inner) } else { (inner, outer) };
+    let Steps::Stride { step: 1, len: width, .. } = *rows.iter().rev().find(|s| s.len() > 1)? else { return None };
+    if width < COLUMN_RUN { return None; }
+    let mut whole = Vec::new();
+    let weights = b.read(0, k, &mut whole);
+    let columns: Vec<(T, usize)> = (0..k).filter_map(|p| Some((weights[p], Steps::reach(0, cols, p)?))).collect();
+    let mut c = filled(m, T::zero());
+    parallel::split(&mut c, COLUMN_ROWS, &|first, part| {
+        let mut r = first;
+        while r < first + part.len() {
+            let len = (width - r % width).min(COLUMN_ROWS).min(first + part.len() - r);
+            // A row whose outer entries give a fill reads only fills, and its result stays 0.
+            if let Some(at) = Steps::reach(*base, rows, r) {
+                let out = &mut part[r - first..r - first + len];
+                for &(w, o) in &columns {
+                    for (y, &x) in out.iter_mut().zip(&a.data[at + o..at + o + len]) { *y = *y + w * x; }
+                }
+            }
+            r += len;
+        }
+        true
+    });
+    Some(c)
+}
+
+/// `+.×` of mapped operands on the tiled kernels, for [`Inner::inner_mapped`]. An operand whose mapping reads it at positive strides, one of them 1, is used where it lies, row by row or as a transpose. Any other operand is read a block of its stored rows at a time. Each block's product goes straight into the result. A block whose rows are the result's rows or columns writes them. A block whose rows run along the contraction adds to the whole result. Where neither operand can be used where it lies, `b` is read whole. A vector `b` beside an `a` whose rows are adjacent in storage goes to [`by_columns`], which reads `a` where it lies.
+fn blocked<T: Tiled + Element>(a: Mapped<'_, T>, b: Mapped<'_, T>, [oa, ob]: [Orientation; 2], [m, k, n]: [usize; 3]) -> Vec<T> {
+    let (ma, mb) = (a.matrix(oa, [m, k]), b.matrix(ob, [k, n]));
+    if let (Some(a), Some(b)) = (ma, mb) { return T::multiply(a, b, [m, k, n]); }
+    if ma.is_none() && n == 1 && let Some(c) = by_columns(a, b, oa, [m, k]) { return c; }
+    let mut c = filled(m * n, T::zero());
+    if m == 0 || k == 0 || n == 0 { return c; }
+    let (one, zero) = (T::one(), T::zero());
+    let added = |first: usize| if first == 0 { zero } else { one };
+    let mut whole = Vec::new();
+    match ma {
+        None => {
+            let b = match mb { Some(b) => b, None => Matrix::oriented(b.read(0, k * n, &mut whole), ob, [k, n]) };
+            blocks(a, if oa == Orientation::Normal { [m, k] } else { [k, m] }, |first, len, part| match oa {
+                Orientation::Normal => T::gemm(&mut c[first * n..], n, Matrix::rows(part, k), b, [len, k, n], one, zero),
+                Orientation::Transpose => T::gemm(&mut c, n, Matrix::oriented(part, oa, [m, len]), b.offset(first, 0), [m, len, n], one, added(first)),
+            });
+        }
+        Some(a) => blocks(b, if ob == Orientation::Normal { [k, n] } else { [n, k] }, |first, len, part| match ob {
+            Orientation::Normal => T::gemm(&mut c, n, a.offset(0, first), Matrix::rows(part, n), [m, len, n], one, added(first)),
+            Orientation::Transpose => T::gemm(&mut c[first..], n, a, Matrix::oriented(part, ob, [k, len]), [m, k, len], one, zero),
+        }),
+    }
+    c
+}
+
 /// `c = beta c` for the items of `c` in `part`, where `c` is an `m`×`n` matrix whose rows start `ldc` items apart. A zero `beta` writes zeros, whatever `c` held.
 fn scale<T: Tiled>(c: &mut [T], ldc: usize, [m, n]: [usize; 2], beta: T, part: Part) {
     if beta == T::one() { return; }
@@ -662,16 +774,13 @@ macro_rules! tiled {
             fn inner(&self, a: &[$t], b: &[$t], size: [usize; 3]) -> Vec<$t> { self.inner_ops(a, b, [Orientation::Normal; 2], size) }
             fn inner_ops(&self, a: &[$t], b: &[$t], [oa, ob]: [Orientation; 2], [m, k, n]: [usize; 3]) -> Vec<$t> {
                 assert!(a.len() == m * k && b.len() == k * n, "`a` must hold `m`×`k` items and `b` `k`×`n`");
-                let view = |data, o: Orientation, [rows, cols]: [usize; 2]| match o {
-                    Orientation::Normal => Matrix { data, ld: cols, op: Op::Normal },
-                    Orientation::Transpose => Matrix { data, ld: rows, op: Op::Transpose },
-                };
-                <$t>::multiply(view(a, oa, [m, k]), view(b, ob, [k, n]), [m, k, n])
+                <$t>::multiply(Matrix::oriented(a, oa, [m, k]), Matrix::oriented(b, ob, [k, n]), [m, k, n])
             }
             fn inner_into(&self, a: &[$t], b: &[$t], [m, k, n]: [usize; 3], c: &mut [$t]) {
                 assert!(a.len() == m * k && b.len() == k * n && c.len() == m * n, "`a` must hold `m`×`k` items, `b` `k`×`n` and `c` `m`×`n`");
                 <$t>::gemm(c, n, Matrix::rows(a, k), Matrix::rows(b, n), [m, k, n], <$t>::one(), <$t>::zero())
             }
+            fn inner_mapped(&self, a: Mapped<'_, $t>, b: Mapped<'_, $t>, orientations: [Orientation; 2], size: [usize; 3]) -> Vec<$t> { blocked(a, b, orientations, size) }
         }
     )+};
 }

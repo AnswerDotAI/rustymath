@@ -19,22 +19,22 @@ pub(crate) fn radix(bases: &[usize], digits: &[usize]) -> PyResult<()> {
     }
 }
 
-/// The mixed-radix digits of each integer in `values`, most significant first, along a new last axis. A zero base takes the whole remaining value. A quotient that doesn't fit `i64` raises `OverflowError`.
+/// The mixed-radix digits of each integer in `values`, most significant first, along a new last axis. A zero base takes the whole remaining value. A quotient that doesn't fit `int64` raises `OverflowError`.
 #[pyfunction]
 fn encode<'py>(py: Python<'py>, bases: &Bound<'py, PyAny>, values: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let ((b, bases), (mut shape, values)) = (integers(bases)?, integers(values)?);
     if b.len() != 1 { return Err(py_err(Error::new(Kind::Rank, "bases must be a vector"))); }
-    let digits = rustymath::integer::encode(&bases, &values).ok_or_else(|| py_err(Error::new(Kind::Overflow, "an encoding quotient doesn't fit i64")))?;
+    let digits = rustymath::integer::encode(&bases, &values).ok_or_else(|| py_err(Error::new(Kind::Overflow, "an encoding quotient doesn't fit int64")))?;
     shape.push(bases.len());
     give(py, core(digits, &shape)?, false)
 }
 
-/// The `i64` value of each vector of digits along the last axis of `digits`. The first base is unused. A value that doesn't fit `i64` raises `OverflowError`. A vector of digits gives a Python integer.
+/// The `int64` value of each vector of digits along the last axis of `digits`. The first base is unused. A value that doesn't fit `int64` raises `OverflowError`. A vector of digits gives a Python integer.
 #[pyfunction]
 fn decode<'py>(py: Python<'py>, bases: &Bound<'py, PyAny>, digits: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let ((b, bases), (mut shape, digits)) = (integers(bases)?, integers(digits)?);
     radix(&b, &shape)?;
-    let values = rustymath::integer::decode(&bases, &digits).ok_or_else(|| py_err(Error::new(Kind::Overflow, "a decoded value doesn't fit i64")))?;
+    let values = rustymath::integer::decode(&bases, &digits).ok_or_else(|| py_err(Error::new(Kind::Overflow, "a decoded value doesn't fit int64")))?;
     shape.pop();
     give(py, core(values, &shape)?, true)
 }

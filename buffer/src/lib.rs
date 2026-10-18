@@ -36,24 +36,18 @@ fn nest<'py>(py: Python<'py>, shape: &[usize], start: usize, item: &dyn Fn(usize
     let items = (0..*n).map(|k| nest(py, rest, start + k * cell, item)).collect::<PyResult<Vec<_>>>()?;
     Ok(PyList::new(py, items)?.into_any())
 }
-/// Each dtype, with the PEP 3118 format code that [`export`] writes for it and its name in Python.
-const DTYPES: [(DType, &CStr, &str); 11] = [
-    (DType::Boolean, c"?", "bool"), (DType::Integer(Width::U8), c"B", "u8"), (DType::Integer(Width::I16), c"h", "i16"),
-    (DType::Integer(Width::I32), c"i", "i32"), (DType::Integer(Width::I64), c"q", "i64"), (DType::Float(FloatWidth::F16), c"e", "f16"),
-    (DType::Float(FloatWidth::F32), c"f", "f32"), (DType::Float(FloatWidth::F64), c"d", "f64"), (DType::Complex(ComplexWidth::F32), c"Zf", "c64"),
-    (DType::Complex(ComplexWidth::F64), c"Zd", "c128"), (DType::Character, c"w", "char"),
+/// Each dtype, with the PEP 3118 format code that [`export`] writes for it.
+const DTYPES: [(DType, &CStr); 11] = [
+    (DType::Boolean, c"?"), (DType::Integer(Width::U8), c"B"), (DType::Integer(Width::I16), c"h"), (DType::Integer(Width::I32), c"i"),
+    (DType::Integer(Width::I64), c"q"), (DType::Float(FloatWidth::F16), c"e"), (DType::Float(FloatWidth::F32), c"f"), (DType::Float(FloatWidth::F64), c"d"),
+    (DType::Complex(ComplexWidth::F32), c"Zf"), (DType::Complex(ComplexWidth::F64), c"Zd"), (DType::Character, c"w"),
 ];
 
 /// Format codes that [`read`] also accepts. `l`, C's `long`, has a size that varies by platform, so [`dtype`] reads it by its item size.
 const ALSO: [(&[u8], DType); 3] = [(b"c", DType::Integer(Width::U8)), (b"n", DType::Integer(Width::I64)), (b"1w", DType::Character)];
 
-fn entry(dtype: DType) -> &'static (DType, &'static CStr, &'static str) { DTYPES.iter().find(|e| e.0 == dtype).expect("every dtype has an entry") }
-
-/// The name of `dtype` in Python, such as `"f32"`.
-pub fn name(dtype: DType) -> &'static str { entry(dtype).2 }
-
-/// The dtype that [`name`] calls `name`, or `None` for any other name.
-pub fn named(name: &str) -> Option<DType> { DTYPES.iter().find(|e| e.2 == name).map(|e| e.0) }
+/// The PEP 3118 format code that [`export`] writes for `dtype`.
+fn format(dtype: DType) -> &'static CStr { DTYPES.iter().find(|e| e.0 == dtype).expect("every dtype has a format code").1 }
 
 /// The size and alignment of an item of `dtype`.
 fn layout(dtype: DType) -> (usize, usize) { with_dtype!(dtype, T => (size_of::<T>(), align_of::<T>())) }
@@ -169,8 +163,14 @@ pub fn read(obj: &Bound<'_, PyAny>) -> PyResult<Option<Read>> {
 
 /// The `shape` and C-order byte strides that [`export`] takes, for items of `dtype` laid out in `shape`. Keep both alive for each export.
 pub fn geometry(dtype: DType, shape: &[usize]) -> (Box<[isize]>, Box<[isize]>) {
-    let size = layout(dtype).0;
-    (shape.iter().map(|&n| n as isize).collect(), rustymath::layout::strides(shape).iter().map(|&s| (s * size) as isize).collect())
+    let strides: Vec<isize> = rustymath::layout::strides(shape).iter().map(|&s| s as isize).collect();
+    strided_geometry(dtype, shape, &strides)
+}
+
+/// The `shape` and byte strides that [`export`] takes, for items of `dtype` reached through signed item `strides`, one for each axis of `shape`, as [`Mapping::affine`](rustymath::agreement::Mapping::affine) gives them. Keep both alive for each export.
+pub fn strided_geometry(dtype: DType, shape: &[usize], strides: &[isize]) -> (Box<[isize]>, Box<[isize]>) {
+    let size = layout(dtype).0 as isize;
+    (shape.iter().map(|&n| n as isize).collect(), strides.iter().map(|&s| s * size).collect())
 }
 
 /// Fills `view` for a class's `__getbuffer__` with the `len` logical items of `dtype` under `shape` and signed byte `strides`. `data` points to the first logical item. Keep storage and geometry valid until release. Only the parts that `flags` requests are filled. Unsupported write or contiguity requests raise `BufferError`.
@@ -190,7 +190,7 @@ pub unsafe fn export(
     v.len = (len * size) as ffi::Py_ssize_t;
     v.itemsize = size as ffi::Py_ssize_t;
     v.readonly = c_int::from(readonly);
-    v.format = if flags & ffi::PyBUF_FORMAT != 0 { entry(dtype).1.as_ptr().cast_mut() } else { ptr::null_mut() };
+    v.format = if flags & ffi::PyBUF_FORMAT != 0 { format(dtype).as_ptr().cast_mut() } else { ptr::null_mut() };
     v.ndim = shape.len() as c_int;
     v.shape = shape.as_ptr().cast_mut();
     v.strides = strides.as_ptr().cast_mut();

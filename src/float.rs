@@ -43,6 +43,8 @@ pub(crate) mod sealed {
     pub trait Sealed {}
     /// A type that function objects take or give: a float, a complex number, an integer or a Boolean. Pieces on several threads read and write items.
     pub trait Item: Copy + Send + Sync {
+        /// Whether the type has NaN, as floats and complex numbers do.
+        const NAN: bool;
         /// Whether this item is NaN, or for a complex number has a NaN part. An integer or Boolean never is.
         fn has_nan(self) -> bool;
     }
@@ -51,11 +53,15 @@ pub(crate) mod sealed {
         type Out: Item;
         fn scalar(&self, x: [E; N]) -> Self::Out;
         fn checked_scalar(&self, x: [E; N]) -> Option<Self::Out>;
+        /// Whether no item fails: `checked_scalar` always gives `Some`, and `slice` always gives true.
+        const TOTAL: bool;
+        /// Whether a failed item's slot holds its result wrapped to the output type, as integer arithmetic's does.
+        const WRAPS: bool;
         fn slice(&self, x: [Arg<'_, E>; N], n: usize, out: &mut [std::mem::MaybeUninit<Self::Out>]) -> bool;
     }
-    macro_rules! nan_items { ($($t:ty),+) => {$( impl Item for $t { #[inline(always)] fn has_nan(self) -> bool { self.is_nan() } } )+} }
+    macro_rules! nan_items { ($($t:ty),+) => {$( impl Item for $t { const NAN: bool = true; #[inline(always)] fn has_nan(self) -> bool { self.is_nan() } } )+} }
     nan_items!(f32, f64, half::f16, Complex<f32>, Complex<f64>);
-    macro_rules! exact_items { ($($t:ty),+) => {$( impl Item for $t { #[inline(always)] fn has_nan(self) -> bool { false } } )+} }
+    macro_rules! exact_items { ($($t:ty),+) => {$( impl Item for $t { const NAN: bool = false; #[inline(always)] fn has_nan(self) -> bool { false } } )+} }
     exact_items!(u8, i16, i32, i64, bool, char, std::cmp::Ordering);
     macro_rules! sealed { ($($t:ty),+) => {$( impl Sealed for $t {} )+} }
     sealed!(i8, i16, i32, i64, u8, u16, u32);

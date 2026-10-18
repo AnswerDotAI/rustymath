@@ -118,12 +118,12 @@ fn lcm<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>) -> Py
 #[pyfunction]
 fn remainder<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { binary(py, x, y, |x, y| Ok(exact::residue(y, x))) }
 
-/// The binomial coefficient `n` choose `k`, for a rational `n` and a whole `k` that fits `i64`.
+/// The binomial coefficient `n` choose `k`, for a rational `n` and a whole `k` that fits `int64`.
 #[pyfunction]
 fn binom<'py>(py: Python<'py>, n: &Bound<'py, PyAny>, k: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     binary(py, n, k, |n, k| {
         if !k.is_integer() { return Err(PyValueError::new_err("binom needs a whole k")); }
-        let k = k.to_integer().to_i64().ok_or_else(|| PyOverflowError::new_err("binom needs k to fit i64"))?;
+        let k = k.to_integer().to_i64().ok_or_else(|| PyOverflowError::new_err("binom needs k to fit int64"))?;
         exact::binom_with(n, k, || py.check_signals())
     })
 }

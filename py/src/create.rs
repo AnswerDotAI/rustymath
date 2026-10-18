@@ -1,8 +1,8 @@
 //! Familiar constructors over rustymath's compact buffers and sequence generators.
 use crate::{array::{Array, core}, convert};
 use pyo3::{exceptions::PyValueError, prelude::*, types::{PyInt, PyTuple}};
-use rustymath::{array::Array as Core, buffer::{Buffer, DType, Element, Source}, layout::{Layout, generated_len}, with_dtype, with_float_width, with_width};
-use rustymath_buffer::{name, py_err};
+use rustymath::{array::Array as Core, buffer::{Buffer, DType, Element, FloatWidth, Source}, layout::{Layout, generated_len}, with_dtype, with_float_width, with_width};
+use rustymath_buffer::py_err;
 
 /// A shape given as one length or a sequence of lengths, checked against the shared allocation limits.
 pub fn shape(size: &Bound<'_, PyAny>) -> PyResult<Vec<usize>> {
@@ -29,7 +29,7 @@ fn _full(shape: &Bound<'_, PyAny>, value: &Bound<'_, PyAny>, dtype: Option<&str>
     let layout = match &like { Some(x) => x.layout(), None => layout(shape)? };
     let dtype = dtype.map(convert::dtype).transpose()?.or_else(|| like.as_ref().map(|x| x.view().dtype()));
     if value.is_none() {
-        let dtype = dtype.unwrap_or(DType::Float(rustymath::buffer::FloatWidth::F64));
+        let dtype = dtype.unwrap_or(DType::Float(FloatWidth::F64));
         return Ok(Array::new(with_dtype!(dtype, T => rustymath::create::full(layout, T::view(&[T::FILL]))).map_err(py_err)?));
     }
     let value = match dtype { Some(dtype) => convert::one_at(value, dtype)?, None => convert::one(value)? };
@@ -103,7 +103,7 @@ fn result_type(dtypes: &Bound<'_, PyTuple>) -> PyResult<&'static str> {
     let mut dtypes = dtypes.iter().map(|d| convert::dtype(d));
     let mut dtype = dtypes.next().ok_or_else(|| PyValueError::new_err("result_type needs at least one dtype"))??;
     for other in dtypes { dtype = dtype.common(other?).ok_or_else(|| PyValueError::new_err("characters and numbers can't share a dtype"))?; }
-    Ok(name(dtype))
+    Ok(dtype.name())
 }
 
 pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {

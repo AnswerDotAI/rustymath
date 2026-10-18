@@ -58,8 +58,7 @@ pub fn arange_int(start: i64, stop: i64, step: i64) -> Result<Vec<i64>, Error> {
     let distance = if step > 0 { i128::from(stop) - i128::from(start) } else { i128::from(start) - i128::from(stop) };
     let width = i128::from(step).abs();
     let n = (distance.max(0) + width - 1) / width;
-    if n > crate::layout::MAX_GENERATED_ELEMENTS as i128 { return Err(Kind::Limit.into()); }
-    let n = n as usize;
+    let n = generated_len(&[usize::try_from(n).unwrap_or(usize::MAX)])?;
     Ok((0..n).map(|i| start.wrapping_add((i as i64).wrapping_mul(step))).collect())
 }
 
@@ -69,8 +68,8 @@ pub fn arange(start: f64, stop: f64, step: f64) -> Result<Vec<f64>, Error> {
         return Err(Error::new(Kind::Domain, "a range needs finite bounds and a finite nonzero step"));
     }
     let n = ((stop - start) / step).ceil().max(0.0);
-    if n > crate::layout::MAX_GENERATED_ELEMENTS as f64 { return Err(Kind::Limit.into()); }
-    Ok((0..n as usize).map(|i| start + i as f64 * step).collect())
+    let n = generated_len(&[n as usize])?;
+    Ok((0..n).map(|i| start + i as f64 * step).collect())
 }
 
 /// `n` evenly spaced values from `start` to `stop`. With `endpoint`, the last item is `stop` when there is more than one item.

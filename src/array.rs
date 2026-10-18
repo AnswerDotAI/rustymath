@@ -2,7 +2,8 @@
 use crate::buffer::{Buffer, DType, Element, Items, View};
 use crate::agreement::Mapping;
 use crate::error::{Error, Kind};
-use crate::layout::{Layout, element_count};
+use crate::gather::Steps;
+use crate::layout::{Lanes, Layout, element_count};
 use std::sync::Arc;
 use std::borrow::Cow;
 
@@ -41,6 +42,16 @@ impl<'a> ArrayView<'a> {
     }
     /// Typed spelling of [`Self::cast`], borrowing or moving its prepared items without another copy.
     pub fn items<T: Element>(self) -> Result<Cow<'a, [T]>, Error> { Ok(self.cast(T::DTYPE)?.items()) }
+    /// The items that a fold over axis `axis`, or over every item for `None`, reads, with the `[outer, len, inner]` dimensions to fold them along their middle, and the tables that read the totals in the order of the other axes, where they come in another order. Where the array reads a block of its storage, as [`Mapping::block`] finds for compact arrays, transposes, reversals and windows that don't overlap, it lends the block, which folds in its own order ([`Block::fold`](crate::agreement::Block::fold)). Any other view gathers its items at its own dtype.
+    pub fn fold_items(self, axis: Option<usize>) -> Result<(Items<'a>, [usize; 3], Option<Vec<Steps>>), Error> {
+        let shape = self.layout.shape();
+        if let Some(block) = self.mapping.block(shape) {
+            let (dims, order) = block.fold(axis);
+            return Ok((Items::Borrowed(self.storage.slice(block.range)), dims, order));
+        }
+        let dims = match axis { None => [1, self.len(), 1], Some(a) => Lanes::new(shape, a)?.dims() };
+        Ok((self.cast(self.dtype())?, dims, None))
+    }
     /// Composes an input with its call's mapping, or prepares it once when conversion or an unsupported composition needs compact items.
     pub(crate) fn mapped(self, outer: &Mapping, frame: &[usize], dtype: DType) -> (Items<'a>, Option<Mapping>) {
         if self.dtype() == dtype {
@@ -87,13 +98,17 @@ impl Array {
     /// Writable compact items, detached from views, exports and any other owners.
     pub fn make_mut(&mut self) -> &mut Buffer { self.detach(); Arc::make_mut(&mut self.storage) }
     /// Shares an affine structural selection, or gathers through its composed mapping. Unsupported compositions compact first.
-    pub fn selected(&self, plan: &crate::structure::Plan) -> Result<Self, Error> {
-        if let Some(mapping) = self.mapping.through(&plan.steps, self.layout.shape()) {
-            if mapping.affine(plan.layout.shape()).is_some() { return Ok(Self { layout: plan.layout.clone(), storage: self.storage.clone(), mapping }); }
-            let buffer = Buffer::cast_mapped(self.storage.view(), &mapping, element_count(plan.layout.shape())?, self.dtype())?;
-            return Self::new(plan.layout.clone(), buffer);
-        }
-        Self::gathered(self.view().cast(self.dtype())?.view(), plan)
+    pub fn selected(&self, plan: crate::structure::Plan) -> Result<Self, Error> {
+        let mapping = match self.mapping {
+            Mapping::Linear(1) => Mapping::Steps { base: 0, steps: plan.steps },
+            _ => match self.mapping.through(&plan.steps, self.layout.shape()) {
+                Some(mapping) => mapping,
+                None => return Self::gathered(self.view().cast(self.dtype())?.view(), &plan),
+            },
+        };
+        if mapping.affine(plan.layout.shape()).is_some() { return Ok(Self { layout: plan.layout, storage: self.storage.clone(), mapping }); }
+        let buffer = Buffer::cast_mapped(self.storage.view(), &mapping, element_count(plan.layout.shape())?, self.dtype())?;
+        Self::new(plan.layout, buffer)
     }
     /// Changes the layout without copying compact items. A noncontiguous sequence compacts once.
     pub fn reshape(&self, layout: Layout) -> Result<Self, Error> {
@@ -169,7 +184,7 @@ impl Array {
         });
         Self::new(agreement.layout, buffer)
     }
-    /// Adjacent differences along one axis, through the ordinary subtraction kernels without two gathered copies. Booleans give XOR. Results retain the following positions' keys.
+    /// Adjacent differences along one axis, through the ordinary subtraction kernels without two gathered copies. Booleans give XOR. Integer differences wrap to their type where they don't fit. Results retain the following positions' keys.
     pub fn differences(source: ArrayView<'_>, axis: usize) -> Result<Self, Error> {
         use crate::{agreement::{Agreement, Mapping}, structure::{self, Selector}};
         let layout = source.layout;
@@ -181,23 +196,36 @@ impl Array {
         let agreement = Agreement { layout: next.layout, len, left: Mapping::Steps { base: 0, steps: next.steps }, right: Mapping::Steps { base: 0, steps: previous.steps } };
         let result = if source.dtype() == DType::Boolean { let k = crate::reduce::Xor; crate::kernels!(Binary of k).binary(&k, source, source, &agreement) }
             else { let k = crate::Subtract; crate::kernels!(Binary of k).binary(&k, source, source, &agreement) };
-        let (buffer, ok) = result.ok_or_else(|| Error::new(Kind::Domain, "differences need numerical items"))?;
-        if !ok && source.dtype().is_integral() { return Err(Kind::Overflow.into()); }
+        let (buffer, _) = result.ok_or_else(|| Error::new(Kind::Domain, "differences need numerical items"))?;
         Self::new(agreement.layout, buffer)
     }
-    /// Writes `source`, broadcast over a selection, detaching shared storage first. Later repeated targets win. Conversion and shape checks finish before any item changes.
-    pub fn assign(&mut self, plan: &crate::structure::Plan, source: &Self) -> Result<(), Error> {
+    /// The offset of each item that a selection writes, and `source`'s items at this array's dtype: one item for every offset, or `source` broadcast over the selection, one item for each offset in the same order. A fill from broadcasting reads the dtype's fill. Shape, position and conversion checks all finish here, before any item changes.
+    fn targets<'s>(&self, plan: &crate::structure::Plan, source: &'s Self) -> Result<(Vec<usize>, Items<'s>), Error> {
         let scalar = Layout::EMPTY;
         let agreement = crate::agreement::Agreement::new(&plan.layout, if source.len() == 1 { &scalar } else { source.layout() })?;
         if agreement.layout.shape() != plan.layout.shape() { return Err(Error::new(Kind::Length, "assignment must fit the selected layout")); }
-        let offsets = (0..agreement.len).map(|i| crate::gather::Steps::reach(0, &plan.steps, i).filter(|&o| o < self.len())).collect::<Option<Vec<_>>>()
-            .ok_or_else(|| Error::new(Kind::Index, "assignment position is outside its array"))?;
+        let len = self.len();
+        let offsets = Steps::combined(0, &plan.steps);
+        if offsets.iter().any(|&o| o >= len) { return Err(Error::new(Kind::Index, "assignment position is outside its array")); }
         let items = source.view().cast(self.dtype())?;
+        if matches!(agreement.right, Mapping::Linear(1) | Mapping::Single) { return Ok((offsets, items)); }
+        Ok((offsets, Items::Owned(Buffer::cast_mapped(items.view(), &agreement.right, agreement.len, self.dtype())?)))
+    }
+    /// Writes `source`, broadcast over a selection, detaching shared storage first. Later repeated targets win. Conversion, shape and position checks finish before any item changes.
+    pub fn assign(&mut self, plan: &crate::structure::Plan, source: &Self) -> Result<(), Error> {
+        let (offsets, items) = self.targets(plan, source)?;
         let values = items.view();
         with_dtype!(self.dtype(), T => {
             let (out, values) = (T::of_mut(self.make_mut()).expect("matching dtype"), T::of(values).expect("matching dtype"));
-            for (i, &o) in offsets.iter().enumerate() { out[o] = agreement.right.get(i).map_or(T::FILL, |j| values[j]); }
+            crate::gather::scatter(out, &offsets, values, |v| v);
         });
         Ok(())
+    }
+    /// Combines `source`, broadcast over a selection, into the items it selects by `k`, in turn, detaching shared storage first. A target selected more than once combines every item that selects it, as NumPy's `ufunc.at` does. `kernels` are `k`'s, from [`kernels!`](crate::kernels)`(Scatter of k)`. It gives whether every result succeeded, as [`Kernels::scatter`](crate::operation::Kernels::scatter) says. Conversion, shape and position checks finish before any item changes. A Domain error where `k` has no kernel at this array's dtype.
+    pub fn combine_at<K>(&mut self, k: &K, kernels: &crate::operation::Kernels<crate::operation::ScatterKernel<K>>, plan: &crate::structure::Plan, source: &Self) -> Result<bool, Error> {
+        let dtype = self.dtype();
+        if kernels.at(dtype).is_none() { return Err(Error::new(Kind::Domain, format!("this function doesn't take {}", dtype.name()))); }
+        let (offsets, items) = self.targets(plan, source)?;
+        Ok(kernels.scatter(k, self.make_mut(), &offsets, items.view()).expect("the function has a kernel at the array's dtype"))
     }
 }

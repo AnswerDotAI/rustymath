@@ -43,7 +43,7 @@ impl Axes {
     /// Each item's offset in the source, computed once, where nonconsecutive axes gather. `None` where the items read in order.
     fn sources(&self) -> Option<Vec<usize>> {
         let steps = self.steps.as_ref()?;
-        Some((0..self.dims.iter().product()).map(|j| Steps::reach(0, steps, j).expect("a transpose has no fills")).collect())
+        Some(Steps::combined(0, steps))
     }
 }
 

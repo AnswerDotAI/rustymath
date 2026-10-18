@@ -1,33 +1,33 @@
 import numpy as np, pytest, rustymath as rm
 
 def test_constructors_and_dtype_facts():
-    a = rm.array({'a': [1, 2], 'b': [3, 4]}, dtype='f32')
+    a = rm.array({'a': [1, 2], 'b': [3, 4]}, dtype='float32')
     a.names = ('row', 'col')
     for fn, value in ((rm.zeros_like, 0), (rm.ones_like, 1)):
         b = fn(a)
         assert b.dtype == a.dtype and b.shape == a.shape and b.keys == a.keys and b.names == a.names
         assert b.tolist() == [[value, value], [value, value]]
-    assert rm.zeros((2, 0), dtype='i16').shape == (2, 0) and rm.ones(3, dtype='bool').tolist() == [True] * 3
-    assert rm.full((2, 2), 2j).tolist() == [[2j, 2j], [2j, 2j]] and rm.full_like(a, 5, dtype='i16').dtype == 'i16'
-    assert rm.zeros((), dtype='f16').shape == () and rm.zeros(2, dtype='char').tolist() == [' ', ' ']
+    assert rm.zeros((2, 0), dtype='int16').shape == (2, 0) and rm.ones(3, dtype='bool').tolist() == [True] * 3
+    assert rm.full((2, 2), 2j).tolist() == [[2j, 2j], [2j, 2j]] and rm.full_like(a, 5, dtype='int16').dtype == 'int16'
+    assert rm.zeros((), dtype='float16').shape == () and rm.zeros(2, dtype='character').tolist() == [' ', ' ']
     assert rm.arange(5).tolist() == list(range(5)) and rm.arange(5, -2, -2).tolist() == [5, 3, 1, -1]
     assert rm.arange(2**60, 2**60 + 3).tolist() == [2**60, 2**60 + 1, 2**60 + 2]
-    assert rm.array([10**20], dtype='f64').tolist() == [1e20] and rm.full(2, 10**20, dtype='f64').tolist() == [1e20, 1e20]
-    assert rm.array([1.7], dtype='i16').tolist() == [1]
-    assert rm.arange(0, 1, .25, dtype='f32').tolist() == [0, .25, .5, .75]
+    assert rm.array([10**20], dtype='float64').tolist() == [1e20] and rm.full(2, 10**20, dtype='float64').tolist() == [1e20, 1e20]
+    assert rm.array([1.7], dtype='int16').tolist() == [1]
+    assert rm.arange(0, 1, .25, dtype='float32').tolist() == [0, .25, .5, .75]
     assert rm.linspace(0, 1, 5).tolist() == [0, .25, .5, .75, 1] and rm.linspace(0, 1, 4, endpoint=False).tolist() == [0, .25, .5, .75]
     assert rm.linspace(2, 3, 1).tolist() == [2] and rm.linspace(2, 3, 0).shape == (0,)
     np.testing.assert_allclose(rm.logspace(0, 3, 4), [1, 10, 100, 1000])
-    for dtype in ('f16', 'f32', 'f64'):
+    for dtype in ('float16', 'float32', 'float64'):
         info, expected = rm.finfo(dtype), np.finfo(DTYPES[dtype])
         assert (info.bits, info.eps, info.tiny, info.max) == (expected.bits, expected.eps, expected.tiny, expected.max)
-    assert rm.iinfo('u8').min == 0 and rm.iinfo('i64').max == 2**63 - 1 and rm.finfo('c64').bits == 32
-    assert rm.issubdtype('f32', 'floating') and not rm.issubdtype('c64', 'floating') and rm.result_type('i16', 'f16') == 'f32'
-    for fn, args in ((rm.arange, (0, 1, 0)), (rm.full, (3, [1, 2])), (rm.finfo, ('i64',)), (rm.iinfo, ('f32',))):
+    assert rm.iinfo('uint8').min == 0 and rm.iinfo('int64').max == 2**63 - 1 and rm.finfo('complex64').bits == 32
+    assert rm.issubdtype('float32', 'floating') and not rm.issubdtype('complex64', 'floating') and rm.result_type('int16', 'float16') == 'float16'
+    for fn, args in ((rm.arange, (0, 1, 0)), (rm.full, (3, [1, 2])), (rm.finfo, ('int64',)), (rm.iinfo, ('float32',))):
         with pytest.raises(ValueError): fn(*args)
-    with pytest.raises(OverflowError): rm.full(2, 300, dtype='u8')
+    with pytest.raises(OverflowError): rm.full(2, 300, dtype='uint8')
 
-DTYPES = {'f16': np.float16, 'f32': np.float32, 'f64': np.float64}
+DTYPES = {'float16': np.float16, 'float32': np.float32, 'float64': np.float64}
 
 def test_persistent_generator():
     from rustymath.random import default_rng
@@ -36,7 +36,7 @@ def test_persistent_generator():
     assert first.tolist() == same.normal(size=5).tolist() and second.tolist() == same.normal(size=5).tolist()
     assert first.tolist() != second.tolist() and isinstance(g.random(), float) and g.random((2, 3)).shape == (2, 3)
     values = g.integers(-2, 3, size=100)
-    assert values.dtype == 'i64' and values.min() >= -2 and values.max() < 3 and 0 <= g.integers(5) < 5
+    assert values.dtype == 'int64' and values.min() >= -2 and values.max() < 3 and 0 <= g.integers(5) < 5
     assert g.integers(-(2**63), 2**63 - 1, size=10).shape == (10,)
     assert g.sample(rm.distribution.beta(2, 3), (2, 2)).shape == (2, 2) and g.exponential(size=3).min() >= 0
     assert sorted(g.permutation(10).tolist()) == list(range(10))

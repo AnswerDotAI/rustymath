@@ -10,7 +10,7 @@ def test_minimize():
         assert r.success and np.allclose(r.x, 1, atol=1e-4), (method, r)
     assert minimize(rosen, [-1.2, 1], jac=rosen_grad).nfev < 100
     r = minimize(rosen, np.array([-1.2, 1], np.float32))
-    assert r.x.dtype == 'f32' and np.allclose(r.x, 1, atol=1e-2)
+    assert r.x.dtype == 'float32' and np.allclose(r.x, 1, atol=1e-2)
     assert np.allclose(minimize(rosen, [0.5, 0.5], bounds=[(None, 0.8), (0, None)]).x, [0.8, 0.64], atol=1e-6)
     shapes = []
     def columns(x): shapes.append(x.shape); return rosen(x)
@@ -50,7 +50,7 @@ def test_linear():
         assert r.success and np.allclose(r.x, np.linalg.solve(spd, b)) and r.normr < 1e-9, solve.__name__
     assert np.allclose(gmres(general, b, rtol=1e-12).x, np.linalg.solve(general, b))
     # `A` and `b` convert together, so a float32 `b` beside a float64 `A` promotes to float64 rather than rounding `A`.
-    assert cg(spd.astype(np.float32), b.astype(np.float32)).x.dtype == 'f32' and cg(spd, b.astype(np.float32)).x.dtype == 'f64'
+    assert cg(spd.astype(np.float32), b.astype(np.float32)).x.dtype == 'float32' and cg(spd, b.astype(np.float32)).x.dtype == 'float64'
     # `maxiter` counts iterations as SciPy does. Four CG steps take four products, plus the residual's at the start and at the end. One
     # GMRES cycle takes 20 steps and its own residual's product.
     assert [cg(spd, b, maxiter=4).nmatvec, gmres(general, b, rtol=1e-14, maxiter=1).nmatvec] == [6, 22]

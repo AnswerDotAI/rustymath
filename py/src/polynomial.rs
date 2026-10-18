@@ -5,7 +5,7 @@ use crate::functions::missing;
 use crate::integer::radix;
 use pyo3::prelude::*;
 use rustymath::array::Array as Core;
-use rustymath::buffer::{Buffer, DType, Element};
+use rustymath::buffer::{Buffer, DType, Element, FloatWidth};
 use rustymath::error::{Error, Kind};
 use rustymath::layout::Layout;
 use rustymath::num_complex::Complex64;
@@ -13,7 +13,7 @@ use rustymath::polynomial;
 use rustymath_buffer::py_err;
 
 /// The dtype that `function` computes in for arguments of `dtype`, and the dtype of its result, as `DType::inexact` gives them.
-fn working(function: &str, dtype: DType) -> PyResult<(DType, DType)> { dtype.inexact().ok_or_else(|| missing(function, dtype)) }
+fn working(function: &str, dtype: DType) -> PyResult<(DType, DType)> { dtype.inexact(FloatWidth::F64).ok_or_else(|| missing(function, dtype)) }
 
 /// `data` as an array of `layout`, in the dtype `result`.
 fn finished<T: Element>(layout: Layout, data: Vec<T>, result: DType) -> PyResult<Core> {

@@ -71,18 +71,49 @@ mod products {
 
     #[test]
     fn transposed_operands_read_as_their_transposes() {
-        // Float `PlusTimes` reads a transposed operand in place, and `MaxPlus` takes the default, which copies it. Small whole numbers keep every sum exact.
+        // Float `PlusTimes` reads a transposed operand in place, and `MaxPlus` takes the default, which copies it. `inner_mapped` uses an operand where its map reads it: through a transposing map, through padded rows, or in a transposed orientation. A map that reads backwards is read in blocks. Small whole numbers keep every sum exact.
         fn check<P: Inner<f64, Out = f64>>(p: P, a: &[f64], b: &[f64], [m, k, n]: [usize; 3]) {
+            use rustymath::{agreement::Mapping, gather::Steps};
             let (at, bt, expected) = (transpose(a, m, k), transpose(b, k, n), p.inner(a, b, [m, k, n]));
             assert_eq!(p.inner_ops(&at, b, [Orientation::Transpose, Orientation::Normal], [m, k, n]), expected);
             assert_eq!(p.inner_ops(a, &bt, [Orientation::Normal, Orientation::Transpose], [m, k, n]), expected);
             assert_eq!(p.inner_ops(&at, &bt, [Orientation::Transpose, Orientation::Transpose], [m, k, n]), expected);
+            let read = |[(s0, l0, d0), (s1, l1, d1)]: [(usize, usize, isize); 2]| Mapping::Steps { base: 0, steps: vec![Steps::Stride { start: s0, len: l0, step: d0 }, Steps::Stride { start: s1, len: l1, step: d1 }] };
+            let (held, (mi, ki, ni)) = (Mapping::Linear(1), (m as isize, k as isize, n as isize));
+            let padded: Vec<f64> = b.chunks(n).flat_map(|row| row.iter().copied().chain([0.0; 2])).collect();
+            let reversed: Vec<f64> = a.iter().rev().copied().collect();
+            let (from_at, padded_rows) = (read([(0, m, 1), (0, k, mi)]), read([(0, k, ni + 2), (0, n, 1)]));
+            let (backwards, stored_t) = (read([((m - 1) * k, m, -ki), (k - 1, k, -1)]), read([(0, k, 1), (0, m, ki)]));
+            let normal = [Orientation::Normal; 2];
+            assert_eq!(p.inner_mapped(Mapped { data: &at, mapping: &from_at }, Mapped { data: &padded, mapping: &padded_rows }, normal, [m, k, n]), expected);
+            assert_eq!(p.inner_mapped(Mapped { data: &reversed, mapping: &backwards }, Mapped { data: b, mapping: &held }, normal, [m, k, n]), expected);
+            assert_eq!(p.inner_mapped(Mapped { data: a, mapping: &stored_t }, Mapped { data: &bt, mapping: &held }, [Orientation::Transpose; 2], [m, k, n]), expected);
         }
-        let [m, k, n] = [5, 7, 9];
-        let a: Vec<f64> = (0..m * k).map(|i| (i * 7 % 17) as f64 - 8.0).collect();
-        let b: Vec<f64> = (0..k * n).map(|i| (i * 5 % 13) as f64 - 6.0).collect();
-        check(PlusTimes, &a, &b, [m, k, n]);
-        check(MaxPlus, &a, &b, [m, k, n]);
+        for [m, k, n] in [[5, 7, 9], [1, 7, 9], [5, 7, 1]] {
+            let a: Vec<f64> = (0..m * k).map(|i| (i * 7 % 17) as f64 - 8.0).collect();
+            let b: Vec<f64> = (0..k * n).map(|i| (i * 5 % 13) as f64 - 6.0).collect();
+            check(PlusTimes, &a, &b, [m, k, n]);
+            check(MaxPlus, &a, &b, [m, k, n]);
+        }
+    }
+    #[test]
+    fn vector_products_read_windows_by_columns() {
+        // `+.×` of windows and a vector reads each column of the windows where it lies, when the windows' rows are adjacent in long runs: the windows of a vector, of a single-channel image whose first row of windows reads fills, and long windows transposed. Each matches the product of the gathered windows. Small whole numbers keep every sum exact.
+        use rustymath::{agreement::{Mapping, expanded_items}, gather::Steps};
+        let along = |start, len, step| Steps::Stride { start, len, step };
+        let check = |data: &[f64], steps: Vec<Steps>, o: Orientation, [m, k]: [usize; 2]| {
+            let mapping = Mapping::Steps { base: 0, steps };
+            let mut buf = Vec::new();
+            let stored = expanded_items(&mapping, data, 0, m * k, &mut buf).to_vec();
+            let a = if o == Orientation::Normal { stored } else { transpose(&stored, k, m) };
+            let b: Vec<f64> = (0..k).map(|i| (i * 5 % 13) as f64 - 6.0).collect();
+            let got = PlusTimes.inner_mapped(Mapped { data, mapping: &mapping }, Mapped { data: &b, mapping: &Mapping::Linear(1) }, [o, Orientation::Normal], [m, k, 1]);
+            assert_eq!(got, PlusTimes.inner(&a, &b, [m, k, 1]));
+        };
+        let x: Vec<f64> = (0..300).map(|i| (i * 7 % 17) as f64 - 8.0).collect();
+        check(&x, vec![along(0, 296, 1), along(0, 5, 1)], Orientation::Normal, [296, 5]);
+        check(&x, vec![Steps::clipped(-1, 3, 4, 75), along(0, 73, 1), along(0, 3, 75), along(0, 3, 1)], Orientation::Normal, [219, 9]);
+        check(&x, vec![along(0, 231, 1), along(0, 70, 1)], Orientation::Transpose, [70, 231]);
     }
     #[test]
     fn products_match_folds_in_order() {

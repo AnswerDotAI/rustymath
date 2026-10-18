@@ -1,4 +1,4 @@
-//! Addition, subtraction and multiplication as function objects, at every float and complex type and at the integer types of compact buffers, `u8`, `i16`, `i32` and `i64`, division at every float and complex type, and the integer arithmetic they run. A float or complex result never fails. An integer result that doesn't fit its type fails.
+//! Addition, subtraction and multiplication as function objects, at every float and complex type and at the integer types of compact buffers, `u8`, `i16`, `i32` and `i64`, division at every float and complex type, and the integer arithmetic they run. A float or complex result never fails. An integer result that doesn't fit its type fails, and holds the result wrapped to the type, as NumPy gives it.
 use crate::{Abs, Sign, float::sealed::Sealed, slice::Total};
 use num_complex::Complex;
 
@@ -116,17 +116,13 @@ macro_rules! unsigned {
 }
 unsigned!(u8: |x, y| wide_product!(u8, u16, x, y));
 
-/// The result of an [`Overflowing`] operation where it fits its type, or `None` where it overflowed.
-#[inline(always)]
-fn fitted<T>((r, fits): (T, bool)) -> Option<T> { fits.then_some(r) }
-
-/// Each integer type's forms of the arithmetic objects. A result that doesn't fit the type fails, as [`Overflowing`] reports it. The forms are `#[inline]`, so that a caller's loop over items inlines them.
+/// Each integer type's forms of the arithmetic objects. A result that doesn't fit the type fails, as [`Overflowing`] reports it, and its slot holds the result wrapped to the type. The forms are `#[inline]`, so that a caller's loop over items inlines them.
 macro_rules! integer_forms {
     ($($t:ty),+) => {$(
-        forms!(#[inline] Add at $t: |_, [x, y]| fitted(x.plus(y)));
-        forms!(#[inline] Subtract at $t: |_, [x, y]| fitted(x.minus(y)));
-        forms!(#[inline] Multiply at $t: |_, [x, y]| fitted(x.times(y)));
-        forms!(#[inline] Abs at $t: |_, [x]| fitted(x.magnitude()));
+        forms!(#[inline] Add at $t: |_, [x, y]| x.plus(y));
+        forms!(#[inline] Subtract at $t: |_, [x, y]| x.minus(y));
+        forms!(#[inline] Multiply at $t: |_, [x, y]| x.times(y));
+        forms!(#[inline] Abs at $t: |_, [x]| x.magnitude());
         forms!(#[inline] Sign at $t: |_, [x]| Total(x.sign()));
     )+};
 }

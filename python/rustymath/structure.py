@@ -7,11 +7,11 @@ def diag(x, k=0):
     "Construct a matrix from a vector, or extract a matrix's diagonal"
     return _core._diag(x, k)
 
-def eye(n, m=None, k=0, dtype='f64'):
+def eye(n, m=None, k=0, dtype='float64'):
     "An n-by-m matrix with ones on diagonal k"
     return _core._diag(1, k, (n, n if m is None else m), dtype)
 
-def identity(n, dtype='f64'):
+def identity(n, dtype='float64'):
     "An n-by-n identity matrix"
     return eye(n, dtype=dtype)
 

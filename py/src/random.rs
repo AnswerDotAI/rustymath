@@ -54,14 +54,14 @@ impl Generator {
         let positions = self.positions(total, n, replace)?;
         let Some(x) = x else { return give(py, core(positions.into_iter().map(|i| i as i64).collect(), &shape)?, size.is_none()) };
         let mut layout = x.layout();
-        let selector = Selector::Indices { layout: shape.into(), positions: positions.into_iter().map(|i| Some(i as usize)).collect() };
+        let selector = Selector::Indices { layout: shape.into(), positions: positions.into_iter().map(|i| i as usize).collect() };
         if replace && layout.has_keys() {
             let mut keys = layout.all_keys();
             keys[0] = None;
             layout = layout.with_keys(keys).map_err(py_err)?;
         }
-        let plan = structure::select(&layout, &[selector]).map_err(py_err)?;
-        give(py, x.selected(&plan)?, size.is_none())
+        let plan = structure::select(&layout, vec![selector], false).map_err(py_err)?;
+        give(py, x.selected(plan)?, size.is_none())
     }
     /// A copy with the leading-axis cells in random order, or a permutation of integers below `x` when it is one integer.
     fn permutation(&mut self, x: &Bound<'_, PyAny>) -> PyResult<Array> {
@@ -70,8 +70,8 @@ impl Generator {
         let positions = self.positions(n, n, false)?;
         let Some(x) = x else { return Ok(Array::new(core(positions.into_iter().map(|i| i as i64).collect(), &[n])?)) };
         let layout = x.layout();
-        let selector = Selector::Indices { layout: [n].into(), positions: positions.into_iter().map(|i| Some(i as usize)).collect() };
-        Ok(Array::new(x.selected(&structure::select(&layout, &[selector]).map_err(py_err)?)?))
+        let selector = Selector::Indices { layout: [n].into(), positions: positions.into_iter().map(|i| i as usize).collect() };
+        Ok(Array::new(x.selected(structure::select(&layout, vec![selector], false).map_err(py_err)?)?))
     }
 }
 

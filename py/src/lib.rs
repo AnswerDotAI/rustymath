@@ -16,7 +16,9 @@ mod optimize;
 mod polynomial;
 mod random;
 mod search;
+mod signal;
 mod structure;
+mod timing;
 
 /// Sets the thread limit for calls made on this thread, returning its previous setting. 0 restores the default, 1 runs serially.
 #[pyfunction]
@@ -39,6 +41,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     structure::add(m)?;
     polynomial::add(m)?;
     search::add(m)?;
+    signal::add(m)?;
+    timing::add(m)?;
     for (name, add) in [
         ("number_theory", number_theory::add as fn(&Bound<'_, PyModule>) -> PyResult<()>), ("distribution", distribution::add), ("linalg", linalg::add),
         ("exact", exact::add), ("integer", integer::add), ("optimize", optimize::add), ("random", random::add),

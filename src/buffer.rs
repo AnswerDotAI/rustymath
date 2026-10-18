@@ -193,10 +193,10 @@ impl Width {
     pub fn wider(self) -> Option<Self> {
         match self { Self::U8 => Some(Self::I16), Self::I16 => Some(Self::I32), Self::I32 => Some(Self::I64), Self::I64 => None }
     }
-    /// The float width that NumPy promotes integers of this width to beside a float: the narrowest that holds each of them exactly. That's `f16` for `u8`, `f32` for `i16` and `f64` for `i32`. `i64` also gives `f64`, which holds its integers exactly only up to 2^53.
+    /// The float width that integers of this width become beside a float, no wider than `limit`. With a `limit` of `f64`, this is NumPy's rule: the narrowest float that holds each of them exactly. That's `f16` for `u8`, `f32` for `i16` and `f64` for `i32`. `i64` also gives `f64`, which holds its integers exactly only up to 2^53. A session whose default float is narrower passes that width as `limit`.
     #[inline]
-    pub fn float(self) -> FloatWidth {
-        match self { Self::U8 => FloatWidth::F16, Self::I16 => FloatWidth::F32, Self::I32 | Self::I64 => FloatWidth::F64 }
+    pub fn float(self, limit: FloatWidth) -> FloatWidth {
+        (match self { Self::U8 => FloatWidth::F16, Self::I16 => FloatWidth::F32, Self::I32 | Self::I64 => FloatWidth::F64 }).min(limit)
     }
 }
 
@@ -254,34 +254,54 @@ impl DType {
     pub fn is_integral(self) -> bool { matches!(self, Self::Boolean | Self::Integer(_)) }
     /// This dtype's kind, in the order that NEP 50 promotes kinds: 0 for Booleans, 1 for integers, 2 for floats, 3 for complex numbers and 4 for characters, which don't mix with numbers.
     pub fn kind(self) -> u8 { match self { Self::Boolean => 0, Self::Integer(_) => 1, Self::Float(_) => 2, Self::Complex(_) => 3, Self::Character => 4 } }
-    /// Whether this dtype widens to `to`: whether [`DType::common`] promotes this dtype and `to` to `to`.
+    /// The dtype's name, as NumPy names its dtypes: `"bool"`, `"uint8"`, `"int16"`, `"int32"`, `"int64"`, `"float16"`, `"float32"`, `"float64"`, `"complex64"` and `"complex128"`. NumPy has no dtype for characters, which are `"character"`. Rustymath's Python API and BPL's `•storage` both use these names.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Boolean => "bool", Self::Integer(Width::U8) => "uint8", Self::Integer(Width::I16) => "int16", Self::Integer(Width::I32) => "int32",
+            Self::Integer(Width::I64) => "int64", Self::Float(FloatWidth::F16) => "float16", Self::Float(FloatWidth::F32) => "float32",
+            Self::Float(FloatWidth::F64) => "float64", Self::Complex(ComplexWidth::F32) => "complex64", Self::Complex(ComplexWidth::F64) => "complex128",
+            Self::Character => "character",
+        }
+    }
+    /// The dtype that [`DType::name`] calls `name`, or `None` for any other name.
+    pub fn named(name: &str) -> Option<Self> { Self::ALL.into_iter().find(|d| d.name() == name) }
+    /// Whether this dtype widens to `to`: whether [`DType::common`] promotes this dtype and `to` to `to`. An integer widens to every float and complex dtype.
     pub fn widens_to(self, to: DType) -> bool { self.common(to) == Some(to) }
-    /// The dtypes that a function of floats or complex numbers computes in and gives, for arguments of this dtype. A Boolean or an integer takes the float that [`Width::float`] gives, but at least `f32`, which computes faster than `f16`: `f32` for Booleans, `u8` and `i16`, and `f64` for `i32` and `i64`. `f16` computes in `f32`, and its results round back. Other floats and complex numbers stay as they are. `None` for characters.
-    pub fn inexact(self) -> Option<(DType, DType)> {
+    /// The dtypes that a function of floats or complex numbers computes in and gives, for arguments of this dtype. A Boolean or an integer takes the float that [`Width::float`] gives under `limit`, but at least `f32`, which computes faster than `f16`. Under NumPy's limit, `f64`, that's `f32` for Booleans, `u8` and `i16`, and `f64` for `i32` and `i64`. `f16` computes in `f32`, and its results round back. Other floats and complex numbers stay as they are. `None` for characters.
+    pub fn inexact(self, limit: FloatWidth) -> Option<(DType, DType)> {
         let at_least_f32 = |w: FloatWidth| { let f = Self::Float(w.max(FloatWidth::F32)); (f, f) };
         Some(match self {
             Self::Boolean => at_least_f32(FloatWidth::F16),
-            Self::Integer(w) => at_least_f32(w.float()),
+            Self::Integer(w) => at_least_f32(w.float(limit)),
             Self::Float(FloatWidth::F16) => (Self::Float(FloatWidth::F32), self),
             Self::Float(_) | Self::Complex(_) => (self, self),
             Self::Character => return None,
         })
     }
-    /// The dtype that NumPy promotes arguments of this dtype and `other` to: the higher kind, wide enough for both. A Boolean takes the other dtype. An integer beside a float or complex dtype takes at least the float that [`Width::float`] gives, and a float beside a complex dtype takes parts at least as wide. `None` for characters beside numbers.
+    /// The dtype that arguments of this dtype and `other` promote to: the higher kind, wide enough for both. A Boolean takes the other dtype. An integer beside a float or complex dtype takes that dtype, as in JAX, where NumPy widens the float to hold every integer exactly. A float beside a complex dtype takes parts at least as wide. `None` for characters beside numbers.
     pub fn common(self, other: DType) -> Option<DType> {
         use DType::*;
         let (low, high) = if self.kind() <= other.kind() { (self, other) } else { (other, self) };
         Some(match (low, high) {
             (Character, Character) => Character,
             (_, Character) => return None,
-            (Boolean, d) => d,
+            (Boolean, d) | (Integer(_), d @ (Float(_) | Complex(_))) => d,
             (Integer(a), Integer(b)) => Integer(a.join(b)),
-            (Integer(w), Float(f)) => Float(f.max(w.float())),
-            (Integer(w), Complex(c)) => Complex(c.max(w.float().into())),
             (Float(a), Float(b)) => Float(a.max(b)),
             (Float(f), Complex(c)) => Complex(c.max(f.into())),
             (Complex(a), Complex(b)) => Complex(a.max(b)),
             _ => unreachable!("the pair is ordered by kind"),
+        })
+    }
+    /// The dtype that NEP 50 promotes an array of this dtype and a weak value of dtype `weak` to. A weak value is a Python scalar, which has no dtype of its own. BPL has no weak values. The caller gives the weak value's dtype at the default width of its kind. Where its kind is no higher, the array's dtype wins. A weak complex value beside floats takes their width. Otherwise the weak dtype wins. `None` for characters beside numbers.
+    pub fn common_weak(self, weak: DType) -> Option<DType> {
+        use DType::*;
+        Some(match (self, weak) {
+            (Character, Character) => Character,
+            (Character, _) | (_, Character) => return None,
+            (Float(_) | Complex(_), Complex(_)) => self.complex(),
+            _ if weak.kind() > self.kind() => weak,
+            _ => self,
         })
     }
     /// The real dtype of a complex dtype's parts. Other dtypes are their own.

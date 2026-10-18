@@ -453,22 +453,22 @@ mod operation {
         let empty = Layout::from([0, 3]);
         assert!(ArrayView::new(&empty, f64::view(&data), &transpose).items::<f64>().unwrap().is_empty());
         assert!(Mapping::Linear(2).affine(&[3]).is_none());
-        let table = |items| Mapping::Steps { base: 2, steps: vec![Steps::Table(items)] };
-        assert_eq!(table(vec![Some(3)]).affine(&[1]), Some((5, vec![0])));
-        assert_eq!(table(vec![Some(3), None]).affine(&[0]), Some((0, vec![0])));
-        assert!(table(vec![Some(3), None]).affine(&[2]).is_none() && table(vec![None]).affine(&[1]).is_none());
+        let table = |items| Mapping::Steps { base: 2, steps: vec![Steps::table(items)] };
+        assert_eq!(table(vec![3]).affine(&[1]), Some((5, vec![0])));
+        assert_eq!(table(vec![3, Steps::FILL]).affine(&[0]), Some((0, vec![0])));
+        assert!(table(vec![3, Steps::FILL]).affine(&[2]).is_none() && table(vec![Steps::FILL]).affine(&[1]).is_none());
     }
 
     #[test]
     fn owned_views_share_detach_and_release_their_base() {
         use rustymath::{array::Array, buffer::Element, structure::{self, Selector}};
         let mut base = Array::new([2, 3].into(), i64::buffer((0..6).collect())).unwrap();
-        let transposed = base.selected(&structure::transpose(base.layout(), &[1, 0]).unwrap()).unwrap();
+        let transposed = base.selected(structure::transpose(base.layout(), &[1, 0]).unwrap()).unwrap();
         assert_eq!(base.view().storage().as_ptr(), transposed.view().storage().as_ptr());
         assert_eq!(transposed.view().items::<i64>().unwrap().as_ref(), &[0, 3, 1, 4, 2, 5]);
         let reshaped = base.reshape([6].into()).unwrap();
         assert_eq!(base.view().storage().as_ptr(), reshaped.view().storage().as_ptr());
-        let mut tail = reshaped.selected(&structure::select_axis(reshaped.layout(), 0, Selector::Range { start: 2, len: 3, step: 1 }).unwrap()).unwrap();
+        let mut tail = reshaped.selected(structure::select_axis(reshaped.layout(), 0, Selector::Range { start: 2, len: 3, step: 1 }).unwrap()).unwrap();
         assert_eq!(tail.view().storage().len(), 6);
         let compact = tail.compact();
         assert_eq!(compact.view().storage().len(), 3);

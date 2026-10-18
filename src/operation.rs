@@ -8,9 +8,9 @@
 //! A character, or a number with none of these, has no kernel.
 use crate::agreement::{Agreement, Frames, Mapping, chunks, map1, map2};
 use crate::array::ArrayView;
-use crate::buffer::{Buffer, DType, Element, Source, View, Width};
+use crate::buffer::{Buffer, DType, Element, FloatWidth, Source, View, Width};
 use crate::reduce::{Reduction, scan_along};
-use crate::slice::{Arg, Binary, CHUNK, Ternary, Unary};
+use crate::slice::{Arg, Binary, CHUNK, Results, Ternary, Unary};
 use crate::linalg::Inner;
 use crate::parallel::{extended, stack_with};
 
@@ -22,18 +22,22 @@ pub type BinaryKernel<K> = for<'a> fn(&K, View<'a>, View<'a>, &Agreement) -> (Bu
 pub type TernaryKernel<K> = for<'a> fn(&K, [View<'a>; 3], &Agreement, &Agreement) -> (Buffer, bool);
 /// An accumulation along the middle of `[outer, len, inner]`. The probe selects `Fold`, `Scan`, `RightFold` or `LeftScan`; the optional argument is a right tail per lane for folds or a scalar start for scans. The selected kernel reads it in its total or computing dtype.
 pub type AccumulationKernel<K> = for<'a> fn(&K, View<'a>, [usize; 3], Option<View<'a>>) -> (Buffer, bool);
+/// A reduction's folds of each window of a number of neighbouring rows along the middle of `[outer, len, inner]`, with that number.
+pub type SlidingKernel<K> = for<'a> fn(&K, View<'a>, [usize; 3], usize) -> (Buffer, bool);
 /// A matrix product's kernel at one dtype: the product of each pair of cells that the frames pair, each of sizes `[n, k, m]`, and whether every product fit. `check` runs between rounds of cells, and a `false` from it stops the products, which then give `None`.
 pub type ProductKernel<P> = for<'a> fn(&P, [View<'a>; 2], &Frames, [usize; 3], &mut dyn FnMut() -> bool) -> Option<(Buffer, bool)>;
+/// An object's kernel at one dtype for combining items into an array in place, as [`Kernels::scatter`] describes.
+pub type ScatterKernel<K> = for<'a> fn(&K, &mut Buffer, &[usize], View<'a>) -> bool;
 
-/// An object's kernel at each dtype where it has one, in the order of [`DType::ALL`].
-pub struct Kernels<F>([Option<F>; DType::ALL.len()]);
+/// An object's kernel at each dtype where it has one, in the order of [`DType::ALL`], with whether it leaves a failed result wrapped to its type.
+pub struct Kernels<F>([Option<(F, bool)>; DType::ALL.len()]);
 
 impl<F: Copy> Kernels<F> {
     /// The kernels that [`kernels!`](crate::kernels) finds.
     #[doc(hidden)]
-    pub const fn new(at: [Option<F>; DType::ALL.len()]) -> Self { Self(at) }
+    pub const fn new(at: [Option<(F, bool)>; DType::ALL.len()]) -> Self { Self(at) }
     /// The kernel at `dtype`, where the object has one.
-    pub fn at(&self, dtype: DType) -> Option<F> { self.0[dtype.index()] }
+    pub fn at(&self, dtype: DType) -> Option<F> { self.0[dtype.index()].map(|(f, _)| f) }
     /// These kernels without any at a dtype outside `dtypes`.
     pub fn only(mut self, dtypes: &[DType]) -> Self {
         for (k, d) in self.0.iter_mut().zip(DType::ALL) { if !dtypes.contains(&d) { *k = None; } }
@@ -43,9 +47,11 @@ impl<F: Copy> Kernels<F> {
     pub fn computes(&self, dtype: DType) -> Option<DType> {
         if self.at(dtype).is_some() { return Some(dtype); }
         let integer = dtype.is_integral().then_some(DType::Integer(Width::I64));
-        let float = dtype.inexact()?.0;
+        let float = dtype.inexact(FloatWidth::F64)?.0;
         integer.into_iter().chain(DType::ALL.into_iter().filter(|&d| float.widens_to(d))).find(|&d| self.at(d).is_some())
     }
+    /// Whether the kernel that an argument of `dtype` computes with leaves a failed result wrapped to its type, as integer arithmetic and every [`Reduction`] do. False where the object has no kernel for it.
+    pub fn wraps(&self, dtype: DType) -> bool { self.computes(dtype).and_then(|d| self.0[d.index()]).is_some_and(|(_, wraps)| wraps) }
     /// The kernel for arguments of `dtype`, and their dtype if they need casting first.
     fn chosen(&self, dtype: DType) -> Option<(F, DType)> {
         let at = self.computes(dtype)?;
@@ -106,11 +112,27 @@ impl<K> Kernels<AccumulationKernel<K>> {
     }
 }
 
+impl<K> Kernels<SlidingKernel<K>> {
+    /// The folds of each window of `width` rows along the middle of `dims`, as [`reduce::sliding`](crate::reduce::sliding) gives them, and whether every fold fits. `None` where there is no kernel for `x`'s dtype.
+    pub fn sliding(&self, k: &K, x: View<'_>, dims: [usize; 3], width: usize) -> Option<(Buffer, bool)> {
+        let (kernel, at) = self.chosen(x.dtype())?;
+        Some(kernel(k, cast(x, at, &mut None), dims, width))
+    }
+}
+
 impl<P> Kernels<ProductKernel<P>> {
     /// `p`'s products of the cells of `x` and `y`, which share a dtype and pair as `frames` says, each of sizes `[n, k, m]`, and whether every product fit. `None` where `p` has no kernel for their dtype, or where `check` stopped them.
     pub fn product(&self, p: &P, [x, y]: [View<'_>; 2], frames: &Frames, size: [usize; 3], check: &mut dyn FnMut() -> bool) -> Option<(Buffer, bool)> {
         let (kernel, at) = self.chosen(x.dtype())?;
         kernel(p, [cast(x, at, &mut None), cast(y, at, &mut None)], frames, size, check)
+    }
+}
+
+impl<K> Kernels<ScatterKernel<K>> {
+    /// Combines each item of `values`, or its only item, into the item of `out` at the matching offset by `k`, in turn. It gives whether every result succeeded. A failed result is written as `k`'s slice form writes it: wrapped to its type, or NaN. `values` reads at `out`'s dtype. `None` where `k` has no kernel at `out`'s dtype.
+    pub fn scatter(&self, k: &K, out: &mut Buffer, offsets: &[usize], values: View<'_>) -> Option<bool> {
+        let kernel = self.at(out.dtype())?;
+        Some(kernel(k, out, offsets, cast(values, out.dtype(), &mut None)))
     }
 }
 
@@ -120,13 +142,13 @@ fn items<T: Element>(x: View<'_>) -> &[T] { T::of(x).expect("an argument has its
 fn unary_at<K: Unary<T, Out: Element> + Sync, T: Element>(k: &K, x: View<'_>, mapping: &Mapping, len: usize) -> (Buffer, bool) {
     let mut out = Vec::with_capacity(len);
     let ok = map1(items::<T>(x), mapping, len, k, &mut out);
-    (<<K as Unary<T>>::Out as Element>::buffer(out), ok)
+    (<<K as Results<T, 1>>::Out as Element>::buffer(out), ok)
 }
 
 fn binary_at<K: Binary<T, Out: Element> + Sync, T: Element>(k: &K, x: View<'_>, y: View<'_>, agreement: &Agreement) -> (Buffer, bool) {
     let mut out = Vec::with_capacity(agreement.len);
     let ok = map2(items::<T>(x), items::<T>(y), agreement, k, &mut out);
-    (<<K as Binary<T>>::Out as Element>::buffer(out), ok)
+    (<<K as Results<T, 2>>::Out as Element>::buffer(out), ok)
 }
 
 /// A contiguous or constant argument through two mappings, without an expansion buffer.
@@ -152,7 +174,7 @@ fn ternary_at<K: Ternary<T, Out: Element> + Sync, T: Element>(k: &K, [x, y, z]: 
     let ok = if let Some(((x, y), z)) = direct { k.many(x, y, z, second.len, &mut out) }
     else { extended(&mut out, second.len, CHUNK, &|range, slots| {
         let mut bufs = [Vec::new(), Vec::new(), Vec::new()];
-        chunks(range, |start, n| {
+        chunks(range, &[], |start, n| {
             bufs.iter_mut().for_each(Vec::clear);
             for i in start..start + n {
                 let pair = second.left.get(i);
@@ -163,7 +185,7 @@ fn ternary_at<K: Ternary<T, Out: Element> + Sync, T: Element>(k: &K, [x, y, z]: 
             k.many_into(Arg::Many(&bufs[0]), Arg::Many(&bufs[1]), Arg::Many(&bufs[2]), n, slots)
         })
     }) };
-    (<<K as Ternary<T>>::Out as Element>::buffer(out), ok)
+    (<<K as Results<T, 3>>::Out as Element>::buffer(out), ok)
 }
 
 fn fold_at<R: Reduction<T>, T: Element>(_: &R, x: View<'_>, dims: [usize; 3], tail: Option<View<'_>>) -> (Buffer, bool) where R::Total: Element {
@@ -179,6 +201,11 @@ fn scan_at<R: Reduction<T>, T: Element>(_: &R, x: View<'_>, dims: [usize; 3], st
     let mut out = Vec::with_capacity(dims.iter().product());
     let ok = scan_along::<T, R>(items::<T>(x), dims, start, &mut out);
     (R::Total::buffer(out), ok)
+}
+
+fn sliding_at<R: Reduction<T>, T: Element>(_: &R, x: View<'_>, dims: [usize; 3], width: usize) -> (Buffer, bool) where R::Total: Element {
+    let (totals, ok) = crate::reduce::sliding::<T, R>(items::<T>(x), dims, width);
+    (R::Total::buffer(totals), ok)
 }
 
 fn right_fold_at<K: Binary<T, Out: Element + Source<T>>, T: Element>(k: &K, x: View<'_>, dims: [usize; 3], tail: Option<View<'_>>) -> (Buffer, bool) {
@@ -198,6 +225,14 @@ fn checked_step<K: Binary<T>, T: Copy>(k: &K, a: T, b: T, ok: &std::cell::Cell<b
         k.many(Arg::One(a), Arg::One(b), 1, &mut one);
         one.pop().expect("one result was written")
     })
+}
+
+fn scatter_at<K: Binary<T, Out = T>, T: Element>(k: &K, out: &mut Buffer, offsets: &[usize], values: View<'_>) -> bool {
+    let ok = std::cell::Cell::new(true);
+    let (out, values) = (T::of_mut(out).expect("the output has its kernel's dtype"), items::<T>(values));
+    let step = |a, y| checked_step(k, a, y, &ok);
+    crate::gather::scatter_with(out, crate::gather::targets(offsets, Arg::of(values)), step);
+    ok.get()
 }
 
 fn left_scan_at<K: Binary<T, Out: Element + Source<T>>, T: Element>(k: &K, x: View<'_>, dims: [usize; 3], seed: Option<View<'_>>) -> (Buffer, bool) {
@@ -239,43 +274,53 @@ pub mod probe {
     pub enum Scan {}
     pub enum RightFold {}
     pub enum LeftScan {}
+    pub enum Sliding {}
     pub enum Product {}
+    pub enum Scatter {}
 
+    /// A kernel where the impl holds, with whether it leaves a failed result wrapped to its type.
     pub trait Found<F> {
-        fn kernel(&self) -> Option<F>;
+        fn kernel(&self) -> Option<(F, bool)>;
     }
     pub trait Missing<F> {
-        fn kernel(&self) -> Option<F> { None }
+        fn kernel(&self) -> Option<(F, bool)> { None }
     }
     impl<K, T, A, F> Missing<F> for &Probe<K, T, A> {}
 
     impl<K: crate::Unary<T, Out: Element> + Sync, T: Element> Found<UnaryKernel<K>> for Probe<K, T, Unary> {
-        fn kernel(&self) -> Option<UnaryKernel<K>> { Some(unary_at::<K, T>) }
+        fn kernel(&self) -> Option<(UnaryKernel<K>, bool)> { Some((unary_at::<K, T>, K::WRAPS)) }
     }
     impl<K: crate::Binary<T, Out: Element> + Sync, T: Element> Found<BinaryKernel<K>> for Probe<K, T, Binary> {
-        fn kernel(&self) -> Option<BinaryKernel<K>> { Some(binary_at::<K, T>) }
+        fn kernel(&self) -> Option<(BinaryKernel<K>, bool)> { Some((binary_at::<K, T>, K::WRAPS)) }
     }
     impl<K: crate::Ternary<T, Out: Element> + Sync, T: Element> Found<TernaryKernel<K>> for Probe<K, T, Ternary> {
-        fn kernel(&self) -> Option<TernaryKernel<K>> { Some(ternary_at::<K, T>) }
+        fn kernel(&self) -> Option<(TernaryKernel<K>, bool)> { Some((ternary_at::<K, T>, K::WRAPS)) }
     }
+    // Every reduction wraps a total that doesn't fit, as `Reduction` says.
     impl<R: Reduction<T>, T: Element> Found<AccumulationKernel<R>> for Probe<R, T, Fold> where R::Total: Element {
-        fn kernel(&self) -> Option<AccumulationKernel<R>> { Some(fold_at::<R, T>) }
+        fn kernel(&self) -> Option<(AccumulationKernel<R>, bool)> { Some((fold_at::<R, T>, true)) }
     }
     impl<R: Reduction<T>, T: Element> Found<AccumulationKernel<R>> for Probe<R, T, Scan> where R::Total: Element {
-        fn kernel(&self) -> Option<AccumulationKernel<R>> { Some(scan_at::<R, T>) }
+        fn kernel(&self) -> Option<(AccumulationKernel<R>, bool)> { Some((scan_at::<R, T>, true)) }
+    }
+    impl<R: Reduction<T>, T: Element> Found<SlidingKernel<R>> for Probe<R, T, Sliding> where R::Total: Element {
+        fn kernel(&self) -> Option<(SlidingKernel<R>, bool)> { Some((sliding_at::<R, T>, true)) }
     }
     impl<K: crate::Binary<T, Out: Element + Source<T>>, T: Element> Found<AccumulationKernel<K>> for Probe<K, T, RightFold> {
-        fn kernel(&self) -> Option<AccumulationKernel<K>> { Some(right_fold_at::<K, T>) }
+        fn kernel(&self) -> Option<(AccumulationKernel<K>, bool)> { Some((right_fold_at::<K, T>, K::WRAPS)) }
     }
     impl<K: crate::Binary<T, Out: Element + Source<T>>, T: Element> Found<AccumulationKernel<K>> for Probe<K, T, LeftScan> {
-        fn kernel(&self) -> Option<AccumulationKernel<K>> { Some(left_scan_at::<K, T>) }
+        fn kernel(&self) -> Option<(AccumulationKernel<K>, bool)> { Some((left_scan_at::<K, T>, K::WRAPS)) }
     }
     impl<P: crate::linalg::Inner<T, Out: Element + Default> + Sync, T: Element> Found<ProductKernel<P>> for Probe<P, T, Product> {
-        fn kernel(&self) -> Option<ProductKernel<P>> { Some(product_at::<P, T>) }
+        fn kernel(&self) -> Option<(ProductKernel<P>, bool)> { Some((product_at::<P, T>, false)) }
+    }
+    impl<K: crate::Binary<T, Out = T>, T: Element> Found<ScatterKernel<K>> for Probe<K, T, Scatter> {
+        fn kernel(&self) -> Option<(ScatterKernel<K>, bool)> { Some((scatter_at::<K, T>, K::WRAPS)) }
     }
 }
 
-/// The [`Kernels`](crate::operation::Kernels) of a function object or reduction: `Unary`, `Binary` or `Ternary` for that arity, `RightFold` or `LeftScan` for ordered accumulation by a binary function, `Fold` or `Scan` for a [`Reduction`](crate::reduce::Reduction), and `Product` for a matrix product's [`Inner`](crate::linalg::Inner) pair. Name the object by its type, or by a value after `of`. Each kernel's test resolves where the macro expands, so the type must be concrete there. In generic code the tests see only the type parameter's bounds, not the impls of the type it later stands for, so a kernel that the bounds don't promise comes out as `None`, with no error.
+/// The [`Kernels`](crate::operation::Kernels) of a function object or reduction: `Unary`, `Binary` or `Ternary` for that arity, `RightFold` or `LeftScan` for ordered accumulation by a binary function, `Scatter` for combining a binary function's results into an array in place, `Fold`, `Scan` or `Sliding` for a [`Reduction`](crate::reduce::Reduction), and `Product` for a matrix product's [`Inner`](crate::linalg::Inner) pair. Name the object by its type, or by a value after `of`. Each kernel's test resolves where the macro expands, so the type must be concrete there. In generic code the tests see only the type parameter's bounds, not the impls of the type it later stands for, so a kernel that the bounds don't promise comes out as `None`, with no error.
 #[macro_export]
 macro_rules! kernels {
     ($arity:ident of $k:expr) => {{

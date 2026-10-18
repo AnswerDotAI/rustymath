@@ -84,6 +84,14 @@ pub fn repeated_name(names: &[Option<Arc<str>>]) -> Option<&Arc<str>> {
     names.iter().flatten().find(|n| !seen.insert(*n))
 }
 
+/// Whether an axis name is hidden: it starts with `_`. Hidden and visible names are separate namespaces.
+#[inline]
+pub fn hidden(name: &str) -> bool { name.starts_with('_') }
+
+/// Whether two axis names conflict: both are names, they differ, and they're in the same namespace. A name meets a name from the other namespace as if that axis were unnamed.
+#[inline]
+pub fn names_conflict(a: Option<&str>, b: Option<&str>) -> bool { matches!((a, b), (Some(a), Some(b)) if a != b && hidden(a) == hidden(b)) }
+
 /// An array's shape: the length of each axis. Ranks 0 to 2 are held inline with no allocation, and higher ranks in one allocation of exactly their length. Convert a `Vec`, an array or a slice of lengths into one, or collect it from lengths.
 #[derive(Clone)]
 pub struct Shape(Lengths);
@@ -153,8 +161,11 @@ impl Eq for Keys {}
 impl Keys {
     /// Keys from `names`, where `None` marks a position with no name. A Domain error when a name appears twice.
     pub fn partial(names: Vec<Option<Arc<str>>>) -> Result<Arc<Self>, Error> {
-        let index: HashMap<_, _> = names.iter().enumerate().filter_map(|(i, k)| Some((k.clone()?, i))).collect();
-        if index.len() != names.iter().flatten().count() { return Err(Kind::Domain.into()); }
+        let mut index = HashMap::with_capacity(names.len());
+        for (i, name) in names.iter().enumerate() {
+            let Some(name) = name else { continue };
+            if index.insert(name.clone(), i).is_some() { return Err(duplicate(name)); }
+        }
         Ok(Arc::new(Self { names, index }))
     }
     #[inline]
@@ -174,7 +185,7 @@ impl Keys {
     /// Adds positions at the end, named by `names`. A Domain error, with no position added, when a name is already here or appears twice in `names`.
     pub fn extend(&mut self, names: &[Option<Arc<str>>]) -> Result<(), Error> {
         let mut new = HashSet::new();
-        if names.iter().flatten().any(|n| self.position(n).is_some() || !new.insert(n)) { return Err(Kind::Domain.into()); }
+        if let Some(name) = names.iter().flatten().find(|n| self.position(n).is_some() || !new.insert(*n)) { return Err(duplicate(name)); }
         for name in names {
             if let Some(name) = name { self.index.insert(name.clone(), self.names.len()); }
             self.names.push(name.clone());
@@ -188,8 +199,12 @@ impl Keys {
     }
     /// For each position of `wanted`, the matching position here. With `subset`, `wanted` may have fewer positions, and one with no match is an Index error. Otherwise both need the same positions, and a mismatch is a Length error.
     pub fn positions(&self, wanted: &Self, subset: bool) -> Result<Vec<usize>, Error> {
-        if !subset && self.len() != wanted.len() { return Err(Kind::Length.into()); }
-        self.align(wanted).into_iter().map(|p| p.ok_or(Error::from(if subset { Kind::Index } else { Kind::Length }))).collect()
+        let kind = if subset { Kind::Index } else { Kind::Length };
+        if !subset && self.len() != wanted.len() { return Err(Error::new(kind, format!("keyed axes of lengths {} and {} don't pair", self.len(), wanted.len()))); }
+        self.align(wanted).into_iter().zip(&wanted.names).map(|(p, name)| p.ok_or_else(|| match name {
+            Some(name) => Error::new(kind, format!("missing key: {name}")),
+            None => Error::new(kind, "too few positions without keys"),
+        })).collect()
     }
     /// Keys at source positions, in the order given. A position with no source has no name.
     pub fn select(&self, positions: impl IntoIterator<Item = Option<usize>>) -> Result<Arc<Self>, Error> {
@@ -198,12 +213,16 @@ impl Keys {
     /// These positions, then the named positions of `other` that these lack. Unnamed positions pair in order. Both sides need the same number of them.
     pub fn union(self: &Arc<Self>, other: &Arc<Self>) -> Result<Arc<Self>, Error> {
         if self == other { return Ok(self.clone()); }
-        if self.len() - self.index.len() != other.len() - other.index.len() { return Err(Kind::Length.into()); }
+        let (a, b) = (self.len() - self.index.len(), other.len() - other.index.len());
+        if a != b { return Err(Error::new(Kind::Length, format!("axes with {a} and {b} positions without keys don't align"))); }
         let mut extra = other.names.iter().filter(|k| k.as_ref().is_some_and(|k| self.position(k).is_none())).peekable();
         if extra.peek().is_none() { return Ok(self.clone()); }
         Self::partial(self.names.iter().chain(extra).cloned().collect())
     }
 }
+
+/// The Domain error for a key that appears twice on one axis.
+fn duplicate(key: &str) -> Error { Error::new(Kind::Domain, format!("duplicate key: {key}")) }
 
 /// An array's shape, with optional keys and a name for each axis. A layout with no keys or names holds no `Meta`.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -272,8 +291,10 @@ impl Layout {
     pub fn all_keys(&self) -> Vec<Option<Arc<Keys>>> { (0..self.shape.len()).map(|a| self.keys(a).cloned()).collect() }
     /// The layout with `keys` on its axes. A Rank error when the count differs from the rank, and a Length error when an axis's keys differ from its length.
     pub fn with_keys(self, keys: Vec<Option<Arc<Keys>>>) -> Result<Self, Error> {
-        if !keys.is_empty() && keys.len() != self.shape.len() { return Err(Kind::Rank.into()); }
-        if keys.iter().zip(self.shape.iter()).any(|(k, &n)| k.as_ref().is_some_and(|k| k.len() != n)) { return Err(Kind::Length.into()); }
+        if !keys.is_empty() && keys.len() != self.shape.len() { return Err(Error::new(Kind::Rank, format!("keys for {} axes of an array with {} axes", keys.len(), self.shape.len()))); }
+        if let Some((k, n)) = keys.iter().zip(self.shape.iter()).find_map(|(k, &n)| k.as_ref().filter(|k| k.len() != n).map(|k| (k.len(), n))) {
+            return Err(Error::new(Kind::Length, format!("{k} keys for an axis of length {n}")));
+        }
         let keys: Vec<_> = keys.into_iter().map(|k| k.filter(|k| !k.blank())).collect();
         let empty = keys.iter().all(Option::is_none);
         Ok(self.edit(empty, |m| m.keys = if empty { vec![] } else { keys }))

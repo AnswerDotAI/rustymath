@@ -6,11 +6,12 @@ use num_traits::{Float as _, Zero as _};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rustymath::agreement::{Frames, Mapping};
-use rustymath::array::Array as Core;
+use rustymath::array::{Array as Core, ArrayView};
 use rustymath::buffer::{Buffer, DType, Element, FloatWidth, Items, View, Width};
 use rustymath::error::{Error, Kind};
+use rustymath::gather::Steps;
 use rustymath::layout::{Lanes, Layout};
-use rustymath::linalg::{self, AndOr, Lu, LuWork, MaxPlus, MinPlus, OrAnd, PlusEqual, PlusNotEqual, PlusTimes, Scalar, Svd};
+use rustymath::linalg::{self, AndOr, Inner, Lu, LuWork, Mapped, MaxPlus, MinPlus, Orientation, OrAnd, PlusEqual, PlusNotEqual, PlusTimes, Scalar, Svd};
 use rustymath::parallel::stack;
 use rustymath::operation::{Kernels, ProductKernel};
 use rustymath_buffer::py_err;
@@ -27,7 +28,7 @@ impl<'py> Stack<'py> {
     fn new(function: &str, args: &[&Bound<'py, PyAny>]) -> PyResult<Self> {
         let call = convert(args)?;
         let dtype = call.args[0].view().dtype();
-        let (compute, store) = dtype.inexact().ok_or_else(|| missing(function, dtype))?;
+        let (compute, store) = dtype.inexact(FloatWidth::F64).ok_or_else(|| missing(function, dtype))?;
         Ok(Self { call, compute, store })
     }
 
@@ -573,7 +574,7 @@ struct Product<'a, 'py> { py: Python<'py>, args: [View<'a>; 2], frames: &'a Fram
 
 impl<'py> Product<'_, 'py> {
     /// The products through `P`, at the dtype that its `kernels` compute in. Integer results, counts included, are int64. float16 matrices give float16 results, and other results keep their kernels' dtype. An Overflow error for an integer result that doesn't fit int64.
-    fn run<P: Default>(&self, kernels: Kernels<ProductKernel<P>>) -> PyResult<Bound<'py, PyAny>> {
+    fn run<P: Default>(&self, kernels: Kernels<ProductKernel<P>>) -> PyResult<Core> {
         let [x, y] = self.args;
         let mut stopped = None;
         let products = kernels.product(&P::default(), [x, y], self.frames, self.size, &mut || self.py.check_signals().map_err(|e| stopped = Some(e)).is_ok());
@@ -586,14 +587,14 @@ impl<'py> Product<'_, 'py> {
         self.finish(buffer)
     }
 
-    fn finish(&self, buffer: Buffer) -> PyResult<Bound<'py, PyAny>> {
+    fn finish(&self, buffer: Buffer) -> PyResult<Core> {
         let x = self.args[0];
         let half = DType::Float(FloatWidth::F16);
         let store = match buffer.dtype() { DType::Integer(_) => I64, DType::Float(_) if x.dtype() == half => half, d => d };
-        result(self.py, stored(buffer, &self.frames.layout, self.cell.clone(), store)?)
+        stored(buffer, &self.frames.layout, self.cell.clone(), store)
     }
 
-    fn generic(&self, f: &str, g: &str) -> PyResult<Bound<'py, PyAny>> {
+    fn generic(&self, f: &str, g: &str) -> PyResult<Core> {
         let (f, g) = (native_binary(f)?, native_binary(g)?);
         let dtype = self.args[0].dtype();
         let compute = match dtype { DType::Integer(_) => I64, DType::Float(FloatWidth::F16) => DType::Float(FloatWidth::F32), d => d };
@@ -622,14 +623,52 @@ impl<'py> Product<'_, 'py> {
     }
 }
 
+/// A product operand's mapping as one entry for each axis of its frame and two for its matrix. A vector's matrix takes a length-1 axis: before its own axis on the left of a product, and after it on the right.
+struct Cells { base: usize, frame: Vec<Steps>, matrix: Vec<Steps> }
+
+impl Cells {
+    /// The split of `view`'s mapping, where its last `side` axes form its matrix. `None` where the mapping doesn't split by axis.
+    fn new(view: ArrayView<'_>, side: usize, left: bool) -> Option<Self> {
+        let shape = view.layout().shape();
+        let (base, mut frame) = view.mapping().entries(shape)?;
+        let mut matrix = frame.split_off(shape.len() - side);
+        if side == 1 { matrix.insert(usize::from(!left), Steps::along(1, 0)); }
+        Some(Self { base, frame, matrix })
+    }
+    /// The mapping of the matrix at position `i` of the frame. `None` where the frame reads a fill there.
+    fn at(&self, i: usize) -> Option<Mapping> { Some(Mapping::Steps { base: Steps::reach(self.base, &self.frame, i)?, steps: self.matrix.clone() }) }
+}
+
+/// `x +.× y` of 32- or 64-bit floats or complex numbers, where a view holds an operand out of order but gemm can read both operands where they lie, as strided or transposed matrices. `Inner::inner_mapped` multiplies them without copying either. `None` where both operands are contiguous, for other dtypes, and where an operand would need a copy, as reversed rows do. A copy and one gemm cost less than gemm over blocks read in turn.
+fn mapped(py: Python<'_>, views: [ArrayView<'_>; 2], sides: [usize; 2], frames: &Frames, size @ [n, k, m]: [usize; 3], cell: &Layout) -> PyResult<Option<Core>> {
+    let dtype = views[0].dtype();
+    if frames.count == 0 || views.iter().all(|v| v.contiguous().is_some()) || views[1].dtype() != dtype || !matches!(dtype, DType::Float(FloatWidth::F32 | FloatWidth::F64) | DType::Complex(_)) { return Ok(None); }
+    let Some(cells) = [0, 1].map(|j| Cells::new(views[j], sides[j], j == 0)).into_iter().collect::<Option<Vec<_>>>() else { return Ok(None) };
+    rustymath::with_inexact!(dtype, T => {
+        let [x, y] = views.map(|v| T::of(v.storage()).expect("a view's storage holds its dtype"));
+        let in_place = |data: &[T], cells: &Cells, shape| cells.at(0).is_some_and(|mapping| Mapped { data, mapping: &mapping }.in_place(Orientation::Normal, shape));
+        if !in_place(x, &cells[0], [n, k]) || !in_place(y, &cells[1], [k, m]) { return Ok(None); }
+        let parts = run(py, frames, |i, _: &mut ()| {
+            let (a, b) = (cells[0].at(frames.cell(0, i))?, cells[1].at(frames.cell(1, i))?);
+            Some(PlusTimes.inner_mapped(Mapped { data: x, mapping: &a }, Mapped { data: y, mapping: &b }, [Orientation::Normal; 2], size))
+        })?;
+        let Some(parts) = parts.into_iter().collect::<Option<Vec<_>>>() else { return Ok(None) };
+        Ok(Some(array(parts.concat(), &frames.layout, cell.clone(), dtype)?))
+    })
+}
+
 /// The inner product of native binary functions named `f` and `g`, on vectors, matrices or broadcast stacks. Recognized pairs use specialized kernels; other pairs apply `g` in bounded blocks and fold `f` from the right. `name` names the product in errors.
 #[pyfunction]
 #[pyo3(signature = (f, g, x1, x2, name=None))]
 pub fn product<'py>(py: Python<'py>, f: &str, g: &str, x1: &Bound<'py, PyAny>, x2: &Bound<'py, PyAny>, name: Option<&str>) -> PyResult<Bound<'py, PyAny>> {
-    let name = name.unwrap_or("inner");
     let call = convert(&[x1, x2])?;
-    let dtype = call.args[0].view().dtype();
-    let (l1, l2) = (call.args[0].layout(), call.args[1].layout());
+    result(py, inner(py, f, g, [call.args[0].view(), call.args[1].view()], name.unwrap_or("inner"))?)
+}
+
+/// [`product`] of two arrays that share one dtype, as a core array.
+pub fn inner(py: Python<'_>, f: &str, g: &str, [x1, x2]: [ArrayView<'_>; 2], name: &str) -> PyResult<Core> {
+    let dtype = x1.dtype();
+    let (l1, l2) = (x1.layout().clone(), x2.layout().clone());
     let side = |l: &Layout| match l.shape().len() {
         0 => Err(py_err(Error::new(Kind::Rank, format!("{name} needs matrices or vectors, with at least one axis")))),
         1 => Ok(1),
@@ -641,9 +680,11 @@ pub fn product<'py>(py: Python<'py>, f: &str, g: &str, x1: &Bound<'py, PyAny>, x
     let (j, m) = if c2 == 1 { (s2[0], 1) } else { (s2[r2 - 2], s2[r2 - 1]) };
     if k != j { return Err(py_err(Error::new(Kind::Length, format!("{name} needs as many columns on the left as rows on the right, not {k} and {j}")))); }
     let frames = framed(&[(&l1, c1), (&l2, c2)])?;
-    let x = call.args[0].at(dtype)?;
-    let y = paired(call.args[1].at(dtype)?, &l2, r2 - c2, &l1, r1 - 1, name)?;
     let cell = l1.axes(r1 - c1..r1).contracted(&l2.axes(r2 - c2..r2));
+    let keyless = l1.keys(r1 - 1).is_none() && l2.keys(r2 - c2).is_none();
+    if (f, g) == ("add", "multiply") && keyless && let Some(r) = mapped(py, [x1, x2], [c1, c2], &frames, [n, k, m], &cell)? { return Ok(r); }
+    let x = x1.cast(dtype).map_err(py_err)?;
+    let y = paired(x2.cast(dtype).map_err(py_err)?, &l2, r2 - c2, &l1, r1 - 1, name)?;
     let p = Product { py, args: [x.view(), y.view()], frames: &frames, size: [n, k, m], cell: &cell, name };
     match (f, g) {
         ("add", "multiply") if dtype == DType::Boolean => p.run(rustymath::kernels!(Product OrAnd)),

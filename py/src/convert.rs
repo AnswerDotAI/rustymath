@@ -10,13 +10,13 @@ use rustymath::buffer::{Buffer, ComplexWidth, DType, Element, FloatWidth, Items,
 use rustymath::error::{Error, Kind};
 use rustymath::layout::{Keys, Layout, element_count, generated_len};
 use rustymath::with_dtype;
-use rustymath_buffer::{Read, name, py_err, read};
+use rustymath_buffer::{Read, py_err, read};
 use std::borrow::Cow;
 use std::sync::Arc;
 
 /// The shared compact dtype named `name`, or a Python argument error.
 pub fn dtype(name: &str) -> PyResult<DType> {
-    rustymath_buffer::named(name).ok_or_else(|| PyValueError::new_err(format!("unknown dtype {name:?}")))
+    DType::named(name).ok_or_else(|| PyValueError::new_err(format!("unknown dtype {name:?}")))
 }
 
 /// One data argument, converted, and whether it was a Python scalar, as `scalar` tests.
@@ -54,9 +54,9 @@ impl Arg<'_> {
         }
     }
     /// Selects before taking ownership: foreign items gather directly, while Rustymath arrays can share affine views.
-    pub fn selected(&self, plan: &rustymath::structure::Plan) -> PyResult<Core> {
+    pub fn selected(&self, plan: rustymath::structure::Plan) -> PyResult<Core> {
         match &self.source {
-            Source::Read { read, .. } => Core::gathered(read.view(), plan),
+            Source::Read { read, .. } => Core::gathered(read.view(), &plan),
             Source::Array(a) => a.core().selected(plan),
             Source::Owned(c) => c.selected(plan),
         }.map_err(py_err)
@@ -65,7 +65,7 @@ impl Arg<'_> {
     pub fn at(&self, dtype: DType) -> PyResult<Items<'_>> {
         let view = self.view();
         if view.is_empty() && view.dtype() != dtype { return Ok(Items::Owned(Buffer::with_capacity(dtype, 0))); }
-        if !view.is_empty() && !view.dtype().widens_to(dtype) { return Err(py_err(Error::new(Kind::Domain, format!("{} doesn't widen to {}", name(view.dtype()), name(dtype))))); }
+        if !view.is_empty() && !view.dtype().widens_to(dtype) { return Err(py_err(Error::new(Kind::Domain, format!("{} doesn't widen to {}", view.dtype().name(), dtype.name())))); }
         view.cast(dtype).map_err(py_err)
     }
     /// The items in row-major order as `T`, widened as [`Arg::at`] widens them: borrowed where the argument already has `T`'s dtype, and otherwise the widened copy.
@@ -109,14 +109,11 @@ fn join(strong: &mut Option<DType>, dtype: DType) -> PyResult<()> {
     Ok(())
 }
 
-/// The dtype of a call whose arrays have `strong` and whose Python values reach `weak`.
+/// The dtype of a call whose arrays have `strong` and whose Python values reach `weak`, as [`DType::common_weak`] promotes them. A call with neither takes `float64`.
 fn target(strong: Option<DType>, weak: Option<DType>) -> PyResult<DType> {
     Ok(match (strong, weak) {
-        (Some(s), Some(w)) if (s == DType::Character) != (w == DType::Character) => return Err(mixed()),
-        (Some(s), Some(DType::Complex(_))) => s.complex(),
-        (Some(s), Some(w)) if w.kind() > s.kind() => w,
-        (Some(s), _) => s,
-        (None, Some(w)) => w,
+        (Some(s), Some(w)) => s.common_weak(w).ok_or_else(mixed)?,
+        (Some(d), None) | (None, Some(d)) => d,
         (None, None) => DType::Float(FloatWidth::F64),
     })
 }
@@ -127,7 +124,7 @@ trait FromLeaf: Sized {
 }
 
 fn unfit(leaf: Leaf, dtype: DType) -> Error {
-    let name = name(dtype);
+    let name = dtype.name();
     match leaf {
         Leaf::Int(n) => Error::new(Kind::Overflow, format!("{n} doesn't fit {name}")),
         Leaf::Big(x) => Error::new(Kind::Overflow, format!("{x:e} doesn't fit {name}")),
@@ -359,7 +356,7 @@ fn convert_at<'py>(args: &[&Bound<'py, PyAny>], forced: Option<DType>) -> PyResu
     let target = forced.unwrap_or(inferred);
     // Every array and nested buffer widens to `strong`, so this one check guards the casts here and in `build`.
     if forced.is_none() && let Some(s) = strong.filter(|&s| !s.widens_to(target)) {
-        return Err(PySystemError::new_err(format!("internal error: promotion would narrow {} to {}", name(s), name(target))));
+        return Err(PySystemError::new_err(format!("internal error: promotion would narrow {} to {}", s.name(), target.name())));
     }
     let args = pending.into_iter().map(|p| {
         let a = match p {

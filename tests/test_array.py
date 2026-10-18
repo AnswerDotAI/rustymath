@@ -1,11 +1,11 @@
 import numpy as np, pytest, rustymath as rm
 
-DTYPES = {'bool': np.bool_, 'u8': np.uint8, 'i16': np.int16, 'i32': np.int32, 'i64': np.int64, 'f16': np.float16, 'f32': np.float32,
-    'f64': np.float64, 'c64': np.complex64, 'c128': np.complex128, 'char': np.dtype('<U1')}
+DTYPES = {'bool': np.bool_, 'uint8': np.uint8, 'int16': np.int16, 'int32': np.int32, 'int64': np.int64, 'float16': np.float16, 'float32': np.float32,
+    'float64': np.float64, 'complex64': np.complex64, 'complex128': np.complex128, 'character': np.dtype('<U1')}
 
 def test_numpy_views_share_items():
     for name, dt in DTYPES.items():
-        x = np.array(['a', 'b', 'c'] if name == 'char' else [1, 0, 1], dtype=dt)
+        x = np.array(['a', 'b', 'c'] if name == 'character' else [1, 0, 1], dtype=dt)
         a = rm.array(x)
         assert a.dtype == name and a.shape == (3,)
         v = np.asarray(a)
@@ -38,7 +38,7 @@ def test_array_copies_and_reads_any_layout():
     unaligned = np.frombuffer(bytearray(1) + np.array([1.5, 2.5]).tobytes(), dtype=np.float64, offset=1)
     for y in (x[:, ::2], x[::-1], x.T, unaligned, np.array(7, np.int16), np.float32(2.5)):
         b = rm.array(y)
-        assert b.dtype == {np.float64: 'f64', np.int16: 'i16', np.float32: 'f32'}[y.dtype.type] and b.shape == np.shape(y)
+        assert b.dtype == {np.float64: 'float64', np.int16: 'int16', np.float32: 'float32'}[y.dtype.type] and b.shape == np.shape(y)
         assert np.array_equal(np.asarray(b), y)
     assert rm.array(np.array([0, 2, 1], np.uint8).view(np.bool_)).tolist() == [False, True, True]
 
@@ -49,16 +49,16 @@ def test_unsupported_buffers_raise():
     with pytest.raises(ValueError, match='Unicode'): rm.array(np.array([0xD800], np.uint32).view('<U1'))
 
 def test_python_values():
-    assert [rm.array(v).dtype for v in ([1, 2], [1, 2.5], [True, False], [1j], 'ab', [], (1, 2), range(3))] == ['i64', 'f64', 'bool', 'c128', 'char', 'f64', 'i64', 'i64']
+    assert [rm.array(v).dtype for v in ([1, 2], [1, 2.5], [True, False], [1j], 'ab', [], (1, 2), range(3))] == ['int64', 'float64', 'bool', 'complex128', 'character', 'float64', 'int64', 'int64']
     m = rm.array([[1, 2], [3, 4]])
     assert m.shape == (2, 2) and len(m) == 2 and m[1].tolist() == [3, 4] and m[-1][0] == 3 and isinstance(m[0][1], int)
     assert rm.array(range(2, 8, 3)).tolist() == [2, 5]
-    assert rm.array([np.float32(1.5), 2]).dtype == 'f32' and rm.array([np.array([1, 2], np.int16), [3, 4]]).dtype == 'i16'
-    assert rm.array([np.float32(1), np.float64(2)]).dtype == 'f64' and rm.array([np.uint8(1), np.float16(2)]).dtype == 'f16'
+    assert rm.array([np.float32(1.5), 2]).dtype == 'float32' and rm.array([np.array([1, 2], np.int16), [3, 4]]).dtype == 'int16'
+    assert rm.array([np.float32(1), np.float64(2)]).dtype == 'float64' and rm.array([np.uint8(1), np.float16(2)]).dtype == 'float16'
     with pytest.raises(OverflowError): rm.array(range(2**63, 2**63 + 2))
     t = rm.array({'a': [1, 2], 'b': [3, 4]})
     assert t.keys == (('a', 'b'), None) and t['b'].tolist() == [3, 4] and t.names == (None, None)
-    assert repr(rm.array([1.5])) == 'Array([1.5], dtype=f64)'
+    assert repr(rm.array([1.5])) == 'Array([1.5], dtype=float64)'
     with pytest.raises(ValueError, match='ragged'): rm.array([[1], [2, 3]])
     with pytest.raises(ValueError): rm.array([1, 'a'])
     with pytest.raises(ValueError): rm.array(['ab'])
@@ -68,10 +68,10 @@ def test_python_values():
     with pytest.raises(IndexError): m[2]
 
 def test_repr_precision():
-    for dtype, text in (('f16', '1.23'), ('f32', '1.23457'), ('f64', '1.2345679')):
+    for dtype, text in (('float16', '1.23'), ('float32', '1.23457'), ('float64', '1.2345679')):
         a = rm.array([1.234567891234, -0.0], dtype=dtype)
         assert f'[{text}, -0.0]' in repr(a) and a.tolist() == np.array([1.234567891234, -0.0], dtype=DTYPES[dtype]).tolist()
-    for dtype, text in (('c64', '(1.23457+2.34568j)'), ('c128', '(1.2345679+2.3456789j)')):
+    for dtype, text in (('complex64', '(1.23457+2.34568j)'), ('complex128', '(1.2345679+2.3456789j)')):
         assert text in repr(rm.array([1.234567891234 + 2.345678912345j], dtype=dtype))
     roots = [1.000000000000002+0j, complex(1.9999999999999984, -0.0), 3.0000000000000036+0j]
     a = rm.array(roots)
@@ -83,18 +83,18 @@ def test_methods():
     t = rm.array({'a': [1, 2], 'b': [3, 4]})
     assert m[1, 0] == 3 and isinstance(m[1, 0], int) and t['b', -1] == 4 and m[()].tolist() == m.tolist()
     with pytest.raises(IndexError): m[0, 0, 0]
-    assert t.astype('f32').dtype == 'f32' and t.astype('f32').keys == t.keys and rm.array([True]).astype('u8').tolist() == [1]
-    assert rm.array([1.5]).astype('c128').tolist() == [1.5 + 0j] and m.astype('i64').tolist() == m.tolist()
-    assert rm.array([1.7, -1.7]).astype('i64').tolist() == [1, -1] and rm.array([5]).astype('i16').tolist() == [5] and rm.array([2 + 0j]).astype('u8').tolist() == [2]
-    assert rm.array([0, 1]).astype('bool').tolist() == rm.array([0.0, 1.0]).astype('bool').tolist() == [False, True] and rm.array([1 + 2j]).astype('c64').dtype == 'c64'
-    for source, values, targets in (('u8', [0, 255], ('i16', 'i32', 'i64')), ('i16', [-32768, 32767], ('i32', 'i64')), ('i32', [-2**31, 2**31-1], ('i64',))):
+    assert t.astype('float32').dtype == 'float32' and t.astype('float32').keys == t.keys and rm.array([True]).astype('uint8').tolist() == [1]
+    assert rm.array([1.5]).astype('complex128').tolist() == [1.5 + 0j] and m.astype('int64').tolist() == m.tolist()
+    assert rm.array([1.7, -1.7]).astype('int64').tolist() == [1, -1] and rm.array([5]).astype('int16').tolist() == [5] and rm.array([2 + 0j]).astype('uint8').tolist() == [2]
+    assert rm.array([0, 1]).astype('bool').tolist() == rm.array([0.0, 1.0]).astype('bool').tolist() == [False, True] and rm.array([1 + 2j]).astype('complex64').dtype == 'complex64'
+    for source, values, targets in (('uint8', [0, 255], ('int16', 'int32', 'int64')), ('int16', [-32768, 32767], ('int32', 'int64')), ('int32', [-2**31, 2**31-1], ('int64',))):
         a = rm.array(values, dtype=source)
         for target in targets: assert a.astype(target).tolist() == a.astype(target).astype(source).tolist() == values
-    for x, dtype in ((-1, 'u8'), (300, 'u8'), (2**40, 'i32'), (float('nan'), 'i64'), (float('inf'), 'i16'), (2, 'bool'), (0.5, 'bool'), (1.5, 'bool'), (1e19, 'i64')):
+    for x, dtype in ((-1, 'uint8'), (300, 'uint8'), (2**40, 'int32'), (float('nan'), 'int64'), (float('inf'), 'int16'), (2, 'bool'), (0.5, 'bool'), (1.5, 'bool'), (1e19, 'int64')):
         with pytest.raises(OverflowError): rm.array([x]).astype(dtype)
-    with pytest.raises(ValueError, match='imaginary'): rm.array([1 + 1j]).astype('f64')
-    with pytest.raises(ValueError, match='characters'): rm.array('ab').astype('i64')
-    with pytest.raises(ValueError, match='unknown dtype'): m.astype('float64')
+    with pytest.raises(ValueError, match='imaginary'): rm.array([1 + 1j]).astype('float64')
+    with pytest.raises(ValueError, match='characters'): rm.array('ab').astype('int64')
+    with pytest.raises(ValueError, match='unknown dtype'): m.astype('f64')
     v = rm.array(range(6))
     r = v.reshape(2, 3)
     assert r.shape == (2, 3) and v.reshape((3, -1)).shape == (3, 2) and v.reshape([6]).tolist() == v.tolist() and t.reshape(4).keys == (None,)
@@ -110,9 +110,9 @@ def test_methods():
     assert s.names == (None, None)
     for names in (('city',), ('a', 'a')):
         with pytest.raises(ValueError): s.names = names
-    assert '[0.1]' in repr(rm.array([0.1]).astype('f32')) and '[0.1]' in repr(rm.array([0.1]).astype('f16')) and '(0.1+0.2j)' in repr(rm.array([0.1 + 0.2j]).astype('c64'))
+    assert '[0.1]' in repr(rm.array([0.1]).astype('float32')) and '[0.1]' in repr(rm.array([0.1]).astype('float16')) and '(0.1+0.2j)' in repr(rm.array([0.1 + 0.2j]).astype('complex64'))
     # Cast only selected items, not invalid values elsewhere in the shared base.
-    assert rm.array([float('nan'), 2.5])[1:].astype('i64').tolist() == [2]
+    assert rm.array([float('nan'), 2.5])[1:].astype('int64').tolist() == [2]
 
 def test_operators_and_reductions():
     a, m = rm.array([1, 2, 3]), rm.array([[1, 2, 3], [4, 5, 6]])
@@ -123,7 +123,7 @@ def test_operators_and_reductions():
     assert (a == 2).tolist() == [False, True, False] and (a >= 2).tolist() == [False, True, True] and (a == None) is False
     with pytest.raises(TypeError): a + None
     with pytest.raises(TypeError): hash(a)
-    with pytest.raises(OverflowError): rm.array([2**62]) * 4
+    assert (rm.array([2**62]) * 4).tolist() == [0]
     assert m.sum() == 21 and isinstance(m.sum(), int) and m.sum(axis=0).tolist() == [5, 7, 9] and m.sum(axis=(0, 1)) == 21
     assert m.prod(axis=1).tolist() == [6, 120] and m.max() == 6 and m.min(axis=1).tolist() == [1, 4]
     assert m.cumsum().tolist() == [1, 3, 6, 10, 15, 21] and m.cumsum(axis=1).tolist() == [[1, 3, 6], [4, 9, 15]] and m.cumprod(axis=0).tolist() == [[1, 2, 3], [4, 10, 18]]

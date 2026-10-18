@@ -12,7 +12,7 @@ use std::marker::PhantomData;
 /// Runs `$body` with `$f` as the float type that a search computes in for data of `$dtype`, as [`DType::inexact`] gives it: `f32` for 16- and 32-bit floats, and `f64` otherwise.
 macro_rules! float {
     ($dtype:expr, $f:ident => $body:expr) => {
-        if $dtype.inexact().map(|d| d.0) == Some(DType::Float(FloatWidth::F32)) { type $f = f32; $body } else { type $f = f64; $body }
+        if $dtype.inexact(FloatWidth::F64).map(|d| d.0) == Some(DType::Float(FloatWidth::F32)) { type $f = f32; $body } else { type $f = f64; $body }
     };
 }
 

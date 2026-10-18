@@ -16,7 +16,9 @@ pub(crate) const fn running(size: usize) -> usize {
 #[derive(Clone, Copy, Debug)]
 pub enum Arg<'a, T> { One(T), Many(&'a [T]) }
 
-impl<T: Copy> Arg<'_, T> {
+impl<'a, T: Copy> Arg<'a, T> {
+    /// The argument that `items` gives: its only item for every result when it holds one, otherwise one item for each result.
+    pub fn of(items: &'a [T]) -> Self { if let [x] = *items { Arg::One(x) } else { Arg::Many(items) } }
     /// Items `start..start + n` of this argument, each converted by `f`. A `Many` argument converts into `buf`.
     #[inline]
     pub fn converted<'b, A: Send>(self, start: usize, n: usize, buf: &'b mut Vec<A>, f: impl Fn(T) -> A + Sync) -> Arg<'b, A> where T: Sync {
@@ -35,13 +37,21 @@ impl<T: Copy> Arg<'_, T> {
     pub(crate) fn part(self, start: usize, n: usize) -> Self { match self { Arg::One(v) => Arg::One(v), Arg::Many(s) => Arg::Many(&s[start..start + n]) } }
 }
 
+/// The results of a function object of `N` items of type `T`: their type, whether any can fail, and how a failed result is written. [`Unary`], [`Binary`] and [`Ternary`] each require it, so code that takes a function object of any arity reads these through one bound.
+pub trait Results<T, const N: usize> {
+    /// The type of each result.
+    type Out;
+    /// Whether no result fails: `checked` always gives `Some`, and `many` and `many_into` always give true. A total float function, such as [`Exp`](crate::Exp), gives NaN only where an argument is NaN.
+    const TOTAL: bool;
+    /// Whether a failed result is written wrapped to its type, as integer arithmetic writes one. A caller that takes integers as wrapping, as NumPy does, keeps it.
+    const WRAPS: bool;
+}
+
 /// Defines each arity's public trait, with a blanket impl at each item type that reaches the forms `forms!` writes. The types pass through `@concrete` one at a time, so that the argument names don't repeat inside the types' repetition.
 macro_rules! arities {
     ($($(#[$doc:meta])* $name:ident<$n:literal>($($x:ident),+);)+) => {$(
         $(#[$doc])*
-        pub trait $name<T> {
-            /// The type of each result.
-            type Out;
+        pub trait $name<T>: Results<T, $n> {
             /// The function of one item of each argument.
             fn one(&self, $($x: T),+) -> Self::Out;
             /// Appends `one` for each of `n` results to `out`, and gives whether every result succeeded. A `Many` argument has at least `n` items, and a `One` argument pairs its item with every result. A float or complex result fails where it is NaN and no argument is, because rustymath gives NaN for an argument outside a function's domain. An integer result fails where it doesn't fit its type.
@@ -57,8 +67,12 @@ macro_rules! arities {
         arities!(@impl $name, $n, $args, $e);
     )+};
     (@impl $name:ident, $n:literal, ($($x:ident),+), $e:ty) => {
-        impl<K: Forms<$e, $n>> $name<$e> for K {
+        impl<K: Forms<$e, $n>> Results<$e, $n> for K {
             type Out = <K as Forms<$e, $n>>::Out;
+            const TOTAL: bool = <K as Forms<$e, $n>>::TOTAL;
+            const WRAPS: bool = <K as Forms<$e, $n>>::WRAPS;
+        }
+        impl<K: Forms<$e, $n>> $name<$e> for K {
             #[inline]
             fn one(&self, $($x: $e),+) -> Self::Out { self.scalar([$($x),+]) }
             #[inline]
@@ -92,6 +106,8 @@ pub struct Flipped<K>(pub K);
 
 impl<E: Item, K: Forms<E, 2>> Forms<E, 2> for Flipped<K> {
     type Out = K::Out;
+    const TOTAL: bool = K::TOTAL;
+    const WRAPS: bool = K::WRAPS;
     #[inline]
     fn scalar(&self, [x, y]: [E; 2]) -> K::Out { self.0.scalar([y, x]) }
     #[inline]
@@ -104,10 +120,14 @@ impl<E: Item, K: Forms<E, 2>> Forms<E, 2> for Flipped<K> {
 #[inline(always)]
 pub(crate) fn kept<O: Item, E: Item, const N: usize>(r: O, args: [E; N]) -> bool { !r.has_nan() | args.iter().any(|a| a.has_nan()) }
 
-/// What a function object's item body gives: an output, which fails where it is NaN and no argument is, an `Option` of one, which fails where it is `None`, or a [`Total`] output, which never fails. An integer function, whose result can overflow, gives an `Option`. An output that is never NaN, such as `bool`, fails only through `None`.
+/// What a function object's item body gives: an output, which fails where it is NaN and no argument is, an `Option` of one, which fails where it is `None`, a wrapped output paired with whether it's exact, which fails where it isn't, or a [`Total`] output, which never fails. Integer arithmetic, whose result can overflow, gives a wrapped output. An integer function with no wrapped result to give, such as a binomial coefficient, gives an `Option`. An output that is never NaN, such as `bool`, fails only through `None` or an inexact pair.
 pub(crate) trait Outcome<O: Item>: Sized {
     /// Whether an output that `split` fails can still succeed, as a NaN output does where an argument is NaN. Only a plain output can.
     const RESCUE: bool;
+    /// Whether no output fails: a [`Total`] output, or a plain output of a type without NaN.
+    const TOTAL: bool;
+    /// Whether a failed output's slot holds the result wrapped to its type: only a wrapped pair's does.
+    const WRAPS: bool = false;
     /// The output, as a scalar form gives it. `None` panics, because a scalar form has no other way to report it.
     fn value(self) -> O;
     /// The output, and whether it succeeded, judged by the output alone, so that a NaN output fails. That costs one test for each item, where testing each argument too would cost one more for each argument.
@@ -119,6 +139,7 @@ pub(crate) trait Outcome<O: Item>: Sized {
 
 impl<O: Item> Outcome<O> for O {
     const RESCUE: bool = true;
+    const TOTAL: bool = !O::NAN;
     #[inline(always)]
     fn value(self) -> O { self }
     #[inline(always)]
@@ -127,10 +148,22 @@ impl<O: Item> Outcome<O> for O {
 
 impl<O: Item + Default> Outcome<O> for Option<O> {
     const RESCUE: bool = false;
+    const TOTAL: bool = false;
     #[inline(always)]
     fn value(self) -> O { self.expect("the result doesn't fit the output type") }
     #[inline(always)]
     fn split(self) -> (O, bool) { (self.unwrap_or_default(), self.is_some()) }
+}
+
+/// An output wrapped to its type, and whether it's the exact result, as integer arithmetic gives it. A result that isn't exact fails, and its slot holds the wrapped output. That output is NumPy's result for fixed-width integers.
+impl<O: Item> Outcome<O> for (O, bool) {
+    const RESCUE: bool = false;
+    const TOTAL: bool = false;
+    const WRAPS: bool = true;
+    #[inline(always)]
+    fn value(self) -> O { self.0 }
+    #[inline(always)]
+    fn split(self) -> (O, bool) { self }
 }
 
 /// The output of an item body that never fails: one that never gives NaN from arguments that aren't NaN, such as `exp`'s, or one whose NaN is the function's value, such as that of `∞ - ∞`. The slice loop tests none of them.
@@ -139,11 +172,17 @@ pub(crate) struct Total<O>(pub O);
 
 impl<O: Item> Outcome<O> for Total<O> {
     const RESCUE: bool = false;
+    const TOTAL: bool = true;
     #[inline(always)]
     fn value(self) -> O { self.0 }
     #[inline(always)]
     fn split(self) -> (O, bool) { (self.0, true) }
 }
+
+/// Whether an item body never fails, as its outcome type `R` says. `forms!` passes the body as a closure, which names that type without running it.
+pub(crate) const fn total<K, E, O: Item, R: Outcome<O>, const N: usize>(_: fn(&K, [E; N]) -> R) -> bool { R::TOTAL }
+/// Whether an item body that fails leaves its result wrapped to the output type, as its outcome type `R` says.
+pub(crate) const fn wraps<K, E, O: Item, R: Outcome<O>, const N: usize>(_: fn(&K, [E; N]) -> R) -> bool { R::WRAPS }
 
 /// The items of `x` that result `i` takes.
 #[inline(always)]
@@ -214,6 +253,8 @@ macro_rules! forms {
                 let $k = self;
                 crate::slice::Outcome::<$o>::value($body)
             }
+            const TOTAL: bool = crate::slice::total::<Self, $e, $o, _, { forms!(@n $($x),+) }>(|$k, [$($x),+]| $body);
+            const WRAPS: bool = crate::slice::wraps::<Self, $e, $o, _, { forms!(@n $($x),+) }>(|$k, [$($x),+]| $body);
             $(#[$m])*
             fn checked_scalar(&self, [$($x),+]: [$e; forms!(@n $($x),+)]) -> Option<$o> {
                 let $k = self;
@@ -242,6 +283,8 @@ macro_rules! forms {
             fn scalar(&self, x: [half::f16; forms!(@n $($x),+)]) -> $o {
                 ($narrow)(crate::float::sealed::Forms::<f32, { forms!(@n $($x),+) }>::scalar(self, x.map(half::f16::to_f32)))
             }
+            const TOTAL: bool = <Self as crate::float::sealed::Forms<f32, { forms!(@n $($x),+) }>>::TOTAL;
+            const WRAPS: bool = <Self as crate::float::sealed::Forms<f32, { forms!(@n $($x),+) }>>::WRAPS;
             $(#[$m])*
             fn checked_scalar(&self, x: [half::f16; forms!(@n $($x),+)]) -> Option<$o> {
                 crate::float::sealed::Forms::<f32, { forms!(@n $($x),+) }>::checked_scalar(self, x.map(half::f16::to_f32)).map($narrow)

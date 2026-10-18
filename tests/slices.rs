@@ -67,7 +67,7 @@ mod forms {
         wide.iter().flat_map(|&x| [x, -x]).map(F::narrow).collect()
     }
 
-    /// `k.many` against `k.one` for every pairing of `One` and `Many` among `items`. It must append after what `out` holds, and say whether every item succeeded, as `checked` does item by item. The NaN rule must agree too. That catches a function marked total that gives NaN from arguments that aren't NaN.
+    /// `k.many` against `k.one` for every pairing of `One` and `Many` among `items`. It must append after what `out` holds, and say whether every item succeeded, as `checked` does item by item. The NaN rule must agree too. That catches a function marked total that gives NaN from arguments that aren't NaN. A function whose `TOTAL` is true must succeed on every item.
     fn binary<F: Float + Debug, K: Binary<F, Out = F>>(k: K, name: &str) {
         let items = items::<F>();
         let check = |x: Arg<'_, F>, y: Arg<'_, F>, n: usize| {
@@ -78,6 +78,7 @@ mod forms {
             for i in 0..n { assert!(same(out[i + 1], k.one(at(x, i), at(y, i))), "{name}({:?}, {:?})", at(x, i), at(y, i)) }
             assert_eq!(ok, (0..n).all(|i| k.checked(at(x, i), at(y, i)).is_some()), "{name}");
             assert_eq!(ok, (0..n).all(|i| !out[i + 1].is_nan() || [at(x, i), at(y, i)].iter().any(|v| v.is_nan())), "{name} breaks the NaN rule");
+            assert!(ok || !K::TOTAL, "{name} is total but fails");
         };
         let (xs, ys): (Vec<F>, Vec<F>) = items.iter().flat_map(|&x| items.iter().map(move |&y| (x, y))).unzip();
         check(Arg::Many(&xs), Arg::Many(&ys), xs.len());
@@ -97,6 +98,7 @@ mod forms {
             for i in 0..n { assert!(same(out[i + 1], k.one(at(i))), "{name}({:?})", at(i)) }
             assert_eq!(ok, (0..n).all(|i| k.checked(at(i)).is_some()), "{name}");
             assert_eq!(ok, (0..n).all(|i| !out[i + 1].is_nan() || at(i).is_nan()), "{name} breaks the NaN rule");
+            assert!(ok || !K::TOTAL, "{name} is total but fails");
         };
         check(Arg::Many(items), items.len());
         for &v in items { check(Arg::One(v), 3) }
@@ -115,6 +117,7 @@ mod forms {
             }
             assert_eq!(ok, (0..n).all(|i| k.checked(at(x, i), at(y, i), at(z, i)).is_some()), "{name}");
             assert_eq!(ok, (0..n).all(|i| !out[i + 1].is_nan() || [at(x, i), at(y, i), at(z, i)].iter().any(|v| v.is_nan())), "{name} breaks the NaN rule");
+            assert!(ok || !K::TOTAL, "{name} is total but fails");
         };
         let (mut xs, mut ys, mut zs) = (Vec::new(), Vec::new(), Vec::new());
         for &x in &items {
@@ -154,6 +157,8 @@ mod forms {
         let q: Vec<f64> = (0..2000).map(|_| 2.0 * rng.random::<f64>()).collect();
         unary(Erfcinv, "Erfcinv", &q);
         unary(Erfinv, "Erfinv", &q.iter().map(|&q| q - 1.0).collect::<Vec<_>>());
+        assert!(<Exp as Results<f64, 1>>::TOTAL && <Maximum as Results<f32, 2>>::TOTAL && !<Pow as Results<f64, 2>>::TOTAL && !<Sqrt as Results<f16, 1>>::TOTAL);
+        assert!(<Add as Results<i64, 2>>::WRAPS && <Pow as Results<u8, 2>>::WRAPS && !<Add as Results<f64, 2>>::WRAPS && !<Binom as Results<i64, 2>>::WRAPS);
     }
 
     /// An output type other than the item type, at each float type, f16 included, and at concrete complex types. A `bool` output is never NaN, so it never fails.
@@ -278,6 +283,38 @@ mod reductions {
         (0..outer).flat_map(|i| (0..inner).map(move |k| (0..len).map(|j| x[(i * len + j) * inner + k]).collect())).collect()
     }
 
+    /// Folds of an array that a mapping lays over its source, against folds of the same array built. Transposes in two and three dimensions, reversed axes, a block of rows, and 2 by 2 windows of a 4 by 6 matrix that don't overlap each read a contiguous block, which folds in its own order. Overlapping windows and a broadcast read the source block by block. Each folds along every axis. `Mapping::block` lays out the windows' block as window row, row within a window, window column and column within a window.
+    #[test]
+    fn mapped_folds_match_built_copies() {
+        use rustymath::{agreement::{Block, Mapping}, gather::{Same, Steps, walk}, layout::Lanes};
+        let x: Vec<i64> = (0..120).map(|i| (i * 37 % 101) - 50).collect();
+        let s = |start, len, step| Steps::Stride { start, len, step };
+        for (shape, steps) in [
+            (vec![7, 6], vec![s(0, 7, 1), s(0, 6, 7)]),
+            (vec![6, 7], vec![s(0, 6, 7), s(6, 7, -1)]),
+            (vec![4, 7], vec![s(14, 4, 7), s(0, 7, 1)]),
+            (vec![6, 4, 5], vec![s(0, 6, 1), s(0, 4, 30), s(0, 5, 6)]),
+            (vec![6, 7], vec![s(35, 6, -7), s(0, 7, 1)]),
+            (vec![5, 3], vec![s(0, 5, 1), s(0, 3, 1)]),
+            (vec![2, 3, 2, 2], vec![s(0, 2, 12), s(0, 3, 2), s(0, 2, 6), s(0, 2, 1)]),
+            (vec![4, 5], vec![s(0, 4, 0), s(0, 5, 1)]),
+        ] {
+            let mut built = Vec::new();
+            walk(&mut built, &x, 0, &steps, 0, Same);
+            let mapping = Mapping::Steps { base: 0, steps };
+            for axis in 0..shape.len() {
+                let dims = Lanes::new(&shape, axis).unwrap().dims();
+                let (mut totals, fits, order) = along_mapped::<i64, Sum>(&x, &mapping, &shape, axis);
+                if let Some(tables) = order { let mut moved = Vec::new(); walk(&mut moved, &totals, 0, &tables, 0, Same); totals = moved; }
+                assert_eq!((totals, fits), along::<i64, Sum>(&built, dims), "{shape:?} {axis}");
+            }
+        }
+        let pool = Mapping::Steps { base: 0, steps: vec![s(0, 2, 12), s(0, 3, 2), s(0, 2, 6), s(0, 2, 1)] };
+        let block = Block { range: 0..24, dims: vec![2, 2, 3, 2], axes: vec![Some((0, false)), Some((2, false)), Some((1, false)), Some((3, false))] };
+        assert_eq!(pool.block(&[2, 3, 2, 2]), Some(block));
+    }
+
+
     /// Folds and scans along the middle axis against the same taken lane by lane, item by item, for lanes of consecutive items and otherwise, short and long, and empty. Folding in blocks of 13 splits lanes at many offsets. Booleans fold by each of their reductions, and an `i64` sum that wraps reports it, along a lane and down the rows.
     #[test]
     fn axes_match_lane_by_lane() {
@@ -396,6 +433,42 @@ mod reductions {
         assert!(!along::<i64, Sum>(&[i64::MAX, 0, 1, 0], [1, 2, 2]).1);
         assert!(!scan_along::<i64, Sum>(&[i64::MAX, 0, 1, 0], [1, 2, 2], None, &mut Vec::new()));
         assert!(!left_scan(&[i64::MAX, 1], [1, 2, 1], None, i64::checked_add, &mut Vec::new()));
+    }
+
+    /// Each window's fold matches the same reduction of that window's items alone, for windows folded directly and by van Herk-Gil-Werman, a last block cut short, a window as wide as its lane, and windows down rows. A float maximum skips each NaN item, as `Max::step` does. Each window's pick is its first row that gives its maximum or minimum. A sum that wraps reports it.
+    #[test]
+    fn windows_fold_as_their_items_do() {
+        let same = |a: f64, b: f64| a == b || a.is_nan() && b.is_nan();
+        for shape in [[1usize, 100, 1], [3, 37, 2], [2, 25, 1], [1, 9, 4], [2, 0, 3]] {
+            let [outer, len, inner] = shape;
+            let x: Vec<i64> = (0..outer * len * inner).map(|i| (i * 37 % 101) as i64 - 50).collect();
+            let f: Vec<f64> = x.iter().map(|&v| if v == 7 { f64::NAN } else { v as f64 / 7.0 }).collect();
+            let b: Vec<bool> = x.iter().map(|v| v % 3 == 0).collect();
+            for width in [1, 2, 3, 8, 9, 10, 25, len] {
+                if width == 0 || width > len.max(1) { continue; }
+                let count = (len + 1).saturating_sub(width);
+                // The items of window `a` of the lane at `(i, k)`.
+                let window = |a: usize, i: usize, k: usize| (a..a + width).map(move |j| (i * len + j) * inner + k);
+                let each = |push: &mut dyn FnMut(usize, usize, usize)| for i in 0..outer { for a in 0..count { for k in 0..inner { push(a, i, k) } } };
+                let (mut sums, mut maxima, mut anys) = (Vec::new(), Vec::new(), Vec::new());
+                each(&mut |a, i, k| {
+                    sums.push(window(a, i, k).map(|p| x[p]).sum::<i64>());
+                    maxima.push(window(a, i, k).map(|p| f[p]).fold(<Max as Reduction<f64>>::unit(), <Max as Reduction<f64>>::step));
+                    anys.push(window(a, i, k).any(|p| b[p]));
+                });
+                assert_eq!(sliding::<i64, Sum>(&x, shape, width), (sums, true), "{shape:?} {width}");
+                let (got, ok) = sliding::<f64, Max>(&f, shape, width);
+                assert!(ok && got.len() == maxima.len() && got.iter().zip(&maxima).all(|(&g, &m)| same(g, m)), "{shape:?} {width} {:?}", got.iter().zip(&maxima).find(|&(&g, &m)| !same(g, m)));
+                assert_eq!(sliding::<bool, Max>(&b, shape, width).0, anys, "{shape:?} {width}");
+                // Each pick is the first row of its window whose item, folded alone, gives the window's fold.
+                let pick = |r: &dyn Fn(f64) -> f64, folds: &[f64]| { let mut at = 0; let mut picks = Vec::new(); each(&mut |a, i, k| { picks.push(window(a, i, k).position(|p| r(f[p]) == folds[at]).map_or(a, |j| a + j)); at += 1; }); picks };
+                let (maxima, minima) = (sliding::<f64, Max>(&f, shape, width).0, sliding::<f64, Min>(&f, shape, width).0);
+                assert_eq!(sliding_picks::<f64, Max>(&f, shape, width), pick(&|x| <Max as Reduction<f64>>::one(x).0, &maxima), "{shape:?} {width}");
+                assert_eq!(sliding_picks::<f64, Min>(&f, shape, width), pick(&|x| <Min as Reduction<f64>>::one(x).0, &minima), "{shape:?} {width}");
+            }
+        }
+        assert!(!sliding::<i64, Sum>(&[i64::MAX, 1, 0], [1, 3, 1], 2).1);
+        assert!(!sliding::<i64, Sum>(&[i64::MAX; 20], [1, 20, 1], 10).1);
     }
 
     /// Folds that run in pieces, of long lanes and of single matrices down their columns, and folds of many short lanes or groups, which split across threads, match the sums taken lane by lane, on one thread and on four.
@@ -840,7 +913,7 @@ mod gather {
             (0, vec![along(3, 20), Steps::Stride { start: 19, len: 20, step: -1 }]),
             (0, vec![along(2, 50), Steps::Rotated { shift: 7, len: 30, stride: 1 }]),
             (0, vec![along(2, 50), Steps::Clipped { start: -3, len: 40, size: 30, stride: 1 }]),
-            (0, vec![Steps::Table(vec![Some(4), None, Some(1)]), along(3, 1)]),
+            (0, vec![Steps::table(vec![4, Steps::FILL, 1]), along(3, 1)]),
         ];
         for (base, steps) in &cases {
             let whole = read(&s, *base, steps);
@@ -865,6 +938,19 @@ mod gather {
             } }
         }
     }
+    /// Index arrays pair by broadcasting and take the place of the first one, while a range keeps its axis in place. With one index array, pairing is the cross product.
+    #[test]
+    fn index_arrays_pair() {
+        use rustymath::{layout::Layout, structure::{select, Selector}};
+        let s: Vec<i64> = (0..24).collect();
+        let layout = Layout::from([2, 3, 4]);
+        let ix = |positions: Vec<usize>| Selector::Indices { layout: Layout::from([positions.len()]), positions };
+        let paired = select(&layout, vec![ix(vec![0, 1]), Selector::all(3), ix(vec![1, 2])], true).unwrap();
+        assert_eq!(paired.layout.shape(), &[2, 3]);
+        assert_eq!(read(&s, 0, &paired.steps), [1, 5, 9, 14, 18, 22]);
+        let one = [ix(vec![1, 0]), Selector::At(2)];
+        assert_eq!(read(&s, 0, &select(&layout, one.to_vec(), true).unwrap().steps), read(&s, 0, &select(&layout, one.to_vec(), false).unwrap().steps));
+    }
     /// A composed walk reads what walking one walk and then the other reads. `spreads` and `rereads` find walks that read an item more than once or read a fill.
     #[test]
     fn walks_compose() {
@@ -885,7 +971,59 @@ mod gather {
         let tables = [along(6, 4), along(4, 1)];
         let (base, steps) = Steps::per_axis(&tables, &[2, 3, 4]).expect("a stride splits");
         assert_eq!(read(&s, base, &steps), read(&s, 0, &tables));
-        assert!(along(3, 0).spreads() && Steps::Table(vec![Some(1), Some(1)]).spreads() && !Steps::Rotated { shift: 1, len: 4, stride: 1 }.spreads());
+        // `walked` moves a walked axis's position into the first entry along it, and leaves the position on an axis no entry walks in the base. A read that crosses a row, or a rotation over part of an axis, has no form by axis.
+        let (base, steps, axes) = Steps::walked(&[Steps::Stride { start: 12, len: 1, step: 0 }, along(3, 1)], &[3], &[4, 5]).expect("part of one row");
+        assert!(base == 10 && axes == [Some(1)] && matches!(steps[..], [Steps::Stride { start: 2, len: 3, step: 1 }]));
+        assert!(Steps::walked(&[Steps::Stride { start: 3, len: 1, step: 0 }, along(3, 1)], &[3], &[4, 5]).is_none());
+        assert!(Steps::walked(&[Steps::Stride { start: 2, len: 1, step: 0 }, Steps::Rotated { shift: 1, len: 6, stride: 1 }], &[6], &[10]).is_none());
+        assert!(along(3, 0).spreads() && Steps::table(vec![1, 1]).spreads() && !Steps::Rotated { shift: 1, len: 4, stride: 1 }.spreads());
         assert!(Steps::rereads(&[along(8, 1), along(3, 1)], &[10]) && !Steps::rereads(&[along(10, 1)], &[10]));
+    }
+    /// The strides of an array of `shape`.
+    fn strides(shape: &[usize]) -> Vec<usize> { (0..shape.len()).map(|i| shape[i + 1..].iter().product()).collect() }
+    /// The items of `s` that `steps` reach, with 0 for a fill.
+    fn read0(s: &[i64], steps: &[Steps]) -> Vec<i64> {
+        let mut out = vec![];
+        walk(&mut out, s, 0, steps, 0, Same);
+        out
+    }
+    /// Each source position's sum of the items of a copy of shape `shape` through `tables` that came from it, as the reads that `Steps::transposed` give find it. `items` are the copy's items.
+    fn sent_back(items: &[i64], tables: &[Steps], shape: &[usize], source: &[usize]) -> Vec<i64> {
+        let (order, terms) = Steps::transposed(tables, shape, source).expect("the copy reads each item at most once, or reads windows that move by 1");
+        let strides = strides(shape);
+        let moved = read0(items, &order.iter().map(|&r| along(shape[r], strides[r] as isize)).collect::<Vec<_>>());
+        terms.iter().fold(vec![0; source.iter().product()], |sum, t| sum.iter().zip(read0(&moved, t)).map(|(a, b)| a + b).collect())
+    }
+    /// Each source position's sum of the items of a copy through `tables` that came from it, as adding each item there finds it.
+    fn added_back(items: &[i64], tables: &[Steps], source: &[usize]) -> Vec<i64> {
+        let n = source.iter().product();
+        let mut sums = vec![0; n];
+        for (&x, &item) in read(&(0..n as i64).collect::<Vec<_>>(), 0, tables).iter().zip(items) { if x >= 0 { sums[x as usize] += item; } }
+        sums
+    }
+    #[test]
+    fn copies_transpose() {
+        // A copy of a 4 by 6 source: reversed rows, a rotation, a drop with an overtake, a transpose, a selection and one row. Then windows of 3, and of 5, along 6 items, windows of 3 over positions 2 to 7 of 8 items, and windows of 2 by 3 over 4 by 6.
+        for (tables, shape, source) in [
+            (vec![Steps::Stride { start: 18, len: 4, step: -6 }, along(6, 1)], vec![4, 6], vec![4, 6]),
+            (vec![along(4, 6), Steps::Rotated { shift: 2, len: 6, stride: 1 }], vec![4, 6], vec![4, 6]),
+            (vec![Steps::Stride { start: 6, len: 2, step: 6 }, Steps::Clipped { start: -1, len: 8, size: 6, stride: 1 }], vec![2, 8], vec![4, 6]),
+            (vec![along(6, 1), along(4, 6)], vec![6, 4], vec![4, 6]),
+            (vec![along(4, 6), Steps::table(vec![5, 0, 3])], vec![4, 3], vec![4, 6]),
+            (vec![Steps::Stride { start: 12, len: 1, step: 0 }, along(6, 1)], vec![1, 6], vec![4, 6]),
+            (vec![along(4, 1), along(3, 1)], vec![4, 3], vec![6]),
+            (vec![along(2, 1), along(5, 1)], vec![2, 5], vec![6]),
+            (vec![Steps::Stride { start: 2, len: 4, step: 1 }, along(3, 1)], vec![4, 3], vec![8]),
+            (vec![along(3, 6), along(4, 1), along(2, 6), along(3, 1)], vec![3, 4, 2, 3], vec![4, 6]),
+        ] {
+            let items: Vec<i64> = (1..=shape.iter().product::<usize>() as i64).collect();
+            assert_eq!(sent_back(&items, &tables, &shape, &source), added_back(&items, &tables, &source));
+        }
+        // Windows that move by 2 and a spread repeat items, which needs a scatter.
+        assert!(Steps::transposed(&[along(3, 2), along(3, 1)], &[3, 3], &[7]).is_none() && Steps::transposed(&[along(3, 0)], &[3], &[2]).is_none());
+        // `windows_of` gives each window axis's frames, window size and move, and refuses windows that don't start at 0.
+        assert_eq!(Steps::windows_of(&[along(3, 6), along(4, 1), along(2, 6), along(3, 1)], &[3, 4, 2, 3], &[4, 6]), Some(vec![[3, 2, 1], [4, 3, 1]]));
+        assert_eq!(Steps::windows_of(&[along(3, 2), along(3, 1)], &[3, 3], &[7]), Some(vec![[3, 3, 2]]));
+        assert_eq!(Steps::windows_of(&[Steps::Stride { start: 2, len: 4, step: 1 }, along(3, 1)], &[4, 3], &[8]), None);
     }
 }
