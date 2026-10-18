@@ -21,12 +21,12 @@ jobs:
         with:
           shared-key: native
       - run: grep -m1 'model name' /proc/cpuinfo
-      # With `RUSTYMATH_COSTS`, the speed test logs every cost, which `basedpl.bpltests.logged_costs` reads.
+      # With `RUSTYMATH_COSTS`, the Rust and Python speed tests log every cost, which `basedpl.bpltests.logged_costs` reads.
       - run: RUSTYMATH_COSTS=1 cargo test
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - run: pip install -e '.[dev]'
       - run: cargo develop
-      - run: pytest -q
+      - run: RUSTYMATH_COSTS=1 pytest -q
       - run: nbdev-test

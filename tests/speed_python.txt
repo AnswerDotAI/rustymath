@@ -16,9 +16,9 @@ rm.sum(x[::-1])	2.3
 rm.minmax(m.T)	4.6
 x[::-1]+1	6
 x[::2]+y[::2]	9.7
-a@b	53
-a.T@b	48
-a[::-1]@b	53
+a@b	160
+a.T@b	150
+a[::-1]@b	150
 x[idx]	50
 m[r, c]	180
 rm.at(rm.add, x, idx, y)	86
