@@ -173,11 +173,11 @@ fn totals<R>(function: &str, kernels: &Kernels<AccumulationKernel<R>>, r: &R, x:
     Ok(out)
 }
 
-/// The lanes along `axis` of an argument with `layout` and `len` items, as rustymath's axis functions take them, and the result's layout: `layout` itself, or the flattened argument for `None`.
-pub(crate) fn along_axis(layout: Layout, len: usize, axis: Option<Axis>) -> PyResult<([usize; 3], Layout)> {
+/// The lanes along `axis` of an argument with `layout` and `len` items, as rustymath's axis functions take them, and the result's layout: `layout` itself, or the flattened argument for `None`. Last comes the position of `axis` in `layout`, or `None` for no axis.
+pub(crate) fn along_axis(layout: Layout, len: usize, axis: Option<Axis>) -> PyResult<([usize; 3], Layout, Option<usize>)> {
     match axis {
-        None => Ok(([1, len, 1], Layout::from([len].as_slice()))),
-        Some(a) => Ok((Lanes::new(layout.shape(), a.of(&layout)?).map_err(py_err)?.dims(), layout)),
+        None => Ok(([1, len, 1], Layout::from([len].as_slice()), None)),
+        Some(a) => { let a = a.of(&layout)?; Ok((Lanes::new(layout.shape(), a).map_err(py_err)?.dims(), layout, Some(a))) }
     }
 }
 
@@ -186,7 +186,7 @@ fn scan<'py, R>(py: Python<'py>, function: &str, kernels: &Kernels<AccumulationK
     let call = convert(&[x])?;
     let items = call.args[0].at(call.args[0].view().dtype())?;
     let x = items.view();
-    let (along, layout) = along_axis(call.args[0].layout(), x.len(), axis)?;
+    let (along, layout, _) = along_axis(call.args[0].layout(), x.len(), axis)?;
     give(py, Core::new(layout, checked(function, kernels, x.dtype(), kernels.run(r, x, along, None))?).map_err(py_err)?, false)
 }
 
@@ -551,7 +551,7 @@ fn logical_scan<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, table: [[bool; 2]; 
     let items = call.args[0].at(call.args[0].view().dtype())?;
     let x = items.view();
     let View::Booleans(items) = x else { return Err(missing("logical_scan", x.dtype())) };
-    let (along, layout) = along_axis(call.args[0].layout(), items.len(), axis)?;
+    let (along, layout, _) = along_axis(call.args[0].layout(), items.len(), axis)?;
     let mut out = Vec::with_capacity(items.len());
     reduce::Logical(table).scan_along(items, along, start, &mut out);
     give(py, Core::new(layout, Buffer::Booleans(out)).map_err(py_err)?, false)
@@ -564,7 +564,7 @@ fn _accumulate<'py>(py: Python<'py>, function: &str, x: &Bound<'py, PyAny>, axis
     let x = &call.args[0];
     let start = call.args.get(1);
     if start.is_some_and(|s| !s.layout().shape().is_empty()) { return Err(PyValueError::new_err("start must be a scalar")); }
-    let (dims, layout) = along_axis(x.layout(), x.view().len(), axis)?;
+    let (dims, layout, _) = along_axis(x.layout(), x.view().len(), axis)?;
     let (items, start) = (x.at(x.view().dtype())?, start.map(|s| s.at(s.view().dtype())).transpose()?);
     let result = (native_binary(function)?.scan)(items.view(), dims, start.as_ref().map(|s| s.view()))?;
     give(py, Core::new(layout, result).map_err(py_err)?, false)

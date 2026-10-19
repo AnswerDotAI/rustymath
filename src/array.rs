@@ -206,7 +206,7 @@ impl Array {
         if agreement.layout.shape() != plan.layout.shape() { return Err(Error::new(Kind::Length, "assignment must fit the selected layout")); }
         let len = self.len();
         let offsets = Steps::combined(0, &plan.steps);
-        if offsets.iter().any(|&o| o >= len) { return Err(Error::new(Kind::Index, "assignment position is outside its array")); }
+        if offsets.iter().any(|&o| o != Steps::FILL && o >= len) { return Err(Error::new(Kind::Index, "assignment position is outside its array")); }
         let items = source.view().cast(self.dtype())?;
         if matches!(agreement.right, Mapping::Linear(1) | Mapping::Single) { return Ok((offsets, items)); }
         Ok((offsets, Items::Owned(Buffer::cast_mapped(items.view(), &agreement.right, agreement.len, self.dtype())?)))

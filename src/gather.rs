@@ -172,6 +172,8 @@ pub fn try_scatter_with<D: Copy, S>(out: &mut [D], pairs: impl IntoIterator<Item
     }
     true
 }
+/// Whether `xs` is 0, 1, 2 and so on: offsets that read a source in order, or an axis order that a transpose leaves unchanged.
+pub fn counts_up(xs: &[usize]) -> bool { xs.iter().enumerate().all(|(i, &x)| x == i) }
 
 /// The source offsets that one axis of `walk`'s result reads. Regular patterns are held as a formula, so a long axis needs no table. A `None` offset gives a fill.
 #[derive(Clone, Debug)]

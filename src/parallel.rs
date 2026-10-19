@@ -128,20 +128,24 @@ pub fn stack<B: Default + Send, S: Default, E>(
 
 /// Appends `n` items to `out`, and gives whether every call of `write` said `true`. `write(range, slots)` fills `slots` with the items in `range`, in order. The calls split across threads as [`split`] splits a call, in units of `unit` items. A call that leaves any of its slots unfilled panics, and `out` keeps its length.
 pub fn extended<B: Copy + Send>(out: &mut Vec<B>, n: usize, unit: usize, write: &(dyn Fn(Range<usize>, &mut Slots<'_, B>) -> bool + Sync)) -> bool {
-    crate::slice::appended(out, n, |slots| split(slots, unit, &|start, slots| filled(slots, |slots| write(start..start + slots.slots.len(), slots))))
+    extended_with::<B, ()>(out, &mut [], n, unit, &|range, slots, _| write(range, slots))
 }
-/// [`extended`] for two outputs, which `write` fills together: `write(range, a, b)` fills the slots of `a` and of `b` with the items in `range`. Each call gets the same range of both.
-pub fn extended2<A: Copy + Send, B: Copy + Send>(
-    a: &mut Vec<A>, b: &mut Vec<B>, n: usize, unit: usize, write: &(dyn Fn(Range<usize>, &mut Slots<'_, A>, &mut Slots<'_, B>) -> bool + Sync),
+/// [`extended`] for one output and any number of outputs of a second type, which `write` fills together: `write(range, a, bs)` fills the slots of `a` and of each of `bs` with the items in `range`. Each call gets the same range of every output.
+pub fn extended_with<A: Copy + Send, B: Copy + Send>(
+    a: &mut Vec<A>, bs: &mut [Vec<B>], n: usize, unit: usize, write: &(dyn Fn(Range<usize>, &mut Slots<'_, A>, &mut [Slots<'_, B>]) -> bool + Sync),
 ) -> bool {
-    crate::slice::appended(a, n, |sa| crate::slice::appended(b, n, |sb| {
-        let shared = Shared(sb.as_mut_ptr());
-        // SAFETY: `split` gives each call its own range within `0..n`, and `b` has `n` slots too.
-        split(sa, unit, &|start, sa| {
-            let sb = unsafe { shared.part(start..start + sa.len()) };
-            filled(sa, |sa| filled(sb, |sb| write(start..start + sa.slots.len(), sa, sb)))
-        })
-    }))
+    let shared: Vec<_> = bs.iter_mut().map(|b| { b.reserve(n); Shared(b.spare_capacity_mut().as_mut_ptr()) }).collect();
+    let ok = crate::slice::appended(a, n, |sa| split(sa, unit, &|start, sa| {
+        let end = start + sa.len();
+        // SAFETY: `split` gives each call its own range within `0..n`, and each of `bs` has `n` spare slots.
+        let mut sbs: Vec<Slots<'_, B>> = shared.iter().map(|s| Slots { slots: unsafe { s.part(start..end) }, written: 0 }).collect();
+        let ok = filled(sa, |sa| write(start..end, sa, &mut sbs));
+        for s in &sbs { assert_eq!(s.written, s.slots.len(), "a writer fills every slot it gets"); }
+        ok
+    }));
+    // SAFETY: every call filled its slots of each of `bs`. A call that didn't panicked before this point.
+    for b in bs.iter_mut() { unsafe { b.set_len(b.len() + n) } }
+    ok
 }
 
 /// `write`'s result for `slots`, which it fills in order through one [`Slots`]. Panics where it leaves any unfilled.

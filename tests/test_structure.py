@@ -15,7 +15,8 @@ def test_selection_and_metadata():
     assert keyed['b', :].names == ('column',)
     for index in ([2], (..., ...), (slice(None), [True]), (0, 0, 0)):
         with pytest.raises(IndexError): a[index]
-    with pytest.raises(TypeError): a[[0.5]]
+    assert a[[1.0, np.nan]].tolist() == [[40, 50, 60], [0, 0, 0]]
+    with pytest.raises(ValueError): a[[0.5]]
     with pytest.raises(ValueError, match='duplicate key: a'): keyed[['a', 'a']]
 
 def test_named_index_arrays_pair_and_address_by_name():
@@ -27,6 +28,9 @@ def test_named_index_arrays_pair_and_address_by_name():
     b, c = rm.array([[0, 1, 2], [3, 4, 5], [6, 7, 8]]), rm.array([2, 0])
     b.names, c.names = ['r', 'c'], ['c']
     assert b[c].tolist() == [[2, 0], [5, 3], [8, 6]] and b[c].names == ('r', 'c')
+    k, cj = rm.array([2, 0, 1]), rm.arange(3)
+    k.names, cj.names = ['c'], ['c']
+    assert b[k, cj].tolist() == [6, 1, 5]
 
 def test_assignment_uses_selection_without_resizing_or_aliasing():
     a = rm.array([[1, 2, 3], [4, 5, 6]])
@@ -43,6 +47,9 @@ def test_assignment_uses_selection_without_resizing_or_aliasing():
     before = a.tolist()
     with pytest.raises(ValueError): a[:, 0] = [1, 2, 3]
     assert a.tolist() == before
+    c = rm.array([10., 20, 30])
+    c[np.array([1.0, np.nan])] = [5, 6]
+    assert c.tolist() == [10, 5, 30]
     small = rm.array([1, 2], dtype='uint8')
     with pytest.raises(OverflowError): small[:] = [3, 300]
     assert small.tolist() == [1, 2]

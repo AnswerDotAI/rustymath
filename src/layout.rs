@@ -289,6 +289,13 @@ impl Layout {
     pub fn keys(&self, axis: usize) -> Option<&Arc<Keys>> { self.key_list().get(axis).and_then(Option::as_ref) }
     /// The keys of every axis, with `None` for an axis without them.
     pub fn all_keys(&self) -> Vec<Option<Arc<Keys>>> { (0..self.shape.len()).map(|a| self.keys(a).cloned()).collect() }
+    /// The layout without keys on `axis`.
+    pub fn without_keys(self, axis: usize) -> Self {
+        if self.keys(axis).is_none() { return self; }
+        let mut keys = self.all_keys();
+        keys[axis] = None;
+        self.with_keys(keys).unwrap()
+    }
     /// The layout with `keys` on its axes. A Rank error when the count differs from the rank, and a Length error when an axis's keys differ from its length.
     pub fn with_keys(self, keys: Vec<Option<Arc<Keys>>>) -> Result<Self, Error> {
         if !keys.is_empty() && keys.len() != self.shape.len() { return Err(Error::new(Kind::Rank, format!("keys for {} axes of an array with {} axes", keys.len(), self.shape.len()))); }

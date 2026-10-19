@@ -405,18 +405,24 @@ pub fn expanded_items<'a, A: Element>(mapping: &Mapping, data: &'a [A], start: u
     match expanded(mapping, data, start, n, buf) { Arg::Many(items) => items, Arg::One(_) => unreachable!("`single` gives every repeated item") }
 }
 
-/// Items `start..start + n` of an argument that `mapping` lays out over the frame. A single item, a contiguous run, and items within one repeat or one cycle need no copy. Others copy into `buf`. A repeated item finds its source by a strength-reduced division, which multiplies in place of dividing. A cycled argument writes one period, then copies what it has written until `buf` is full. A `Steps` mapping reads a forward run in place through `run`, and copies anything else through `walk_range`.
-pub fn expanded<'a, A: Element>(mapping: &Mapping, data: &'a [A], start: usize, n: usize, buf: &'a mut Vec<A>) -> Arg<'a, A> {
-    if let Some(x) = single(mapping, data, start, n) { return Arg::One(x); }
+/// Items `start..start + n` of an argument that `mapping` lays out, where they need no copy: a single item, a contiguous run, or items within one repeat or one cycle. A `Steps` mapping reads a forward run in place through `run`.
+pub fn in_place<'a, A: Copy>(mapping: &Mapping, data: &'a [A], start: usize, n: usize) -> Option<Arg<'a, A>> {
+    if let Some(x) = single(mapping, data, start, n) { return Some(Arg::One(x)); }
     match *mapping {
-        Mapping::Linear(1) => return Arg::Many(&data[start..start + n]),
-        Mapping::Steps { base, ref steps } => {
-            if let Some((o, 1)) = mapping.run(start, n) { return Arg::Many(&data[o..o + n]); }
-            buf.clear();
-            walk_range(buf, data, base, steps, A::FILL, start, n, Same);
-            return Arg::Many(&buf[..n]);
-        }
-        Mapping::Tiled(m) if n <= m - start % m => return Arg::Many(&data[start % m..start % m + n]), _ => {}
+        Mapping::Linear(1) => Some(Arg::Many(&data[start..start + n])),
+        Mapping::Steps { .. } => mapping.run(start, n).and_then(|(o, step)| (step == 1).then(|| Arg::Many(&data[o..o + n]))),
+        Mapping::Tiled(m) if n <= m - start % m => Some(Arg::Many(&data[start % m..start % m + n])),
+        _ => None,
+    }
+}
+
+/// Items `start..start + n` of an argument that `mapping` lays out over the frame, read `in_place` where they can be. Others copy into `buf`. A repeated item finds its source by a strength-reduced division, which multiplies in place of dividing. A cycled argument writes one period, then copies what it has written until `buf` is full. A `Steps` mapping copies through `walk_range`.
+pub fn expanded<'a, A: Element>(mapping: &Mapping, data: &'a [A], start: usize, n: usize, buf: &'a mut Vec<A>) -> Arg<'a, A> {
+    if let Some(arg) = in_place(mapping, data, start, n) { return arg; }
+    if let Mapping::Steps { base, ref steps } = *mapping {
+        buf.clear();
+        walk_range(buf, data, base, steps, A::FILL, start, n, Same);
+        return Arg::Many(&buf[..n]);
     }
     if buf.len() < n { buf.resize(n, A::FILL) }
     let out = &mut buf[..n];

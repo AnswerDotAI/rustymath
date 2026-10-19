@@ -115,4 +115,3 @@ The Rust page’s [Accuracy and speed](https://answerdotai.github.io/rustymath/r
 ## Licence
 
 Apache-2.0. Some algorithms and constants come from SLEEF and Arm Optimized Routines. `THIRD-PARTY.md` has their notices.
-

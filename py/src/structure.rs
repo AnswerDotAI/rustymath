@@ -34,11 +34,11 @@ fn selector(layout: &Layout, axis: usize, obj: &Bound<'_, PyAny>) -> PyResult<Se
             let positions: Vec<_> = mask.iter().enumerate().filter_map(|(i, &b)| b.then_some(i)).collect();
             (Layout::from([positions.len()]), positions)
         }
-        View::Integers(_) => {
+        View::Integers(_) | View::Floats(_) => {
             (indices.layout().clone(), structure::positions(items.view(), size).map_err(py_err)?)
         }
         _ if indices.view().is_empty() => (indices.layout().clone(), vec![]),
-        _ => return Err(PyTypeError::new_err("an axis selector must be an integer, key, slice, Boolean mask or integer array")),
+        _ => return Err(PyTypeError::new_err("an axis selector must be an integer, key, slice, Boolean mask or integer or float array")),
     };
     Ok(Selector::Indices { layout: within, positions })
 }

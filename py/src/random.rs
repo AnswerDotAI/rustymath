@@ -55,11 +55,7 @@ impl Generator {
         let Some(x) = x else { return give(py, core(positions.into_iter().map(|i| i as i64).collect(), &shape)?, size.is_none()) };
         let mut layout = x.layout();
         let selector = Selector::Indices { layout: shape.into(), positions: positions.into_iter().map(|i| i as usize).collect() };
-        if replace && layout.has_keys() {
-            let mut keys = layout.all_keys();
-            keys[0] = None;
-            layout = layout.with_keys(keys).map_err(py_err)?;
-        }
+        if replace { layout = layout.without_keys(0); }
         let plan = structure::select(&layout, vec![selector], false).map_err(py_err)?;
         give(py, x.selected(plan)?, size.is_none())
     }

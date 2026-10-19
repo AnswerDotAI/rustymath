@@ -27,6 +27,9 @@ def test_sort_and_bins():
     a = [-np.inf, -0.0, 0.0, np.inf, np.nan, np.nan]
     for side in ['left', 'right']: assert np.array_equal(s.searchsorted(a, a, side), np.searchsorted(a, a, side))
     assert s.argsort(np.empty((2, 0))).shape == (2, 0) and s.argsort(5).tolist() == [0] and s.searchsorted([], 5) == 0
+    k = rm.array({'a': 30, 'b': 10, 'c': 20})
+    k.names = ('i',)
+    assert s.argsort(k).tolist() == [1, 2, 0] and s.argsort(k).keys == (None,) and s.argsort(k).names == ('i',)
     for f, args in [(s.argsort, ([1j],)), (s.searchsorted, ([[1, 2]], 1)), (s.searchsorted, ([1], 1, 'bad')), (s.lexsort, ([],))]:
         with pytest.raises(ValueError): f(*args)
 

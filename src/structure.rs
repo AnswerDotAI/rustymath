@@ -136,19 +136,21 @@ pub fn sole_name(layout: &Layout) -> Option<&str> {
     names.next().filter(|_| names.next().is_none()).map(|n| &**n)
 }
 
-/// The first axis of `layout` that each selector addresses, given the name of each selector's one named axis, where it has exactly one, and the number of axes it covers, where more axes than remain cover the rest, as a coordinate past the last axis does. A selector whose name `layout` has addresses the axis with that name. Each other selector takes the first free axes whose names don't conflict with its name. Either way a selector claims every axis it covers. Two selectors that claim one axis, or a selector with no free axis, give an Index error.
+/// The first axis of `layout` that each selector addresses, given the name of each selector's one named axis, where it has exactly one, and the number of axes it covers, where more axes than remain cover the rest, as a coordinate past the last axis does. A selector whose name `layout` has addresses the axis with that name, unless another selector has the same name. Selectors with the same name take free axes in order, as unnamed selectors and NumPy's index arrays do. Each other selector takes the first free axes whose names don't conflict with its name. Either way a selector claims every axis it covers. Two selectors that claim one axis, or a selector with no free axis, give an Index error.
 pub fn addressed(layout: &Layout, selectors: &[(Option<&str>, usize)]) -> Result<Vec<usize>, Error> {
     let rank = layout.shape().len();
     let (mut free, mut axes) = (vec![true; rank], vec![rank; selectors.len()]);
     let span = |a: usize, width: usize| a..(a + width).min(rank);
-    for (k, &(name, width)) in selectors.iter().enumerate() {
-        let Some((n, a)) = name.and_then(|n| Some((n, layout.axis_named(n)?))) else { continue };
+    let names: Vec<_> = selectors.iter().map(|&(n, _)| n.filter(|_| selectors.iter().filter(|s| s.0 == n).count() == 1)).collect();
+    for (k, &(_, width)) in selectors.iter().enumerate() {
+        let Some((n, a)) = names[k].and_then(|n| Some((n, layout.axis_named(n)?))) else { continue };
         if span(a, width).any(|b| !free[b]) { return Err(Error::new(Kind::Index, format!("two selectors address axis {n}"))); }
         free[span(a, width)].fill(false);
         axes[k] = a;
     }
-    for (k, &(name, width)) in selectors.iter().enumerate() {
+    for (k, &(_, width)) in selectors.iter().enumerate() {
         if axes[k] != rank { continue; }
+        let name = names[k];
         let fits = |a: usize| a < rank && span(a, width).all(|b| free[b] && !names_conflict(name, layout.name(b).map(|n| &**n)));
         let missing = || Error::new(Kind::Index, name.map_or_else(|| "too many axis selectors".into(), |n| format!("no axis for a selector named {n}")));
         let a = (0..rank).find(|&a| fits(a)).ok_or_else(missing)?;
@@ -223,10 +225,17 @@ pub fn filled_positions<F: Float>(values: &[F], size: usize) -> Result<Vec<usize
 
 /// How a position outside an axis maps to one inside it, as edge modes of padding do. `Fill` gives no position, which reads the fill.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Edge { Fill, Clamp, Wrap, Reflect }
+pub enum Edge { Fill, Clamp, Wrap, Reflect, Symmetric }
 
 impl Edge {
-    /// The position on an axis of `n` items that position `p` reads, or `None` for the fill. A negative `p` is outside the axis here. `Reflect` leaves out the edge item, as NumPy's `reflect` does, so `-1` reads 1. An empty axis gives `None` in every mode.
+    /// Each mode with its name.
+    pub const MODES: [(&'static str, Edge); 5] =
+        [("fill", Edge::Fill), ("clamp", Edge::Clamp), ("wrap", Edge::Wrap), ("reflect", Edge::Reflect), ("symmetric", Edge::Symmetric)];
+    /// The mode named `name`.
+    pub fn named(name: &str) -> Option<Edge> { Self::MODES.iter().find(|(n, _)| *n == name).map(|&(_, e)| e) }
+    /// This mode's name.
+    pub fn name(self) -> &'static str { Self::MODES.iter().find(|&&(_, e)| e == self).expect("every mode has a name").0 }
+    /// The position on an axis of `n` items that position `p` reads, or `None` for the fill. A negative `p` is outside the axis here. `Reflect` leaves out the edge item, as NumPy's `reflect` does, so `-1` reads 1. `Symmetric` repeats it, as NumPy's `symmetric` does, so `-1` reads 0. An empty axis gives `None` in every mode.
     pub fn position(self, p: i64, n: usize) -> Option<usize> {
         let n = i64::try_from(n).ok().filter(|&n| n > 0)?;
         let q = match self {
@@ -235,6 +244,7 @@ impl Edge {
             Edge::Wrap => p.rem_euclid(n),
             Edge::Reflect if n == 1 => 0,
             Edge::Reflect => (n - 1) - ((n - 1) - p.rem_euclid(2 * (n - 1))).abs(),
+            Edge::Symmetric => { let r = p.rem_euclid(2 * n); r.min(2 * n - 1 - r) }
         };
         usize::try_from(q).ok().filter(|&q| q < n as usize)
     }
@@ -311,9 +321,7 @@ pub fn rotate(layout: &Layout, axis: usize, counts: Option<(&[usize], &[i64])>) 
             if len != 0 && (ns.is_empty() || ns.iter().any(|&n| shift(n) != shift(ns[0]))) {
                 // Each lane has its own count, so the offsets don't separate by axis, and the axis loses its keys.
                 let offsets = (0..outer).flat_map(|i| (0..len).flat_map(move |j| (0..inner).map(move |k| lanes.offset(i, (j + shift(ns[i * inner + k])) % len, k))));
-                let mut keys = layout.all_keys();
-                keys[axis] = None;
-                return Ok(Plan { layout: layout.clone().with_keys(keys)?, steps: vec![Steps::table(offsets.collect())] });
+                return Ok(Plan { layout: layout.clone().without_keys(axis), steps: vec![Steps::table(offsets.collect())] });
             }
             Some(shift(ns.first().copied().unwrap_or(0)))
         }

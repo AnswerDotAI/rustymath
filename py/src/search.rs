@@ -104,14 +104,15 @@ pub fn group_indices<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, ct: Option<f64
     grouped.each().map(|these| give(py, vector(these.iter().map(|&p| p as usize))?, false)).collect()
 }
 
-/// Stable positions that sort equally shaped `keys` along `axis`, with the last key primary, or along the flattened keys with no axis. A rank-0 key sorts as one item, as in NumPy.
+/// Stable positions that sort equally shaped `keys` along `axis`, with the last key primary, or along the flattened keys with no axis. The sorted axis keeps its name and drops its keys. A rank-0 key sorts as one item, as in NumPy.
 fn sorted<'py>(py: Python<'py>, function: &str, keys: &[Arg<'_>], axis: Option<Axis>) -> PyResult<Bound<'py, PyAny>> {
     let layout = keys.first().map(Arg::layout).filter(|l| keys.iter().all(|k| k.layout().shape() == l.shape())).ok_or_else(|| py_err(Error::new(Kind::Length, format!("{function} needs one or more equally shaped keys"))))?;
     let keys = keys.iter().map(|k| k.at(k.view().dtype())).collect::<PyResult<Vec<_>>>()?;
     for k in &keys { if matches!(k.view(), View::Complexes(_)) { return Err(missing(function, k.view().dtype())); } }
     let total = keys[0].view().len();
     let layout = if layout.shape().is_empty() { Layout::from([total].as_slice()) } else { layout };
-    let ([outer, n, inner], layout) = along_axis(layout, total, axis)?;
+    let ([outer, n, inner], mut layout, position) = along_axis(layout, total, axis)?;
+    if let Some(a) = position { layout = layout.without_keys(a); }
     let mut order = vec![0; total];
     if n > 0 {
         for o in 0..outer {
@@ -143,8 +144,7 @@ fn ordered<'py>(py: Python<'py>, name: &str, a: &Bound<'py, PyAny>, axis: Option
     let view = items.view();
     if matches!(view, View::Complexes(_)) { return Err(missing(name, view.dtype())); }
     let layout = if x.layout().shape().is_empty() { Layout::from([1]) } else { x.layout() };
-    let position = axis.as_ref().map(|a| a.of(&layout)).transpose()?;
-    let (dims @ [outer, n, inner], mut layout) = along_axis(layout, view.len(), axis)?;
+    let (dims @ [outer, n, inner], mut layout, position) = along_axis(layout, view.len(), axis)?;
     let rank = if let Ordering::Partition(k, _) = how {
         rustymath::layout::position(k, n).ok_or_else(|| py_err(Error::new(Kind::Index, "partition rank is outside the axis")))?
     } else { 0 };
@@ -158,9 +158,7 @@ fn ordered<'py>(py: Python<'py>, name: &str, a: &Bound<'py, PyAny>, axis: Option
             let layout = layout.select(a, order.iter().map(|&p| Some(p as usize))).map_err(py_err)?;
             return give(py, Core::new(layout, Buffer::gathered(view, &order)).map_err(py_err)?, false);
         }
-        let mut keys = layout.all_keys();
-        keys[a] = None;
-        layout = layout.with_keys(keys).map_err(py_err)?;
+        layout = layout.without_keys(a);
     }
     let result = match how {
         Ordering::Sort(down) => search::view_sort_along(view, dims, down).unwrap(),
@@ -208,8 +206,7 @@ pub fn quantile<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, q: &Bound<'py, PyAn
     if q.layout().shape().len() > 1 { return Err(py_err(Error::new(Kind::Rank, "quantile probabilities must be a scalar or vector"))); }
     let probabilities = q.items::<f64>()?;
     let layout = x.layout();
-    let position = axis.as_ref().map(|a| a.of(&layout)).transpose()?;
-    let (dims, _) = along_axis(layout.clone(), x.view().len(), axis)?;
+    let (dims, _, position) = along_axis(layout.clone(), x.view().len(), axis)?;
     let input = x.at(x.view().dtype())?;
     let items = search::view_quantiles_along(input.view(), dims, &probabilities).map_err(py_err)?.ok_or_else(|| missing("quantile", x.view().dtype()))?;
     let frame = position.map_or(Layout::EMPTY, |a| layout.axes((0..layout.shape().len()).filter(move |&i| i != a)));
