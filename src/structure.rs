@@ -176,8 +176,11 @@ pub fn index_positions<I: Copy + Into<i64>>(values: &[I], size: usize) -> Result
     }
     if inside { return Ok(positions); }
     let k = positions.iter().position(|&p| p >= size).expect("a position is outside the axis");
-    Err(Error::new(Kind::Index, format!("position {} is outside an axis of length {size}", values[k].into())))
+    Err(outside(Into::<i64>::into(values[k]), size))
 }
+
+/// The Index error for `position` on an axis of length `size`.
+fn outside(position: impl std::fmt::Display, size: usize) -> Error { Error::new(Kind::Index, format!("position {position} is outside an axis of length {size}")) }
 
 /// Position `i` on an axis of length `size`, where a negative `i` counts back from the end. Adding `size` to a negative position without a branch keeps a loop over positions vectorised. A position outside the axis is then at least `size`.
 #[inline(always)]
@@ -185,18 +188,32 @@ fn counted_back(i: i64, size: usize) -> usize { (i + (size as i64 & (i >> 63))) 
 
 /// The positions that index values give along an axis of length `size`: integers as `index_positions` reads them, and floats as `filled_positions` does. Other items are a Domain error.
 pub fn positions(view: View<'_>, size: usize) -> Result<Vec<usize>, Error> {
-    match view {
-        View::Booleans(b) => index_positions(b, size),
-        View::Integers(ix) => with_ints!(ix, |ix| index_positions(ix, size)),
-        View::Floats(x) => with_floats!(x, |x| filled_positions(x, size)),
-        _ => Err(Error::new(Kind::Domain, "index must be an integer")),
-    }
+    index_view!(view, |ix| index_positions(ix, size), |x| filled_positions(x, size))
 }
+
+/// The message of the Domain error for an index value that isn't a whole number.
+pub const NOT_WHOLE: &str = "index must be an integer";
+
+/// The Domain error for an index value that isn't a whole number.
+fn not_whole() -> Error { Error::new(Kind::Domain, NOT_WHOLE) }
+
+/// `$int` on the items of a Boolean or integer view, `$float` on a float view's items, or the Domain error for any other view.
+macro_rules! index_view {
+    ($view:expr, |$i:ident| $int:expr, |$f:ident| $float:expr) => {
+        match $view {
+            View::Booleans($i) => $int,
+            View::Integers(ix) => with_ints!(ix, |$i| $int),
+            View::Floats(x) => with_floats!(x, |$f| $float),
+            _ => Err(not_whole()),
+        }
+    };
+}
+use index_view;
 
 /// The whole number that a float index value equals within the default tolerance, or `None` for a NaN, which reads the fill. Any other value is a Domain error.
 pub fn float_position<F: Float>(y: F) -> Result<Option<i64>, Error> {
     if y.is_nan() { return Ok(None); }
-    match Tolerance::DEFAULT.nearest_whole(y) { (n, true) => Ok(Some(n.wide() as i64)), _ => Err(Error::new(Kind::Domain, "index must be an integer")) }
+    match Tolerance::DEFAULT.nearest_whole(y) { (n, true) => Ok(Some(n.wide() as i64)), _ => Err(not_whole()) }
 }
 
 /// The positions that float index values give along an axis of length `size`, as `index_positions` gives them from integers, with each value read by `float_position`. A NaN gives `Steps::FILL`, which reads the fill and drops a write.
@@ -220,7 +237,21 @@ pub fn filled_positions<F: Float>(values: &[F], size: usize) -> Result<Vec<usize
     if inside { return Ok(positions); }
     let k = positions.iter().zip(values).position(|(&p, y)| !y.is_nan() && p >= size).expect("a position is outside the axis");
     let x = values[k].wide();
-    Err(Error::new(Kind::Index, format!("position {} is outside an axis of length {size}", if x.abs() < 1e16 { x.to_string() } else { format!("{x:e}") })))
+    Err(outside(if x.abs() < 1e16 { x.to_string() } else { format!("{x:e}") }, size))
+}
+
+/// The signed position that each index value gives, before any axis applies: integers as they are, and floats as `float_position` reads them, with `None` for a NaN. Other items are a Domain error. [`positions`] reads the values and checks them against an axis in one pass.
+pub fn signed_positions(view: View<'_>) -> Result<Vec<Option<i64>>, Error> {
+    index_view!(view, |ix| Ok(ix.iter().map(|&i| Some(i.into())).collect()), |x| x.iter().map(|&y| float_position(y)).collect())
+}
+
+/// The positions along an axis of length `size` that signed positions give, as `index_positions` gives them, with `Steps::FILL` for `None`.
+pub fn counted_positions(values: &[Option<i64>], size: usize) -> Result<Vec<usize>, Error> {
+    values.iter().map(|&q| match q.map(|i| (i, counted_back(i, size))) {
+        None => Ok(Steps::FILL),
+        Some((_, p)) if p < size => Ok(p),
+        Some((i, _)) => Err(outside(i, size)),
+    }).collect()
 }
 
 /// How a position outside an axis maps to one inside it, as edge modes of padding do. `Fill` gives no position, which reads the fill.
@@ -339,11 +370,11 @@ pub fn rotate(layout: &Layout, axis: usize, counts: Option<(&[usize], &[i64])>) 
 pub struct WindowAxis { pub size: usize, pub step: usize, pub padded: bool }
 
 impl WindowAxis {
-    /// Whether an axis of length `len` can hold this window. A padded size must be less than twice the length.
-    pub fn fits(&self, len: usize) -> bool { !self.padded || self.size / 2 < len }
+    /// Whether an axis of length `len` can hold this window. A padded size must be less than twice the length of an axis that isn't empty.
+    pub fn fits(&self, len: usize) -> bool { !self.padded || len == 0 || self.size / 2 < len }
     /// The number of windows along an axis of length `len` that `fits`.
     pub fn count(&self, len: usize) -> usize {
-        if self.padded { (len - usize::from(self.size.is_multiple_of(2))).div_ceil(self.step) }
+        if self.padded { len.saturating_sub(usize::from(self.size.is_multiple_of(2))).div_ceil(self.step) }
         else if len < self.size { 0 }
         else { (len - self.size) / self.step + 1 }
     }

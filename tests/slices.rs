@@ -562,8 +562,8 @@ mod search {
         stable.sort_by_key(|&r| !y[r as usize]);
         assert_eq!(sort_rows(y.len(), vec![y.iter().map(|&v| !v).collect()]), stable);
         // Two keys take the pass by masks of 8 items. Here group 0's block writes past its end, onto group 1's first places. In the second, group 1's only item follows the last block.
-        assert_eq!(grouped(&[1, 0, 0, 0, 0, 0, 1, 1], 2), (vec![1, 2, 3, 4, 5, 0, 6, 7], vec![5, 3]));
-        assert_eq!(grouped(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 2), ((0..10).collect(), vec![9, 1]));
+        assert_eq!(grouped(&[1, 0, 0, 0, 0, 0, 1, 1], 2).each().collect::<Vec<_>>(), [&[1, 2, 3, 4, 5][..], &[0, 6, 7][..]]);
+        assert_eq!(grouped(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 2).each().collect::<Vec<_>>(), [&(0..9).collect::<Vec<u32>>()[..], &[9][..]]);
         let b: Vec<u16> = (0..300).map(|i| u16::from(i % 3 == 0)).collect();
         let mut two: Vec<u32> = (0..300).collect();
         two.sort_by_key(|&r| b[r as usize]);
@@ -576,15 +576,15 @@ mod search {
         assert_eq!(sort_rows(300, vec![wide.clone()]), rows);
         rows.sort_by_key(|&r| (wide[r as usize], second[r as usize]));
         assert_eq!(sort_rows(300, vec![wide, second]), rows);
-        assert_eq!((grouped(&[1, 0, 1, 1], 2), grouped(&[0, 0], 1)), ((vec![1, 0, 2, 3], vec![1, 3]), (vec![0, 1], vec![2])));
+        assert_eq!((grouped(&[1, 0, 1, 1], 2).each().collect::<Vec<_>>(), grouped(&[0, 0], 1).each().collect::<Vec<_>>(), grouped(&[0, 0], 2).each().collect::<Vec<_>>()), (vec![&[1][..], &[0, 2, 3][..]], vec![&[0, 1][..]], vec![&[0, 1][..], &[][..]]));
         // `grouped_keys` gives the classes that `classes` and `numbered` give, each with its positions. The five keys first appear out of their order, and a range of 2^20 + 1 is too wide for a table.
         let together = |k: &[i32]| {
             let n = numbered(&classes(k));
             let mut each = vec![Vec::new(); n.firsts.len()];
             for (i, &g) in n.numbers.iter().enumerate() { each[g].push(i as u32) }
             let g = grouped_keys(k).expect("a table holds the keys");
-            assert_eq!((&g.firsts, g.each().collect::<Vec<_>>()), (&n.firsts, each.iter().map(Vec::as_slice).collect()));
-            assert_eq!(g.into_classes(), each);
+            assert_eq!((&g.firsts, g.groups.each().collect::<Vec<_>>()), (&n.firsts, each.iter().map(Vec::as_slice).collect()));
+            assert_eq!(g.groups.into_buffers(), each);
         };
         together(&(0..300).map(|i| i32::from(i % 3 == 0)).collect::<Vec<_>>());
         together(&(0..300).map(|i| 3 + (i * 7 + 2) % 5).collect::<Vec<_>>());
@@ -857,6 +857,28 @@ mod tolerant {
         assert_eq!(Lcm(T).one(c(2.0, 0.0), c(0.0, 3.0)), c(0.0, 6.0));
     }
 
+    /// An `Indicator` gives each comparison's Booleans as 1 and 0 at each float width, over more items than its buffer holds, with one number on either side and with slices on both.
+    #[test]
+    fn indicator() {
+        fn check<F: Float + std::fmt::Debug, K: Binary<F, Out = bool> + Copy>(k: K) where Indicator<K>: Binary<F, Out = F> {
+            let x: Vec<F> = (0..700).map(|i| F::narrow(f64::from(i % 7) - 3.0)).collect();
+            let zero = F::narrow(0.0);
+            for (a, b) in [(Arg::Many(&x[..]), Arg::One(zero)), (Arg::One(zero), Arg::Many(&x[..])), (Arg::Many(&x[..]), Arg::Many(&x[1..]))] {
+                let (mut bools, mut lanes) = (Vec::new(), Vec::new());
+                assert!(k.many(a, b, 699, &mut bools) & Indicator(k).many(a, b, 699, &mut lanes));
+                assert_eq!(lanes, bools.iter().map(|&b| F::narrow(if b { 1.0 } else { 0.0 })).collect::<Vec<_>>());
+            }
+        }
+        macro_rules! comparisons { ($f:ty, $t:expr) => {
+            check::<$f, _>(Equal($t)); check::<$f, _>(NotEqual($t)); check::<$f, _>(Less($t)); check::<$f, _>(LessEqual($t));
+            check::<$f, _>(Greater($t)); check::<$f, _>(GreaterEqual($t)); check::<$f, _>(Matches($t));
+        } }
+        for t in [T, Tolerance::EXACT] {
+            comparisons!(f64, t);
+            comparisons!(f32, t);
+        }
+    }
+
     /// Tolerant search finds the first match that a brute-force search finds, at every width and at small and large tolerances, among floats crowded near a few values, and among zeros, infinities and NaN, whether it scans for a few items or indexes many.
     #[test]
     fn slice_search() {
@@ -894,7 +916,7 @@ mod tolerant {
 }
 
 mod gather {
-    use rustymath::gather::{walk, walk_range, Same, Steps};
+    use rustymath::gather::{scatter, scatter_walk, walk, walk_range, Same, Steps};
     /// The items of `s` that `steps` reach from `base`, with -1 for a fill.
     fn read(s: &[i64], base: usize, steps: &[Steps]) -> Vec<i64> {
         let mut out = vec![];
@@ -914,6 +936,7 @@ mod gather {
             (0, vec![along(2, 50), Steps::Rotated { shift: 7, len: 30, stride: 1 }]),
             (0, vec![along(2, 50), Steps::Clipped { start: -3, len: 40, size: 30, stride: 1 }]),
             (0, vec![Steps::table(vec![4, Steps::FILL, 1]), along(3, 1)]),
+            (0, vec![Steps::table((0..10).collect()), along(4, 20)]),
         ];
         for (base, steps) in &cases {
             let whole = read(&s, *base, steps);
@@ -925,6 +948,15 @@ mod gather {
                 let mut part = vec![];
                 walk_range(&mut part, &s, *base, steps, -1, from, n, Same);
                 assert_eq!(part, whole[from..from + n]);
+            }
+            // `scatter_walk` writes where the walk reads, in the same order, so it agrees with `scatter` at the listed offsets, for many items and for one.
+            let offsets = Steps::combined(*base, steps);
+            let many: Vec<i64> = (1000..1000 + whole.len() as i64).collect();
+            for items in [&many[..], &[7]] {
+                let (mut walked, mut listed) = (vec![-1; 600], vec![-1; 600]);
+                scatter_walk(&mut walked, items, *base, steps, |x| x);
+                scatter(&mut listed, &offsets, items, |x| x);
+                assert_eq!(walked, listed);
             }
         }
         assert_eq!((Steps::run(0, &cases[0].1, 3, 5), Steps::run(0, &cases[0].1, 18, 5)), (Some((3, 1)), Some((18, 1))));

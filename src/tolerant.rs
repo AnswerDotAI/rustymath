@@ -280,14 +280,26 @@ macro_rules! tolerant {
     };
 }
 
-/// Writes a tolerant comparison's forms at `real`: its item body over a tolerance `$t`, as `tolerant!` writes them, and a slice form that compares many items with one number through `against`. `$left` is the band an item must lie in when it is on the left of the one number, and `$right` the band when it is on the right.
+/// Writes an [`Indicator`]'s forms for the tolerant comparison `$object` at each float type `$e`, through `forms!`: its item body over a tolerance `$t` as 1 or 0, and a slice form that compares many items with one number through `against`, writing each float in the same loop.
+macro_rules! indicator {
+    ($object:ident: |$t:ident, [$x:ident, $y:ident]| $body:expr, $left:ident, $right:ident, $($e:ty),+) => {$(
+        forms!([Indicator<$object>] at $e: |k, [$x, $y]| crate::slice::Total(indicated::<$e>(with_tolerance!(k.0.0, |$t| $body))),
+            many |k, [$x, $y], n, out| match against(k.0.0, $x, $y, n, out, Band::$left, Band::$right, |xs, lo, hi, band, out| in_band(xs, lo, hi, band, out, indicated::<$e>)) {
+                Some(ok) => ok,
+                None => with_tolerance!(k.0.0, |$t| each!([$x, $y], n, out, |[$x, $y]| crate::slice::Total(indicated::<$e>($body)))),
+            });
+    )+};
+}
+
+/// Writes a tolerant comparison's forms at `real`: its item body over a tolerance `$t`, as `tolerant!` writes them, and a slice form that compares many items with one number through `against`. `$left` is the band an item must lie in when it is on the left of the one number, and `$right` the band when it is on the right. It also writes the comparison's [`Indicator`] forms at `f32` and `f64`.
 macro_rules! compared {
     ($object:ident: |$t:ident, [$x:ident, $y:ident]| $body:expr, $left:ident, $right:ident) => {
         forms!($object at real => bool: |k, [$x, $y]| with_tolerance!(k.0, |$t| $body),
-            many |k, [$x, $y], n, out| match against(k.0, $x, $y, n, out, Band::$left, Band::$right) {
+            many |k, [$x, $y], n, out| match against(k.0, $x, $y, n, out, Band::$left, Band::$right, Banded::banded) {
                 Some(ok) => ok,
                 None => with_tolerance!(k.0, |$t| each!([$x, $y], n, out, |[$x, $y]| $body)),
             });
+        indicator!($object: |$t, [$x, $y]| $body, $left, $right, f32, f64);
     };
 }
 
@@ -320,31 +332,42 @@ macro_rules! with_band {
     };
 }
 
-/// The float types that `against` compares with one number. The default writes each result through `pairs_into`, whose loop vectorizes. Wasm's `f64` and `f32` override it in `narrowed`.
+/// Writes into `out`, through `from`, whether each item of `xs` lies in `band` against the range `lo` to `hi`. Its loop, through `pairs_into`, vectorizes.
+#[inline(always)]
+fn in_band<F: Copy + PartialOrd, O>(xs: &[F], lo: F, hi: F, band: Band, out: &mut [std::mem::MaybeUninit<O>], from: impl Fn(bool) -> O + Copy) {
+    with_band!(band, |B| pairs_into(Arg::Many(xs), Arg::One(()), xs.len(), out, #[inline(always)] |v, ()| (from(B.holds(lo, hi, v)), true)));
+}
+
+/// The float types that `against` compares with one number to give Booleans. The default writes them through `in_band`. Wasm's `f64` and `f32` override it in `narrowed`.
 trait Banded: Copy + PartialOrd {
     /// Writes into `out` whether each item of `xs` lies in `band` against the range `lo` to `hi`.
     #[inline(always)]
-    fn banded(xs: &[Self], lo: Self, hi: Self, band: Band, out: &mut [std::mem::MaybeUninit<bool>]) {
-        with_band!(band, |B| pairs_into(
-            Arg::Many(xs), Arg::One(()), xs.len(), out, #[inline(always)] |v, ()| (B.holds(lo, hi, v), true)
-        ));
-    }
+    fn banded(xs: &[Self], lo: Self, hi: Self, band: Band, out: &mut [std::mem::MaybeUninit<bool>]) { in_band(xs, lo, hi, band, out, |b| b) }
 }
 #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
 impl Banded for f32 {}
 #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
 impl Banded for f64 {}
 
-/// Compares each item of the `Many` argument with the `One` argument `c`, through the range of floats equal to `c`, worked out once. Each item then takes one or two plain comparisons, through `Banded`. `left` is the band an item on the left of `c` must lie in, and `right` the band for an item on its right. `None`, writing nothing, unless exactly one argument is `One` and `c` isn't NaN.
+/// Compares each item of the `Many` argument with the `One` argument `c`, through the range of floats equal to `c`, worked out once. Each item then takes one or two plain comparisons, which `banded` writes: Booleans through `Banded`, or an `Indicator`'s floats through `in_band`. `left` is the band an item on the left of `c` must lie in, and `right` the band for an item on its right. `None`, writing nothing, unless exactly one argument is `One` and `c` isn't NaN.
 #[inline(always)]
-fn against<F: Float + Banded>(
-    t: Tolerance, x: Arg<'_, F>, y: Arg<'_, F>, n: usize, out: &mut [std::mem::MaybeUninit<bool>], left: Band, right: Band) -> Option<bool> {
+fn against<F: Float, O>(
+    t: Tolerance, x: Arg<'_, F>, y: Arg<'_, F>, n: usize, out: &mut [std::mem::MaybeUninit<O>], left: Band, right: Band,
+    banded: impl FnOnce(&[F], F, F, Band, &mut [std::mem::MaybeUninit<O>])) -> Option<bool> {
     let (items, (lo, hi), band) = match (x, y) {
         (Arg::Many(xs), Arg::One(c)) => (xs, t.range(c)?, left), (Arg::One(c), Arg::Many(ys)) => (ys, t.range(c)?, right), _ => return None
     };
-    F::banded(&items[..n], lo, hi, band, &mut out[..n]);
+    banded(&items[..n], lo, hi, band, &mut out[..n]);
     Some(true)
 }
+
+/// A comparison's results as floats, 1 where it holds and 0 where it doesn't, as a [`Binary`](crate::Binary) at `f32` and `f64` for each comparison here. A caller that computes in floats reads a comparison's results this way, rather than storing Booleans and converting them. Its slice form compares each item and writes its float in one loop.
+#[derive(Clone, Copy, Debug)]
+pub struct Indicator<K>(pub K);
+
+/// 1 for true and 0 for false.
+#[inline(always)]
+fn indicated<F: Float>(b: bool) -> F { if b { F::one() } else { F::zero() } }
 
 /// Wasm has no instruction that narrows a 64-bit lane to a byte. LLVM writes a float comparison's results two items at a time, in about ten instructions for each item. Where it can prove that lanes hold masks, it also replaces wasm's narrowing instructions with slower code. Here each block of 16 items compares with vector instructions, then shuffles the first byte of each mask into place: 7 shuffles for `f64`'s 8 vectors, and 3 for `f32`'s 4.
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]

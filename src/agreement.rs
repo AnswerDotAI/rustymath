@@ -7,7 +7,7 @@ use crate::{
 use std::ops::Range;
 
 /// How one argument's items lay out over a result: the argument's offset for each result position.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mapping {
     /// One item, which every position reads.
     Single,
@@ -176,11 +176,25 @@ impl Mapping {
     }
     /// The fewest items in a block of a read through this mapping, where its innermost axis skips items, as a transpose's does: as many whole rows as a cache line holds items of `size` bytes, up to `LINE_BLOCK` items. The rows of such a block then share each fetch of a line. 0 where the innermost axis reads adjacent items or one item.
     pub fn line_block(&self, size: usize) -> usize {
-        let Self::Steps { steps, .. } = self else { return 0 };
-        match steps.iter().rev().find(|s| s.len() > 1) {
+        match self.inner() {
             Some(inner) if inner.skips() => (inner.len() * (LINE / size).max(1)).min(LINE_BLOCK),
             _ => 0,
         }
+    }
+    /// Whether `expanded` copies most blocks of `block` items read through this mapping, rather than reading them where they lie: positions, and steps whose runs of adjacent offsets (`Steps::contiguous`) are shorter than a block, as a transpose's, a reversal's, windows' and a column slice's are. Repeats and cycles don't count: a run that stays inside one repeat or cycle reads in place, and the caller decides where runs end.
+    pub fn copies(&self, block: usize) -> bool {
+        match self {
+            Self::Positions(_) => true,
+            Self::Steps { steps, .. } => Steps::contiguous(steps) < block,
+            _ => false,
+        }
+    }
+    /// Whether some position reads a fill, as a padded read's does.
+    pub fn fills(&self) -> bool { matches!(self, Self::Steps { steps, .. } if steps.iter().any(Steps::fills)) }
+    /// The innermost axis of a `Steps` mapping that reaches more than one offset.
+    fn inner(&self) -> Option<&Steps> {
+        let Self::Steps { steps, .. } = self else { return None };
+        steps.iter().rev().find(|s| s.len() > 1)
     }
 }
 

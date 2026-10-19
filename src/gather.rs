@@ -149,6 +149,50 @@ pub fn windows<const W: usize, S: Copy, D>(out: &mut Vec<D>, s: &[S], o: usize, 
 pub fn scatter<S: Copy, D>(out: &mut [D], offsets: &[usize], items: &[S], f: impl Fn(S) -> D) {
     for (o, x) in targets(offsets, Arg::of(items)) { if o != Steps::FILL { out[o] = f(x) } }
 }
+/// Replaces the items of `out` that `steps` reach from `base`, in the order that [`walk`] reads them, with the matching ones of `items`, converted by `f`, or with the only one when `items` holds one. A fill position writes nothing. Cells of adjacent items write along a slice. Cells that a table of starts picks, each reaching items a stride apart, as columns' do, write in blocks of 8 cells, row by row, so each block's writes share the lines they touch, as [`walk`]'s reads do. Within such a block, a later cell wins where two cells are the same cell, which is the only overlap a selection's cells have. Other steps write in [`walk`]'s order.
+pub fn scatter_walk<S: Copy, D>(out: &mut [D], items: &[S], base: usize, steps: &[Steps], f: impl Fn(S) -> D) {
+    let (base, steps) = Steps::simplify(base, steps);
+    let item = |k: usize| if let [x] = items { *x } else { items[k] };
+    scatter_into(out, &item, &f, base, &steps, &mut 0);
+}
+
+/// [`scatter_walk`] after `Steps::simplify`, writing from item `k` on, and moving `k` past each position, fills included.
+fn scatter_into<S: Copy, D>(out: &mut [D], item: &impl Fn(usize) -> S, f: &impl Fn(S) -> D, base: usize, steps: &[Cow<Steps>], k: &mut usize) {
+    let Some((axis, rest)) = steps.split_first() else { out[base] = f(item(*k)); *k += 1; return };
+    if rest.is_empty() {
+        match **axis {
+            Steps::Table(ref t) => for (j, &o) in t.offsets().iter().enumerate() { if o != Steps::FILL { out[base + o] = f(item(*k + j)) } },
+            Steps::Stride { start, len, step } => for j in 0..len { out[(base + start).wrapping_add_signed(step * j as isize)] = f(item(*k + j)) },
+            _ => for (j, o) in axis.offsets().enumerate() { if let Some(o) = o { out[base + o] = f(item(*k + j)) } },
+        }
+        *k += axis.len();
+        return;
+    }
+    if let [inner] = rest {
+        if let Steps::Stride { start: b, len: n, step } = **inner {
+            if step == 1 {
+                for o in axis.offsets() {
+                    if let Some(o) = o { for (j, slot) in out[base + o + b..][..n].iter_mut().enumerate() { *slot = f(item(*k + j)) } }
+                    *k += n;
+                }
+                return;
+            }
+            // Cells picked by a table of starts, each reaching items a stride apart, as columns are, write in blocks, as `picked` reads them.
+            if step > 1 && matches!(**axis, Steps::Table(_)) {
+                let starts: Vec<Option<usize>> = axis.offsets().collect();
+                for block in starts.chunks(8) {
+                    for j in 0..n {
+                        for (c, o) in block.iter().enumerate() { if let Some(o) = o { out[base + o + b + j * step as usize] = f(item(*k + c * n + j)) } }
+                    }
+                    *k += block.len() * n;
+                }
+                return;
+            }
+        }
+    }
+    let width: usize = rest.iter().map(|s| s.len()).product();
+    for j in 0..axis.len() { match axis.get(j) { Some(o) => scatter_into(out, item, f, base + o, rest, k), None => *k += width } }
+}
 /// Each offset with its value: the matching item of `values`, or its only item.
 #[inline]
 pub fn targets<'a, A: Copy>(offsets: &'a [usize], values: Arg<'a, A>) -> impl Iterator<Item = (usize, A)> + 'a {
@@ -176,7 +220,7 @@ pub fn try_scatter_with<D: Copy, S>(out: &mut [D], pairs: impl IntoIterator<Item
 pub fn counts_up(xs: &[usize]) -> bool { xs.iter().enumerate().all(|(i, &x)| x == i) }
 
 /// The source offsets that one axis of `walk`'s result reads. Regular patterns are held as a formula, so a long axis needs no table. A `None` offset gives a fill.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Steps {
     /// `len` offsets from `start`, each `step` further on. A negative step walks backwards.
     Stride { start: usize, len: usize, step: isize },
@@ -189,7 +233,7 @@ pub enum Steps {
 }
 
 /// Explicit offsets along one axis, with [`Steps::FILL`] where a fill goes. `start` and `len` choose the offsets in use, so that slicing a table copies none of them.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Table { all: Arc<Vec<usize>>, start: usize, len: usize }
 
 impl Table {
@@ -333,10 +377,27 @@ impl Steps {
         }
         (n == 1).then(|| (Self::reach(base, steps, start).expect("singleton run has no fill"), 1))
     }
+    /// How many consecutive items of the frame read adjacent offsets: the product of the lengths of the innermost axes, outward, while each axis steps on from the ones inside it. Clip and wrap edges don't count, because only the runs that cross them copy. A run of `n` items reads in place through `run` only where it lies inside one such stretch, so a frame whose stretches are shorter than its blocks copies every block.
+    pub fn contiguous(steps: &[Self]) -> usize {
+        let mut width = 1;
+        for axis in steps.iter().rev() {
+            if axis.len() == 1 { continue; }
+            let step = match *axis {
+                Self::Stride { step, .. } => step,
+                Self::Clipped { stride, .. } | Self::Rotated { stride, .. } => stride as isize,
+                Self::Table(_) => return width,
+            };
+            if step != width as isize { return width; }
+            width *= axis.len();
+        }
+        width
+    }
     /// Whether this entry reads items that aren't adjacent: a step or stride of more than 1, as a transpose's innermost axis has.
     pub fn skips(&self) -> bool {
         match *self { Self::Stride { step, .. } => step.unsigned_abs() > 1, Self::Clipped { stride, .. } | Self::Rotated { stride, .. } => stride > 1, Self::Table(_) => false }
     }
+    /// Whether this entry gives a fill at some position: a `Clipped` entry always does, and a table does where it holds [`Steps::FILL`].
+    pub fn fills(&self) -> bool { match self { Self::Clipped { .. } => true, Self::Table(t) => t.offsets().contains(&Self::FILL), _ => false } }
     /// This entry's first offset and step, where it reads its whole axis as one regular run with no fill: a `Stride`, or a `Rotated` entry that doesn't rotate.
     pub fn affine(&self) -> Option<(usize, isize)> {
         match *self {
@@ -638,6 +699,10 @@ fn walk_into<S: Copy, D: Clone, C: Convert<S, D>>(d: &mut Vec<D>, s: &[S], conv:
         if let (&Steps::Stride { start: a, len: m, step: 1 }, &Steps::Stride { start: b, len: n, step }) = (&**axis, &**inner) {
             if step > 1 { return transposed(d, &s[base + a + b..], &|x| conv.one(x), filled(), m, n, step as usize); }
         }
+        // Cells picked from a matrix, as columns are: a table of starts, each reaching items a stride apart.
+        if let (Steps::Table(t), &Steps::Stride { start: b, len: n, step }) = (&**axis, &**inner) {
+            if step > 1 { return picked(d, &s[base + b..], &|x| conv.one(x), filled(), t.offsets(), n, step as usize); }
+        }
         // One run of `n` adjacent items for each offset along `axis`, as windows give. A run longer than `RUN` copies as one slice.
         if let Steps::Stride { start: b, len: n, step: 1 } = **inner {
             if n > RUN {
@@ -716,5 +781,19 @@ fn transposed<S: Copy, D: Clone>(d: &mut Vec<D>, s: &[S], f: &impl Fn(S) -> D, f
         d.resize(start + rows * n, fill.clone());
         // `|x| f(x)` calls `f` directly. Passing `f` calls it through `&F`'s `Fn` shim, which LLVM left out of line, doubling the cost.
         crate::linalg::transpose_into(&s[i0..], stride, &mut d[start..], n, [n, rows], |x| f(x));
+    }
+}
+
+/// Appends a row of `n` items for each start in `starts`, where item `j` of row `i` is `f(s[starts[i] + j * stride])`, and a `Steps::FILL` start gives a row of `fill`: cells picked from a matrix whose items lie a stride apart, as columns' do. Each block of 8 rows reads the source row by row, so its starts share the lines they read.
+fn picked<S: Copy, D: Clone>(d: &mut Vec<D>, s: &[S], f: &impl Fn(S) -> D, fill: D, starts: &[usize], n: usize, stride: usize) {
+    for block in starts.chunks(8) {
+        let at = d.len();
+        d.resize(at + block.len() * n, fill.clone());
+        let out = &mut d[at..];
+        for j in 0..n {
+            for (k, &start) in block.iter().enumerate() {
+                if start != Steps::FILL { out[k * n + j] = f(s[start + j * stride]); }
+            }
+        }
     }
 }

@@ -389,41 +389,58 @@ pub(crate) fn first_classes<T: Copy, K: Eq + Hash>(x: &[T], key: impl Fn(T) -> K
 /// Whether each position of `classes` is its own class, which makes its item the first with its key.
 pub(crate) fn first_mask(classes: &[u32]) -> Vec<bool> { classes.iter().enumerate().map(|(i, &c)| c as usize == i).collect() }
 
-/// The positions of `groups` in order of group, keeping their order within each group, and the number of positions in each of the `n` groups.
+/// The positions of `groups` in order of group, keeping their order within each group, with the number in each of the `n` groups.
 #[inline(never)]
-pub fn grouped(groups: &[usize], n: usize) -> (Vec<u32>, Vec<usize>) { grouped_by(groups, n, |g| g) }
+pub fn grouped(groups: &[usize], n: usize) -> Groups { grouped_by(groups, n, |g| g) }
 
-/// The classes of a slice, numbered from 0 in order of their first positions, with the positions of each.
+/// Positions group by group, ascending within each group, with the number in each group. Each buffer holds whole groups. The two classes of a slice of two keys take a buffer each, which `into_buffers` hands over without a copy. Other groups share one buffer. Positions are `u32`s.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Grouped {
-    /// The first position of each class, in ascending order.
-    pub firsts: Vec<usize>,
-    /// The number of items in each class.
+pub struct Groups {
+    /// The number of positions in each group.
     pub sizes: Vec<usize>,
-    /// The positions of the classes, class by class, ascending within each. Each buffer holds whole classes. Two classes take a buffer each, which `into_classes` hands over without a copy. More classes share one buffer. A slice holds at most `u32::MAX` items.
     buffers: Vec<Vec<u32>>,
 }
 
-impl Grouped {
-    /// The classes that `groups` numbers, giving each item's class, whose first positions are `firsts`.
-    pub fn new(firsts: Vec<usize>, groups: &[usize]) -> Grouped { grouped_classes(groups, firsts, |g| g) }
-
-    /// The positions of each class, one slice for each class in turn.
+impl Groups {
+    /// The positions of each group, one slice for each group in turn. An empty group gives an empty slice.
     pub fn each(&self) -> impl Iterator<Item = &[u32]> {
         let (mut buffers, mut rest) = (self.buffers.iter(), &[][..]);
         self.sizes.iter().map(move |&n| {
-            if rest.is_empty() { rest = buffers.next().expect("a buffer holds each class") }
+            while rest.len() < n { rest = buffers.next().expect("a buffer holds each group") }
             let (these, more) = rest.split_at(n);
             rest = more;
             these
         })
     }
 
-    /// Folds each nonempty group of `data` in position order by `R`, and whether every fold fits.
+    /// The positions of group `k`, which are none for a group past the last.
+    pub fn group(&self, k: usize) -> &[u32] { self.each().nth(k).unwrap_or_default() }
+
+    /// The positions of each group in a buffer of its own. Groups that already have one hand it over. Groups that share a buffer copy their positions from it.
+    pub fn into_buffers(self) -> Vec<Vec<u32>> { if self.buffers.len() == self.sizes.len() { return self.buffers; } self.each().map(<[u32]>::to_vec).collect() }
+
+    /// Every position, group by group, in one buffer. Groups that share a buffer hand it over.
+    pub fn into_positions(mut self) -> Vec<u32> { if self.buffers.len() == 1 { return self.buffers.pop().expect("one buffer"); } self.buffers.concat() }
+}
+
+/// The classes of a slice, numbered from 0 in order of their first positions, with the positions of each.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Grouped {
+    /// The first position of each class, in ascending order.
+    pub firsts: Vec<usize>,
+    /// The positions of each class.
+    pub groups: Groups,
+}
+
+impl Grouped {
+    /// The classes that `groups` numbers, giving each item's class, whose first positions are `firsts`.
+    pub fn new(firsts: Vec<usize>, groups: &[usize]) -> Grouped { grouped_classes(groups, firsts, |g| g) }
+
+    /// Folds each class of `data` in position order by `R`, and whether every fold fits.
     #[inline]
     pub fn fold<T: Copy, R: crate::reduce::Reduction<T>>(&self, data: &[T]) -> (Vec<R::Total>, bool) {
         let mut fits = true;
-        let totals = self.each().map(|rows| {
+        let totals = self.groups.each().map(|rows| {
             let (mut total, mut ok) = R::one(data[rows[0] as usize]);
             for &r in &rows[1..] {
                 let (t, k) = R::checked(total, data[r as usize]);
@@ -434,9 +451,6 @@ impl Grouped {
         }).collect();
         (totals, fits)
     }
-
-    /// The positions of each class in a buffer of its own. Two classes already have theirs. More are copied from the buffer they share.
-    pub fn into_classes(self) -> Vec<Vec<u32>> { if self.buffers.len() == self.sizes.len() { return self.buffers; } self.each().map(<[u32]>::to_vec).collect() }
 }
 
 /// The classes of `x` as [`Grouped`] gives them, or `None` when its keys span too many values for a table. The table entry of each key takes its first position, then its class number, so no pass gives each item its first position.
@@ -453,27 +467,29 @@ pub fn grouped_keys<K: Key>(x: &[K]) -> Option<Grouped> {
     else { grouped_classes(x, firsts, move |k| table[k.key().wrapping_sub(min) as usize]) })
 }
 
-/// `grouped` for the positions of `items`, each in the group that `group` gives its item.
+/// The positions of `items` grouped by the group that `group` gives each item, keeping their order within each group, with the number in each of the `n` groups. `grouped` is the version for groups given as numbers.
 #[inline(always)]
-fn grouped_by<T: Copy + Sync>(items: &[T], n: usize, group: impl Fn(T) -> usize + Sync) -> (Vec<u32>, Vec<usize>) {
-    let len = items.len();
-    if n <= 1 { return ((0..len as u32).collect(), vec![len; n]); }
-    if n == 2 { return two_groups(items, group); }
-    // A slice here holds at most `u32::MAX` items, so the counts are `u32`s. Up to 256 groups, a run of one group would make each count wait for the previous one to be stored. So the positions then split into four parts, each with its own counts and next place in each group. Above 256 groups such runs are rare, and one part measured faster.
-    if n <= 256 && n * 16 <= len { parted::<4, T>(items, n, group) } else { parted::<1, T>(items, n, group) }
+pub fn grouped_by<T: Copy + Sync>(items: &[T], n: usize, group: impl Fn(T) -> usize + Sync) -> Groups {
+    let len = checked_len(items);
+    if n <= 1 { return Groups { sizes: vec![len; n], buffers: vec![(0..len as u32).collect()] }; }
+    if n == 2 { return two_groups(items, group, false); }
+    // Up to 256 groups, a run of one group would make each count wait for the previous one to be stored. So the positions then split into four parts, each with its own counts and next place in each group. Above 256 groups such runs are rare, and one part measured faster.
+    let (positions, sizes) = if n <= 256 && n * 16 <= len { parted::<4, T>(items, n, group) } else { parted::<1, T>(items, n, group) };
+    Groups { sizes, buffers: vec![positions] }
 }
 
-/// [`Grouped`] for the classes of `items`, each in the class that `class` gives its item, whose first positions are `firsts`. Two classes write a buffer each. More share one, as `grouped_by` writes it.
+/// The length of `items`, which grouped positions hold as `u32`s. Panics for a longer slice, rather than truncate its positions.
+fn checked_len<T>(items: &[T]) -> usize {
+    assert!(u32::try_from(items.len()).is_ok(), "grouped positions hold at most u32::MAX items");
+    items.len()
+}
+
+/// [`Grouped`] for the classes of `items`, each in the class that `class` gives its item, whose first positions are `firsts`. Two classes take a buffer each. More share one, as `grouped_by` writes it.
 #[inline(always)]
 fn grouped_classes<T: Copy + Sync>(items: &[T], firsts: Vec<usize>, class: impl Fn(T) -> usize + Sync) -> Grouped {
-    if firsts.len() == 2 {
-        let (groups, ones) = group_bytes(items, class);
-        let (mut zeros, mut found) = (Vec::new(), Vec::new());
-        crate::slice::appended(&mut zeros, groups.len() - ones, |d0| crate::slice::appended(&mut found, ones, |d1| split2(&groups, d0, d1)));
-        return Grouped { firsts, sizes: vec![zeros.len(), ones], buffers: vec![zeros, found] };
-    }
-    let (positions, sizes) = grouped_by(items, firsts.len(), class);
-    Grouped { firsts, sizes, buffers: vec![positions] }
+    checked_len(items);
+    let groups = if firsts.len() == 2 { two_groups(items, class, true) } else { grouped_by(items, firsts.len(), class) };
+    Grouped { firsts, groups }
 }
 
 /// Each item's group, 0 or 1, as a byte, written in a pass that vectorizes, and the number of items in group 1.
@@ -484,13 +500,20 @@ fn group_bytes<T: Copy + Sync>(items: &[T], group: impl Fn(T) -> usize + Sync) -
     (groups, ones)
 }
 
-/// `grouped_by` for two groups. Group 0's positions fill the front of one buffer, and group 1's the rest.
-fn two_groups<T: Copy + Sync>(items: &[T], group: impl Fn(T) -> usize + Sync) -> (Vec<u32>, Vec<usize>) {
+/// `grouped_by` for two groups: in one buffer with group 0's positions first, or in a buffer each where `apart`. `split2` writes both groups' positions in one pass.
+fn two_groups<T: Copy + Sync>(items: &[T], group: impl Fn(T) -> usize + Sync, apart: bool) -> Groups {
     let (groups, ones) = group_bytes(items, group);
     let zeros = groups.len() - ones;
-    let mut d = Vec::new();
-    crate::slice::appended(&mut d, groups.len(), |d| { let (d0, d1) = d.split_at_mut(zeros); split2(&groups, d0, d1) });
-    (d, vec![zeros, ones])
+    let buffers = if apart {
+        let (mut d0, mut d1) = (Vec::new(), Vec::new());
+        crate::slice::appended(&mut d0, zeros, |a| crate::slice::appended(&mut d1, ones, |b| split2(&groups, a, b)));
+        vec![d0, d1]
+    } else {
+        let mut d = Vec::new();
+        crate::slice::appended(&mut d, groups.len(), |d| { let (a, b) = d.split_at_mut(zeros); split2(&groups, a, b) });
+        vec![d]
+    };
+    Groups { sizes: vec![zeros, ones], buffers }
 }
 
 /// Writes the positions of the items whose byte in `groups` is 0 into `d0`, and of those whose byte is 1 into `d1`, each in order. Each block of 8 bytes becomes a mask of the items in group 1. `gather::selected` writes group 1's positions from the mask and group 0's from its complement. No write depends on a group. Each buffer holds exactly its group's positions.
@@ -574,7 +597,7 @@ fn counted<K: RadixKey>(keys: &[K]) -> Option<Vec<u32>> {
     let (lo, hi) = K::extremes(keys);
     let range = size((lo, hi))?;
     let lo = lo.word();
-    Some(grouped_by(keys, range, move |k| (k.word() - lo) as usize).0)
+    Some(grouped_by(keys, range, move |k| (k.word() - lo) as usize).into_positions())
 }
 
 /// `keys` sorted, with each key's position, keeping the order of positions among equal keys.

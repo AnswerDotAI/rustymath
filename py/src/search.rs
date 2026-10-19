@@ -101,7 +101,7 @@ pub fn group_indices<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, ct: Option<f64
     let items = x.at(x.view().dtype())?;
     let view = items.view();
     let grouped = search::view_grouped(view, tolerance(ct)?, || py.check_signals()).ok_or_else(|| missing("group_indices", view.dtype()))??;
-    grouped.each().map(|these| give(py, vector(these.iter().map(|&p| p as usize))?, false)).collect()
+    grouped.groups.each().map(|these| give(py, vector(these.iter().map(|&p| p as usize))?, false)).collect()
 }
 
 /// Stable positions that sort equally shaped `keys` along `axis`, with the last key primary, or along the flattened keys with no axis. The sorted axis keeps its name and drops its keys. A rank-0 key sorts as one item, as in NumPy.

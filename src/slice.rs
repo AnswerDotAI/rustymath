@@ -240,12 +240,16 @@ macro_rules! forms {
     ($(#[$m:meta])* $object:ident at $($e:ty $(=> $o:ty)?),+ : |$k:pat_param, $args:tt| $body:expr $(, many |$mk:pat_param, $margs:tt, $n:ident, $out:ident| $many:expr)?) => {
         forms!(@types [$(#[$m])*], $object, $k, $args, $body, [$((|$mk, $margs, $n, $out| $many))?], [$($e $(=> $o)?),+]);
     };
+    // A generic type, such as `Indicator<Less>`, goes in brackets, because a type can't be followed by `at`.
+    ($(#[$m:meta])* [$object:ty] at $($e:ty $(=> $o:ty)?),+ : |$k:pat_param, $args:tt| $body:expr $(, many |$mk:pat_param, $margs:tt, $n:ident, $out:ident| $many:expr)?) => {
+        forms!(@types [$(#[$m])*], $object, $k, $args, $body, [$((|$mk, $margs, $n, $out| $many))?], [$($e $(=> $o)?),+]);
+    };
     // One type at a time, so that the optional `many` group, which repeats on its own, needn't sit inside the types' repetition.
-    (@types $attrs:tt, $object:ident, $k:pat_param, $args:tt, $body:expr, $many:tt, [$e:ty $(=> $o:ty)? $(, $($rest:tt)+)?]) => {
+    (@types $attrs:tt, $object:ty, $k:pat_param, $args:tt, $body:expr, $many:tt, [$e:ty $(=> $o:ty)? $(, $($rest:tt)+)?]) => {
         forms!(@concrete $attrs, $object, $e, forms!(@out $e $(, $o)?), $k, $args, $body, $many);
         $(forms!(@types $attrs, $object, $k, $args, $body, $many, [$($rest)+]);)?
     };
-    (@concrete [$(#[$m:meta])*], $object:ident, $e:ty, $o:ty, $k:pat_param, [$($x:ident),+], $body:expr, $many:tt) => {
+    (@concrete [$(#[$m:meta])*], $object:ty, $e:ty, $o:ty, $k:pat_param, [$($x:ident),+], $body:expr, $many:tt) => {
         impl crate::float::sealed::Forms<$e, { forms!(@n $($x),+) }> for $object {
             type Out = $o;
             $(#[$m])*
@@ -276,7 +280,7 @@ macro_rules! forms {
             $many
         }
     };
-    (@half [$(#[$m:meta])*], $object:ident, $o:ty, $narrow:expr, [$($x:ident),+]) => {
+    (@half [$(#[$m:meta])*], $object:ty, $o:ty, $narrow:expr, [$($x:ident),+]) => {
         impl crate::float::sealed::Forms<half::f16, { forms!(@n $($x),+) }> for $object {
             type Out = $o;
             $(#[$m])*
