@@ -926,6 +926,7 @@ mod gather {
     fn along(len: usize, step: isize) -> Steps { Steps::Stride { start: 0, len, step } }
     #[test]
     fn walks_reach_and_run_agree() {
+        assert_eq!(read(&[], 1, &[Steps::table(vec![Steps::FILL; 2]), along(2, 3)]), [-1; 4]);
         // Each item of `s` is its own offset, so a walk shows the offsets it read.
         let s: Vec<i64> = (0..600).collect();
         let cases = [

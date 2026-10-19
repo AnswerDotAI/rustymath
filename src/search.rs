@@ -413,9 +413,6 @@ impl Groups {
         })
     }
 
-    /// The positions of group `k`, which are none for a group past the last.
-    pub fn group(&self, k: usize) -> &[u32] { self.each().nth(k).unwrap_or_default() }
-
     /// The positions of each group in a buffer of its own. Groups that already have one hand it over. Groups that share a buffer copy their positions from it.
     pub fn into_buffers(self) -> Vec<Vec<u32>> { if self.buffers.len() == self.sizes.len() { return self.buffers; } self.each().map(<[u32]>::to_vec).collect() }
 

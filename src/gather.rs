@@ -149,7 +149,7 @@ pub fn windows<const W: usize, S: Copy, D>(out: &mut Vec<D>, s: &[S], o: usize, 
 pub fn scatter<S: Copy, D>(out: &mut [D], offsets: &[usize], items: &[S], f: impl Fn(S) -> D) {
     for (o, x) in targets(offsets, Arg::of(items)) { if o != Steps::FILL { out[o] = f(x) } }
 }
-/// Replaces the items of `out` that `steps` reach from `base`, in the order that [`walk`] reads them, with the matching ones of `items`, converted by `f`, or with the only one when `items` holds one. A fill position writes nothing. Cells of adjacent items write along a slice. Cells that a table of starts picks, each reaching items a stride apart, as columns' do, write in blocks of 8 cells, row by row, so each block's writes share the lines they touch, as [`walk`]'s reads do. Within such a block, a later cell wins where two cells are the same cell, which is the only overlap a selection's cells have. Other steps write in [`walk`]'s order.
+/// Replaces the items of `out` that `steps` reach from `base`, in the order that [`walk`] reads them, with the matching ones of `items`, converted by `f`, or with the only one when `items` holds one. A fill position writes nothing. Cells of adjacent items write along a slice. Cells that a table of starts picks, each reaching items a stride apart, as columns' do, must be disjoint or identical. They write in blocks of 8 cells, row by row, so each block's writes share the lines they touch, as [`walk`]'s reads do. A later identical cell wins. Other steps write in [`walk`]'s order.
 pub fn scatter_walk<S: Copy, D>(out: &mut [D], items: &[S], base: usize, steps: &[Steps], f: impl Fn(S) -> D) {
     let (base, steps) = Steps::simplify(base, steps);
     let item = |k: usize| if let [x] = items { *x } else { items[k] };
@@ -701,7 +701,7 @@ fn walk_into<S: Copy, D: Clone, C: Convert<S, D>>(d: &mut Vec<D>, s: &[S], conv:
         }
         // Cells picked from a matrix, as columns are: a table of starts, each reaching items a stride apart.
         if let (Steps::Table(t), &Steps::Stride { start: b, len: n, step }) = (&**axis, &**inner) {
-            if step > 1 { return picked(d, &s[base + b..], &|x| conv.one(x), filled(), t.offsets(), n, step as usize); }
+            if step > 1 { return picked(d, s, base + b, &|x| conv.one(x), filled(), t.offsets(), n, step as usize); }
         }
         // One run of `n` adjacent items for each offset along `axis`, as windows give. A run longer than `RUN` copies as one slice.
         if let Steps::Stride { start: b, len: n, step: 1 } = **inner {
@@ -784,15 +784,15 @@ fn transposed<S: Copy, D: Clone>(d: &mut Vec<D>, s: &[S], f: &impl Fn(S) -> D, f
     }
 }
 
-/// Appends a row of `n` items for each start in `starts`, where item `j` of row `i` is `f(s[starts[i] + j * stride])`, and a `Steps::FILL` start gives a row of `fill`: cells picked from a matrix whose items lie a stride apart, as columns' do. Each block of 8 rows reads the source row by row, so its starts share the lines they read.
-fn picked<S: Copy, D: Clone>(d: &mut Vec<D>, s: &[S], f: &impl Fn(S) -> D, fill: D, starts: &[usize], n: usize, stride: usize) {
+/// Appends a row of `n` items for each start in `starts`, where item `j` of row `i` is `f(s[base + starts[i] + j * stride])`, and a `Steps::FILL` start gives a row of `fill`: cells picked from a matrix whose items lie a stride apart, as columns' do. Each block of 8 rows reads the source row by row, so its starts share the lines they read.
+fn picked<S: Copy, D: Clone>(d: &mut Vec<D>, s: &[S], base: usize, f: &impl Fn(S) -> D, fill: D, starts: &[usize], n: usize, stride: usize) {
     for block in starts.chunks(8) {
         let at = d.len();
         d.resize(at + block.len() * n, fill.clone());
         let out = &mut d[at..];
         for j in 0..n {
             for (k, &start) in block.iter().enumerate() {
-                if start != Steps::FILL { out[k * n + j] = f(s[start + j * stride]); }
+                if start != Steps::FILL { out[k * n + j] = f(s[base + start + j * stride]); }
             }
         }
     }
