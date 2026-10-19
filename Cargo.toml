@@ -3,7 +3,7 @@ members = ["buffer", "py"]
 default-members = [".", "buffer", "py"]
 
 [workspace.package]
-version = "0.1.35"
+version = "0.1.36"
 edition = "2024"
 
 [workspace.metadata.fastfmt]
