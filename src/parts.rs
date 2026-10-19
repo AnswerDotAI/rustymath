@@ -42,6 +42,8 @@ objects! {
     Rint;
     /// Clipping x between lower and upper bounds, `minimum(maximum(x, lower), upper)` in one pass.
     Clip;
+    /// `x` where `m` is nonzero and `y` where it's zero, item by item: a select, with the mask `m` as lanes of the items' type.
+    Choose;
 }
 
 /// Multiplication by a fixed real scale, computing f16 in f32 before rounding once.
@@ -114,3 +116,9 @@ forms!(Imag at Complex64 => f64: |_, [x]| Total(x.im));
 forms!(Clip at real: |_, [x, lo, hi]| Total(crate::reduce::minimum(crate::reduce::maximum(x, lo), hi)));
 forms!(Clip at u8, i16, i32, i64: |_, [x, lo, hi]| x.max(lo).min(hi));
 forms!(Clip at bool: |_, [x, lo, hi]| (x | lo) & hi);
+
+forms!(Choose at real: |_, [x, y, m]| Total(if m != 0.0 { x } else { y }));
+forms!(Choose at Complex32, Complex64: |_, [x, y, m]| Total(if m.re != 0.0 { x } else { y }));
+forms!(Choose at u8, i16, i32, i64: |_, [x, y, m]| if m != 0 { x } else { y });
+forms!(Choose at bool: |_, [x, y, m]| (m & x) | (!m & y));
+forms!(Choose at char: |_, [x, y, m]| if m == '\u{1}' { x } else { y });

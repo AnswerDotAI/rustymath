@@ -65,6 +65,8 @@ macro_rules! buffers {
             fn buffer(data: Vec<Self>) -> Buffer { Buffer::$outer($owned::$variant(data)) }
             #[inline]
             fn vec(buffer: Buffer) -> Option<Vec<Self>> { match buffer { Buffer::$outer($owned::$variant(v)) => Some(v), _ => None } }
+            #[inline]
+            fn truth(b: bool) -> Self { Source::<Self>::read(b) }
         })+
     };
 }
@@ -75,7 +77,7 @@ buffers!(FloatBuf, Floats, FloatWidth, Floats, Float, f64: F16(half::f16 = half:
 buffers!(ComplexBuf, Complexes, ComplexWidth, Complexes, Complex, Complex64: F32(Complex32 = Complex32::new(0.0, 0.0)), F64(Complex64 = Complex64::new(0.0, 0.0)));
 /// Booleans and characters each have one element type.
 macro_rules! single {
-    ($($t:ty: $variant:ident($dtype:ident) = $fill:expr),+) => {$(
+    ($($t:ty: $variant:ident($dtype:ident) = $fill:expr, $truth:expr),+) => {$(
         impl Element for $t {
             const FILL: Self = $fill;
             const DTYPE: DType = DType::$dtype;
@@ -89,10 +91,12 @@ macro_rules! single {
             fn buffer(data: Vec<Self>) -> Buffer { Buffer::$variant(data) }
             #[inline]
             fn vec(buffer: Buffer) -> Option<Vec<Self>> { match buffer { Buffer::$variant(v) => Some(v), _ => None } }
+            #[inline]
+            fn truth(b: bool) -> Self { ($truth)(b) }
         }
     )+};
 }
-single!(bool: Booleans(Boolean) = false, char: Characters(Character) = ' ');
+single!(bool: Booleans(Boolean) = false, |b| b, char: Characters(Character) = ' ', |b| if b { '\u{1}' } else { '\0' });
 
 /// The narrowest complex width whose parts hold floats of `width`.
 impl From<FloatWidth> for ComplexWidth {
@@ -491,6 +495,8 @@ pub trait Element: Copy + Send + Sync {
     fn buffer(data: Vec<Self>) -> Buffer;
     /// The items of `buffer`, moved out, when they have this type.
     fn vec(buffer: Buffer) -> Option<Vec<Self>>;
+    /// `b` as an item of this type: 1 or 0 for a number, the Boolean itself, or the characters U+0001 and U+0000. A Boolean mask becomes lanes of the items that a kernel such as [`Choose`](crate::Choose) chooses between.
+    fn truth(b: bool) -> Self;
 }
 
 /// An item that reads as type `A`: a Boolean as a number, an integer as a wider integer, a float or a complex number, a float as a float of another width or a complex number, and a complex number as one of the other width.

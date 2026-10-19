@@ -3,7 +3,7 @@
 //! A tolerance is a value of a type that implements `Tolerant`: a `Tolerance`, or `Exactly`, whose methods compile to plain IEEE comparisons and `floor`. A function written once over `Tolerant` compiles to a version for each. `with_tolerance!` picks one when the program runs, outside any loop. The methods are generic over the float type and compute at its width. `TolerantComplex` gives the complex versions. The function objects `Equal`, `NotEqual`, `Less`, `LessEqual`, `Greater`, `GreaterEqual`, `Matches`, `Compare`, `Floor`, `Ceil`, `Residue`, `FloorDivide`, `Gcd` and `Lcm` each hold a `Tolerance` and give the same results as the methods, one item at a time or over slices. A slice form picks its loop with `with_tolerance!` once. A comparison's slice form compares many items with one number through the range of floats equal to it (`Tolerant::range`), so each item takes one or two plain comparisons. All but `Matches` and `Compare` also have integer forms, from the `integer` module, which ignore the tolerance. `Floor` and `Ceil` also take Booleans.
 //!
 //! Tolerant equality isn't transitive: `x` can equal `y` and `y` equal `z` while `x` doesn't equal `z`. Hash maps and sorting need a transitive `PartialEq`. This module therefore has no float type with a tolerant `==`. Each comparison is a method of the tolerance.
-use crate::{Arg, BETWEEN_CHECKS, convert::{float, int}, float::{Float, Native}, ok, search::{self, Chains, Key, Links}, slice::{Total, pairs_into}};
+use crate::{Arg, BETWEEN_CHECKS, buffer::Element, convert::{float, int}, float::{Float, Native}, ok, search::{self, Chains, Key, Links}, slice::{Total, pairs_into}};
 use num_bigint::BigInt;
 use num_complex::Complex;
 use num_rational::BigRational;
@@ -283,10 +283,10 @@ macro_rules! tolerant {
 /// Writes an [`Indicator`]'s forms for the tolerant comparison `$object` at each float type `$e`, through `forms!`: its item body over a tolerance `$t` as 1 or 0, and a slice form that compares many items with one number through `against`, writing each float in the same loop.
 macro_rules! indicator {
     ($object:ident: |$t:ident, [$x:ident, $y:ident]| $body:expr, $left:ident, $right:ident, $($e:ty),+) => {$(
-        forms!([Indicator<$object>] at $e: |k, [$x, $y]| crate::slice::Total(indicated::<$e>(with_tolerance!(k.0.0, |$t| $body))),
-            many |k, [$x, $y], n, out| match against(k.0.0, $x, $y, n, out, Band::$left, Band::$right, |xs, lo, hi, band, out| in_band(xs, lo, hi, band, out, indicated::<$e>)) {
+        forms!([Indicator<$object>] at $e: |k, [$x, $y]| crate::slice::Total(<$e as Element>::truth(with_tolerance!(k.0.0, |$t| $body))),
+            many |k, [$x, $y], n, out| match against(k.0.0, $x, $y, n, out, Band::$left, Band::$right, |xs, lo, hi, band, out| in_band(xs, lo, hi, band, out, <$e as Element>::truth)) {
                 Some(ok) => ok,
-                None => with_tolerance!(k.0.0, |$t| each!([$x, $y], n, out, |[$x, $y]| crate::slice::Total(indicated::<$e>($body)))),
+                None => with_tolerance!(k.0.0, |$t| each!([$x, $y], n, out, |[$x, $y]| crate::slice::Total(<$e as Element>::truth($body)))),
             });
     )+};
 }
@@ -365,9 +365,6 @@ fn against<F: Float, O>(
 #[derive(Clone, Copy, Debug)]
 pub struct Indicator<K>(pub K);
 
-/// 1 for true and 0 for false.
-#[inline(always)]
-fn indicated<F: Float>(b: bool) -> F { if b { F::one() } else { F::zero() } }
 
 /// Wasm has no instruction that narrows a 64-bit lane to a byte. LLVM writes a float comparison's results two items at a time, in about ten instructions for each item. Where it can prove that lanes hold masks, it also replaces wasm's narrowing instructions with slower code. Here each block of 16 items compares with vector instructions, then shuffles the first byte of each mask into place: 7 shuffles for `f64`'s 8 vectors, and 3 for `f32`'s 4.
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]

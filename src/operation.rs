@@ -93,12 +93,13 @@ impl<K> Kernels<BinaryKernel<K>> {
 }
 
 impl<K> Kernels<TernaryKernel<K>> {
-    /// `k` on three arguments of one dtype, paired as [`TernaryKernel`] describes, and whether every result succeeded. `None` where `k` has no kernel for their dtype.
+    /// `k` on three arguments of one dtype, or on two of one dtype and a Boolean mask, paired as [`TernaryKernel`] describes, and whether every result succeeded. `None` where `k` has no kernel for their dtype.
     pub fn ternary(&self, k: &K, [x, y, z]: [ArrayView<'_>; 3], first: &Agreement, second: &Agreement) -> Option<(Buffer, bool)> {
         let (kernel, at) = self.chosen(x.dtype())?;
         let (x, left) = x.mapped(&first.left, first.layout.shape(), at);
         let (y, right) = y.mapped(&first.right, first.layout.shape(), at);
-        let (z, last) = z.mapped(&second.right, second.layout.shape(), at);
+        // A Boolean third argument keeps its dtype: `ternary_at` turns it into items of `at` a chunk at a time, through `Element::truth`.
+        let (z, last) = z.mapped(&second.right, second.layout.shape(), if z.dtype() == DType::Boolean { DType::Boolean } else { at });
         let (one, two) = (remapped(first, left, right), remapped(second, None, last));
         Some(kernel(k, [x.view(), y.view(), z.view()], one.as_ref().unwrap_or(first), two.as_ref().unwrap_or(second)))
     }
@@ -162,17 +163,29 @@ fn direct<'a, T: Element>(data: &'a [T], mapping: &Mapping, parent: &Mapping) ->
     }
 }
 
-/// Contiguous/constant arguments go to the slice form directly. Other mappings expand in chunks within parallel ranges.
+/// A third argument at a kernel's item type `T`, or a Boolean mask that [`Kernels::ternary`] leaves uncast, which becomes items of `T` through [`Element::truth`].
+#[derive(Clone, Copy)]
+enum Third<'a, T> { Items(&'a [T]), Mask(&'a [bool]) }
+
+impl<'a, T: Element> Third<'a, T> {
+    fn of(z: View<'a>) -> Self { match bool::of(z) { Some(mask) if T::DTYPE != DType::Boolean => Third::Mask(mask), _ => Third::Items(items::<T>(z)) } }
+    /// The item at `at`, or what a missing keyed entry reads as. A mask reads false there.
+    fn read(&self, at: Option<usize>) -> T {
+        match *self { Third::Items(d) => at.map_or(T::FILL, |j| d[j]), Third::Mask(m) => T::truth(at.is_some_and(|j| m[j])) }
+    }
+}
+
+/// Contiguous/constant arguments go to the slice form directly, a mask through [`masked`](crate::slice::masked). Other mappings expand in chunks within parallel ranges.
 fn ternary_at<K: Ternary<T, Out: Element> + Sync, T: Element>(k: &K, [x, y, z]: [View<'_>; 3], first: &Agreement, second: &Agreement) -> (Buffer, bool) {
-    let (x, y, z) = (items::<T>(x), items::<T>(y), items::<T>(z));
+    let (x, y, z) = (items::<T>(x), items::<T>(y), Third::<T>::of(z));
     let read = |data: &[T], at: Option<usize>| at.map_or(T::FILL, |j| data[j]);
     let mut out = Vec::with_capacity(second.len);
-    let direct = if second.len == 0 { None } else {
-        direct(x, &first.left, &second.left).zip(direct(y, &first.right, &second.left))
-            .zip(direct(z, &second.right, &Mapping::Linear(1)))
-    };
-    let ok = if let Some(((x, y), z)) = direct { k.many(x, y, z, second.len, &mut out) }
-    else { extended(&mut out, second.len, CHUNK, &|range, slots| {
+    let pair = if second.len == 0 { None } else { direct(x, &first.left, &second.left).zip(direct(y, &first.right, &second.left)) };
+    let done = pair.and_then(|(xa, ya)| match z {
+        Third::Items(z) => direct(z, &second.right, &Mapping::Linear(1)).map(|za| k.many(xa, ya, za, second.len, &mut out)),
+        Third::Mask(m) => direct(m, &second.right, &Mapping::Linear(1)).map(|ma| crate::slice::masked(k, xa, ya, ma, second.len, &mut out)),
+    });
+    let ok = done.unwrap_or_else(|| extended(&mut out, second.len, CHUNK, &|range, slots| {
         let mut bufs = [Vec::new(), Vec::new(), Vec::new()];
         chunks(range, &[], |start, n| {
             bufs.iter_mut().for_each(Vec::clear);
@@ -180,13 +193,14 @@ fn ternary_at<K: Ternary<T, Out: Element> + Sync, T: Element>(k: &K, [x, y, z]: 
                 let pair = second.left.get(i);
                 bufs[0].push(read(x, pair.and_then(|j| first.left.get(j))));
                 bufs[1].push(read(y, pair.and_then(|j| first.right.get(j))));
-                bufs[2].push(read(z, second.right.get(i)));
+                bufs[2].push(z.read(second.right.get(i)));
             }
             k.many_into(Arg::Many(&bufs[0]), Arg::Many(&bufs[1]), Arg::Many(&bufs[2]), n, slots)
         })
-    }) };
+    }));
     (<<K as Results<T, 3>>::Out as Element>::buffer(out), ok)
 }
+
 
 fn fold_at<R: Reduction<T>, T: Element>(_: &R, x: View<'_>, dims: [usize; 3], tail: Option<View<'_>>) -> (Buffer, bool) where R::Total: Element {
     let mut tc = None;

@@ -97,7 +97,7 @@ rm.optimize.root_scalar(lambda x: rm.cos(x) - x, [0, 1]).root
 
 ## Polynomials, exact arithmetic and number theory
 
-Polynomial coefficients start from the constant term. Number-theory functions accept Python integers of any size:
+Polynomial coefficients start from the constant term. Factorization accepts Python integers of any size:
 
 ``` python
 rm.polynomial.polyroots([-6, 11, -6, 1]), rm.number_theory.factor(2**64 + 1)

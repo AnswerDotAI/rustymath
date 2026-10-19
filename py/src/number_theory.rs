@@ -1,4 +1,4 @@
-//! rustymath's `number_theory` module on Python integers of any size. Each function checks for Ctrl-C at least about once a millisecond, and stops with `KeyboardInterrupt`.
+//! Primality and factorization on arbitrary-size nonnegative Python integers. Prime enumeration/counting and factorial take `u64` arguments; enumerated primes must fit `int64`. Long calls check for Ctrl-C and stop with `KeyboardInterrupt`.
 use num_bigint::BigUint;
 use num_traits::Zero;
 use crate::array::{core, give};
@@ -9,7 +9,7 @@ fn positive(n: &BigUint, name: &str) -> PyResult<()> {
     if n.is_zero() { Err(PyValueError::new_err(format!("{name} needs a positive integer"))) } else { Ok(()) }
 }
 
-/// Whether `n` is prime.
+/// Whether `n` passes the Baillie–PSW primality test. No composite below 2**64 passes; larger results are probable primes, with no known counterexample.
 #[pyfunction]
 pub fn is_prime(py: Python<'_>, n: BigUint) -> PyResult<bool> { nt::is_prime_with(&n, || py.check_signals()) }
 

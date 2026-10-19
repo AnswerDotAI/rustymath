@@ -1,4 +1,4 @@
-//! rustymath's searches, sorts and classifications, on arguments that `convert` reads. Booleans, integers and characters match exactly. Floats match within the tolerance `ct`, and each search of floats checks for Ctrl-C as it goes, stopping with `KeyboardInterrupt`. Sorts and insertion searches compare exactly: signed zeros compare equal, and every NaN comes after positive infinity. Complex numbers raise. Positions come back as `i64` arrays.
+//! rustymath's searches, sorts and classifications, on arguments that `convert` reads. Booleans, integers and characters match exactly. Floats match within the tolerance `ct`. Tolerant classification and item matching check for Ctrl-C, stopping with `KeyboardInterrupt`. Sorts and insertion searches compare exactly: signed zeros compare equal, and every NaN comes after positive infinity. Complex numbers raise. Positions come back as `i64` arrays.
 use crate::array::{core, give};
 use crate::convert::{Arg, Call, convert, one};
 use crate::functions::{Axis, along_axis, missing, tolerance};
@@ -66,6 +66,18 @@ pub fn isin<'py>(py: Python<'py>, element: &Bound<'py, PyAny>, test_elements: &B
     let (call, found) = first_matches(py, "isin", test_elements, element, ct)?;
     let (n, ys) = (call.args[0].view().len(), &call.args[1]);
     give(py, Core::new(ys.layout(), bool::buffer(found.into_iter().map(|p| (p as usize) < n).collect())).map_err(py_err)?, ys.scalar)
+}
+
+/// A Boolean mask shaped like `target`, marking starts where `pattern` fits and matches. A lower-rank pattern has leading singleton axes; a higher-rank pattern never matches. Floats use `ct`.
+#[pyfunction]
+#[pyo3(signature = (pattern, target, *, ct=None))]
+pub fn find<'py>(py: Python<'py>, pattern: &Bound<'py, PyAny>, target: &Bound<'py, PyAny>, ct: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+    let call = convert(&[pattern, target])?;
+    let (pattern, target) = (&call.args[0], &call.args[1]);
+    let (xs, ys) = (pattern.at(pattern.view().dtype())?, target.at(target.view().dtype())?);
+    let found = search::view_find(xs.view(), pattern.layout().shape(), ys.view(), target.layout().shape(), tolerance(ct)?)
+        .ok_or_else(|| missing("find", xs.view().dtype()))?;
+    give(py, Core::new(target.layout(), bool::buffer(found)).map_err(py_err)?, target.scalar)
 }
 
 #[pyfunction]
@@ -274,7 +286,8 @@ pub fn bincount<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, minlength: i64) -> 
 /// Adds this module's functions to `m`.
 pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
     for f in [
-        wrap_pyfunction!(unique, m)?, wrap_pyfunction!(index, m)?, wrap_pyfunction!(isin, m)?, wrap_pyfunction!(counts, m)?, wrap_pyfunction!(group_indices, m)?,
+        wrap_pyfunction!(unique, m)?, wrap_pyfunction!(index, m)?, wrap_pyfunction!(isin, m)?, wrap_pyfunction!(find, m)?,
+        wrap_pyfunction!(counts, m)?, wrap_pyfunction!(group_indices, m)?,
         wrap_pyfunction!(argsort, m)?, wrap_pyfunction!(sort, m)?, wrap_pyfunction!(partition, m)?, wrap_pyfunction!(argpartition, m)?,
         wrap_pyfunction!(argmin, m)?, wrap_pyfunction!(argmax, m)?, wrap_pyfunction!(median, m)?, wrap_pyfunction!(quantile, m)?,
         wrap_pyfunction!(lexsort, m)?, wrap_pyfunction!(searchsorted, m)?, wrap_pyfunction!(bincount, m)?, wrap_pyfunction!(_set, m)?,

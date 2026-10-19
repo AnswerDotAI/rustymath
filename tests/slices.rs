@@ -984,6 +984,18 @@ mod gather {
         let one = [ix(vec![1, 0]), Selector::At(2)];
         assert_eq!(read(&s, 0, &select(&layout, one.to_vec(), true).unwrap().steps), read(&s, 0, &select(&layout, one.to_vec(), false).unwrap().steps));
     }
+    /// A window's border is the fill it reads before its axis, positive, or past it, negative. `borders` gives every window's `border` in ravel order, and a frame with no windows one row, for the position that `starts` gives it.
+    #[test]
+    fn window_borders() {
+        use rustymath::structure::Windows;
+        let w = Windows::new(&[3, 2], &[], |_| true, &[4, 5]).unwrap();
+        let n: usize = w.frame().iter().product();
+        assert_eq!((w.border(0), w.border(n - 1)), (vec![1, 0], vec![-1, 0]));
+        assert_eq!(w.borders(), (0..n).flat_map(|p| w.border(p)).collect::<Vec<_>>());
+        let empty = Windows::new(&[1, 1, 1], &[], |_| true, &[0, 1000, 1000]).unwrap();
+        assert_eq!(empty.frame(), &[0, 1000, 1000]);
+        assert_eq!(empty.borders(), empty.border(0));
+    }
     /// A composed walk reads what walking one walk and then the other reads. `spreads` and `rereads` find walks that read an item more than once or read a fill.
     #[test]
     fn walks_compose() {

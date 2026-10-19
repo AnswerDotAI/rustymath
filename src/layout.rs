@@ -241,6 +241,7 @@ impl Layout {
     pub const EMPTY: Self = Self { shape: Shape::EMPTY, meta: None };
     #[inline]
     pub fn shape(&self) -> &[usize] { &self.shape }
+    /// The name of each axis, with `None` for an axis without one. Empty when no axis has a name (`has_names`).
     #[inline]
     pub fn names(&self) -> &[Option<Arc<str>>] { self.meta.as_ref().map_or(&[], |l| &l.names) }
     #[inline]
@@ -282,6 +283,9 @@ impl Layout {
     fn key_list(&self) -> &[Option<Arc<Keys>>] { self.meta.as_ref().map_or(&[], |l| &l.keys) }
     #[inline]
     pub fn has_keys(&self) -> bool { !self.key_list().is_empty() }
+    /// Whether any axis has a name.
+    #[inline]
+    pub fn has_names(&self) -> bool { !self.names().is_empty() }
     /// Whether the layout has no keys or names.
     #[inline]
     pub fn plain(&self) -> bool { self.meta.is_none() }

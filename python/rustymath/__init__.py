@@ -1,5 +1,27 @@
 """Maths in plain Rust, from fast f16, f32 and f64 functions to exact rationals.
 
+Rustymath provides fast elementary and special functions, statistics, searching and sorting, random sampling, linear algebra, optimization, polynomials and exact arithmetic in Rust and Python. It is the numerical core of [BasedPL](https://answerdotai.github.io/basedpl/).
+
+The Python package needs no NumPy. Its eager operations use the same broadcasting, selection and tolerant-comparison rules as the shared Rust core. For richer array notation, operators and fusion, use BasedPL.
+
+Elementary float functions target four units in the last place (ulps). Rustymath prioritizes speed over last-bit agreement and reproducibility.
+
+[Arrays and indexing](https://answerdotai.github.io/rustymath/arrays.html) covers construction, dtypes, selection, reshaping, axis names, keys and interoperability.
+
+[Maths and statistics](https://answerdotai.github.io/rustymath/math.html) covers elementary and special functions, reductions, scans, statistics and tolerant comparison.
+
+[Searching, sorting and selection](https://answerdotai.github.io/rustymath/search.html) distinguishes tolerant matching from exact ordering.
+
+[Random numbers and distributions](https://answerdotai.github.io/rustymath/random.html) covers sampling and probability functions.
+
+[Linear algebra](https://answerdotai.github.io/rustymath/linalg.html) covers matrix products, reusable factorizations, decompositions and least squares.
+
+[Optimization and iterative solves](https://answerdotai.github.io/rustymath/optimize.html) also covers matrix-free linear systems.
+
+[Polynomials, exact arithmetic and number theory](https://answerdotai.github.io/rustymath/exact.html) includes rational matrix solves and calculations with `fractions.Fraction`.
+
+The Rust page's [Accuracy and speed](https://answerdotai.github.io/rustymath/rust.html#accuracy-and-speed) section compares each function's speed with Rust's standard library. It also explains how the 4-ulp bound holds for `f16`, with and without fused multiply-add, and for `pow` and `root`.
+
 Modules:
 
 - `rustymath.optimize`: Minimizing a function of several variables, and solving equations, nonlinear or linear, with SciPy's names. The searches run in Rust and call the Python functions at each point."""
@@ -9,7 +31,7 @@ from . import _core, linalg, polynomial, exact, integer, search, optimize, rando
 from .linalg import matmul
 from .integer import encode, decode
 from .search import (Unique, unique, index, isin, argsort, lexsort, searchsorted, bins, bincount, counts, group_indices, sort, partition, argpartition,
-    argmin, argmax, median, quantile, percentile, union1d, intersect1d, setdiff1d)
+    argmin, argmax, median, quantile, percentile, union1d, intersect1d, setdiff1d, find)
 from ._core import (__version__, CT, Array, absolute, add, all, angle, any, arccos, arccosh, arcsin, arcsinh, arctan, arctan2, arctanh, array, betainc,
     betaincinv, binom, cbrt, ceil, cis, cos, cosh, cumprod, cumsum, distribution, divide, equal, erf, erfc, erfcinv, erfinv, exp, expm1, factorial, floor,
     gamma, gammainc, gammaincc, gammaincinv, gammaln, gcd, greater, greater_equal, hypot, lambertw, lcm, less, less_equal, log, log10, log1p, log2, logb,

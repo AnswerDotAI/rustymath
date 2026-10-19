@@ -4,9 +4,12 @@
 
 `root_scalar` finds a zero of a function of one variable by Brent's method, and `least_squares` the least-squares solution of a system of equations by Levenberg–Marquardt, which is a zero for a square system.
 
-`cg`, `minres` and `gmres` solve a square linear system by conjugate gradients, MINRES and restarted GMRES, and `lsmr` gives a least-squares solution through MINRES on the normal equations, which gives LSMR's iterates. They take `A` as an array, or as anything with a `shape` and a `matvec` method, plus `rmatvec` for `lsmr`, such as SciPy's `LinearOperator`. Each takes a preconditioner `M`, an approximation to the inverse of `A`, or of `A.T @ A` for `lsmr`.
+`cg`, `minres` and `gmres` solve square linear systems by conjugate gradients, MINRES and restarted GMRES. `cgls` and `lsmr` solve least-squares systems by CG and MINRES on the normal equations without forming `A.T @ A`. CGLS uses normal-equation CG rather than Golub–Kahan LSQR. They take `A` as an array or an operator with `shape` and `matvec`, plus `rmatvec` for `cgls` and `lsmr`. The preconditioner `M` approximates the inverse of `A`, or of `A.T @ A` for least squares. GMRES applies it on the right.
 
-The functions get their points as rustymath arrays. A float32 or float16 start, or `b` for the linear solvers, computes in float32, and anything else in float64. An exception from a function stops the search and reaches the caller."""
+The functions get their points as rustymath arrays. A float32 or float16 start, or `b` for the linear solvers, computes in float32, and anything else in float64. An exception from a function stops the search and reaches the caller.
+
+Docs: https://answerdotai.github.io/rustymath/optimize.html.md
+"""
 from typing import NamedTuple
 from math import inf
 from ._core import Array, optimize as _o
@@ -33,7 +36,7 @@ class LeastSquaresResult(NamedTuple):
     success: bool
 
 class LinearResult(NamedTuple):
-    "What a linear solver found: its last iterate, the norm of `b - A @ x` there, the number of products with `A` and its transpose, and whether the residual fell within tolerance"
+    "What a linear solver found: its last iterate, the norm of `b - A @ x` there, the number of products with `A` and its transpose, and whether the method's stopping test passed"
     x: Array
     normr: float
     nmatvec: int
@@ -87,9 +90,9 @@ def _krylov(name, method, transpose, doc):
         A, # Matrix as an array, or anything with a `shape` and a `matvec` method, plus `rmatvec` for least squares
         b, # Right-hand side, flattened
         x0=None, # Start point; None for zeros
-        rtol=None, # The residual's norm, relative to the right-hand side's, at which the solver stops; None for the square root of its machine epsilon
-        maxiter=None, # The most iterations, as SciPy counts them: restart cycles of up to 20 steps for `gmres`, and steps for the others, where `lsmr`'s each take a product with `A` and one with its transpose; None for 20 products for each unknown, plus 20
-        M=None # Preconditioner, an approximation to the inverse of `A`, or of `A.T @ A` for `lsmr`, as an array or anything with `matvec`. It must be symmetric positive definite for all but `gmres`, which applies it on the right, where SciPy's applies it on the left
+        rtol=None, # Relative residual tolerance, applied to the normal equations for least squares; None for the square root of its machine epsilon
+        maxiter=None, # The most iterations, as SciPy counts them: restart cycles of up to 20 steps for `gmres`, and steps for the others, where `cgls` and `lsmr` each take a product with `A` and one with its transpose; None for 20 products for each unknown, plus 20
+        M=None # Preconditioner, an approximation to the inverse of `A`, or of `A.T @ A` for `cgls` and `lsmr`, as an array or anything with `matvec`. It must be symmetric positive definite for all but `gmres`, which applies it on the right, where SciPy's applies it on the left
     ):
         return LinearResult(*_o.linear(A, b, x0, method, transpose, name, M, rtol, maxiter))
     return _named(solve, name, doc)
@@ -97,4 +100,5 @@ def _krylov(name, method, transpose, doc):
 cg = _krylov('cg', 'cg', False, "The solution of `A @ x = b` for a symmetric positive definite `A` by conjugate gradients, as a `LinearResult`")
 minres = _krylov('minres', 'minres', False, "The solution of `A @ x = b` for a symmetric `A` by MINRES, as a `LinearResult`")
 gmres = _krylov('gmres', 'gmres', False, "The solution of `A @ x = b` for a square `A` by GMRES, restarted every 20 steps, as a `LinearResult`")
+cgls = _krylov('cgls', 'cg', True, "The least-squares solution of `A @ x = b` by conjugate gradients on the normal equations, as a `LinearResult`")
 lsmr = _krylov('lsmr', 'minres', True, "The least-squares solution of `A @ x = b` by MINRES on the normal equations, which gives LSMR's iterates, as a `LinearResult`")

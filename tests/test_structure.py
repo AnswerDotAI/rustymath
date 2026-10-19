@@ -112,6 +112,13 @@ def test_nonzero_and_where_use_shared_broadcasting():
     assert rm.argwhere(a).tolist() == [[0, 1], [1, 0], [1, 2]]
     assert rm.where(a > 0, [10, 20], a).tolist() == [[0, 10, 0], [20, 0, 20]]
     assert rm.where(True, 2, 3) == 2 and rm.argwhere(rm.array([])).shape == (0, 1)
+    assert rm.where([True, False, True], "abc", "xyz").tolist() == ["a", "y", "c"]
+    # A key the condition lacks picks y, for characters as for numbers. The result takes its keys from x and y, then the condition's extra keys.
+    c = rm.array({'a': True})
+    picked = rm.where(c, rm.array({'b': 1, 'a': 2}), rm.array({'b': 3, 'a': 4}))
+    assert picked.tolist() == [3, 2] and picked.keys == (('b', 'a'),)
+    picked = rm.where(c, rm.array({'b': 'p', 'a': 'q'}), rm.array({'b': 'r', 'a': 's'}))
+    assert picked.tolist() == ['r', 'q'] and picked.keys == (('b', 'a'),)
     with pytest.raises(TypeError): rm.where([0, 1], 2, 3)
 
 def test_diagonals_triangles_and_conveniences():

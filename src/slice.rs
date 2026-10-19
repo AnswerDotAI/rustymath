@@ -1,5 +1,6 @@
 //! Slice forms of rustymath's functions. Each function object, such as [`Pow`], has a scalar form `one` and a slice form `many`. Both run code that rustymath compiles once for each item type, inside its own crate. A caller's build settings can't change that code, and rustymath's speed test times what callers run. An edit to a function's body rebuilds only rustymath.
 use crate::float::{Float, sealed::{Forms, Item}};
+use crate::buffer::Element;
 use num_complex::Complex;
 use std::mem::MaybeUninit;
 
@@ -188,21 +189,14 @@ pub(crate) const fn wraps<K, E, O: Item, R: Outcome<O>, const N: usize>(_: fn(&K
 #[inline(always)]
 fn items<E: Copy, const N: usize>(x: &[Arg<'_, E>; N], i: usize) -> [E; N] { std::array::from_fn(|k| match x[k] { Arg::One(v) => v, Arg::Many(s) => s[i] }) }
 
-/// Writes `f` for each of `n` results into `out`, for arguments `x`, and gives whether `f` said `true` for every result. One and two arguments run through [`pairs_into`], whose loops vectorize.
+/// Writes `f` for each of `n` results into `out`, for arguments `x`, and gives whether `f` said `true` for every result. One and two arguments run through [`pairs_into`], and three through `triples_into`, whose loops vectorize.
 #[inline(always)]
 fn mapped<E: Copy, O, const N: usize>(x: &[Arg<'_, E>; N], n: usize, out: &mut [MaybeUninit<O>], f: impl Fn([E; N]) -> (O, bool)) -> bool {
     match x.as_slice() {
         &[a] => pairs_into(a, Arg::One(()), n, out, #[inline(always)] |a, ()| f([a; N])),
         &[a, b] => pairs_into(a, b, n, out, #[inline(always)] |a, b| f(std::array::from_fn(|k| if k == 0 { a } else { b }))),
-        _ => {
-            let mut ok = true;
-            for (i, slot) in out[..n].iter_mut().enumerate() {
-                let (r, good) = f(items(x, i));
-                slot.write(r);
-                ok &= good;
-            }
-            ok
-        }
+        &[a, b, c] => triples_into(a, b, c, n, out, #[inline(always)] |a, b, c| f(std::array::from_fn(|k| match k { 0 => a, 1 => b, _ => c }))),
+        _ => unreachable!("function objects take one to three arguments"),
     }
 }
 
@@ -340,6 +334,23 @@ macro_rules! each_pair {
     }};
 }
 
+/// Runs `$body` for each item `$i` of a result of `$n` items, with `$a`, `$b` and `$c` the items of `$x`, `$y` and `$z` that go with it, as [`each_pair!`] does for two arguments. Each pairing of `One` and `Many` has a loop of its own.
+macro_rules! each_triple {
+    ($x:expr, $y:expr, $z:expr, $n:expr, |$i:ident, $a:ident, $b:ident, $c:ident| $body:expr) => {{
+        let n = $n;
+        match $x {
+            Arg::One($a) => each_pair!($y, $z, n, |$i, $b, $c| $body),
+            Arg::Many(firsts) => {
+                let firsts = &firsts[..n];
+                each_pair!($y, $z, n, |$i, $b, $c| {
+                    let $a = firsts[$i];
+                    $body
+                })
+            }
+        }
+    }};
+}
+
 /// Appends `f` on each of `n` pairs of items to `out`, and gives whether `f` said `true` for every pair. An `Arg::One` pairs with every item of the other argument. The loops write straight into `out`'s spare capacity, which is never zeroed first. This is the loop that rustymath's slice forms run, and a caller's own kernels can run it too, as basedpl's arithmetic does. A long call splits across threads, as [`parallel`](crate::parallel) describes.
 #[inline(never)]
 pub fn pairs<X: Copy + Sync, Y: Copy + Sync, B: Send>(x: Arg<'_, X>, y: Arg<'_, Y>, n: usize, out: &mut Vec<B>, f: impl Fn(X, Y) -> (B, bool) + Sync) -> bool {
@@ -350,16 +361,40 @@ pub fn pairs<X: Copy + Sync, Y: Copy + Sync, B: Send>(x: Arg<'_, X>, y: Arg<'_, 
     })
 }
 
-/// [`pairs`], writing into the `n` slots of `out` in place of appending to a vector.
+/// [`pairs`], writing into the `n` slots of `out` in place of appending to a vector. It runs [`triples_into`]'s loops with a unit first argument, which go straight to [`each_pair!`]'s.
 #[inline]
 pub(crate) fn pairs_into<X: Copy, Y: Copy, B>(x: Arg<'_, X>, y: Arg<'_, Y>, n: usize, out: &mut [MaybeUninit<B>], f: impl Fn(X, Y) -> (B, bool)) -> bool {
+    triples_into(Arg::One(()), x, y, n, out, #[inline(always)] |(), a, b| f(a, b))
+}
+
+/// [`pairs_into`] for three arguments, which `mapped` runs for a function object of three arguments.
+#[inline]
+fn triples_into<X: Copy, Y: Copy, Z: Copy, B>(x: Arg<'_, X>, y: Arg<'_, Y>, z: Arg<'_, Z>, n: usize, out: &mut [MaybeUninit<B>], f: impl Fn(X, Y, Z) -> (B, bool)) -> bool {
     let (out, mut ok) = (&mut out[..n], true);
-    each_pair!(x, y, n, |i, a, b| {
-        let (r, good) = f(a, b);
+    each_triple!(x, y, z, n, |i, a, b, c| {
+        let (r, good) = f(a, b, c);
         out[i].write(r);
         ok &= good;
     });
     ok
+}
+
+/// Appends `n` items to `out`: item `i` of `x` where item `i` of `mask` is true, and item `i` of `y` where it's false, through [`Choose`](crate::Choose). An `Arg::One` serves every item. Like [`pairs`], a long call splits across threads.
+#[inline(never)]
+pub fn choose<E: Element>(mask: Arg<'_, bool>, x: Arg<'_, E>, y: Arg<'_, E>, n: usize, out: &mut Vec<E>) where crate::Choose: crate::Ternary<E, Out = E> {
+    masked(&crate::Choose, x, y, mask, n, out);
+}
+
+/// `k` on `x`, `y` and a Boolean `mask`, appending `n` results to `out`, and whether every result succeeded. Each chunk of the mask becomes items of `T` through [`Element::truth`] while the chunk is in the cache, because a kernel on lanes as wide as its items vectorizes where one on Booleans doesn't. Like [`pairs`], a long call splits across threads.
+pub(crate) fn masked<K: Ternary<T> + Sync, T: Element>(k: &K, x: Arg<'_, T>, y: Arg<'_, T>, mask: Arg<'_, bool>, n: usize, out: &mut Vec<K::Out>) -> bool where K::Out: Copy + Send {
+    crate::parallel::extended(out, n, CHUNK, &|range, slots| {
+        let mut lanes = Vec::new();
+        (range.start..range.end).step_by(CHUNK).fold(true, |ok, at| {
+            let len = CHUNK.min(range.end - at);
+            let m = mask.converted(at, len, &mut lanes, T::truth);
+            k.many_into(x.part(at, len), y.part(at, len), m, len, slots) & ok
+        })
+    })
 }
 
 /// Appends `n` items to `out`, which `write` writes into its spare capacity, never zeroed first, and gives `write`'s result. `write` must write every slot it gets. Each caller's loop does, by its construction.

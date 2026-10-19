@@ -56,7 +56,7 @@ pub fn select(layout: &Layout, selectors: Vec<Selector>, broadcast: bool) -> Res
             continue;
         }
         result = result.concat(part.alone.as_ref().unwrap_or(&part.axes));
-        steps.push(scaled(part.steps, part.stride));
+        steps.push(part.steps.scaled(part.stride));
     }
     generated_len(result.shape())?;
     Ok(Plan { layout: result, steps })
@@ -87,9 +87,9 @@ impl Part {
                 // Check selected keys even when the result drops them, as BPL selection does.
                 let selected = layout.select(axis, steps.offsets())?;
                 let alone = match within.shape().len() {
-                    1 if within.names().is_empty() => Some(selected.axes(axis..axis + 1)),
+                    1 if !within.has_names() => Some(selected.axes(axis..axis + 1)),
                     1 if within.keys(0).is_none() => Some(within.clone().with_keys(vec![selected.keys(axis).cloned()])?),
-                    _ if within.names().is_empty() => Some(Layout::from(within.shape().to_vec())),
+                    _ if !within.has_names() => Some(Layout::from(within.shape().to_vec())),
                     _ => None,
                 };
                 Ok(Part { steps, axes: within, stride, array: true, alone })
@@ -119,15 +119,6 @@ fn joined(parts: &[Part], group: &[usize], broadcast: bool) -> Result<(Layout, S
         }
     }
     Ok((frame, Steps::table(table)))
-}
-
-/// `positions` along an axis whose items lie `stride` apart, as offsets into the argument.
-fn scaled(positions: Steps, stride: usize) -> Steps {
-    match positions {
-        Steps::Stride { start, len, step } => Steps::Stride { start: start * stride, len, step: step * stride as isize },
-        Steps::Table(positions) => Steps::Table(positions.scaled(stride)),
-        _ => unreachable!("selectors use ranges or explicit positions"),
-    }
 }
 
 /// The name of the one named axis of `layout`, where it has exactly one.
@@ -380,6 +371,11 @@ impl WindowAxis {
     }
     /// Where window `i` starts along the axis. It's negative when padding comes before the first item.
     pub fn start(&self, i: usize) -> isize { (i * self.step) as isize - if self.padded { ((self.size - 1) / 2) as isize } else { 0 } }
+    /// The fill that window `i` reads along an axis of length `len`: the count before the first item, positive, or past the last, negative, or 0 where the window fits.
+    fn border(&self, i: usize, len: usize) -> isize {
+        let start = self.start(i);
+        if start < 0 { -start } else { (len as isize - start - self.size as isize).min(0) }
+    }
     /// The positions that every window covers alike, which keep their keys: all of an empty window, or the only window when it needs no padding.
     fn shared(&self, len: usize) -> Option<std::ops::Range<usize>> {
         if self.size == 0 { return Some(0..0); }
@@ -415,20 +411,36 @@ impl Windows {
     pub fn frame(&self) -> &[usize] { &self.frame }
     /// The shape of one window: the windows' sizes, then the argument's remaining axes.
     pub fn cell(&self) -> &[usize] { &self.cell }
-    /// Where the window at `position` of the frame, counted in ravel order, starts along each windowed axis.
-    pub fn starts(&self, position: usize) -> Vec<isize> {
-        let mut starts = vec![0; self.axes.len()];
+    /// For the window at `position` of the frame, counted in ravel order, `f` of each windowed axis: the axis's number, its `WindowAxis` and the window's index along it. An empty frame has one position, 0.
+    fn along(&self, position: usize, f: impl Fn(usize, &WindowAxis, usize) -> isize) -> Vec<isize> {
+        let mut out = vec![0; self.axes.len()];
         let mut rest = position;
         for a in (0..self.axes.len()).rev() {
             let n = self.frame[a].max(1);
-            starts[a] = self.axes[a].start(rest % n);
+            out[a] = f(a, &self.axes[a], rest % n);
             rest /= n;
         }
-        starts
+        out
     }
-    /// The fill that the window at `starts` reads along each windowed axis: the count before the first item, positive, or past the last, negative, or 0 where the window fits.
-    pub fn border(&self, starts: &[isize]) -> Vec<isize> {
-        self.axes.iter().enumerate().map(|(a, w)| if starts[a] < 0 { -starts[a] } else { (self.shape[a] as isize - starts[a] - w.size as isize).min(0) }).collect()
+    /// Where the window at `position` of the frame, counted in ravel order, starts along each windowed axis.
+    pub fn starts(&self, position: usize) -> Vec<isize> { self.along(position, |_, w, i| w.start(i)) }
+    /// The fill that the window at `position` of the frame reads along each windowed axis, as `WindowAxis::border` gives it.
+    pub fn border(&self, position: usize) -> Vec<isize> { self.along(position, |a, w, i| w.border(i, self.shape[a])) }
+    /// `border` for every position of the frame, in ravel order: one row of `axes().len()` values for each window. An empty frame has one row, for the one position that `starts` gives it.
+    pub fn borders(&self) -> Vec<isize> {
+        if self.frame.contains(&0) { return self.border(0); }
+        let n = self.axes.len();
+        let count: usize = self.frame.iter().product();
+        let mut borders = vec![0; count * n];
+        for (a, w) in self.axes.iter().enumerate() {
+            let inner: usize = self.frame[a + 1..].iter().product();
+            let column: Vec<isize> = (0..self.frame[a]).map(|i| w.border(i, self.shape[a])).collect();
+            for (k, block) in borders.chunks_exact_mut(n * inner).enumerate() {
+                let b = column[k % self.frame[a]];
+                for x in block[a..].iter_mut().step_by(n) { *x = b; }
+            }
+        }
+        borders
     }
     /// The keys of the frame's axes. A padded axis keeps the key of the position each window centres on, and an unpadded axis has none.
     fn frame_keys(&self, layout: &Layout) -> Result<Vec<Option<Arc<Keys>>>, Error> {

@@ -1,8 +1,8 @@
-"""Numeric search, stable sorting and grouping. Sorts and insertion searches compare exactly: signed zeros compare equal, and every NaN comes after positive infinity. Classification matches floats within the tolerance `ct`, and Booleans, integers and characters exactly. With no `axis`, `argsort` and `lexsort` sort the flattened array."""
+"""Numeric and character search, stable sorting and grouping. Sorts and insertion searches compare exactly: signed zeros compare equal, and every NaN comes after positive infinity. Matching and classification compare floats within the tolerance `ct`, and Booleans, integers and characters exactly. Sorts use the last axis by default. Explicit `axis=None` flattens the input."""
 from typing import NamedTuple
 from . import _core
 from ._core import Array, index, isin, sort, argsort, partition, argpartition, argmin, argmax, median, quantile
-from ._core import lexsort, searchsorted, bincount, counts, group_indices
+from ._core import find, lexsort, searchsorted, bincount, counts, group_indices
 from ._naming import _named
 
 class Unique(NamedTuple):

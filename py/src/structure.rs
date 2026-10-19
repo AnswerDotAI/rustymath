@@ -269,6 +269,7 @@ fn nonzero_rows(x: &Arg<'_>) -> PyResult<(usize, Vec<i64>)> {
     Ok((positions.len(), rows))
 }
 
+/// Coordinates of non-fill items, as one index vector per axis. Fill is zero, false or a space for the item's dtype.
 #[pyfunction]
 pub fn nonzero<'py>(py: Python<'py>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyTuple>> {
     let x = convert::one(x)?;
@@ -278,6 +279,7 @@ pub fn nonzero<'py>(py: Python<'py>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'p
     PyTuple::new(py, axes)
 }
 
+/// Coordinates of non-fill items, with one row per item and one column per axis.
 #[pyfunction]
 pub fn argwhere(x: &Bound<'_, PyAny>) -> PyResult<Array> {
     let x = convert::one(x)?;
@@ -285,6 +287,7 @@ pub fn argwhere(x: &Bound<'_, PyAny>) -> PyResult<Array> {
     Ok(Array::new(core(rows, &[n, x.layout().shape().len()])?))
 }
 
+/// Choose between x and y with a Boolean condition, broadcasting all three by leading axes.
 #[pyfunction(name = "where")]
 pub fn where_<'py>(py: Python<'py>, condition: &Bound<'py, PyAny>, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let condition = convert::one(condition)?;

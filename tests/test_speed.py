@@ -14,7 +14,7 @@ def arrays():
     return dict(np=np, rm=rm, xn=x, x=rm.array(x), y=rm.array(y), xf=rm.array(x.astype(np.float32)), yf=rm.array(y.astype(np.float32)),
         m=rm.array(u(256, 256)), a=rm.array(u(256, 256)), b=rm.array(u(256, 256)), row=rm.array(u(256)), idx=rm.array(rng.permutation(N)),
         img=rm.array(u(256, 256)), k=rm.array(u(3, 3)), kern=rm.array(u(16)), frames=rm.array(u(1024, 64)),
-        r=rm.array(rng.integers(0, 256, N)), c=rm.array(rng.integers(0, 256, N)))
+        r=rm.array(rng.integers(0, 256, N)), c=rm.array(rng.integers(0, 256, N)), mask=rm.array(u(N) > 0))
 
 def budgets():
     "Each case in `speed_python.txt` as `(section, code, budget)`, with the native budget that `rm.timing().column` picks for this machine, as written."

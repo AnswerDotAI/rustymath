@@ -82,6 +82,8 @@ complex linalg::qr	180	510
 complex linalg::svd	1100	1600
 complex linalg::eigh	1100	880
 complex linalg::eig	4600	4800
+Clip	4.2	8.3
+Choose	4.1	8.2
 [f32]
 Exp	12	12
 Expm1	16	15
@@ -165,5 +167,7 @@ complex linalg::eig	5000	5300
 Array::differences short lanes	5.2	5.2
 Array::differences	2.7	2.6
 Array::broadcasted	2.2	2.2
+Clip	4.1	8.1
+Choose	4.1	8.1
 [i64]
 Buffer::cast i32	1.5	3

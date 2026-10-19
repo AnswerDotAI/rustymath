@@ -6,6 +6,7 @@ use pyo3::{IntoPyObjectExt, ffi, prelude::*};
 use pyo3::pyclass::CompareOp;
 use rustymath::array::{Array as Core, ArrayView};
 use rustymath::buffer::{Buffer, Element, FloatWidth, Items, View};
+use rustymath::layout::Keys;
 use rustymath_buffer::{export, item, strided_geometry, nested, py_err};
 use std::ffi::c_int;
 use std::sync::Arc;
@@ -123,12 +124,17 @@ array_methods! { folds [sum, prod, max, min, all, any, mean] scans [cumsum, cump
     fn ndim(&self) -> usize { self.core.layout().shape().len() }
     #[getter]
     fn size(&self) -> usize { self.core.len() }
-    /// For each axis, `None`, or the name of each position, which is `None` where a position has no name.
+    /// For each axis, `None`, or a tuple of position keys with `None` for unlabelled positions. Assign the same representation to replace keys without reordering values, or `None` to clear them.
     #[getter]
     fn keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
         let layout = self.core.layout();
         let axes = (0..self.ndim()).map(|a| layout.keys(a).map(|k| PyTuple::new(py, k.names().iter().map(|n| n.as_deref()))).transpose()).collect::<PyResult<Vec<_>>>()?;
         PyTuple::new(py, axes)
+    }
+    #[setter]
+    fn set_keys(&mut self, keys: Option<Vec<Option<Vec<Option<String>>>>>) -> PyResult<()> {
+        let keys = keys.unwrap_or_default().into_iter().map(|axis| axis.map(|names| Keys::partial(names.into_iter().map(|n| n.map(Arc::from)).collect())).transpose()).collect::<Result<Vec<_>, _>>().map_err(py_err)?;
+        self.core.set_keys(keys).map_err(py_err)
     }
     /// For each axis, its name or `None`. Assign one name or `None` for each axis to rename the axes, or `()` to remove every name.
     #[getter]

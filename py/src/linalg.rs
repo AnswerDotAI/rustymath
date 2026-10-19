@@ -1,4 +1,4 @@
-//! rustymath's `linalg` module as Python functions, which `python/rustymath/linalg.py` wraps. Each takes stacks of matrices in its arguments' last two axes, or a right-hand side vector in its last axis. The axes before those form each argument's frame. Frames pair as rustymath broadcasts, through [`Frames`]: axes with the same name first, then the rest from the front. The cells of a stack split across rustymath's threads, and Ctrl-C stops a call between cells.
+//! rustymath's `linalg` module as Python functions, which `python/rustymath/linalg.py` wraps. Each takes stacks of matrices in its arguments' last two axes. Only a one-dimensional right-hand side is a vector. The axes before those form each argument's frame. Frames pair as rustymath broadcasts, through [`Frames`]: axes with the same name first, then the rest from the front. The cells of a stack split across rustymath's threads, and Ctrl-C stops a call between cells.
 //!
 //! float32, float64, complex64 and complex128 matrices compute at their own width. float16 matrices compute in float32, with results rounded to float16. Booleans and integers compute in the float that `DType::inexact` gives them, float32 for Booleans, `u8` and `i16` and float64 for `i32` and `i64`, except in the matrix products, where integers compute in int64 and raise `OverflowError` for a result that doesn't fit. Results that are always real, such as singular values, take the real dtype of the matrices' width, and a general matrix's eigenvalues the complex dtype. A matrix that `cholesky`, `eigh`, `eig` or their value-only forms can't factor gives NaN results.
 use rustymath::num_complex::Complex;
@@ -321,7 +321,7 @@ fn lu_lower<'py>(py: Python<'py>, factors: &Bound<'py, PyAny>) -> PyResult<Bound
 #[pyfunction]
 fn lu_upper<'py>(py: Python<'py>, factors: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { triangle(py, "lu_upper", factors, false) }
 
-/// The lower triangular `l` with `l @ l.conj().mT == a` for each Hermitian positive definite matrix `a`, reading only `a`'s lower triangle.
+/// The lower triangular factor L satisfying L L-adjoint = A for each Hermitian positive definite matrix A, reading only its lower triangle.
 #[pyfunction]
 fn cholesky<'py>(py: Python<'py>, a: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let s = Stack::new("cholesky", &[a])?;
@@ -336,7 +336,7 @@ fn cholesky<'py>(py: Python<'py>, a: &Bound<'py, PyAny>) -> PyResult<Bound<'py, 
     })
 }
 
-/// The QR factorization `(q, r)` of each matrix, with `r`'s diagonal real and never negative. With `complete`, `q` is square and `r` as tall as the matrix.
+/// The QR factorization `(q, r)` of each matrix, with `r`'s diagonal real. With `complete`, `q` is square and `r` as tall as the matrix.
 #[pyfunction]
 #[pyo3(signature = (a, complete=false))]
 fn qr<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, complete: bool) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
@@ -356,7 +356,7 @@ fn qr<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, complete: bool) -> PyResult<(
     })
 }
 
-/// The thin SVD of each matrix: `u`, the singular values `s` in descending order, and `v`, with `a == u @ (s[..., None] * v.conj().mT)`. With `rank`, only the `rank` largest singular values and their vectors, or fewer for a smaller matrix, from Halko, Martinsson and Tropp's randomized range finder.
+/// The thin SVD of each matrix: `u`, the singular values `s` in descending order, and `v`, with reconstruction U diag(s) V-adjoint. With `rank`, only the `rank` largest singular values and their vectors, or fewer for a smaller matrix, from Halko, Martinsson and Tropp's randomized range finder.
 #[pyfunction]
 #[pyo3(signature = (a, rank=None))]
 fn svd<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, rank: Option<usize>) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>, Bound<'py, PyAny>)> {

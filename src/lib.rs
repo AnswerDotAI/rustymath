@@ -1,4 +1,4 @@
-//! Maths in plain Rust. Its float functions take `f16`, `f32` and `f64`, each within 4 units in the last place (ulps) of the correctly rounded result. The crate also has APL's tolerant comparison, exact rationals, linear algebra, number theory and polynomials. Its Python package gives the float functions as NumPy ufuncs.
+//! Maths in plain Rust. Its float functions take `f16`, `f32` and `f64`, each within 4 units in the last place (ulps) of the correctly rounded result. The crate also has APL's tolerant comparison, exact rationals, linear algebra, number theory and polynomials. Its Python functions evaluate eagerly and return Rustymath arrays or Python scalars.
 #![doc = include_str!("lib.md")]
 #[macro_use]
 mod slice;
@@ -54,9 +54,9 @@ pub use {half, num_complex};
 pub use complex::{Cis, divide};
 pub use float::{FUSED, Float, Native};
 pub use ln::Logb;
-pub use parts::{Abs, Angle, Sign, Isnan, Isfinite, Isinf, Real, Imag, Conj, Trunc, Rint, Clip, Scale, Round};
+pub use parts::{Abs, Angle, Sign, Isnan, Isfinite, Isinf, Real, Imag, Conj, Trunc, Rint, Clip, Choose, Scale, Round};
 pub use pow::{Pow, Root};
-pub use slice::{Arg, Binary, CHUNK, Flipped, Results, Ternary, Unary, pairs};
+pub use slice::{Arg, Binary, CHUNK, Flipped, Results, Ternary, Unary, choose, pairs};
 pub use special::{Erfc, Erfcinv, Erfinv};
 pub use sqrts::Sqrt;
 pub use trig::{Cos, Sin, Tan};

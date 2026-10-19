@@ -3,7 +3,7 @@ use crate::buffer::{Buffer, DType, Element, Items, View};
 use crate::agreement::Mapping;
 use crate::error::{Error, Kind};
 use crate::gather::Steps;
-use crate::layout::{Lanes, Layout, element_count};
+use crate::layout::{Keys, Lanes, Layout, element_count};
 use std::sync::Arc;
 use std::borrow::Cow;
 
@@ -77,6 +77,8 @@ impl Array {
     pub fn layout(&self) -> &Layout { &self.layout }
     /// Names the axes through [`Layout::with_names`]: one name or `None` for each axis, or none at all to remove them.
     pub fn set_names(&mut self, names: Vec<Option<Arc<str>>>) -> Result<(), Error> { self.layout = self.layout.clone().with_names(names)?; Ok(()) }
+    /// Labels axis positions through [`Layout::with_keys`], without changing the values or their order.
+    pub fn set_keys(&mut self, keys: Vec<Option<Arc<Keys>>>) -> Result<(), Error> { self.layout = self.layout.clone().with_keys(keys)?; Ok(()) }
     #[inline]
     pub fn view(&self) -> ArrayView<'_> { ArrayView::new(&self.layout, self.storage.view(), &self.mapping) }
     #[inline]
@@ -132,37 +134,31 @@ impl Array {
             if view.dtype() != source.dtype() { return Err(Error::new(Kind::Domain, "concatenate items must have one dtype")); }
             layout = crate::structure::catenate(&layout, view.layout, axis)?;
         }
-        let mut buffer = Buffer::with_capacity(source.dtype(), crate::layout::generated_len(layout.shape())?);
-        let lanes = arrays.iter().map(|a| crate::layout::Lanes::new(a.layout.shape(), axis)).collect::<Result<Vec<_>, _>>()?;
-        let items = arrays.iter().map(|a| a.cast(source.dtype())).collect::<Result<Vec<_>, _>>()?;
-        for outer in 0..lanes[0].outer {
-            for (items, lane) in items.iter().zip(&lanes) {
-                let n = lane.len * lane.inner;
-                buffer.extend_from(items.view(), outer * n..(outer + 1) * n);
+        let lanes = arrays.iter().map(|a| Lanes::new(a.layout.shape(), axis)).collect::<Result<Vec<_>, _>>()?;
+        let lens: Vec<usize> = lanes.iter().map(|l| l.len * l.inner).collect();
+        let (outer, stride) = (lanes[0].outer, lens.iter().sum::<usize>());
+        let buffer = with_dtype!(source.dtype(), T => {
+            let parts = arrays.iter().map(|a| a.items::<T>()).collect::<Result<Vec<_>, _>>()?;
+            // The result starts as copies of one item. Each array's lanes then replace them, in one typed loop for each array.
+            let mut out = parts.iter().find_map(|p| p.first()).map_or_else(Vec::new, |&x| vec![x; outer * stride]);
+            let mut at = 0;
+            for (part, &n) in parts.iter().zip(&lens) {
+                crate::gather::scatter_walk(&mut out, part, at, &[Steps::along(outer, stride), Steps::along(n, 1)], |x| x);
+                at += n;
             }
-        }
-        Self::new(layout, buffer)
-    }
-    /// Chooses between two arrays by a Boolean mask, using ordinary named/keyed broadcasting for all three arguments.
-    pub fn choose(condition: ArrayView<'_>, x: ArrayView<'_>, y: ArrayView<'_>) -> Result<Self, Error> {
-        use crate::agreement::Agreement;
-        let mask = bool::of(condition.storage).ok_or_else(|| Error::new(Kind::Domain, "condition must be Boolean"))?;
-        if x.dtype() != y.dtype() { return Err(Error::new(Kind::Domain, "chosen items must have one dtype")); }
-        let pair = Agreement::new(x.layout, y.layout)?;
-        let whole = Agreement::new(condition.layout, &pair.layout)?;
-        let buffer = with_dtype!(x.dtype(), T => {
-            let (xs, ys) = (T::of(x.storage).expect("matching dtype"), T::of(y.storage).expect("matching dtype"));
-            let mut out = Vec::with_capacity(whole.len);
-            crate::parallel::extended(&mut out, whole.len, crate::CHUNK, &|range, slots| slots.fill(range.len(), |slots| {
-                for (i, slot) in range.zip(slots) {
-                    let take_x = whole.left.get(i).and_then(|j| condition.mapping.get(j)).is_some_and(|j| mask[j]);
-                    slot.write(whole.right.get(i).and_then(|j| if take_x { pair.left.get(j).and_then(|j| x.mapping.get(j)).map(|j| xs[j]) }
-                        else { pair.right.get(j).and_then(|j| y.mapping.get(j)).map(|j| ys[j]) }).unwrap_or(T::FILL));
-                }
-                true
-            }));
             T::buffer(out)
         });
+        Self::new(layout, buffer)
+    }
+    /// Chooses between two arrays by a Boolean mask, using ordinary named/keyed broadcasting for all three arguments, through [`Choose`](crate::Choose).
+    pub fn choose(condition: ArrayView<'_>, x: ArrayView<'_>, y: ArrayView<'_>) -> Result<Self, Error> {
+        use crate::agreement::Agreement;
+        if condition.dtype() != DType::Boolean { return Err(Error::new(Kind::Domain, "condition must be Boolean")); }
+        if x.dtype() != y.dtype() { return Err(Error::new(Kind::Domain, "chosen items must have one dtype")); }
+        let pair = Agreement::new(x.layout, y.layout)?;
+        let whole = Agreement::new(&pair.layout, condition.layout)?;
+        let k = crate::Choose;
+        let (buffer, _) = crate::kernels!(Ternary of k).ternary(&k, [x, y, condition], &pair, &whole).expect("`Choose` has a kernel at every dtype");
         Self::new(whole.layout, buffer)
     }
     /// Broadcasts borrowed items into a compact array of `shape`, pairing axes from the front and retaining matching metadata.

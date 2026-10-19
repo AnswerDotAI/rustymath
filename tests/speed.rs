@@ -240,6 +240,18 @@ fn special(units: &Units<f64, f32>) -> [Costed; 11] {
     ]
 }
 
+/// `Clip` and `Choose`, which run once for each item, with their costs in copies of floats against `units`. `Choose`'s mask holds lanes of 0 and 1, as a comparison writes them in basedpl's fused graphs.
+fn selections(units: &Units<f64, f32>) -> [Costed; 2] {
+    let ((x64, x32), (y64, y32)) = (widths(-1.0, 1.0, GOLDEN, N), widths(-1.0, 1.0, SILVER, N));
+    let ((lo64, lo32), (hi64, hi32)) = (widths(-0.6, -0.4, BRONZE, N), widths(0.4, 0.6, BRONZE, N));
+    let (m64, m32) = widths(0.0, 1.0, BRONZE, N);
+    let (m64, m32): (Vec<f64>, Vec<f32>) = (m64.iter().map(|m| m.round()).collect(), m32.iter().map(|m| m.round()).collect());
+    [
+        ("Clip", units.costs(|| time_ternary(&x64, &lo64, &hi64, &Clip), || time_ternary(&x32, &lo32, &hi32, &Clip))),
+        ("Choose", units.costs(|| time_ternary(&x64, &y64, &m64, &Choose), || time_ternary(&x32, &y32, &m32, &Choose))),
+    ]
+}
+
 /// Complex function objects, with their costs in copies of the same number of complex items.
 fn complex(units: &Units<num_complex::Complex<f64>, num_complex::Complex<f32>>) -> [Costed; 12] {
     use num_complex::Complex;
@@ -453,7 +465,7 @@ fn measured(units: &Units<f64, f32>, complex_units: &Units<num_complex::Complex<
     }, || time(&x64, |x| horner(c64, x)), || {
         time_slice(N, |k, out| { negate(black_box(set(&x32, k)), out); polynomial::evaluate(c32, out) })
     }, || time(&x32, |x| horner(c32, x))));
-    let costed = compared.iter().map(|&(name, _, costs)| (name, costs)).chain(special(units)).chain(complex(complex_units))
+    let costed = compared.iter().map(|&(name, _, costs)| (name, costs)).chain(special(units)).chain(selections(units)).chain(complex(complex_units))
         .chain(inner_products(units)).chain(orderings(units)).chain(decompositions(units, complex_units))
         .flat_map(|(name, costs)| ["f64", "f32"].into_iter().zip(costs).map(move |(width, cost)| (width, name, cost)))
         .chain(arrays(&units.1)).collect();
