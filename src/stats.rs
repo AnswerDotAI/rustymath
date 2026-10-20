@@ -36,7 +36,7 @@ impl Axes {
     pub fn read<'a, T: Element>(&self, data: &'a [T]) -> Cow<'a, [T]> {
         let Some(steps) = &self.steps else { return Cow::Borrowed(data) };
         let mut out = Vec::with_capacity(data.len());
-        gather::walk(&mut out, data, 0, steps, T::FILL, |x| x);
+        gather::walk(&mut out, data, 0, steps, T::FILL, gather::Same);
         Cow::Owned(out)
     }
 

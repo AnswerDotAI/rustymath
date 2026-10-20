@@ -10,7 +10,7 @@ use rustymath::buffer::{Buffer, ComplexWidth, DType, Element, FloatWidth, Items,
 use rustymath::error::{Error, Kind};
 use rustymath::layout::{Keys, Layout, element_count, generated_len};
 use rustymath::with_dtype;
-use rustymath_buffer::{Read, py_err, read};
+use rustymath_buffer::{Read, py_err, read, read_array};
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -298,13 +298,14 @@ fn classify<'py>(obj: &Bound<'py, PyAny>, strong: &mut Option<DType>) -> PyResul
     if scalar(obj) { return Ok(Pending::Values(Layout::EMPTY, vec![Piece::Leaf(leaf(obj)?.expect("a Python scalar is a leaf"))], true)); }
     let source = if let Ok(a) = obj.cast::<Array>() {
         Some(Source::Array(a.try_borrow()?))
-    } else if let Some(r) = read(obj)? {
-        Some(Arg::from(r).source)
-    } else if obj.hasattr("__array__")? {
-        let a = obj.call_method0("__array__")?;
-        Some(Arg::from(read(&a)?.ok_or_else(|| PyTypeError::new_err("__array__ gave an object without a buffer"))?).source)
     } else {
-        None
+        let read = match read_array(obj)? {
+            None if obj.hasattr("__array__")? => Some(read_array(&obj.call_method0("__array__")?)?.ok_or_else(|| PyTypeError::new_err("__array__ gave an object without a buffer"))?),
+            read => read,
+        };
+        read.map(|(read, layout)| -> PyResult<_> {
+            Ok(if read.is_owned() { Source::Owned(Core::new(layout, read.into_buffer()).map_err(py_err)?) } else { Source::Read { read, layout } })
+        }).transpose()?
     };
     if let Some(source) = source {
         let a = Arg { source, scalar: false };

@@ -1,7 +1,7 @@
 //! Search and sort over slices of keys. A key is an item read as a whole number (`Key`), or an unsigned word whose order is the order you want (`RadixKey`). `Float::order_key` gives each float such a word, as wide as the float. Positions take 32 bits inside these functions, so a slice holds at most `u32::MAX` items. `tolerant` builds its searches over floats on these functions.
 //!
 //! `index_of`, `classes` and `firsts` index the first position of each key. `index_of` passes over `x` once for each item of `y` when `y` has at most `SCANNED` items. The index is a table when the keys span at most twice the slice's length, or 1024, and a hash map otherwise. `numbered` numbers the classes in order of first position, with each one's size. `grouped_keys` numbers them the same way from a table of keys, with each one's positions, and `class_counts` gives only their sizes. `counts` counts the items with each key in such a table. `sort_rows` sorts keys that span such a table by counting them. It sorts other keys with an LSD radix sort that skips any byte that is the same in every key. With several threads, the sort splits each pass of more than `RADIX_PIECE` keys across them, and `index_of` splits its lookups.
-use crate::{Float, buffer::{Buffer, DType, Element, Floats, View}, error::{Error, Kind}, tolerant::{self, Tolerance}};
+use crate::{Float, agreement::Mapping, array::ArrayView, layout::Layout, buffer::{Buffer, DType, Element, Floats, View}, error::{Error, Kind}, tolerant::{self, Tolerance}};
 use hashbrown::{HashMap, hash_map::Entry};
 use std::{convert::Infallible, hash::Hash, mem::MaybeUninit, ops::Not};
 use std::cmp::Ordering;
@@ -814,6 +814,54 @@ pub fn view_index_of<E>(x: View<'_>, y: View<'_>, t: Tolerance, check: impl FnMu
         return with_ints!(x, |x| whole_needles(x, y, t).map(Ok));
     }
     key_pairs!(x, y, |x, y| Ok(index_of(x, y)))
+}
+
+/// Whether equal-length compact cells match. `None` when their kinds need the caller's numeric conversion.
+pub fn view_matches(x: View<'_>, y: View<'_>, t: Tolerance) -> Option<bool> {
+    use tolerant::{Tolerant, TolerantComplex};
+    if x.len() != y.len() { return Some(false); }
+    Some(match (x, y) {
+        (View::Booleans(x), View::Booleans(y)) => x == y,
+        (View::Integers(x), View::Integers(y)) => x == y,
+        (View::Booleans(x), View::Integers(y)) => x.iter().enumerate().all(|(i, &x)| i64::from(x) == y.get(i)),
+        (View::Integers(x), View::Booleans(y)) => y.iter().enumerate().all(|(i, &y)| x.get(i) == i64::from(y)),
+        (View::Floats(x), View::Floats(y)) => crate::with_tolerance!(t, |t| with_floats!(x, |x| with_floats!(y, |y|
+            x.iter().zip(y).all(|(&x, &y)| t.matches::<f64>(x.into(), y.into()))))),
+        (View::Complexes(x), View::Complexes(y)) => (0..x.len()).all(|i| t.complex_equal(x.get(i), y.get(i))),
+        (View::Characters(x), View::Characters(y)) => x == y,
+        _ => return None,
+    })
+}
+
+/// Whether one of `cells` consecutive cells of `x` matches `y`. The caller checks cell shapes and aligns keys before searching, as [`view_member`] does.
+pub fn view_contains<E>(x: View<'_>, y: View<'_>, cells: usize, t: Tolerance, mut check: impl FnMut() -> Result<(), E>) -> Option<Result<bool, E>> {
+    if y.len() == 1 {
+        if let Some(found) = view_index_of(x, y, t, &mut check) { return Some(found.map(|found| (found[0] as usize) < cells)); }
+    }
+    for i in 0..cells {
+        if i.is_multiple_of(crate::BETWEEN_CHECKS) { if let Err(e) = check() { return Some(Err(e)); } }
+        if view_matches(x.slice(i * y.len()..(i + 1) * y.len()), y, t)? { return Some(Ok(true)); }
+    }
+    Some(Ok(false))
+}
+
+/// The layout of the major cells of an array laid out by `layout`, when a query laid out by `query` can match one of them: its shape equals theirs, and its axis names and keys agree with theirs ([`Layout::matches`]). `None` when it can't. A Rank error for a rank-0 array, which isn't a container.
+pub fn member_layout(layout: &Layout, query: &Layout) -> Result<Option<Layout>, Error> {
+    let rank = layout.shape().len();
+    if rank == 0 { return Err(Error::new(Kind::Rank, "a rank-0 array is not a container")); }
+    let cell = layout.axes(1..rank);
+    Ok(cell.matches(query).then_some(cell))
+}
+
+/// Whether `query` matches one major cell of `x`, as `≡` matches arrays, for compact items in row-major order. The query's layout must match a cell's ([`member_layout`]). Its items line up with the cell's by key. Items compare at the two views' common dtype, as [`view_matches`] compares them, and characters never match numbers. `check` runs as the search goes. A Rank error for a rank-0 `x`.
+pub fn view_member<E>(x: &Layout, xs: View<'_>, query: &Layout, ys: View<'_>, t: Tolerance, check: impl FnMut() -> Result<(), E>) -> Result<Result<bool, E>, Error> {
+    let Some(cell) = member_layout(x, query)? else { return Ok(Ok(false)) };
+    let Some(dtype) = xs.dtype().common(ys.dtype()) else { return Ok(Ok(false)) };
+    let haystack = ArrayView::compact(x, xs).cast(dtype)?;
+    let axes: Vec<usize> = (0..cell.shape().len()).collect();
+    let mapping = Mapping::new(query, &axes, &cell, ys.len());
+    let needle = ArrayView::new(&cell, ys, &mapping).cast(dtype)?;
+    view_contains(haystack.view(), needle.view(), x.shape()[0], t, check).ok_or_else(|| Error::new(Kind::Domain, "membership can't compare these kinds"))
 }
 
 /// Exact whole float needles small enough that tolerance cannot equate them with another integer. Other needles decline this integer fast path.

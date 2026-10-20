@@ -293,6 +293,13 @@ impl Layout {
     pub fn keys(&self, axis: usize) -> Option<&Arc<Keys>> { self.key_list().get(axis).and_then(Option::as_ref) }
     /// The keys of every axis, with `None` for an axis without them.
     pub fn all_keys(&self) -> Vec<Option<Arc<Keys>>> { (0..self.shape.len()).map(|a| self.keys(a).cloned()).collect() }
+    /// Whether shapes, assigned axis names and assigned keys match. An unlabelled axis matches either label set.
+    pub fn matches(&self, other: &Self) -> bool {
+        self.shape == other.shape && (0..self.shape.len()).all(|a| {
+            !names_conflict(self.name(a).map(AsRef::as_ref), other.name(a).map(AsRef::as_ref)) &&
+                match (self.keys(a), other.keys(a)) { (Some(x), Some(y)) => !y.align(x).contains(&None), _ => true }
+        })
+    }
     /// The layout without keys on `axis`.
     pub fn without_keys(self, axis: usize) -> Self {
         if self.keys(axis).is_none() { return self; }

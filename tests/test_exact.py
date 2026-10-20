@@ -91,6 +91,5 @@ def test_mixed_radix():
         for bases, digits in [([], []), ([[1, 2]], [1, 2]), ([1, 2], [1]), ([1, 2], 1)]:
             with pytest.raises(ValueError): decode(bases, digits)
     with pytest.raises(OverflowError): rm.integer.decode([0, 2], [2**62, 0])
-    # uint64 isn't a rustymath dtype.
-    with pytest.raises(ValueError): rm.integer.encode([0], np.array([2**63], dtype=np.uint64))
+    with pytest.raises(OverflowError): rm.integer.encode([0], np.array([2**63], dtype=np.uint64))
     with pytest.raises(TypeError): rm.integer.encode([10], [1.5])

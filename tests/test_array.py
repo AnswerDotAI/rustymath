@@ -36,16 +36,19 @@ def test_array_copies_and_reads_any_layout():
     x[0, 0] = 99
     assert a.tolist()[0][0] == 0.0
     unaligned = np.frombuffer(bytearray(1) + np.array([1.5, 2.5]).tobytes(), dtype=np.float64, offset=1)
-    for y in (x[:, ::2], x[::-1], x.T, unaligned, np.array(7, np.int16), np.float32(2.5)):
+    for y in (x[:, ::2], x[::-1], x.T, unaligned, np.array(7, np.int16), np.float32(2.5), np.arange(3, dtype=np.int8),
+              np.arange(3, dtype=np.uint16), np.arange(3, dtype=np.uint32), np.arange(3, dtype=np.uint64),
+              np.array([1, -2], '>i4'), np.array([1.5, 2.5], '>f8'), np.array([1+2j, 3-4j], '>c8')):
         b = rm.array(y)
-        assert b.dtype == {np.float64: 'float64', np.int16: 'int16', np.float32: 'float32'}[y.dtype.type] and b.shape == np.shape(y)
+        assert b.dtype == {np.float64: 'float64', np.float32: 'float32', np.int8: 'int16', np.int16: 'int16', np.int32: 'int32',
+                           np.uint16: 'int64', np.uint32: 'int64', np.uint64: 'int64', np.complex64: 'complex64'}[y.dtype.type] and b.shape == np.shape(y)
         assert np.array_equal(np.asarray(b), y)
     assert rm.array(np.array([0, 2, 1], np.uint8).view(np.bool_)).tolist() == [False, True, True]
 
 def test_unsupported_buffers_raise():
-    for x in (np.zeros(2, np.uint16), np.zeros(2, np.uint32), np.zeros(2, np.uint64), np.zeros(2, np.int8), np.zeros(2, np.longdouble),
-              np.array(['ab']), np.array([b'ab']), np.zeros(2, '>f8')):
+    for x in (np.zeros(2, np.longdouble), np.array(['ab']), np.array([b'ab'])):
         with pytest.raises(ValueError): rm.array(x)
+    with pytest.raises(OverflowError): rm.array(np.array([2**63], np.uint64))
     with pytest.raises(ValueError, match='Unicode'): rm.array(np.array([0xD800], np.uint32).view('<U1'))
 
 def test_python_values():
@@ -57,7 +60,7 @@ def test_python_values():
     assert rm.array([np.float32(1), np.float64(2)]).dtype == 'float64' and rm.array([np.uint8(1), np.float16(2)]).dtype == 'float16'
     with pytest.raises(OverflowError): rm.array(range(2**63, 2**63 + 2))
     t = rm.array({'a': [1, 2], 'b': [3, 4]})
-    assert t.keys == (('a', 'b'), None) and t['b'].tolist() == [3, 4] and t.names == (None, None)
+    assert t.keys == (('a', 'b'), None) and t[rm.array('b')].tolist() == [3, 4] and t.names == (None, None)
     assert repr(rm.array([1.5])) == 'Array([1.5], dtype=float64)'
     with pytest.raises(ValueError, match='ragged'): rm.array([[1], [2, 3]])
     with pytest.raises(ValueError): rm.array([1, 'a'])
@@ -81,6 +84,9 @@ def test_repr_precision():
 def test_methods():
     m = rm.array([[1, 2], [3, 4]])
     t = rm.array({'a': [1, 2], 'b': [3, 4]})
+    assert not bool(rm.array(0)) and bool(rm.array([1])) and not bool(rm.array([[0]]))
+    for value in ([], [0, 1]):
+        with pytest.raises(ValueError): bool(rm.array(value))
     assert m[1, 0] == 3 and isinstance(m[1, 0], int) and t['b', -1] == 4 and m[()].tolist() == m.tolist()
     with pytest.raises(IndexError): m[0, 0, 0]
     assert t.astype('float32').dtype == 'float32' and t.astype('float32').keys == t.keys and rm.array([True]).astype('uint8').tolist() == [1]

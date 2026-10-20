@@ -72,7 +72,7 @@ def test_integers():
     for t, u, want in [(np.int16, np.int32, np.int32), (np.bool_, np.uint8, np.uint8), (np.uint8, np.float16, np.float16), (np.int16, np.float16, np.float16), (np.int32, np.float32, np.float32), (np.float64, np.complex64, np.complex128)]:
         x, y = np.arange(3).astype(t), np.arange(3).astype(u)
         assert A(rm.add(x, y)).dtype == want, (t, u)
-    with pytest.raises(ValueError): rm.add(np.arange(3, dtype=np.uint64), 1)
+    assert rm.add(np.arange(3, dtype=np.uint64), 1).tolist() == [1, 2, 3]
     # A signed type's least value has no magnitude of its type, and wraps to itself.
     assert rm.absolute(np.array([-32768], np.int16)).tolist() == [-32768]
     p, q = np.array([True, True, False, False]), np.array([True, False, True, False])

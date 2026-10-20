@@ -10,6 +10,63 @@ use std::sync::Arc;
 #[derive(Clone, Debug)]
 pub struct Plan { pub layout: Layout, pub steps: Vec<Steps> }
 
+/// Written index parts, before the selected axes and their lengths are known.
+#[derive(Clone, Debug)]
+pub enum IndexPart<T> { Axis(T), All, NewAxis, Rest }
+impl<T> IndexPart<T> {
+    /// The part with its axis payload borrowed.
+    pub fn as_ref(&self) -> IndexPart<&T> {
+        match self { IndexPart::Axis(t) => IndexPart::Axis(t), IndexPart::All => IndexPart::All, IndexPart::NewAxis => IndexPart::NewAxis, IndexPart::Rest => IndexPart::Rest }
+    }
+    /// The part with `f` applied to its axis payload. The structural markers stay as they are.
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> IndexPart<U> {
+        match self { IndexPart::Axis(t) => IndexPart::Axis(f(t)), IndexPart::All => IndexPart::All, IndexPart::NewAxis => IndexPart::NewAxis, IndexPart::Rest => IndexPart::Rest }
+    }
+    /// The part with fallible `f` applied to its axis payload, or `f`'s error.
+    pub fn try_map<U, E>(self, f: impl FnOnce(T) -> Result<U, E>) -> Result<IndexPart<U>, E> {
+        Ok(match self { IndexPart::Axis(t) => IndexPart::Axis(f(t)?), IndexPart::All => IndexPart::All, IndexPart::NewAxis => IndexPart::NewAxis, IndexPart::Rest => IndexPart::Rest })
+    }
+    /// The axis payload, or `None` for a structural marker.
+    pub fn axis(&self) -> Option<&T> { match self { IndexPart::Axis(t) => Some(t), _ => None } }
+}
+
+/// Expands Rest once geometry is known, with one source claim per consuming part. Axis payloads identify the original written part.
+pub fn index_claims<'a>(rank: usize, parts: &[IndexPart<(Option<&'a str>, usize)>]) -> Result<(Vec<IndexPart<usize>>, Vec<(Option<&'a str>, usize)>), Error> {
+    let used: usize = parts.iter().map(|p| match p { IndexPart::Axis((_, n)) => *n, IndexPart::All => 1, _ => 0 }).sum();
+    if used > rank { return Err(Error::new(Kind::Index, "too many axis selectors")); }
+    if parts.iter().filter(|p| matches!(p, IndexPart::Rest)).count() > 1 { return Err(Error::new(Kind::Index, "only one rest selector is allowed")); }
+    let mut written = Vec::new();
+    let mut claims = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        match part {
+            IndexPart::Axis(claim) => { written.push(IndexPart::Axis(i)); claims.push(*claim); }
+            IndexPart::All => { written.push(IndexPart::All); claims.push((None, 1)); }
+            IndexPart::NewAxis => written.push(IndexPart::NewAxis),
+            IndexPart::Rest => for _ in used..rank { written.push(IndexPart::All); claims.push((None, 1)); },
+        }
+    }
+    Ok((written, claims))
+}
+
+/// Routes written parts to source axes without padding them with implicit selectors. Axis payloads give their name and consumed width; returned payloads identify the original part.
+pub fn addressed_parts(layout: &Layout, parts: &[IndexPart<(Option<&str>, usize)>], explicit: Option<&[usize]>) -> Result<Vec<(usize, IndexPart<usize>)>, Error> {
+    let rank = layout.shape().len();
+    let (written, claims) = index_claims(rank, parts)?;
+    let axes = match explicit { Some(axes) if axes.len() == claims.len() => axes.to_vec(), Some(_) => return Err(Error::new(Kind::Length, "one axis is needed for each consuming selector")), None => addressed(layout, &claims)? };
+    if axes.iter().zip(&claims).any(|(&axis, &(_, width))| axis.checked_add(width).is_none_or(|end| end > rank)) {
+        return Err(Error::new(Kind::Index, "a selector spans beyond the array's axes"));
+    }
+    let last = axes.iter().zip(&claims).map(|(&a, &(_, n))| a + n).max().unwrap_or(0);
+    let mut next = 0;
+    let mut routed = written.into_iter().map(|part| {
+        let axis = axes.get(next).copied().unwrap_or(last);
+        if !matches!(part, IndexPart::NewAxis) { next += 1; }
+        (axis, part)
+    }).collect::<Vec<_>>();
+    routed.sort_by_key(|(axis, _)| *axis);
+    Ok(routed)
+}
+
 /// One independent axis selector. Positions are zero-based and already normalized; a range can walk backwards. An index array replaces its axis by the axes of its layout. Its positions lie within the axis or are `Steps::FILL`, which reads the caller's fill. The code that builds an index array checks its positions, as `index_positions` does. `NewAxis` inserts a length-one axis without consuming an input axis.
 #[derive(Clone, Debug)]
 pub enum Selector { At(usize), Range { start: usize, len: usize, step: isize }, Indices { layout: Layout, positions: Vec<usize> }, NewAxis }

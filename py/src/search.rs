@@ -68,6 +68,14 @@ pub fn isin<'py>(py: Python<'py>, element: &Bound<'py, PyAny>, test_elements: &B
     give(py, Core::new(ys.layout(), bool::buffer(found.into_iter().map(|p| (p as usize) < n).collect())).map_err(py_err)?, ys.scalar)
 }
 
+pub fn contains(py: Python<'_>, a: &Bound<'_, PyAny>, query: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let (x, y) = (one(a)?, one(query)?);
+    let wanted = if query.is_instance_of::<pyo3::types::PyString>() && query.len()? == 1 { Layout::EMPTY } else { y.layout() };
+    let (xs, ys) = (x.at(x.view().dtype())?, y.at(y.view().dtype())?);
+    search::view_member(&x.layout(), xs.view(), &wanted, ys.view(), tolerance(None)?, || py.check_signals())
+        .map_err(|e| if e.kind == Kind::Rank { pyo3::exceptions::PyTypeError::new_err(e.message.to_string()) } else { py_err(e) })?
+}
+
 /// A Boolean mask shaped like `target`, marking starts where `pattern` fits and matches. A lower-rank pattern has leading singleton axes; a higher-rank pattern never matches. Floats use `ct`.
 #[pyfunction]
 #[pyo3(signature = (pattern, target, *, ct=None))]

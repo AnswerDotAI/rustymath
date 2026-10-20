@@ -480,7 +480,7 @@ impl PartialEq for View<'_> {
 }
 
 /// An element type of compact buffers: `bool`, the integer widths `u8`, `i16`, `i32` and `i64`, the float widths `half::f16`, `f32` and `f64`, `Complex32` and `Complex64`, and `char`.
-pub trait Element: Copy + Send + Sync {
+pub trait Element: Copy + Send + Sync + crate::gather::Item {
     /// The item that a missing keyed entry reads as: zero, false or a space.
     const FILL: Self;
     /// The dtype of buffers of this type.

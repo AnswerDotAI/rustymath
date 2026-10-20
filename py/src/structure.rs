@@ -1,76 +1,28 @@
 //! Python syntax for the shared structural plans and independent-value views.
 use crate::{array::{Array, core, give}, convert::{self, Arg}, functions::{Axis, Axes}};
-use pyo3::{exceptions::{PyIndexError, PyKeyError, PyTypeError, PyValueError}, prelude::*, types::{PyBool, PySlice, PyString, PyTuple}};
-use rustymath::{array::{Array as Core, ArrayView}, buffer::{Buffer, DType, View}, error::Error, layout::{Layout, element_count, generated_len, position}, structure::{self, Plan, Selector}};
+use pyo3::{exceptions::{PyIndexError, PyTypeError, PyValueError}, prelude::*, types::PyTuple};
+use rustymath::{array::{Array as Core, ArrayView}, buffer::{Buffer, DType}, error::Error, layout::{Layout, element_count, generated_len, position}, structure::{self, Plan, Selector}};
 use rustymath_buffer::py_err;
 
 fn at(n: i64, size: usize) -> PyResult<usize> {
     position(n, size).ok_or_else(|| PyIndexError::new_err(format!("position {n} is outside an axis of length {size}")))
 }
-fn key(layout: &Layout, axis: usize, name: &str) -> PyResult<usize> {
-    layout.keys(axis).and_then(|k| k.position(name)).ok_or_else(|| PyKeyError::new_err(name.to_owned()))
-}
-
-/// One Python selector, independent of the selectors on the other axes.
-fn selector(layout: &Layout, axis: usize, obj: &Bound<'_, PyAny>) -> PyResult<Selector> {
-    let size = *layout.shape().get(axis).ok_or_else(|| PyIndexError::new_err("too many axis selectors"))?;
-    if let Ok(slice) = obj.cast::<PySlice>() {
-        let s = slice.indices(size as isize)?;
-        return Ok(Selector::Range { start: s.start.max(0) as usize, len: s.slicelength, step: s.step });
-    }
-    if let Ok(s) = obj.cast::<PyString>() { return Ok(Selector::At(key(layout, axis, s.to_str()?)?)); }
-    if !obj.is_instance_of::<PyBool>() {
-        if let Ok(i) = obj.extract::<i64>() { return Ok(Selector::At(at(i, size)?)); }
-    }
-    if let Ok(names) = obj.extract::<Vec<String>>() {
-        let positions = names.iter().map(|n| key(layout, axis, n)).collect::<PyResult<Vec<_>>>()?;
-        return Ok(Selector::Indices { layout: Layout::from([positions.len()]), positions });
-    }
+fn array_selector(layout: &Layout, axis: usize, obj: &Bound<'_, PyAny>) -> PyResult<(Selector, bool)> {
     let indices = convert::one(obj)?;
     let items = indices.at(indices.view().dtype())?;
-    let (within, positions) = match items.view() {
-        View::Booleans(mask) => {
-            if indices.layout().shape() != [size] { return Err(PyIndexError::new_err("a Boolean selector must be a vector matching its axis")); }
-            let positions: Vec<_> = mask.iter().enumerate().filter_map(|(i, &b)| b.then_some(i)).collect();
-            (Layout::from([positions.len()]), positions)
-        }
-        View::Integers(_) | View::Floats(_) => {
-            (indices.layout().clone(), structure::positions(items.view(), size).map_err(py_err)?)
-        }
-        _ if indices.view().is_empty() => (indices.layout().clone(), vec![]),
-        _ => return Err(PyTypeError::new_err("an axis selector must be an integer, key, slice, Boolean mask or integer or float array")),
-    };
-    Ok(Selector::Indices { layout: within, positions })
+    rustymath_buffer::selection::array_selector(layout, axis, indices.layout(), items.view(), false)
 }
-
-/// Decodes brackets once; the same plan serves reads and assignment. A selector with one axis name addresses the axis with that name, and the others take the remaining axes in order, as `structure::addressed` gives them.
+fn selector(layout: &Layout, axis: usize, obj: &Bound<'_, PyAny>) -> PyResult<Selector> {
+    rustymath_buffer::selection::selector(layout, axis, obj, || array_selector(layout, axis, obj)).map(|(s, _)| s)
+}
 pub fn selection(layout: &Layout, index: &Bound<'_, PyAny>) -> PyResult<Plan> {
-    let parts: Vec<_> = match index.cast::<PyTuple>() { Ok(t) => t.iter().collect(), Err(_) => vec![index.clone()] };
-    let (ellipsis, rank) = (index.py().Ellipsis(), layout.shape().len());
-    let used = parts.iter().filter(|p| !p.is_none() && !p.is(&ellipsis)).count();
-    if used > rank { return Err(PyIndexError::new_err("too many axis selectors")); }
-    if parts.iter().filter(|p| p.is(&ellipsis)).count() > 1 { return Err(PyIndexError::new_err("only one ellipsis is allowed")); }
-    // Each written selector, or `None` for an axis that the ellipsis stands for, with the number of new axes before it.
-    let (mut written, mut new) = (Vec::new(), 0);
-    for p in parts {
-        if p.is_none() { new += 1; }
-        else if p.is(&ellipsis) { for _ in used..rank { written.push((None, std::mem::take(&mut new))); } }
-        else { written.push((Some(p), std::mem::take(&mut new))); }
-    }
-    let names: Vec<Option<String>> = written.iter().map(|(p, _)| p.as_ref().and_then(|p| p.cast::<Array>().ok()).and_then(|a| structure::sole_name(a.borrow().core().layout()).map(str::to_owned))).collect();
-    let claims: Vec<_> = names.iter().map(|n| (n.as_deref(), 1)).collect();
-    let axes = structure::addressed(layout, &claims).map_err(py_err)?;
-    let mut order: Vec<_> = (0..written.len()).collect();
-    order.sort_by_key(|&k| axes[k]);
-    let (mut selectors, mut next) = (Vec::with_capacity(rank), 0);
-    for k in order {
-        selectors.extend((next..axes[k]).map(|a| Selector::all(layout.shape()[a])));
-        selectors.extend(std::iter::repeat_n(Selector::NewAxis, written[k].1));
-        selectors.push(match &written[k].0 { Some(p) => selector(layout, axes[k], p)?, None => Selector::all(layout.shape()[axes[k]]) });
-        next = axes[k] + 1;
-    }
-    selectors.extend(std::iter::repeat_n(Selector::NewAxis, new));
-    structure::select(layout, selectors, true).map_err(py_err)
+    rustymath_buffer::selection::selection(layout, index,
+        |p| {
+            if let Ok(a) = p.cast::<Array>() { return Ok(structure::sole_name(a.borrow().core().layout()).map(str::to_owned)); }
+            Ok(if p.hasattr("__rustymath_array__")? { rustymath_buffer::read_array(p)?.and_then(|(_, layout)| structure::sole_name(&layout).map(str::to_owned)) } else { None })
+        },
+        array_selector,
+    ).map(|(plan, _)| plan)
 }
 
 fn planned(arg: Arg<'_>, build: impl FnOnce(&Layout) -> Result<Plan, Error>) -> PyResult<Array> {

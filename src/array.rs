@@ -143,7 +143,7 @@ impl Array {
             let mut out = parts.iter().find_map(|p| p.first()).map_or_else(Vec::new, |&x| vec![x; outer * stride]);
             let mut at = 0;
             for (part, &n) in parts.iter().zip(&lens) {
-                crate::gather::scatter_walk(&mut out, part, at, &[Steps::along(outer, stride), Steps::along(n, 1)], |x| x);
+                crate::gather::scatter_walk(&mut out, part, at, &[Steps::along(outer, stride), Steps::along(n, 1)], crate::gather::Same);
                 at += n;
             }
             T::buffer(out)

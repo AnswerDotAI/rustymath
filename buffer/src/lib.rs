@@ -1,11 +1,19 @@
-//! The Python buffer protocol for rustymath's compact buffers, shared by the Python extensions of rustymath and basedpl. [`read`] reads any object that exports a buffer. It borrows contiguous aligned items, and copies others into C order. [`export`] fills a `Py_buffer` for a class's `__getbuffer__`. [`py_err`] turns a rustymath error into a Python exception.
-use pyo3::exceptions::{PyBufferError, PyIndexError, PyOverflowError, PyValueError};
+//! Python array interchange and selectors, shared by rustymath and basedpl. [`read`] borrows native contiguous buffers and normalizes other supported buffers. [`read_array`] preserves sibling-array metadata. [`export`] fills a `Py_buffer`. [`selection`] decodes Python indexing, and [`py_err`] converts array errors to Python exceptions.
+use pyo3::exceptions::{PyBufferError, PyIndexError, PyOverflowError, PyTypeError, PyValueError};
 use pyo3::{IntoPyObjectExt, ffi, prelude::*, types::{PyComplex, PyList}};
 use rustymath::buffer::{Buffer, ComplexWidth, DType, Element, FloatWidth, View, Width};
 use rustymath::error::{Error, Kind};
 use rustymath::{layout::element_count, with_dtype};
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::{mem::size_of, ptr, slice};
+
+pub mod selection;
+
+/// Decodes the Python per-axis key representation; shared layout methods validate its shape.
+pub fn axis_keys(keys: Vec<Option<Vec<Option<String>>>>) -> PyResult<Vec<Option<std::sync::Arc<rustymath::layout::Keys>>>> {
+    use std::sync::Arc;
+    keys.into_iter().map(|k| k.map(|v| rustymath::layout::Keys::partial(v.into_iter().map(|s| s.map(Arc::from)).collect())).transpose()).collect::<Result<Vec<_>, _>>().map_err(py_err)
+}
 
 /// The Python exception for a rustymath error: `OverflowError` for Overflow, `IndexError` for Index, and `ValueError` for the other kinds.
 pub fn py_err(e: Error) -> PyErr {
@@ -43,8 +51,12 @@ const DTYPES: [(DType, &CStr); 11] = [
     (DType::Complex(ComplexWidth::F32), c"Zf"), (DType::Complex(ComplexWidth::F64), c"Zd"), (DType::Character, c"w"),
 ];
 
-/// Format codes that [`read`] also accepts. `l`, C's `long`, has a size that varies by platform, so [`dtype`] reads it by its item size.
+/// Format codes that [`read`] also accepts. `l`, C's `long`, has a size that varies by platform, so [`source`] reads it by its item size.
 const ALSO: [(&[u8], DType); 3] = [(b"c", DType::Integer(Width::U8)), (b"n", DType::Integer(Width::I64)), (b"1w", DType::Character)];
+
+/// Integer formats with no dtype of their own, each with its item size and the type that [`read`] widens from. Signed bytes widen to int16, and wider unsigned integers to int64.
+const WIDENED: [(&[u8], usize, Widen); 6] =
+    [(b"b", 1, Widen::I8), (b"H", 2, Widen::U16), (b"I", 4, Widen::U32), (b"L", 4, Widen::U32), (b"L", 8, Widen::U64), (b"Q", 8, Widen::U64)];
 
 /// The PEP 3118 format code that [`export`] writes for `dtype`.
 fn format(dtype: DType) -> &'static CStr { DTYPES.iter().find(|e| e.0 == dtype).expect("every dtype has a format code").1 }
@@ -52,20 +64,52 @@ fn format(dtype: DType) -> &'static CStr { DTYPES.iter().find(|e| e.0 == dtype).
 /// The size and alignment of an item of `dtype`.
 fn layout(dtype: DType) -> (usize, usize) { with_dtype!(dtype, T => (size_of::<T>(), align_of::<T>())) }
 
-/// The dtype of a buffer whose items have the PEP 3118 format `format` and `item_size` bytes each. A Domain error for a format that no dtype has, or for non-native byte order.
-pub fn dtype(format: &CStr, item_size: usize) -> Result<DType, Error> {
+/// An integer type that a buffer can hold and no dtype matches, which [`read`] widens as it copies.
+#[derive(Clone, Copy)]
+enum Widen { I8, U16, U32, U64 }
+
+impl Widen {
+    /// The dtype that holds this type's values: int16 for signed bytes, and int64 for the unsigned types.
+    fn dtype(self) -> DType { DType::Integer(if matches!(self, Widen::I8) { Width::I16 } else { Width::I64 }) }
+    /// The `n` items of `view`, held as this type, copied into a buffer of [`Self::dtype`]. A `u64` above `i64`'s range raises `OverflowError`.
+    unsafe fn copied(self, view: &ffi::Py_buffer, n: usize, swapped: Option<usize>, py: Python<'_>) -> PyResult<Buffer> {
+        unsafe {
+            Ok(match self {
+                Widen::I8 => i16::buffer(copied::<i8>(view, n, swapped, py)?.into_iter().map(i16::from).collect()),
+                Widen::U16 => i64::buffer(copied::<u16>(view, n, swapped, py)?.into_iter().map(i64::from).collect()),
+                Widen::U32 => i64::buffer(copied::<u32>(view, n, swapped, py)?.into_iter().map(i64::from).collect()),
+                Widen::U64 => i64::buffer(copied::<u64>(view, n, swapped, py)?.into_iter().map(i64::try_from).collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| PyOverflowError::new_err("an unsigned integer exceeds int64; convert explicitly"))?),
+            })
+        }
+    }
+}
+
+/// How a buffer stores its items, read once from its PEP 3118 format and item size.
+struct Source {
+    /// The dtype the items read as.
+    dtype: DType,
+    /// For items in the other byte order from this machine's, the length of each run of bytes to reverse: the item size, or half of it for a complex number's two parts.
+    swapped: Option<usize>,
+    /// The type of integer items that no dtype matches, which reading widens.
+    widen: Option<Widen>,
+}
+
+/// How a buffer with PEP 3118 format `format` and items of `item_size` bytes stores them. A format with no supported dtype, or whose dtype has another size, is DOMAIN.
+fn source(format: &CStr, item_size: usize) -> Result<Source, Error> {
     let unsupported = || Error::new(Kind::Domain, format!("unsupported buffer format `{}`", format.to_string_lossy()));
-    let code = match format.to_bytes() {
-        [b'>' | b'!', ..] => return Err(Error::new(Kind::Domain, "rustymath reads only native byte order")),
-        [b'@' | b'=' | b'<', code @ ..] => code,
-        code => code,
+    let (code, swap) = match format.to_bytes() {
+        [order @ (b'@' | b'=' | b'<' | b'>' | b'!'), code @ ..] => (code, match order { b'<' => cfg!(target_endian = "big"), b'>' | b'!' => cfg!(target_endian = "little"), _ => false }),
+        code => (code, false),
     };
+    let swapped = swap.then_some(if code.starts_with(b"Z") { item_size / 2 } else { item_size });
+    if let Some(&(_, _, widen)) = WIDENED.iter().find(|e| e.0 == code && e.1 == item_size) { return Ok(Source { dtype: widen.dtype(), swapped, widen: Some(widen) }); }
     let dtype = match code {
         b"l" => DType::Integer(if item_size == 4 { Width::I32 } else { Width::I64 }),
         code => DTYPES.iter().map(|e| (e.1.to_bytes(), e.0)).chain(ALSO).find(|e| e.0 == code).ok_or_else(unsupported)?.1,
     };
     if layout(dtype).0 != item_size { return Err(unsupported()); }
-    Ok(dtype)
+    Ok(Source { dtype, swapped, widen: None })
 }
 
 /// A buffer that an exporter lends, released when this drops.
@@ -102,13 +146,17 @@ impl Read {
 /// The `n` items of type `T` at `p`, borrowed.
 unsafe fn items<'a, T>(p: *const c_void, n: usize) -> &'a [T] { if n == 0 { &[] } else { unsafe { slice::from_raw_parts(p.cast(), n) } } }
 
-/// The `n` items of `view` in C order, copied by CPython into a new vector. Every bit pattern must be a valid `T`.
-unsafe fn copied<T>(view: &ffi::Py_buffer, n: usize, py: Python<'_>) -> PyResult<Vec<T>> {
+/// The `n` items of `view` in C order, copied by CPython into a new vector, with each run of `swapped` bytes reversed where it's given. Every bit pattern must be a valid `T`.
+unsafe fn copied<T>(view: &ffi::Py_buffer, n: usize, swapped: Option<usize>, py: Python<'_>) -> PyResult<Vec<T>> {
     let mut out = Vec::<T>::with_capacity(n);
     if n > 0 && unsafe { ffi::PyBuffer_ToContiguous(out.as_mut_ptr().cast(), view, (n * size_of::<T>()) as ffi::Py_ssize_t, b'C' as c_char) } < 0 {
         return Err(PyErr::fetch(py));
     }
     unsafe { out.set_len(n) };
+    if let Some(width) = swapped {
+        let bytes = unsafe { slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u8>(), n * size_of::<T>()) };
+        for item in bytes.chunks_exact_mut(width) { item.reverse(); }
+    }
     Ok(out)
 }
 
@@ -120,18 +168,20 @@ fn characters(codes: &[u32]) -> PyResult<()> {
     }
 }
 
-/// The `n` items of `view` as an owned buffer of `dtype`. A Boolean byte other than 0 or 1 reads as true.
-unsafe fn owned(dtype: DType, view: &ffi::Py_buffer, n: usize, py: Python<'_>) -> PyResult<Buffer> {
+/// The `n` items of `view`, stored as `src` describes, as an owned buffer. A Boolean byte other than 0 or 1 reads as true.
+unsafe fn owned(src: &Source, view: &ffi::Py_buffer, n: usize, py: Python<'_>) -> PyResult<Buffer> {
+    let swapped = src.swapped;
     unsafe {
-        Ok(match dtype {
-            DType::Boolean => bool::buffer(copied::<u8>(view, n, py)?.into_iter().map(|b| b != 0).collect()),
+        if let Some(widen) = src.widen { return widen.copied(view, n, swapped, py); }
+        Ok(match src.dtype {
+            DType::Boolean => bool::buffer(copied::<u8>(view, n, swapped, py)?.into_iter().map(|b| b != 0).collect()),
             DType::Character => {
-                let codes = copied::<u32>(view, n, py)?;
+                let codes = copied::<u32>(view, n, swapped, py)?;
                 characters(&codes)?;
                 char::buffer(codes.into_iter().filter_map(char::from_u32).collect())
             }
             // Every bit pattern is a valid number, which the arms above leave.
-            numbers => with_dtype!(numbers, T => T::buffer(copied::<T>(view, n, py)?)),
+            numbers => with_dtype!(numbers, T => T::buffer(copied::<T>(view, n, swapped, py)?)),
         })
     }
 }
@@ -145,20 +195,37 @@ pub fn read(obj: &Bound<'_, PyAny>) -> PyResult<Option<Read>> {
     let held = Held(buffer);
     let v = &*held.0;
     let format = if v.format.is_null() { c"B" } else { unsafe { CStr::from_ptr(v.format) } };
-    let dtype = dtype(format, v.itemsize as usize).map_err(py_err)?;
+    let src = source(format, v.itemsize as usize).map_err(py_err)?;
+    let dtype = src.dtype;
     let shape: Vec<usize> = match v.ndim {
         0 => vec![],
         _ if v.shape.is_null() => vec![v.len as usize / v.itemsize as usize],
         ndim => unsafe { items::<ffi::Py_ssize_t>(v.shape.cast(), ndim as usize) }.iter().map(|&n| n as usize).collect(),
     };
     let n = element_count(&shape).map_err(py_err)?;
-    let lend = unsafe { ffi::PyBuffer_IsContiguous(v, b'C' as c_char) } == 1 && v.buf as usize % layout(dtype).1 == 0 && match dtype {
+    let lend = src.swapped.is_none() && src.widen.is_none() && unsafe { ffi::PyBuffer_IsContiguous(v, b'C' as c_char) } == 1 && v.buf as usize % layout(dtype).1 == 0 && match dtype {
         DType::Boolean => unsafe { items::<u8>(v.buf, n) }.iter().all(|&b| b <= 1),
         DType::Character => characters(unsafe { items::<u32>(v.buf, n) }).map(|_| true)?,
         _ => true,
     };
-    let items = if lend { Items::Lent(held) } else { Items::Owned(unsafe { owned(dtype, &held.0, n, py) }?) };
+    let items = if lend { Items::Lent(held) } else { Items::Owned(unsafe { owned(&src, &held.0, n, py) }?) };
     Ok(Some(Read { shape, len: n, dtype, items }))
+}
+
+/// Reads an ordinary array, including its keys and names when its frontend supplies `__rustymath_array__`. No numerical conversion is implicit in that handoff.
+pub fn read_array(obj: &Bound<'_, PyAny>) -> PyResult<Option<(Read, rustymath::layout::Layout)>> {
+    use rustymath::layout::Layout;
+    use std::sync::Arc;
+    if obj.hasattr("__rustymath_array__")? {
+        let (source, keys, names): (Bound<'_, PyAny>, Vec<Option<Vec<Option<String>>>>, Vec<Option<String>>) = obj.call_method0("__rustymath_array__")?.extract()?;
+        let read = read(&source)?.ok_or_else(|| PyTypeError::new_err("array interchange requires compact items"))?;
+        let keys = axis_keys(keys)?;
+        let layout = Layout::from(read.shape()).with_keys(keys).map_err(py_err)?.with_names(names.into_iter().map(|n| n.map(Arc::from)).collect()).map_err(py_err)?;
+        return Ok(Some((read, layout)));
+    }
+    let Some(read) = read(obj)? else { return Ok(None) };
+    let layout = Layout::from(read.shape());
+    Ok(Some((read, layout)))
 }
 
 /// The `shape` and C-order byte strides that [`export`] takes, for items of `dtype` laid out in `shape`. Keep both alive for each export.
