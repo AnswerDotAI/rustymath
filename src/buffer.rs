@@ -495,7 +495,7 @@ pub trait Element: Copy + Send + Sync + crate::gather::Item {
     fn buffer(data: Vec<Self>) -> Buffer;
     /// The items of `buffer`, moved out, when they have this type.
     fn vec(buffer: Buffer) -> Option<Vec<Self>>;
-    /// `b` as an item of this type: 1 or 0 for a number, the Boolean itself, or the characters U+0001 and U+0000. A Boolean mask becomes lanes of the items that a kernel such as [`Choose`](crate::Choose) chooses between.
+    /// `b` as an item of this type: 1 or 0 for a number, the Boolean itself, or the characters U+0001 and U+0000. A Boolean mask becomes lanes of the items that a kernel such as [`Choose`](crate::Choose) chooses between. A number converts through an integer, which suits stored Booleans. A comparison's lane mask turns into 1 or 0 faster by a choice between the two, so `Indicator` writes its own (`tolerant::indicated`).
     fn truth(b: bool) -> Self;
 }
 

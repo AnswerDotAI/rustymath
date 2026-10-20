@@ -433,12 +433,6 @@ impl WindowAxis {
         let start = self.start(i);
         if start < 0 { -start } else { (len as isize - start - self.size as isize).min(0) }
     }
-    /// The positions that every window covers alike, which keep their keys: all of an empty window, or the only window when it needs no padding.
-    fn shared(&self, len: usize) -> Option<std::ops::Range<usize>> {
-        if self.size == 0 { return Some(0..0); }
-        let start = usize::try_from(self.start(0)).ok()?;
-        (self.count(len) == 1 && start + self.size <= len).then_some(start..start + self.size)
-    }
 }
 
 /// Windows over the leading axes of an array of one shape: a `WindowAxis` for each, the frame that counts the windows along each, and the shape of one window.
@@ -506,6 +500,10 @@ impl Windows {
             _ => Ok(None),
         }).collect()
     }
+    /// The keys of one window's axes: none on a windowed axis, so that every window has one layout, and `layout`'s own on the others.
+    fn cell_keys(&self, layout: &Layout) -> Vec<Option<Arc<Keys>>> {
+        (0..self.cell.len()).map(|a| if a < self.axes.len() { None } else { layout.keys(a).cloned() }).collect()
+    }
     /// The plan that adds fill around each padded axis, or `None` when no axis pads or there are no windows. Each padded axis of the result holds only the positions its windows read, and the result's unpadded windows are the padded windows of the argument.
     pub fn padding(&self) -> Option<Plan> {
         if !self.axes.iter().any(|w| w.padded) || self.frame.contains(&0) || self.cell.contains(&0) { return None; }
@@ -516,7 +514,7 @@ impl Windows {
         let padded: Vec<_> = steps.iter().map(Steps::len).collect();
         Some(Plan { layout: padded.into(), steps })
     }
-    /// The plan of every window over `layout`, which has the windows' shape: the frame's axes, then each window's axes. The windows read an array of shape `source`: `layout`'s shape, or the shape of `padding`'s result. A window's axis keeps its keys where every window covers the same positions.
+    /// The plan of every window over `layout`, which has the windows' shape: the frame's axes, then each window's axes. The windows read an array of shape `source`: `layout`'s shape, or the shape of `padding`'s result. The frame's axes have the keys that `frame_keys` gives, and each window's the keys that `cell_keys` gives.
     pub fn plan(&self, layout: &Layout, source: &[usize]) -> Result<Plan, Error> {
         let n = self.axes.len();
         let shape = [self.frame.as_slice(), &self.cell].concat();
@@ -525,23 +523,13 @@ impl Windows {
         let stride = strides(source);
         let frame = (0..n).map(|a| Steps::Stride { start: 0, len: self.frame[a], step: (self.axes[a].step * stride[a]) as isize });
         let steps = frame.chain(self.cell.iter().zip(&stride).map(|(&len, &stride)| Steps::along(len, stride))).collect();
-        let cell_keys = (0..self.cell.len()).map(|a| match self.axes.get(a) {
-            None => Ok(layout.keys(a).cloned()),
-            Some(w) => layout.keys(a).zip(w.shared(self.shape[a])).map(|(k, r)| k.select(r.map(Some))).transpose(),
-        });
-        let keys = self.frame_keys(layout)?.into_iter().map(Ok).chain(cell_keys).collect::<Result<_, Error>>()?;
+        let keys = self.frame_keys(layout)?.into_iter().chain(self.cell_keys(layout)).collect();
         let names = (0..n).chain(0..self.cell.len()).map(|a| layout.name(a).cloned()).collect();
         Ok(Plan { layout: Layout::from(shape).with_keys(keys)?.inherit_names(names), steps })
     }
-    /// The plan of the window that begins at `starts` along the windowed axes of `layout`, as `starts` gives them for a frame position. A windowed axis keeps its keys where the window needs no padding.
+    /// The plan of the window that begins at `starts` along the windowed axes of `layout`, as `starts` gives them for a frame position, with the keys that `cell_keys` gives.
     pub fn window(&self, layout: &Layout, starts: &[isize]) -> Result<Plan, Error> {
-        let keys = (0..self.cell.len()).map(|a| match (layout.keys(a), starts.get(a)) {
-            (Some(k), Some(&s)) => match usize::try_from(s) {
-                Ok(s) if s + self.cell[a] <= self.shape[a] => k.select((s..s + self.cell[a]).map(Some)).map(Some),
-                _ => Ok(None),
-            },
-            (k, _) => Ok(k.cloned()),
-        }).collect::<Result<_, Error>>()?;
+        let keys = self.cell_keys(layout);
         let steps = (0..self.cell.len())
             .map(|a| Steps::clipped(starts.get(a).map_or(0, |&s| s as i128), self.cell[a], self.shape[a], self.stride[a])).collect();
         Ok(Plan { layout: Layout::from(self.cell.clone()).with_keys(keys)?.inherit_names(layout.names().to_vec()), steps })

@@ -213,6 +213,11 @@ impl Agreement {
         }
         Self::paired(left, right, &Self::paired_axes(left, right, true))
     }
+    /// Pairs the axes of `left` and `right` as [`Agreement::new`] does, except that where both key an axis, the result keeps `left`'s keys. An item of `right` whose key `left` lacks is never read, and a key of `left` that `right` lacks reads as its type's fill.
+    pub fn onto(left: &Layout, right: &Layout) -> Result<Self, Error> {
+        if left.plain() && right.plain() { return Self::new(left, right); }
+        Self::mapped(left, right, &(0..left.shape().len()).collect::<Vec<_>>(), &Self::paired_axes(left, right, true), true)
+    }
     /// For each axis of `right`, the axis of `left` that it pairs with, or a new axis after `left`'s. Axes with the same name pair first. With `positional`, the remaining axes then pair from the front where their names don't conflict, as [`Agreement::new`] pairs them.
     pub fn paired_axes(left: &Layout, right: &Layout, positional: bool) -> Vec<usize> {
         let (nx, ny) = (left.shape().len(), right.shape().len());
@@ -226,18 +231,18 @@ impl Agreement {
         ya.into_iter().map(|a| a.unwrap_or_else(|| { next += 1; next - 1 })).collect()
     }
     /// Pairs each axis of `right` with the axis of `left` that `axes` gives, where an axis past `left`'s is a new one.
-    pub fn paired(left: &Layout, right: &Layout, axes: &[usize]) -> Result<Self, Error> { Self::mapped(left, right, &(0..left.shape().len()).collect::<Vec<_>>(), axes) }
+    pub fn paired(left: &Layout, right: &Layout, axes: &[usize]) -> Result<Self, Error> { Self::mapped(left, right, &(0..left.shape().len()).collect::<Vec<_>>(), axes, false) }
     /// Pairs each axis of the argument with fewer axes with the axis of the other that `axes` names.
     pub fn with_axes(left: &Layout, right: &Layout, axes: &[usize]) -> Result<Self, Error> {
-        if left.shape().len() < right.shape().len() { Self::mapped(left, right, axes, &(0..right.shape().len()).collect::<Vec<_>>()) }
-        else { Self::mapped(left, right, &(0..left.shape().len()).collect::<Vec<_>>(), axes) }
+        if left.shape().len() < right.shape().len() { Self::mapped(left, right, axes, &(0..right.shape().len()).collect::<Vec<_>>(), false) }
+        else { Self::mapped(left, right, &(0..left.shape().len()).collect::<Vec<_>>(), axes, false) }
     }
     /// Gives each argument its own result axes. The left argument's axes come first.
     pub fn outer(left: &Layout, right: &Layout) -> Result<Self, Error> {
         let nx = left.shape().len();
-        Self::mapped(left, right, &(0..nx).collect::<Vec<_>>(), &(nx..nx + right.shape().len()).collect::<Vec<_>>())
+        Self::mapped(left, right, &(0..nx).collect::<Vec<_>>(), &(nx..nx + right.shape().len()).collect::<Vec<_>>(), false)
     }
-    fn mapped(left: &Layout, right: &Layout, xa: &[usize], ya: &[usize]) -> Result<Self, Error> {
+    fn mapped(left: &Layout, right: &Layout, xa: &[usize], ya: &[usize], left_keys: bool) -> Result<Self, Error> {
         let mut shape = vec![1; xa.iter().chain(ya).max().map_or(0, |a| a + 1)];
         let mut keys = vec![None; shape.len()];
         let mut names = vec![None; shape.len()];
@@ -248,7 +253,7 @@ impl Agreement {
             let (lx, ly) = (x.and_then(|a| left.name(a)), y.and_then(|a| right.name(a)));
             names[axis] = match (lx, ly) { (Some(l), Some(r)) if hidden(l) && !hidden(r) => Some(r), _ => lx.or(ly) }.cloned();
             if let (Some(x), Some(y)) = (kx, ky) {
-                let key = x.union(y)?;
+                let key = if left_keys { x.clone() } else { x.union(y)? };
                 shape[axis] = key.len();
                 keys[axis] = Some(key);
             } else {

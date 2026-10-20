@@ -150,13 +150,13 @@ impl Array {
         });
         Self::new(layout, buffer)
     }
-    /// Chooses between two arrays by a Boolean mask, using ordinary named/keyed broadcasting for all three arguments, through [`Choose`](crate::Choose).
+    /// Chooses between two arrays by a Boolean mask, through [`Choose`](crate::Choose). `x` and `y` agree by the usual rules for names and keys, and the mask lays onto their result through [`Agreement::onto`](crate::agreement::Agreement::onto): a key that only the mask has is ignored, and a key that the mask lacks picks `y`.
     pub fn choose(condition: ArrayView<'_>, x: ArrayView<'_>, y: ArrayView<'_>) -> Result<Self, Error> {
         use crate::agreement::Agreement;
         if condition.dtype() != DType::Boolean { return Err(Error::new(Kind::Domain, "condition must be Boolean")); }
         if x.dtype() != y.dtype() { return Err(Error::new(Kind::Domain, "chosen items must have one dtype")); }
         let pair = Agreement::new(x.layout, y.layout)?;
-        let whole = Agreement::new(&pair.layout, condition.layout)?;
+        let whole = Agreement::onto(&pair.layout, condition.layout)?;
         let k = crate::Choose;
         let (buffer, _) = crate::kernels!(Ternary of k).ternary(&k, [x, y, condition], &pair, &whole).expect("`Choose` has a kernel at every dtype");
         Self::new(whole.layout, buffer)

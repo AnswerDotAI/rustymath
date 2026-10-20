@@ -113,8 +113,8 @@ def test_nonzero_and_where_use_shared_broadcasting():
     assert rm.where(a > 0, [10, 20], a).tolist() == [[0, 10, 0], [20, 0, 20]]
     assert rm.where(True, 2, 3) == 2 and rm.argwhere(rm.array([])).shape == (0, 1)
     assert rm.where([True, False, True], "abc", "xyz").tolist() == ["a", "y", "c"]
-    # A key the condition lacks picks y, for characters as for numbers. The result takes its keys from x and y, then the condition's extra keys.
-    c = rm.array({'a': True})
+    # A key the condition lacks picks y, for characters as for numbers. The result takes its keys from x and y: a key that only the condition has is ignored, as `⍚` ignores a selector's extra keys.
+    c = rm.array({'a': True, 'c': False})
     picked = rm.where(c, rm.array({'b': 1, 'a': 2}), rm.array({'b': 3, 'a': 4}))
     assert picked.tolist() == [3, 2] and picked.keys == (('b', 'a'),)
     picked = rm.where(c, rm.array({'b': 'p', 'a': 'q'}), rm.array({'b': 'r', 'a': 's'}))

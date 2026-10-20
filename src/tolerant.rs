@@ -280,13 +280,17 @@ macro_rules! tolerant {
     };
 }
 
+/// `b` as 1 or 0 for an [`Indicator`]. Choosing between the two constants turns a comparison's lane mask into the result with one `and`. [`Element::truth`] converts through an integer instead, which suits the stored Booleans that `slice::masked` reads but would narrow and widen a lane mask here.
+#[inline(always)]
+fn indicated<E: Element>(b: bool) -> E where bool: crate::buffer::Source<E> { if b { crate::buffer::Source::<E>::read(true) } else { crate::buffer::Source::<E>::read(false) } }
+
 /// Writes an [`Indicator`]'s forms for the tolerant comparison `$object` at each float type `$e`, through `forms!`: its item body over a tolerance `$t` as 1 or 0, and a slice form that compares many items with one number through `against`, writing each float in the same loop.
 macro_rules! indicator {
     ($object:ident: |$t:ident, [$x:ident, $y:ident]| $body:expr, $left:ident, $right:ident, $($e:ty),+) => {$(
-        forms!([Indicator<$object>] at $e: |k, [$x, $y]| crate::slice::Total(<$e as Element>::truth(with_tolerance!(k.0.0, |$t| $body))),
-            many |k, [$x, $y], n, out| match against(k.0.0, $x, $y, n, out, Band::$left, Band::$right, |xs, lo, hi, band, out| in_band(xs, lo, hi, band, out, <$e as Element>::truth)) {
+        forms!([Indicator<$object>] at $e: |k, [$x, $y]| crate::slice::Total(indicated::<$e>(with_tolerance!(k.0.0, |$t| $body))),
+            many |k, [$x, $y], n, out| match against(k.0.0, $x, $y, n, out, Band::$left, Band::$right, |xs, lo, hi, band, out| in_band(xs, lo, hi, band, out, indicated::<$e>)) {
                 Some(ok) => ok,
-                None => with_tolerance!(k.0.0, |$t| each!([$x, $y], n, out, |[$x, $y]| crate::slice::Total(<$e as Element>::truth($body)))),
+                None => with_tolerance!(k.0.0, |$t| each!([$x, $y], n, out, |[$x, $y]| crate::slice::Total(indicated::<$e>($body)))),
             });
     )+};
 }
