@@ -1,5 +1,5 @@
 //! Reductions and scans over a contiguous slice: sums, products, maximums and minimums, and their running versions. Each compiles inside rustymath once for each item type. A float sum or product may combine the items in any order, which lets its loop vectorize, so its last bits can differ from a sum taken item by item. Beside a NaN item, a float maximum or minimum gives either NaN or the greatest or least other item, depending on the target and the loop. An empty slice gives -∞ or ∞. `f16` items compute in `f32`. Their sum or product is an `f32` total. An integer sum or product computes at `i64`, or at `u64` for `u64` items. Where it doesn't fit, it wraps, and reports that it doesn't fit, as the running versions do.
-use crate::{Arg, Float, Native, agreement::{Mapping, expanded_items}, arith::Overflowing, buffer::{Element, View}, float::sealed::{Core, Folds}, gather::Steps, layout::Lanes, parallel, slice::{CHUNK, appended}};
+use crate::{Arg, Float, Native, agreement::{Mapping, expanded_items}, arith::Overflowing, buffer::{Element, View}, float::sealed::{Core, Folds}, gather::Steps, layout::Lanes, parallel, slice::{CHUNK, appended, written}};
 use half::f16;
 use num_complex::Complex;
 use std::ops::Range;
@@ -1156,13 +1156,13 @@ pub fn comparison_scan<T: Copy>(data: &[T], [_, len, inner]: [usize; 3], starts:
     (bits, ok)
 }
 
-/// Appends the running differences along the middle axis of `data`, an array of shape `[outer, len, inner]` held row by row, to `out`, in the same layout: each lane's first row, or `start` less it, and then each later row subtracted from the total before it. `read` gives an item as a total, and `negated` gives it negated. A lane of consecutive items adds its negated items through [`grouped`]'s running sums, as `+\` does, in one pass, with `reorders` passed on. Each caller defines its closures in this module, because a closure from another crate can stay out of line in a build of many codegen units, at a call for each item.
+/// Appends the running differences along the middle axis of `data`, an array of shape `[outer, len, inner]` held row by row, to `out`, in the same layout: each lane's first row, or `start` less it, and then each later row subtracted from the total before it. `read` gives an item as a total, and `negated` gives it negated. A lane of consecutive items adds its negated items through [`grouped`]'s running sums, as `+\` does, in one pass, with `reorders` passed on. Each caller defines its closures in this module, because a closure from another crate can stay out of line in a build of many codegen units, at a call for each item. `grouped` takes `negated` and `add` by value, because such a build can also leave core's `<&F as Fn>::call` for a reference out of line.
 #[inline(always)]
 fn differences<T: Copy, S: Copy>(
-    data: &[T], dims: [usize; 3], start: Option<S>, out: &mut Vec<S>, read: impl Fn(T) -> S, negated: impl Fn(T) -> S, add: impl Fn(S, S) -> S, reorders: bool) {
+    data: &[T], dims: [usize; 3], start: Option<S>, out: &mut Vec<S>, read: impl Fn(T) -> S, negated: impl Fn(T) -> S + Copy, add: impl Fn(S, S) -> S + Copy, reorders: bool) {
     let lane = |lane: &[T], o: &mut Vec<S>| {
         let (total, rest) = match start { Some(s) => (s, lane), None => { let first = read(lane[0]); o.push(first); (first, &lane[1..]) } };
-        grouped(rest, Some(total), o, &negated, &add, |t| t, reorders);
+        grouped(rest, Some(total), o, negated, add, |t| t, reorders);
         true
     };
     rows_scan(data, dims, out, lane, |x| (start.map_or_else(|| read(x), |s| add(s, negated(x))), true), |t, x| (add(t, negated(x)), true));
@@ -1346,7 +1346,7 @@ const LANES: usize = 8;
 /// Runs `first` and `step` along the lanes of `len` items in `data`, `B` lanes side by side, writing the running results to `slots`, and gives whether every result fits. `data` holds a whole number of groups of `B` lanes.
 #[inline(always)]
 fn side_by_side<const B: usize, T: Copy, S: Copy>(
-    data: &[T], slots: &mut [std::mem::MaybeUninit<S>], len: usize, first: &impl Fn(T) -> (S, bool), step: &impl Fn(S, T) -> (S, bool)) -> bool {
+    data: &[T], slots: &mut [std::mem::MaybeUninit<S>], len: usize, first: impl Fn(T) -> (S, bool), step: impl Fn(S, T) -> (S, bool)) -> bool {
     let mut fits = true;
     for (group, outs) in data.chunks_exact(B * len).zip(slots.chunks_exact_mut(B * len)) {
         let mut ok = [true; B];
@@ -1364,40 +1364,46 @@ fn side_by_side<const B: usize, T: Copy, S: Copy>(
     fits
 }
 
-/// Appends the running results along the middle axis of `data`, an array of shape `[outer, len, inner]` held row by row, to `out`, in the same layout, and gives whether every one fits. A lane of at least [`SHORT_LANE`] consecutive items runs through `lane`. Shorter lanes run [`LANES`] side by side, and lanes along any other axis run a row at a time: `first` gives each lane's first item or row, and `step` steps each from the one before.
+/// Appends the running results along the middle axis of `data`, an array of shape `[outer, len, inner]` held row by row, to `out`, in the same layout, and gives whether every one fits. A lane of at least [`SHORT_LANE`] consecutive items runs through `lane`. Shorter lanes run [`LANES`] side by side, and lanes along any other axis run a row at a time: `first` gives each lane's first item or row, and `step` steps each from the one before. `first` and `step` go to `side_by_side` by value, for the reason that [`differences`] gives.
 #[inline(always)]
 fn rows_scan<T: Copy, S: Copy>(
-    data: &[T], [_, len, inner]: [usize; 3], out: &mut Vec<S>, lane: impl Fn(&[T], &mut Vec<S>) -> bool, first: impl Fn(T) -> (S, bool),
-    step: impl Fn(S, T) -> (S, bool)) -> bool {
+    data: &[T], [_, len, inner]: [usize; 3], out: &mut Vec<S>, lane: impl Fn(&[T], &mut Vec<S>) -> bool, first: impl Fn(T) -> (S, bool) + Copy,
+    step: impl Fn(S, T) -> (S, bool) + Copy) -> bool {
     if data.is_empty() { return true; }
     if inner == 1 && len >= SHORT_LANE { return data.chunks(len).fold(true, |fits, l| lane(l, out) & fits); }
     if inner == 1 {
         return appended(out, data.len(), |slots| {
             let whole = data.len() / (LANES * len) * (LANES * len);
             let (groups, rest) = slots.split_at_mut(whole);
-            side_by_side::<LANES, _, _>(&data[..whole], groups, len, &first, &step) & side_by_side::<1, _, _>(&data[whole..], rest, len, &first, &step)
+            side_by_side::<LANES, _, _>(&data[..whole], groups, len, first, step) & side_by_side::<1, _, _>(&data[whole..], rest, len, first, step)
         });
     }
-    let (mut totals, mut fits) = (Vec::with_capacity(inner), true);
-    out.reserve(data.len());
-    for l in data.chunks(len * inner) {
-        let (head, rows) = l.split_at(inner);
-        totals.clear();
-        totals.extend(head.iter().map(|&x| {
-            let (t, f) = first(x);
-            fits &= f;
-            t
-        }));
-        out.extend_from_slice(&totals);
-        for row in rows.chunks_exact(inner) {
-            for (s, &x) in totals.iter_mut().zip(row) {
-                let (t, f) = step(*s, x);
-                (*s, fits) = (t, fits & f);
+    // Each row steps from the row before it, which `out` already holds. Indexed loops, because a `Zip` or an `extend_from_slice` for each row can stay out of line in a build of many codegen units.
+    appended(out, data.len(), |slots| {
+        let mut fits = true;
+        let mut at = 0;
+        while at < data.len() {
+            let (row, outs) = (&data[at..at + inner], &mut slots[at..at + inner]);
+            for k in 0..inner {
+                let (t, f) = first(row[k]);
+                outs[k].write(t);
+                fits &= f;
             }
-            out.extend_from_slice(&totals);
+            let mut r = at + inner;
+            while r < at + len * inner {
+                let (done, rest) = slots.split_at_mut(r);
+                let (before, row, outs) = (written(&mut done[r - inner..]), &data[r..r + inner], &mut rest[..inner]);
+                for k in 0..inner {
+                    let (t, f) = step(before[k], row[k]);
+                    outs[k].write(t);
+                    fits &= f;
+                }
+                r += inner;
+            }
+            at += len * inner;
         }
-    }
-    fits
+        fits
+    })
 }
 
 /// A function of two Booleans, held as its truth table: `Logical(t)` gives `t[r][x]` for the running result `r` and the next item `x`. Its scans run any such function.

@@ -25,16 +25,35 @@ pub(crate) fn cycled<T: Copy>(d: &mut Vec<T>, s: &[T], from: usize, n: usize) {
 /// The bytes of whole periods that `cycled` copies at a time, small enough to stay in cache.
 const CYCLE_BLOCK: usize = 32 << 10;
 
-/// Appends each of `items`, converted by `f`, as many times as its count. `counts` holds one count for all the items, or one for each item. The counts are nonnegative and sum to `total`. An item with a count of at most 4 writes four copies where its run starts. The items after it overwrite the copies beyond its count. A larger count fills its run.
+/// Appends each of `items`, converted by `f`, as many times as its count. `counts` holds one count for all the items, or one for each item. The counts are nonnegative and sum to `total`. An item with a count of at most 4 writes four copies where its run starts. The items after it overwrite the copies beyond its count. A larger count fills its run. With a count for each item, a group of 4 items whose counts are all at most 4 writes its copies after one check for the whole group. With a check and a taken branch for each item, the loop's cost varied by about a third with where its code was placed.
 #[inline]
 pub fn repeat<S: Copy, D: Copy>(out: &mut Vec<D>, items: &[S], counts: &[i64], total: usize, f: impl Fn(S) -> D) {
-    let count = |j: usize| counts[if counts.len() == 1 { 0 } else { j }] as usize;
     crate::slice::appended(out, total, |d| {
         let mut k = 0;
-        for (j, &x) in items.iter().enumerate() {
-            let (x, n) = (MaybeUninit::new(f(x)), count(j));
-            match d[k..].first_chunk_mut::<4>() { Some(w) if n <= 4 => *w = [x; 4], _ => d[k..k + n].fill(x) }
-            k += n;
+        let each = |d: &mut [MaybeUninit<D>], k: &mut usize, x: S, n: usize| {
+            let x = MaybeUninit::new(f(x));
+            match d[*k..].first_chunk_mut::<4>() { Some(w) if n <= 4 => *w = [x; 4], _ => d[*k..*k + n].fill(x) }
+            *k += n;
+        };
+        if let [n] = *counts { for &x in items { each(d, &mut k, x, n as usize) } }
+        else {
+            let (groups, rest) = items.as_chunks::<4>();
+            let count_groups = counts.as_chunks::<4>().0;
+            for j in 0..groups.len() {
+                let (g, c) = (groups[j], count_groups[j]);
+                if k + 16 > total || c[0].max(c[1]).max(c[2]).max(c[3]) as u64 > 4 {
+                    for i in 0..4 { each(d, &mut k, g[i], c[i] as usize) }
+                    continue;
+                }
+                let w = &mut d[k..k + 16];
+                let mut o = 0;
+                for i in 0..4 {
+                    *w[o..].first_chunk_mut::<4>().expect("each count in the group is at most 4") = [MaybeUninit::new(f(g[i])); 4];
+                    o += c[i] as usize;
+                }
+                k += o;
+            }
+            for (&x, &n) in rest.iter().zip(&counts[groups.len() * 4..]) { each(d, &mut k, x, n as usize) }
         }
         assert_eq!(k, total, "the counts must sum to `total`");
     })
