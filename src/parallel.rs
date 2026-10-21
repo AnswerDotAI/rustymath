@@ -1,26 +1,24 @@
-//! Splitting work across threads. [`pieces`] cuts a call's items into pieces of the sizes its caller gives, and [`ranges`] into as many pieces as the time of its first unit justifies. The pieces run on a Rayon pool with Rayon's default number of threads: `RAYON_NUM_THREADS` where it's set, and otherwise one for each core. [`set_threads`] changes that number for the calls made on one thread. A call made on one of a pool's threads, such as a function that another call's piece runs, doesn't split again. In the browser build, which has no threads, every call runs its pieces in turn on the calling thread.
+//! Splitting work across threads. [`pieces`] cuts a call's items into pieces of the sizes its caller gives, and [`ranges`] into as many pieces as the time of its first unit justifies. The pieces run on a Rayon pool with Rayon's default number of threads: `RAYON_NUM_THREADS` where it's set, and otherwise one for each core. [`set_threads`] changes that number for the whole process. A call made on one of a pool's threads, such as a function that another call's piece runs, doesn't split again. In the browser build, which has no threads, every call runs its pieces in turn on the calling thread.
 use crate::slice::{Arg, CHUNK};
-use std::{cell::Cell, mem::MaybeUninit, ops::Range, time::{Duration, Instant}};
+use std::{mem::MaybeUninit, ops::Range, sync::atomic::{AtomicUsize, Ordering::Relaxed}, time::{Duration, Instant}};
 
-thread_local! {
-    /// The number of threads that calls made on this thread split across, or 0 for the default pool's number.
-    static THREADS: Cell<usize> = const { Cell::new(0) };
-}
+/// The number of threads that calls split across, for the whole process, or 0 for the default pool's number.
+static THREADS: AtomicUsize = AtomicUsize::new(0);
 
-/// Sets how many threads the calls made on this thread split their work across, and gives the number it replaces. 0 restores the default. 1 runs every call on this thread, as the speed tests do for their budgets.
-pub fn set_threads(n: usize) -> usize { THREADS.replace(n) }
+/// Sets how many threads calls split their work across, for the whole process, and gives the number it replaces. 0 restores the default. 1 runs every call on its calling thread, as the speed tests do for their budgets.
+pub fn set_threads(n: usize) -> usize { THREADS.swap(n, Relaxed) }
 
-/// The number that [`set_threads`] last set on this thread. It starts at 0, the default.
-pub fn thread_setting() -> usize { THREADS.get() }
+/// The number that [`set_threads`] last set. It starts at 0, the default.
+pub fn thread_setting() -> usize { THREADS.load(Relaxed) }
 
-/// How many threads the calls made on this thread split their work across.
+/// How many threads the calls made on this thread split their work across: the process's [`set_threads`] count, or 1 on a pool's worker thread.
 pub fn threads() -> usize { requested().map_or(1, |n| if n == 0 { pool::get(0).current_num_threads() } else { n }) }
 
 /// Whether calls made on this thread run serially: after `set_threads(1)`, or on a pool's worker thread.
 pub(crate) fn serial() -> bool { requested().is_none() }
 
 /// The pool that calls made on this thread split across, as its number of threads, 0 for the default. `None` where they run on this thread.
-fn requested() -> Option<usize> { let n = THREADS.get(); (n != 1 && !pool::inside()).then_some(n) }
+fn requested() -> Option<usize> { let n = THREADS.load(Relaxed); (n != 1 && !pool::inside()).then_some(n) }
 
 /// Runs `piece` on each range that cuts `0..n` into pieces of `size` items, the last one shorter, and gives whether every call said `true`. Every piece runs, whatever another one gives. The pieces run across at most `most` of this thread's [`threads`], on a smaller pool where `most` or the number of pieces is below the pool's threads, as [`sized`] chooses. Where either is 1, they run in order on this thread.
 pub(crate) fn pieces(n: usize, size: usize, most: usize, piece: &(dyn Fn(Range<usize>) -> bool + Sync)) -> bool {
@@ -128,24 +126,10 @@ pub fn stack<B: Default + Send, S: Default, E>(
 
 /// Appends `n` items to `out`, and gives whether every call of `write` said `true`. `write(range, slots)` fills `slots` with the items in `range`, in order. The calls split across threads as [`split`] splits a call, in units of `unit` items. A call that leaves any of its slots unfilled panics, and `out` keeps its length.
 pub fn extended<B: Copy + Send>(out: &mut Vec<B>, n: usize, unit: usize, write: &(dyn Fn(Range<usize>, &mut Slots<'_, B>) -> bool + Sync)) -> bool {
-    extended_with::<B, ()>(out, &mut [], n, unit, &|range, slots, _| write(range, slots))
-}
-/// [`extended`] for one output and any number of outputs of a second type, which `write` fills together: `write(range, a, bs)` fills the slots of `a` and of each of `bs` with the items in `range`. Each call gets the same range of every output.
-pub fn extended_with<A: Copy + Send, B: Copy + Send>(
-    a: &mut Vec<A>, bs: &mut [Vec<B>], n: usize, unit: usize, write: &(dyn Fn(Range<usize>, &mut Slots<'_, A>, &mut [Slots<'_, B>]) -> bool + Sync),
-) -> bool {
-    let shared: Vec<_> = bs.iter_mut().map(|b| { b.reserve(n); Shared(b.spare_capacity_mut().as_mut_ptr()) }).collect();
-    let ok = crate::slice::appended(a, n, |sa| split(sa, unit, &|start, sa| {
-        let end = start + sa.len();
-        // SAFETY: `split` gives each call its own range within `0..n`, and each of `bs` has `n` spare slots.
-        let mut sbs: Vec<Slots<'_, B>> = shared.iter().map(|s| Slots { slots: unsafe { s.part(start..end) }, written: 0 }).collect();
-        let ok = filled(sa, |sa| write(start..end, sa, &mut sbs));
-        for s in &sbs { assert_eq!(s.written, s.slots.len(), "a writer fills every slot it gets"); }
-        ok
-    }));
-    // SAFETY: every call filled its slots of each of `bs`. A call that didn't panicked before this point.
-    for b in bs.iter_mut() { unsafe { b.set_len(b.len() + n) } }
-    ok
+    crate::slice::appended(out, n, |slots| split(slots, unit, &|start, slots| {
+        let end = start + slots.len();
+        filled(slots, |slots| write(start..end, slots))
+    }))
 }
 
 /// `write`'s result for `slots`, which it fills in order through one [`Slots`]. Panics where it leaves any unfilled.

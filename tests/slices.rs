@@ -6,6 +6,7 @@ mod parallel {
 
     #[test]
     fn ranges_and_outputs() {
+        let _threads = crate::support::threads_lock();
         let empty = Mutex::new(Vec::new());
         assert!(!ranges(0, 8, &|range| {
             empty.lock().unwrap().push(range);
@@ -344,15 +345,12 @@ mod reductions {
             assert_eq!(ordered, want, "{shape:?}");
             ordered.clear();
             assert!(left_scan(&x, shape, None, i64::checked_sub, &mut ordered));
-            if inner == 1 {
-                let mut subtractions = Vec::new();
-                subtract_sums::<_, i64>(&x, len, &mut subtractions);
-                assert_eq!(subtractions, ordered, "{shape:?}");
-            }
-            let negated = negated_tail(&x, shape, false, |x| x);
-            let mut transformed = Vec::new();
-            scan_along::<i64, Sum>(&negated, shape, None, &mut transformed);
-            assert_eq!(transformed, ordered, "{shape:?}");
+            let mut running = Vec::new();
+            difference_scan_along(&x, shape, None, &mut running);
+            assert_eq!(running, ordered, "{shape:?}");
+            running.clear();
+            difference_scan_as::<_, i64>(&x, shape, None, &mut running);
+            assert_eq!(running, ordered, "{shape:?}");
             let mut differences = Vec::new();
             assert!(adjacent(&x, shape, &mut differences, |_, _| true, |before, next, out| {
                 out.extend(next.iter().zip(before).map(|(&a, &b)| a - b)); true
@@ -433,6 +431,7 @@ mod reductions {
         assert!(!along::<i64, Sum>(&[i64::MAX, 0, 1, 0], [1, 2, 2]).1);
         assert!(!scan_along::<i64, Sum>(&[i64::MAX, 0, 1, 0], [1, 2, 2], None, &mut Vec::new()));
         assert!(!left_scan(&[i64::MAX, 1], [1, 2, 1], None, i64::checked_add, &mut Vec::new()));
+        assert!(!left_scan(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i64::MAX, 1], [8, 2, 1], None, i64::checked_add, &mut Vec::new()));
     }
 
     /// Each window's fold matches the same reduction of that window's items alone, for windows folded directly and by van Herk-Gil-Werman, a last block cut short, a window as wide as its lane, and windows down rows. A float maximum skips each NaN item, as `Max::step` does. Each window's pick is its first row that gives its maximum or minimum. A sum that wraps reports it.
@@ -474,6 +473,7 @@ mod reductions {
     /// Folds that run in pieces, of long lanes and of single matrices down their columns, and folds of many short lanes or groups, which split across threads, match the sums taken lane by lane, on one thread and on four.
     #[test]
     fn long_and_many_lanes() {
+        let _threads = crate::support::threads_lock();
         for shape in [[1, (3 << 18) + 5, 1], [2, (1 << 18) + 7, 3], [5000, 200, 1], [300, 50, 70], [1, 2000, 300], [1, 600, 2000]] {
             let x: Vec<i64> = (0..shape.iter().product::<usize>()).map(|i| (i * 37 % 101) as i64 - 50).collect();
             let lanes = lanes_of(&x, shape);
@@ -637,6 +637,7 @@ mod search {
     /// Over more than one 65,536-key piece, the radix sort's passes and the lookups split across threads and give one thread's results. Equal keys keep their order of position.
     #[test]
     fn pieces_across_threads() {
+        let _threads = crate::support::threads_lock();
         use rustymath::tolerant::{self, Tolerance};
         let n = 200_000;
         // 5,000 keys, about 40 of each, spread too wide for a table, so the sort takes the radix passes.
@@ -936,8 +937,15 @@ mod gather {
             (0, vec![along(3, 20), Steps::Stride { start: 19, len: 20, step: -1 }]),
             (0, vec![along(2, 50), Steps::Rotated { shift: 7, len: 30, stride: 1 }]),
             (0, vec![along(2, 50), Steps::clipped(-3, 40, 30, 1)]),
+            (0, vec![Steps::Rotated { shift: 4, len: 9, stride: 3 }]),
+            (5, vec![along(3, 40), Steps::padded(-4, 12, 6, 0, rustymath::structure::Edge::Wrap)]),
+            (0, vec![Steps::padded(-3, 20, 8, 2, rustymath::structure::Edge::Reflect)]),
+            (0, vec![along(2, 100), Steps::clipped(-2, 9, 5, 3)]),
             (0, vec![Steps::table(vec![4, Steps::FILL, 1]), along(3, 1)]),
             (0, vec![Steps::table((0..10).collect()), along(4, 20)]),
+            (0, vec![Steps::table(vec![3, Steps::FILL, 9, 0, 5, 1, 2, 7, 8, 4]), along(3, 40)]),
+            (0, vec![along(9, 1), along(10, 30)]),
+            (0, vec![along(4, 10), Steps::Stride { start: 2, len: 3, step: 0 }]),
         ];
         for (base, steps) in &cases {
             let whole = read(&s, *base, steps);

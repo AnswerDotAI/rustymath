@@ -67,9 +67,7 @@ pub(crate) fn expm1_times<R: Native, const FUSED: bool>(x: R, k: R) -> R {
     let h = if R::WIDE { horner::<R, FUSED, 11>(r, H_64) } else { horner::<R, FUSED, 6>(r, H_32) };
     let m = if n > top { top } else { n };
     let scale = R::pow2(m + R::SHIFT);
-    let y = (r * h).mla::<FUSED>(scale, scale - R::one()) * R::pow2(n - m + k + R::SHIFT);
-    // -0 must give -0, which the sum above turns into 0.
-    if x == R::zero() { x } else { y }
+    (r * h).mla::<FUSED>(scale, scale - R::one()) * R::pow2(n - m + k + R::SHIFT)
 }
 
 /// e^(hi + lo) for any double word. It renormalizes the word first, because `exp_parts` needs `lo` far below `hi`.

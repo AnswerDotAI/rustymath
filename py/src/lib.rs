@@ -1,7 +1,7 @@
 //! rustymath's Python extension. Each module's functions are plain Python functions, which convert their arguments through `convert` and return rustymath arrays through `array::give`.
 
 use pyo3::prelude::*;
-use rustymath::tolerant::{Tolerance, Tolerant};
+use rustymath::tolerant::Tolerance;
 
 mod array;
 mod convert;
@@ -20,13 +20,13 @@ mod signal;
 mod structure;
 mod timing;
 
-/// Sets the thread limit for calls made on this thread, returning its previous setting. 0 restores the default, 1 runs serially.
+/// Sets the thread limit for calls in the whole process, returning its previous setting. 0 restores the default, 1 runs serially.
 #[pyfunction]
 fn set_threads(n: usize) -> usize { rustymath::parallel::set_threads(n) }
-/// The thread limit explicitly set on this thread, or 0 for the default.
+/// The thread limit that `set_threads` set for the process, or 0 for the default.
 #[pyfunction]
 fn thread_setting() -> usize { rustymath::parallel::thread_setting() }
-/// The effective thread count for calls made on this thread.
+/// The effective thread count for calls made on this thread: the process's limit, or 1 on a pool's worker thread.
 #[pyfunction]
 fn threads() -> usize { rustymath::parallel::threads() }
 

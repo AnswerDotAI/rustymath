@@ -4,11 +4,16 @@
 use crate::{Abs, Arg, Binom, Pow, tolerant::{Ceil, Equal, Floor, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue, FloorDivide}};
 use strength_reduce::StrengthReducedU64;
 
-/// Bounds for every prefix sum of up to `len` items in `[lo, hi]`, from `start` or 0. With `subtract`, also bounds `2×first - prefix_sum`. `None` where the bounds leave `i64`.
+/// Bounds for every prefix sum of up to `len` items in `[lo, hi]`, from `start` or 0. With `subtract`, bounds every running difference instead: `start` less up to `len` items, or without `start`, the first item less up to `len - 1` more. `None` where the bounds leave `i64`.
 pub fn sum_bounds([lo, hi]: [i64; 2], len: usize, start: Option<i64>, subtract: bool) -> Option<[i64; 2]> {
-    let (lo, hi, len, s) = (i128::from(lo), i128::from(hi), len as i128, i128::from(start.unwrap_or(0)));
-    let (mut least, mut most) = (s + lo.min(len * lo), s + hi.max(len * hi));
-    if subtract { (least, most) = (least.min(2 * lo - most), most.max(2 * hi - least)); }
+    let (lo, hi, len) = (i128::from(lo), i128::from(hi), len as i128);
+    let (least, most) = match (start, subtract) {
+        (None, true) => (lo + ((len - 1) * -hi).min(0), hi + ((len - 1) * -lo).max(0)),
+        _ => {
+            let ([lo, hi], s) = (if subtract { [-hi, -lo] } else { [lo, hi] }, i128::from(start.unwrap_or(0)));
+            (s + lo.min(len * lo), s + hi.max(len * hi))
+        }
+    };
     Some([i64::try_from(least).ok()?, i64::try_from(most).ok()?])
 }
 

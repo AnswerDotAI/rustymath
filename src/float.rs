@@ -116,7 +116,7 @@ pub(crate) mod sealed {
         fn scan_min(x: &[Self], start: Option<Self>, out: &mut Vec<Self>) {
             crate::reduce::records(x, start, out, |t, v| Self::minimum(v, t), crate::reduce::above)
         }
-        fn scan_sum(x: &[Self], start: Option<Self>, out: &mut Vec<Self>) { crate::reduce::grouped(x, start, out, |v| v, |a, b| a + b, |t| t) }
+        fn scan_sum(x: &[Self], start: Option<Self>, out: &mut Vec<Self>) { crate::reduce::grouped(x, start, out, |v| v, |a, b| a + b, |t| t, false) }
     }
 }
 

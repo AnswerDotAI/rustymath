@@ -35,10 +35,10 @@ rm.max(m.T, axis=1)	1.2	1.2
 rm.sum(x[::-1])	1.2	1.2
 # 0.8 copies, for one read and two ops per item, plus a tenth of a copy for the Python call.
 rm.minmax(m.T)	1.6	1.6
-# 1.1 copies, for one reversed read and one write, plus a tenth of a copy for the Python call.
-x[::-1]+1	2.2	2.2
-# 1.4 copies, for strided reads that still load every cache line of x and y (1), and writing half as many items (0.25), plus a tenth of a copy for the Python call.
-x[::2]+y[::2]	2.8	2.8
+# 1.6 copies, for the kernel's read and write (1), a gather of each 4,096-item chunk of the reversed view into a cached buffer (0.4), and a tenth of a copy for each of two Python calls, one of which makes the view. Raised on 21 October 2026 from 1.1 copies, which counted the kernel reading through the view in one pass. The route gathers first because kernels read only forward contiguous slices. At this size, a pass over a cached buffer costs about as much as any other pass. A kernel run over the block in storage order, with the result taking the view's mapping, would skip the gather at about 1.15 copies. Nobody has built it.
+x[::-1]+1	3.2	3.2
+# 2.4 copies, for two strided gathers into cached buffers, each reading every cache line of its argument and writing half its items (0.75 each), the kernel's two reads and one write on half the items (0.7), and a tenth of a copy for each of three Python calls. Raised on 21 October 2026 from 1.4 copies, which counted the kernel reading through the views in one pass. The route gathers first because kernels read only forward contiguous slices. At this size, a pass over a cached buffer costs about as much as any other pass. A storage-order kernel would still need these gathers, because half of each view's storage holds items outside it.
+x[::2]+y[::2]	4.8	4.8
 # 64 copies, for 256 FMAs per result item, a quarter copy each, on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged.
 a@b	27	130
 # 64 copies, for 256 FMAs per result item, a quarter copy each, on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged.

@@ -1,6 +1,6 @@
 //! Array shapes, axis keys and names, and their limits.
 use crate::error::{Error, Kind};
-use hashbrown::{HashMap, HashSet};
+use crate::hashing::{HashMap, HashMapExt, HashSet, HashSetExt};
 use std::{fmt, sync::Arc};
 
 /// The most axes an array can have.

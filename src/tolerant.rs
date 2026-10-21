@@ -25,6 +25,9 @@ impl Tolerance {
     /// Whether this tolerance is 0.
     #[inline]
     pub fn is_exact(self) -> bool { self.0 == 0.0 }
+    /// The tolerance, as a relative difference.
+    #[inline]
+    pub const fn value(self) -> f64 { self.0 }
 }
 
 /// Comparison within a tolerance. `Exactly` and `Tolerance` implement it.
@@ -176,7 +179,7 @@ impl Tolerant for Exactly {
 
 impl Tolerant for Tolerance {
     #[inline]
-    fn value(self) -> f64 { self.0 }
+    fn value(self) -> f64 { Tolerance::value(self) }
     // A loop of comparisons vectorizes only when the test has no branch. The test therefore uses `&` and `|`, not `&&` and `||`. With a strict `<`, an infinity is unequal to every finite number without a finiteness test, because `inf < inf` is false. NaN fails every comparison.
     #[inline]
     fn equal<F: Float>(self, x: F, y: F) -> bool { let t = F::narrow(self.0); (x == y) | ((x - y).abs() < t * larger(x.abs(), y.abs())) }

@@ -145,6 +145,16 @@ pub fn take<S: Copy, D, I: Copy + Into<i64>>(out: &mut Vec<D>, items: &[S], indi
     out.extend(indices.iter().map(move |&i| f(items[crate::structure::counted_back(i.into(), items.len())])));
 }
 
+/// Writes `items`, or its only item where it holds one, into `out` at `indices`, in order, as [`take`] reads them. Each index is in `-n..n` for `n` places, and a negative index counts back from the end.
+#[inline]
+fn put<T: Copy, I: Copy + Into<i64>>(out: &mut [T], items: &[T], indices: &[I]) {
+    let n = out.len();
+    match items {
+        [x] => for &i in indices { out[crate::structure::counted_back(i.into(), n)] = *x },
+        _ => for (&i, &x) in indices.iter().zip(items) { out[crate::structure::counted_back(i.into(), n)] = x },
+    }
+}
+
 /// Writes `slots` as windows of `W` units. Window `k` holds the units of `s` at `o + k × step` plus each offset in `cell`.
 #[inline]
 fn windows<const W: usize, U: Unit>(slots: &mut [MaybeUninit<U>], s: &[U], o: usize, step: isize, cell: &[usize; W]) {
@@ -215,16 +225,48 @@ fn nth<T: Copy>(items: &[T], k: usize) -> T { if let [x] = items { *x } else { i
 fn scatter_axis<T: Item>(out: &mut [T], items: &[T], base: usize, axis: &Steps, rest: &[Cow<Steps>], k: &mut usize) {
     let item = |k: usize| nth(items, k);
     if rest.is_empty() {
+        if axis.len() == 0 { return; }
         match *axis {
-            Steps::Table(ref t) => t.chunks(|j0, run| for (j, &o) in run.iter().enumerate() { if o != Steps::FILL { out[base + o] = item(*k + j0 + j) } }),
+            Steps::Table(ref t) => if !t.put_into(out, base, items, *k) { t.chunks(|j0, run| for (j, &o) in run.iter().enumerate() { if o != Steps::FILL { out[base + o] = item(*k + j0 + j) } }) },
             Steps::Stride { start, len, step: 1 } => row(&mut out[base + start..][..len], items, *k),
-            Steps::Stride { start, len, step } => for j in 0..len { out[(base + start).wrapping_add_signed(step * j as isize)] = item(*k + j) },
-            _ => for (j, o) in axis.offsets().enumerate() { if let Some(o) = o { out[base + o] = item(*k + j) } },
+            Steps::Stride { start, len, step: -1 } => {
+                let out = &mut out[base + start + 1 - len..=base + start];
+                match items { [x] => out.fill(*x), _ => for (o, &x) in out.iter_mut().rev().zip(&items[*k..][..len]) { *o = x } }
+            }
+            // Every write lands on one position, so the last one wins.
+            Steps::Stride { start, len, step: 0 } => out[base + start] = item(*k + len - 1),
+            Steps::Stride { start, len, step } => {
+                let out = &mut out[base..];
+                checked_run(start, len, step, out.len());
+                // SAFETY: both endpoints were checked; every j is within the run.
+                for j in 0..len { unsafe { *out.get_unchecked_mut(start.wrapping_add_signed(step * j as isize)) = item(*k + j) } }
+            }
+            Steps::Rotated { shift, len, stride } => {
+                scatter_axis(out, items, base, &Steps::Stride { start: shift * stride, len: len - shift, step: stride as isize }, rest, k);
+                scatter_axis(out, items, base, &Steps::Stride { start: 0, len: shift, step: stride as isize }, rest, k);
+                return;
+            }
+            Steps::Padded { start, len, size, stride, edge } => {
+                let (before, lo, middle) = padded_parts(start, len, size);
+                // The middle writes as one regular run. Only the positions past the ends go through the edge mode.
+                let border = |out: &mut [T], from: i128, n: usize, k: &mut usize| {
+                    for j in 0..n { if let Some(q) = edged(edge, from + j as i128, size) { out[base + q * stride] = item(*k + j) } }
+                    *k += n;
+                };
+                border(out, start, before, k);
+                scatter_axis(out, items, base, &Steps::Stride { start: lo * stride, len: middle, step: stride as isize }, rest, k);
+                border(out, start + (before + middle) as i128, len - before - middle, k);
+                return;
+            }
         }
         *k += axis.len();
         return;
     }
     if let [inner] = rest {
+        // A transposed matrix writes in tiles, as `transposed` reads one.
+        if let (&Steps::Stride { start: a, len: m, step: 1 }, &Steps::Stride { start: b, len: n, step }) = (axis, &**inner) {
+            if step > 1 && items.len() > 1 { crate::linalg::transpose_into(&items[*k..], n, &mut out[base + a + b..], step as usize, [m, n], |x| x); *k += m * n; return; }
+        }
         if let Steps::Stride { start: b, len: n, step } = **inner {
             // Rows longer than `RUN` write along a slice each.
             if step == 1 && n > RUN {
@@ -232,15 +274,10 @@ fn scatter_axis<T: Item>(out: &mut [T], items: &[T], base: usize, axis: &Steps, 
                 *k += axis.len() * n;
                 return;
             }
-            // Cells picked by a table of starts, each reaching items a stride apart, as columns are, write in blocks, as `picked` reads them.
-            if step > 1 && matches!(*axis, Steps::Table(_)) {
-                let mut starts = Vec::with_capacity(axis.len()); axis.for_each(|_, o| starts.push(o));
-                for block in starts.chunks(8) {
-                    for j in 0..n {
-                        for (c, o) in block.iter().enumerate() { if let Some(o) = o { out[base + o + b + j * step as usize] = item(*k + c * n + j) } }
-                    }
-                    *k += block.len() * n;
-                }
+            // Cells at a table of starts, each reaching items a stride apart, as columns are, write in blocks (`placed`), as `picked` reads them.
+            if let (Steps::Table(t), true) = (axis, step > 1) {
+                t.chunks(|j0, run| placed(out, items, base + b, run, n, step as usize, *k + j0 * n));
+                *k += axis.len() * n;
                 return;
             }
         }
@@ -303,6 +340,12 @@ pub fn counts_up(xs: &[usize]) -> bool { xs.iter().enumerate().all(|(i, &x)| x =
 
 /// The position that position `p` of a padded axis of `size` items reads under `edge`, or `None` for a fill.
 fn edged(edge: Edge, p: i128, size: usize) -> Option<usize> { edge.position(i64::try_from(p).ok()?, size) }
+
+/// The count of `len` positions from `start` that lie before an axis of `size` items, the first position inside the axis, and the count inside it.
+fn padded_parts(start: i128, len: usize, size: usize) -> (usize, usize, usize) {
+    let (lo, hi) = (start.clamp(0, size as i128), (start + len as i128).clamp(0, size as i128));
+    ((lo - start).clamp(0, len as i128) as usize, lo as usize, (hi - lo).max(0) as usize)
+}
 
 /// The source offsets that one axis of `walk`'s result reads. Regular patterns are held as a formula, so a long axis needs no table. A `None` offset gives a fill.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -401,7 +444,10 @@ impl Table {
     /// Writes each offset plus `base` into `out`, in order, and a fill as [`Steps::FILL`]. Index values convert straight into `out`.
     fn write_offsets(&self, base: usize, out: &mut [MaybeUninit<usize>]) {
         fn positions<I: Copy + Into<i64>>(values: &[I], size: usize, scale: usize, base: usize, out: &mut [MaybeUninit<usize>]) {
-            for (slot, &i) in out.iter_mut().zip(values) { slot.write(base + crate::structure::counted_back(i.into(), size) * scale); }
+            let at = |i: I| crate::structure::counted_back(i.into(), size);
+            // AArch64 has no vector multiply of 64-bit lanes, so the usual scale of 1 takes a loop without one, which vectorises.
+            if scale == 1 { for (slot, &i) in out.iter_mut().zip(values) { slot.write(base + at(i)); } }
+            else { for (slot, &i) in out.iter_mut().zip(values) { slot.write(base + at(i) * scale); } }
         }
         let range = self.start..self.start + self.len;
         match &self.all {
@@ -415,6 +461,15 @@ impl Table {
         let Some(items) = s.get(..size) else { return false };
         let range = self.start..self.start + self.len;
         with_index_values!(values.view(), |x| take(d, items, &x[range], |v| v));
+        true
+    }
+    /// Writes `items` from `k` on, or its only item, at the offsets this table gives from `base`, converting each index value inside the write loop as [`put`] does, where the table reads index values one item apart within the first `size` places from `base`. Gives whether it wrote them. [`Table::take_into`] reads in the same way.
+    fn put_into<T: Copy>(&self, out: &mut [T], base: usize, items: &[T], k: usize) -> bool {
+        let Positions::Indices { ref values, size, scale: 1, .. } = self.all else { return false };
+        let Some(out) = out.get_mut(base..base + size) else { return false };
+        let items = if let [_] = items { items } else { &items[k..k + self.len] };
+        let range = self.start..self.start + self.len;
+        with_index_values!(values.view(), |x| put(out, items, &x[range]));
         true
     }
     /// This table as one stride, where it reads index values that [`structure::index_table`](crate::structure::index_table) found evenly spaced. `None` for any other table.
@@ -660,7 +715,7 @@ impl Steps {
             Self::Stride { len, step, .. } => step == 0 && len > 1,
             Self::Padded { .. } => true,
             Self::Rotated { .. } => false,
-            _ => { let mut seen = std::collections::HashSet::new(); !self.offsets().all(|o| o.is_some_and(|o| seen.insert(o))) }
+            _ => { let mut seen = crate::hashing::HashSet::default(); !self.offsets().all(|o| o.is_some_and(|o| seen.insert(o))) }
         }
     }
     /// `tables`, a walk's entries for a result of `shape`, as one entry for each axis of `shape`, with the offset of each entry of one item moved into the base. An entry over several axes splits into one `Stride` for each. `None` where an entry that isn't a `Stride` covers several axes.
@@ -1065,7 +1120,7 @@ fn walk_into<T: Item>(d: &mut Vec<T>, s: &[T], fill: T, base: usize, steps: &[Co
 fn walk_axis<T: Item>(d: &mut Vec<T>, s: &[T], fill: T, base: usize, axis: &Steps, rest: &[Cow<Steps>]) {
     if let [inner] = rest {
         if let (&Steps::Stride { start: a, len: m, step: 1 }, &Steps::Stride { start: b, len: n, step }) = (axis, &**inner) {
-            if step > 1 { return transposed(d, &s[base + a + b..], fill, m, n, step as usize); }
+            if step > 1 { return transposed(d, &s[base + a + b..], m, n, step as usize); }
         }
         // Cells picked from a matrix, as columns are: a table of starts, each reaching items a stride apart.
         if let (Steps::Table(t), &Steps::Stride { start: b, len: n, step }) = (axis, &**inner) {
@@ -1111,8 +1166,7 @@ fn walk_axis<T: Item>(d: &mut Vec<T>, s: &[T], fill: T, base: usize, axis: &Step
         Steps::Stride { start, len, step: -1 } => d.extend(s[start + 1 - len..=start].iter().rev().copied()),
         Steps::Stride { start, len, step: 0 } => d.extend(std::iter::repeat_n(s[start], len)),
         Steps::Stride { start, len, step } => {
-            let end = start.checked_add_signed(step.checked_mul((len - 1) as isize).expect("stride fits")).expect("run stays in the source");
-            assert!(start < s.len() && end < s.len(), "run stays in the source");
+            checked_run(start, len, step, s.len());
             crate::slice::appended(d, len, |slots| {
                 let item = std::convert::identity(#[inline(always)] |i: usize, slot: &mut MaybeUninit<T>| {
                     // SAFETY: both endpoints were checked; every i is within the run.
@@ -1124,35 +1178,31 @@ fn walk_axis<T: Item>(d: &mut Vec<T>, s: &[T], fill: T, base: usize, axis: &Step
                 for (j, slot) in tail.iter_mut().enumerate() { item(blocks.len() * 4 + j, slot); }
             });
         }
-        Steps::Rotated { shift, len, stride: 1 } => {
-            d.extend_from_slice(&s[shift..len]);
-            d.extend_from_slice(&s[..shift]);
+        Steps::Rotated { shift, len, stride } => {
+            walk_axis(d, s, fill, 0, &Steps::Stride { start: shift * stride, len: len - shift, step: stride as isize }, &[]);
+            walk_axis(d, s, fill, 0, &Steps::Stride { start: 0, len: shift, step: stride as isize }, &[]);
         }
-        Steps::Padded { start, len, size, stride: 1, edge } => {
-            let (lo, hi) = (start.clamp(0, size as i128), (start + len as i128).clamp(0, size as i128));
-            let before = (lo - start).clamp(0, len as i128) as usize;
-            let middle = (hi - lo).max(0) as usize;
-            // The middle copies as one slice. Only the positions past the ends go through the edge mode.
+        Steps::Padded { start, len, size, stride, edge } => {
+            let (before, lo, middle) = padded_parts(start, len, size);
+            // The middle walks as one regular run. Only the positions past the ends go through the edge mode.
             let border = |d: &mut Vec<T>, from: i128, n: usize| match edge {
                 Edge::Fill => d.extend(std::iter::repeat_n(fill, n)),
-                Edge::Wrap if size > 0 => cycled(d, &s[..size], from.rem_euclid(size as i128) as usize, n),
-                _ => d.extend((0..n).map(|j| edged(edge, from + j as i128, size).map_or(fill, |q| s[q]))),
+                Edge::Wrap if size > 0 && stride == 1 => cycled(d, &s[..size], from.rem_euclid(size as i128) as usize, n),
+                _ => d.extend((0..n).map(|j| edged(edge, from + j as i128, size).map_or(fill, |q| s[q * stride]))),
             };
             border(d, start, before);
-            d.extend_from_slice(&s[lo as usize..lo as usize + middle]);
+            walk_axis(d, s, fill, 0, &Steps::Stride { start: lo * stride, len: middle, step: stride as isize }, &[]);
             border(d, start + (before + middle) as i128, len - before - middle);
         }
         Steps::Table(ref t) => if !t.take_into(d, s) { crate::slice::appended(d, t.len(), |slots| t.chunks(|j0, run| for (slot, &o) in slots[j0..].iter_mut().zip(run) { slot.write(s.get(o).copied().unwrap_or(fill)); })) },
-        _ => d.extend(axis.offsets().map(move |o| o.map_or(fill, |o| s[o]))),
     }
 }
 
-/// Appends `m` rows of `n` items, where item `j` of row `i` is `s[i + j * stride]`, as `walk_into` does for a transposed matrix. Each block of 8 result rows is filled first, then overwritten by the tiled `linalg::transpose_into`.
-fn transposed<T: Copy>(d: &mut Vec<T>, s: &[T], fill: T, m: usize, n: usize, stride: usize) {
+/// Appends `m` rows of `n` items, where item `j` of row `i` is `s[i + j * stride]`, as `walk_into` does for a transposed matrix. The tiled `linalg::transpose_into` writes each block of 8 result rows straight into spare capacity.
+fn transposed<T: Copy>(d: &mut Vec<T>, s: &[T], m: usize, n: usize, stride: usize) {
     for i0 in (0..m).step_by(8) {
-        let (start, rows) = (d.len(), 8.min(m - i0));
-        d.resize(start + rows * n, fill);
-        crate::linalg::transpose_into(&s[i0..], stride, &mut d[start..], n, [n, rows], |x| x);
+        let rows = 8.min(m - i0);
+        crate::slice::appended(d, rows * n, |slots| crate::linalg::transpose_into(&s[i0..], stride, slots, n, [n, rows], MaybeUninit::new));
     }
 }
 
@@ -1168,4 +1218,22 @@ fn picked<T: Copy>(d: &mut Vec<T>, s: &[T], base: usize, fill: T, starts: &[usiz
             }
         }
     }
+}
+
+/// Writes a row of `n` items for each start in `starts`, from `items` at `k` on, or its only item, where item `j` of row `i` goes to `out[base + starts[i] + j * stride]`, and a `Steps::FILL` start writes nothing: the cells that [`picked`] reads. Each block of 8 rows writes the destination row by row, so its starts share the lines they write.
+fn placed<T: Copy>(out: &mut [T], items: &[T], base: usize, starts: &[usize], n: usize, stride: usize, k: usize) {
+    for (b, block) in starts.chunks(8).enumerate() {
+        let k = k + b * 8 * n;
+        for j in 0..n {
+            for (c, &start) in block.iter().enumerate() {
+                if start != Steps::FILL { out[base + start + j * stride] = nth(items, k + c * n + j); }
+            }
+        }
+    }
+}
+
+/// Checks that a run of `len` positions from `start`, `step` apart, lies below `n`, so that a loop along it can skip each bounds check.
+fn checked_run(start: usize, len: usize, step: isize, n: usize) {
+    let end = start.checked_add_signed(step.checked_mul((len - 1) as isize).expect("stride fits")).expect("run stays in range");
+    assert!(start < n && end < n, "run stays in range");
 }

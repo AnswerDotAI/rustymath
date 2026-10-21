@@ -2,7 +2,8 @@
 //!
 //! `index_of`, `classes` and `firsts` index the first position of each key. `index_of` passes over `x` once for each item of `y` when `y` has at most `SCANNED` items. The index is a table when the keys span at most twice the slice's length, or 1024, and a hash map otherwise. `numbered` numbers the classes in order of first position, with each one's size. `grouped_keys` numbers them the same way from a table of keys, with each one's positions, and `class_counts` gives only their sizes. `counts` counts the items with each key in such a table. `sort_rows` sorts keys that span such a table by counting them. It sorts other keys with an LSD radix sort that skips any byte that is the same in every key. `view_sort_along`, `view_partition_along` and `view_quantiles_along` work on each item's `SortKey`, which reads back to the item exactly. A sort counts, or sorts the keys by comparison or by the same radix sort. With several threads, the radix sort splits each pass of more than `RADIX_PIECE` keys across them, and `index_of` splits its lookups.
 use crate::{Float, agreement::Mapping, array::ArrayView, layout::Layout, buffer::{Buffer, DType, Element, Floats, View}, error::{Error, Kind}, tolerant::{self, Tolerance}};
-use hashbrown::{HashMap, hash_map::Entry};
+use crate::hashing::{HashMap, HashMapExt};
+use hashbrown::hash_map::Entry;
 use std::{convert::Infallible, hash::Hash, mem::MaybeUninit, ops::Not};
 use std::cmp::Ordering;
 

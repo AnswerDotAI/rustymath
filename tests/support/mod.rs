@@ -23,3 +23,9 @@ impl TryRng for Seeded {
     }
     fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Infallible> { rand::rand_core::utils::fill_bytes_via_next_word(dst, || self.try_next_u64()) }
 }
+
+/// Held by each test that sets rustymath's thread count, which holds for the whole process, so that tests running at the same time leave it as each set it.
+pub fn threads_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}

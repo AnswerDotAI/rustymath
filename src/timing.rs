@@ -5,7 +5,7 @@ use std::{fs::{File, TryLockError}, io, time::{Duration, Instant}};
 /// The file whose lock keeps timings apart from builds and test runs.
 pub const LOCK: &str = "/tmp/aai-ws-timing.lock";
 
-/// A hold on the timing lock, released when dropped. The operating system also releases it when its process ends, even by a crash. An exclusive hold runs the holding thread's calls on that thread alone until it's dropped, because speed budgets are for one thread.
+/// A hold on the timing lock, released when dropped. The operating system also releases it when its process ends, even by a crash. An exclusive hold runs every call on its calling thread alone until it's dropped, because speed budgets are for one thread.
 pub struct Hold {
     _file: File,
     /// The thread setting that an exclusive hold replaced, to restore when dropped.

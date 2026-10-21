@@ -118,12 +118,12 @@ const SIN_64: [f64; 7] = [
 ];
 const SIN_32: [f64; 4] = [2.6105958568223286e-06, -0.00019811994570773095, 0.00833310279995203, -0.16666661202907562];
 
-/// sin r, for |r| up to π/2. r + r³ P(r²) takes the sign of r, so that sin(-0) is -0.
+/// sin r, for |r| up to π/2.
 #[inline]
 fn sine<R: Native, const FUSED: bool>(r: R) -> R {
     let r2 = r * r;
     let p = if R::WIDE { horner::<R, FUSED, 7>(r2, SIN_64) } else { horner::<R, FUSED, 4>(r2, SIN_32) };
-    (r * r2).mla::<FUSED>(p, r).copysign(r)
+    (r * r2).mla::<FUSED>(p, r)
 }
 
 /// The coefficients of (tan u - u)/u³ as a polynomial in u², highest degree first, for |u| up to π/8.

@@ -177,7 +177,7 @@ mod integer {
     #[test]
     fn gcd_lcm_power_residue() {
         assert_eq!(sum_bounds([-2, 3], 4, Some(10), false), Some([2, 22]));
-        assert_eq!(sum_bounds([-2, 3], 4, None, true), Some([-16, 14]));
+        assert_eq!((sum_bounds([-2, 3], 4, None, true), sum_bounds([-2, 3], 4, Some(10), true)), (Some([-11, 9]), Some([-2, 18])));
         assert_eq!((product_bounds([-3, 2], [-5, 7]), product_bounds([i64::MAX, i64::MAX], [2, 2])), (Some([-21, 15]), None));
         assert_eq!(sum_bounds([i64::MIN, i64::MAX], 2, None, false), None);
         // Hours, minutes and seconds; a base of 0 that takes what remains; and a quotient that leaves `i64`.

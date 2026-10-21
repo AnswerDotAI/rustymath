@@ -18,9 +18,10 @@ trait Measured: Copy + Debug {
     /// A key whose order is the order of the floats, with -0 just below 0. Adjacent floats have adjacent keys.
     fn key(self) -> u64;
     fn is_nan(self) -> bool;
+    fn is_zero(self) -> bool;
 }
 
-/// The input of a function under test: one float, or several. An input with a zero, infinite or NaN argument is special, and must give exactly IEEE's result.
+/// The input of a function under test: one float, or several. An input with a zero, infinite or NaN argument is special, and must give IEEE's result exactly, except that a zero may have either sign.
 trait Input: Copy + Debug {
     fn is_special(self) -> bool;
     /// The input from the fields of a line of test data.
@@ -35,6 +36,7 @@ macro_rules! measured {
                 (if bits & sign != 0 { !bits } else { bits | sign }) as u64
             }
             fn is_nan(self) -> bool { num_traits::Float::is_nan(self) }
+            fn is_zero(self) -> bool { num_traits::Zero::is_zero(&self) }
         }
         impl Input for $t {
             fn is_special(self) -> bool { !num_traits::Float::is_normal(self) && !num_traits::Float::is_subnormal(self) }
@@ -52,11 +54,11 @@ macro_rules! measured {
 }
 measured!(f16: u16, f32: u32, f64: u64);
 
-/// The error of `got` in ulps, against the result `want` at `x`. A special input or a NaN must give exactly the right result, or the error is `u64::MAX`.
+/// The error of `got` in ulps, against the result `want` at `x`. A special input or a NaN must give the right result exactly, with a zero of either sign, or the error is `u64::MAX`.
 fn error<A: Input, T: Measured>(x: A, got: T, want: T) -> u64 {
     let exact = |same: bool| if same { 0 } else { u64::MAX };
     if want.is_nan() || got.is_nan() { exact(want.is_nan() && got.is_nan()) }
-    else if x.is_special() { exact(got.key() == want.key()) }
+    else if x.is_special() { exact(got.key() == want.key() || got.is_zero() && want.is_zero()) }
     else { got.key().abs_diff(want.key()) }
 }
 

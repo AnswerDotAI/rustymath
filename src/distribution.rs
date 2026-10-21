@@ -1,6 +1,6 @@
 //! Probability distributions. Each has a density, a cumulative distribution, a quantile function and a sampler. The first three are also function objects, `Pdf`, `Cdf` and `Quantile`, which hold the distribution. Their slice forms choose the distribution's formulas once, outside the loop, so the loops of the closed-form distributions vectorize. An item of a slice form fails where its result is NaN and its argument isn't, as for a quantile of p outside 0 to 1. A discrete distribution's density is its mass at a whole x, and its quantile function and sampler give whole numbers.
 use crate::{
-    Arg, Erfc, Erfcinv, Float, Unary, atan, betainc, betaincinv, cos, erfc, erfcinv, exp, expm1, gammainc, gammaincc, gammaincinv, lgamma, ln, log1p, pow, sin,
+    Arg, Erfc, Erfcinv, Float, Ln, Unary, atan, betainc, betaincinv, cos, erfc, erfcinv, exp, expm1, gammainc, gammaincc, gammaincinv, lgamma, ln, log1p, pow, sin,
     tan,
 };
 use rand::{Rng, distr::{Distribution as _, Open01, StandardUniform}};
@@ -66,21 +66,25 @@ fn quantile_of(d: &impl Formulas, p: f64) -> f64 { if (0.0..=1.0).contains(&p) {
 #[inline(always)]
 fn narrowed<F: Float>(x: F, f: impl Fn(f64) -> f64) -> F { F::narrow(f(x.wide())) }
 
-/// [`Distribution::pdf`] as a function object.
+/// [`Distribution::pdf`] as a function object. The log-normal distribution's slice form takes ln x from [`Ln`]'s slice form, which vectorizes where a loop of whole log-normal densities doesn't.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Pdf(pub Distribution);
 forms!(Pdf at real: |k, [x]| narrowed(x, |x| each_law!(&k.0 .0, d => d.pdf(x))),
-    many |k, [x], n, out| each_law!(&k.0 .0, d => each!([x], n, out, |[x]| narrowed(x, |x| d.pdf(x)))));
+many |k, [x], n, out| match (&k.0 .0, x) {
+    // A nonpositive or NaN x goes to `Ln` as 1, so no item fails there. Its density is then 0, or NaN for NaN.
+    (Law::LogNormal(d), Arg::Many(x)) => composed(&x[..n], out, #[inline(always)] |x| if x > 0.0 { x } else { 1.0 }, Ln,
+        #[inline(always)] |x, l| { let p = d.normal().pdf(l) / x; if x <= 0.0 { 0.0 } else { p } }),
+    (law, x) => each_law!(law, d => each!([x], n, out, |[x]| narrowed(x, |x| d.pdf(x)))),
+});
 
 /// [`Distribution::cdf`] as a function object. The normal and log-normal distributions' slice forms take erfc from [`Erfc`]'s slice form, which computes only the formulas that each block of arguments needs.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cdf(pub Distribution);
 forms!(Cdf at real: |k, [x]| narrowed(x, |x| each_law!(&k.0 .0, d => d.cdf(x))),
 many |k, [x], n, out| match (&k.0 .0, x) {
-    (Law::Normal(d), Arg::Many(x)) => composed(&x[..n], out, #[inline(always)] |x| (d.mean - x) / d.sd * FRAC_1_SQRT_2, Erfc,
+    (Law::Normal(d), Arg::Many(x)) => composed(&x[..n], out, #[inline(always)] |x| d.erfc_arg(x), Erfc,
         #[inline(always)] |_, e| 0.5 * e),
-    (Law::LogNormal(d), Arg::Many(x)) => composed(&x[..n], out, #[inline(always)] |x| (d.location - ln(x)) / d.scale * FRAC_1_SQRT_2,
-        Erfc, #[inline(always)] |x, e| if x <= 0.0 { 0.0 } else { 0.5 * e }),
+    (Law::LogNormal(d), Arg::Many(x)) => composed(&x[..n], out, #[inline(always)] |x| d.normal().erfc_arg(ln(x)), Erfc, #[inline(always)] |x, e| if x <= 0.0 { 0.0 } else { 0.5 * e }),
     (law, x) => each_law!(law, d => each!([x], n, out, |[x]| narrowed(x, |x| d.cdf(x)))),
 });
 
@@ -89,10 +93,8 @@ many |k, [x], n, out| match (&k.0 .0, x) {
 pub struct Quantile(pub Distribution);
 forms!(Quantile at real: |k, [p]| narrowed(p, |p| each_law!(&k.0 .0, d => quantile_of(d, p))),
 many |k, [p], n, out| match (&k.0 .0, p) {
-    (Law::Normal(d), Arg::Many(p)) => composed(&p[..n], out, #[inline(always)] |p| 2.0 * p, Erfcinv,
-        #[inline(always)] |_, e| d.mean - d.sd * SQRT_2 * e),
-    (Law::LogNormal(d), Arg::Many(p)) => composed(&p[..n], out, #[inline(always)] |p| 2.0 * p, Erfcinv,
-        #[inline(always)] |_, e| exp(d.location - d.scale * SQRT_2 * e)),
+    (Law::Normal(d), Arg::Many(p)) => composed(&p[..n], out, #[inline(always)] |p| 2.0 * p, Erfcinv, #[inline(always)] |_, e| d.from_erfcinv(e)),
+    (Law::LogNormal(d), Arg::Many(p)) => composed(&p[..n], out, #[inline(always)] |p| 2.0 * p, Erfcinv, #[inline(always)] |_, e| exp(d.normal().from_erfcinv(e))),
     (law, p) => each_law!(law, d => each!([p], n, out, |[p]| narrowed(p, |p| quantile_of(d, p)))),
 });
 
@@ -250,11 +252,21 @@ fn standard_gamma<R: Rng + ?Sized>(shape: f64, rng: &mut R) -> f64 {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Normal { mean: f64, sd: f64 }
+impl Normal {
+    /// The argument of `erfc` in the cdf: (mean - x)/(sd√2), as a product so that a loop computes the reciprocal once.
+    #[inline(always)]
+    fn erfc_arg(&self, x: f64) -> f64 { (self.mean - x) * (FRAC_1_SQRT_2 / self.sd) }
+    /// The quantile from e = erfcinv(2p): mean - sd·√2·e.
+    #[inline(always)]
+    fn from_erfcinv(&self, e: f64) -> f64 { self.mean - self.sd * SQRT_2 * e }
+}
 
 impl Formulas for Normal {
-    fn pdf(&self, x: f64) -> f64 { let z = (x - self.mean) / self.sd; exp(-0.5 * z * z) / (self.sd * SQRT_TAU) }
-    fn cdf(&self, x: f64) -> f64 { 0.5 * erfc((self.mean - x) / self.sd * FRAC_1_SQRT_2) }
-    fn quantile(&self, p: f64) -> f64 { self.mean - self.sd * SQRT_2 * erfcinv(2.0 * p) }
+    // Inlined always, as rustymath's function wrappers are: the log-normal density's slice form calls it in a loop, which a call per item stops vectorizing.
+    #[inline(always)]
+    fn pdf(&self, x: f64) -> f64 { let z = (x - self.mean) * self.sd.recip(); exp(-0.5 * z * z) * (self.sd * SQRT_TAU).recip() }
+    fn cdf(&self, x: f64) -> f64 { 0.5 * erfc(self.erfc_arg(x)) }
+    fn quantile(&self, p: f64) -> f64 { self.from_erfcinv(erfcinv(2.0 * p)) }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { self.mean + self.sd * standard_normal(rng) }
     /// Each pair of uniform draws gives two values, from the cosine and the sine of one angle.
     fn samples<R: Rng + ?Sized>(&self, rng: &mut R, out: &mut [f64]) {
@@ -392,16 +404,17 @@ impl Formulas for Logistic {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct LogNormal { location: f64, scale: f64 }
+impl LogNormal {
+    /// The normal distribution that ln x follows. The log-normal density at x is its density at ln x over x, the log-normal cdf is its cdf at ln x, and the log-normal quantile and samples are exponentials of its own.
+    #[inline(always)]
+    fn normal(&self) -> Normal { Normal { mean: self.location, sd: self.scale } }
+}
 
 impl Formulas for LogNormal {
-    fn pdf(&self, x: f64) -> f64 {
-        if x <= 0.0 { return 0.0; }
-        let z = (ln(x) - self.location) / self.scale;
-        exp(-0.5 * z * z) / (x * self.scale * SQRT_TAU)
-    }
-    fn cdf(&self, x: f64) -> f64 { if x <= 0.0 { 0.0 } else { 0.5 * erfc((self.location - ln(x)) / self.scale * FRAC_1_SQRT_2) } }
-    fn quantile(&self, p: f64) -> f64 { exp(self.location - self.scale * SQRT_2 * erfcinv(2.0 * p)) }
-    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { exp(self.location + self.scale * standard_normal(rng)) }
+    fn pdf(&self, x: f64) -> f64 { if x <= 0.0 { 0.0 } else { self.normal().pdf(ln(x)) / x } }
+    fn cdf(&self, x: f64) -> f64 { if x <= 0.0 { 0.0 } else { self.normal().cdf(ln(x)) } }
+    fn quantile(&self, p: f64) -> f64 { exp(self.normal().quantile(p)) }
+    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { exp(self.normal().sample(rng)) }
 }
 
 /// Student's t distribution, with its density's constant factor computed once. Its cdf comes from the incomplete beta function: of y = t²/(df + t²) near the centre, and of 1 - y = df/(df + t²) in the tails, whichever keeps its digits.

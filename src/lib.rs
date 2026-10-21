@@ -19,6 +19,7 @@ mod exp;
 mod field;
 mod float;
 pub mod gather;
+pub mod hashing;
 mod hyperbolic;
 pub mod integer;
 mod lambert;
