@@ -61,14 +61,29 @@ def test_python_values():
     with pytest.raises(OverflowError): rm.array(range(2**63, 2**63 + 2))
     t = rm.array({'a': [1, 2], 'b': [3, 4]})
     assert t.keys == (('a', 'b'), None) and t[rm.array('b')].tolist() == [3, 4] and t.names == (None, None)
+    assert np.isnan(rm.array([1, None]).tolist()[1])
+    with pytest.raises(TypeError): rm.array(None)
     assert repr(rm.array([1.5])) == 'Array([1.5], dtype=float64)'
     with pytest.raises(ValueError, match='ragged'): rm.array([[1], [2, 3]])
+    with pytest.raises(ValueError, match='ragged'): rm.array([1, [2, 3]])
+    cyclic = [1]
+    cyclic.append(cyclic)
+    with pytest.raises(ValueError, match='cyclic'): rm.array(cyclic)
     with pytest.raises(ValueError): rm.array([1, 'a'])
     with pytest.raises(ValueError): rm.array(['ab'])
     with pytest.raises(OverflowError): rm.array([2**70])
     with pytest.raises(TypeError): rm.array(x for x in [1])
     with pytest.raises(KeyError): t['c']
     with pytest.raises(IndexError): m[2]
+
+def test_data_frames():
+    import pandas as pd
+    df = pd.DataFrame({'a': [1, 2], 'b': [1.5, None]}, index=pd.Index(['r', 's'], name='row'))
+    df.columns.name = 'col'
+    t = rm.array(df)
+    assert t.keys == (('r', 's'), ('a', 'b')) and t.names == ('row', 'col') and t.dtype == 'float64'
+    assert t['s', 'a'] == 2 and np.isnan(t['s', 'b'])
+    with pytest.raises(ValueError, match='column "t" holds text'): rm.array(pd.DataFrame({'t': ['ab', 'c']}))
 
 def test_repr_precision():
     for dtype, text in (('float16', '1.23'), ('float32', '1.23457'), ('float64', '1.2345679')):

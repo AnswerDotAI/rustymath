@@ -282,6 +282,16 @@ impl DType {
             Self::Character => return None,
         })
     }
+    /// The dtype that an argument of this dtype computes in, for a function with a kernel at each dtype where `has` holds. That's this dtype where it has a kernel. Otherwise it's the first with a kernel of these: for a Boolean or an integer, integers of `int` or of this dtype's width, whichever is wider, then floats of `float`; for a float or a complex number, the dtype that [`DType::inexact`] gives it; then each wider float, and each complex dtype whose parts are at least as wide. `int` and `float` are the caller's policy for exact numbers. NumPy's is `i64` and the float that `inexact` gives under `f64`. `None` where no dtype on the way has a kernel.
+    pub fn computes_in(self, int: Width, float: FloatWidth, has: impl Fn(DType) -> bool) -> Option<DType> {
+        if has(self) { return Some(self); }
+        let (integer, float) = match self {
+            Self::Boolean => (Some(Self::Integer(int)), Self::Float(float)),
+            Self::Integer(w) => (Some(Self::Integer(w.join(int))), Self::Float(float)),
+            _ => (None, self.inexact(float)?.0),
+        };
+        integer.into_iter().chain(Self::ALL.into_iter().filter(|&d| float.widens_to(d))).find(|&d| has(d))
+    }
     /// The dtype that arguments of this dtype and `other` promote to: the higher kind, wide enough for both. A Boolean takes the other dtype. An integer beside a float or complex dtype takes that dtype, as in JAX, where NumPy widens the float to hold every integer exactly. A float beside a complex dtype takes parts at least as wide. `None` for characters beside numbers.
     pub fn common(self, other: DType) -> Option<DType> {
         use DType::*;
@@ -297,7 +307,7 @@ impl DType {
             _ => unreachable!("the pair is ordered by kind"),
         })
     }
-    /// The dtype that NEP 50 promotes an array of this dtype and a weak value of dtype `weak` to. A weak value is a Python scalar, which has no dtype of its own. BPL has no weak values. The caller gives the weak value's dtype at the default width of its kind. Where its kind is no higher, the array's dtype wins. A weak complex value beside floats takes their width. Otherwise the weak dtype wins. `None` for characters beside numbers.
+    /// The dtype that NEP 50 promotes an array of this dtype and a weak value of dtype `weak` to. A weak value is a Python scalar, which has no dtype of its own. BPL's weak numbers follow the same rule. The caller gives the weak value's dtype at the default width of its kind. Where its kind is no higher, the array's dtype wins. A weak complex value beside floats takes their width. Otherwise the weak dtype wins. `None` for characters beside numbers.
     pub fn common_weak(self, weak: DType) -> Option<DType> {
         use DType::*;
         Some(match (self, weak) {

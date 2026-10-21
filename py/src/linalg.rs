@@ -75,11 +75,11 @@ fn solution(rows: Layout, rhs: &Layout, vector: bool) -> Layout {
 /// `items`, of an argument of `layout`, read so that its axis `axis` pairs by key with axis `along` of `with`, as [`Mapping::contract`] pairs them. Axes without keys pair by position. A Length error where both have keys and they differ.
 fn paired<'a>(items: Items<'a>, layout: &Layout, axis: usize, with: &Layout, along: usize, function: &str) -> PyResult<Items<'a>> {
     let contracted = Mapping::contract(with, along, layout, axis).map_err(|_| py_err(Error::new(Kind::Length, format!("{function} needs the same keys on the axes it pairs"))))?;
-    let Mapping::Positions(p) = contracted else { return Ok(items) };
-    let lanes = Lanes::new(layout.shape(), axis).map_err(py_err)?;
-    let [outer, _, inner] = lanes.dims();
-    let offsets: Vec<i64> = (0..outer).flat_map(|i| p.iter().flat_map(move |&j| (0..inner).map(move |k| lanes.offset(i, j, k) as i64))).collect();
-    Ok(Items::Owned(Buffer::gathered(items.view(), &offsets)))
+    let Mapping::Steps { steps, .. } = contracted else { return Ok(items) };
+    let [outer, len, inner] = Lanes::new(layout.shape(), axis).map_err(py_err)?.dims();
+    let table = steps.into_iter().next().expect("a contraction maps one axis").scaled(inner);
+    let plan = [Steps::along(outer, len * inner), table, Steps::along(inner, 1)];
+    Ok(Items::Owned(Buffer::walked(items.view(), 0, &plan, outer * plan[1].len() * inner)))
 }
 
 /// The `per` items of cell `at` in `x`.

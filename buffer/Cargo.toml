@@ -10,5 +10,5 @@ repository = "https://github.com/AnswerDotAI/rustymath"
 test = false
 
 [dependencies]
-rustymath = { path = "..", version = ">=0.1.37, <1", default-features = false }
-pyo3 = ">=0.29"
+rustymath.workspace = true
+pyo3.workspace = true

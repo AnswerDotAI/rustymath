@@ -1,18 +1,13 @@
 //! Running a function object on compact arrays, at the dtype that each argument computes in. [`kernels!`](crate::kernels) finds an object's kernels by testing its [`Unary`], [`Binary`], [`Ternary`], [`Reduction`] or [`Inner`] impl at each element type, so only the object's forms say which dtypes it takes. [`Kernels::computes`] gives the dtype that an argument computes in, and the method for each arity casts an argument there where its own dtype differs, then runs the kernel.
 //!
-//! An argument computes in its own dtype where the object has a kernel there. Otherwise it computes in the first of these that the object has a kernel for:
-//! - a Boolean or an integer: `i64`, then the float that [`DType::inexact`] gives it, then each wider float, then each complex dtype whose parts are at least as wide
-//! - a float: each wider float, narrowest first, then each complex dtype at least as wide
-//! - a `Complex32`: `Complex64`
-//!
-//! A character, or a number with none of these, has no kernel.
-use crate::agreement::{Agreement, Frames, Mapping, chunks, map1, map2};
+//! An argument computes in the dtype that [`DType::computes_in`] gives for the object's kernels, under NumPy's policy for exact numbers: a Boolean or an integer without a kernel at its own dtype tries `i64`, then the float that [`DType::inexact`] gives it under `f64`. A character, or a number with no kernel on that ladder, has no kernel.
+use crate::agreement::{Agreement, Frames, Mapping, Read, Side, expanded, map1, map2, read_runs};
 use crate::array::ArrayView;
 use crate::buffer::{Buffer, DType, Element, FloatWidth, Source, View, Width};
 use crate::reduce::{Reduction, scan_along};
-use crate::slice::{Arg, Binary, CHUNK, Results, Ternary, Unary};
+use crate::slice::{Arg, Binary, Results, Ternary, Unary};
 use crate::linalg::Inner;
-use crate::parallel::{extended, stack_with};
+use crate::parallel::{stack_with, Slots};
 
 /// An object's kernel at one dtype for one argument: its result at each of `len` positions, which read the argument through the mapping, and whether every result succeeded.
 pub type UnaryKernel<K> = for<'a> fn(&K, View<'a>, &Mapping, usize) -> (Buffer, bool);
@@ -45,10 +40,8 @@ impl<F: Copy> Kernels<F> {
     }
     /// The dtype that an argument of `dtype` computes in, as the module describes, or `None` where the object has no kernel for it.
     pub fn computes(&self, dtype: DType) -> Option<DType> {
-        if self.at(dtype).is_some() { return Some(dtype); }
-        let integer = dtype.is_integral().then_some(DType::Integer(Width::I64));
-        let float = dtype.inexact(FloatWidth::F64)?.0;
-        integer.into_iter().chain(DType::ALL.into_iter().filter(|&d| float.widens_to(d))).find(|&d| self.at(d).is_some())
+        let float = match dtype.inexact(FloatWidth::F64) { Some((DType::Float(w), _)) => w, _ => FloatWidth::F64 };
+        dtype.computes_in(Width::I64, float, |d| self.at(d).is_some())
     }
     /// Whether the kernel that an argument of `dtype` computes with leaves a failed result wrapped to its type, as integer arithmetic and every [`Reduction`] do. False where the object has no kernel for it.
     pub fn wraps(&self, dtype: DType) -> bool { self.computes(dtype).and_then(|d| self.0[d.index()]).is_some_and(|(_, wraps)| wraps) }
@@ -169,36 +162,39 @@ enum Third<'a, T> { Items(&'a [T]), Mask(&'a [bool]) }
 
 impl<'a, T: Element> Third<'a, T> {
     fn of(z: View<'a>) -> Self { match bool::of(z) { Some(mask) if T::DTYPE != DType::Boolean => Third::Mask(mask), _ => Third::Items(items::<T>(z)) } }
-    /// The item at `at`, or what a missing keyed entry reads as. A mask reads false there.
-    fn read(&self, at: Option<usize>) -> T {
-        match *self { Third::Items(d) => at.map_or(T::FILL, |j| d[j]), Third::Mask(m) => T::truth(at.is_some_and(|j| m[j])) }
-    }
 }
 
-/// Contiguous/constant arguments go to the slice form directly, a mask through [`masked`](crate::slice::masked). Other mappings expand in chunks within parallel ranges.
+/// Contiguous or constant arguments go to the slice form directly, and a mask through [`masked`](crate::slice::masked). Otherwise each argument reads through its two mappings composed into one, as [`read_runs`] reads it. Where the two don't compose structurally, they compose into a table of offsets.
 fn ternary_at<K: Ternary<T, Out: Element> + Sync, T: Element>(k: &K, [x, y, z]: [View<'_>; 3], first: &Agreement, second: &Agreement) -> (Buffer, bool) {
     let (x, y, z) = (items::<T>(x), items::<T>(y), Third::<T>::of(z));
-    let read = |data: &[T], at: Option<usize>| at.map_or(T::FILL, |j| data[j]);
     let mut out = Vec::with_capacity(second.len);
     let pair = if second.len == 0 { None } else { direct(x, &first.left, &second.left).zip(direct(y, &first.right, &second.left)) };
     let done = pair.and_then(|(xa, ya)| match z {
         Third::Items(z) => direct(z, &second.right, &Mapping::Linear(1)).map(|za| k.many(xa, ya, za, second.len, &mut out)),
         Third::Mask(m) => direct(m, &second.right, &Mapping::Linear(1)).map(|ma| crate::slice::masked(k, xa, ya, ma, second.len, &mut out)),
     });
-    let ok = done.unwrap_or_else(|| extended(&mut out, second.len, CHUNK, &|range, slots| {
-        let mut bufs = [Vec::new(), Vec::new(), Vec::new()];
-        chunks(range, &[], |start, n| {
-            bufs.iter_mut().for_each(Vec::clear);
-            for i in start..start + n {
-                let pair = second.left.get(i);
-                bufs[0].push(read(x, pair.and_then(|j| first.left.get(j))));
-                bufs[1].push(read(y, pair.and_then(|j| first.right.get(j))));
-                bufs[2].push(z.read(second.right.get(i)));
-            }
-            k.many_into(Arg::Many(&bufs[0]), Arg::Many(&bufs[1]), Arg::Many(&bufs[2]), n, slots)
-        })
-    }));
+    let ok = done.unwrap_or_else(|| {
+        let through = |m: &Mapping| m.composed(&second.left, first.layout.shape(), second.layout.shape(), true).expect("a table always composes");
+        let (xm, ym) = (through(&first.left), through(&first.right));
+        let (xs, ys) = (Side::new(x, &xm), Side::new(y, &ym));
+        let leaf = |[a, b, c]: [Arg<'_, T>; 3], n: usize, slots: &mut Slots<'_, _>| k.many_into(a, b, c, n, slots);
+        match z {
+            Third::Items(z) => read_runs([&xs, &ys, &Side::new(z, &second.right)], second.len, &mut out, &leaf),
+            Third::Mask(mask) => read_runs([&xs, &ys, &Truths { mask, mapping: &second.right }], second.len, &mut out, &leaf),
+        }
+    });
     (<<K as Results<T, 3>>::Out as Element>::buffer(out), ok)
+}
+
+/// A Boolean mask read as items of `T` through [`Element::truth`], as a ternary's third argument.
+struct Truths<'a> { mask: &'a [bool], mapping: &'a Mapping }
+
+impl<T: Element> Read<T> for Truths<'_> {
+    fn read<'b>(&'b self, start: usize, n: usize, buf: &'b mut Vec<T>) -> Arg<'b, T> {
+        expanded(self.mapping, self.mask, start, n, &mut Vec::new()).converted(0, n, buf, T::truth)
+    }
+    fn constant(&self) -> Option<T> { matches!(self.mapping, Mapping::Single).then(|| T::truth(self.mask[0])) }
+    fn reads(&self) -> (&Mapping, usize) { (self.mapping, 1) }
 }
 
 

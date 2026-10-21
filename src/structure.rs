@@ -1,6 +1,6 @@
 //! Plans for structural operations: take and drop, rotate and reverse, windows, transpose and catenate. A plan gives the result's layout, and `Steps` that read the result's items from the argument's items in order. `gather::walk` copies a compact array by a plan, and basedpl copies its other arrays by the same plan. Each plan checks its arguments.
 use crate::error::{Error, Kind};
-use crate::gather::Steps;
+use crate::gather::{IndexSource, Steps, Table};
 use crate::{buffer::View, float::Float, tolerant::{Tolerance, Tolerant}};
 use crate::agreement::{Agreement, Mapping};
 use crate::layout::{agreed, generated_len, names_conflict, strides, Keys, Lanes, Layout};
@@ -67,9 +67,42 @@ pub fn addressed_parts(layout: &Layout, parts: &[IndexPart<(Option<&str>, usize)
     Ok(routed)
 }
 
-/// One independent axis selector. Positions are zero-based and already normalized; a range can walk backwards. An index array replaces its axis by the axes of its layout. Its positions lie within the axis or are `Steps::FILL`, which reads the caller's fill. The code that builds an index array checks its positions, as `index_positions` does. `NewAxis` inserts a length-one axis without consuming an input axis.
+/// Plans a selection by written parts on `layout`, as `⌷` and the Python frontends read brackets. `claims` give each part's axis name and width, as for `addressed_parts`, and `explicit` its axes. `decode(i, axis)` gives the selector of written part `i` at source `axis`, with whether it reads one position. Axes that no part reaches stay whole, and a part wider than one axis reads its axes as one. Also gives whether the selection reads one item: one position on every source axis, in order. `broadcast` pairs index arrays as `select` does. `err` converts this module's errors to the caller's.
+pub fn plan_parts<E>(layout: &Layout, claims: &[IndexPart<(Option<&str>, usize)>], explicit: Option<&[usize]>, broadcast: bool,
+    mut decode: impl FnMut(usize, usize) -> Result<(Selector, bool), E>, err: impl Fn(Error) -> E) -> Result<(Plan, bool), E> {
+    let shape = layout.shape();
+    let (mut one, mut next, mut sources, mut selectors) = (claims.iter().any(|p| matches!(p, IndexPart::Axis(_))), 0, Vec::<Vec<usize>>::new(), Vec::new());
+    for (axis, part) in addressed_parts(layout, claims, explicit).map_err(&err)? {
+        one &= next == axis;
+        for a in next..axis { sources.push(vec![a]); selectors.push(Selector::all(shape[a])); }
+        next = axis;
+        let (selector, width, single) = match part {
+            IndexPart::NewAxis => { selectors.push(Selector::NewAxis); one = false; continue; }
+            IndexPart::Axis(i) => {
+                let IndexPart::Axis((_, width)) = claims[i] else { unreachable!("an axis refers to its written claim") };
+                let (selector, single) = decode(i, axis)?;
+                (selector, width, single)
+            }
+            _ => (Selector::all(shape[axis]), 1, false),
+        };
+        one &= single;
+        sources.push((axis..axis + width).collect());
+        selectors.push(selector);
+        next += width;
+    }
+    one &= next == shape.len();
+    sources.extend((next..shape.len()).map(|a| vec![a]));
+    let merged;
+    let layout = if sources.len() == shape.len() { layout } else {
+        merged = regrouped(layout, sources.iter().map(|s| s.iter().map(|&a| shape[a]).product()).collect(), &sources, &[]).map_err(&err)?;
+        &merged
+    };
+    Ok((select(layout, selectors, broadcast).map_err(&err)?, one))
+}
+
+/// One independent axis selector. Positions are zero-based and already normalized; a range can walk backwards. An index array replaces its axis by the axes of its layout. Its positions, a [`Table`], lie within the axis or are `Steps::FILL`, which reads the caller's fill. The code that builds an index array checks its positions, as `index_positions` and `index_table` do. `NewAxis` inserts a length-one axis without consuming an input axis.
 #[derive(Clone, Debug)]
-pub enum Selector { At(usize), Range { start: usize, len: usize, step: isize }, Indices { layout: Layout, positions: Vec<usize> }, NewAxis }
+pub enum Selector { At(usize), Range { start: usize, len: usize, step: isize }, Indices { layout: Layout, positions: Table }, NewAxis }
 
 impl Selector {
     /// The whole of an axis of length `len`.
@@ -140,7 +173,7 @@ impl Part {
             }
             Selector::Indices { layout: within, positions } => {
                 if generated_len(within.shape())? != positions.len() { return Err(Error::new(Kind::Length, "index array shape doesn't fit its positions")); }
-                let steps = Steps::table(positions);
+                let steps = Steps::Table(positions);
                 // Check selected keys even when the result drops them, as BPL selection does.
                 let selected = layout.select(axis, steps.offsets())?;
                 let alone = match within.shape().len() {
@@ -171,7 +204,7 @@ fn joined(parts: &[Part], group: &[usize], broadcast: bool) -> Result<(Layout, S
         let Part { steps, axes: own, stride, .. } = &parts[p];
         let add = |t: &mut usize, o: Option<usize>| *t = match o { Some(o) if *t != Steps::FILL => *t + o * stride, _ => Steps::FILL };
         match (Mapping::new(own, axes, &frame, len), steps) {
-            (Mapping::Linear(1), Steps::Table(positions)) => for (t, &o) in table.iter_mut().zip(positions.offsets()) { add(t, Some(o).filter(|&o| o != Steps::FILL)) },
+            (Mapping::Linear(1), Steps::Table(positions)) => positions.chunks(|j0, run| for (t, &o) in table[j0..].iter_mut().zip(run) { add(t, Some(o).filter(|&o| o != Steps::FILL)) }),
             (map, _) => for (b, t) in table.iter_mut().enumerate() { add(t, map.get(b).and_then(|j| steps.get(j))) },
         }
     }
@@ -223,8 +256,30 @@ pub fn index_positions<I: Copy + Into<i64>>(values: &[I], size: usize) -> Result
         inside &= *p < size;
     }
     if inside { return Ok(positions); }
-    let k = positions.iter().position(|&p| p >= size).expect("a position is outside the axis");
-    Err(outside(Into::<i64>::into(values[k]), size))
+    Err(first_outside(values, size))
+}
+
+/// A table that reads the Boolean or integer index values in `values` as positions along an axis of length `size`, as [`index_positions`] reads them, converting each one as it reads it. A value outside the axis is an Index error. The one pass that checks the values writes nothing, and also finds whether they give evenly spaced positions, so that a walk can read them as one stride.
+pub fn index_table(values: Arc<dyn IndexSource>, size: usize) -> Result<Table, Error> {
+    fn check<I: Copy + Into<i64>>(values: &[I], size: usize) -> Result<Option<(usize, isize)>, Error> {
+        // Folding to the least and greatest values with no branch keeps the loop vectorised.
+        let (lo, hi) = values.iter().fold((i64::MAX, i64::MIN), |(lo, hi), &i| { let i = i.into(); (lo.min(i), hi.max(i)) });
+        if !values.is_empty() && !(lo >= -(size as i64) && hi < size as i64) { return Err(first_outside(values, size)); }
+        let at = |k: usize| -> i64 { values[k].into() };
+        if values.len() < 2 { return Ok(None); }
+        // Values of one sign give evenly spaced positions where they're evenly spaced themselves. Checking the second step first skips the full pass for values in no order.
+        let step = at(1) - at(0);
+        let even = (lo >= 0 || hi < 0) && (values.len() < 3 || at(2) - at(1) == step) && values.windows(2).fold(true, |even, w| even & (w[1].into() - w[0].into() == step));
+        Ok(even.then(|| (counted_back(at(0), size), step as isize)))
+    }
+    let even = crate::gather::with_index_values!(values.view(), |x| check(x, size))?;
+    Ok(Table::indices(values, size, even))
+}
+
+/// The Index error for the first of `values` outside an axis of length `size`.
+fn first_outside<I: Copy + Into<i64>>(values: &[I], size: usize) -> Error {
+    let k = values.iter().position(|&i| counted_back(i.into(), size) >= size).expect("a position is outside the axis");
+    outside(Into::<i64>::into(values[k]), size)
 }
 
 /// The Index error for `position` on an axis of length `size`.
@@ -232,7 +287,7 @@ fn outside(position: impl std::fmt::Display, size: usize) -> Error { Error::new(
 
 /// Position `i` on an axis of length `size`, where a negative `i` counts back from the end. Adding `size` to a negative position without a branch keeps a loop over positions vectorised. A position outside the axis is then at least `size`.
 #[inline(always)]
-fn counted_back(i: i64, size: usize) -> usize { (i + (size as i64 & (i >> 63))) as usize }
+pub(crate) fn counted_back(i: i64, size: usize) -> usize { (i + (size as i64 & (i >> 63))) as usize }
 
 /// The positions that index values give along an axis of length `size`: integers as `index_positions` reads them, and floats as `filled_positions` does. Other items are a Domain error.
 pub fn positions(view: View<'_>, size: usize) -> Result<Vec<usize>, Error> {
@@ -413,26 +468,23 @@ pub fn rotate(layout: &Layout, axis: usize, counts: Option<(&[usize], &[i64])>) 
     Ok(Plan { layout: layout.select(axis, (0..len).map(|j| Some(source(j))))?, steps: vec![Steps::along(outer, len * inner), along, Steps::along(inner, 1)] })
 }
 
-/// One axis of windows: windows of `size` items, each `step` items after the last. A padded axis has a window centred on every `step`th position, with fill past the ends.
+/// One axis of windows: windows of `size` items, each `step` items after the last. A padded axis has a window centred on every `step`th position, and reads past its ends by its edge mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WindowAxis { pub size: usize, pub step: usize, pub padded: bool }
+pub struct WindowAxis { pub size: usize, pub step: usize, pub edge: Option<Edge> }
 
 impl WindowAxis {
+    /// Whether the axis pads, with a window centred on its positions.
+    pub fn padded(&self) -> bool { self.edge.is_some() }
     /// Whether an axis of length `len` can hold this window. A padded size must be less than twice the length of an axis that isn't empty.
-    pub fn fits(&self, len: usize) -> bool { !self.padded || len == 0 || self.size / 2 < len }
+    pub fn fits(&self, len: usize) -> bool { !self.padded() || len == 0 || self.size / 2 < len }
     /// The number of windows along an axis of length `len` that `fits`.
     pub fn count(&self, len: usize) -> usize {
-        if self.padded { len.saturating_sub(usize::from(self.size.is_multiple_of(2))).div_ceil(self.step) }
+        if self.padded() { len.saturating_sub(usize::from(self.size.is_multiple_of(2))).div_ceil(self.step) }
         else if len < self.size { 0 }
         else { (len - self.size) / self.step + 1 }
     }
     /// Where window `i` starts along the axis. It's negative when padding comes before the first item.
-    pub fn start(&self, i: usize) -> isize { (i * self.step) as isize - if self.padded { ((self.size - 1) / 2) as isize } else { 0 } }
-    /// The fill that window `i` reads along an axis of length `len`: the count before the first item, positive, or past the last, negative, or 0 where the window fits.
-    fn border(&self, i: usize, len: usize) -> isize {
-        let start = self.start(i);
-        if start < 0 { -start } else { (len as isize - start - self.size as isize).min(0) }
-    }
+    pub fn start(&self, i: usize) -> isize { (i * self.step) as isize - if self.padded() { ((self.size - 1) / 2) as isize } else { 0 } }
 }
 
 /// Windows over the leading axes of an array of one shape: a `WindowAxis` for each, the frame that counts the windows along each, and the shape of one window.
@@ -440,8 +492,8 @@ impl WindowAxis {
 pub struct Windows { shape: Vec<usize>, stride: Vec<usize>, axes: Vec<WindowAxis>, frame: Vec<usize>, cell: Vec<usize> }
 
 impl Windows {
-    /// The windows of `sizes` and `moves` over the leading axes of `shape`. A size's magnitude is the window's size, and `padded` says which sizes pad their axis. An axis with no move moves by 1.
-    pub fn new(sizes: &[i64], moves: &[i64], padded: impl Fn(i64) -> bool, shape: &[usize]) -> Result<Self, Error> {
+    /// The windows of `sizes` and `moves` over the leading axes of `shape`. A size's magnitude is the window's size, and `edge` gives the edge mode of each size's axis, or `None` for an axis that doesn't pad. An axis with no move moves by 1.
+    pub fn new(sizes: &[i64], moves: &[i64], edge: impl Fn(i64) -> Option<Edge>, shape: &[usize]) -> Result<Self, Error> {
         if sizes.len() > shape.len() { return Err(Error::new(Kind::Rank, "window specification has more axes than its argument")); }
         if moves.len() > sizes.len() { return Err(Error::new(Kind::Length, "window specification has more movements than sizes")); }
         let axes = sizes.iter().zip(shape).enumerate().map(|(a, (&size, &len))| {
@@ -450,53 +502,22 @@ impl Windows {
                 Some(&m) if m > 0 => usize::try_from(m).unwrap_or(usize::MAX),
                 Some(_) => return Err(Error::new(Kind::Domain, "window movements must be positive")),
             };
-            let axis = WindowAxis { size: usize::try_from(size.unsigned_abs()).unwrap_or(usize::MAX), step, padded: padded(size) };
+            let axis = WindowAxis { size: usize::try_from(size.unsigned_abs()).unwrap_or(usize::MAX), step, edge: edge(size) };
+            if axis.padded() && axis.size == 0 { return Err(Error::new(Kind::Domain, "padded window sizes must be positive")); }
             if axis.fits(len) { Ok(axis) } else { Err(Error::new(Kind::Domain, "padded window is too large for the argument")) }
         }).collect::<Result<Vec<_>, _>>()?;
         let frame = axes.iter().zip(shape).map(|(w, &n)| w.count(n)).collect();
         let cell = axes.iter().map(|w| w.size).chain(shape[axes.len()..].iter().copied()).collect();
         Ok(Self { shape: shape.to_vec(), stride: strides(shape), axes, frame, cell })
     }
-    pub fn axes(&self) -> &[WindowAxis] { &self.axes }
     /// The number of windows along each windowed axis.
     pub fn frame(&self) -> &[usize] { &self.frame }
     /// The shape of one window: the windows' sizes, then the argument's remaining axes.
     pub fn cell(&self) -> &[usize] { &self.cell }
-    /// For the window at `position` of the frame, counted in ravel order, `f` of each windowed axis: the axis's number, its `WindowAxis` and the window's index along it. An empty frame has one position, 0.
-    fn along(&self, position: usize, f: impl Fn(usize, &WindowAxis, usize) -> isize) -> Vec<isize> {
-        let mut out = vec![0; self.axes.len()];
-        let mut rest = position;
-        for a in (0..self.axes.len()).rev() {
-            let n = self.frame[a].max(1);
-            out[a] = f(a, &self.axes[a], rest % n);
-            rest /= n;
-        }
-        out
-    }
-    /// Where the window at `position` of the frame, counted in ravel order, starts along each windowed axis.
-    pub fn starts(&self, position: usize) -> Vec<isize> { self.along(position, |_, w, i| w.start(i)) }
-    /// The fill that the window at `position` of the frame reads along each windowed axis, as `WindowAxis::border` gives it.
-    pub fn border(&self, position: usize) -> Vec<isize> { self.along(position, |a, w, i| w.border(i, self.shape[a])) }
-    /// `border` for every position of the frame, in ravel order: one row of `axes().len()` values for each window. An empty frame has one row, for the one position that `starts` gives it.
-    pub fn borders(&self) -> Vec<isize> {
-        if self.frame.contains(&0) { return self.border(0); }
-        let n = self.axes.len();
-        let count: usize = self.frame.iter().product();
-        let mut borders = vec![0; count * n];
-        for (a, w) in self.axes.iter().enumerate() {
-            let inner: usize = self.frame[a + 1..].iter().product();
-            let column: Vec<isize> = (0..self.frame[a]).map(|i| w.border(i, self.shape[a])).collect();
-            for (k, block) in borders.chunks_exact_mut(n * inner).enumerate() {
-                let b = column[k % self.frame[a]];
-                for x in block[a..].iter_mut().step_by(n) { *x = b; }
-            }
-        }
-        borders
-    }
     /// The keys of the frame's axes. A padded axis keeps the key of the position each window centres on, and an unpadded axis has none.
     fn frame_keys(&self, layout: &Layout) -> Result<Vec<Option<Arc<Keys>>>, Error> {
         self.axes.iter().enumerate().map(|(a, w)| match layout.keys(a) {
-            Some(k) if w.padded => k.select((0..self.frame[a]).map(|i| Some(i * w.step))).map(Some),
+            Some(k) if w.padded() => k.select((0..self.frame[a]).map(|i| Some(i * w.step))).map(Some),
             _ => Ok(None),
         }).collect()
     }
@@ -504,12 +525,13 @@ impl Windows {
     fn cell_keys(&self, layout: &Layout) -> Vec<Option<Arc<Keys>>> {
         (0..self.cell.len()).map(|a| if a < self.axes.len() { None } else { layout.keys(a).cloned() }).collect()
     }
-    /// The plan that adds fill around each padded axis, or `None` when no axis pads or there are no windows. Each padded axis of the result holds only the positions its windows read, and the result's unpadded windows are the padded windows of the argument.
+    /// The plan that pads each padded axis by its edge mode, or `None` when no axis pads or there are no windows. Each padded axis of the result holds only the positions its windows read, and the result's unpadded windows are the padded windows of the argument.
     pub fn padding(&self) -> Option<Plan> {
-        if !self.axes.iter().any(|w| w.padded) || self.frame.contains(&0) || self.cell.contains(&0) { return None; }
-        let steps: Vec<_> = (0..self.shape.len()).map(|a| match self.axes.get(a) {
-            Some(w) => Steps::clipped(w.start(0) as i128, (self.frame[a] - 1) * w.step + w.size, self.shape[a], self.stride[a]),
-            None => Steps::along(self.shape[a], self.stride[a]),
+        if !self.axes.iter().any(WindowAxis::padded) || self.frame.contains(&0) || self.cell.contains(&0) { return None; }
+        let steps: Vec<_> = (0..self.shape.len()).map(|a| {
+            let (n, stride) = (self.shape[a], self.stride[a]);
+            let Some(w) = self.axes.get(a) else { return Steps::along(n, stride) };
+            Steps::padded(w.start(0) as i128, (self.frame[a] - 1) * w.step + w.size, n, stride, w.edge.unwrap_or(Edge::Fill))
         }).collect();
         let padded: Vec<_> = steps.iter().map(Steps::len).collect();
         Some(Plan { layout: padded.into(), steps })
@@ -526,18 +548,6 @@ impl Windows {
         let keys = self.frame_keys(layout)?.into_iter().chain(self.cell_keys(layout)).collect();
         let names = (0..n).chain(0..self.cell.len()).map(|a| layout.name(a).cloned()).collect();
         Ok(Plan { layout: Layout::from(shape).with_keys(keys)?.inherit_names(names), steps })
-    }
-    /// The plan of the window that begins at `starts` along the windowed axes of `layout`, as `starts` gives them for a frame position, with the keys that `cell_keys` gives.
-    pub fn window(&self, layout: &Layout, starts: &[isize]) -> Result<Plan, Error> {
-        let keys = self.cell_keys(layout);
-        let steps = (0..self.cell.len())
-            .map(|a| Steps::clipped(starts.get(a).map_or(0, |&s| s as i128), self.cell[a], self.shape[a], self.stride[a])).collect();
-        Ok(Plan { layout: Layout::from(self.cell.clone()).with_keys(keys)?.inherit_names(layout.names().to_vec()), steps })
-    }
-    /// The layout of the frame over `layout`, with the frame's keys.
-    pub fn frame_layout(&self, layout: &Layout) -> Result<Layout, Error> {
-        let names = (0..self.frame.len()).map(|a| layout.name(a).cloned()).collect();
-        Ok(Layout::from(self.frame.clone()).with_keys(self.frame_keys(layout)?)?.inherit_names(names))
     }
 }
 

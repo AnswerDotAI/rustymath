@@ -1,8 +1,7 @@
 "How fast rustymath's Python API runs. Each case in `speed_python.txt` is timed as `speed.rs` times the Rust slice forms, and checked against its budget."
 import gc, os, sys, time
-from contextlib import contextmanager
 from pathlib import Path
-import numpy as np, rustymath as rm
+import numpy as np, pytest, rustymath as rm
 
 N, RUNS = 65_536, 5
 
@@ -43,9 +42,9 @@ def cost(code, namespace, section):
     copy = fastest(lambda: np.negative(u, out=v))
     return fastest(lambda: eval(case, namespace)) / copy
 
-@contextmanager
-def timing():
-    "Hold the timing lock exclusively through `rm.timing`, as `speed.rs` does, with the garbage collector off. Gives the pauses, in seconds, before each retry."
+@pytest.fixture
+def pauses():
+    "Hold the timing lock exclusively through `rm.timing`, as `speed.rs` does, with the garbage collector off. Gives the pauses, in seconds, before each retry. As a fixture, its wait for the lock falls outside the test's timeout."
     with rm.timing() as hold:
         gc.disable()
         try: yield hold.pauses
@@ -74,8 +73,8 @@ def over_budget(cases, namespace, pauses, show):
         over = again
     return [line for _, line in over]
 
-def test_speed(capsys):
+def test_speed(capsys, pauses):
     "Every case costs no more than its budget. `RUSTYMATH_COSTS` prints every cost."
     namespace, cases = arrays(), budgets()
-    with capsys.disabled(), timing() as pauses: over = over_budget(cases, namespace, pauses, 'RUSTYMATH_COSTS' in os.environ)
+    with capsys.disabled(): over = over_budget(cases, namespace, pauses, 'RUSTYMATH_COSTS' in os.environ)
     assert not over, '\n'.join(over)

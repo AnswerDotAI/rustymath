@@ -1,18 +1,29 @@
-//! Python array interchange and selectors, shared by rustymath and basedpl. [`read`] borrows native contiguous buffers and normalizes other supported buffers. [`read_array`] preserves sibling-array metadata. [`export`] fills a `Py_buffer`. [`selection`] decodes Python indexing, and [`py_err`] converts array errors to Python exceptions.
+//! Python array interchange and selectors, shared by rustymath and basedpl. [`read`] borrows native contiguous buffers and normalizes other supported buffers. [`read_array`] preserves sibling-array metadata. [`export`] fills a `Py_buffer`. [`labels`] and [`frame`] read dict keys and data frames, [`selection`] decodes Python indexing, [`walk`] walks nested Python values, and [`py_err`] converts array errors to Python exceptions.
 use pyo3::exceptions::{PyBufferError, PyIndexError, PyOverflowError, PyTypeError, PyValueError};
-use pyo3::{IntoPyObjectExt, ffi, prelude::*, types::{PyComplex, PyList}};
+use pyo3::{IntoPyObjectExt, ffi, prelude::*, types::{PyComplex, PyInt, PyList, PyString}};
 use rustymath::buffer::{Buffer, ComplexWidth, DType, Element, FloatWidth, View, Width};
 use rustymath::error::{Error, Kind};
 use rustymath::{layout::element_count, with_dtype};
 use std::ffi::{CStr, c_char, c_int, c_void};
-use std::{mem::size_of, ptr, slice};
+use std::{mem::size_of, ptr, slice, sync::Arc};
 
+pub mod frame;
 pub mod selection;
+pub mod walk;
 
 /// Decodes the Python per-axis key representation; shared layout methods validate its shape.
-pub fn axis_keys(keys: Vec<Option<Vec<Option<String>>>>) -> PyResult<Vec<Option<std::sync::Arc<rustymath::layout::Keys>>>> {
-    use std::sync::Arc;
+pub fn axis_keys(keys: Vec<Option<Vec<Option<String>>>>) -> PyResult<Vec<Option<Arc<rustymath::layout::Keys>>>> {
     keys.into_iter().map(|k| k.map(|v| rustymath::layout::Keys::partial(v.into_iter().map(|s| s.map(Arc::from)).collect())).transpose()).collect::<Result<Vec<_>, _>>().map_err(py_err)
+}
+
+/// Keys from a Python dict's keys or a frame's column labels: a `str` is a key, and an `int` equal to its position leaves that position unkeyed. A `TypeError` for any other label.
+pub fn labels(labels: &Bound<'_, PyAny>) -> PyResult<Vec<Option<Arc<str>>>> {
+    labels.try_iter()?.enumerate().map(|(i, label)| {
+        let label = label?;
+        if let Ok(s) = label.cast::<PyString>() { return Ok(Some(Arc::from(s.to_str()?))); }
+        if label.is_exact_instance_of::<PyInt>() && label.extract::<usize>().is_ok_and(|n| n == i) { return Ok(None); }
+        Err(PyTypeError::new_err("keys must be strings, or ints equal to their positions"))
+    }).collect()
 }
 
 /// The Python exception for a rustymath error: `OverflowError` for Overflow, `IndexError` for Index, and `ValueError` for the other kinds.

@@ -54,7 +54,7 @@ impl Generator {
         let positions = self.positions(total, n, replace)?;
         let Some(x) = x else { return give(py, core(positions.into_iter().map(|i| i as i64).collect(), &shape)?, size.is_none()) };
         let mut layout = x.layout();
-        let selector = Selector::Indices { layout: shape.into(), positions: positions.into_iter().map(|i| i as usize).collect() };
+        let selector = Selector::Indices { layout: shape.into(), positions: rustymath::gather::Table::new(positions.into_iter().map(|i| i as usize).collect()) };
         if replace { layout = layout.without_keys(0); }
         let plan = structure::select(&layout, vec![selector], false).map_err(py_err)?;
         give(py, x.selected(plan)?, size.is_none())
@@ -66,7 +66,7 @@ impl Generator {
         let positions = self.positions(n, n, false)?;
         let Some(x) = x else { return Ok(Array::new(core(positions.into_iter().map(|i| i as i64).collect(), &[n])?)) };
         let layout = x.layout();
-        let selector = Selector::Indices { layout: [n].into(), positions: positions.into_iter().map(|i| i as usize).collect() };
+        let selector = Selector::Indices { layout: [n].into(), positions: rustymath::gather::Table::new(positions.into_iter().map(|i| i as usize).collect()) };
         Ok(Array::new(x.selected(structure::select(&layout, vec![selector], false).map_err(py_err)?)?))
     }
 }

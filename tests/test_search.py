@@ -65,6 +65,23 @@ def test_selection_and_statistics(threads):
                 assert np.array_equal(np.take(p, rank, axis=actual_axis), np.take(expected, rank, axis=actual_axis))
                 assert np.array_equal(np.sort(p, axis=actual_axis), expected)
                 assert np.array_equal(np.take_along_axis(source, order, axis=actual_axis), p)
+    # Lanes of 256 items or more with few distinct values sort by counting; floats sort by order key, with NaN last.
+    for dt in [np.bool_, np.int16, np.float64]:
+        a = (np.arange(600) % 7).reshape(2, 300).astype(dt)
+        if dt == np.float64: a[0, 5] = np.nan
+        expected = np.sort(a, axis=1)
+        assert np.array_equal(s.sort(a, axis=1), expected, equal_nan=dt == np.float64)
+        assert np.array_equal(s.sort(a, axis=1, descending=True), np.flip(expected, axis=1), equal_nan=dt == np.float64)
+    # Long lanes, by radix for 4-byte keys and by comparison for 8-byte ones, keep each value exactly, ¯0 included, with NaN last.
+    rng = np.random.default_rng(0)
+    for dt in [np.int32, np.float32, np.float64]:
+        a = (rng.standard_normal((3, 700)) * 1e6).astype(dt)
+        if dt != np.int32: a[:, ::5], a[:, 1::7], a[1, 3] = 0.0, -0.0, np.nan
+        expected = np.sort(a, axis=1)
+        actual = np.asarray(s.sort(a, axis=1))
+        assert np.array_equal(actual, expected, equal_nan=True) and np.signbit(actual).sum() == np.signbit(a).sum()
+        assert np.array_equal(s.sort(a, axis=1, descending=True), np.flip(expected, axis=1), equal_nan=True)
+        assert np.array_equal(s.sort(a[0]), expected[0], equal_nan=True)
     assert s.sort(list('cab')).tolist() == ['a', 'b', 'c']
     keyed = rm.array({'b': 2, 'a': 1})
     assert s.sort(keyed).keys == (('a', 'b'),)

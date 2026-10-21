@@ -42,7 +42,7 @@ impl<'a, T: Copy> Arg<'a, T> {
 pub trait Results<T, const N: usize> {
     /// The type of each result.
     type Out;
-    /// Whether no result fails: `checked` always gives `Some`, and `many` and `many_into` always give true. A total float function, such as [`Exp`](crate::Exp), gives NaN only where an argument is NaN.
+    /// Whether no result fails: `checked` always gives `Some`, and `many` and `many_into` always give true. A total float function gives NaN from arguments that aren't NaN only where NaN is its value, as [`Subtract`](crate::Subtract) gives for ∞ - ∞ and [`Sin`](crate::Sin) for ±∞.
     const TOTAL: bool;
     /// Whether a failed result is written wrapped to its type, as integer arithmetic writes one. A caller that takes integers as wrapping, as NumPy does, keeps it.
     const WRAPS: bool;

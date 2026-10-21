@@ -1,4 +1,4 @@
-//! Double-word arithmetic: a value held as an unevaluated sum `hi + lo`, with `lo` below half an ulp of `hi`. It carries about twice a float's precision where a later step magnifies errors, as `pow`'s exponent multiplies the error of its logarithm. The operations and their forms with and without FMA come from SLEEF's `dd.h`. See `THIRD-PARTY.md`.
+//! Double-word arithmetic: a value held as an unevaluated sum `hi + lo`. It carries about twice a float's precision where a later step magnifies errors, as `pow`'s exponent multiplies the error of its logarithm. A normalized value has `lo` below half an ulp of `hi`. `add` and `plus` bound their result's `lo` only by about an ulp of the larger operand, as SLEEF's do. Where the operands nearly cancel, that `lo` can exceed `hi`. `sum` gives the normalized form of any pair, and `normalize` does where `lo` is already below `hi`. The operations and their forms with and without FMA come from SLEEF's `dd.h`. See `THIRD-PARTY.md`.
 use crate::float::Native;
 
 #[derive(Clone, Copy)]

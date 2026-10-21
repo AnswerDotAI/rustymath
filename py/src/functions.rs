@@ -394,6 +394,8 @@ functions! {
     factorial(x) = rustymath::Factorial;
     /// ln |Γ(x)|.
     gammaln(x) = rustymath::Lgamma, only REAL;
+    /// ψ(x), the digamma function: the derivative of ln Γ(x).
+    digamma(x) = rustymath::Digamma, only REAL;
     /// The principal branch of ln Γ(z), as SciPy's `loggamma` gives it for complex z. A real z computes as complex.
     loggamma(x) = rustymath::Lgamma, only COMPLEX;
     /// The principal branch W₀ of the Lambert W function. A real x below -1/e gives NaN.
@@ -422,8 +424,12 @@ functions! {
     hypot(x, y) = rustymath::Hypot;
     /// The angle of the point (x, y) from the positive x axis, from -π to π.
     arctan2(y, x) = rustymath::Atan2;
-    /// The binomial coefficient of n and k. An integer result raises OverflowError where it doesn't fit its dtype, and ValueError for a negative k.
+    /// The binomial coefficient of n and k. An integer result raises OverflowError where it doesn't fit its dtype, and ValueError for a negative k. For a non-whole n with a whole k up to 64, a float result is within 2k ulps.
     binom(n, k) = rustymath::Binom, negative "an integer binom takes no negative k";
+    /// ∂C(n, k)/∂n, the binomial coefficient's slope in n. For a non-whole n with a whole k up to 64, it's within 2k ulps.
+    binom_dn(n, k) = rustymath::BinomDn, only REAL;
+    /// ∂C(n, k)/∂k, the binomial coefficient's slope in k. Near n = 2k, where its two ψ terms cancel, its relative error has no bound.
+    binom_dk(n, k) = rustymath::BinomDk, only REAL;
     /// The larger of x and y, or y where either is NaN.
     maximum(x, y) = reduce::Maximum;
     /// The smaller of x and y, or y where either is NaN.

@@ -229,6 +229,29 @@ mod integer {
         assert_eq!(binom(i64::MAX, 2), None);
         assert_eq!(binom(-2, 1_000_000_000_000), Some(1_000_000_000_001));
         assert_eq!(binom(-1, i64::MAX), Some(-1));
+        // A whole k with a non-whole n takes the falling factorial, which stays accurate beside the polynomial's roots, where Γ(n + 1)/(Γ(k + 1) Γ(n - k + 1)) cancels: C(n, k) and its slope in n against mpmath, within the documented 2k ulps.
+        let near = |got: f64, want: f64, k: f64| assert!((got - want).abs() <= 2.0 * k * f64::EPSILON * want.abs(), "{got} against {want}");
+        for (n, k, c, slope) in [(0.999999999, 2.0, -4.9999998535903429657e-10, 0.49999999900000002828), (3.000000001, 5.0, -5.0000004178685223475e-11, -0.050000000083333340103),
+                                 (-21.20622351098135, 64.0, 14366238820115916784.0, -20237195289673071829.0), (4.001, 20.0, -1.2883957254018030871e-8, -0.000012868008206733345107)] {
+            near(rustymath::binom(n, k), c, k);
+            near(rustymath::binom_dn(n, k), slope, k);
+        }
+        // Other real arguments take the Γ ratio in double words, which keeps C(n, k) within 4 ulps of mpmath for large n, negative arguments and a whole k above 64, and its slope in n where both ψ arguments are from 10 up.
+        let close = |got: f64, want: f64| assert!((got - want).abs() <= 4.0 * f64::EPSILON * want.abs(), "{got} against {want}");
+        for (n, k, c) in [(1.3e16, 2.5, 5.798052885632725e39), (1e36, 1.64, 7.439939859224348e58), (-35.249400585757215, -16.771288022576677, -6.434749405414238e-12),
+                          (0.8465836218811786, 3.865135317059345, -0.0018154754878552631), (92.57318691468267, 117.0, 1.3012421741507206e-27), (7.25, 1.5, 13.909723913795338)] {
+            close(rustymath::binom(n, k), c);
+        }
+        for (n, k, slope) in [(1.3e16, 2.5, 1.1150101703139856e24), (1e36, 1.64, 1.220150136912793e23), (92.57318691468267, 117.0, 8.106595581093816e-28)] {
+            close(rustymath::binom_dn(n, k), slope);
+        }
+        // A result the type holds stays finite where a step's product would overflow, in the whole route at f64 and f32, and in the falling factorial and its slopes.
+        close(rustymath::binom(1028.0, 514.0), 7.156051054877897e307);
+        let c32 = rustymath::binom(130.0f32, 65.0f32);
+        assert!((c32 - 9.50676258279607e37).abs() <= 4.0 * f32::EPSILON * 9.50676258279607e37, "{c32}");
+        near(rustymath::binom(1_550_000.5, 64.0), 1.1946917951960594e307, 64.0);
+        near(rustymath::binom_dn(1_550_000.5, 64.0), 4.933019621902672e302, 64.0);
+        near(rustymath::binom_dk(1_550_000.5, 64.0), 1.205091539975857e308, 64.0);
     }
 
     #[test]
@@ -433,9 +456,9 @@ mod operation {
         let args = [x, ArrayView::compact(&Layout::EMPTY, f64::view(&[1.])), ArrayView::compact(&Layout::EMPTY, f64::view(&[4.]))];
         let (clipped, ok) = kernels!(Ternary rustymath::Clip).ternary(&rustymath::Clip, args, &one, &two).unwrap();
         assert!(ok); assert_eq!(f64::of(clipped.view()).unwrap(), &[1., 3., 1., 4., 2., 4.]);
-        // A nonseparable position map falls back to one compact preparation before broadcasting.
+        // A table of positions reads through its offsets before broadcasting.
         let row = Layout::from([3]);
-        let positions = Mapping::Positions(vec![5, 0, 3]);
+        let positions = Mapping::Steps { base: 0, steps: vec![Steps::table(vec![5, 0, 3])] };
         let row_view = ArrayView::new(&row, f64::view(&data), &positions);
         let (sum, _) = kernels!(Binary rustymath::Add).binary(&rustymath::Add, row_view, compact, &Agreement::new(&row, &shape).unwrap()).unwrap();
         assert_eq!(f64::of(sum.view()).unwrap(), &[5., 6., 2., 3., 7., 8.]);

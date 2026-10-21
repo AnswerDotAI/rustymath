@@ -13,7 +13,7 @@ authors = [{name = "Jeremy Howard", email = "github@jhoward.fastmail.fm"}]
 classifiers = ["Programming Language :: Rust", "Programming Language :: Python :: Implementation :: CPython"]
 
 [project.optional-dependencies]
-dev = ["fastship>=0.0.11", "fastws-cli>=0.0.26", "maturin>=1.0,<2.0", "pytest", "nbdev", "numpy", "scipy"]
+dev = ["fastship>=0.0.11", "fastws-cli>=0.0.26", "maturin>=1.0,<2.0", "pytest", "pytest-timeout", "nbdev", "numpy", "pandas", "scipy"]
 
 [project.urls]
 Homepage = "https://github.com/AnswerDotAI/rustymath"
@@ -37,6 +37,8 @@ cache-keys = [{ file = "pyproject.toml" }, { file = "Cargo.toml" }, { file = "py
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+timeout = 60
+timeout_func_only = true
 
 [tool.nbdev]
 lib_path = "python/rustymath"

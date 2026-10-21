@@ -1,5 +1,5 @@
 //! e^x and e^x - 1. The f64 reduction and the form of the final step come from SLEEF's `xexp`, and the f32 polynomial of `exp` and the f32 split of ln 2 from Arm Optimized Routines' AdvSIMD `expf`. The other polynomials are minimax fits. See `THIRD-PARTY.md`.
-use crate::float::{Native, horner, ln2, pow2_times, sealed::Core};
+use crate::{dd::Double, float::{Native, horner, ln2, pow2_times, sealed::Core}};
 
 /// The coefficients of h(r) = (e^r - 1)/r, highest degree first, for |r| up to about ln 2 / 2. `exp` needs h only to within its error in e^r = 1 + r h, which shrinks with r.
 const EXP_64: [f64; 10] = [
@@ -72,9 +72,9 @@ pub(crate) fn expm1_times<R: Native, const FUSED: bool>(x: R, k: R) -> R {
     if x == R::zero() { x } else { y }
 }
 
-/// e^(hi + lo), for a double word whose lo is far below hi.
+/// e^(hi + lo) for any double word. It renormalizes the word first, because `exp_parts` needs `lo` far below `hi`.
 #[inline]
-pub(crate) fn exp_plus<R: Native, const FUSED: bool>(hi: R, lo: R) -> R { exp_parts::<R, FUSED>(hi, lo, R::neg_zero()) }
+pub(crate) fn exp_plus<R: Native, const FUSED: bool>(x: Double<R>) -> R { let x = Double::sum(x.hi, x.lo); exp_parts::<R, FUSED>(x.hi, x.lo, R::neg_zero()) }
 
 /// e^x in f64 for an f32 or f16 result. Beyond 110 in magnitude, e^x is 0 or ∞ at those widths. x stops there. One power of two then scales the result.
 #[inline]

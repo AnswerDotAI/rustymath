@@ -67,7 +67,7 @@ mod forms {
         wide.iter().flat_map(|&x| [x, -x]).map(F::narrow).collect()
     }
 
-    /// `k.many` against `k.one` for every pairing of `One` and `Many` among `items`. It must append after what `out` holds, and say whether every item succeeded, as `checked` does item by item. The NaN rule must agree too. That catches a function marked total that gives NaN from arguments that aren't NaN. A function whose `TOTAL` is true must succeed on every item.
+    /// `k.many` against `k.one` for every pairing of `One` and `Many` among `items`. It must append after what `out` holds, and say whether every item succeeded, as `checked` does item by item. Where `K` isn't total, the verdict follows the NaN rule: an item fails exactly where it gives NaN from arguments that aren't NaN. A function whose `TOTAL` is true must succeed on every item, including where NaN is its value, as sin ∞ is.
     fn binary<F: Float + Debug, K: Binary<F, Out = F>>(k: K, name: &str) {
         let items = items::<F>();
         let check = |x: Arg<'_, F>, y: Arg<'_, F>, n: usize| {
@@ -77,7 +77,7 @@ mod forms {
             assert_eq!((out.len(), out[0]), (n + 1, F::one()), "{name}");
             for i in 0..n { assert!(same(out[i + 1], k.one(at(x, i), at(y, i))), "{name}({:?}, {:?})", at(x, i), at(y, i)) }
             assert_eq!(ok, (0..n).all(|i| k.checked(at(x, i), at(y, i)).is_some()), "{name}");
-            assert_eq!(ok, (0..n).all(|i| !out[i + 1].is_nan() || [at(x, i), at(y, i)].iter().any(|v| v.is_nan())), "{name} breaks the NaN rule");
+            if !K::TOTAL { assert_eq!(ok, (0..n).all(|i| !out[i + 1].is_nan() || [at(x, i), at(y, i)].iter().any(|v| v.is_nan())), "{name} breaks the NaN rule") }
             assert!(ok || !K::TOTAL, "{name} is total but fails");
         };
         let (xs, ys): (Vec<F>, Vec<F>) = items.iter().flat_map(|&x| items.iter().map(move |&y| (x, y))).unzip();
@@ -97,7 +97,7 @@ mod forms {
             assert_eq!((out.len(), out[0]), (n + 1, F::one()), "{name}");
             for i in 0..n { assert!(same(out[i + 1], k.one(at(i))), "{name}({:?})", at(i)) }
             assert_eq!(ok, (0..n).all(|i| k.checked(at(i)).is_some()), "{name}");
-            assert_eq!(ok, (0..n).all(|i| !out[i + 1].is_nan() || at(i).is_nan()), "{name} breaks the NaN rule");
+            if !K::TOTAL { assert_eq!(ok, (0..n).all(|i| !out[i + 1].is_nan() || at(i).is_nan()), "{name} breaks the NaN rule") }
             assert!(ok || !K::TOTAL, "{name} is total but fails");
         };
         check(Arg::Many(items), items.len());
@@ -116,7 +116,7 @@ mod forms {
                 assert!(same(out[i + 1], k.one(at(x, i), at(y, i), at(z, i))), "{name}({:?}, {:?}, {:?})", at(x, i), at(y, i), at(z, i))
             }
             assert_eq!(ok, (0..n).all(|i| k.checked(at(x, i), at(y, i), at(z, i)).is_some()), "{name}");
-            assert_eq!(ok, (0..n).all(|i| !out[i + 1].is_nan() || [at(x, i), at(y, i), at(z, i)].iter().any(|v| v.is_nan())), "{name} breaks the NaN rule");
+            if !K::TOTAL { assert_eq!(ok, (0..n).all(|i| !out[i + 1].is_nan() || [at(x, i), at(y, i), at(z, i)].iter().any(|v| v.is_nan())), "{name} breaks the NaN rule") }
             assert!(ok || !K::TOTAL, "{name} is total but fails");
         };
         let (mut xs, mut ys, mut zs) = (Vec::new(), Vec::new(), Vec::new());
@@ -935,7 +935,7 @@ mod gather {
             (2, vec![Steps::Stride { start: 30, len: 11, step: -3 }]),
             (0, vec![along(3, 20), Steps::Stride { start: 19, len: 20, step: -1 }]),
             (0, vec![along(2, 50), Steps::Rotated { shift: 7, len: 30, stride: 1 }]),
-            (0, vec![along(2, 50), Steps::Clipped { start: -3, len: 40, size: 30, stride: 1 }]),
+            (0, vec![along(2, 50), Steps::clipped(-3, 40, 30, 1)]),
             (0, vec![Steps::table(vec![4, Steps::FILL, 1]), along(3, 1)]),
             (0, vec![Steps::table((0..10).collect()), along(4, 20)]),
         ];
@@ -977,24 +977,26 @@ mod gather {
         use rustymath::{layout::Layout, structure::{select, Selector}};
         let s: Vec<i64> = (0..24).collect();
         let layout = Layout::from([2, 3, 4]);
-        let ix = |positions: Vec<usize>| Selector::Indices { layout: Layout::from([positions.len()]), positions };
+        let ix = |positions: Vec<usize>| Selector::Indices { layout: Layout::from([positions.len()]), positions: rustymath::gather::Table::new(positions) };
         let paired = select(&layout, vec![ix(vec![0, 1]), Selector::all(3), ix(vec![1, 2])], true).unwrap();
         assert_eq!(paired.layout.shape(), &[2, 3]);
         assert_eq!(read(&s, 0, &paired.steps), [1, 5, 9, 14, 18, 22]);
         let one = [ix(vec![1, 0]), Selector::At(2)];
         assert_eq!(read(&s, 0, &select(&layout, one.to_vec(), true).unwrap().steps), read(&s, 0, &select(&layout, one.to_vec(), false).unwrap().steps));
     }
-    /// A window's border is the fill it reads before its axis, positive, or past it, negative. `borders` gives every window's `border` in ravel order, and a frame with no windows one row, for the position that `starts` gives it.
+    /// A padded axis reads its edge mode's positions past its ends. Centred windows of 3 over 4 items read one position before the axis and one after it. A padded size of 0 is an error.
     #[test]
-    fn window_borders() {
-        use rustymath::structure::Windows;
-        let w = Windows::new(&[3, 2], &[], |_| true, &[4, 5]).unwrap();
-        let n: usize = w.frame().iter().product();
-        assert_eq!((w.border(0), w.border(n - 1)), (vec![1, 0], vec![-1, 0]));
-        assert_eq!(w.borders(), (0..n).flat_map(|p| w.border(p)).collect::<Vec<_>>());
-        let empty = Windows::new(&[1, 1, 1], &[], |_| true, &[0, 1000, 1000]).unwrap();
-        assert_eq!(empty.frame(), &[0, 1000, 1000]);
-        assert_eq!(empty.borders(), empty.border(0));
+    fn window_padding() {
+        use rustymath::{gather::{walk, Same}, structure::{Edge, Windows}};
+        let read = |edge| {
+            let mut out = vec![];
+            walk(&mut out, &[10i64, 11, 12, 13], 0, &Windows::new(&[3], &[], |_| Some(edge), &[4]).unwrap().padding().unwrap().steps, -1, Same);
+            out
+        };
+        assert_eq!(read(Edge::Wrap), [13, 10, 11, 12, 13, 10]);
+        assert_eq!(read(Edge::Clamp), [10, 10, 11, 12, 13, 13]);
+        assert_eq!(read(Edge::Fill), [-1, 10, 11, 12, 13, -1]);
+        assert!(Windows::new(&[0], &[], |_| Some(Edge::Fill), &[4]).is_err());
     }
     /// A composed walk reads what walking one walk and then the other reads. `spreads` and `rereads` find walks that read an item more than once or read a fill.
     #[test]
@@ -1007,7 +1009,7 @@ mod gather {
             vec![Steps::Stride { start: 50, len: 6, step: -10 }, along(10, 1)],
             vec![Steps::Stride { start: 10, len: 4, step: 10 }, Steps::Stride { start: 2, len: 5, step: 1 }],
             vec![along(6, 10), Steps::Rotated { shift: 3, len: 10, stride: 1 }],
-            vec![along(6, 10), Steps::Clipped { start: -2, len: 12, size: 10, stride: 1 }],
+            vec![along(6, 10), Steps::clipped(-2, 12, 10, 1)],
         ] {
             let (base, steps) = Steps::through(&outer, &shape, 5, &inner).expect("these reads compose");
             assert_eq!(read(&s, base, &steps), read(&array, 0, &outer));
@@ -1052,7 +1054,7 @@ mod gather {
         for (tables, shape, source) in [
             (vec![Steps::Stride { start: 18, len: 4, step: -6 }, along(6, 1)], vec![4, 6], vec![4, 6]),
             (vec![along(4, 6), Steps::Rotated { shift: 2, len: 6, stride: 1 }], vec![4, 6], vec![4, 6]),
-            (vec![Steps::Stride { start: 6, len: 2, step: 6 }, Steps::Clipped { start: -1, len: 8, size: 6, stride: 1 }], vec![2, 8], vec![4, 6]),
+            (vec![Steps::Stride { start: 6, len: 2, step: 6 }, Steps::clipped(-1, 8, 6, 1)], vec![2, 8], vec![4, 6]),
             (vec![along(6, 1), along(4, 6)], vec![6, 4], vec![4, 6]),
             (vec![along(4, 6), Steps::table(vec![5, 0, 3])], vec![4, 3], vec![4, 6]),
             (vec![Steps::Stride { start: 12, len: 1, step: 0 }, along(6, 1)], vec![1, 6], vec![4, 6]),

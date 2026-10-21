@@ -435,6 +435,21 @@ fn lgamma_accuracy() {
     }
 }
 
+/// `digamma`'s checks, with each error in units of epsilon times the larger of the result and 1, because its relative error near its zeros has no bound. Below -20, where `digamma` reflects, ψ(1 - x) and π cot πx cancel near each zero, and an f64 error counts in units of epsilon times ln(1 - x), their size there. The f16 check rounds rustymath's f64 result.
+#[test]
+fn digamma_accuracy() {
+    let cases: Vec<(f64, f64)> = vectors(MPMATH, "digamma");
+    let (lifted, reflected): (Vec<_>, Vec<_>) = cases.iter().copied().partition(|&(x, _)| !(x < -20.0));
+    for (wide, narrow, how) in variants!(digamma) {
+        check(&format!("f64 digamma, {how}"), scaled(lifted.iter().copied(), wide, f64::EPSILON, 1.0));
+        check(&format!("f64 reflected digamma, {how}"), reflected.iter().map(|&c| scaled([c], wide, f64::EPSILON, (1.0 - c.0).ln())).max_by_key(|w| w.0).unwrap());
+        check(&format!("f32 digamma, {how}"), scaled(at32(&cases).into_iter().map(|(x, y)| (x, y.into())), |x| narrow(x).into(), f32::EPSILON.into(), 1.0));
+    }
+    check("f16 digamma", worst(1 << 16, |i| f16::from_bits(i as u16), rustymath::digamma, |x| f16::from_f64(rustymath::digamma::<f64>(x.into()))));
+    // Near zero, ψ(x) rounds to -1/x, including where that reciprocal overflows.
+    assert_eq!([rustymath::digamma(1e-309f64), rustymath::digamma(-1e-309)], [f64::NEG_INFINITY, f64::INFINITY]);
+}
+
 /// The error that the incomplete functions allow at f64, in units of f64's epsilon times the reference: their factors x^a e^-x and x^a (1-x)^b come from `lgamma`, whose absolute error grows with a and b.
 const ITERATIVE: u64 = 1 << 10;
 

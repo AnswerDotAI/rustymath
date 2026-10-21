@@ -4,15 +4,15 @@ use rustymath::half::f16;
 use rustymath::num_complex::{Complex32, Complex64};
 use pyo3::exceptions::{PySystemError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyComplex, PyDict, PyFloat, PyInt, PyList, PyRange, PyString, PyTuple};
+use pyo3::types::{PyBool, PyComplex, PyFloat, PyInt, PyList, PyString};
 use rustymath::array::{Array as Core, ArrayView};
 use rustymath::buffer::{Buffer, ComplexWidth, DType, Element, FloatWidth, Items, Width};
 use rustymath::error::{Error, Kind};
-use rustymath::layout::{Keys, Layout, element_count, generated_len};
+use rustymath::layout::Layout;
+use rustymath::structure::transpose;
 use rustymath::with_dtype;
-use rustymath_buffer::{Read, py_err, read, read_array};
+use rustymath_buffer::{Read, frame::{Frame, frame}, py_err, read, read_array, walk::{Collect, walked}};
 use std::borrow::Cow;
-use std::sync::Arc;
 
 /// The shared compact dtype named `name`, or a Python argument error.
 pub fn dtype(name: &str) -> PyResult<DType> {
@@ -180,36 +180,20 @@ complexes!(Complex32: |z| Complex32::new(z.re as f32, z.im as f32), Complex64: |
 /// A part of nested values in row-major order: one Python value, or the items of a buffer.
 enum Piece { Leaf(Leaf), Block(Read) }
 
-/// What a walk of nested Python values collects, in row-major order. Compact values collect a [`Piece`] for each Python value or buffer, and `exact` collects rationals.
-pub(crate) trait Collect: Sized {
-    /// The piece for the item `n` of a `range`.
-    fn int(n: i128) -> Self;
-    /// The piece for `obj`, with the shape of its items, which is empty for one value. `None` for an object that holds no values of this kind.
-    fn piece(obj: &Bound<'_, PyAny>) -> PyResult<Option<(Self, Vec<usize>)>>;
-}
+/// The collector for compact values: a [`Piece`] for each Python value or buffer.
+struct Pieces;
 
-impl Collect for Piece {
-    fn int(n: i128) -> Self { Self::Leaf(i64::try_from(n).map_or(Leaf::Big(n as f64), Leaf::Int)) }
+impl Collect for Pieces {
+    type Piece = Piece;
+    fn int(&mut self, n: i128) -> Piece { Piece::Leaf(i64::try_from(n).map_or(Leaf::Big(n as f64), Leaf::Int)) }
     /// A buffer is tested first, because NumPy's `float64` and `complex128` scalars are also Python floats and complex numbers.
-    fn piece(obj: &Bound<'_, PyAny>) -> PyResult<Option<(Self, Vec<usize>)>> {
-        if let Some(r) = read(obj)? { let shape = r.shape().to_vec(); return Ok(Some((Self::Block(r), shape))); }
-        Ok(leaf(obj)?.map(|l| (Self::Leaf(l), vec![])))
+    fn piece(&mut self, obj: &Bound<'_, PyAny>) -> PyResult<Option<(Piece, Vec<usize>)>> {
+        if let Some(r) = read(obj)? { let shape = r.shape().to_vec(); return Ok(Some((Piece::Block(r), shape))); }
+        Ok(leaf(obj)?.map(|l| (Piece::Leaf(l), vec![])))
     }
 }
 
-/// Nested values walked into a layout, with their pieces.
-struct Walk<P> { shape: Vec<usize>, names: Vec<Option<Vec<Option<Arc<str>>>>>, depth: Option<usize>, pieces: Vec<P> }
-
-/// The nested values of `obj`: their layout, with the keys of any dicts, and their pieces.
-pub(crate) fn walked<P: Collect>(obj: &Bound<'_, PyAny>) -> PyResult<(Layout, Vec<P>)> {
-    let mut walk = Walk { shape: vec![], names: vec![], depth: None, pieces: vec![] };
-    walk.walk(obj, 0)?;
-    Ok((walk.layout()?, walk.pieces))
-}
-
-fn ragged() -> PyErr { py_err(Error::new(Kind::Length, "ragged nested sequence")) }
-
-/// The value of a Python scalar or a one-character `str`, or `None` for any other object.
+/// The value of a Python scalar, a one-character `str`, or `None`, which reads as NaN. `Ok(None)` for any other object.
 fn leaf(obj: &Bound<'_, PyAny>) -> PyResult<Option<Leaf>> {
     Ok(Some(if obj.is_instance_of::<PyBool>() {
         Leaf::Bool(obj.extract()?)
@@ -225,64 +209,11 @@ fn leaf(obj: &Bound<'_, PyAny>) -> PyResult<Option<Leaf>> {
             (Some(c), None) => Leaf::Char(c),
             _ => return Err(py_err(Error::new(Kind::Domain, "a str inside a sequence must be one character; use list(s) for its characters"))),
         }
+    } else if obj.is_none() {
+        Leaf::Float(f64::NAN)
     } else {
         return Ok(None);
     }))
-}
-
-impl<P: Collect> Walk<P> {
-    /// Records an axis of `len` positions with `names` at `depth`, which must match every other axis there.
-    fn axis(&mut self, depth: usize, len: usize, names: Option<Vec<Option<Arc<str>>>>) -> PyResult<()> {
-        if self.depth == Some(depth) { return Err(ragged()); }
-        if depth == self.shape.len() {
-            self.shape.push(len);
-            self.names.push(names);
-            element_count(&self.shape).map_err(py_err)?;
-        } else if self.shape[depth] != len || self.names[depth] != names {
-            return Err(ragged());
-        }
-        Ok(())
-    }
-    /// Adds a piece whose items sit `depth` levels down.
-    fn push(&mut self, depth: usize, piece: P) -> PyResult<()> {
-        if depth < self.shape.len() || *self.depth.get_or_insert(depth) != depth { return Err(ragged()); }
-        self.pieces.push(piece);
-        Ok(())
-    }
-    fn walk(&mut self, obj: &Bound<'_, PyAny>, depth: usize) -> PyResult<()> {
-        if let Ok(d) = obj.cast::<PyDict>() {
-            let names = d.keys().iter().enumerate().map(|(i, k)| match k.cast::<PyString>() {
-                Ok(s) => Ok(Some(Arc::from(s.to_str()?))),
-                Err(_) if k.extract::<usize>().is_ok_and(|n| n == i) => Ok(None),
-                Err(_) => Err(py_err(Error::new(Kind::Domain, "a dict's keys must be strings, or ints equal to their positions"))),
-            }).collect::<PyResult<Vec<_>>>()?;
-            self.axis(depth, d.len(), Some(names))?;
-            for v in d.values() { self.walk(&v, depth + 1)?; }
-        } else if obj.is_instance_of::<PyList>() || obj.is_instance_of::<PyTuple>() {
-            self.axis(depth, obj.len()?, None)?;
-            for v in obj.try_iter()? { self.walk(&v?, depth + 1)?; }
-        } else if obj.is_instance_of::<PyRange>() {
-            let len = generated_len(&[obj.len()?]).map_err(py_err)?;
-            let (start, step): (i128, i128) = (obj.getattr("start")?.extract()?, obj.getattr("step")?.extract()?);
-            self.axis(depth, len, None)?;
-            for i in 0..len as i128 {
-                self.push(depth + 1, P::int(start + i * step))?;
-            }
-        } else if let Some((piece, shape)) = P::piece(obj)? {
-            for (a, &len) in shape.iter().enumerate() { self.axis(depth + a, len, None)?; }
-            self.push(depth + shape.len(), piece)?;
-        } else {
-            return Err(PyTypeError::new_err(format!("rustymath can't convert {}", obj.get_type().name()?)));
-        }
-        Ok(())
-    }
-    /// The walked values' layout, with the keys of their dicts.
-    fn layout(&self) -> PyResult<Layout> {
-        let layout = Layout::from(self.shape.as_slice());
-        if self.names.iter().all(Option::is_none) { return Ok(layout); }
-        let keys = self.names.iter().map(|n| n.clone().map(Keys::partial).transpose()).collect::<Result<Vec<_>, _>>().map_err(py_err)?;
-        layout.with_keys(keys).map_err(py_err)
-    }
 }
 
 /// An argument before the call's dtype is known: an array, or nested values with their layout and whether they were a Python scalar.
@@ -296,6 +227,9 @@ fn scalar(obj: &Bound<'_, PyAny>) -> bool {
 /// Classifies one data argument, adding the dtype of any array it holds to `strong`.
 fn classify<'py>(obj: &Bound<'py, PyAny>, strong: &mut Option<DType>) -> PyResult<Pending<'py>> {
     if scalar(obj) { return Ok(Pending::Values(Layout::EMPTY, vec![Piece::Leaf(leaf(obj)?.expect("a Python scalar is a leaf"))], true)); }
+    // `None` is a missing value only as an item, so an operator given a bare `None` returns `NotImplemented`.
+    if obj.is_none() { return Err(PyTypeError::new_err("rustymath can't convert NoneType")); }
+    if let Some(frame) = frame(obj)? { return framed(obj.py(), frame, strong); }
     let source = if let Ok(a) = obj.cast::<Array>() {
         Some(Source::Array(a.try_borrow()?))
     } else {
@@ -316,9 +250,25 @@ fn classify<'py>(obj: &Bound<'py, PyAny>, strong: &mut Option<DType>) -> PyResul
         let chars: Vec<Piece> = s.to_str()?.chars().map(|c| Piece::Leaf(Leaf::Char(c))).collect();
         return Ok(Pending::Values(Layout::from([chars.len()]), chars, false));
     }
-    let (layout, pieces) = walked::<Piece>(obj)?;
+    let (layout, pieces) = walked(obj, &mut Pieces)?;
     for p in &pieces { if let Piece::Block(r) = p { join(strong, r.dtype())?; } }
     Ok(Pending::Values(layout, pieces, false))
+}
+
+/// A frame as a matrix of rows by columns, keyed and named by its labels. Its columns convert together, as a list of them would, and the result is their transpose, a view.
+fn framed<'py>(py: Python<'py>, frame: Frame<'py>, strong: &mut Option<DType>) -> PyResult<Pending<'py>> {
+    // rustymath holds characters but not strings, so a column of strings fails here, naming its label.
+    let text = |o: Bound<'_, PyAny>| o.cast::<PyString>().is_ok_and(|s| s.to_str().is_ok_and(|t| t.chars().count() != 1));
+    if let Some(i) = frame.columns.iter().position(|c| c.cast::<PyList>().is_ok_and(|items| items.iter().any(text))) {
+        let label = frame.keys[1].as_ref().and_then(|k| k.names()[i].as_deref().map(|n| format!("{n:?}"))).unwrap_or_else(|| i.to_string());
+        return Err(py_err(Error::new(Kind::Domain, format!("column {label} holds text, which a rustymath array can't hold"))));
+    }
+    let columns = one(&PyList::new(py, &frame.columns)?.into_any())?.into_core()?;
+    let mut core = if frame.columns.is_empty() { columns.reshape(Layout::from([frame.rows, 0])) } else { columns.selected(transpose(columns.layout(), &[1, 0]).map_err(py_err)?) }.map_err(py_err)?;
+    core.set_keys(frame.keys.to_vec()).map_err(py_err)?;
+    core.set_names(frame.names.to_vec()).map_err(py_err)?;
+    join(strong, core.dtype())?;
+    Ok(Pending::Array(Arg { source: Source::Owned(core), scalar: false }))
 }
 
 /// Nested values at `dtype` under `layout`.

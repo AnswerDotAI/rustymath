@@ -1,4 +1,4 @@
-//! Maths in plain Rust. Its float functions take `f16`, `f32` and `f64`, each within 4 units in the last place (ulps) of the correctly rounded result. The crate also has APL's tolerant comparison, exact rationals, linear algebra, number theory and polynomials. Its Python functions evaluate eagerly and return Rustymath arrays or Python scalars.
+//! Maths in plain Rust. Its float functions take `f16`, `f32` and `f64`, each within 4 units in the last place (ulps) of the correctly rounded result. The README lists the functions with wider bounds. The crate also has APL's tolerant comparison, exact rationals, linear algebra, number theory and polynomials. Its Python functions evaluate eagerly and return Rustymath arrays or Python scalars.
 #![doc = include_str!("lib.md")]
 #[macro_use]
 mod slice;
@@ -167,8 +167,14 @@ functions! {
     factorial(x) in special as Factorial;
     /// ln |Γ(x)|. It is ∞ at 0, at the negative whole numbers and at ±∞. Near its zeros at 1 and 2 its error is within 4 ulps of 2, not of the result.
     lgamma(x) in special as Lgamma: total;
-    /// C(n, k), the binomial coefficient. Whole n and k from 0 multiply out exactly while the result times |n| + k is a whole number the type holds, and a negative whole n gives (-1)^k C(k - n - 1, k). Other arguments go through Γ, with the complex binomial coefficient's error.
+    /// ψ(x), the digamma function: the derivative of ln Γ(x), Γ′(x)/Γ(x). ψ(+0) is -∞, ψ(-0) is ∞, a negative whole x and -∞ give NaN, and ψ(∞) is ∞. Near its zeros its error is within 4 ulps of 1, not of the result, and below -20 within 4 ulps of ln(1 - x).
+    digamma(x) in special as Digamma;
+    /// C(n, k), the binomial coefficient. Whole n and k from 0 multiply out exactly while the result times |n| + k is a whole number the type holds, and a negative whole n gives (-1)^k C(k - n - 1, k). Other n with a whole k from 0 to 64 multiply out n(n - 1)…(n - k + 1)/k!, within 2k ulps. Other real arguments take Γ(n + 1)/(Γ(k + 1) Γ(n - k + 1)) in double words, within 4 ulps in tests against mpmath, for large n and negative arguments too.
     binom(n, k) in special as Binom;
+    /// ∂C(n, k)/∂n, the binomial coefficient's slope in n. For a whole k from 0 to 64 it is the slope of the polynomial n(n - 1)…(n - k + 1)/k! by the product rule, within 2k ulps. Other arguments take C(n, k)(ψ(n + 1) - ψ(n - k + 1)), with the ψ difference in double words where both arguments are from 10 up, with the polynomial's slope where a whole n below a whole k puts those ψ at a pole. Other poles of ψ give NaN.
+    binom_dn(n, k) in special as BinomDn;
+    /// ∂C(n, k)/∂k, the binomial coefficient's slope in k: C(n, k)(ψ(n - k + 1) - ψ(k + 1)). At a whole n from 0 below a whole k, it is the negative of `binom_dn`. Other poles of ψ, as at a negative whole k, give NaN. For a whole k from 0 to 64, its error is within 2k ulps of C(n, k) times ψ(n - k + 1) - ψ(k + 1), plus the error of that difference, so near n = 2k, where the two ψ cancel, its relative error has no bound.
+    binom_dk(n, k) in special as BinomDk;
     /// The error function, 2/√π times the integral of e^-t² from 0 to x.
     erf(x) in special as Erf: total;
     /// 1 - erf(x), without the loss of digits for large x that `1 - erf(x)` has.

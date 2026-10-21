@@ -2,7 +2,7 @@
 //!
 //! Axes with the same name pair first. The remaining axes pair from the front unless their names conflict, so a vector pairs with the rows of a matrix. Two names conflict when they differ and are both hidden or both visible. A hidden name, which starts with `_`, meets a visible one as if that axis were unnamed, and the result keeps the visible name. An axis of length 1 repeats along its partner. Where both arguments key an axis, the result's keys are their union, and an item that one argument lacks reads as its type's fill.
 use crate::{
-    buffer::{Element, Source}, error::{Error, Kind}, gather::{walk_range, Same, Steps}, layout::{generated_len, hidden, names_conflict, strides, Layout}, parallel::{extended, Slots}, Arg, Binary, Unary, CHUNK
+    buffer::{Element, Source}, error::{Error, Kind}, gather::{cycled, walk_range, Same, Steps}, layout::{generated_len, hidden, names_conflict, strides, Layout}, parallel::{extended, Slots}, Arg, Binary, Unary, CHUNK
 };
 use std::ops::Range;
 
@@ -15,8 +15,6 @@ pub enum Mapping {
     Linear(usize),
     /// The input fills the trailing result axes and repeats as one block.
     Tiled(usize),
-    /// Item `positions[i]` for position `i`.
-    Positions(Vec<usize>),
     /// The offsets that one entry for each result axis, outermost first, reach from `base`. An axis the input broadcasts along has step 0, and a `None` offset gives a fill.
     Steps { base: usize, steps: Vec<Steps> },
 }
@@ -65,7 +63,6 @@ impl Mapping {
             let (offset, steps) = Steps::per_axis(steps, shape)?;
             return Some((base + offset, steps));
         }
-        if matches!(self, Self::Positions(_)) { return None; }
         if let Self::Linear(period) | Self::Tiled(period) = *self {
             let n: usize = shape.iter().product();
             if period < n && period != 1 && !shape.iter().rev().scan(1, |p, &n| { *p *= n; Some(*p) }).any(|p| p == period) { return None; }
@@ -91,6 +88,12 @@ impl Mapping {
         let (base, steps) = outer.entries(frame)?;
         if base != 0 { return None; }
         self.through(&steps, shape)
+    }
+    /// [`Mapping::compose`], or else, where `table` allows it, the composed offsets as one table over `frame`'s positions, with a fill wherever either mapping reads one.
+    pub fn composed(&self, outer: &Self, shape: &[usize], frame: &[usize], table: bool) -> Option<Self> {
+        if let Some(mapping) = self.compose(outer, shape, frame) { return Some(mapping); }
+        let n: usize = frame.iter().product();
+        table.then(|| Self::Steps { base: 0, steps: vec![Steps::table((0..n).map(|k| outer.get(k).and_then(|j| self.get(j)).unwrap_or(Steps::FILL)).collect())] })
     }
     /// First item offset and signed item strides, where the mapping is affine over `shape`: each axis reads one regular run with no fill, as [`Steps::affine`] decides.
     pub fn affine(&self, shape: &[usize]) -> Option<(usize, Vec<isize>)> {
@@ -135,13 +138,16 @@ impl Mapping {
     #[inline]
     pub fn get(&self, i: usize) -> Option<usize> {
         Some(match self {
-            Self::Single => 0, Self::Linear(repeat) => i / repeat, Self::Tiled(size) => i % size, Self::Positions(positions) => positions[i],
+            Self::Single => 0, Self::Linear(repeat) => i / repeat, Self::Tiled(size) => i % size,
             Self::Steps { base, steps } => Steps::reach(*base, steps, i)?,
         })
     }
-    /// For a contraction such as a matrix product: the position on `right`'s axis `raxis` of each key on `left`'s axis `laxis`. Where the keys match, or either axis has none, positions pair in order.
+    /// For a contraction such as a matrix product: a one-axis mapping from each key on `left`'s axis `laxis` to its position on `right`'s axis `raxis`, as a table. Where the keys match, or either axis has none, positions pair in order.
     pub fn contract(left: &Layout, laxis: usize, right: &Layout, raxis: usize) -> Result<Self, Error> {
-        match (left.keys(laxis), right.keys(raxis)) { (Some(x), Some(y)) if x != y => Ok(Self::Positions(y.positions(x, false)?)), _ => Ok(Self::Linear(1)) }
+        match (left.keys(laxis), right.keys(raxis)) {
+            (Some(x), Some(y)) if x != y => Ok(Self::Steps { base: 0, steps: vec![Steps::table(y.positions(x, false)?)] }),
+            _ => Ok(Self::Linear(1)),
+        }
     }
     /// How `input` lays out over `result`, which has `count` items. Axis `a` of `input` is axis `axes[a]` of `result`.
     pub fn new(input: &Layout, axes: &[usize], result: &Layout, count: usize) -> Self {
@@ -181,10 +187,11 @@ impl Mapping {
             _ => 0,
         }
     }
-    /// Whether `expanded` copies most blocks of `block` items read through this mapping, rather than reading them where they lie: positions, and steps whose runs of adjacent offsets (`Steps::contiguous`) are shorter than a block, as a transpose's, a reversal's, windows' and a column slice's are. Repeats and cycles don't count: a run that stays inside one repeat or cycle reads in place, and the caller decides where runs end.
+    /// The number of positions over which this mapping repeats each item, or after which it cycles. `None` for one item, adjacent items and steps.
+    pub fn period(&self) -> Option<usize> { match *self { Self::Linear(r) if r > 1 => Some(r), Self::Tiled(m) => Some(m), _ => None } }
+    /// Whether `expanded` copies most blocks of `block` items read through this mapping, rather than reading them where they lie: steps whose runs of adjacent offsets (`Steps::contiguous`) are shorter than a block, as a transpose's, a reversal's, windows' and a column slice's are. Repeats and cycles don't count: a run that stays inside one repeat or cycle reads in place, and the caller decides where runs end.
     pub fn copies(&self, block: usize) -> bool {
         match self {
-            Self::Positions(_) => true,
             Self::Steps { steps, .. } => Steps::contiguous(steps) < block,
             _ => false,
         }
@@ -305,22 +312,16 @@ impl Frames {
     pub fn cell(&self, k: usize, i: usize) -> usize { self.cells[k][i] }
 }
 
-/// Item `i` of the frame, read from `data` through `mapping`.
-#[inline]
-fn item<A: Element>(mapping: &Mapping, data: &[A], i: usize) -> A { mapping.get(i).map_or(A::FILL, |j| data[j]) }
-
 /// The shortest broadcast block that runs as one call, where one argument repeats each of its items along the block. A shorter block expands into a chunk buffer instead, which measured faster than a call for each block of up to 5 items.
 const SHORT_REPEATED: usize = 6;
 /// The shortest broadcast block that runs as one call, where an argument cycles and no argument repeats its items. A shorter block expands into a chunk buffer, which measured faster than a call for each block of up to 12 items.
 const SHORT_CYCLED: usize = 16;
+/// The shortest repeat or cycle at which runs of positions end with its periods, so that a read takes the repeated item, or the cycle's items, where they lie. A shorter repeat or cycle fills the run's buffer. On a broadcast `clip` through `read_runs`, reading a repeat of 128 as one item cost about 20% less than filling it, and a repeat of 64 cost about the same either way.
+const LONG_PERIOD: usize = 128;
 /// Bytes in a cache line on the Apple processors that rustymath is tuned on. An x86-64 line holds half as many.
 pub(crate) const LINE: usize = 128;
 /// The most items in a block of whole rows from [`Mapping::line_block`].
 const LINE_BLOCK: usize = 1 << 16;
-
-/// `f` on each block of `n` of a frame's `len` items, with the block's number and length, until a call fails. Gives whether every call succeeded. After a failure, the caller discards every block's results.
-#[inline]
-pub fn each_block(len: usize, n: usize, mut f: impl FnMut(usize, usize) -> bool) -> bool { (0..len.div_ceil(n)).all(|k| f(k, n.min(len - k * n))) }
 
 /// Runs `leaf` over a frame of `len` items that one argument lays out through `mapping`, appending its results to `out` in order, and gives whether every call succeeded. Ranges of the frame run in parallel, and `leaf` writes each range's results into its slots. Contiguous arguments and long enough broadcast blocks go to `leaf` whole, as in [`blocks`]. Other mappings expand a run of items at a time, as `chunks` sizes it, into a buffer for each range.
 #[inline]
@@ -332,12 +333,13 @@ pub fn block<Y: Element, B: Copy + Send>(
         match *mapping {
             Single => leaf(One(y[0]), range.len(), slots),
             Linear(1) => leaf(Many(&y[range.clone()]), range.len(), slots),
-            Linear(r) if r >= SHORT_REPEATED => periods(range, r, |k, p| leaf(One(y[k]), p.len(), slots)),
-            Tiled(m) if m >= SHORT_CYCLED => periods(range, m, |k, p| leaf(Many(&y[p.start - k * m..p.end - k * m]), p.len(), slots)),
-            _ => {
-                let mut ys = Vec::new();
-                chunks(range, &[(mapping, size_of::<Y>())], |at, n| leaf(expanded(mapping, y, at, n, &mut ys), n, slots))
-            }
+            _ => match by_periods([mapping]) {
+                Some((p, [w])) => periods(range, p, |k, part| leaf(w.items(y, k, &part), part.len(), slots)),
+                None => {
+                    let mut ys = Vec::new();
+                    chunks(range, &[(mapping, size_of::<Y>())], &mut |at, n| leaf(expanded(mapping, y, at, n, &mut ys), n, slots))
+                }
+            },
         }
     })
 }
@@ -361,16 +363,13 @@ fn paired<X: Element, Y: Element, B>(
         (Single, Linear(1)) => leaf(One(x[0]), Many(&y[range]), n, out),
         (Linear(1), Single) => leaf(Many(&x[range]), One(y[0]), n, out),
         (Linear(1), Linear(1)) => leaf(Many(&x[range.clone()]), Many(&y[range]), n, out),
-        (Linear(r), Tiled(m)) if r == m && *m >= SHORT_REPEATED => periods(range, *m, |k, p| leaf(One(x[k]), Many(&y[p.start - k * m..p.end - k * m]), p.len(), out)),
-        (Tiled(m), Linear(r)) if r == m && *m >= SHORT_REPEATED => periods(range, *m, |k, p| leaf(Many(&x[p.start - k * m..p.end - k * m]), One(y[k]), p.len(), out)),
-        (Linear(1), Linear(r)) if *r >= SHORT_REPEATED => periods(range, *r, |k, p| leaf(Many(&x[p.clone()]), One(y[k]), p.len(), out)),
-        (Linear(r), Linear(1)) if *r >= SHORT_REPEATED => periods(range, *r, |k, p| leaf(One(x[k]), Many(&y[p.clone()]), p.len(), out)),
-        (Linear(1), Tiled(m)) if *m >= SHORT_CYCLED => periods(range, *m, |k, p| leaf(Many(&x[p.clone()]), Many(&y[p.start - k * m..p.end - k * m]), p.len(), out)),
-        (Tiled(m), Linear(1)) if *m >= SHORT_CYCLED => periods(range, *m, |k, p| leaf(Many(&x[p.start - k * m..p.end - k * m]), Many(&y[p.clone()]), p.len(), out)),
-        _ => {
-            let (mut xs, mut ys) = (Vec::new(), Vec::new());
-            chunks(range, &[(left, size_of::<X>()), (right, size_of::<Y>())], |at, n| leaf(expanded(left, x, at, n, &mut xs), expanded(right, y, at, n, &mut ys), n, out))
-        }
+        _ => match by_periods([left, right]) {
+            Some((p, [l, r])) => periods(range, p, |k, part| leaf(l.items(x, k, &part), r.items(y, k, &part), part.len(), out)),
+            None => {
+                let (mut xs, mut ys) = (Vec::new(), Vec::new());
+                chunks(range, &[(left, size_of::<X>()), (right, size_of::<Y>())], &mut |at, n| leaf(expanded(left, x, at, n, &mut xs), expanded(right, y, at, n, &mut ys), n, out))
+            }
+        },
     }
 }
 
@@ -379,38 +378,99 @@ fn periods(range: Range<usize>, p: usize, mut f: impl FnMut(usize, Range<usize>)
     (range.start / p..range.end.div_ceil(p)).fold(true, |ok, k| f(k, range.start.max(k * p)..range.end.min(k * p + p)) & ok)
 }
 
-/// `f` on each run of positions of `range`, with the run's first position and length. A run holds `CHUNK` positions, or more where one of `reads`, each a mapping with the size of the items it reads, asks for whole rows through `Mapping::line_block`. Gives whether every call succeeded. It calls `f` on every run even after a failure, so that every slot gets written.
-pub(crate) fn chunks(range: Range<usize>, reads: &[(&Mapping, usize)], mut f: impl FnMut(usize, usize) -> bool) -> bool {
-    let len = reads.iter().fold(CHUNK, |n, &(mapping, size)| n.max(mapping.line_block(size)));
-    range.clone().step_by(len).fold(true, |ok, at| f(at, len.min(range.end - at)) & ok)
+/// How an argument's items lie within each period of a frame that runs a period at a time: in the frame's own order, as one item repeated over the period, or as a cycle of `m` items that starts again each period.
+#[derive(Clone, Copy)]
+enum Within { Same, Repeated, Cycled(usize) }
+
+impl Within {
+    /// How `mapping` lays its items within its periods. `None` for a mapping that neither reads in order, repeats nor cycles.
+    fn of(mapping: &Mapping) -> Option<Self> {
+        match *mapping { Mapping::Linear(1) => Some(Self::Same), Mapping::Linear(_) => Some(Self::Repeated), Mapping::Tiled(m) => Some(Self::Cycled(m)), _ => None }
+    }
+
+    /// The items of `x` over positions `part` of period `k`.
+    #[inline(always)]
+    fn items<'a, X: Copy>(self, x: &'a [X], k: usize, part: &Range<usize>) -> Arg<'a, X> {
+        match self { Self::Same => Arg::Many(&x[part.clone()]), Self::Repeated => Arg::One(x[k]), Self::Cycled(m) => Arg::Many(&x[part.start - k * m..part.end - k * m]) }
+    }
 }
 
-/// `f` on the frame of `len` items that one argument lays out through `mapping`, with the argument's items read as `A`, appended to `out`. Gives whether every result succeeded. Ranges of the frame run in parallel. Items that already have type `A` go to `f` as [`block`] passes them. Items of another type convert a run at a time, as `chunks` sizes it, into buffers for each range.
+/// The period at which `mappings` run as one call for each period, with how each lays its items within it. Every mapping must read in order, repeat or cycle, those that repeat or cycle must share the period, and the period must be long enough that a call for each period beats expanding it: `SHORT_REPEATED` where a mapping repeats, and `SHORT_CYCLED` otherwise.
+fn by_periods<const N: usize>(mappings: [&Mapping; N]) -> Option<(usize, [Within; N])> {
+    let mut ps = mappings.iter().filter_map(|m| m.period());
+    let p = ps.next()?;
+    if ps.any(|q| q != p) { return None; }
+    let short = if mappings.iter().any(|m| matches!(**m, Mapping::Linear(r) if r > 1)) { SHORT_REPEATED } else { SHORT_CYCLED };
+    let within = mappings.map(Within::of);
+    (p >= short && within.iter().all(Option::is_some)).then(|| (p, within.map(|w| w.unwrap_or(Within::Same))))
+}
+
+/// `f` on each run of positions of `range`, with the run's first position and length. A run holds `CHUNK` positions, or more where one of `reads`, each a mapping with the size of the items it reads, asks for whole rows through `Mapping::line_block`. Where a read repeats each item, or cycles, over at least `LONG_PERIOD` positions, runs also end where its periods do, so that it reads its item, or its cycle's items, where they lie (`in_place`). Periods under leading-axis agreement nest, so runs end where the shortest such period does. Gives whether every call succeeded. It calls `f` on every run even after a failure, so that every slot gets written. It takes `f` as `dyn` and stays out of line, so it compiles once.
+#[inline(never)]
+pub(crate) fn chunks(range: Range<usize>, reads: &[(&Mapping, usize)], f: &mut dyn FnMut(usize, usize) -> bool) -> bool {
+    let len = reads.iter().fold(CHUNK, |n, &(mapping, size)| n.max(mapping.line_block(size)));
+    let mut runs = |part: Range<usize>| part.clone().step_by(len).fold(true, |ok, at| f(at, len.min(part.end - at)) & ok);
+    match reads.iter().filter_map(|&(mapping, _)| mapping.period()).filter(|&p| p >= LONG_PERIOD).min() {
+        Some(p) => periods(range, p, |_, part| runs(part)),
+        None => runs(range),
+    }
+}
+
+/// `f` on the frame of `len` items that one argument lays out through `mapping`, with the argument's items read as `A`, appended to `out`. Gives whether every result succeeded. Ranges of the frame run in parallel. Items that already have type `A` go to `f` as [`block`] passes them. Items of another type convert a run at a time, through [`read_runs`].
 #[inline]
 pub fn map1<A: Element, Y: Source<A>, B: Copy + Send>(y: &[Y], mapping: &Mapping, len: usize, f: &(impl Unary<A, Out = B> + Sync), out: &mut Vec<B>) -> bool {
     if let Some(y) = Y::borrowed(y) { return block(y, mapping, len, out, |y, n, o| f.many_into(y, n, o)); }
-    extended(out, len, CHUNK, &|range, slots| {
-        let (mut ye, mut ys) = (Vec::new(), Vec::new());
-        chunks(range, &[(mapping, size_of::<Y>())], |at, n| f.many_into(read_mapped(mapping, y, at, n, &mut ye, &mut ys), n, slots))
-    })
+    read_runs([&Side::new(y, mapping)], len, out, &|[y], n, o| f.many_into(y, n, o))
 }
 
-/// `f` on the frame of `agreement`, with both arguments' items read as `A`, appended to `out`. Gives whether every result succeeded. Ranges of the frame run in parallel. Where both arguments' items already have type `A`, `f` takes them as [`blocks`] passes them. Otherwise `f` takes a run of pairs at a time, as `chunks` sizes it, converted into buffers for each range.
+/// `f` on the frame of `agreement`, with both arguments' items read as `A`, appended to `out`. Gives whether every result succeeded. Ranges of the frame run in parallel. Where both arguments' items already have type `A`, `f` takes them as [`blocks`] passes them. Otherwise `f` takes a run of pairs at a time, through [`read_runs`].
 #[inline]
 pub fn map2<A: Element, X: Source<A>, Y: Source<A>, B: Copy + Send, L>(x: &[X], y: &[Y], agreement: &Agreement<L>, f: &(impl Binary<A, Out = B> + Sync), out: &mut Vec<B>) -> bool {
     if let (Some(x), Some(y)) = (X::borrowed(x), Y::borrowed(y)) { return blocks(x, y, agreement, out, |x, y, n, o| f.many_into(x, y, n, o)); }
-    let (left, right) = (&agreement.left, &agreement.right);
-    extended(out, agreement.len, CHUNK, &|range, slots| {
-        let (mut xe, mut ye, mut xs, mut ys) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        chunks(range, &[(left, size_of::<X>()), (right, size_of::<Y>())], |at, n| f.many_into(read_mapped(left, x, at, n, &mut xe, &mut xs), read_mapped(right, y, at, n, &mut ye, &mut ys), n, slots))
+    read_runs([&Side::new(x, &agreement.left), &Side::new(y, &agreement.right)], agreement.len, out, &|[x, y], n, o| f.many_into(x, y, n, o))
+}
+
+/// One argument of a call, read a run of the frame's positions at a time as items of type `A`. A reader holds no buffers, so one reader serves every range of a parallel loop. A loop that takes readers as `dyn Read<A>` compiles once for `A`, whatever types the arguments' items have.
+pub trait Read<A>: Sync {
+    /// Items `start..start + n` of the argument, as its mapping lays them over the frame. Items that the read copies or converts go into `buf`.
+    fn read<'b>(&'b self, start: usize, n: usize, buf: &'b mut Vec<A>) -> Arg<'b, A>;
+    /// The argument's one item, where every position of the frame reads it.
+    fn constant(&self) -> Option<A>;
+    /// The mapping that the argument reads through, and the size of its items, which together size a run (`chunks`).
+    fn reads(&self) -> (&Mapping, usize);
+}
+
+/// An argument's items and the mapping that lays them over the frame. It reads them as any type they convert to through [`Source`].
+pub struct Side<'a, X> { data: &'a [X], mapping: &'a Mapping }
+
+impl<'a, X> Side<'a, X> {
+    pub fn new(data: &'a [X], mapping: &'a Mapping) -> Self { Self { data, mapping } }
+}
+
+impl<A: Element, X: Source<A>> Read<A> for Side<'_, X> {
+    #[inline]
+    fn read<'b>(&'b self, start: usize, n: usize, buf: &'b mut Vec<A>) -> Arg<'b, A> { read_mapped(self.mapping, self.data, start, n, buf) }
+    fn constant(&self) -> Option<A> { matches!(self.mapping, Mapping::Single).then(|| self.data[0].read()) }
+    fn reads(&self) -> (&Mapping, usize) { (self.mapping, size_of::<X>()) }
+}
+
+/// `leaf` on the frame of `len` positions, a run at a time, with the items that each of `readers` reads for the run. It appends the results to `out` in order, and gives whether every call succeeded. Ranges of the frame run in parallel, each with its own buffers. Runs take the sizes that `chunks` gives them, and every run is written even after a failure. The readers and `leaf` are `dyn`, so the loop compiles once for each item type `A`, result type `B` and number of readers, whatever the arguments' types and the kernel. A call through them costs little next to a run's items.
+pub fn read_runs<A: Element, B: Copy + Send, const N: usize>(readers: [&dyn Read<A>; N], len: usize, out: &mut Vec<B>, leaf: &(dyn Fn([Arg<'_, A>; N], usize, &mut Slots<'_, B>) -> bool + Sync)) -> bool {
+    let reads = readers.map(|r| r.reads());
+    extended(out, len, CHUNK, &|range, slots| {
+        let mut bufs: [Vec<A>; N] = std::array::from_fn(|_| Vec::new());
+        chunks(range, &reads, &mut |at, n| {
+            let mut k = 0;
+            leaf(bufs.each_mut().map(|buf| { k += 1; readers[k - 1].read(at, n, buf) }), n, slots)
+        })
     })
 }
 
-/// Items `start..start + n` of the frame that `mapping` lays `data` over, read as `A`. A mapping that doesn't read `data` in order expands into `spread`, and items of another type convert into `buf`.
+/// Items `start..start + n` of the frame that `mapping` lays `data` over, read as `A`. Items that the read copies or converts go into `buf`. Items of another type that need copying expand first into a buffer of their own type, which the call allocates, so that a reader holds no buffers.
 #[inline]
-pub fn read_mapped<'a, A: Element, X: Source<A>>(mapping: &Mapping, data: &'a [X], start: usize, n: usize, spread: &'a mut Vec<X>, buf: &'a mut Vec<A>) -> Arg<'a, A> {
+fn read_mapped<'a, A: Element, X: Source<A>>(mapping: &Mapping, data: &'a [X], start: usize, n: usize, buf: &'a mut Vec<A>) -> Arg<'a, A> {
     if let Some(data) = X::borrowed(data) { return expanded(mapping, data, start, n, buf); }
-    expanded(mapping, data, start, n, spread).converted(0, n, buf, X::read)
+    expanded(mapping, data, start, n, &mut Vec::new()).converted(0, n, buf, <X as Source<A>>::read)
 }
 
 /// The one item that every position in `start..start + n` reads, where `mapping` repeats a single item over all of them. `None` where the positions read more than one item.
@@ -435,33 +495,22 @@ pub fn in_place<'a, A: Copy>(mapping: &Mapping, data: &'a [A], start: usize, n: 
     }
 }
 
-/// Items `start..start + n` of an argument that `mapping` lays out over the frame, read `in_place` where they can be. Others copy into `buf`. A repeated item finds its source by a strength-reduced division, which multiplies in place of dividing. A cycled argument writes one period, then copies what it has written until `buf` is full. A `Steps` mapping copies through `walk_range`.
+/// Items `start..start + n` of an argument that `mapping` lays out over the frame, read `in_place` where they can be. Others copy into `buf`. A repeated item fills each of its periods. A cycled argument copies through `gather::cycled`, and a `Steps` mapping through `walk_range`.
 pub fn expanded<'a, A: Element>(mapping: &Mapping, data: &'a [A], start: usize, n: usize, buf: &'a mut Vec<A>) -> Arg<'a, A> {
     if let Some(arg) = in_place(mapping, data, start, n) { return arg; }
-    if let Mapping::Steps { base, ref steps } = *mapping {
-        buf.clear();
-        walk_range(buf, data, base, steps, A::FILL, start, n, Same);
-        return Arg::Many(&buf[..n]);
-    }
-    if buf.len() < n { buf.resize(n, A::FILL) }
-    let out = &mut buf[..n];
+    Arg::Many(copied(mapping, data, start, n, buf))
+}
+
+/// Items `start..start + n` that `expanded` copies into `buf`, cleared first. It's out of line, so it compiles once for each item type rather than in each caller.
+#[inline(never)]
+fn copied<'a, A: Element>(mapping: &Mapping, data: &[A], start: usize, n: usize, buf: &'a mut Vec<A>) -> &'a [A] {
+    buf.clear();
     match *mapping {
-        Mapping::Linear(r) => {
-            let r = strength_reduce::StrengthReducedUsize::new(r);
-            for (i, slot) in out.iter_mut().enumerate() { *slot = data[(start + i) / r] }
-        }
-        Mapping::Tiled(m) => {
-            let period = m.min(n);
-            for (i, slot) in out[..period].iter_mut().enumerate() { *slot = data[(start + i) % m] }
-            let mut filled = period;
-            while filled < n {
-                let more = filled.min(n - filled);
-                out.copy_within(..more, filled);
-                filled += more;
-            }
-        }
-        _ => { for (i, slot) in out.iter_mut().enumerate() { *slot = item(mapping, data, start + i) } }
+        Mapping::Single => buf.resize(n, data[0]),
+        Mapping::Linear(r) => { periods(start..start + n, r, |k, p| { buf.resize(buf.len() + p.len(), data[k]); true }); }
+        Mapping::Tiled(m) => cycled(buf, &data[..m], start, n),
+        Mapping::Steps { base, ref steps } => walk_range(buf, data, base, steps, A::FILL, start, n, Same),
     }
-    Arg::Many(out)
+    &buf[..n]
 }
 

@@ -12,7 +12,7 @@ use std::borrow::Cow;
 use std::ops::Range;
 
 /// Groups the selected axes into one reduction axis, and keeps the other axes' metadata. One axis, or consecutive axes, needs no copy. Nonconsecutive axes gather through the ordinary transpose plan.
-pub struct Axes { pub dims: [usize; 3], pub layout: Layout, steps: Option<Vec<Steps>> }
+pub struct Axes { pub dims: [usize; 3], pub layout: Layout, shape: Vec<usize>, steps: Option<Vec<Steps>> }
 
 impl Axes {
     pub fn new(layout: &Layout, axes: &[usize]) -> Result<Self, Error> {
@@ -25,12 +25,12 @@ impl Axes {
         let result = layout.axes(remaining.iter().copied());
         let (first, end) = axes.first().zip(axes.last()).map_or((0, 0), |(&a, &b)| (a, b + 1));
         if end - first == axes.len() {
-            return Ok(Self { dims: [shape[..first].iter().product(), shape[first..end].iter().product(), shape[end..].iter().product()], layout: result, steps: None });
+            return Ok(Self { dims: [shape[..first].iter().product(), shape[first..end].iter().product(), shape[end..].iter().product()], layout: result, shape: shape.to_vec(), steps: None });
         }
         let mut destinations = vec![0; shape.len()];
         for (to, &from) in remaining.iter().chain(&axes).enumerate() { destinations[from] = to; }
         let plan = crate::structure::transpose(layout, &destinations)?;
-        Ok(Self { dims: [remaining.iter().map(|&a| shape[a]).product(), axes.iter().map(|&a| shape[a]).product(), 1], layout: result, steps: Some(plan.steps) })
+        Ok(Self { dims: [remaining.iter().map(|&a| shape[a]).product(), axes.iter().map(|&a| shape[a]).product(), 1], layout: result, shape: shape.to_vec(), steps: Some(plan.steps) })
     }
 
     pub fn read<'a, T: Element>(&self, data: &'a [T]) -> Cow<'a, [T]> {
@@ -40,10 +40,14 @@ impl Axes {
         Cow::Owned(out)
     }
 
-    /// Each item's offset in the source, computed once, where nonconsecutive axes gather. `None` where the items read in order.
-    fn sources(&self) -> Option<Vec<usize>> {
-        let steps = self.steps.as_ref()?;
-        Some(Steps::combined(0, steps))
+    /// The offsets that `mapping` reads, in the order the reduction reads its items: one entry per axis where the mapping and the axes compose, otherwise a table.
+    fn plan(&self, mapping: &Mapping) -> (usize, Vec<Steps>) {
+        let frame: Vec<usize> = self.steps.as_ref().map_or_else(|| self.shape.clone(), |steps| steps.iter().map(Steps::len).collect());
+        let ordered = match &self.steps {
+            Some(steps) => mapping.composed(&Mapping::Steps { base: 0, steps: steps.clone() }, &self.shape, &frame, true).expect("a table always composes"),
+            None => mapping.clone(),
+        };
+        ordered.entries(&frame).unwrap_or_else(|| (0, vec![Steps::table((0..frame.iter().product()).map(|j| ordered.get(j).unwrap_or(Steps::FILL)).collect())]))
     }
 }
 
@@ -129,15 +133,16 @@ pub fn norm<T: Scalar>(data: &[T], dims: [usize; 3], p: f64) -> Vec<T::Real> {
 }
 
 /// Weighted means. The two mappings broadcast `data` and `weights` into an array of `dims`. Weights may be real or complex; a zero total weight gives the ordinary floating-point quotient.
-pub fn average<T: Scalar>(data: &[T], weights: &[T], axes: &Axes, mappings: [&Mapping; 2]) -> Vec<T> where Sum: Reduction<T, Total = T> {
-    let dims = axes.dims;
-    let at = |x: &[T], mapping: &Mapping, j| mapping.get(j).map_or(T::zero(), |i| x[i]);
-    let sources = axes.sources();
-    let source = |j: usize| sources.as_ref().map_or(j, |s| s[j]);
-    let mut sums = mapped::<_, Sum>(dims, |range, out| out.extend(range.map(#[inline(always)] |j| {
-        let j = source(j); at(data, mappings[0], j) * at(weights, mappings[1], j)
-    })));
-    let totals = mapped::<_, Sum>(dims, |range, out| out.extend(range.map(#[inline(always)] |j| at(weights, mappings[1], source(j)))));
+pub fn average<T: Scalar + Element>(data: &[T], weights: &[T], axes: &Axes, mappings: [&Mapping; 2]) -> Vec<T> where Sum: Reduction<T, Total = T> {
+    let [(xbase, xsteps), (wbase, wsteps)] = mappings.map(|mapping| axes.plan(mapping));
+    let read = |x: &[T], base, steps: &[Steps], range: Range<usize>, out: &mut Vec<T>| gather::walk_range(out, x, base, steps, T::zero(), range.start, range.len(), gather::Same);
+    let mut sums = mapped::<_, Sum>(axes.dims, |range, out| {
+        read(data, xbase, &xsteps, range.clone(), out);
+        let mut w = Vec::with_capacity(range.len());
+        read(weights, wbase, &wsteps, range, &mut w);
+        for (x, w) in out.iter_mut().zip(w) { *x = *x * w; }
+    });
+    let totals = mapped::<_, Sum>(axes.dims, |range, out| read(weights, wbase, &wsteps, range, out));
     for (sum, weight) in sums.iter_mut().zip(totals) { *sum = sum.quotient(weight); }
     sums
 }

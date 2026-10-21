@@ -1,5 +1,5 @@
 //! Exact arithmetic on Python integers and `fractions.Fraction`. An argument is an `int`, a `Fraction`, nested lists or tuples of them, or a buffer of integers or Booleans, such as a NumPy array. Results are Fractions, in nested lists for arrays. Elementwise functions pair their arguments' axes as rustymath broadcasts them: axes with the same name first, then the rest from the front. Matrix functions take one matrix, not stacks. Long operations poll for Ctrl-C.
-use crate::convert::{Arg, Collect, walked};
+use crate::convert::Arg;
 use crate::integer::radix;
 use num_rational::BigRational;
 use num_traits::{One, ToPrimitive};
@@ -8,7 +8,7 @@ use rustymath::agreement::Agreement;
 use rustymath::error::{Error, Kind};
 use rustymath::layout::Layout;
 use rustymath::{exact, linalg::exact as matrix, polynomial};
-use rustymath_buffer::{py_err, read};
+use rustymath_buffer::{py_err, read, walk::{Collect, walked}};
 
 type R = BigRational;
 
@@ -23,13 +23,17 @@ fn inexact() -> PyErr { PyTypeError::new_err("exact arithmetic takes integers an
 /// One part of nested exact values: one value, or the integers of a buffer.
 struct Rationals(Vec<R>);
 
-impl Collect for Rationals {
-    fn int(n: i128) -> Self { Self(vec![R::from_integer(n.into())]) }
-    fn piece(obj: &Bound<'_, PyAny>) -> PyResult<Option<(Self, Vec<usize>)>> {
+/// The collector for exact values.
+struct Exact;
+
+impl Collect for Exact {
+    type Piece = Rationals;
+    fn int(&mut self, n: i128) -> Rationals { Rationals(vec![R::from_integer(n.into())]) }
+    fn piece(&mut self, obj: &Bound<'_, PyAny>) -> PyResult<Option<(Rationals, Vec<usize>)>> {
         if let Some(r) = read(obj)? {
             if !r.view().is_empty() && !r.view().dtype().is_integral() { return Err(inexact()); }
             let shape = r.shape().to_vec();
-            return Ok(Some((Self(Arg::from(r).items::<i64>()?.iter().map(|&n| R::from_integer(n.into())).collect()), shape)));
+            return Ok(Some((Rationals(Arg::from(r).items::<i64>()?.iter().map(|&n| R::from_integer(n.into())).collect()), shape)));
         }
         let value = if obj.is_instance_of::<PyInt>() {
             R::from_integer(obj.extract()?)
@@ -40,13 +44,13 @@ impl Collect for Rationals {
         } else {
             return Ok(None);
         };
-        Ok(Some((Self(vec![value]), vec![])))
+        Ok(Some((Rationals(vec![value]), vec![])))
     }
 }
 
 /// The layout and values of `x`.
 fn values(x: &Bound<'_, PyAny>) -> PyResult<(Layout, Vec<R>)> {
-    let (layout, pieces) = walked::<Rationals>(x)?;
+    let (layout, pieces) = walked(x, &mut Exact)?;
     Ok((layout, pieces.into_iter().flat_map(|p| p.0).collect()))
 }
 

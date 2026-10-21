@@ -56,7 +56,7 @@ pub fn correlation(input: &[usize], kernel: &[usize], slide: usize, mode: Mode, 
     let padding = widths.iter().any(|&w| w != (0, 0)).then(|| structure::pad(&layout, &widths)).transpose()?;
     let padded = padding.as_ref().map_or(&layout, |p| &p.layout);
     let signed = |n: &[usize]| n.iter().map(|&n| i64::try_from(n).unwrap_or(i64::MAX)).collect::<Vec<_>>();
-    let slid = Windows::new(&signed(window), &signed(stride), |_| false, padded.shape())?;
+    let slid = Windows::new(&signed(window), &signed(stride), |_| None, padded.shape())?;
     let windows = slid.plan(padded, padded.shape())?;
     let at = strides(kernel);
     let steps = (0..kernel.len()).map(|a| match a < slide && flip {

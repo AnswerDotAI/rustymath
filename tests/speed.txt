@@ -1,173 +1,340 @@
 # The budgets that `tests/speed.rs` checks. Each section starts with an item type in brackets. Each line under it holds a function's name and its two native budgets at that type, separated by tabs: first for macOS on Apple silicon, where matrix products and decompositions run on Accelerate, then for Linux on CI's x86 runner, where they run on rustymath's own kernels. `rustymath::timing::NATIVE_COLUMN` picks the budget a machine checks. A budget counts copies of as many items as the function's inputs hold, or its output for broadcasting.
-# The macOS budget is twice the most the function has cost on a Mac. The Linux budget is twice the most it has cost on CI's runner. Each is at least 0.5. `basedpl.bpltests.set_budgets` rewrites each budget from the runs on its own platform.
-# A function that CI hasn't timed yet has a Linux budget of four times its Mac cost with rustymath's own kernels, timed with `native=True`, and at least 0.5. `set_budgets` applies this rule with `untimed=True`. The next CI run that logs costs, a push's `Test` run or a `Speed` run, sets its Linux budget under the rule above.
-# The CI figures come from the `Test` and `Speed` runs that last set each budget. Every one ran on the AMD Ryzen 9 7950X3D 16-Core Processor.
+# An initial budget is twice what a first-principles analysis says the function should cost, and at least 0.5. A later budget comes from a fuller understanding of the function than that analysis gives, such as a platform difference or a cost the analysis missed. A comment above each function, or above its group, gives the expected cost and its reason, as in "1 copy: one read and one write per item", and records each later change with its reason. `basedpl.bpltests.set_budgets` writes budgets from expected costs.
+# One expected cost serves both platforms at first. A platform's budget differs only where a specific difference on that platform is found, such as Accelerate's matrix products on macOS.
+# A function that costs more than its budget needs study, which finds either a speed bug to fix or something the analysis missed. Avoid raising a budget to match a run without understanding why the function costs what it does.
+# CI's x86 runner is an AMD Ryzen 9 7950X3D 16-Core Processor.
 [f64]
-Exp	14	15
-Expm1	18	18
-Ln	23	22
-Log1p	31	35
-Log2	23	23
-Log10	23	23
-Sin	13	15
-Cos	15	16
-Tan	19	21
-Asin	16	16
-Acos	18	18
-Atan	16	17
-Sinh	22	26
-Cosh	16	17
-Tanh	21	25
-Asinh	26	28
-Acosh	27	34
-Atanh	24	28
-Cbrt	19	19
-Pow	50	48
-Pow.one	76	83
-Hypot	9.1	9.2
-Root	53	58
-Root.one	76	87
-Maximum	3.2	3.1
-reduce::sum	1.1	1.1
-reduce::max	1.1	1.6
-reduce::cumsum	2.5	3.5
-reduce::cummax	2.2	3.4
-polynomial::evaluate	8.6	8.6
-Gamma	330	320
-Lgamma	160	160
-Erf	51	56
-Erfc	120	120
-Erfinv	54	65
-Erfcinv	55	67
-Gammainc	1300	1700
-Gammaincc	1200	1700
-Gammaincinv	3800	5300
-Betainc	3000	4200
-Betaincinv	8700	13000
-complex Exp	38	43
-complex Ln	63	61
-complex Sqrt	18	21
-complex Sin	43	52
-complex Tan	45	61
-complex Asin	72	94
-complex Atanh	54	66
-complex Lgamma	200	350
-complex Gamma	280	480
-complex Abs	5.1	5
-complex Sqrt1mx2	53	62
-complex Pow	110	130
-linalg::PlusTimes	23	140
-linalg::MaxPlus	300	290
-linalg::MinPlus	280	300
-linalg::PlusEqual	290	280
-linalg::PlusTimes at i64	31	160
-linalg::PlusEqual at i64	290	280
-search::view_sort_along	280	280
-search::view_sort_along long lanes	230	220
-search::view_partition_along	35	66
-search::view_quantiles_along	65	130
-stats::variance	4.5	4.5
-stats::average	74	330
-linalg::Lu::solve	53	110
-linalg::Lu::inverse	89	300
-linalg::cholesky	28	56
-linalg::qr	130	490
-linalg::svd	970	2000
-linalg::eigh	660	1300
-linalg::eig	3600	5100
-linalg::eigenvalues	2400	2700
-linalg::lstsq	69	68
-complex linalg::Lu::solve	58	100
-complex linalg::qr	180	510
-complex linalg::svd	1100	1600
-complex linalg::eigh	1100	880
-complex linalg::eig	4600	4800
-Clip	4.2	4.5
-Choose	4.1	5.5
-[f32]
-Exp	12	12
-Expm1	16	15
-Ln	20	20
-Log1p	27	28
-Log2	20	20
-Log10	20	20
-Sin	12	12
+# 7 copies, for 28 vector ops: clamp, reduction by ln 2, a degree-9 polynomial, scaling by 2^n.
+Exp	14	14
+# 8.5 copies, for 34 vector ops: exp's steps with a longer polynomial near 0.
+Expm1	17	17
+# 8 copies, for 32 vector ops: split into mantissa and exponent, one division, a series in s², the combine.
+Ln	16	16
+# 10 copies, for 40 vector ops: ln's steps plus the correction for 1 + x.
+Log1p	20	20
+# 8.5 copies, for 34 vector ops: ln's steps with a scaled combine.
+Log2	17	17
+# 8.5 copies, for 34 vector ops: ln's steps with a scaled combine.
+Log10	17	17
+# 6.5 copies, for 26 vector ops: reduction by π/2, a polynomial, the quadrant.
+Sin	13	13
+# 7 copies, for 28 vector ops: sin's steps with a shifted quadrant.
 Cos	14	14
+# 8 copies, for 32 vector ops: reduction, a polynomial, a division.
 Tan	16	16
-Asin	11	11
-Acos	13	13
-Atan	12	13
-Sinh	18	19
-Cosh	13	14
-Tanh	18	18
-Asinh	22	23
-Acosh	24	26
-Atanh	20	20
-Cbrt	19	18
-Pow	56	55
-Pow.one	83	76
-Hypot	9.1	9.2
-Root	56	62
-Root.one	81	110
-Maximum	3.1	3.3
-reduce::sum	1.2	1.2
-reduce::max	1.2	1.5
-reduce::cumsum	3.6	6.3
-reduce::cummax	2.4	3.8
-polynomial::evaluate	7.8	7.2
-Gamma	170	170
-Lgamma	140	140
-Erf	29	31
-Erfc	89	110
-Erfinv	51	61
-Erfcinv	51	62
-Gammainc	1300	1400
-Gammaincc	920	1400
-Gammaincinv	7400	11000
-Betainc	6000	8300
-Betaincinv	18000	26000
-complex Exp	47	52
-complex Ln	59	62
-complex Sqrt	17	23
-complex Sin	43	47
-complex Tan	47	70
-complex Asin	76	120
-complex Atanh	60	74
-complex Lgamma	330	640
-complex Gamma	470	810
-complex Abs	5.1	5.1
-complex Sqrt1mx2	59	92
+# 7.5 copies, for 30 vector ops: a square root past 1/2, a polynomial, selects.
+Asin	15	15
+# 8 copies, for 32 vector ops: asin's steps and a reflection.
+Acos	16	16
+# 7 copies, for 28 vector ops: a reduction by division, a polynomial, selects.
+Atan	14	14
+# 10 copies, for 40 vector ops: expm1, a division, selects.
+Sinh	20	20
+# 8 copies, for 32 vector ops: exp and its reciprocal.
+Cosh	16	16
+# 10 copies, for 40 vector ops: expm1 and a division.
+Tanh	20	20
+# 11.5 copies, for 46 vector ops: ln, a square root, selects.
+Asinh	23	23
+# 11.5 copies, for 46 vector ops: ln and a square root.
+Acosh	23	23
+# 10.5 copies, for 42 vector ops: log1p of a quotient.
+Atanh	21	21
+# 9 copies, for 36 vector ops: split, a polynomial, two Newton steps with divisions.
+Cbrt	18	18
+# 27.5 copies, for 110 vector ops: double-word ln and exp, special cases.
+Pow	55	55
+# 55 copies, for Pow's 110 ops as scalar code, pair by pair, at half a copy each.
+Pow.one	110	110
+# 4 copies, for 16 vector ops: scaling, a square root, a division; two reads and a write take 1.5.
+Hypot	8	8
+# 28 copies, for Pow's steps with a reciprocal power.
+Root	56	56
+# 55 copies, for Root as scalar code, pair by pair.
+Root.one	110	110
+# 1.5 copies, for two reads and one write per item.
+Maximum	3	3
+# 0.5 copies, for one read per item.
+reduce::sum	1	1
+# 0.5 copies, for one read per item.
+reduce::max	1	1
+# 1 copies, for one read and one write per item; the scan runs in vector steps.
+reduce::cumsum	2	2
+# 1 copies, for one read and one write per item; the scan runs in vector steps.
+reduce::cummax	2	2
+# 3.75 copies, for the negate (1), a read and write in place (1), 7 FMAs (1.75).
+polynomial::evaluate	7.5	7.5
+# 132 copies, for 530 vector ops: a double-word Lanczos sum and quotient, double-word ln of the exponent, exp_plus, sinpi for the reflection.
+Gamma	270	270
+# 54 copies, for 215 vector ops: a plain Lanczos sum, double-word ln, ln_split, sinpi.
+Lgamma	110	110
+# 32 copies, for 130 vector ops: every piece of the piecewise rational, selected per lane.
+Erf	64	64
+# 32 copies, for 130 vector ops: rational pieces with divisions, a double-word -a², exp_plus.
+Erfc	64	64
+# 20 copies, for 80 vector ops: piecewise rationals, ln and a square root in the tails.
+Erfinv	40	40
+# 21 copies, for 85 vector ops: as erfinv, from 1 - q.
+Erfcinv	42	42
+# 450 copies, for 900 scalar ops: a double-word prefactor (300) and about 50 series or continued-fraction steps of 12 ops, at half a copy each.
+Gammainc	900	900
+# 450 copies, for Gammainc's 900 scalar ops.
+Gammaincc	900	900
+# 1800 copies, for about four evaluations of Gammainc and its derivative, 3,600 scalar ops.
+Gammaincinv	3600	3600
+# 1200 copies, for 2,400 scalar ops: a double-word prefactor of two ln and three lgamma (1,500) and about 60 continued-fraction steps of 15 ops.
+Betainc	2400	2400
+# 4800 copies, for about four evaluations of Betainc.
+Betaincinv	9600	9600
+# 10 copies, for 78 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: exp of the real part and sin and cos of the imaginary part. It costs about 21.5 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+complex Exp	20	43
+# 12.5 copies, for 100 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: hypot, ln with care near |z| = 1, atan2. It costs about 30 copies on macOS and about 30.5 on CI, by its old budget, more than twice that, so both budgets are unchanged until the cost is studied.
+complex Ln	63	61
+# 4.5 copies, for 36 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: hypot, a square root, a division, selects. It costs about 10.5 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+complex Sqrt	9	21
+# 16 copies, for 126 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: sin, cos, sinh and cosh.
+complex Sin	32	32
+# 17.5 copies, for 140 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: sin, cos, sinh, cosh and a division.
+complex Tan	35	35
+# 22.5 copies, for 180 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: a complex square root of 1 - z², a complex ln, products. It costs about 47 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+complex Asin	45	94
+# 16 copies, for 130 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: a complex ln of a quotient. It costs about 33 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+complex Atanh	32	66
+# 52 copies, for 420 f64 ops per complex item: a complex Lanczos sum with 13 complex divisions, a complex ln. It costs about 175 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+complex Lgamma	110	350
+# 62 copies, for 500 f64 ops: complex Lgamma and a complex exp. It costs about 134.3 copies on macOS and about 240 on CI, by its old budget, more than twice that, so both budgets are unchanged until the cost is studied.
+complex Gamma	280	480
+# 2 copies, for 16 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: hypot; reading two floats and writing one take 0.75.
+complex Abs	4	4
+# 11.5 copies, for 92 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: two complex square roots, each with a hypot, a product and a rebalance, in separate real and imaginary passes. It costs about 25.8 copies on macOS and about 31 on CI, by its old budget, more than twice that, so both budgets are unchanged until the cost is studied.
+complex Sqrt1mx2	53	62
+# 23 copies, for 184 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: a complex ln, a complex product, a complex exp. It costs about 50.6 copies on macOS and about 65 on CI, by its old budget, more than twice that, so both budgets are unchanged until the cost is studied.
 complex Pow	110	130
-linalg::PlusTimes	13	160
-linalg::MaxPlus	280	300
-linalg::MinPlus	270	300
-linalg::PlusEqual	300	290
-linalg::PlusTimes at i64	16	82
-linalg::PlusEqual at i64	79	83
-search::view_sort_along	330	330
-search::view_sort_along long lanes	250	240
-search::view_partition_along	70	140
-search::view_quantiles_along	150	270
-stats::variance	4.7	4.7
+# 64 copies, for 256 FMAs per result item, a quarter copy each, on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged.
+linalg::PlusTimes	23	130
+# 128 copies, for 256 steps of a max and an add per result item, a quarter copy per op.
+linalg::MaxPlus	260	260
+# 128 copies, for 256 steps of a min and an add per result item, a quarter copy per op.
+linalg::MinPlus	260	260
+# 128 copies, for 256 steps of a comparison and an add per result item, a quarter copy per op.
+linalg::PlusEqual	260	260
+# 64 copies, for 256 multiply-adds per result item, as f64 products. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged.
+linalg::PlusTimes at i64	31	130
+# 128 copies, for 256 steps of an integer comparison and an add per result item.
+linalg::PlusEqual at i64	260	260
+# 40 copies, for an unstable comparison sort of each 256-item row's keys, computed once: about 8 compare-and-swap levels per item at about 5 copies a level, the standard library sort's cost on random keys, which its cost at 32,768 items agrees with, plus a pass that computes the keys and one that writes the floats back. A vectorized sort kernel would reach about 12, as "Left for later" in basedpl's `meta/next-phases.md` records. It costs about 41 copies on macOS, down from about 80 when each comparison computed two keys.
+search::view_sort_along	80	80
+# 60 copies, for an unstable comparison sort of each 32,768-item lane's keys: about 15 levels per item at about 4 copies a level. A radix sort of the keys costs about 71, at about 9 copies for each of its 8 passes. A vectorized sort kernel would reach about 22.5, as "Left for later" in basedpl's `meta/next-phases.md` records. It costs about 60 copies on macOS, down from about 105 when each comparison computed two keys.
+search::view_sort_along long lanes	120	120
+# 15 copies, for a quickselect of each row's keys: about 3 comparisons per item at about 5 copies each, as the sorts measure comparisons, plus a pass that computes the keys and one that writes the floats back. A vectorized kernel that partitions would cost less, as "Left for later" in basedpl's `meta/next-phases.md` records. It costs about 15 copies on macOS, down from about 17 when each comparison computed two keys. On CI, selection cost about twice what it cost on macOS before this change, so its Linux expected cost is twice.
+search::view_partition_along	30	60
+# 15 copies, for selecting the two middle keys of each row, which costs about what one partition does. It costs about 15 copies on macOS, down from about 33 when each comparison computed two keys. On CI, selection cost about twice what it cost on macOS before this change, so its Linux expected cost is twice.
+search::view_quantiles_along	30	60
+# 1.5 copies, for two reads per item, for the mean and the squares, and two ops.
+stats::variance	3	3
+# 1.5 copies, for reading the data and the weights once, with a multiply-add per item. It costs about 5.8 copies on macOS, because each chunk gathers the data and the weights into buffers, and a second pass gathers the weights again for their total. Two other methods measured slower on 21 October 2026: folding pairs of products and weights in one walk cost 6.9, because a buffer of pairs folds more slowly than the walk it saves, and reading each 64-item row in place cost 8.7, because each in-place read works out its row's offset with divisions and each row's fold pays its own setup. Reading the runs in place without copying them only ties with the gather at 64 items. A fold that sums each run straight into its output's accumulator, with no product buffer, would reach the expected cost, as step 4 in basedpl's `meta/next-phases.md` records. Both budgets stay held until then.
+stats::average	74	330
+# 22 copies, for 2n³/3 flops per n² items, as FMAs, plus the solve, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 55 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+linalg::Lu::solve	53	110
+# 64 copies, for 2n³ flops per n² items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 150 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+linalg::Lu::inverse	89	300
+# 11 copies, for n³/3 flops per n² items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 28 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+linalg::cholesky	28	56
+# 43 copies, for 4n³/3 flops per n² items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 245 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+linalg::qr	130	490
+# 384 copies, for about 12n³ flops per n² items, with the vectors, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 1000 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+linalg::svd	970	2000
+# 288 copies, for about 9n³ flops per n² items, with the vectors, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 650 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+linalg::eigh	660	1300
+# 800 copies, for about 25n³ flops per n² items, with the vectors, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 2550 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+linalg::eig	3600	5100
+# 320 copies, for about 10n³ flops per n² items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 1350 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+linalg::eigenvalues	2400	2700
+# 5 copies, for 2mn² flops on 4096×16 (32 per item) and reading the matrix, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 34 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+linalg::lstsq	69	68
+# 21 copies, for 8n³/3 real flops per n² complex items, two floats per complex copy, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 50 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+complex linalg::Lu::solve	58	100
+# 43 copies, for 16n³/3 real flops per n² complex items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 255 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+complex linalg::qr	180	510
+# 384 copies, for about 48n³ real flops per n² complex items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 800 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+complex linalg::svd	1100	1600
+# 288 copies, for about 36n³ real flops per n² complex items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged.
+complex linalg::eigh	1100	580
+# 800 copies, for about 100n³ real flops per n² complex items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 2400 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+complex linalg::eig	4600	4800
+# 2 copies, for three reads and one write per item.
+Clip	4	4
+# 2 copies, for three reads and one write per item.
+Choose	4	4
+[f32]
+# 5.5 copies, for 22 vector ops: clamp, reduction by ln 2, a degree-9 polynomial, scaling by 2^n.
+Exp	11	11
+# 7 copies, for 27 vector ops: exp's steps with a longer polynomial near 0.
+Expm1	14	14
+# 6.5 copies, for 26 vector ops: split into mantissa and exponent, one division, a series in s², the combine.
+Ln	13	13
+# 8 copies, for 32 vector ops: ln's steps plus the correction for 1 + x.
+Log1p	16	16
+# 7 copies, for 27 vector ops: ln's steps with a scaled combine.
+Log2	14	14
+# 7 copies, for 27 vector ops: ln's steps with a scaled combine.
+Log10	14	14
+# 5 copies, for 21 vector ops: reduction by π/2, a polynomial, the quadrant.
+Sin	10	10
+# 5.5 copies, for 22 vector ops: sin's steps with a shifted quadrant.
+Cos	11	11
+# 6.5 copies, for 26 vector ops: reduction, a polynomial, a division.
+Tan	13	13
+# 6 copies, for 24 vector ops: a square root past 1/2, a polynomial, selects.
+Asin	12	12
+# 6.5 copies, for 26 vector ops: asin's steps and a reflection.
+Acos	13	13
+# 5.5 copies, for 22 vector ops: a reduction by division, a polynomial, selects.
+Atan	11	11
+# 8 copies, for 32 vector ops: expm1, a division, selects.
+Sinh	16	16
+# 6.5 copies, for 26 vector ops: exp and its reciprocal.
+Cosh	13	13
+# 8 copies, for 32 vector ops: expm1 and a division.
+Tanh	16	16
+# 9 copies, for 37 vector ops: ln, a square root, selects.
+Asinh	18	18
+# 9 copies, for 37 vector ops: ln and a square root.
+Acosh	18	18
+# 8.5 copies, for 34 vector ops: log1p of a quotient.
+Atanh	17	17
+# 7 copies, for 29 vector ops: split, a polynomial, two Newton steps with divisions.
+Cbrt	14	14
+# 30 copies, for about 60 ops computed in f64 at half the lanes: ln and exp, special cases.
+Pow	60	60
+# 60 copies, for Pow's 60 ops in scalar f64, pair by pair, at one f32 copy each.
+Pow.one	120	120
+# 4 copies, for 16 vector ops: scaling, a square root, a division; two reads and a write take 1.5.
+Hypot	8	8
+# 30 copies, for Pow's steps in f64 with a reciprocal power.
+Root	60	60
+# 60 copies, for Root in scalar f64, pair by pair.
+Root.one	120	120
+# 1.5 copies, for two reads and one write per item.
+Maximum	3	3
+# 0.5 copies, for one read per item.
+reduce::sum	1	1
+# 0.5 copies, for one read per item.
+reduce::max	1	1
+# 1 copies, for one read and one write per item; the scan runs in vector steps. It costs about 3.1 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+reduce::cumsum	2	6.3
+# 1 copies, for one read and one write per item; the scan runs in vector steps.
+reduce::cummax	2	2
+# 3.75 copies, for the negate (1), a read and write in place (1), 7 FMAs (1.75).
+polynomial::evaluate	7.5	7.5
+# 75 copies, for 150 ops in f64 at half the lanes: a plain Lanczos sum, ln, exp, sinpi.
+Gamma	150	150
+# 50 copies, for 100 ops in f64 at half the lanes.
+Lgamma	100	100
+# 25 copies, for 100 vector ops: the piecewise rational.
+Erf	50	50
+# 25 copies, for 100 vector ops: the same pieces. It costs about 55 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+Erfc	50	110
+# 17.5 copies, for 70 vector ops: the same.
+Erfinv	35	35
+# 18 copies, for 72 vector ops: the same.
+Erfcinv	36	36
+# 420 copies, for 420 scalar f64 ops: incomplete_gamma's narrow route, a plain prefactor and about 25 steps, at one f32 copy each.
+Gammainc	840	840
+# 420 copies, for Gammainc's narrow route.
+Gammaincc	840	840
+# 1700 copies, for about four evaluations of Gammainc's narrow route, 1,700 scalar f64 ops. It costs about 3531.6 copies on macOS and about 5500 on CI, by its old budget, more than twice that, so both budgets are unchanged until the cost is studied.
+Gammaincinv	7400	11000
+# 850 copies, for 850 scalar f64 ops for a narrow route like incomplete_gamma: a plain prefactor (400) and about 30 steps. It costs about 2898.6 copies on macOS and about 4150 on CI, by its old budget, more than twice that, so both budgets are unchanged until the cost is studied.
+Betainc	6000	8300
+# 3400 copies, for about four evaluations of Betainc's narrow route. It costs about 8512 copies on macOS and about 13000 on CI, by its old budget, more than twice that, so both budgets are unchanged until the cost is studied.
+Betaincinv	18000	26000
+# 10 copies, for 78 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: exp of the real part and sin and cos of the imaginary part. It costs about 23.5 copies on macOS and about 26 on CI, by its old budget, more than twice that, so both budgets are unchanged until the cost is studied.
+complex Exp	47	52
+# 12.5 copies, for 100 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: hypot, ln with care near |z| = 1, atan2. It costs about 30.5 copies on macOS and about 31 on CI, by its old budget, more than twice that, so both budgets are unchanged until the cost is studied.
+complex Ln	59	62
+# 4.5 copies, for 36 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: hypot, a square root, a division, selects. It costs about 11.5 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+complex Sqrt	9	23
+# 16 copies, for 126 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: sin, cos, sinh and cosh.
+complex Sin	32	32
+# 17.5 copies, for 140 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: sin, cos, sinh, cosh and a division.
+complex Tan	35	35
+# 22.5 copies, for 180 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: a complex square root of 1 - z², a complex ln, products. It costs about 60 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+complex Asin	45	120
+# 16 copies, for 130 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: a complex ln of a quotient. It costs about 37 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+complex Atanh	32	74
+# 104 copies, for f64's 420 ops computed in f64, which cost twice as many f32 copies. It costs about 320 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+complex Lgamma	210	640
+# 125 copies, for f64's 500 ops computed in f64, which cost twice as many f32 copies. It costs about 405 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+complex Gamma	250	810
+# 2 copies, for 16 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: hypot; reading two floats and writing one take 0.75.
+complex Abs	4	4
+# 11.5 copies, for 92 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: two complex square roots, each with a hypot, a product and a rebalance, in separate real and imaginary passes. It costs about 29.4 copies on macOS and about 46 on CI, by its old budget, more than twice that, so both budgets are unchanged until the cost is studied.
+complex Sqrt1mx2	59	92
+# 23 copies, for 184 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: a complex ln, a complex product, a complex exp. It costs about 52.3 copies on macOS and about 65 on CI, by its old budget, more than twice that, so both budgets are unchanged until the cost is studied.
+complex Pow	110	130
+# 64 copies, for 256 FMAs per result item, a quarter copy each, on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged.
+linalg::PlusTimes	13	130
+# 128 copies, for 256 steps of a max and an add per result item, a quarter copy per op.
+linalg::MaxPlus	260	260
+# 128 copies, for 256 steps of a min and an add per result item, a quarter copy per op.
+linalg::MinPlus	260	260
+# 128 copies, for 256 steps of a comparison and an add per result item, a quarter copy per op.
+linalg::PlusEqual	260	260
+# 64 copies, for 256 multiply-adds per result item, as f64 products. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged.
+linalg::PlusTimes at i64	16	130
+# 128 copies, for 256 steps of an integer comparison and an add per result item.
+linalg::PlusEqual at i64	260	260
+# 80 copies, for a radix sort of each 256-item row's keys alone, which costs about what an unstable comparison sort of them does: about 8 levels per item at about 10 copies a level of half-width items, as the f64 sorts measure them. A vectorized sort kernel would reach about 24, as "Left for later" in basedpl's `meta/next-phases.md` records. It costs about 83 copies on macOS, down from about 96 when the sort carried each float beside its key.
+search::view_sort_along	160	160
+# 52 copies, for a radix sort of each 32,768-item lane's keys alone: 4 byte passes, each scattering the keys to 256 places at about 13 copies, as measured on this hardware. A vectorized sort kernel would reach about 45, as "Left for later" in basedpl's `meta/next-phases.md` records. It costs about 52 copies on macOS, down from about 72 when the sort carried each float beside its key.
+search::view_sort_along long lanes	110	110
+# 30 copies, for a quickselect of each row's keys: about 3 comparisons per item at about 10 copies each, as the sorts measure comparisons of half-width items, plus a pass that computes the keys and one that writes the floats back. A vectorized kernel that partitions would cost less, as "Left for later" in basedpl's `meta/next-phases.md` records. It costs about 25 copies on macOS, down from about 33 when each comparison computed two keys. On CI, selection cost about twice what it cost on macOS before this change, so its Linux expected cost is twice.
+search::view_partition_along	60	120
+# 30 copies, for selecting the two middle keys of each row, which costs about what one partition does. It costs about 27 copies on macOS, down from about 66 when each comparison computed two keys. On CI, selection cost about twice what it cost on macOS before this change, so its Linux expected cost is twice.
+search::view_quantiles_along	60	120
+# 1.5 copies, for two reads per item, for the mean and the squares, and two ops.
+stats::variance	3	3
+# 1.5 copies, for reading the data and the weights once, with a multiply-add per item. It costs about 7.4 copies on macOS, because each chunk gathers the data and the weights into buffers, and a second pass gathers the weights again for their total. Two other methods measured slower on 21 October 2026: folding pairs of products and weights in one walk cost 10.6, because a buffer of pairs folds more slowly than the walk it saves, and reading each 64-item row in place cost 11.7, because each in-place read works out its row's offset with divisions and each row's fold pays its own setup. Reading the runs in place without copying them only ties with the gather at 64 items. A fold that sums each run straight into its output's accumulator, with no product buffer, would reach the expected cost, as step 4 in basedpl's `meta/next-phases.md` records. Both budgets stay held until then.
 stats::average	150	650
+# 22 copies, for 2n³/3 flops per n² items, as FMAs, plus the solve, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 70 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 linalg::Lu::solve	73	140
+# 64 copies, for 2n³ flops per n² items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 210 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 linalg::Lu::inverse	91	420
+# 11 copies, for n³/3 flops per n² items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 40.5 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 linalg::cholesky	35	81
+# 43 copies, for 4n³/3 flops per n² items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 330 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 linalg::qr	160	660
+# 384 copies, for about 12n³ flops per n² items, with the vectors, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 1400 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 linalg::svd	1500	2800
+# 288 copies, for about 9n³ flops per n² items, with the vectors, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 750 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 linalg::eigh	940	1500
+# 800 copies, for about 25n³ flops per n² items, with the vectors, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 2800 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 linalg::eig	5100	5600
+# 320 copies, for about 10n³ flops per n² items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 1700 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 linalg::eigenvalues	3000	3400
+# 5 copies, for 2mn² flops on 4096×16 (32 per item) and reading the matrix, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 50 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 linalg::lstsq	100	100
+# 21 copies, for 8n³/3 real flops per n² complex items, two floats per complex copy, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 75 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 complex linalg::Lu::solve	81	150
+# 43 copies, for 16n³/3 real flops per n² complex items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 360 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 complex linalg::qr	240	720
+# 384 copies, for about 48n³ real flops per n² complex items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 1200 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 complex linalg::svd	1600	2400
+# 288 copies, for about 36n³ real flops per n² complex items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 600 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 complex linalg::eigh	1400	1200
+# 800 copies, for about 100n³ real flops per n² complex items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 2650 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 complex linalg::eig	5000	5300
+# 1 copies, for reading two items and writing one per lane of 2. It costs about 2.4 copies on macOS and about 2.6 on CI, by its old budget, more than twice that, so both budgets are unchanged until the cost is studied.
 Array::differences short lanes	5.2	5.2
-Array::differences	2.7	2.6
+# 1 copies, for one read and one write per item.
+Array::differences	2	2
+# 0.5 copies, for one write per output item; each input is read once for 64 outputs. It costs about 1.1 copies on macOS and about 1.1 on CI, by its old budget, more than twice that, so both budgets are unchanged until the cost is studied.
 Array::broadcasted	2.2	2.2
-Clip	4.1	4.2
-Choose	4.1	4.4
+# 2 copies, for three reads and one write per item.
+Clip	4	4
+# 2 copies, for three reads and one write per item.
+Choose	4	4
 [i64]
-Buffer::cast i32	1.5	3
+# 0.75 copies, for reading 4 bytes and writing 8 per item, against a copy that moves 16.
+Buffer::cast i32	1.5	1.5

@@ -1,6 +1,5 @@
-//! Special functions: gamma, its logarithm and binomial coefficients, the error function and its inverses, and the regularized incomplete gamma and beta functions with their inverses. f64 computes in f64. Narrower types round an f64 result, from a cheaper f64 algorithm where one has the precision they need. `gamma`, `lgamma` and `erf` have no branch on their usual path, and loops that call them vectorize. The others choose a method by range, or iterate until they converge.
+//! Special functions: gamma, its logarithm and its logarithmic derivative digamma, binomial coefficients, the error function and its inverses, and the regularized incomplete gamma and beta functions with their inverses. f64 computes in f64. Narrower types round an f64 result, from a cheaper f64 algorithm where one has the precision they need. `gamma`, `lgamma` and `erf` have no branch on their usual path, and loops that call them vectorize. The others choose a method by range, or iterate until they converge.
 use crate::{Arg, Native, dd::Double, exp::{exp, exp_narrow, exp_plus}, float::{horner, sealed::Core}, ln::{ln, ln_double, ln_narrow, ln_split, log1p}};
-use num_complex::Complex;
 use std::{f64::consts::PI, mem::MaybeUninit};
 
 /// Each function at every type: it computes in f64, and narrower types round the result.
@@ -12,6 +11,9 @@ macro_rules! in_f64 {
 }
 
 in_f64! {
+    digamma(x) = digamma64;
+    binom_dn(n, k) = binom_dn64;
+    binom_dk(n, k) = binom_dk64;
     gammaincinv(a, p) = gammaincinv64;
     betainc(a, b, x) = betainc64;
     betaincinv(a, b, p) = betaincinv64;
@@ -34,7 +36,29 @@ pub(crate) fn lgamma<R: Native, const FUSED: bool>(x: R) -> R {
 /// The most factors that `binom` multiplies at f64 and at narrower types. C(n, k) with that many steps, the smaller of k and n - k, is at least C(2k, k), which overflows the type, so more steps give ±∞ at once.
 const BINOM_STEPS: (f64, f64) = (600.0, 80.0);
 
-/// C(n, k). For whole n and a whole k from 0, it multiplies by (top - i)/(i + 1) for i below the smaller of k and top - k, where top is n, or k - n - 1 for a negative n, which gives (-1)^k C(top, k). Each step's quotient is a whole number, so the result is exact while the result times top is a whole number the type holds. Other arguments take Γ(n + 1)/(Γ(k + 1) Γ(n - k + 1)) through the complex binomial coefficient's real part.
+/// The most factors that `binom` and `binom_slopes` multiply as a falling factorial, n(n - 1)…(n - k + 1)/k!, for a whole k and any other n. The falling factorial costs more than the real Γ route (`binom_real`) beyond about 64 factors, where that route costs about 900 copies at any k.
+const FALLING_STEPS: f64 = 64.0;
+
+/// a × m / d. It multiplies first, so that a whole quotient stays exact, and divides first only where the product overflows, so that a quotient the type holds stays finite.
+#[inline(always)]
+fn ratio_step<R: Native>(a: R, m: R, d: R) -> R {
+    let p = a * m;
+    if p.is_finite() { p / d } else { a / d * m }
+}
+
+/// C(n, k) for a whole k from 0, as the falling factorial n(n - 1)…(n - k + 1)/k!, and its slope in n by the product rule, which stays finite at the polynomial's roots.
+fn falling(n: f64, k: f64) -> (f64, f64) {
+    let (mut c, mut slope, mut i) = (1.0, 0.0, 0.0);
+    while i < k {
+        let next = i + 1.0;
+        slope = ratio_step(slope, n - i, next) + c / next;
+        c = ratio_step(c, n - i, next);
+        i = next;
+    }
+    (c, slope)
+}
+
+/// C(n, k). For whole n and a whole k from 0, it multiplies by (top - i)/(i + 1) for i below the smaller of k and top - k, where top is n, or k - n - 1 for a negative n, which gives (-1)^k C(top, k). Each step's quotient is a whole number, so the result is exact while the result times top is a whole number the type holds. A step whose product would overflow divides first (`ratio_step`), so a result the type holds stays finite. Other n with a whole k up to `FALLING_STEPS` take the falling factorial at f64 (`falling`). A whole k below 0 with a whole n reduces to C(n, n - k), or 0. Other real arguments take Γ(n + 1)/(Γ(k + 1) Γ(n - k + 1)) in double words (`binom_real`).
 #[inline]
 pub(crate) fn binom<R: Native, const FUSED: bool>(n: R, k: R) -> R {
     let whole = |v: R| v.trunc() == v;
@@ -46,7 +70,7 @@ pub(crate) fn binom<R: Native, const FUSED: bool>(n: R, k: R) -> R {
             let c = if steps > R::narrow(if R::WIDE { BINOM_STEPS.0 } else { BINOM_STEPS.1 }) { R::infinity() } else {
                 let (mut c, mut i) = (R::one(), R::zero());
                 while i < steps {
-                    c = c * (top - i) / (i + R::one());
+                    c = ratio_step(c, top - i, i + R::one());
                     i = i + R::one();
                 }
                 c
@@ -54,7 +78,44 @@ pub(crate) fn binom<R: Native, const FUSED: bool>(n: R, k: R) -> R {
             return if negative { -c } else { c };
         }
     }
-    crate::complex::binom::<R, FUSED>(Complex::new(n, R::zero()), Complex::new(k, R::zero())).re
+    // C(n, k) = C(n, n - k), so a whole k below 0 reduces to a whole k from 0 where n is negative and at least k. Otherwise C(n, k) is 0.
+    if whole(n) & whole(k) & (k < R::zero()) { return if (n < R::zero()) & (k <= n) { binom::<R, FUSED>(n, n - k) } else { R::zero() }; }
+    if whole(k) & (k >= R::zero()) & (k <= R::narrow(FALLING_STEPS)) { return R::narrow(falling(n.wide(), k.wide()).0); }
+    R::narrow(binom_real::<FUSED>(n.wide(), k.wide()))
+}
+
+/// The exact double words n + 1, k + 1 and n - k + 1, the arguments of the Γ in C(n, k) = Γ(n + 1)/(Γ(k + 1) Γ(n - k + 1)).
+fn gamma_args(n: f64, k: f64) -> (Double<f64>, Double<f64>, Double<f64>) {
+    (Double::sum(n, 1.0), Double::sum(k, 1.0), Double::sum(n, -k).plus(Double::new(1.0, 0.0)).normalize())
+}
+
+/// C(n, k) for real n and k as Γ(n + 1)/(Γ(k + 1) Γ(n - k + 1)), on exact double-word arguments. Each Γ below 1/2 reflects (`reflection`), so each factor gives ±ln Γ(z) for some z from 1/2 up, a sign, and a logarithm of π/|sin πx|. One positive and one negative ln Γ with arguments from 10 up, the closest such pair, are taken as one difference (`lgamma_gap`), which keeps the result's relative accuracy for large n. A pole of Γ(k + 1) or Γ(n - k + 1) gives 0, and a pole of Γ(n + 1) gives NaN. An infinite k with a finite n gives 0, and an infinite n gives NaN.
+fn binom_real<const FUSED: bool>(n: f64, k: f64) -> f64 {
+    if !(n.is_finite() && k.is_finite()) { return if n.is_finite() && k.is_infinite() { 0.0 } else { f64::NAN }; }
+    let (a, b, c) = gamma_args(n, k);
+    let pole = |y: Double<f64>| y.hi <= 0.0 && y.hi.fract() == 0.0 && y.lo.fract() == 0.0;
+    if pole(a) { return f64::NAN; }
+    if pole(b) || pole(c) { return 0.0; }
+    let (mut sign, mut log) = (1.0, Double::new(0.0, 0.0));
+    let mut terms = [(a, true), (b, false), (c, false)];
+    for t in &mut terms {
+        if t.0.hi < 0.5 {
+            let (z, l, s) = reflection::<FUSED>(t.0);
+            sign *= s;
+            log = log.plus(if t.1 { l } else { -l });
+            *t = (z, !t.1);
+        }
+    }
+    let gap = |&(i, j): &(usize, usize)| (terms[i].0.hi - terms[j].0.hi).abs();
+    let pair = (0..3).flat_map(|i| (0..3).map(move |j| (i, j)))
+        .filter(|&(i, j)| terms[i].1 && !terms[j].1 && terms[i].0.hi >= 10.0 && terms[j].0.hi >= 10.0).min_by(|p, q| gap(p).total_cmp(&gap(q)));
+    if let Some((i, j)) = pair { log = log.plus(lgamma_gap::<FUSED>(terms[i].0, terms[j].0)); }
+    for (i, &(z, up)) in terms.iter().enumerate() {
+        if pair.is_some_and(|(p, q)| i == p || i == q) { continue; }
+        let l = lgamma_dd::<FUSED>(z);
+        log = log.plus(if up { l } else { -l });
+    }
+    sign * exp_plus::<f64, FUSED>(log)
 }
 
 /// The g of the Lanczos approximation that musl's `tgamma` uses, and g - 1/2.
@@ -108,11 +169,41 @@ fn ln_dd<const FUSED: bool>(u: Double<f64>, fine: bool) -> Double<f64> {
     Double::new(l.hi, l.lo + u.lo / u.hi)
 }
 
-/// ln Γ(y) as a double word, for y > 0. From 1/2 up it keeps the Lanczos exponent's double word, so that a sum of such logarithms cancels without rounding. Below 1/2 it is small, and one float holds it.
+/// For a double-word x below 1/2, the parts of Γ(x) = π/(sin πx Γ(1 - x)): 1 - x, ln(π/|sin πx|) and the sign of sin πx. It reduces πx from the whole double word, so the sine keeps its relative accuracy beside the poles, where the logarithm is ∞.
+fn reflection<const FUSED: bool>(x: Double<f64>) -> (Double<f64>, Double<f64>, f64) {
+    let n = x.hi.round();
+    let s = sinpi::<FUSED>((x.hi - n) + x.lo);
+    let s = if (n * 0.5).fract() != 0.0 { -s } else { s };
+    (Double::sum(1.0, -x.hi).plus(Double::new(-x.lo, 0.0)), ln_dd::<FUSED>(Double::new(PI, PI_LO).div::<FUSED>(Double::new(s.abs(), 0.0)), true), s.signum())
+}
+
+/// ln |Γ(y)| as a double word, for a double-word y. From 1/2 up it keeps the Lanczos exponent's double word, so that a sum of such logarithms cancels without rounding. Below 1/2 it reflects (`reflection`). The exponent multiplies a logarithm's rounding by y, so the difference of two large ones loses accuracy in proportion to their arguments, which `lgamma_gap` avoids.
 fn lgamma_dd<const FUSED: bool>(y: Double<f64>) -> Double<f64> {
-    if y.hi < 0.5 { return Double::new(lgamma64::<FUSED>(y.hi), 0.0); }
+    if y.hi < 0.5 { let (z, l, _) = reflection::<FUSED>(y); return l.plus(-lgamma_dd::<FUSED>(z)); }
     let (s, e) = lanczos::<FUSED>(y);
     e.plus(Double::new(ln::<f64, FUSED>(s.hi * EXP_NEG_G), s.lo / s.hi))
+}
+
+/// ln Γ(z) - ln Γ(w) as a double word, for double-word z and w from 10 up, from Stirling's series: (z - 1/2) ln(1 + (z - w)/w) + (z - w) ln w - (z - w), plus the difference of the series' tails. The large factor z - 1/2 multiplies the logarithm of a ratio near 1 (`ln_ratio`), so the difference keeps its relative accuracy where ln Γ(z) and ln Γ(w) are too large to subtract.
+fn lgamma_gap<const FUSED: bool>(z: Double<f64>, w: Double<f64>) -> Double<f64> {
+    let times = |x: Double<f64>, y: Double<f64>| x.mul_float::<FUSED>(y.hi).plus(Double::new(x.hi * y.lo, 0.0));
+    let tail = |y: Double<f64>| { let v = 1.0 / y.hi; v * horner::<f64, FUSED, 10>(v * v, STIRLING) };
+    let (d, r) = ln_ratio::<FUSED>(z, w);
+    times(r, z.plus(Double::new(-0.5, 0.0))).plus(times(ln_dd::<FUSED>(w, true), d)).plus(-d).plus(Double::new(tail(z) - tail(w), 0.0))
+}
+
+/// ψ(z) - ψ(w) for double-word z and w from 10 up, from the asymptotic series: ln(1 + (z - w)/w) + (z - w)/(2zw), minus the difference of the series' tails. It keeps its relative accuracy where z and w are close, where ψ(z) and ψ(w) alone would cancel.
+fn psi_gap<const FUSED: bool>(z: Double<f64>, w: Double<f64>) -> f64 {
+    let tail = |y: Double<f64>| { let v = 1.0 / (y.hi * y.hi); v * horner::<f64, FUSED, 8>(v, PSI_SERIES) };
+    let (d, r) = ln_ratio::<FUSED>(z, w);
+    r.hi + (r.lo + 0.5 * d.hi / (z.hi * w.hi) - (tail(z) - tail(w)))
+}
+
+/// z - w and ln(1 + (z - w)/w), each a double word, for double-word z and w. The ratio is 1 plus the double word (z - w)/w, which keeps its distance from 1 where the quotient z/w would round it away.
+fn ln_ratio<const FUSED: bool>(z: Double<f64>, w: Double<f64>) -> (Double<f64>, Double<f64>) {
+    let d = z.plus(-w).normalize();
+    let x = d.div::<FUSED>(w);
+    (d, ln_dd::<FUSED>(Double::sum(1.0, x.hi).plus(Double::new(x.lo, 0.0)), true))
 }
 
 /// sin πr / r and cos πr as polynomials in r², highest degree first: their Taylor series, which are within an ulp up to |r| = 1/4.
@@ -162,7 +253,7 @@ fn gamma64<const FUSED: bool>(x: f64) -> f64 {
     let d = Double::sum(e.hi, -G);
     let (hi, lo) = (d.hi, d.lo + e.lo);
     let up = Double::sum(-hi, LN2_512.0);
-    let p = if reflect { exp_plus::<f64, FUSED>(up.hi, up.lo - lo + LN2_512.1) } else { exp_plus::<f64, FUSED>(hi, lo) };
+    let p = if reflect { exp_plus::<f64, FUSED>(Double::new(up.hi, up.lo - lo + LN2_512.1)) } else { exp_plus::<f64, FUSED>(Double::new(hi, lo)) };
     // Below 1/2, π / (sin πx S(y)) is a double-word quotient, so the result rounds once more, in the last product.
     let f = Double::new(PI, PI_LO).div::<FUSED>(s.mul_float::<FUSED>(sinpi::<FUSED>(x)));
     let g = if reflect { (f.hi * TWO_M512).mla::<FUSED>(p, f.lo * TWO_M512 * p) } else { s.hi.mla::<FUSED>(p, s.lo * p) };
@@ -219,6 +310,63 @@ fn lgamma_stirling<const FUSED: bool>(x: f64) -> f64 {
     let r = if reflect { l - s } else { s + l };
     if x.is_infinite() || (x <= 0.0 && x == x.floor()) { f64::INFINITY } else { r }
 }
+
+/// ψ's asymptotic series after ln z - 1/(2z): B_2k/(2k) for k from 8 down to 1, as a polynomial in 1/z², highest degree first, so that ψ(z) ≈ ln z - 1/(2z) - (1/z²)(1/12 - 1/(120 z²) + 1/(252 z⁴) - …). From z = 10 its first omitted term is below 2^-59 of ψ(z).
+const PSI_SERIES: [f64; 8] = [-3617.0 / 8160.0, 1.0 / 12.0, -691.0 / 32760.0, 1.0 / 132.0, -1.0 / 240.0, 1.0 / 252.0, -1.0 / 120.0, 1.0 / 12.0];
+/// Below this, `digamma` reflects in place of lifting its argument, which would take too many steps.
+const PSI_REFLECT: f64 = -20.0;
+
+/// ψ(z) as a double word, for z = `hi + lo` of at least 10, from its asymptotic series.
+fn psi_series<const FUSED: bool>(z: Double<f64>) -> Double<f64> {
+    let w = 1.0 / (z.hi * z.hi);
+    let tail = w * horner::<f64, FUSED, 8>(w, PSI_SERIES);
+    ln_dd::<FUSED>(z, true).plus(-Double::new(0.5, 0.0).div::<FUSED>(z)).plus(Double::new(-tail, 0.0))
+}
+
+/// ψ(x), the derivative of ln Γ(x). From `PSI_REFLECT` up, ψ(x) = ψ(x + n) - Σ 1/(x + k) for k below n lifts x to z = x + n of at least 10. The sum and the series are double words, so their cancellation near ψ's zeros keeps the result's digits. Below `PSI_REFLECT`, the reflection ψ(x) = ψ(1 - x) - π cot πx gives the result, with π cot πx in floats.
+fn digamma64<const FUSED: bool>(x: f64) -> f64 {
+    if x.is_nan() || x == f64::NEG_INFINITY || (x < 0.0 && x == x.floor()) { return f64::NAN; }
+    // Below 1e-18, ψ(x) = -1/x - γ + O(x) rounds to -1/x, because γ is less than half an ulp of 1/x. That covers ±0 and a reciprocal that overflows too.
+    if x.abs() < 1e-18 { return -1.0 / x; }
+    if x == f64::INFINITY { return x; }
+    if x < PSI_REFLECT {
+        // x + 0.5 is exact, because x is negative.
+        let r = psi_series::<FUSED>(reflected(x).1);
+        return (r.hi - PI * sinpi::<FUSED>(x + 0.5) / sinpi::<FUSED>(x)) + r.lo;
+    }
+    let n = (10.0 - x).ceil().max(0.0);
+    let mut lifted = Double::new(0.0, 0.0);
+    for k in 0..n as u32 { lifted = lifted.plus(Double::new(1.0, 0.0).div::<FUSED>(Double::sum(x, k as f64))); }
+    let r = psi_series::<FUSED>(Double::sum(x, n)).plus(-lifted);
+    r.hi + r.lo
+}
+
+/// ∂C(n, k)/∂n and ∂C(n, k)/∂k. For a whole k up to `FALLING_STEPS`, the slope in n is the falling factorial's, by the product rule (`falling`), and the slope in k is C(n, k) times ψ(n - k + 1) - ψ(k + 1). Other arguments take C(n, k) times ψ(n + 1) - ψ(n - k + 1), and times ψ(n - k + 1) - ψ(k + 1), each difference through `psi_gap` where both arguments are from 10 up. A whole n below a whole k from 0 puts those ψ at a pole, where C(n, k) is the polynomial n(n - 1)…(n - k + 1)/k! in n, with a finite slope.
+fn binom_slopes<const FUSED: bool>(n: f64, k: f64) -> (f64, f64) {
+    let whole = |v: f64| v == v.trunc();
+    let psi = digamma64::<FUSED>;
+    if whole(k) && k >= 0.0 && k <= FALLING_STEPS {
+        let (c, dn) = falling(n, k);
+        // At a root of the polynomial, a whole n from 0 below k, the slope in k is the negative of the slope in n.
+        return (dn, if whole(n) && (0.0..k).contains(&n) { -dn } else { c * (psi(n - k + 1.0) - psi(k + 1.0)) });
+    }
+    let c = binom::<f64, FUSED>(n, k);
+    if whole(k) && k >= 0.0 && whole(n) && n < k {
+        if n >= 0.0 {
+            // A root of the polynomial, where its slope is ±1/(k C(k - 1, n)), and the slope with respect to k is its negative.
+            let sign = if (k - 1.0 - n) % 2.0 == 0.0 { 1.0 } else { -1.0 };
+            let slope = sign / (k * binom::<f64, FUSED>(k - 1.0, n));
+            return (slope, -slope);
+        }
+        // For a whole k, ψ(n + 1) - ψ(n - k + 1) = ψ(-n) - ψ(k - n), whose ψ are finite at a negative whole n.
+        return (c * (psi(-n) - psi(k - n)), c * (psi(n - k + 1.0) - psi(k + 1.0)));
+    }
+    let (a, b, rest) = gamma_args(n, k);
+    let gap = |z: Double<f64>, w: Double<f64>| if z.hi >= 10.0 && w.hi >= 10.0 { psi_gap::<FUSED>(z, w) } else { psi(z.hi) - psi(w.hi) };
+    (c * gap(a, rest), c * gap(rest, b))
+}
+fn binom_dn64<const FUSED: bool>(n: f64, k: f64) -> f64 { binom_slopes::<FUSED>(n, k).0 }
+fn binom_dk64<const FUSED: bool>(n: f64, k: f64) -> f64 { binom_slopes::<FUSED>(n, k).1 }
 
 // erfc follows FreeBSD's s_erf.c at f64 and s_erff.c at f32, through compiler-builtins' libm. Each polynomial is highest degree first.
 /// One width's coefficients. erf(x) = x + x pp(x²)/qq(x²) for |x| below 0.84375, and erf(1 + s) = erx + pa(s)/qa(s) up to 1.25. Beyond, erfc(x) = e^(-x² - 0.5625 + r(v)/s(v))/x for v = 1/x², with `ra` and `sa` up to 1/0.35 and `rb` and `sb` above. `rb` and `sb` start with a zero, so that they match `ra` and `sa` in length.
@@ -302,7 +450,7 @@ fn erfc_tail<R: Native, const FUSED: bool>(a: R) -> R {
             let z = a.upper();
             let h = Double::sum(-z * z, R::narrow(-0.5625));
             let u = Double::sum(h.hi, (z - a) * (z + a) + rs);
-            exp_plus::<R, FUSED>(u.hi, u.lo + h.lo) / a
+            exp_plus::<R, FUSED>(Double::new(u.hi, u.lo + h.lo)) / a
         },
     )
 }
@@ -609,7 +757,7 @@ const RESCALE: f64 = 4503599627370496.0;
 fn gamma_factor<const FUSED: bool>(a: f64, x: f64) -> f64 {
     let t = ln_dd::<FUSED>(Double::new(x, 0.0), true).mul_float::<FUSED>(a).plus(Double::new(-x, 0.0));
     let t = t.plus(-lgamma_dd::<FUSED>(Double::new(a, 0.0)));
-    exp_plus::<f64, FUSED>(t.hi, t.lo)
+    exp_plus::<f64, FUSED>(t)
 }
 
 /// `gamma_factor` for the narrower types, in plain f64, for a > 0. With (z, P) = `shifted(a)`, Stirling's series turns it into exp(a ln(x/z) + ln(z (P/z^(z-a))²)/2 + z - x - `stirling_tail`(1/z)). z - a is 0 or 8, so the second logarithm's argument needs only products, and f32's precision for its logarithm.
@@ -747,7 +895,7 @@ fn betainc64<const FUSED: bool>(a: f64, b: f64, x: f64) -> f64 {
     let (lx, l1x) = (ln_dd::<FUSED>(Double::new(x, 0.0), true), ln_dd::<FUSED>(one.plus(Double::new(-x, 0.0)), true));
     let t = lx.mul_float::<FUSED>(a).plus(l1x.mul_float::<FUSED>(b));
     let t = t.plus(lgamma_dd::<FUSED>(sum)).plus(-lgamma_dd::<FUSED>(Double::new(a, 0.0)).plus(lgamma_dd::<FUSED>(Double::new(b, 0.0))));
-    let front = exp_plus::<f64, FUSED>(t.hi, t.lo);
+    let front = exp_plus::<f64, FUSED>(t);
     if x < (a + 1.0) / (a + b + 2.0) { front * beta_fraction(a, b, x) / a } else { 1.0 - front * beta_fraction(b, a, 1.0 - x) / b }
 }
 

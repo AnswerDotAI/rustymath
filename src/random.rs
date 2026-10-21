@@ -1,4 +1,4 @@
-//! Random integers from a caller's generator: rolls, each uniform below its own bound, and deals, distinct integers below a total.
+//! Random numbers from a caller's generator: floats between 0 and 1, rolls, each uniform below its own bound, and deals, distinct integers below a total.
 use crate::Arg;
 use rand::{Rng, RngExt, distr::{Distribution, Uniform}};
 
@@ -8,6 +8,17 @@ pub fn roll<R: Rng + ?Sized>(bounds: Arg<'_, u64>, n: usize, rng: &mut R, out: &
         Arg::One(b) => out.extend(Uniform::new(0, b).expect("a roll's bound must be at least 1").sample_iter(rng).take(n)),
         Arg::Many(bs) => out.extend(bs[..n].iter().map(|&b| rng.random_range(0..b))),
     }
+}
+
+/// The float in the open interval (0, 1) that `rand`'s `Open01` makes from the word `w`: its top 52 bits as the fraction of a number in [1, 2), less 1 − ε/2. Seeded draws depend on this staying bit for bit what `Open01` gives.
+#[inline]
+pub fn unit(w: u64) -> f64 { f64::from_bits((w >> 12) | 1.0f64.to_bits()) - (1.0 - f64::EPSILON / 2.0) }
+
+/// Appends `n` floats to `out`, each `unit` of the generator's next `u64`, the numbers that drawing `Open01` `n` times gives. Drawing every word before converting any lets the conversion run as a separate, vectorized pass.
+pub fn units<R: Rng + ?Sized>(n: usize, rng: &mut R, out: &mut Vec<f64>) {
+    let start = out.len();
+    out.extend((0..n).map(|_| f64::from_bits(rng.next_u64())));
+    for x in &mut out[start..] { *x = unit(x.to_bits()); }
 }
 
 /// Appends `n` distinct integers below `total` to `out`, in random order: every choice of them, in every order, is equally likely. `n` must be at most `total`.

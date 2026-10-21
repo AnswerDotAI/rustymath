@@ -1,6 +1,6 @@
 //! Search and sort over slices of keys. A key is an item read as a whole number (`Key`), or an unsigned word whose order is the order you want (`RadixKey`). `Float::order_key` gives each float such a word, as wide as the float. Positions take 32 bits inside these functions, so a slice holds at most `u32::MAX` items. `tolerant` builds its searches over floats on these functions.
 //!
-//! `index_of`, `classes` and `firsts` index the first position of each key. `index_of` passes over `x` once for each item of `y` when `y` has at most `SCANNED` items. The index is a table when the keys span at most twice the slice's length, or 1024, and a hash map otherwise. `numbered` numbers the classes in order of first position, with each one's size. `grouped_keys` numbers them the same way from a table of keys, with each one's positions, and `class_counts` gives only their sizes. `counts` counts the items with each key in such a table. `sort_rows` sorts keys that span such a table by counting them. It sorts other keys with an LSD radix sort that skips any byte that is the same in every key. With several threads, the sort splits each pass of more than `RADIX_PIECE` keys across them, and `index_of` splits its lookups.
+//! `index_of`, `classes` and `firsts` index the first position of each key. `index_of` passes over `x` once for each item of `y` when `y` has at most `SCANNED` items. The index is a table when the keys span at most twice the slice's length, or 1024, and a hash map otherwise. `numbered` numbers the classes in order of first position, with each one's size. `grouped_keys` numbers them the same way from a table of keys, with each one's positions, and `class_counts` gives only their sizes. `counts` counts the items with each key in such a table. `sort_rows` sorts keys that span such a table by counting them. It sorts other keys with an LSD radix sort that skips any byte that is the same in every key. `view_sort_along`, `view_partition_along` and `view_quantiles_along` work on each item's `SortKey`, which reads back to the item exactly. A sort counts, or sorts the keys by comparison or by the same radix sort. With several threads, the radix sort splits each pass of more than `RADIX_PIECE` keys across them, and `index_of` splits its lookups.
 use crate::{Float, agreement::Mapping, array::ArrayView, layout::Layout, buffer::{Buffer, DType, Element, Floats, View}, error::{Error, Kind}, tolerant::{self, Tolerance}};
 use hashbrown::{HashMap, hash_map::Entry};
 use std::{convert::Infallible, hash::Hash, mem::MaybeUninit, ops::Not};
@@ -102,6 +102,45 @@ impl OrderKey for char {
     #[inline]
     fn order_key(self) -> u32 { self.into() }
 }
+
+/// An item's unsigned key in sorting order that reads back to the item exactly, so a sort, partition or selection can work on keys alone and write the items back once. Integers, Booleans and characters take their order key. Floats take `Float::total_key`, which puts `¯0` before `0` and every NaN last.
+pub(crate) trait SortKey: Element + Default {
+    type Key: RadixKey;
+    fn sort_key(self) -> Self::Key;
+    fn from_sort_key(k: Self::Key) -> Self;
+    /// Writes `x` sorted into `out` by counting, where its items span a small table (`spread_into`), and gives whether it did.
+    fn counted(_x: &[Self], _out: &mut [Self], _down: bool) -> bool { false }
+    /// Replaces `keys` with the key of each item of `x`, complemented for descending order.
+    fn keys_into(x: &[Self], keys: &mut Vec<Self::Key>, down: bool) {
+        keys.clear();
+        keys.extend(x.iter().map(|&v| if down { !v.sort_key() } else { v.sort_key() }));
+    }
+    /// Writes into `out` the item that each of `keys` reads back to, undoing `keys_into`'s complement.
+    fn write_back(keys: &[Self::Key], out: &mut [Self], down: bool) {
+        for (o, &k) in out.iter_mut().zip(keys) { *o = Self::from_sort_key(if down { !k } else { k }); }
+    }
+}
+impl<F: Float + Element + Default> SortKey for F {
+    type Key = F::OrderKey;
+    #[inline]
+    fn sort_key(self) -> F::OrderKey { self.total_key() }
+    #[inline]
+    fn from_sort_key(k: F::OrderKey) -> Self { F::from_order_key(k) }
+}
+macro_rules! sort_keys {
+    ($($t:ty => $key:ty, $back:expr);+) => {$(
+        impl SortKey for $t {
+            type Key = $key;
+            #[inline]
+            fn sort_key(self) -> $key { self.order_key() }
+            #[inline]
+            fn from_sort_key(k: $key) -> Self { ($back)(k) }
+            fn counted(x: &[Self], out: &mut [Self], down: bool) -> bool { spread_into(x, out, down) }
+        }
+    )+};
+}
+sort_keys!(i16 => u16, |k: u16| (k ^ 1 << 15) as i16; i32 => u32, |k: u32| (k ^ 1 << 31) as i32; i64 => u64, |k: u64| (k ^ 1 << 63) as i64;
+    u8 => u8, |k| k; bool => u8, |k| k != 0; char => u32, |k| char::from_u32(k).unwrap_or_default());
 
 /// The number of items of `y` up to which `index_of` and `tolerant::index_of` pass over `x` once for each, in place of building an index.
 pub const SCANNED: usize = 16;
@@ -561,6 +600,9 @@ fn parted<const P: usize, T: Copy>(items: &[T], n: usize, group: impl Fn(T) -> u
 /// The first row count at which sorting uses radix passes rather than comparisons.
 const RADIX_FROM: usize = 256;
 
+/// The first lane length at which a value sort uses radix passes on its keys rather than an unstable comparison sort, for `bytes`-byte keys. On macOS, 8-byte keys cost less by comparison at 256 items (about 41 copies against 96) and at 32,768 (about 60 against 71), so they switch at 2^17 items. 4-byte keys cost about the same both ways at 256 items (about 83 copies against 87) and less by radix at 32,768 (about 52 against 113), so narrower keys switch at 256.
+const fn value_radix_from(bytes: usize) -> usize { if bytes > 4 { 1 << 17 } else { RADIX_FROM } }
+
 /// The rows of an `n`-row table in ascending order, comparing entries column by column from the first. Rows that compare equal keep their order of position. `columns` holds each column's `n` keys, whose unsigned order is the order you want. A caller fills them from its items in a pass that vectorizes. Fewer than 256 rows take a comparison sort. One column whose keys `tabled` allows takes a counting sort. Other tables take the radix sort once for each column, from the last. Positions are `u32`s, as a slice holds at most `u32::MAX` items.
 #[inline(never)]
 pub fn sort_rows<K: RadixKey>(n: usize, columns: Vec<Vec<K>>) -> Vec<u32> {
@@ -583,7 +625,7 @@ fn radix_column<K: RadixKey>(keys: &mut Vec<K>, order: &mut Vec<u32>, spare: &mu
         for (key, &i) in spare.0.iter_mut().zip(order.iter()) { *key = keys[i as usize]; }
         std::mem::swap(keys, &mut spare.0);
     }
-    radix(keys, order, spare);
+    radix(keys, order, (&mut spare.0, &mut spare.1));
 }
 
 /// The order of one column's `keys` by counting, when `table_size` allows their range. Equal keys keep their order. Each key's place follows the places of all smaller keys. The range of the first 256 keys rules out most keys that span too wide a range, such as floats', before a pass over all of them.
@@ -602,40 +644,41 @@ pub(crate) fn sorted<K: RadixKey>(mut keys: Vec<K>) -> (Vec<K>, Vec<u32>) {
     let n = keys.len();
     let mut order: Vec<u32> = (0..n as u32).collect();
     if n < RADIX_FROM { order.sort_by_key(|&i| keys[i as usize]); return (order.iter().map(|&i| keys[i as usize]).collect(), order); }
-    radix(&mut keys, &mut order, &mut (vec![K::default(); n], vec![0; n]));
+    radix(&mut keys, &mut order, (&mut vec![K::default(); n], &mut vec![0; n]));
     (keys, order)
 }
 
-/// Sorts `keys`, and their positions in `order`, keeping the order of equal keys: an LSD radix sort, one byte at a time from the lowest, which skips any byte that is the same in every key. Each pass moves the keys and positions into `spare`, which holds as many, then swaps the two. They move as two arrays, so a pass over 64-bit keys moves 12 bytes for each, where pairs would move 16. A key no wider than its float keeps each pass's bytes in proportion to the float's width.
-fn radix<K: RadixKey>(keys: &mut Vec<K>, order: &mut Vec<u32>, spare: &mut (Vec<K>, Vec<u32>)) {
+/// Sorts `keys` in place, keeping the order of equal keys, and moves `payload` with them: an LSD radix sort, one byte at a time from the lowest, which skips any byte that is the same in every key. Each pass moves the keys and payload into `spare`, which holds as many, and the two then trade places. Where the passes end in `spare`, a last copy brings the result back. Keys and payload move as two arrays, so a pass over 64-bit keys with `u32` positions moves 12 bytes for each, where pairs would move 16. A grade carries positions. A value sort carries nothing, since its keys read back to its values. A key no wider than its float keeps each pass's bytes in proportion to the float's width.
+fn radix<K: RadixKey, P: Copy + Send + Sync>(keys: &mut [K], payload: &mut [P], spare: (&mut [K], &mut [P])) {
     let n = keys.len();
-    if n > RADIX_PIECE && crate::parallel::threads() > 1 { return radix_pieces(keys, order, spare); }
-    let mut counts = [[0usize; 256]; 8];
+    if n > RADIX_PIECE && crate::parallel::threads() > 1 { return radix_pieces(keys, payload, spare); }
+    let mut counts = [[0u32; 256]; 8];
     let counts = &mut counts[..K::BYTES];
     for &k in keys.iter() { for (b, count) in counts.iter_mut().enumerate() { count[k.byte(b)] += 1; } }
+    let (mut from, mut to, mut passes) = ((keys, payload), spare, 0);
     for (b, count) in counts.iter().enumerate() {
-        if count.contains(&n) { continue; }
-        let (mut next, mut total) = ([0; 256], 0);
-        for (place, &c) in next.iter_mut().zip(count) { (*place, total) = (total, total + c) }
-        let (from, positions, to, places) = (&keys[..n], &order[..n], &mut spare.0[..n], &mut spare.1[..n]);
+        if count.contains(&(n as u32)) { continue; }
+        let (mut next, mut total) = ([0usize; 256], 0);
+        for (place, &c) in next.iter_mut().zip(count) { (*place, total) = (total, total + c as usize) }
+        let (source, carried, dest, places) = (&from.0[..n], &from.1[..n], &mut to.0[..n], &mut to.1[..n]);
         for j in 0..n {
-            let place = &mut next[from[j].byte(b)];
-            (to[*place], places[*place]) = (from[j], positions[j]);
+            let place = &mut next[source[j].byte(b)];
+            (dest[*place], places[*place]) = (source[j], carried[j]);
             *place += 1;
         }
-        std::mem::swap(keys, &mut spare.0);
-        std::mem::swap(order, &mut spare.1);
+        (from, to, passes) = (to, from, passes + 1);
     }
+    if passes % 2 == 1 { to.0.copy_from_slice(from.0); to.1.copy_from_slice(from.1); }
 }
 
 /// The fewest keys in a `radix_pieces` piece. A pass cuts one piece for each thread, or fewer where the keys run short.
 const RADIX_PIECE: usize = 1 << 16;
 
 /// `radix` across threads, for more than one `RADIX_PIECE` of keys. Each pass counts the byte's values in each piece, gives each piece its own run of every bucket, after the runs of the pieces before it, and moves each piece's keys into its runs in order. The sort stays stable, so it gives `radix`'s result. A pass splits the unwritten part of `spare` into its runs, so each piece writes only its own.
-fn radix_pieces<K: RadixKey>(keys: &mut Vec<K>, order: &mut Vec<u32>, spare: &mut (Vec<K>, Vec<u32>)) {
+fn radix_pieces<K: RadixKey, P: Copy + Send + Sync>(keys: &mut [K], payload: &mut [P], spare: (&mut [K], &mut [P])) {
     use crate::parallel::pieces_of;
-    /// One piece's run in each bucket, for keys and for positions.
-    struct Runs<'a, K> { keys: Vec<std::slice::IterMut<'a, K>>, places: Vec<std::slice::IterMut<'a, u32>> }
+    /// One piece's run in each bucket, for keys and for payload.
+    struct Runs<'a, K, P> { keys: Vec<std::slice::IterMut<'a, K>>, places: Vec<std::slice::IterMut<'a, P>> }
     let n = keys.len();
     let count = (n / RADIX_PIECE).min(crate::parallel::threads());
     let size = n.div_ceil(count);
@@ -645,47 +688,46 @@ fn radix_pieces<K: RadixKey>(keys: &mut Vec<K>, order: &mut Vec<u32>, spare: &mu
         for &k in &keys[piece(p)] { for b in 0..K::BYTES { c[0][b][k.byte(b)] += 1; } }
         true
     });
-    let mut moved = false;
+    let (mut from, mut to, mut passes) = ((keys, payload), spare, 0);
     for b in 0..K::BYTES {
         let total = (0..256).map(|d| every.iter().map(|c| c[b][d] as usize).sum::<usize>());
         if total.into_iter().any(|t| t == n) { continue; }
         let mut counts: Vec<[u32; 256]> = every.iter().map(|c| c[b]).collect();
-        if moved {
+        if passes > 0 {
             pieces_of(&mut counts, 1, usize::MAX, &|p, c| {
                 c[0] = [0; 256];
-                for &k in &keys[piece(p)] { c[0][k.byte(b)] += 1; }
+                for &k in &from.0[piece(p)] { c[0][k.byte(b)] += 1; }
                 true
             });
         }
         {
-            let (mut to, mut places) = (&mut spare.0[..n], &mut spare.1[..n]);
-            let mut runs: Vec<Runs<'_, K>> = (0..count).map(|_| Runs { keys: Vec::with_capacity(256), places: Vec::with_capacity(256) }).collect();
+            let (mut dest, mut places) = (&mut to.0[..n], &mut to.1[..n]);
+            let mut runs: Vec<Runs<'_, K, P>> = (0..count).map(|_| Runs { keys: Vec::with_capacity(256), places: Vec::with_capacity(256) }).collect();
             for d in 0..256 {
                 for (run, c) in runs.iter_mut().zip(&counts) {
-                    let (k, rest) = std::mem::take(&mut to).split_at_mut(c[d] as usize);
+                    let (k, rest) = std::mem::take(&mut dest).split_at_mut(c[d] as usize);
                     let (o, others) = std::mem::take(&mut places).split_at_mut(c[d] as usize);
-                    (to, places) = (rest, others);
+                    (dest, places) = (rest, others);
                     run.keys.push(k.iter_mut());
                     run.places.push(o.iter_mut());
                 }
             }
-            let (from, positions) = (&keys[..n], &order[..n]);
+            let (source, carried) = (&from.0[..n], &from.1[..n]);
             pieces_of(&mut runs, 1, usize::MAX, &|p, run| {
                 let run = &mut run[0];
                 let range = piece(p);
-                let (from, positions) = (&from[range.clone()], &positions[range]);
-                for j in 0..from.len() {
-                    let d = from[j].byte(b);
-                    *run.keys[d].next().expect("a run holds each key that the counts gave its piece") = from[j];
-                    *run.places[d].next().expect("a run holds each key that the counts gave its piece") = positions[j];
+                let (source, carried) = (&source[range.clone()], &carried[range]);
+                for j in 0..source.len() {
+                    let d = source[j].byte(b);
+                    *run.keys[d].next().expect("a run holds each key that the counts gave its piece") = source[j];
+                    *run.places[d].next().expect("a run holds each key that the counts gave its piece") = carried[j];
                 }
                 true
             });
         }
-        std::mem::swap(keys, &mut spare.0);
-        std::mem::swap(order, &mut spare.1);
-        moved = true;
+        (from, to, passes) = (to, from, passes + 1);
     }
+    if passes % 2 == 1 { to.0.copy_from_slice(from.0); to.1.copy_from_slice(from.1); }
 }
 
 /// Positions grouped by a 64-bit key, such as a hash. A map gives the first and last position pushed with each key, and each position links to the next one pushed with the same key. Positions pushed in order give chains in order.
@@ -911,8 +953,17 @@ pub fn view_bins_below(boundaries: View<'_>, values: View<'_>) -> Option<Vec<u32
     Some(bins(&a, &v).into_iter().map(|p| n - p).collect())
 }
 
-/// Runs an ordered operation at the view's item width. Complex numbers have no ordering.
+/// Runs an ordered operation at the view's item width, with `$key` bound to the items' order key where the closure names it. Complex numbers have no ordering.
 macro_rules! ordered_view {
+    ($view:expr, |$x:ident| $body:expr) => {
+        Some(match $view {
+            View::Booleans($x) => $body,
+            View::Characters($x) => $body,
+            View::Integers(ints) => with_ints!(ints, |$x| $body),
+            View::Floats(floats) => with_floats!(floats, |$x| $body),
+            View::Complexes(_) => return None,
+        })
+    };
     ($view:expr, |$x:ident, $key:ident| $body:expr) => {
         Some(match $view {
             View::Booleans($x) => { let $key = OrderKey::order_key; $body },
@@ -966,41 +1017,47 @@ fn order_column<T: Copy + Sync, K: RadixKey, O: Send>(x: &[T], n: usize, start: 
     keys
 }
 
-/// A counting sort with no position buffer, when the items span a small table. Extra writes avoid one unpredictable branch per sparse count.
-fn spread<T: Element + Key>(x: &[T], down: bool) -> Option<Buffer> {
-    if x.len() < 256 { return None; }
-    let (min, counts) = counts(x)?;
-    let mut sorted = vec![T::FILL; x.len() + 4];
+/// Writes `x` sorted into `out`, which has `x`'s length, by counting, and gives `false` where the items don't span a small table. Extra writes avoid one unpredictable branch per sparse count.
+fn spread_into<T: Element + Key>(x: &[T], out: &mut [T], down: bool) -> bool {
+    if x.len() < 256 { return false; }
+    let Some((min, counts)) = counts(x) else { return false };
     let mut at = 0;
     let mut write = |(k, &c): (usize, &usize)| {
         let v = T::from_key(min + k as i64).unwrap_or(T::FILL);
-        sorted[at..at + 4].fill(v);
-        if c > 4 { sorted[at + 4..at + c].fill(v); }
+        if at + 4 <= out.len() {
+            out[at..at + 4].fill(v);
+            if c > 4 { out[at + 4..at + c].fill(v); }
+        } else { out[at..at + c].fill(v); }
         at += c;
     };
     if down { counts.iter().enumerate().rev().for_each(&mut write); }
     else { counts.iter().enumerate().for_each(&mut write); }
-    sorted.truncate(x.len());
-    Some(T::buffer(sorted))
+    true
 }
 
-/// A sorted vector, counting Boolean/integer/character values directly where possible, otherwise gathering its stable grade.
-pub fn view_sort(x: View<'_>, down: bool) -> Option<Buffer> {
-    let counted = match x {
-        View::Booleans(x) => spread(x, down), View::Characters(x) => spread(x, down),
-        View::Integers(ints) => with_ints!(ints, |x| spread(x, down)), _ => None,
-    };
-    counted.or_else(|| Some(Buffer::gathered(x, &view_grade(x, down)?)))
-}
+/// A sorted vector: one lane of `view_sort_along`.
+pub fn view_sort(x: View<'_>, down: bool) -> Option<Buffer> { view_sort_along(x, [1, x.len(), 1], down) }
 
-/// Sorts each lane through the shared stack scheduler, retaining the direct counting path for values.
-pub fn view_sort_along(x: View<'_>, dims @ [outer, _, inner]: [usize; 3], down: bool) -> Option<Buffer> {
-    if outer * inner == 1 { return view_sort(x, down); }
-    if matches!(x, View::Complexes(_)) { return None; }
-    Some(with_dtype!(x.dtype(), T => T::buffer(map_lanes::<_, _, ()>(T::of(x).unwrap(), dims, dims[1], |lane, out, _| {
-        let sorted = view_sort(T::view(lane), down).unwrap();
-        out.copy_from_slice(T::of(sorted.view()).unwrap());
-    }))))
+/// Sorts each lane into its own output. A lane of 256 items or more whose values span a small table sorts by counting. Other lanes sort their items' `SortKey`s, computed once, by an unstable comparison sort below `value_radix_from` and by the radix sort from there, then write the items back from the keys. Equal keys come from equal items, so the result doesn't depend on how the sort orders them, and `¯0` comes before `0`. Lanes run through the shared stack scheduler, which reuses each thread's buffers. A single lane runs on the calling thread, where the radix sort can split its passes across threads. `None` for complex numbers.
+pub fn view_sort_along(x: View<'_>, dims: [usize; 3], down: bool) -> Option<Buffer> {
+    fn run<T: SortKey>(x: &[T], dims @ [outer, len, inner]: [usize; 3], down: bool) -> Buffer {
+        let sort = |lane: &[T], out: &mut [T], (keys, spare): &mut (Vec<T::Key>, Vec<T::Key>)| {
+            if T::counted(lane, out, down) { return; }
+            T::keys_into(lane, keys, down);
+            let n = keys.len();
+            if n < value_radix_from(<T::Key as RadixKey>::BYTES) { keys.sort_unstable(); } else {
+                spare.resize(n, Default::default());
+                radix(keys, &mut vec![(); n], (spare, &mut vec![(); n]));
+            }
+            T::write_back(keys, out, down);
+        };
+        T::buffer(if outer * inner == 1 {
+            let mut out = vec![T::FILL; len];
+            sort(x, &mut out, &mut Default::default());
+            out
+        } else { map_lanes::<_, _, (Vec<T::Key>, Vec<T::Key>)>(x, dims, len, |lane, out, work| sort(lane, out, work)) })
+    }
+    ordered_view!(x, |x| run(x, dims, down))
 }
 
 /// Places each of the sorted, distinct `ranks` at its sorted position, leaving the runs between them unordered. Ranks must be below `x.len()`.
@@ -1035,18 +1092,20 @@ pub fn view_argpartition(x: View<'_>, rank: usize) -> Option<Vec<u32>> {
     Some(out)
 }
 
-/// Partitions each lane directly in its output buffer. Index partitioning compares the original native-width values and writes i64 positions.
+/// Partitions each lane around `rank` in its output buffer, comparing its items' `SortKey`s, computed once. Value partitioning writes the items back from the keys, and index partitioning writes i64 positions.
 pub fn view_partition_along(x: View<'_>, dims: [usize; 3], rank: usize, indices: bool) -> Option<Buffer> {
-    fn run<T: Element + Default, K: Ord>(x: &[T], dims: [usize; 3], rank: usize, indices: bool, key: impl Fn(T) -> K + Copy + Sync) -> Buffer {
-        if indices { i64::buffer(map_lanes::<_, _, ()>(x, dims, dims[1], |lane, out, _| {
+    fn run<T: SortKey>(x: &[T], dims: [usize; 3], rank: usize, indices: bool) -> Buffer {
+        if indices { i64::buffer(map_lanes::<_, _, Vec<T::Key>>(x, dims, dims[1], |lane, out, keys| {
+            T::keys_into(lane, keys, false);
             for (i, p) in out.iter_mut().enumerate() { *p = i as i64; }
-            select(out, &[rank], |a, b| key(lane[*a as usize]).cmp(&key(lane[*b as usize])));
-        })) } else { T::buffer(map_lanes::<_, _, ()>(x, dims, dims[1], |lane, out, _| {
-            out.copy_from_slice(lane);
-            select(out, &[rank], |a, b| key(*a).cmp(&key(*b)));
+            select(out, &[rank], |a, b| keys[*a as usize].cmp(&keys[*b as usize]));
+        })) } else { T::buffer(map_lanes::<_, _, Vec<T::Key>>(x, dims, dims[1], |lane, out, keys| {
+            T::keys_into(lane, keys, false);
+            select(keys, &[rank], |a, b| a.cmp(b));
+            T::write_back(keys, out, false);
         })) }
     }
-    ordered_view!(x, |x, key| run(x, dims, rank, indices, key))
+    ordered_view!(x, |x| run(x, dims, rank, indices))
 }
 
 /// Only `range` of a stable grade, by selection followed by sorting the requested run. Original positions break ties because taking from a stable grade observes them.
@@ -1126,21 +1185,19 @@ pub fn quantiles<F: Float>(x: &mut [F], probabilities: &[f64]) -> Result<Vec<F>,
 /// Quantiles of each lane, with a leading probability axis. Integers select exactly before converting the selected values to f64; floats keep their width. `None` for complex numbers, which have no order. A probability outside `[0, 1]`, or NaN, gives a Domain error.
 pub fn view_quantiles_along(x: View<'_>, dims @ [outer, _, inner]: [usize; 3], probabilities: &[f64]) -> Result<Option<Buffer>, Error> {
     use crate::buffer::Source;
-    fn run<T: Element, F: Element + Float + Default, K: Ord>(x: &[T], dims: [usize; 3], plan: &Quantiles, key: impl Fn(T) -> K + Copy + Sync,
-        read: impl Fn(T) -> F::Working + Sync) -> Vec<F> {
-        map_lanes::<_, _, Vec<T>>(x, dims, plan.points.len(), |lane, out, work| {
-            work.clear();
-            work.extend_from_slice(lane);
-            plan.apply(work, out, |a, b| key(*a).cmp(&key(*b)), &read);
+    fn run<T: SortKey, F: Element + Float + Default>(x: &[T], dims: [usize; 3], plan: &Quantiles, read: impl Fn(T) -> F::Working + Sync) -> Vec<F> {
+        map_lanes::<_, _, Vec<T::Key>>(x, dims, plan.points.len(), |lane, out, keys| {
+            T::keys_into(lane, keys, false);
+            plan.apply(keys, out, |a, b| a.cmp(b), |k| read(T::from_sort_key(k)));
         })
     }
     fn floats<F: Element + Float + Default>(x: &[F], dims: [usize; 3], plan: &Quantiles) -> Buffer {
-        F::buffer(run::<_, F, _>(x, dims, plan, Float::order_key, Float::working))
+        F::buffer(run::<_, F>(x, dims, plan, Float::working))
     }
     let plan = Quantiles::new(dims[1], probabilities)?;
     let items = match x {
-        View::Booleans(x) => f64::buffer(run::<_, f64, _>(x, dims, &plan, OrderKey::order_key, Source::<f64>::read)),
-        View::Integers(ints) => with_ints!(ints, |x| f64::buffer(run::<_, f64, _>(x, dims, &plan, OrderKey::order_key, Source::<f64>::read))),
+        View::Booleans(x) => f64::buffer(run::<_, f64>(x, dims, &plan, Source::<f64>::read)),
+        View::Integers(ints) => with_ints!(ints, |x| f64::buffer(run::<_, f64>(x, dims, &plan, Source::<f64>::read))),
         View::Floats(x) => with_floats!(x, |x| floats(x, dims, &plan)), _ => return Ok(None),
     };
     let count = probabilities.len();

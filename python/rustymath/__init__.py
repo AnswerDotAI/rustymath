@@ -4,7 +4,12 @@ Rustymath provides fast elementary and special functions, statistics, searching 
 
 The Python package needs no NumPy. Its eager operations use the same broadcasting, selection and tolerant-comparison rules as the shared Rust core. For richer array notation, operators and fusion, use BasedPL.
 
-Elementary float functions target four units in the last place (ulps). Rustymath prioritizes speed over last-bit agreement and reproducibility.
+Float functions target four units in the last place (ulps). Rustymath prioritizes speed over last-bit agreement and reproducibility. These functions document wider bounds:
+
+- `lgamma` near its zeros at 1 and 2 is within 4 ulps of 2, not of the result. `digamma` near its zeros is within 4 ulps of 1, and below -20 within 4 ulps of ln(1 - x).
+- `binom` and `binom_dn` of a non-whole n with a whole k up to 64 are within 2k ulps.
+- `binom_dk` has no relative bound near n = 2k, where its two ψ terms cancel.
+- Complex functions count ulps of the result's magnitude, so a much smaller part can carry most of the error. Complex powers, Γ and binomial coefficients allow ulps of their magnitude times one more than the exponent's magnitude. `exp` gives an exact direction at the float nearest a whole number of quarter turns, so e^(iπ/2) is exactly i.
 
 [Arrays and indexing](https://answerdotai.github.io/rustymath/arrays.html) covers construction, dtypes, selection, reshaping, axis names, keys and interoperability.
 
@@ -33,7 +38,7 @@ from .integer import encode, decode
 from .search import (Unique, unique, index, isin, argsort, lexsort, searchsorted, bins, bincount, counts, group_indices, sort, partition, argpartition,
     argmin, argmax, median, quantile, percentile, union1d, intersect1d, setdiff1d, find)
 from ._core import (__version__, CT, Array, absolute, add, all, angle, any, arccos, arccosh, arcsin, arcsinh, arctan, arctan2, arctanh, array, betainc,
-    betaincinv, binom, cbrt, ceil, cis, cos, cosh, cumprod, cumsum, distribution, divide, equal, erf, erfc, erfcinv, erfinv, exp, expm1, factorial, floor,
+    betaincinv, binom, binom_dk, binom_dn, cbrt, ceil, cis, cos, cosh, cumprod, cumsum, digamma, distribution, divide, equal, erf, erfc, erfcinv, erfinv, exp, expm1, factorial, floor,
     gamma, gammainc, gammaincc, gammaincinv, gammaln, gcd, greater, greater_equal, hypot, lambertw, lcm, less, less_equal, log, log10, log1p, log2, logb,
     loggamma, logical_and, logical_or, logical_scan, logical_xor, logical_xnor, max, maximum, min, minimum, minmax, multiply, not_equal, number_theory, power,
     prod, remainder, root, set_threads, sign, sin, sinh, sqrt, sqrt1mx2, sqrt1px2, sqrtx2m1, subtract, sum, tan, tanh, threads, thread_setting, timing)

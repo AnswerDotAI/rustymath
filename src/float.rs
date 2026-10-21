@@ -25,7 +25,9 @@ pub trait Float: num_traits::Float + sealed::Sealed + sealed::Item {
     type OrderKey: RadixKey + Key;
     /// A key whose unsigned order is the order of `total_cmp`, after `¯0` becomes `0` and every NaN becomes one NaN. So `¯0` and `0` share a key, NaN's key follows every other, and two floats match exactly when their keys are equal.
     fn order_key(self) -> Self::OrderKey;
-    /// The float whose `order_key` is `k`. Every NaN reads back as one NaN, and `¯0` as `0`.
+    /// A key whose unsigned order is the order of `total_cmp`, after every NaN becomes positive. So `¯0`'s key comes just before `0`'s, every NaN's follows `∞`'s, and `from_order_key` reads the float back exactly, apart from a NaN's sign. Sorts and selections compare these keys and write floats back from them.
+    fn total_key(self) -> Self::OrderKey;
+    /// The float whose `order_key` or `total_key` is `k`. A total key reads back exactly, apart from a NaN's sign. An order key reads `¯0` back as `0`, and every NaN as one NaN.
     fn from_order_key(k: Self::OrderKey) -> Self;
     /// Writes `x` where `mask`'s lanes aren't zero and `y` where they are into the next `n` slots of `out`, through [`Choose`](crate::Choose), and gives whether every result succeeded. Fused graphs pass a comparison's lanes of 1 and 0 as the mask.
     fn choose(x: Arg<'_, Self>, y: Arg<'_, Self>, mask: Arg<'_, Self>, n: usize, out: &mut Slots<'_, Self>) -> bool;
@@ -118,7 +120,14 @@ pub(crate) mod sealed {
     }
 }
 
-/// `Float`'s order-key items, for a float whose bits have type `$k`. A key is the bits with the sign bit flipped, and a negative float's other bits flipped too. `¯0` adds to `0` first, and every NaN takes the greatest key.
+/// A float's bits as a key in its total order: the sign bit flipped, and a negative float's other bits flipped too. `Float::from_order_key` undoes it.
+#[inline(always)]
+fn ordered_bits<K: num_traits::PrimInt>(bits: K) -> K {
+    let sign = K::one() << (K::zero().count_zeros() as usize - 1);
+    if bits & sign == K::zero() { bits | sign } else { !bits }
+}
+
+/// `Float`'s order-key items, for a float whose bits have type `$k`, through `ordered_bits`. An order key adds `¯0` to `0` first and gives every NaN the greatest key. A total key clears a NaN's sign bit, so every NaN follows `∞`.
 macro_rules! order_key {
     ($k:ty) => {
         type OrderKey = $k;
@@ -127,8 +136,12 @@ macro_rules! order_key {
             if self.is_nan() {
                 return <$k>::MAX;
             }
-            let bits = (self + <Self as num_traits::Zero>::zero()).to_bits();
-            if bits >> (<$k>::BITS - 1) == 1 { !bits } else { bits | 1 << (<$k>::BITS - 1) }
+            ordered_bits((self + <Self as num_traits::Zero>::zero()).to_bits())
+        }
+        #[inline(always)]
+        fn total_key(self) -> $k {
+            let bits = self.to_bits();
+            ordered_bits(if self.is_nan() { bits & !(1 << (<$k>::BITS - 1)) } else { bits })
         }
         #[inline(always)]
         fn from_order_key(k: $k) -> Self {
