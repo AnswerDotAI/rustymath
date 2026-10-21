@@ -1,5 +1,6 @@
 //! rustymath's `distribution` module. Each constructor checks its parameters and gives a `Distribution`, whose methods take a number or an array of any shape.
 use crate::array::{core, give};
+use crate::convert::released;
 use crate::functions::Apply;
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyFloat};
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -11,13 +12,12 @@ use rustymath_buffer::py_err;
 pub struct Distribution(pub(crate) dist::Distribution);
 
 /// The common sampler for fresh-seed distribution calls and persistent generators.
-pub(crate) fn sampled<'py>(py: Python<'py>, distribution: dist::Distribution, rng: &mut impl Rng, size: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn sampled<'py>(py: Python<'py>, distribution: dist::Distribution, rng: &mut (impl Rng + Send), size: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
     let Some(size) = size else { return Ok(PyFloat::new(py, distribution.sample(rng)).into_any()) };
     let shape = crate::create::shape(size)?;
     let n = generated_len(&shape).map_err(py_err)?;
-    let mut out = Vec::with_capacity(n);
-    out.resize(n, 0.0);
-    distribution.samples(rng, &mut out);
+    let mut out = vec![0.0; n];
+    released(py, || distribution.samples(rng, &mut out));
     give(py, core(out, &shape)?, false)
 }
 

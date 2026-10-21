@@ -57,11 +57,17 @@ pub(crate) mod sealed {
     pub trait Forms<E: Item, const N: usize>: Sync {
         type Out: Item;
         fn scalar(&self, x: [E; N]) -> Self::Out;
-        fn checked_scalar(&self, x: [E; N]) -> Option<Self::Out>;
+        /// The scalar form's result and whether it succeeded, as `slice` judges each item: a failed result is what `slice` writes in its slot.
+        fn judged_scalar(&self, x: [E; N]) -> (Self::Out, bool);
+        /// `judged_scalar`'s result where it succeeded.
+        #[inline]
+        fn checked_scalar(&self, x: [E; N]) -> Option<Self::Out> { let (r, ok) = self.judged_scalar(x); ok.then_some(r) }
         /// Whether no item fails: `checked_scalar` always gives `Some`, and `slice` always gives true.
         const TOTAL: bool;
         /// Whether a failed item's slot holds its result wrapped to the output type, as integer arithmetic's does.
         const WRAPS: bool;
+        /// Whether `slice` runs `judged_scalar` in a loop, and the scalar forms inline into a caller in another crate.
+        const INLINE: bool;
         fn slice(&self, x: [Arg<'_, E>; N], n: usize, out: &mut [std::mem::MaybeUninit<Self::Out>]) -> bool;
     }
     macro_rules! nan_items { ($($t:ty),+) => {$( impl Item for $t { const NAN: bool = true; #[inline(always)] fn has_nan(self) -> bool { self.is_nan() } } )+} }

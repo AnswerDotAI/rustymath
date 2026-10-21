@@ -1,4 +1,4 @@
-//! Python array interchange and selectors, shared by rustymath and basedpl. [`read`] borrows native contiguous buffers and normalizes other supported buffers. [`read_array`] preserves sibling-array metadata. [`export`] fills a `Py_buffer`. [`labels`] and [`frame`] read dict keys and data frames, [`selection`] decodes Python indexing, [`walk`] walks nested Python values, and [`py_err`] converts array errors to Python exceptions.
+//! Python array interchange and selectors, shared by rustymath and basedpl. [`read`] borrows native contiguous buffers and normalizes other supported buffers. [`read_array`] preserves sibling-array metadata. [`export`] fills a `Py_buffer`, and [`lend`] fills one read-only for items that the export itself keeps alive. [`labels`] and [`frame`] read dict keys and data frames, [`selection`] decodes Python indexing, [`walk`] walks nested Python values, and [`py_err`] converts array errors to Python exceptions.
 use pyo3::exceptions::{PyBufferError, PyIndexError, PyOverflowError, PyTypeError, PyValueError};
 use pyo3::{IntoPyObjectExt, ffi, prelude::*, types::{PyComplex, PyInt, PyList, PyString}};
 use rustymath::buffer::{Buffer, ComplexWidth, DType, Element, FloatWidth, View, Width};
@@ -246,7 +246,7 @@ pub fn geometry(dtype: DType, shape: &[usize]) -> (Box<[isize]>, Box<[isize]>) {
 }
 
 /// The `shape` and byte strides that [`export`] takes, for items of `dtype` reached through signed item `strides`, one for each axis of `shape`, as [`Mapping::affine`](rustymath::agreement::Mapping::affine) gives them. Keep both alive for each export.
-pub fn strided_geometry(dtype: DType, shape: &[usize], strides: &[isize]) -> (Box<[isize]>, Box<[isize]>) {
+fn strided_geometry(dtype: DType, shape: &[usize], strides: &[isize]) -> (Box<[isize]>, Box<[isize]>) {
     let size = layout(dtype).0 as isize;
     (shape.iter().map(|&n| n as isize).collect(), strides.iter().map(|&s| s * size).collect())
 }
@@ -286,4 +286,22 @@ pub unsafe fn export(
     v.internal = ptr::null_mut();
     unsafe { *view = v; }
     Ok(())
+}
+
+/// What a [`lend`] export holds: the value that owns the items, and the export's shape and byte strides.
+#[pyclass(frozen)]
+struct Lent { _keep: Box<dyn std::any::Any + Send + Sync>, shape: Box<[isize]>, strides: Box<[isize]> }
+
+/// Fills `view` for a class's `__getbuffer__`, read-only, with the items of `dtype` under `shape` that `keep` owns. The first is at `first(&keep)`, and the rest follow at signed item `strides` from it, or in C order where `strides` is `None`. The export holds `keep`, so the items stay valid until release, whatever then happens to the object that exported them.
+///
+/// # Safety
+/// `view` must be the `Py_buffer` that CPython passed to `__getbuffer__`, and every address that the geometry reaches from `first(&keep)` must hold a valid item of `dtype` that `keep` owns.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn lend<K: Send + Sync + 'static>(view: *mut ffi::Py_buffer, flags: c_int, py: Python<'_>, keep: K, first: impl FnOnce(&K) -> *const u8, dtype: DType, shape: &[usize], strides: Option<&[isize]>) -> PyResult<()> {
+    let keep = Box::new(keep);
+    let data = first(&keep);
+    let (dims, steps) = match strides { Some(s) => strided_geometry(dtype, shape, s), None => geometry(dtype, shape) };
+    let lent = Bound::new(py, Lent { _keep: keep, shape: dims, strides: steps })?;
+    let this = lent.get();
+    unsafe { export(view, flags, lent.as_any(), dtype, data.cast_mut(), shape.iter().product(), &this.shape, &this.strides, true) }
 }

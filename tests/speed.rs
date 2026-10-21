@@ -2,7 +2,8 @@
 //! Array guards time f32 differences on length-2 lanes and on one long vector, and a compact broadcast repeating each input 64 times. Safe i32-to-i64 widening counts i64 copies. These rows use only the demonstrated dtypes.
 use rand::seq::SliceRandom;
 use rustymath::*;
-use std::{collections::HashMap, hint::black_box, io::Write, ops::Neg, time::Instant};
+use rustymath::timing::RUNS;
+use std::{collections::HashMap, hint::black_box, io::Write, ops::Neg};
 pub mod support;
 
 const N: usize = 65_536;
@@ -11,19 +12,10 @@ type Compared = (&'static str, [f64; 4], [f64; 2]);
 /// A function's name and its costs in copies, at f64 and at f32.
 type Costed = (&'static str, [f64; 2]);
 
-/// How many runs each timing takes. Each run reads inputs that no earlier run has read. A branch predictor learns the outcomes of up to tens of thousands of items it has seen. On repeated inputs, a function that branches on its data runs as fast as on sorted data.
-const RUNS: usize = 5;
+/// The fastest of `RUNS` runs of `run`, as `timing::fastest` times them, in ns for each of `n` items.
+fn fastest(n: usize, run: impl FnMut(usize)) -> f64 { timing::fastest(run) * 1e9 / n as f64 }
 
-/// The fastest of `RUNS` runs of `run`, in ns for each of `n` items. Run `k` is passed `k`, so it can read its own inputs.
-fn fastest(n: usize, mut run: impl FnMut(usize)) -> f64 {
-    (0..RUNS).map(|k| {
-        let start = Instant::now();
-        run(k);
-        start.elapsed().as_secs_f64() * 1e9 / n as f64
-    }).fold(f64::INFINITY, f64::min)
-}
-
-/// Run `k`'s inputs, from `x`, which holds `RUNS` sets of them one after another.
+/// Run `k`'s inputs, from `x`, which holds `RUNS` sets of them one after another. Each run reads inputs that no earlier run has read. A branch predictor learns the outcomes of up to tens of thousands of items it has seen. On repeated inputs, a function that branches on its data runs as fast as on sorted data.
 fn set<A>(x: &[A], k: usize) -> &[A] { let n = x.len() / RUNS; &x[k * n..][..n] }
 
 /// The fastest of `RUNS` runs of `f`, which writes `n` outputs into a slice, in ns per item.
@@ -183,10 +175,7 @@ fn reductions(units: &Units<f64, f32>) -> [Compared; 4] {
     ]
 }
 
-/// Writes each item of `x`, negated, to `out`. It moves the data that a copy does, in a vector loop as the functions do. The compiler would turn a plain copy into a call to `memcpy`. The speed of `memcpy` varies with the CPU and with how the two buffers align.
-fn negate<T: Copy + Neg<Output = T>>(x: &[T], out: &mut [T]) { for (o, &v) in out.iter_mut().zip(x) { *o = -v } }
-
-/// The unit of every budget, called a copy: the time to `negate` `N` items of type `T`, each `v`, in ns per item. A nonzero `v` makes `vec!` write every item. Zeros could come from untouched pages. Every read of an untouched page finds the same page of zeros in the cache.
+/// The unit of every budget, one `timing::copy` of `N` items of type `T`, each `v`, in ns per item. A nonzero `v` makes `vec!` write every item. Zeros could come from untouched pages. Every read of an untouched page finds the same page of zeros in the cache.
 struct Unit<T>(Vec<T>);
 
 impl<T: Copy + Default + Neg<Output = T>> Unit<T> {
@@ -194,7 +183,7 @@ impl<T: Copy + Default + Neg<Output = T>> Unit<T> {
 
     /// The time per item that `run` gives, in ns and in copies. The copy is timed just before `run`, as basedpl's speed test times each case's copy.
     fn beside(&self, run: impl FnOnce() -> f64) -> (f64, f64) {
-        let copy = time_slice(N, |k, out| negate(black_box(set(&self.0, k)), out));
+        let copy = time_slice(N, |k, out| timing::copy(black_box(set(&self.0, k)), out));
         let t = run();
         (t, t / copy)
     }
@@ -409,16 +398,10 @@ fn decompositions(units: &Units<f64, f32>, complex_units: &Units<num_complex::Co
     ]
 }
 
-/// This machine's budget of each function at each item type, keyed by `(type, name)`. Each section of `text` starts with a type in brackets, and each line under it holds a name and its two native budgets, separated by tabs. `timing::NATIVE_COLUMN` picks the budget this machine checks. Lines that start with `#` are comments.
+/// This machine's budget of each function at each item type, keyed by `(type, name)`. Each section of `text` (`timing::sections`) is an item type, and each line under it holds a name and its two native budgets. `timing::NATIVE_COLUMN` picks the budget this machine checks.
 fn budgets(text: &str) -> HashMap<(&str, &str), f64> {
-    let mut width = "";
-    text.lines().filter(|line| !line.is_empty() && !line.starts_with('#')).filter_map(|line| {
-        if let Some(w) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) { width = w; return None; }
-        let mut fields = line.split('\t');
-        let name = fields.next().expect("a budget line starts with a name");
-        let budget = fields.nth(rustymath::timing::NATIVE_COLUMN).expect("a budget line holds a name and two budgets, separated by tabs");
-        Some(((width, name), budget.parse().expect("a budget is a number")))
-    }).collect()
+    let budget = |line: &str| line.split('\t').nth(1 + timing::NATIVE_COLUMN).expect("a budget line holds a name and two budgets, separated by tabs").parse::<f64>().expect("a budget is a number");
+    timing::sections(text).expect("speed.txt starts with a section").into_iter().flat_map(|(width, _, lines)| lines.into_iter().map(move |line| ((width, timing::code_of(line)), budget(line)))).collect()
 }
 
 /// Every row's comparison with the standard library, where there is one, and every row's cost in copies, as `(width, name, cost)`.
@@ -461,9 +444,9 @@ fn measured(units: &Units<f64, f32>, complex_units: &Units<num_complex::Complex<
     let (c64, c32): (&[f64], &[f32]) = (black_box(&c64), black_box(&c32));
     let (x64, x32) = widths(-2.0, 2.0, GOLDEN, N);
     compared.push(compare(units, "polynomial::evaluate", || {
-        time_slice(N, |k, out| { negate(black_box(set(&x64, k)), out); polynomial::evaluate(c64, out) })
+        time_slice(N, |k, out| { timing::copy(black_box(set(&x64, k)), out); polynomial::evaluate(c64, out) })
     }, || time(&x64, |x| horner(c64, x)), || {
-        time_slice(N, |k, out| { negate(black_box(set(&x32, k)), out); polynomial::evaluate(c32, out) })
+        time_slice(N, |k, out| { timing::copy(black_box(set(&x32, k)), out); polynomial::evaluate(c32, out) })
     }, || time(&x32, |x| horner(c32, x))));
     let costed = compared.iter().map(|&(name, _, costs)| (name, costs)).chain(special(units)).chain(selections(units)).chain(complex(complex_units))
         .chain(inner_products(units)).chain(orderings(units)).chain(decompositions(units, complex_units))

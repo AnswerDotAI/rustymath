@@ -65,9 +65,9 @@ def test_integers():
         assert rm.add(np.array([np.iinfo(t).max], t), np.array([1], t)).tolist() == [np.iinfo(t).min], t
     # Integers compare exactly, where float64 would round them to one value.
     assert not rm.equal(10**15, 10**15 + 1) and rm.less(2**62, 2**62 + 1)
-    # A Python float beside integers promotes them to float64, and the comparison then uses the tolerance.
+    # A Python float beside integers promotes them to float64, so a tolerant comparison applies to them.
     assert A(rm.add(np.arange(3, dtype=np.int16), 0.5)).dtype == np.float64
-    assert rm.equal(np.arange(3), 1 + 1e-15).tolist() == [False, True, False]
+    assert rm.equal(np.arange(3), 1 + 1e-15, ct=rm.CT).tolist() == [False, True, False]
     # Arrays of different dtypes promote to the higher kind, wide enough for both. An integer beside a float takes the float's dtype, as in JAX, where NumPy widens the float. NumPy's other integer widths have no rustymath dtype.
     for t, u, want in [(np.int16, np.int32, np.int32), (np.bool_, np.uint8, np.uint8), (np.uint8, np.float16, np.float16), (np.int16, np.float16, np.float16), (np.int32, np.float32, np.float32), (np.float64, np.complex64, np.complex128)]:
         x, y = np.arange(3).astype(t), np.arange(3).astype(u)
@@ -83,6 +83,15 @@ def test_integers():
     assert rm.add(p, q).tolist() == [2, 1, 1, 0] and rm.multiply(p, q).dtype == 'int64'
     with pytest.raises(ValueError): rm.logical_and([1, 2], [3, 4])
     assert A(rm.floor(p)).dtype == bool and A(rm.absolute(p)).dtype == bool
+
+def test_characters():
+    "Characters compute as their code points. A number orders before a character, and an integer offsets one."
+    t = lambda x: A(x).tolist()
+    assert t(rm.less('abc', 'bcb')) == [True, True, False] and t(rm.maximum('abc', 'bab')) == ['b', 'b', 'c']
+    assert t(rm.less(3, 'ab')) == [True, True] and t(rm.minimum('ab', 3)) == [3, 3] and t(rm.equal(97, 'a')) == [False]
+    assert t(rm.add('ab', 1)) == ['b', 'c'] and t(rm.add(1, 'ab')) == ['b', 'c'] and t(rm.subtract('bc', 'ab')) == [1, 1]
+    for bad in [lambda: rm.add('ab', 'ab'), lambda: rm.add('a', 1.5), lambda: rm.subtract(1, 'a')]:
+        with pytest.raises(ValueError): bad()
 
 def test_reductions(threads):
     x = np.random.default_rng(0).random(10_001)
@@ -129,13 +138,20 @@ def test_reductions(threads):
     assert np.array_equal(A(rm.any(rm.array(b).T, axis=0)), b.T.any(0))
 
 def test_tolerant():
-    assert rm.equal(0.1 + 0.2, 0.3) and not rm.equal(0.1 + 0.2, 0.3, ct=0)
-    assert not rm.equal(1, 1 + 3e-14) and rm.equal([1, 2], 1 + 3e-14, ct=1e-13).tolist() == [True, False]
-    assert not rm.less(0.3, 0.1 + 0.2) and rm.less(0.3, 0.1 + 0.2, ct=0) and rm.greater_equal(0.3, 0.1 + 0.2) and not rm.not_equal(0.3, 0.1 + 0.2)
-    assert rm.floor(0.5 + 0.5 - 1e-16) == 1 and rm.ceil(1 + 1e-15) == 1 and rm.floor(1 - 1e-15, ct=0) == 0
-    assert rm.remainder([-5.0, 5.0], 3).tolist() == np.remainder([-5.0, 5.0], 3).tolist() and rm.remainder(0.3, 0.1) == 0
-    assert abs(rm.gcd(0.6, 0.4) - 0.2) < 1e-15 and abs(rm.lcm(-0.6, 0.4) + 1.2) < 1e-14
+    # Comparisons start exact. `ct` sets one call's tolerance, and `set_tolerance` the process's.
+    assert rm.tolerance() == 0 and not rm.equal(0.1 + 0.2, 0.3) and rm.equal(0.1 + 0.2, 0.3, ct=rm.CT)
+    assert rm.set_tolerance(rm.CT) == 0
+    try:
+        assert rm.tolerance() == rm.CT and rm.equal(0.1 + 0.2, 0.3) and not rm.equal(0.1 + 0.2, 0.3, ct=0)
+        assert not rm.equal(1, 1 + 3e-14) and rm.equal([1, 2], 1 + 3e-14, ct=1e-13).tolist() == [True, False]
+        assert not rm.less(0.3, 0.1 + 0.2) and rm.less(0.3, 0.1 + 0.2, ct=0) and rm.greater_equal(0.3, 0.1 + 0.2) and not rm.not_equal(0.3, 0.1 + 0.2)
+        assert rm.floor(0.5 + 0.5 - 1e-16) == 1 and rm.ceil(1 + 1e-15) == 1 and rm.floor(1 - 1e-15, ct=0) == 0
+        assert rm.remainder([-5.0, 5.0], 3).tolist() == np.remainder([-5.0, 5.0], 3).tolist() and rm.remainder(0.3, 0.1) == 0
+        assert abs(rm.gcd(0.6, 0.4) - 0.2) < 1e-15 and abs(rm.lcm(-0.6, 0.4) + 1.2) < 1e-14
+        assert len(rm.unique([0.3, 0.1 + 0.2]).values) == 1 and 0.1 + 0.2 in rm.array([0.3])
+    finally: rm.set_tolerance(0)
     with pytest.raises(ValueError): rm.equal(1, 1, ct=1)
+    with pytest.raises(ValueError): rm.set_tolerance(-1)
 
 def test_special():
     from scipy import special

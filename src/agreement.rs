@@ -135,13 +135,16 @@ impl Mapping {
         Steps::run(*base, steps, start, n)
     }
     /// The offset for position `i`, or `None` where it reads a fill.
+    // Per-item loops in basedpl call this for every item. The `Steps` arm calls an out-of-line walk to keep `get` small enough to inline there. `Linear(1)` skips the division.
     #[inline]
     pub fn get(&self, i: usize) -> Option<usize> {
-        Some(match self {
-            Self::Single => 0, Self::Linear(repeat) => i / repeat, Self::Tiled(size) => i % size,
-            Self::Steps { base, steps } => Steps::reach(*base, steps, i)?,
-        })
+        match self {
+            Self::Single => Some(0), Self::Linear(1) => Some(i), Self::Linear(repeat) => Some(i / repeat), Self::Tiled(size) => Some(i % size),
+            Self::Steps { base, steps } => Self::reached(*base, steps, i),
+        }
     }
+    #[inline(never)]
+    fn reached(base: usize, steps: &[Steps], i: usize) -> Option<usize> { Steps::reach(base, steps, i) }
     /// For a contraction such as a matrix product: a one-axis mapping from each key on `left`'s axis `laxis` to its position on `right`'s axis `raxis`, as a table. Where the keys match, or either axis has none, positions pair in order.
     pub fn contract(left: &Layout, laxis: usize, right: &Layout, raxis: usize) -> Result<Self, Error> {
         match (left.keys(laxis), right.keys(raxis)) {
@@ -308,8 +311,17 @@ impl Frames {
         Ok(Self { layout, count, cells })
     }
 
-    /// Argument `k`'s cell under position `i` of the result's frame.
-    pub fn cell(&self, k: usize, i: usize) -> usize { self.cells[k][i] }
+    /// The frames of arguments that are one cell each, with no frame axes: one cell, which each argument's only cell fills. It allocates nothing.
+    #[inline]
+    pub fn one() -> Self { Self { layout: Layout::EMPTY, count: 1, cells: Vec::new() } }
+
+    /// Argument `k`'s cell under position `i` of the result's frame. An argument with no list of cells, as in [`Frames::one`], has the result's frame.
+    #[inline]
+    pub fn cell(&self, k: usize, i: usize) -> usize { self.cells.get(k).map_or(i, |c| c[i]) }
+
+    /// The positions of the `per` items of argument `k`'s cell under position `i` of the result's frame, in an argument that holds its cells in order.
+    #[inline]
+    pub fn items(&self, k: usize, i: usize, per: usize) -> std::ops::Range<usize> { let c = self.cell(k, i); c * per..(c + 1) * per }
 }
 
 /// The shortest broadcast block that runs as one call, where one argument repeats each of its items along the block. A shorter block expands into a chunk buffer instead, which measured faster than a call for each block of up to 5 items.
@@ -416,16 +428,18 @@ pub(crate) fn chunks(range: Range<usize>, reads: &[(&Mapping, usize)], f: &mut d
     }
 }
 
-/// `f` on the frame of `len` items that one argument lays out through `mapping`, with the argument's items read as `A`, appended to `out`. Gives whether every result succeeded. Ranges of the frame run in parallel. Items that already have type `A` go to `f` as [`block`] passes them. Items of another type convert a run at a time, through [`read_runs`].
+/// `f` on the frame of `len` items that one argument lays out through `mapping`, with the argument's items read as `A`, appended to `out`. Gives whether every result succeeded. Ranges of the frame run in parallel. An [`INLINE`](crate::Results::INLINE) object runs item by item in [`block`]'s loop, through `judged`, and converts each item as it reads it, so a short broadcast block costs no call. For any other object, items that already have type `A` go to `f` as `block` passes them, and items of another type convert a run at a time, through [`read_runs`].
 #[inline]
-pub fn map1<A: Element, Y: Source<A>, B: Copy + Send>(y: &[Y], mapping: &Mapping, len: usize, f: &(impl Unary<A, Out = B> + Sync), out: &mut Vec<B>) -> bool {
+pub fn map1<A: Element, Y: Source<A>, B: Copy + Send, K: Unary<A, Out = B> + Sync>(y: &[Y], mapping: &Mapping, len: usize, f: &K, out: &mut Vec<B>) -> bool {
+    if K::INLINE { return block(y, mapping, len, out, |y, n, o| o.pairs(y, Arg::One(()), n, |b, ()| f.judged(b.read()))); }
     if let Some(y) = Y::borrowed(y) { return block(y, mapping, len, out, |y, n, o| f.many_into(y, n, o)); }
     read_runs([&Side::new(y, mapping)], len, out, &|[y], n, o| f.many_into(y, n, o))
 }
 
-/// `f` on the frame of `agreement`, with both arguments' items read as `A`, appended to `out`. Gives whether every result succeeded. Ranges of the frame run in parallel. Where both arguments' items already have type `A`, `f` takes them as [`blocks`] passes them. Otherwise `f` takes a run of pairs at a time, through [`read_runs`].
+/// `f` on the frame of `agreement`, with both arguments' items read as `A`, appended to `out`. Gives whether every result succeeded. Ranges of the frame run in parallel. An [`INLINE`](crate::Results::INLINE) object runs item by item in [`blocks`]' loop, as [`map1`] runs one. For any other object, where both arguments' items already have type `A`, `f` takes them as `blocks` passes them. Otherwise `f` takes a run of pairs at a time, through [`read_runs`].
 #[inline]
-pub fn map2<A: Element, X: Source<A>, Y: Source<A>, B: Copy + Send, L>(x: &[X], y: &[Y], agreement: &Agreement<L>, f: &(impl Binary<A, Out = B> + Sync), out: &mut Vec<B>) -> bool {
+pub fn map2<A: Element, X: Source<A>, Y: Source<A>, B: Copy + Send, L, K: Binary<A, Out = B> + Sync>(x: &[X], y: &[Y], agreement: &Agreement<L>, f: &K, out: &mut Vec<B>) -> bool {
+    if K::INLINE { return blocks(x, y, agreement, out, |x, y, n, o| o.pairs(x, y, n, |a, b| f.judged(a.read(), b.read()))); }
     if let (Some(x), Some(y)) = (X::borrowed(x), Y::borrowed(y)) { return blocks(x, y, agreement, out, |x, y, n, o| f.many_into(x, y, n, o)); }
     read_runs([&Side::new(x, &agreement.left), &Side::new(y, &agreement.right)], agreement.len, out, &|[x, y], n, o| f.many_into(x, y, n, o))
 }
@@ -505,12 +519,13 @@ pub fn expanded<'a, A: Element>(mapping: &Mapping, data: &'a [A], start: usize, 
 #[inline(never)]
 fn copied<'a, A: Element>(mapping: &Mapping, data: &[A], start: usize, n: usize, buf: &'a mut Vec<A>) -> &'a [A] {
     buf.clear();
-    match *mapping {
-        Mapping::Single => buf.resize(n, data[0]),
-        Mapping::Linear(r) => { periods(start..start + n, r, |k, p| { buf.resize(buf.len() + p.len(), data[k]); true }); }
-        Mapping::Tiled(m) => cycled(buf, &data[..m], start, n),
-        Mapping::Steps { base, ref steps } => walk_range(buf, data, base, steps, A::FILL, start, n, Same),
-    }
+    let reason = match *mapping {
+        Mapping::Single => { buf.resize(n, data[0]); "a repeated item" }
+        Mapping::Linear(r) => { periods(start..start + n, r, |k, p| { buf.resize(buf.len() + p.len(), data[k]); true }); "repeats of each item" }
+        Mapping::Tiled(m) => { cycled(buf, &data[..m], start, n); "a cycle that wraps" }
+        Mapping::Steps { base, ref steps } => { walk_range(buf, data, base, steps, A::FILL, start, n, Same); "steps other than a forward run" }
+    };
+    crate::events::declined("in place", reason, n);
     &buf[..n]
 }
 

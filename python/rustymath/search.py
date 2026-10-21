@@ -1,4 +1,4 @@
-"""Numeric and character search, stable sorting and grouping. Sorts and insertion searches compare exactly: signed zeros compare equal, and every NaN comes after positive infinity. Matching and classification compare floats within the tolerance `ct`, and Booleans, integers and characters exactly. Sorts use the last axis by default. Explicit `axis=None` flattens the input."""
+"""Numeric and character search, stable sorting and grouping. Sorts and insertion searches compare exactly: signed zeros compare equal, and every NaN comes after positive infinity. Matching and classification compare floats within the tolerance `ct`, or within the process's tolerance (`set_tolerance`, exact unless set) where `ct` is None, and Booleans, integers and characters exactly. Sorts use the last axis by default. Explicit `axis=None` flattens the input."""
 from typing import NamedTuple
 from . import _core
 from ._core import Array, index, isin, sort, argsort, partition, argpartition, argmin, argmax, median, quantile

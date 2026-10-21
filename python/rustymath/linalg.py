@@ -73,12 +73,13 @@ def inner(
     f, # Native binary function that folds the products, from the right
     g, # Native binary function that forms the products
 ):
-    "The inner product `f.g`: apply `g` over the contracted axis and fold with `f` from the right. Recognized pairs use specialized kernels; others use bounded scratch. Equality counts with `add` compare exactly; other comparisons use the default tolerance"
+    "The inner product `f.g`: apply `g` over the contracted axis and fold with `f` from the right. Recognized pairs use specialized kernels; others use bounded scratch. Comparisons use the product's `ct`, as the elementwise functions do"
     names = tuple(map(_binary_name, (f, g)))
     name = '_'.join(names)
     def product(
         x1, x2, # Matrices, or vectors, which act as one row on the left and one column on the right
         /,
-    ): return _g.product(*names, x1, x2, name)
+        *, ct=None, # Tolerance for a comparing `f` or `g`; None for the process's tolerance (`set_tolerance`)
+    ): return _g.product(*names, x1, x2, name, ct=ct)
     return _named(product, name, f"The matrix product whose item `[i, j]` is the `{names[0]}` over `k` of `{names[1]}(x1[i, k], x2[k, j])`")
 

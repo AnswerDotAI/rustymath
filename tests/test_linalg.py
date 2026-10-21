@@ -151,6 +151,9 @@ def test_linalg(kind):
     # Integer products compute in int64. An int16 argument converts to it, so these sums of 3 million don't overflow.
     i16 = np.full((2, 300), 100, np.int16)
     assert A(rm.matmul(i16, i16.T)).dtype == np.int64 and (rm.matmul(i16, i16.T) == 3_000_000).all()
+    # Counts of int16 items compute in int64 too, so a count past int16's range is exact.
+    zeros = np.zeros((1, 40_000), np.int16)
+    assert la.inner(rm.add, rm.equal)(zeros, zeros.T) == 40_000
     # Integer max-plus and min-plus products, and the counts of equal and unequal items, match NumPy's results built item by item.
     n, p = rng.integers(-5, 5, (5, 7)), rng.integers(-5, 5, (7, 4))
     assert np.array_equal(la.inner(rm.maximum, rm.add)(n, p), np.max(n[:, :, None] + p[None], axis=1))
@@ -158,6 +161,12 @@ def test_linalg(kind):
     equal = (n[:, :, None] == p[None]).sum(axis=1)
     assert np.array_equal(la.inner(rm.add, rm.equal)(n, p), equal) and np.array_equal(la.inner(rm.add, rm.not_equal)(n, p), 7 - equal)
     assert np.array_equal(la.inner(rm.add, rm.equal)(n / 2, p / 2), equal)
+    # A pair with no kernel at a dtype computes through the native functions, as counts of complex numbers do.
+    assert la.inner(rm.add, rm.equal)(np.array([[1+1j, 2]]), np.array([[1+1j], [3]])) == 1
+    # Counts compare exactly unless a tolerance is given, for floats and complex numbers alike.
+    count = la.inner(rm.add, rm.equal)
+    assert count([0.3, 1.0], [0.1 + 0.2, 1.0]) == 1 and count([0.3, 1.0], [0.1 + 0.2, 1.0], ct=rm.CT) == 2
+    assert count([[0.3 + 1j]], [[0.1 + 0.2 + 1j]]) == 0 and count([[0.3 + 1j]], [[0.1 + 0.2 + 1j]], ct=rm.CT) == 1
     # NumPy's ufuncs aren't rustymath's functions.
     with pytest.raises(ValueError): la.inner(np.add, np.multiply)
     # An integer product that doesn't fit int64 raises: 2^62 times 4 is 2^64.

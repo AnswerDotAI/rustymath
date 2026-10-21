@@ -158,9 +158,15 @@ mod products {
         }
     }
 
+    /// `p`'s `checked_into` as the results it writes, or `None` where it gives `false`.
+    fn checked<P: Inner<i64, Out = i64>>(p: &P, a: &[i64], b: &[i64], size @ [m, _, n]: [usize; 3]) -> Option<Vec<i64>> {
+        let mut out = vec![0; m * n];
+        p.checked_into(a, b, size, &mut out).then_some(out)
+    }
+
     #[test]
     fn integer_products_match_exact_folds() {
-        // Each pair of scales for `a` and `b` reaches one path. `+.×` runs at f32, f64, i64, then in 128 bits, overflowing. `⌈.+` and `⌊.+` run at f32 twice, then f64, then in 128 bits, overflowing. Odd scales give products that a narrower path would round, where a power of two would keep them exact. `checked` gives `None` only where a result doesn't fit `i64`, and `inner` gives the same results elsewhere.
+        // Each pair of scales for `a` and `b` reaches one path. `+.×` runs at f32, f64, i64, then in 128 bits, overflowing. `⌈.+` and `⌊.+` run at f32 twice, then f64, then in 128 bits, overflowing. Odd scales give products that a narrower path would round, where a power of two would keep them exact. `checked_into` gives `false` only where a result doesn't fit `i64`, and `inner` gives the same results elsewhere.
         let scales = [(1, 1), (4097, 4093), ((1 << 22) + 1, (1 << 22) + 3), ((1 << 59) + 1, (1 << 60) + 1)];
         for (sa, sb) in scales {
             for size @ [m, k, n] in [[0, 3, 4], [3, 0, 4], [3, 4, 0], [5, 7, 9], [MC + 3, KC + 5, 37]] {
@@ -168,21 +174,21 @@ mod products {
                 let b: Vec<i64> = (0..k * n).map(|i| ((i * 5 % 13) as i64 - 6) * sb).collect();
                 let overflows = sa > 1 << 59 && !a.is_empty() && !b.is_empty();
                 let products = (!overflows).then(|| folded(&a, &b, size, 0i64, |s, x, y| s + x * y));
-                assert_eq!(PlusTimes.checked(&a, &b, size), products);
+                assert_eq!(checked(&PlusTimes, &a, &b, size), products);
                 if let Some(products) = products { assert_eq!(PlusTimes.inner(&a, &b, size), products); }
                 let exact = |unit: i64, step: fn(i128, i128) -> i128| {
                     folded(&a, &b, size, i128::from(unit), |s, x, y| step(s, i128::from(x) + i128::from(y))).into_iter().map(|t| i64::try_from(t).ok()).collect::<Option<Vec<_>>>()
                 };
                 let maxima = exact(i64::MIN, i128::max);
-                assert_eq!(MaxPlus.checked(&a, &b, size), maxima);
+                assert_eq!(checked(&MaxPlus, &a, &b, size), maxima);
                 if let Some(maxima) = maxima { assert_eq!(MaxPlus.inner(&a, &b, size), maxima); }
                 let minima = exact(i64::MAX, i128::min);
-                assert_eq!(MinPlus.checked(&a, &b, size), minima);
+                assert_eq!(checked(&MinPlus, &a, &b, size), minima);
                 if let Some(minima) = minima { assert_eq!(MinPlus.inner(&a, &b, size), minima); }
             }
         }
         let ([a, b], size) = ([1i64 << 40, -(1 << 40)], [1, 2, 1]);
-        assert_eq!(PlusTimes.checked(&[a, b], &[1 << 30, 1 << 30], size), Some(vec![0]), "products beyond i64 whose sum fits");
+        assert_eq!(checked(&PlusTimes, &[a, b], &[1 << 30, 1 << 30], size), Some(vec![0]), "products beyond i64 whose sum fits");
     }
 
     #[test]
@@ -453,9 +459,10 @@ mod factor {
         let det = |a: &[T], n: usize| lu(a, n).determinant().wide();
         let inverse = pinv(&regular, [6, 6]);
         assert!((det(&regular, 6) * det(&inverse, 6) - 1.0).abs() < bound, "determinants of a matrix and its inverse");
-        let (x, d) = rustymath::linalg::inverse(&regular, 6).expect("a regular matrix has an inverse");
+        let mut x = vec![T::narrow(0.0); 36];
+        let d = LuWork::default().inverse_into(&regular, [6, 6], &mut x).expect("a regular matrix has an inverse");
         assert!(x == inverse && d.wide() == det(&regular, 6), "a regular matrix's inverse, which pinv gives, and its determinant, which lu gives");
-        assert!(rustymath::linalg::inverse(&[1., 2., 2., 4.].map(T::narrow), 2).is_none(), "a singular matrix has no inverse");
+        assert!(LuWork::default().inverse_into(&[1., 2., 2., 4.].map(T::narrow), [2, 2], &mut [T::narrow(0.0); 4]).is_none(), "a singular matrix has no inverse");
         let (sign, log) = lu(&regular, 6).log_determinant();
         assert!((sign.wide() * log.wide().exp() / det(&regular, 6) - 1.0).abs() < bound, "log-determinant");
         // diag(1, 2, 3, 4) with two rows swapped has determinant -24, and with a zero column, 0 and a logarithm of -∞.

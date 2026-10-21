@@ -36,11 +36,11 @@ pub trait Tolerant: Copy + Send + Sync {
     fn value(self) -> f64;
     /// Whether `x` equals `y`. NaN equals nothing, as in IEEE, and an infinity equals only itself.
     fn equal<F: Float>(self, x: F, y: F) -> bool;
-    /// The floor of `y`: the whole number nearest to `y`, unless it lies above `y` and doesn't equal it. Then the whole number below.
+    /// The floor of `y`: the whole number nearest to `y`, unless it lies above `y` and doesn't equal it. Then the whole number below. A floor or ceiling that is zero is `0`, never `-0`, as BPL's numbers give it.
     fn floor<F: Float>(self, y: F) -> F;
     /// The ceiling of `y`: the whole number nearest to `y`, unless it lies below `y` and doesn't equal it. Then the whole number above.
     #[inline]
-    fn ceil<F: Float>(self, y: F) -> F { -self.floor(-y) }
+    fn ceil<F: Float>(self, y: F) -> F { F::narrow(0.0) - self.floor(-y) }
     /// Whether `x` and `y` match: they are equal, or both are NaN. A search that must find NaN compares with `matches`.
     #[inline]
     fn matches<F: Float>(self, x: F, y: F) -> bool { self.equal(x, y) | (x.is_nan() & y.is_nan()) }
@@ -174,7 +174,8 @@ impl Tolerant for Exactly {
     #[inline]
     fn equal<F: Float>(self, x: F, y: F) -> bool { x == y }
     #[inline]
-    fn floor<F: Float>(self, y: F) -> F { y.floor() }
+    // Adding 0 turns IEEE's `-0` into `0`.
+    fn floor<F: Float>(self, y: F) -> F { y.floor() + F::narrow(0.0) }
 }
 
 impl Tolerant for Tolerance {
@@ -273,12 +274,12 @@ macro_rules! with_tolerance {
     }};
 }
 
-/// Writes a tolerant function object's forms from one item body over a tolerance `$t`, at `real` or at a list of concrete types, as `forms!` takes them. The object holds a `Tolerance`. Its slice form reads it once and runs the body's loop at `Exactly` where the tolerance is 0.
+/// Writes a tolerant function object's forms from one item body over a tolerance `$t`, at `real` or at a list of concrete types, as `forms!` takes them, with its attributes, such as `#[inline]`. The object holds a `Tolerance`. Its slice form reads it once and runs the body's loop at `Exactly` where the tolerance is 0. Its scalar forms run the body at the `Tolerance` itself, which gives the exact result at 0 with no test for each item, so a caller's own loop over items has no branch to hoist.
 macro_rules! tolerant {
-    ($object:ident at real $(=> $o:ty)?: $($rest:tt)+) => { tolerant!(@forms $object, (real $(=> $o)?), $($rest)+); };
-    ($object:ident at $($e:ty $(=> $o:ty)?),+: $($rest:tt)+) => { tolerant!(@forms $object, ($($e $(=> $o)?),+), $($rest)+); };
-    (@forms $object:ident, ($($at:tt)+), |$t:ident, [$($x:ident),+]| $body:expr) => {
-        forms!($object at $($at)+: |k, [$($x),+]| with_tolerance!(k.0, |$t| $body),
+    ($(#[$($m:tt)+])* $object:ident at real $(=> $o:ty)?: $($rest:tt)+) => { tolerant!(@forms [$(#[$($m)+])*], $object, (real $(=> $o)?), $($rest)+); };
+    ($(#[$($m:tt)+])* $object:ident at $($e:ty $(=> $o:ty)?),+: $($rest:tt)+) => { tolerant!(@forms [$(#[$($m)+])*], $object, ($($e $(=> $o)?),+), $($rest)+); };
+    (@forms [$(#[$($m:tt)+])*], $object:ident, ($($at:tt)+), |$t:ident, [$($x:ident),+]| $body:expr) => {
+        forms!($(#[$($m)+])* $object at $($at)+: |k, [$($x),+]| { let $t = k.0; $body },
             many |k, [$($x),+], n, out| with_tolerance!(k.0, |$t| each!([$($x),+], n, out, |[$($x),+]| $body)));
     };
 }
@@ -290,7 +291,7 @@ fn indicated<E: Element>(b: bool) -> E where bool: crate::buffer::Source<E> { if
 /// Writes an [`Indicator`]'s forms for the tolerant comparison `$object` at each float type `$e`, through `forms!`: its item body over a tolerance `$t` as 1 or 0, and a slice form that compares many items with one number through `against`, writing each float in the same loop.
 macro_rules! indicator {
     ($object:ident: |$t:ident, [$x:ident, $y:ident]| $body:expr, $left:ident, $right:ident, $($e:ty),+) => {$(
-        forms!([Indicator<$object>] at $e: |k, [$x, $y]| crate::slice::Total(indicated::<$e>(with_tolerance!(k.0.0, |$t| $body))),
+        forms!([Indicator<$object>] at $e: |k, [$x, $y]| crate::slice::Total(indicated::<$e>({ let $t = k.0.0; $body })),
             many |k, [$x, $y], n, out| match against(k.0.0, $x, $y, n, out, Band::$left, Band::$right, |xs, lo, hi, band, out| in_band(xs, lo, hi, band, out, indicated::<$e>)) {
                 Some(ok) => ok,
                 None => with_tolerance!(k.0.0, |$t| each!([$x, $y], n, out, |[$x, $y]| crate::slice::Total(indicated::<$e>($body)))),
@@ -298,10 +299,10 @@ macro_rules! indicator {
     )+};
 }
 
-/// Writes a tolerant comparison's forms at `real`: its item body over a tolerance `$t`, as `tolerant!` writes them, and a slice form that compares many items with one number through `against`. `$left` is the band an item must lie in when it is on the left of the one number, and `$right` the band when it is on the right. It also writes the comparison's [`Indicator`] forms at `f32` and `f64`.
+/// Writes a tolerant comparison's forms at `real`: its item body over a tolerance `$t`, at the `Tolerance` itself, as `tolerant!` writes them, and a slice form that compares many items with one number through `against`. `$left` is the band an item must lie in when it is on the left of the one number, and `$right` the band when it is on the right. It also writes the comparison's [`Indicator`] forms at `f32` and `f64`.
 macro_rules! compared {
     ($object:ident: |$t:ident, [$x:ident, $y:ident]| $body:expr, $left:ident, $right:ident) => {
-        forms!($object at real => bool: |k, [$x, $y]| with_tolerance!(k.0, |$t| $body),
+        forms!($object at real => bool: |k, [$x, $y]| { let $t = k.0; $body },
             many |k, [$x, $y], n, out| match against(k.0, $x, $y, n, out, Band::$left, Band::$right, Banded::banded) {
                 Some(ok) => ok,
                 None => with_tolerance!(k.0, |$t| each!([$x, $y], n, out, |[$x, $y]| $body)),
@@ -437,14 +438,14 @@ mod narrowed {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Equal(pub Tolerance);
 compared!(Equal: |t, [x, y]| t.equal(x, y), Inside, Inside);
-forms!(Equal at Complex<f32> => bool, Complex<f64> => bool: |k, [x, y]| with_tolerance!(k.0, |t| t.complex_equal(x, y)),
+forms!(Equal at Complex<f32> => bool, Complex<f64> => bool: |k, [x, y]| k.0.complex_equal(x, y),
     many |k, [x, y], n, out| with_tolerance!(k.0, |t| complex_equals(t, [x, y], n, out, false)));
 
 /// The negation of [`Equal`] at the tolerance it holds, as a function object, for real and complex items.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NotEqual(pub Tolerance);
 compared!(NotEqual: |t, [x, y]| !t.equal(x, y), Outside, Outside);
-forms!(NotEqual at Complex<f32> => bool, Complex<f64> => bool: |k, [x, y]| with_tolerance!(k.0, |t| !t.complex_equal(x, y)),
+forms!(NotEqual at Complex<f32> => bool, Complex<f64> => bool: |k, [x, y]| !k.0.complex_equal(x, y),
     many |k, [x, y], n, out| with_tolerance!(k.0, |t| complex_equals(t, [x, y], n, out, true)));
 
 /// `Equal`'s slice form on complex items, or with `negate` `NotEqual`'s. Each `CHUNK` of items splits into slices of real and imaginary parts, as in `slice::split`, so `squared_equal` runs over plain slices with no branch and vectorizes. `scaled_equal` then takes the pairs it leaves undecided, one at a time. No result fails.
@@ -494,19 +495,19 @@ tolerant!(Compare at real => Ordering: |t, [x, y]| t.compare(x, y).unwrap_or(x.i
 /// [`Tolerant::floor`], or [`TolerantComplex::complex_floor`] for complex items, at the tolerance it holds, as a function object.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Floor(pub Tolerance);
-tolerant!(Floor at real: |t, [y]| t.floor(y));
-tolerant!(Floor at Complex<f32>, Complex<f64>: |t, [y]| t.complex_floor(y));
+tolerant!(#[inline] Floor at real: |t, [y]| Total(t.floor(y)));
+tolerant!(Floor at Complex<f32>, Complex<f64>: |t, [y]| Total(t.complex_floor(y)));
 
 /// [`Tolerant::ceil`], or [`TolerantComplex::complex_ceil`] for complex items, at the tolerance it holds, as a function object.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Ceil(pub Tolerance);
-tolerant!(Ceil at real: |t, [y]| t.ceil(y));
-tolerant!(Ceil at Complex<f32>, Complex<f64>: |t, [y]| t.complex_ceil(y));
+tolerant!(#[inline] Ceil at real: |t, [y]| Total(t.ceil(y)));
+tolerant!(Ceil at Complex<f32>, Complex<f64>: |t, [y]| Total(t.complex_ceil(y)));
 
 /// [`Tolerant::residue`], or [`TolerantComplex::complex_residue`] for complex items, at the tolerance it holds, as a function object: `y` modulo `x`, for arguments `x` and `y` in that order. Its `i64` form is [`integer::residue`](crate::integer::residue), which needs no tolerance.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Residue(pub Tolerance);
-tolerant!(Residue at real: |t, [x, y]| t.residue(x, y));
+tolerant!(#[inline] Residue at real: |t, [x, y]| Total(t.residue(x, y)));
 tolerant!(Residue at Complex<f32>, Complex<f64>: |t, [x, y]| t.complex_residue(x, y));
 
 /// The floor of `x ÷ y` from [`Tolerant::floor_quotient`], at the tolerance it holds, as a function object. Where the quotient equals a whole number, it gives that number and `Residue` gives 0. A float result never fails, as IEEE division doesn't. Its integer forms, from the `integer` module, divide exactly and fail on a zero divisor or an overflowing quotient.

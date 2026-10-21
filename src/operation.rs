@@ -27,6 +27,9 @@ pub type ScatterKernel<K> = for<'a> fn(&K, &mut Buffer, &[usize], View<'a>) -> b
 /// An object's kernel at each dtype where it has one, in the order of [`DType::ALL`], with whether it leaves a failed result wrapped to its type.
 pub struct Kernels<F>([Option<(F, bool)>; DType::ALL.len()]);
 
+/// The float width that a Boolean or integer computes in under rustymath's own policy, NumPy's: the float that [`DType::inexact`] gives it under `f64`. `f64` for any other dtype.
+pub fn numpy_float(dtype: DType) -> FloatWidth { match dtype.inexact(FloatWidth::F64) { Some((DType::Float(w), _)) => w, _ => FloatWidth::F64 } }
+
 impl<F: Copy> Kernels<F> {
     /// The kernels that [`kernels!`](crate::kernels) finds.
     #[doc(hidden)]
@@ -34,14 +37,15 @@ impl<F: Copy> Kernels<F> {
     /// The kernel at `dtype`, where the object has one.
     pub fn at(&self, dtype: DType) -> Option<F> { self.0[dtype.index()].map(|(f, _)| f) }
     /// These kernels without any at a dtype outside `dtypes`.
+    #[inline]
     pub fn only(mut self, dtypes: &[DType]) -> Self {
-        for (k, d) in self.0.iter_mut().zip(DType::ALL) { if !dtypes.contains(&d) { *k = None; } }
+        let kept = dtypes.iter().fold(0u32, |kept, d| kept | 1 << d.index());
+        for (i, k) in self.0.iter_mut().enumerate() { if kept >> i & 1 == 0 { *k = None; } }
         self
     }
     /// The dtype that an argument of `dtype` computes in, as the module describes, or `None` where the object has no kernel for it.
     pub fn computes(&self, dtype: DType) -> Option<DType> {
-        let float = match dtype.inexact(FloatWidth::F64) { Some((DType::Float(w), _)) => w, _ => FloatWidth::F64 };
-        dtype.computes_in(Width::I64, float, |d| self.at(d).is_some())
+        dtype.computes_in(Width::I64, numpy_float(dtype), |d| self.at(d).is_some())
     }
     /// Whether the kernel that an argument of `dtype` computes with leaves a failed result wrapped to its type, as integer arithmetic and every [`Reduction`] do. False where the object has no kernel for it.
     pub fn wraps(&self, dtype: DType) -> bool { self.computes(dtype).and_then(|d| self.0[d.index()]).is_some_and(|(_, wraps)| wraps) }
@@ -53,6 +57,7 @@ impl<F: Copy> Kernels<F> {
 }
 
 /// `x` at `dtype`: itself where it already has `dtype`, and otherwise a cast that `cast` holds.
+#[inline]
 fn cast<'a>(x: View<'a>, dtype: DType, cast: &'a mut Option<Buffer>) -> View<'a> {
     if x.dtype() == dtype { return x; }
     cast.insert(Buffer::cast(x, dtype).expect("an argument casts to the dtype it computes in")).view()
@@ -139,7 +144,7 @@ fn unary_at<K: Unary<T, Out: Element> + Sync, T: Element>(k: &K, x: View<'_>, ma
     (<<K as Results<T, 1>>::Out as Element>::buffer(out), ok)
 }
 
-fn binary_at<K: Binary<T, Out: Element> + Sync, T: Element>(k: &K, x: View<'_>, y: View<'_>, agreement: &Agreement) -> (Buffer, bool) {
+pub(crate) fn binary_at<K: Binary<T, Out: Element> + Sync, T: Element, L>(k: &K, x: View<'_>, y: View<'_>, agreement: &Agreement<L>) -> (Buffer, bool) {
     let mut out = Vec::with_capacity(agreement.len);
     let ok = map2(items::<T>(x), items::<T>(y), agreement, k, &mut out);
     (<<K as Results<T, 2>>::Out as Element>::buffer(out), ok)
@@ -256,10 +261,7 @@ fn left_scan_at<K: Binary<T, Out: Element + Source<T>>, T: Element>(k: &K, x: Vi
 
 fn product_at<P: Inner<T, Out: Element + Default> + Sync, T: Element>(p: &P, [x, y]: [View<'_>; 2], frames: &Frames, size @ [n, k, m]: [usize; 3], check: &mut dyn FnMut() -> bool) -> Option<(Buffer, bool)> {
     let (x, y) = (items::<T>(x), items::<T>(y));
-    let write = |i: usize, out: &mut [P::Out], _: &mut ()| match p.checked(&x[frames.cell(0, i) * n * k..][..n * k], &y[frames.cell(1, i) * k * m..][..k * m], size) {
-        Some(r) => { out.copy_from_slice(&r); true }
-        None => false,
-    };
+    let write = |i: usize, out: &mut [P::Out], _: &mut ()| p.checked_into(&x[frames.items(0, i, n * k)], &y[frames.items(1, i, k * m)], size, out);
     let (out, ok) = stack_with(frames.count, n * m, &write, || if check() { Ok(()) } else { Err(()) }).ok()?;
     Some((P::Out::buffer(out), ok))
 }
@@ -272,8 +274,10 @@ pub mod probe {
 
     pub struct Probe<K, T, A>(PhantomData<(K, T, A)>);
     impl<K, T, A> Probe<K, T, A> {
+        #[inline(always)]
         pub const fn new() -> Self { Self(PhantomData) }
         /// The probe for `k`'s type, for a [`kernels!`](crate::kernels) given a value.
+        #[inline(always)]
         pub const fn of(_: &K) -> Self { Self(PhantomData) }
     }
     /// The operations that `kernels!` names.
@@ -287,46 +291,63 @@ pub mod probe {
     pub enum Sliding {}
     pub enum Product {}
     pub enum Scatter {}
+    /// The test that [`characters!`](crate::characters!) makes.
+    pub enum Characters {}
 
     /// A kernel where the impl holds, with whether it leaves a failed result wrapped to its type.
     pub trait Found<F> {
         fn kernel(&self) -> Option<(F, bool)>;
     }
     pub trait Missing<F> {
+        #[inline(always)]
         fn kernel(&self) -> Option<(F, bool)> { None }
     }
     impl<K, T, A, F> Missing<F> for &Probe<K, T, A> {}
 
     impl<K: crate::Unary<T, Out: Element> + Sync, T: Element> Found<UnaryKernel<K>> for Probe<K, T, Unary> {
+        #[inline(always)]
         fn kernel(&self) -> Option<(UnaryKernel<K>, bool)> { Some((unary_at::<K, T>, K::WRAPS)) }
     }
     impl<K: crate::Binary<T, Out: Element> + Sync, T: Element> Found<BinaryKernel<K>> for Probe<K, T, Binary> {
-        fn kernel(&self) -> Option<(BinaryKernel<K>, bool)> { Some((binary_at::<K, T>, K::WRAPS)) }
+        #[inline(always)]
+        fn kernel(&self) -> Option<(BinaryKernel<K>, bool)> { Some((binary_at::<K, T, crate::layout::Layout>, K::WRAPS)) }
     }
     impl<K: crate::Ternary<T, Out: Element> + Sync, T: Element> Found<TernaryKernel<K>> for Probe<K, T, Ternary> {
+        #[inline(always)]
         fn kernel(&self) -> Option<(TernaryKernel<K>, bool)> { Some((ternary_at::<K, T>, K::WRAPS)) }
     }
     // Every reduction wraps a total that doesn't fit, as `Reduction` says.
     impl<R: Reduction<T>, T: Element> Found<AccumulationKernel<R>> for Probe<R, T, Fold> where R::Total: Element {
+        #[inline(always)]
         fn kernel(&self) -> Option<(AccumulationKernel<R>, bool)> { Some((fold_at::<R, T>, true)) }
     }
     impl<R: Reduction<T>, T: Element> Found<AccumulationKernel<R>> for Probe<R, T, Scan> where R::Total: Element {
+        #[inline(always)]
         fn kernel(&self) -> Option<(AccumulationKernel<R>, bool)> { Some((scan_at::<R, T>, true)) }
     }
     impl<R: Reduction<T>, T: Element> Found<SlidingKernel<R>> for Probe<R, T, Sliding> where R::Total: Element {
+        #[inline(always)]
         fn kernel(&self) -> Option<(SlidingKernel<R>, bool)> { Some((sliding_at::<R, T>, true)) }
     }
     impl<K: crate::Binary<T, Out: Element + Source<T>>, T: Element> Found<AccumulationKernel<K>> for Probe<K, T, RightFold> {
+        #[inline(always)]
         fn kernel(&self) -> Option<(AccumulationKernel<K>, bool)> { Some((right_fold_at::<K, T>, K::WRAPS)) }
     }
     impl<K: crate::Binary<T, Out: Element + Source<T>>, T: Element> Found<AccumulationKernel<K>> for Probe<K, T, LeftScan> {
+        #[inline(always)]
         fn kernel(&self) -> Option<(AccumulationKernel<K>, bool)> { Some((left_scan_at::<K, T>, K::WRAPS)) }
     }
-    impl<P: crate::linalg::Inner<T, Out: Element + Default> + Sync, T: Element> Found<ProductKernel<P>> for Probe<P, T, Product> {
+    impl<P: crate::linalg::Inner<T, Out: Element> + Sync, T: Element> Found<ProductKernel<P>> for Probe<P, T, Product> {
+        #[inline(always)]
         fn kernel(&self) -> Option<(ProductKernel<P>, bool)> { Some((product_at::<P, T>, false)) }
     }
     impl<K: crate::Binary<T, Out = T>, T: Element> Found<ScatterKernel<K>> for Probe<K, T, Scatter> {
+        #[inline(always)]
         fn kernel(&self) -> Option<(ScatterKernel<K>, bool)> { Some((scatter_at::<K, T>, K::WRAPS)) }
+    }
+    impl<K: crate::characters::Characters + crate::Binary<i32, Out: Element> + crate::Binary<i64, Out: Element> + Sync> Found<crate::characters::Kernel<K>> for Probe<K, (), Characters> {
+        #[inline(always)]
+        fn kernel(&self) -> Option<(crate::characters::Kernel<K>, bool)> { Some((crate::characters::binary::<K, crate::layout::Layout>, false)) }
     }
 }
 

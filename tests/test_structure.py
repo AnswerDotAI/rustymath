@@ -101,6 +101,7 @@ def test_join_split_repeat_and_padding(a):
     assert [x.tolist() for x in rm.split([1, 2, 3], [1, 2])] == [[1], [2], [3]]
     assert rm.repeat(a, [2, 0], axis=1).tolist() == [[1, 1], [3, 3]]
     assert rm.repeat(a, 2).tolist() == [1, 1, 2, 2, 3, 3, 4, 4]
+    assert rm.repeat([10, 20, 30], [2, -1, 0]).tolist() == [10, 10, 0] and rm.repeat([5], [1, 0, 2]).tolist() == [5, 5, 5]
     assert rm.pad(a, [(1, 0), (0, 1)]).tolist() == [[0, 0, 0], [1, 2, 0], [3, 4, 0]]
     assert rm.pad('ab', 1).tolist() == [' ', 'a', 'b', ' ']
     assert rm.take(a, [1, 0], axis=0).tolist() == [[3, 4], [1, 2]] and rm.take(a, [-1]).tolist() == [4]

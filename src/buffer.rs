@@ -150,10 +150,12 @@ width_macros!($ with_complexes: Complexes, with_complex_width: ComplexWidth { ; 
 macro_rules! with_inexact {
     ($dtype:expr, $t:ident => $body:expr) => {
         match $dtype {
-            $crate::buffer::DType::Float(w) => $crate::with_float_width!(kernel w, $t => Some($body)),
-            $crate::buffer::DType::Complex(w) => Some($crate::with_complex_width!(w, $t => $body)),
-            _ => None,
-        }.expect("with_inexact! takes a computing dtype that DType::inexact gives")
+            $crate::buffer::DType::Float($crate::buffer::FloatWidth::F32) => { type $t = f32; $body }
+            $crate::buffer::DType::Float($crate::buffer::FloatWidth::F64) => { type $t = f64; $body }
+            $crate::buffer::DType::Complex($crate::buffer::ComplexWidth::F32) => { type $t = $crate::num_complex::Complex32; $body }
+            $crate::buffer::DType::Complex($crate::buffer::ComplexWidth::F64) => { type $t = $crate::num_complex::Complex64; $body }
+            _ => panic!("with_inexact! takes a computing dtype that DType::inexact gives"),
+        }
     };
 }
 

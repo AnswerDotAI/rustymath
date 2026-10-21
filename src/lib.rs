@@ -8,14 +8,17 @@ pub mod agreement;
 #[macro_use]
 pub mod buffer;
 pub mod array;
+pub mod characters;
 mod complex;
 pub mod convert;
 pub mod create;
 mod dd;
 pub mod distribution;
 pub mod error;
+pub mod events;
 pub mod exact;
 mod exp;
+mod facts;
 mod field;
 mod float;
 pub mod gather;
@@ -42,14 +45,13 @@ pub mod stats;
 mod sqrts;
 pub mod structure;
 mod table;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod timing;
 pub mod tolerant;
 mod trig;
 #[cfg(accelerate)]
 mod vforce;
 
-pub use arith::{Add, Divide, Multiply, Subtract, BitAnd, BitOr, BitXor, BitNot, LeftShift, RightShift};
+pub use arith::{Add, Divide, Multiply, Subtract, BitAnd, BitOr, BitXor, BitNot, LeftShift, RightShift, Negate, Reciprocal, Square, PiTimes, WholeDivide, Bitwise, Not, Nand, Nor, bitwise};
 /// The crates whose types compact buffers hold, which the exported width macros name.
 pub use {half, num_complex};
 pub use complex::{Cis, divide};

@@ -10,9 +10,9 @@ use rustymath::signal::{self, Mode};
 use rustymath::structure::Plan;
 use rustymath_buffer::py_err;
 
-use crate::array::give;
-use crate::convert::{convert, one};
-use crate::functions::{missing, Axis};
+use crate::array::{give, give_items};
+use crate::convert::{convert, one, released};
+use crate::functions::{missing, tolerance, Axis};
 
 /// `buffer`, computed at `compute`, as the dtype `store`.
 fn stored(buffer: Buffer, compute: DType, store: DType) -> PyResult<Buffer> {
@@ -35,17 +35,19 @@ fn _correlate<'py>(py: Python<'py>, f: &str, g: &str, x: &Bound<'py, PyAny>, ker
         let (compute, store) = dtype.inexact(FloatWidth::F64).ok_or_else(|| missing(name, dtype))?;
         return rustymath::with_inexact!(compute, T => {
             let (xs, ks) = (call.args[0].items::<T>()?, call.args[1].items::<T>()?);
-            let buffer = stored(T::buffer(signal::correlate(&PlusTimes, &xs, &ks, &c)), compute, store)?;
-            give(py, Core::new(Layout::from(c.shape.clone()), buffer).map_err(py_err)?, false)
+            let buffer = stored(T::buffer(released(py, || signal::correlate(&PlusTimes, &xs, &ks, &c))), compute, store)?;
+            give_items(py, Layout::from(c.shape.clone()), buffer, false)
         });
     }
-    let (xi, ki) = (call.args[0].at(dtype)?, call.args[1].at(dtype)?);
-    let padded = c.padding.as_ref().map(|p| Core::gathered(xi.view(), p)).transpose().map_err(py_err)?;
-    let source = match &padded { Some(p) => p.view().contiguous().expect("a gathered array is contiguous"), None => xi.view() };
-    let matrix = |view, plan: &Plan, rows, cols| Core::gathered(view, &Plan { layout: Layout::from(vec![rows, cols]), steps: plan.steps.clone() }).map_err(py_err);
-    let [positions, cells, outputs] = c.size;
-    let (windows, kernel) = (matrix(source, &c.windows, positions, cells)?, matrix(ki.view(), &c.kernel, cells, outputs)?);
-    let product = crate::linalg::inner(py, f, g, [windows.view(), kernel.view()], name)?;
+    let (xi, ki, t) = (call.args[0].at(dtype)?, call.args[1].at(dtype)?, tolerance(None)?);
+    let product = released(py, || -> PyResult<Core> {
+        let padded = c.padding.as_ref().map(|p| Core::gathered(xi.view(), p)).transpose().map_err(py_err)?;
+        let source = match &padded { Some(p) => p.view().contiguous().expect("a gathered array is contiguous"), None => xi.view() };
+        let matrix = |view, plan: &Plan, rows, cols| Core::gathered(view, &Plan { layout: Layout::from(vec![rows, cols]), steps: plan.steps.clone() }).map_err(py_err);
+        let [positions, cells, outputs] = c.size;
+        let (windows, kernel) = (matrix(source, &c.windows, positions, cells)?, matrix(ki.view(), &c.kernel, cells, outputs)?);
+        crate::linalg::inner(f, g, [windows.view(), kernel.view()], name, t)
+    })?;
     give(py, product.reshape(Layout::from(c.shape.clone())).map_err(py_err)?, false)
 }
 
@@ -65,8 +67,9 @@ fn overlap_add<'py>(py: Python<'py>, frames: &Bound<'py, PyAny>, step: usize, ax
     let dtype = x.view().dtype();
     let (compute, store) = dtype.inexact(FloatWidth::F64).ok_or_else(|| missing("overlap_add", dtype))?;
     rustymath::with_inexact!(compute, T => {
-        let buffer = stored(T::buffer(signal::overlap_add(&x.items::<T>()?, dims, step, len)), compute, store)?;
-        give(py, Core::new(Layout::from(result), buffer).map_err(py_err)?, false)
+        let xs = x.items::<T>()?;
+        let buffer = stored(T::buffer(released(py, || signal::overlap_add(&xs, dims, step, len))), compute, store)?;
+        give_items(py, Layout::from(result), buffer, false)
     })
 }
 

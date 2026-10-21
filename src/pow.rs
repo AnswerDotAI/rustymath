@@ -1,5 +1,6 @@
 //! Powers and roots. `pow` and `root` compute e^(y ln |x|): at f64 through `table`'s logarithm and exponential, and for narrower types through `ln_narrow` and `exp_narrow` in f64. A whole exponent from 2 to `MULTIPLIED` squares and multiplies instead. A degree of 2 or 3 takes `sqrt` or `cbrt`. `cbrt` refines an estimate taken from x's bits with Newton steps. `hypot` scales both arguments by a power of two before squaring them. See `THIRD-PARTY.md`.
 use crate::{Arg, dd::Double, exp::exp_narrow, float::Native, ln::ln_narrow, table};
+use num_complex::Complex;
 
 /// Whether a is finite and nonzero, for an a whose sign bit is clear. 0, ∞ and NaN give false.
 #[inline]
@@ -167,6 +168,14 @@ many |_, [n, y], count, out| match n {
     Arg::One(d) if d == 2.0 => each!([y], count, out, |[y]| root2(y)),
     Arg::One(d) if d == 3.0 => each!([y], count, out, |[y]| cbrt::<_, { crate::FUSED }>(y)),
     _ => two_pass!([n, y], count, out, |[a, b]| fast::<_, { crate::FUSED }>(b, a, true), |[a, b]| root_any::<_, { crate::FUSED }>(a, b)),
+});
+// A complex degree of 2 takes `Sqrt`, and any other degree but 0 takes `Pow` of its reciprocal. A degree of 0 gives NaN, which fails.
+forms!(Root at Complex<f32>, Complex<f64>: |_, [n, y]| if n == Complex::new(0.0, 0.0) {
+    Complex::new(num_traits::Float::nan(), num_traits::Float::nan())
+} else if n == Complex::new(2.0, 0.0) {
+    crate::Unary::one(&crate::Sqrt, y)
+} else {
+    crate::Binary::one(&Pow, y, crate::divide(Complex::new(1.0, 0.0), n))
 });
 
 /// The top bits of |x|^(-1/3) plus a third of those of |x|, at f64 and at f32, as `top` reads them. The sum is nearly the same for every positive normal x. These values keep `cbrt`'s first estimate within 3.5%.

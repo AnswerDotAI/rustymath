@@ -384,23 +384,51 @@ impl Edge {
     }
 }
 
-/// Repeats each cell along `axis` by its count: one nonnegative count, or one per position. Repeating a keyed position is an error, as it is for selection.
-pub fn repeat(layout: &Layout, axis: usize, counts: &[i64]) -> Result<Plan, Error> {
+/// Repeats each cell along `axis` by its count: one count for every cell, or one for each cell. A negative count gives that many fills in place of its cell. Where the axis has one cell, every count repeats it. A fill has no key, and repeating a keyed position is an error, as it is for selection.
+pub fn repeat(layout: &Layout, axis: usize, counts: &[i64]) -> Result<Plan, Error> { replicated(layout, axis, counts, false) }
+
+/// Undoes `repeat` with the same counts: one cell for each count. A positive count gives the first cell it made, and any other count a fill. One count must divide the number of cells. More counts must use every cell, unless the axis has one cell.
+pub fn expand(layout: &Layout, axis: usize, counts: &[i64]) -> Result<Plan, Error> { replicated(layout, axis, counts, true) }
+
+/// The plan of `repeat`, or of `expand` where `inverse`. Repeating, each count uses up one cell. Undoing, each count uses up the cells it made and gives back one.
+fn replicated(layout: &Layout, axis: usize, counts: &[i64], inverse: bool) -> Result<Plan, Error> {
     let lanes = Lanes::new(layout.shape(), axis)?;
-    if counts.len() != 1 && counts.len() != lanes.len { return Err(Error::new(Kind::Length, "repeat needs one count or one per axis position")); }
-    let count = |i: usize| usize::try_from(counts[if counts.len() == 1 { 0 } else { i }]).map_err(|_| Error::new(Kind::Domain, "repeat counts must be nonnegative"));
-    if counts.len() == 1 { count(0)?; }
-    let len = (0..lanes.len).try_fold(0usize, |n, i| n.checked_add(count(i)?).ok_or_else(|| Error::new(Kind::Limit, "repeat length overflow")))?;
+    let single = counts.len() == 1;
+    let count = |j: usize| counts[if single { 0 } else { j }];
+    let size = |n: i64| usize::try_from(n.unsigned_abs()).unwrap_or(usize::MAX);
+    let len = match (inverse, single) {
+        (false, true) => lanes.len,
+        (false, false) if lanes.len == 1 || counts.len() == lanes.len => counts.len(),
+        (false, false) => return Err(Error::new(Kind::Length, "repeat needs one count, or one count for each cell")),
+        (true, true) => match size(counts[0]) {
+            0 if lanes.len == 0 => 1,
+            n if n > 0 && lanes.len % n == 0 => lanes.len / n,
+            _ => return Err(Error::new(Kind::Domain, "one count must divide the number of cells to invert")),
+        },
+        (true, false) => counts.len(),
+    };
+    let total = if inverse { Some(len) } else { (0..len).try_fold(0usize, |total, j| total.checked_add(size(count(j)))) };
     let mut shape = layout.shape().to_vec();
-    shape[axis] = len;
+    shape[axis] = total.ok_or_else(|| Error::new(Kind::Limit, "repeat length overflow"))?;
     generated_len(&shape)?;
-    if counts.len() == 1 && layout.keys(axis).is_none() {
-        let result = Layout::from(shape).with_keys(layout.all_keys())?.inherit_names(layout.names().to_vec());
-        return Ok(Plan { layout: result, steps: vec![Steps::along(lanes.outer, lanes.len * lanes.inner), Steps::along(lanes.len, lanes.inner), Steps::along(count(0)?, 0), Steps::along(lanes.inner, 1)] });
+    let keyed = layout.keys(axis).is_some();
+    let unkeyed = |shape: Vec<usize>| Ok::<_, Error>(Layout::from(shape).with_keys(layout.all_keys())?.inherit_names(layout.names().to_vec()));
+    let rows = Steps::along(lanes.outer, lanes.len * lanes.inner);
+    if !inverse && single && counts[0] >= 0 && !keyed {
+        return Ok(Plan { layout: unkeyed(shape)?, steps: vec![rows, Steps::along(lanes.len, lanes.inner), Steps::along(size(counts[0]), 0), Steps::along(lanes.inner, 1)] });
     }
-    let positions = (0..lanes.len).flat_map(|i| std::iter::repeat_n(i, count(i).expect("validated counts"))).collect::<Vec<_>>();
-    let result = layout.select(axis, positions.iter().map(|&i| Some(i)))?;
-    Ok(Plan { layout: result, steps: vec![Steps::along(lanes.outer, lanes.len * lanes.inner), Steps::table(positions.into_iter().map(|i| i * lanes.inner).collect()), Steps::along(lanes.inner, 1)] })
+    let (mut table, mut positions, mut used) = (Vec::with_capacity(shape[axis]), Vec::new(), 0usize);
+    for j in 0..len {
+        let n = count(j);
+        let cell = (n > 0).then_some(if lanes.len == 1 { 0 } else { used });
+        used = used.saturating_add(if inverse { size(n) } else { 1 });
+        let copies = if inverse { 1 } else { size(n) };
+        table.extend(std::iter::repeat_n(cell.map_or(Steps::FILL, |c| c * lanes.inner), copies));
+        if keyed { positions.extend(std::iter::repeat_n(cell, copies)); }
+    }
+    if inverse && lanes.len != 1 && used != lanes.len { return Err(Error::new(Kind::Length, "the counts must use every cell to invert")); }
+    let result = if keyed { layout.select(axis, positions.into_iter())? } else { unkeyed(shape)? };
+    Ok(Plan { layout: result, steps: vec![rows, Steps::table(table), Steps::along(lanes.inner, 1)] })
 }
 
 /// Pads every axis by `(before, after)` positions, filled with the item type's fill. Existing axis keys remain on their positions. An axis that pads by nothing keeps a plain walk.

@@ -19,46 +19,58 @@ pub fn dtype(name: &str) -> PyResult<DType> {
     DType::named(name).ok_or_else(|| PyValueError::new_err(format!("unknown dtype {name:?}")))
 }
 
+/// A Python exception carried through a rustymath function that's generic over its error, as [`Stacked`](rustymath::linalg::Stacked) is: a rustymath error, or the exception that [`signals`] raised.
+pub struct Raised(PyErr);
+
+impl From<Error> for Raised { fn from(e: Error) -> Self { Self(py_err(e)) } }
+
+impl From<Raised> for PyErr { fn from(r: Raised) -> Self { r.0 } }
+
+/// Runs `work`, a call's computation in Rust, with the GIL released, so other Python threads run meanwhile, as they do during NumPy's computations. Every binding converts its arguments before `work` and gives its results after it, holding the GIL. A call reads each `rustymath.Array` argument as it was when converted: the argument shares the array's storage, and another thread's write to the array during the call copies the storage first. Another thread's write to a buffer argument, such as a NumPy array, during the call leaves the call's results undefined.
+pub fn released<R: Send>(py: Python<'_>, work: impl FnOnce() -> R + Send) -> R { py.detach(work) }
+
+/// Raises the exception for a pending signal, such as Ctrl-C, holding the GIL only for the check. Work that [`released`] runs checks with it between steps.
+pub fn signals() -> Result<(), Raised> { Python::attach(|py| py.check_signals()).map_err(Raised) }
+
 /// One data argument, converted, and whether it was a Python scalar, as `scalar` tests.
-pub struct Arg<'py> { source: Source<'py>, pub scalar: bool }
+pub struct Arg { source: Source, pub scalar: bool }
 
 /// Where an argument's items are.
-enum Source<'py> {
+enum Source {
     /// The items of an object that exports a buffer, such as a NumPy array.
     Read { read: Read, layout: Layout },
-    /// A `rustymath.Array`, borrowed.
-    Array(PyRef<'py, Array>),
-    /// Python values, copied foreign storage, or an array converted to another dtype.
+    /// Python values, copied foreign storage, an array converted to another dtype, or a `rustymath.Array`'s items, shared with it.
     Owned(Core),
 }
 
-impl From<Read> for Arg<'_> {
-    fn from(read: Read) -> Self {
-        let layout = Layout::from(read.shape());
-        let source = if read.is_owned() { Source::Owned(Core::new(layout, read.into_buffer()).expect("buffer shape")) } else { Source::Read { read, layout } };
-        Self { source, scalar: false }
+impl Source {
+    /// The source of items read from a buffer: borrowed in place where the read lent them, and owned where it copied them.
+    fn read(read: Read, layout: Layout) -> Self {
+        if read.is_owned() { Self::Owned(Core::new(layout, read.into_buffer()).expect("a read's layout fits its items")) } else { Self::Read { read, layout } }
     }
 }
 
-impl Arg<'_> {
+impl From<Read> for Arg {
+    fn from(read: Read) -> Self { let layout = Layout::from(read.shape()); Self { source: Source::read(read, layout), scalar: false } }
+}
+
+impl Arg {
     pub fn view(&self) -> ArrayView<'_> {
-        match &self.source { Source::Read { read, layout } => ArrayView::compact(layout, read.view()), Source::Array(a) => a.core().view(), Source::Owned(c) => c.view() }
+        match &self.source { Source::Read { read, layout } => ArrayView::compact(layout, read.view()), Source::Owned(c) => c.view() }
     }
     pub fn layout(&self) -> Layout { self.view().layout().clone() }
     /// The argument as an owned array. Only borrowed items are copied.
     pub fn into_core(self) -> PyResult<Core> {
         match self.source {
             Source::Read { read, layout } => Core::new(layout, read.into_buffer()).map_err(py_err),
-            Source::Array(a) => Ok(a.core().clone()),
             Source::Owned(c) => Ok(c),
         }
     }
-    /// Selects before taking ownership: foreign items gather directly, while Rustymath arrays can share affine views.
-    pub fn selected(&self, plan: rustymath::structure::Plan) -> PyResult<Core> {
+    /// Selects before taking ownership, with the GIL released: foreign items gather directly, while Rustymath arrays can share affine views.
+    pub fn selected(&self, py: Python<'_>, plan: rustymath::structure::Plan) -> PyResult<Core> {
         match &self.source {
-            Source::Read { read, .. } => Core::gathered(read.view(), &plan),
-            Source::Array(a) => a.core().selected(plan),
-            Source::Owned(c) => c.selected(plan),
+            Source::Read { read, .. } => { let items = read.view(); released(py, || Core::gathered(items, &plan)) }
+            Source::Owned(c) => released(py, || c.selected(plan)),
         }.map_err(py_err)
     }
     /// The items at `dtype`, borrowed where the argument already has it, and otherwise widened. An empty argument converts to any dtype. It raises where the argument's dtype doesn't widen to `dtype`, as [`DType::widens_to`] decides.
@@ -68,6 +80,8 @@ impl Arg<'_> {
         if !view.is_empty() && !view.dtype().widens_to(dtype) { return Err(py_err(Error::new(Kind::Domain, format!("{} doesn't widen to {}", view.dtype().name(), dtype.name())))); }
         view.cast(dtype).map_err(py_err)
     }
+    /// The items in row-major order at the argument's own dtype, borrowed where they're stored that way.
+    pub fn row_major(&self) -> PyResult<Items<'_>> { self.at(self.view().dtype()) }
     /// The items in row-major order as `T`, widened as [`Arg::at`] widens them: borrowed where the argument already has `T`'s dtype, and otherwise the widened copy.
     pub fn items<T: Element>(&self) -> PyResult<Cow<'_, [T]>> {
         Ok(self.at(T::DTYPE)?.items())
@@ -77,9 +91,9 @@ impl Arg<'_> {
 }
 
 /// A call's data arguments, at one dtype.
-pub struct Call<'py> { pub args: Vec<Arg<'py>> }
+pub struct Call { pub args: Vec<Arg> }
 
-impl Call<'_> {
+impl Call {
     /// Whether every argument was a Python scalar, so that the result is a Python number.
     pub fn scalar(&self) -> bool { self.args.iter().all(|a| a.scalar) }
 }
@@ -217,7 +231,7 @@ fn leaf(obj: &Bound<'_, PyAny>) -> PyResult<Option<Leaf>> {
 }
 
 /// An argument before the call's dtype is known: an array, or nested values with their layout and whether they were a Python scalar.
-enum Pending<'py> { Array(Arg<'py>), Values(Layout, Vec<Piece>, bool) }
+enum Pending { Array(Arg), Values(Layout, Vec<Piece>, bool) }
 
 /// Whether `obj` is a Python scalar: a `bool`, `int`, `float` or `complex`, not a subclass such as NumPy's `float64`.
 fn scalar(obj: &Bound<'_, PyAny>) -> bool {
@@ -225,21 +239,19 @@ fn scalar(obj: &Bound<'_, PyAny>) -> bool {
 }
 
 /// Classifies one data argument, adding the dtype of any array it holds to `strong`.
-fn classify<'py>(obj: &Bound<'py, PyAny>, strong: &mut Option<DType>) -> PyResult<Pending<'py>> {
+fn classify(obj: &Bound<'_, PyAny>, strong: &mut Option<DType>) -> PyResult<Pending> {
     if scalar(obj) { return Ok(Pending::Values(Layout::EMPTY, vec![Piece::Leaf(leaf(obj)?.expect("a Python scalar is a leaf"))], true)); }
     // `None` is a missing value only as an item, so an operator given a bare `None` returns `NotImplemented`.
     if obj.is_none() { return Err(PyTypeError::new_err("rustymath can't convert NoneType")); }
     if let Some(frame) = frame(obj)? { return framed(obj.py(), frame, strong); }
     let source = if let Ok(a) = obj.cast::<Array>() {
-        Some(Source::Array(a.try_borrow()?))
+        Some(Source::Owned(a.try_borrow()?.core().clone()))
     } else {
         let read = match read_array(obj)? {
             None if obj.hasattr("__array__")? => Some(read_array(&obj.call_method0("__array__")?)?.ok_or_else(|| PyTypeError::new_err("__array__ gave an object without a buffer"))?),
             read => read,
         };
-        read.map(|(read, layout)| -> PyResult<_> {
-            Ok(if read.is_owned() { Source::Owned(Core::new(layout, read.into_buffer()).map_err(py_err)?) } else { Source::Read { read, layout } })
-        }).transpose()?
+        read.map(|(read, layout)| Source::read(read, layout))
     };
     if let Some(source) = source {
         let a = Arg { source, scalar: false };
@@ -256,7 +268,7 @@ fn classify<'py>(obj: &Bound<'py, PyAny>, strong: &mut Option<DType>) -> PyResul
 }
 
 /// A frame as a matrix of rows by columns, keyed and named by its labels. Its columns convert together, as a list of them would, and the result is their transpose, a view.
-fn framed<'py>(py: Python<'py>, frame: Frame<'py>, strong: &mut Option<DType>) -> PyResult<Pending<'py>> {
+fn framed(py: Python<'_>, frame: Frame<'_>, strong: &mut Option<DType>) -> PyResult<Pending> {
     // rustymath holds characters but not strings, so a column of strings fails here, naming its label.
     let text = |o: Bound<'_, PyAny>| o.cast::<PyString>().is_ok_and(|s| s.to_str().is_ok_and(|t| t.chars().count() != 1));
     if let Some(i) = frame.columns.iter().position(|c| c.cast::<PyList>().is_ok_and(|items| items.iter().any(text))) {
@@ -290,7 +302,7 @@ fn build(layout: Layout, pieces: &[Piece], dtype: DType) -> PyResult<Core> {
 }
 
 /// Converts arguments together, optionally at a constructor's explicit dtype.
-fn convert_at<'py>(args: &[&Bound<'py, PyAny>], forced: Option<DType>) -> PyResult<Call<'py>> {
+fn convert_at(args: &[&Bound<'_, PyAny>], forced: Option<DType>) -> PyResult<Call> {
     let mut strong = None;
     let pending = args.iter().map(|a| classify(a, &mut strong)).collect::<PyResult<Vec<_>>>()?;
     let mut weak: Option<DType> = None;
@@ -327,12 +339,23 @@ fn convert_at<'py>(args: &[&Bound<'py, PyAny>], forced: Option<DType>) -> PyResu
 }
 
 /// Converts a call's data arguments to their promoted dtype.
-pub fn convert<'py>(args: &[&Bound<'py, PyAny>]) -> PyResult<Call<'py>> { convert_at(args, None) }
+pub fn convert(args: &[&Bound<'_, PyAny>]) -> PyResult<Call> { convert_at(args, None) }
+
+/// Converts a call's data arguments as [`convert`] does, except that characters beside numbers keep their dtype: the character arguments convert together, and so do the numeric ones. Characters and numbers inside one argument still raise.
+pub fn convert_kinds(args: &[&Bound<'_, PyAny>]) -> PyResult<Call> {
+    let joint = convert(args);
+    if joint.is_ok() { return joint; }
+    let characters = args.iter().map(|a| Ok(convert(&[a])?.args[0].view().dtype() == DType::Character)).collect::<PyResult<Vec<_>>>()?;
+    if characters.iter().all(|&c| c == characters[0]) { return joint; }
+    let group = |kind: bool| convert(&args.iter().zip(&characters).filter(|&(_, &c)| c == kind).map(|(a, _)| *a).collect::<Vec<_>>());
+    let (mut chars, mut numbers) = (group(true)?.args.into_iter(), group(false)?.args.into_iter());
+    Ok(Call { args: characters.iter().map(|&c| if c { chars.next() } else { numbers.next() }.expect("one converted argument for each")).collect() })
+}
 
 /// Converts one data argument.
-pub fn one<'py>(x: &Bound<'py, PyAny>) -> PyResult<Arg<'py>> { Ok(convert(&[x])?.args.into_iter().next().expect("one argument gives one")) }
+pub fn one(x: &Bound<'_, PyAny>) -> PyResult<Arg> { Ok(convert(&[x])?.args.into_iter().next().expect("one argument gives one")) }
 
 /// Converts one argument to an explicit dtype, constructing Python values there and borrowing matching arrays.
-pub fn one_at<'py>(x: &Bound<'py, PyAny>, dtype: DType) -> PyResult<Arg<'py>> {
+pub fn one_at(x: &Bound<'_, PyAny>, dtype: DType) -> PyResult<Arg> {
     Ok(convert_at(&[x], Some(dtype))?.args.into_iter().next().expect("one argument gives one"))
 }

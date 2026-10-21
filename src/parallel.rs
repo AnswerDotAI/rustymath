@@ -84,18 +84,19 @@ const ROUND_TIME: Duration = Duration::from_millis(20);
 
 /// Runs `write(i, items, scratch)` on each cell `i` of a stack of `count` cells, and gives the output with whether every call said `true`. `items` is cell `i`'s part of the output: `per` items from `i * per`. Cells that run in turn on one thread share one `S` for their scratch buffers, such as an `LuWork`. `check` runs on this thread before the first cell and between rounds, and its error stops the call.
 ///
-/// The first cells run alone on this thread, to time a cell: up to `CELLS` of them, or [`PIECE_TIME`] of work, because one cell alone reads high from a cold start. Each later round holds about `ROUND_TIME` of cells for each of this thread's [`threads`], at least one each. A round's cells split into about `PIECES` pieces for each thread, each of at least `PIECE_TIME` of work. A cell that runs on this thread can split its own work, and one on another thread doesn't. On all 18 threads of an M5 Max, splitting stacks of 8 to 16 matrices of 128² to 512² was 1.5 to 5 times as fast as running their cells in turn, each split across the threads. Three inverses of 1024² were 25% slower. The browser build has no clock to time a cell, and runs the cells in turn with `check` before each.
+/// The first cells run alone on this thread, to time a cell: up to `CELLS` of them, or [`PIECE_TIME`] of work, because one cell alone reads high from a cold start. Each later round holds about `ROUND_TIME` of cells for each of this thread's [`threads`], at least one each. A round's cells split into about `PIECES` pieces for each thread, each of at least `PIECE_TIME` of work. A cell that runs on this thread can split its own work, and one on another thread doesn't. On all 18 threads of an M5 Max, splitting stacks of 8 to 16 matrices of 128² to 512² was 1.5 to 5 times as fast as running their cells in turn, each split across the threads. Three inverses of 1024² were 25% slower. The browser build has no clock to time a cell, and runs the cells in turn with `check` before each. A stack of one cell runs that way too, with nothing to time.
 pub fn stack_with<B: Default + Send, S: Default, E>(
     count: usize, per: usize, write: &(dyn Fn(usize, &mut [B], &mut S) -> bool + Sync), mut check: impl FnMut() -> Result<(), E>) -> Result<(Vec<B>, bool), E> {
     let mut out: Vec<B> = (0..count * per).map(|_| B::default()).collect();
-    let (threads, mut ok, mut scratch) = (threads(), true, S::default());
-    if cfg!(target_arch = "wasm32") {
+    let (mut ok, mut scratch) = (true, S::default());
+    if cfg!(target_arch = "wasm32") || count <= 1 {
         for i in 0..count {
             check()?;
             ok &= write(i, &mut out[i * per..][..per], &mut scratch);
         }
         return Ok((out, ok));
     }
+    let threads = threads();
     check()?;
     let (start, mut timed) = (Instant::now(), 0);
     while timed < count && (timed == 0 || (timed < CELLS && start.elapsed() < PIECE_TIME)) {

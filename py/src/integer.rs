@@ -1,5 +1,5 @@
 //! Checked mixed-radix conversion of integers. Booleans and integers of any dtype compute as `i64`.
-use crate::{array::{core, give}, convert::one};
+use crate::{array::{core, give}, convert::{one, released}};
 use pyo3::{exceptions::PyTypeError, prelude::*};
 use rustymath::error::{Error, Kind};
 use rustymath_buffer::py_err;
@@ -24,7 +24,7 @@ pub(crate) fn radix(bases: &[usize], digits: &[usize]) -> PyResult<()> {
 fn encode<'py>(py: Python<'py>, bases: &Bound<'py, PyAny>, values: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let ((b, bases), (mut shape, values)) = (integers(bases)?, integers(values)?);
     if b.len() != 1 { return Err(py_err(Error::new(Kind::Rank, "bases must be a vector"))); }
-    let digits = rustymath::integer::encode(&bases, &values).ok_or_else(|| py_err(Error::new(Kind::Overflow, "an encoding quotient doesn't fit int64")))?;
+    let digits = released(py, || rustymath::integer::encode(&bases, &values)).ok_or_else(|| py_err(Error::new(Kind::Overflow, "an encoding quotient doesn't fit int64")))?;
     shape.push(bases.len());
     give(py, core(digits, &shape)?, false)
 }
@@ -34,7 +34,7 @@ fn encode<'py>(py: Python<'py>, bases: &Bound<'py, PyAny>, values: &Bound<'py, P
 fn decode<'py>(py: Python<'py>, bases: &Bound<'py, PyAny>, digits: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let ((b, bases), (mut shape, digits)) = (integers(bases)?, integers(digits)?);
     radix(&b, &shape)?;
-    let values = rustymath::integer::decode(&bases, &digits).ok_or_else(|| py_err(Error::new(Kind::Overflow, "a decoded value doesn't fit int64")))?;
+    let values = released(py, || rustymath::integer::decode(&bases, &digits)).ok_or_else(|| py_err(Error::new(Kind::Overflow, "a decoded value doesn't fit int64")))?;
     shape.pop();
     give(py, core(values, &shape)?, true)
 }

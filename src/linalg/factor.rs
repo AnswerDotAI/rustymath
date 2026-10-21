@@ -209,13 +209,13 @@ impl<T: Factor> LuWork<T> {
     }
     /// [`pinv`] of the matrix `a` of `size` `[m, n]`, written into `out`, which holds `n`×`m` items.
     pub fn pinv_into(&mut self, a: &[T], size: [usize; 2], out: &mut [T]) {
-        if !self.inverse_into(a, size, out) { out.copy_from_slice(&svd(a, size).pseudoinverse()) }
+        if self.inverse_into(a, size, out).is_none() { out.copy_from_slice(&svd(a, size).pseudoinverse()) }
     }
-    /// [`inverse`] of the matrix `a` of `size` `[m, n]`, written into `out`, using these buffers. False, writing nothing, where `a` isn't square or a pivot is negligible.
-    pub fn inverse_into(&mut self, a: &[T], size: [usize; 2], out: &mut [T]) -> bool {
-        if !self.regular(a, size) { return false; }
+    /// The inverse of the matrix `a` of `size` `[m, n]`, written into `out`, and `a`'s determinant, from one LU factorization in these buffers. `None`, writing nothing, where `a` isn't square or a pivot is negligible: where [`solve`] and [`pinv`] fall back to least squares.
+    pub fn inverse_into(&mut self, a: &[T], size: [usize; 2], out: &mut [T]) -> Option<T> {
+        if !self.regular(a, size) { return None; }
         T::matrix_lu_inverse_into(self.lu.as_ref(), &mut self.x, out);
-        true
+        Some(self.lu.as_ref().determinant())
     }
     /// Whether `a` is square and nonempty, with pivots that all exceed `ε` times `n` times `a`'s largest magnitude, leaving its LU factorization in these buffers. A NaN pivot doesn't count as negligible, so NaN reaches the results.
     fn regular(&mut self, a: &[T], [m, n]: [usize; 2]) -> bool {
@@ -274,12 +274,6 @@ pub fn pinv<T: Factor>(a: &[T], [m, n]: [usize; 2]) -> Vec<T> {
     let mut out = filled(m * n, T::zero());
     LuWork::default().pinv_into(a, [m, n], &mut out);
     out
-}
-/// The inverse of the `n`×`n` matrix `a` and its determinant, from one LU factorization, or `None` where a pivot is negligible: where [`solve`] and [`pinv`] fall back to least squares.
-pub fn inverse<T: Factor>(a: &[T], n: usize) -> Option<(Vec<T>, T)> {
-    let (mut work, mut out) = (LuWork::default(), filled(n * n, T::zero()));
-    if !work.inverse_into(a, [n, n], &mut out) { return None; }
-    Some((out, work.lu.as_ref().determinant()))
 }
 /// √(least normal)/ε, the bottom of the range where sums of squares neither overflow nor lose digits to underflow. Its reciprocal is the top.
 fn safe_low<R: Native>() -> R { R::min_positive_value().sqrt() / R::epsilon() }

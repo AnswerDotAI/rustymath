@@ -154,6 +154,9 @@ pub fn decode(bases: &[i64], digits: &[i64]) -> Option<Vec<i64>> {
 
 forms!(#[inline] Gcd at i64: |_, [x, y]| gcd(x, y));
 forms!(#[inline] Lcm at i64: |_, [x, y]| lcm(x, y));
+// On Booleans, the greatest common divisor is `or` and the least common multiple is `and`.
+forms!(#[inline] Gcd at bool: |_, [x, y]| x | y);
+forms!(#[inline] Lcm at bool: |_, [x, y]| x & y);
 forms!(#[inline] Binom at i64: |_, [n, k]| binom(n, k));
 forms!(#[inline] Pow at i64: |_, [x, y]| wrapped_power(x, y));
 forms!(
@@ -187,18 +190,20 @@ narrower!(u8, i16, i32);
 forms!(FloorDivide at u8: |_, [x, y]| x.checked_div(y));
 forms!(FloorDivide at i16, i32, i64: |_, [x, y]| x.checked_div(y).map(|q| if x % y != 0 && (x < 0) != (y < 0) { q - 1 } else { q }));
 
-/// `$object`'s forms at each integer type of compact buffers, with Boolean outputs where `=> bool` says so.
-macro_rules! every_width {
-    ($object:ident $(=> $o:ty)?: $($body:tt)+) => {
-        forms!($object at u8 $(=> $o)?, i16 $(=> $o)?, i32 $(=> $o)?, i64 $(=> $o)?: $($body)+);
-    };
+/// Each comparison's exact forms, which give Booleans: at each integer type of compact buffers, and at Booleans, where `false` orders before `true`. Characters compare as their code points, through these forms at `i32` ([`characters`](crate::characters)).
+macro_rules! exactly {
+    ($($object:ident: |$x:ident, $y:ident| $body:expr;)+) => {$(
+        forms!(#[inline] $object at u8 => bool, i16 => bool, i32 => bool, i64 => bool, bool => bool: |_, [$x, $y]| $body);
+    )+};
 }
-every_width!(Equal => bool: |_, [x, y]| x == y);
-every_width!(NotEqual => bool: |_, [x, y]| x != y);
-every_width!(Less => bool: |_, [x, y]| x < y);
-every_width!(LessEqual => bool: |_, [x, y]| x <= y);
-every_width!(Greater => bool: |_, [x, y]| x > y);
-every_width!(GreaterEqual => bool: |_, [x, y]| x >= y);
+exactly! {
+    Equal: |x, y| x == y;
+    NotEqual: |x, y| x != y;
+    Less: |x, y| x < y;
+    LessEqual: |x, y| x <= y;
+    Greater: |x, y| x > y;
+    GreaterEqual: |x, y| x >= y;
+}
 forms!(Floor at u8, i16, i32, i64, bool: |_, [x]| x);
 forms!(Ceil at u8, i16, i32, i64, bool: |_, [x]| x);
 forms!(Abs at bool: |_, [x]| x);

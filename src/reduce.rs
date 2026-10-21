@@ -70,16 +70,16 @@ pub fn minimum<F: Float>(x: F, y: F) -> F { F::from_working(Core::minimum(x.work
 /// [`maximum`] as a function object, which also takes integers and Booleans. The maximum of two Booleans is their `or`.
 #[derive(Clone, Copy, Debug)]
 pub struct Maximum;
-forms!(Maximum at real: |_, [x, y]| crate::slice::Total(maximum(x, y)));
-forms!(Maximum at u8, i16, i32, i64: |_, [x, y]| x.max(y));
-forms!(Maximum at bool: |_, [x, y]| x | y);
+forms!(#[inline] Maximum at real: |_, [x, y]| crate::slice::Total(maximum(x, y)));
+forms!(#[inline] Maximum at u8, i16, i32, i64: |_, [x, y]| x.max(y));
+forms!(#[inline] Maximum at bool: |_, [x, y]| x | y);
 
 /// [`minimum`] as a function object, which also takes integers and Booleans. The minimum of two Booleans is their `and`.
 #[derive(Clone, Copy, Debug)]
 pub struct Minimum;
-forms!(Minimum at real: |_, [x, y]| crate::slice::Total(minimum(x, y)));
-forms!(Minimum at u8, i16, i32, i64: |_, [x, y]| x.min(y));
-forms!(Minimum at bool: |_, [x, y]| x & y);
+forms!(#[inline] Minimum at real: |_, [x, y]| crate::slice::Total(minimum(x, y)));
+forms!(#[inline] Minimum at u8, i16, i32, i64: |_, [x, y]| x.min(y));
+forms!(#[inline] Minimum at bool: |_, [x, y]| x & y);
 
 /// A reduction by [`Sum`], [`Product`], [`Max`], [`Min`], [`Xor`], [`Xnor`] or [`SumAs`], implemented inside rustymath once for each item type it takes. `slice` folds a whole slice of consecutive items, in any order, `merge` combines the folds of two neighbouring runs, and `scan` gives the running folds. [`along`], [`fold_into`] and [`scan_along`] fold along an axis whose items aren't consecutive. [`Sum`] and [`Product`] take floats, integers and complex numbers. [`Max`] and [`Min`] take floats, integers and Booleans, [`Xor`] and [`Xnor`] take Booleans, and [`SumAs`] takes Booleans and integers. An `f16` reduction computes in `f32`. A sum or product of `f16`s gives an `f32` total, for its caller to round once. A total that doesn't fit its type fails, with its value wrapped to that type.
 pub trait Reduction<T> {

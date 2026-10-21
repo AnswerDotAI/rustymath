@@ -78,7 +78,7 @@ impl<'py, F: Element> Product<'py, F> where PlusTimes: Inner<F, Out = F> {
         Ok(Self::Python { f: a.getattr(intern!(py, "matvec"))?, t })
     }
     /// The matrix `a`.
-    fn matrix(a: &Arg<'_>) -> PyResult<Self> {
+    fn matrix(a: &Arg) -> PyResult<Self> {
         let &[m, n] = a.layout().shape() else { return Err(py_err(Error::new(Kind::Rank, "a matrix needs two axes"))) };
         Ok(Self::Matrix { a: a.items()?.into_owned(), shape: [m, n] })
     }
@@ -130,7 +130,7 @@ fn outcome<F: Native + Element>(py: Python<'_>, found: opt::Found<Vec<F>, F>) ->
 /// `minimize` at the float type `F`, with `data` the start point and, where there are bounds, the lower and upper bounds.
 #[allow(clippy::too_many_arguments)]
 fn minimize_at<'py, F: Native + Element>(
-    fun: Bound<'py, PyAny>, jac: Option<Bound<'py, PyAny>>, vectorized: bool, data: &[Arg<'_>], method: Option<Method>, tol: Option<f64>, maxfev: Option<usize>,
+    fun: Bound<'py, PyAny>, jac: Option<Bound<'py, PyAny>>, vectorized: bool, data: &[Arg], method: Option<Method>, tol: Option<f64>, maxfev: Option<usize>,
     popsize: Option<usize>, seed: u64) -> PyResult<Outcome<'py>> {
     let (py, start) = (fun.py(), data[0].items::<F>()?);
     let limits = if let [_, lower, upper] = data { Some((lower.items::<F>()?, upper.items::<F>()?)) } else { None };
@@ -177,7 +177,7 @@ fn root_scalar(
 
 /// `least_squares` at the float type `F`.
 fn least_squares_at<'py, F: Native + Element + Factor>(
-    fun: Bound<'py, PyAny>, x0: &Arg<'_>, jac: Option<Bound<'py, PyAny>>, tol: Option<f64>, maxfev: Option<usize>) -> PyResult<Outcome<'py>> where PlusTimes: Inner<F, Out = F> {
+    fun: Bound<'py, PyAny>, x0: &Arg, jac: Option<Bound<'py, PyAny>>, tol: Option<f64>, maxfev: Option<usize>) -> PyResult<Outcome<'py>> where PlusTimes: Inner<F, Out = F> {
     let (py, start) = (fun.py(), x0.items::<F>()?);
     let options = Options { method: Some(Method::LevenbergMarquardt), tolerance: tol.map(F::narrow), evaluations: maxfev, ..Default::default() };
     let first = one(&apply(&fun, array(py, start.to_vec(), &[start.len()])?)?)?.cast::<F>()?;
@@ -198,7 +198,7 @@ fn least_squares<'py>(
 /// `linear` at the float type `F`. `data` holds `b`, then `a` where it's a matrix, `x0` where `start` says it's given, and `m` where it's a matrix.
 #[allow(clippy::too_many_arguments)]
 fn linear_at<'py, F: Native + Element>(
-    a: &Bound<'py, PyAny>, m: Option<&Bound<'py, PyAny>>, data: &[Arg<'_>], start: bool, method: Method, normal: bool, name: &str, rtol: Option<f64>,
+    a: &Bound<'py, PyAny>, m: Option<&Bound<'py, PyAny>>, data: &[Arg], start: bool, method: Method, normal: bool, name: &str, rtol: Option<f64>,
     maxiter: Option<usize>) -> PyResult<Outcome<'py>> where PlusTimes: Inner<F, Out = F> {
     let (py, mut data) = (a.py(), data.iter());
     let b = data.next().expect("b comes first").items::<F>()?;

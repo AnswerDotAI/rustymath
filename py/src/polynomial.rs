@@ -1,6 +1,6 @@
 //! rustymath's `polynomial` module under the names of `numpy.polynomial.polynomial`. Each function converts its data arguments to one dtype, as `convert` does. Booleans, `u8` and `i16` compute as `f32`, wider integers as `f64`, and `float16` computes as `float32` and rounds its result back. Root finding computes in `complex128`, and gives `complex64` roots for `float16`, `float32` and `complex64` coefficients.
 use crate::array::give;
-use crate::convert::{convert, one};
+use crate::convert::{convert, one, released};
 use crate::functions::missing;
 use crate::integer::radix;
 use pyo3::prelude::*;
@@ -45,12 +45,12 @@ pub fn polyval<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, c: &Bound<'py, PyAny
     let core = match work {
         DType::Float(w) => rustymath::with_float_width!(w, F => {
             let (c, mut y) = (cs.items::<F>()?, xs.items::<F>()?.into_owned());
-            polynomial::evaluate(&c, &mut y);
+            released(py, || polynomial::evaluate(&c, &mut y));
             finished(xs.layout(), y, result)?
         }),
         _ => rustymath::with_inexact!(work, T => {
-            let c = cs.items::<T>()?;
-            finished(xs.layout(), xs.items::<T>()?.iter().map(|x| polynomial::value(&c, x)).collect(), result)?
+            let (c, x) = (cs.items::<T>()?, xs.items::<T>()?);
+            finished(xs.layout(), released(py, || x.iter().map(|x| polynomial::value(&c, x)).collect()), result)?
         }),
     };
     give(py, core, xs.scalar)
@@ -67,8 +67,8 @@ pub fn polyvalfromroots<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, roots: &Bou
     leading(&ms.layout())?;
     let (work, result) = working("polyvalfromroots", xs.view().dtype())?;
     let core = rustymath::with_inexact!(work, T => {
-        let (roots, m) = (rs.items::<T>()?, ms.items::<T>()?[0]);
-        finished(xs.layout(), xs.items::<T>()?.iter().map(|x| polynomial::factored(&m, &roots, x)).collect(), result)?
+        let (roots, m, x) = (rs.items::<T>()?, ms.items::<T>()?[0], xs.items::<T>()?);
+        finished(xs.layout(), released(py, || x.iter().map(|x| polynomial::factored(&m, &roots, x)).collect()), result)?
     });
     give(py, core, xs.scalar)
 }
@@ -82,7 +82,7 @@ pub fn polyroots<'py>(py: Python<'py>, c: &Bound<'py, PyAny>) -> PyResult<Bound<
     if dtype == DType::Character { return Err(missing("polyroots", dtype)); }
     let result = dtype.complex();
     let c = cs.items::<Complex64>()?;
-    let roots = polynomial::roots(&c).unwrap_or_else(|| vec![Complex64::new(f64::NAN, f64::NAN); polynomial::trimmed(&c).len().saturating_sub(1)]);
+    let roots = released(py, || polynomial::roots(&c)).unwrap_or_else(|| vec![Complex64::new(f64::NAN, f64::NAN); polynomial::trimmed(&c).len().saturating_sub(1)]);
     give(py, vector_of(roots, result)?, false)
 }
 
@@ -96,7 +96,7 @@ pub fn polyfromroots<'py>(py: Python<'py>, roots: &Bound<'py, PyAny>, m: Option<
     vector(&rs.layout(), "the roots")?;
     leading(&ms.layout())?;
     let (work, result) = working("polyfromroots", rs.view().dtype())?;
-    let core = rustymath::with_inexact!(work, T => vector_of(polynomial::from_roots(ms.items::<T>()?[0], &rs.items::<T>()?), result)?);
+    let core = rustymath::with_inexact!(work, T => { let (m, r) = (ms.items::<T>()?[0], rs.items::<T>()?); vector_of(released(py, || polynomial::from_roots(m, &r)), result)? });
     give(py, core, false)
 }
 
@@ -106,7 +106,7 @@ pub fn polyder<'py>(py: Python<'py>, c: &Bound<'py, PyAny>) -> PyResult<Bound<'p
     let cs = one(c)?;
     vector(&cs.layout(), "the coefficients")?;
     let (work, result) = working("polyder", cs.view().dtype())?;
-    let core = rustymath::with_inexact!(work, T => vector_of(polynomial::derivative(&cs.items::<T>()?), result)?);
+    let core = rustymath::with_inexact!(work, T => { let c = cs.items::<T>()?; vector_of(released(py, || polynomial::derivative(&c)), result)? });
     give(py, core, false)
 }
 
@@ -119,7 +119,7 @@ pub fn polydecode<'py>(py: Python<'py>, bases: &Bound<'py, PyAny>, digits: &Boun
     radix(bs.layout().shape(), d.shape())?;
     let (work, result) = working("decode", bs.view().dtype())?;
     let layout = d.axes(0..d.shape().len() - 1);
-    let core = rustymath::with_inexact!(work, T => finished(layout, polynomial::decode(&bs.items::<T>()?, &ds.items::<T>()?), result)?);
+    let core = rustymath::with_inexact!(work, T => { let (b, d) = (bs.items::<T>()?, ds.items::<T>()?); finished(layout, released(py, || polynomial::decode(&b, &d)), result)? });
     let reduced = core.layout().shape().is_empty();
     give(py, core, reduced)
 }
@@ -133,7 +133,7 @@ pub fn polyfit<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny
     if xs.layout().shape() != ys.layout().shape() { return Err(py_err(Error::new(Kind::Length, "polyfit needs one y for each x"))); }
     let (work, result) = working("polyfit", xs.view().dtype())?;
     let DType::Float(w) = work else { return Err(missing("polyfit", work)) };
-    let core = rustymath::with_float_width!(w, F => vector_of(polynomial::fit(&xs.items::<F>()?, &ys.items::<F>()?, deg), result)?);
+    let core = rustymath::with_float_width!(w, F => { let (x, y) = (xs.items::<F>()?, ys.items::<F>()?); vector_of(released(py, || polynomial::fit(&x, &y, deg)), result)? });
     give(py, core, false)
 }
 

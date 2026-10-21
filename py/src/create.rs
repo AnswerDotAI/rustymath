@@ -1,5 +1,5 @@
 //! Familiar constructors over rustymath's compact buffers and sequence generators.
-use crate::{array::{Array, core}, convert};
+use crate::{array::{Array, core}, convert::{self, released}};
 use pyo3::{exceptions::PyValueError, prelude::*, types::{PyInt, PyTuple}};
 use rustymath::{array::Array as Core, buffer::{Buffer, DType, Element, FloatWidth, Source}, layout::{Layout, generated_len}, with_dtype, with_float_width, with_width};
 use rustymath_buffer::py_err;
@@ -13,59 +13,62 @@ pub fn shape(size: &Bound<'_, PyAny>) -> PyResult<Vec<usize>> {
 
 fn layout(size: &Bound<'_, PyAny>) -> PyResult<Layout> { Ok(Layout::from(shape(size)?)) }
 
-fn cast(core: Core, dtype: Option<&str>) -> PyResult<Array> {
+fn cast(py: Python<'_>, core: Core, dtype: Option<&str>) -> PyResult<Array> {
     let Some(dtype) = dtype else { return Ok(Array::new(core)) };
     let (layout, buffer) = core.into_compact();
     let dtype = convert::dtype(dtype)?;
-    let buffer = if buffer.dtype() == dtype { buffer } else { Buffer::cast(buffer.view(), dtype).map_err(py_err)? };
+    let buffer = if buffer.dtype() == dtype { buffer } else { released(py, || Buffer::cast(buffer.view(), dtype)).map_err(py_err)? };
     Ok(Array::new(Core::new(layout, buffer).map_err(py_err)?))
 }
 
 /// One fill primitive. `like` supplies layout and default dtype; `None` fills with the dtype's zero or space.
 #[pyfunction]
 #[pyo3(signature = (shape, value, dtype=None, *, like=None))]
-fn _full(shape: &Bound<'_, PyAny>, value: &Bound<'_, PyAny>, dtype: Option<&str>, like: Option<&Bound<'_, PyAny>>) -> PyResult<Array> {
+fn _full(py: Python<'_>, shape: &Bound<'_, PyAny>, value: &Bound<'_, PyAny>, dtype: Option<&str>, like: Option<&Bound<'_, PyAny>>) -> PyResult<Array> {
     let like = like.map(convert::one).transpose()?;
     let layout = match &like { Some(x) => x.layout(), None => layout(shape)? };
     let dtype = dtype.map(convert::dtype).transpose()?.or_else(|| like.as_ref().map(|x| x.view().dtype()));
     if value.is_none() {
         let dtype = dtype.unwrap_or(DType::Float(FloatWidth::F64));
-        return Ok(Array::new(with_dtype!(dtype, T => rustymath::create::full(layout, T::view(&[T::FILL]))).map_err(py_err)?));
+        return Ok(Array::new(released(py, || with_dtype!(dtype, T => rustymath::create::full(layout, T::view(&[T::FILL])))).map_err(py_err)?));
     }
     let value = match dtype { Some(dtype) => convert::one_at(value, dtype)?, None => convert::one(value)? };
-    Ok(Array::new(rustymath::create::full(layout, value.at(value.view().dtype())?.view()).map_err(py_err)?))
+    let items = value.row_major()?;
+    Ok(Array::new(released(py, || rustymath::create::full(layout, items.view())).map_err(py_err)?))
 }
 
 /// Values separated by `step`, including `start` and excluding `stop`. With only one bound, `start` is zero.
 #[pyfunction]
 #[pyo3(signature = (start, stop=None, step=None, dtype=None))]
-fn arange(start: &Bound<'_, PyAny>, stop: Option<&Bound<'_, PyAny>>, step: Option<&Bound<'_, PyAny>>, dtype: Option<&str>) -> PyResult<Array> {
+fn arange(py: Python<'_>, start: &Bound<'_, PyAny>, stop: Option<&Bound<'_, PyAny>>, step: Option<&Bound<'_, PyAny>>, dtype: Option<&str>) -> PyResult<Array> {
     let integer = |x: &Bound<'_, PyAny>| x.is_instance_of::<PyInt>() || x.extract::<i64>().is_ok();
     let integers = integer(start) && stop.is_none_or(integer) && step.is_none_or(integer);
     let core = if integers {
         let (a, b) = match stop { Some(stop) => (start.extract()?, stop.extract()?), None => (0, start.extract()?) };
-        let values = rustymath::create::arange_int(a, b, step.map(|x| x.extract()).transpose()?.unwrap_or(1)).map_err(py_err)?;
+        let step = step.map(|x| x.extract()).transpose()?.unwrap_or(1);
+        let values = released(py, || rustymath::create::arange_int(a, b, step)).map_err(py_err)?;
         let n = values.len(); core(values, &[n])?
     } else {
         let (a, b) = match stop { Some(stop) => (start.extract()?, stop.extract()?), None => (0.0, start.extract()?) };
-        let values = rustymath::create::arange(a, b, step.map(|x| x.extract()).transpose()?.unwrap_or(1.0)).map_err(py_err)?;
+        let step = step.map(|x| x.extract()).transpose()?.unwrap_or(1.0);
+        let values = released(py, || rustymath::create::arange(a, b, step)).map_err(py_err)?;
         let n = values.len(); core(values, &[n])?
     };
-    cast(core, dtype)
+    cast(py, core, dtype)
 }
 
 /// `num` evenly spaced values between the bounds, including `stop` when `endpoint` is true.
 #[pyfunction]
 #[pyo3(signature = (start, stop, num=50, endpoint=true, dtype=None))]
-fn linspace(start: f64, stop: f64, num: usize, endpoint: bool, dtype: Option<&str>) -> PyResult<Array> {
-    cast(core(rustymath::create::linspace(start, stop, num, endpoint).map_err(py_err)?, &[num])?, dtype)
+fn linspace(py: Python<'_>, start: f64, stop: f64, num: usize, endpoint: bool, dtype: Option<&str>) -> PyResult<Array> {
+    cast(py, core(released(py, || rustymath::create::linspace(start, stop, num, endpoint)).map_err(py_err)?, &[num])?, dtype)
 }
 
 /// `base` raised to `num` evenly spaced exponents between the bounds.
 #[pyfunction]
 #[pyo3(signature = (start, stop, num=50, endpoint=true, base=10.0, dtype=None))]
-fn logspace(start: f64, stop: f64, num: usize, endpoint: bool, base: f64, dtype: Option<&str>) -> PyResult<Array> {
-    cast(core(rustymath::create::logspace(start, stop, num, endpoint, base).map_err(py_err)?, &[num])?, dtype)
+fn logspace(py: Python<'_>, start: f64, stop: f64, num: usize, endpoint: bool, base: f64, dtype: Option<&str>) -> PyResult<Array> {
+    cast(py, core(released(py, || rustymath::create::logspace(start, stop, num, endpoint, base)).map_err(py_err)?, &[num])?, dtype)
 }
 
 /// The precision and finite range of a float dtype, or of a complex dtype's real parts.

@@ -610,7 +610,7 @@ mod search {
             let second: Vec<f32> = (0..n).map(|i| if i % 19 == 0 { f32::NAN } else { (i % 17) as f32 / 7. }).collect();
             for down in [false, true] {
                 let mut expected: Vec<u32> = (0..n as u32).collect();
-                expected.sort_by_key(|&i| { let k = (rows[i as usize * 3].order_key(), second[i as usize].order_key()); if down { (!k.0, !k.1) } else { k } });
+                expected.sort_by_key(|&i| { let k = (rows[i as usize * 3] as u16 ^ 1 << 15, second[i as usize].order_key()); if down { (!k.0, !k.1) } else { k } });
                 let order = view_lexgrade(n, [(i16::view(&rows), 0, 3), (f32::view(&second), 0, 1)].into_iter(), down).unwrap();
                 assert_eq!(order, expected);
                 let ranks = inverse_permutation(order.iter().map(|&i| i as usize));

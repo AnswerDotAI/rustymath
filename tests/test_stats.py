@@ -75,7 +75,12 @@ def test_bitwise_decimal_rounding_and_angles():
         assert fn(a, 3).tolist() == op(a).tolist() == [op(x) for x in a.tolist()]
     assert (~a).tolist() == [~x for x in a.tolist()] and (3 // a[3:]).tolist() == [1, 0]
     assert rm.floor_divide([-7, 7], -3).tolist() == [2, -3] and rm.floor_divide([-7., 7.], -3.).tolist() == [2., -3.]
-    assert (rm.array([0.3, 1.]) // .1).tolist() == [3., 10.] and (rm.array([0.3, 1.]) % .1).tolist() == [0., 0.]
+    # 0.3 / 0.1 is 2.9999999999999996, which floors to 2 exactly, and to 3 within the tolerance 1e-14.
+    x = rm.array([0.3, 1.])
+    assert (x // .1).tolist() == [2., 10.] and (x % .1).tolist() == [0.3 % .1, 0.]
+    rm.set_tolerance(rm.CT)
+    try: assert (x // .1).tolist() == [3., 10.] and (x % .1).tolist() == [0., 0.]
+    finally: rm.set_tolerance(0)
     for dtype in ('float16', 'float32', 'float64'):
         x = rm.array([1.25, -1.25, 0., np.inf], dtype=dtype)
         assert np.allclose(rm.round(x, 1), [1.2, -1.2, 0., np.inf], atol=.001)

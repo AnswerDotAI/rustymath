@@ -73,38 +73,7 @@ macro_rules! radix_keys {
 }
 radix_keys!(u8, u16, u32, u64);
 
-/// An unsigned key in an integer's numeric order. An unsigned integer is its own key. A signed integer's key is its bits with the sign bit flipped.
-pub trait OrderKey: Copy {
-    type Key: Copy + Into<u64>;
-    fn order_key(self) -> Self::Key;
-}
-macro_rules! order_keys {
-    ($($s:ty => $u:ty),+; $($own:ty),+) => {
-        $(impl OrderKey for $s {
-            type Key = $u;
-            #[inline]
-            fn order_key(self) -> $u { self as $u ^ 1 << (<$u>::BITS - 1) }
-        })+
-        $(impl OrderKey for $own {
-            type Key = $own;
-            #[inline]
-            fn order_key(self) -> $own { self }
-        })+
-    };
-}
-order_keys!(i16 => u16, i32 => u32, i64 => u64; u8);
-impl OrderKey for bool {
-    type Key = u8;
-    #[inline]
-    fn order_key(self) -> u8 { self as u8 }
-}
-impl OrderKey for char {
-    type Key = u32;
-    #[inline]
-    fn order_key(self) -> u32 { self.into() }
-}
-
-/// An item's unsigned key in sorting order that reads back to the item exactly, so a sort, partition or selection can work on keys alone and write the items back once. Integers, Booleans and characters take their order key. Floats take `Float::total_key`, which puts `¯0` before `0` and every NaN last.
+/// An item's unsigned key in sorting order that reads back to the item exactly, so a sort, partition or selection can work on keys alone and write the items back once. A signed integer's key is its bits with the sign bit flipped, and an unsigned integer, Boolean or character is its own number. Floats take `Float::total_key`, which puts `¯0` before `0` and every NaN last.
 pub(crate) trait SortKey: Element + Default {
     type Key: RadixKey;
     fn sort_key(self) -> Self::Key;
@@ -129,19 +98,19 @@ impl<F: Float + Element + Default> SortKey for F {
     fn from_sort_key(k: F::OrderKey) -> Self { F::from_order_key(k) }
 }
 macro_rules! sort_keys {
-    ($($t:ty => $key:ty, $back:expr);+) => {$(
+    ($($t:ty => $key:ty, $to:expr, $back:expr);+) => {$(
         impl SortKey for $t {
             type Key = $key;
             #[inline]
-            fn sort_key(self) -> $key { self.order_key() }
+            fn sort_key(self) -> $key { ($to)(self) }
             #[inline]
             fn from_sort_key(k: $key) -> Self { ($back)(k) }
             fn counted(x: &[Self], out: &mut [Self], down: bool) -> bool { spread_into(x, out, down) }
         }
     )+};
 }
-sort_keys!(i16 => u16, |k: u16| (k ^ 1 << 15) as i16; i32 => u32, |k: u32| (k ^ 1 << 31) as i32; i64 => u64, |k: u64| (k ^ 1 << 63) as i64;
-    u8 => u8, |k| k; bool => u8, |k| k != 0; char => u32, |k| char::from_u32(k).unwrap_or_default());
+sort_keys!(i16 => u16, |x: i16| x as u16 ^ 1 << 15, |k: u16| (k ^ 1 << 15) as i16; i32 => u32, |x: i32| x as u32 ^ 1 << 31, |k: u32| (k ^ 1 << 31) as i32;
+    i64 => u64, |x: i64| x as u64 ^ 1 << 63, |k: u64| (k ^ 1 << 63) as i64; u8 => u8, |x| x, |k| k; bool => u8, u8::from, |k| k != 0; char => u32, u32::from, |k| char::from_u32(k).unwrap_or_default());
 
 /// The number of items of `y` up to which `index_of` and `tolerant::index_of` pass over `x` once for each, in place of building an index.
 pub const SCANNED: usize = 16;
@@ -203,24 +172,29 @@ fn count_eq<K: Key>(x: &[K], v: K) -> usize {
     total
 }
 
-/// The least key of `x`, and the number of items with each key from it to the greatest, when `tabled` allows that range. Up to 4 keys, each count but the first takes a pass that vectorizes. With fewer than 64 keys, runs of one key are common, and each count would wait for the previous one to be stored. So the items then go to four tables in turn, which are summed at the end. On the Mac, four tables made 2 keys 3 times as fast as one table, and 64 keys or more no faster.
-#[inline(never)]
+/// The least key of `x`, and the number of items with each key from it to the greatest (`counts_into`), when `table` allows that range.
 pub fn counts<K: Key>(x: &[K]) -> Option<(i64, Vec<usize>)> {
     let (min, mut counts) = table(x, 0)?;
+    counts_into(x, min, &mut counts);
+    Some((min, counts))
+}
+
+/// Writes the number of items of `x` with each key into `counts`, whose entries are zero and stand for the keys from `min` on, covering every key of `x`. Up to 4 keys, each count but the first takes a pass that vectorizes. With fewer than 64 keys, runs of one key are common, and each count would wait for the previous one to be stored. So the items then go to four tables in turn, which are summed at the end. On the Mac, four tables made 2 keys 3 times as fast as one table, and 64 keys or more no faster.
+#[inline(never)]
+pub fn counts_into<K: Key>(x: &[K], min: i64, counts: &mut [usize]) {
     let n = counts.len();
     let at = move |k: &K| k.key().wrapping_sub(min) as usize;
     if n <= 4 {
         for (g, count) in counts.iter_mut().enumerate().skip(1) { *count = K::from_key(min + g as i64).map_or(0, |v| count_eq(x, v)); }
         counts[0] = x.len() - counts[1..].iter().sum::<usize>();
-        return Some((min, counts));
+        return;
     }
-    if n >= 64 { for k in x { counts[at(k)] += 1 } return Some((min, counts)); }
+    if n >= 64 { for k in x { counts[at(k)] += 1 } return; }
     let mut parts = vec![0; 4 * n];
     let (chunks, rest) = x.as_chunks::<4>();
     for chunk in chunks { for (p, k) in chunk.iter().enumerate() { parts[p * n + at(k)] += 1 } }
     for k in rest { parts[at(k)] += 1 }
     for (g, count) in counts.iter_mut().enumerate() { *count = (0..4).map(|p| parts[p * n + g]).sum() }
-    Some((min, counts))
 }
 
 /// The classes that `classes` gives, numbered from 0 in order of their first positions.
@@ -310,7 +284,7 @@ pub fn view_find(pattern: View<'_>, pattern_shape: &[usize], target: View<'_>, s
         (View::Booleans(x), View::Booleans(y)) => find(pattern_shape, shape, |i, j| x[i] == y[j]),
         (View::Integers(x), View::Integers(y)) => find(pattern_shape, shape, |i, j| x.get(i) == y.get(j)),
         (View::Characters(x), View::Characters(y)) => find(pattern_shape, shape, |i, j| x[i] == y[j]),
-        (View::Floats(x), View::Floats(y)) => find(pattern_shape, shape, |i, j| t.matches(x.get(i), y.get(j))),
+        (View::Floats(x), View::Floats(y)) => crate::with_tolerance!(t, |t| find(pattern_shape, shape, |i, j| t.matches(x.get(i), y.get(j)))),
         _ => return None,
     })
 }
@@ -870,7 +844,7 @@ pub fn view_matches(x: View<'_>, y: View<'_>, t: Tolerance) -> Option<bool> {
         (View::Integers(x), View::Booleans(y)) => y.iter().enumerate().all(|(i, &y)| x.get(i) == i64::from(y)),
         (View::Floats(x), View::Floats(y)) => crate::with_tolerance!(t, |t| with_floats!(x, |x| with_floats!(y, |y|
             x.iter().zip(y).all(|(&x, &y)| t.matches::<f64>(x.into(), y.into()))))),
-        (View::Complexes(x), View::Complexes(y)) => (0..x.len()).all(|i| t.complex_equal(x.get(i), y.get(i))),
+        (View::Complexes(x), View::Complexes(y)) => crate::with_tolerance!(t, |t| (0..x.len()).all(|i| t.complex_equal(x.get(i), y.get(i)))),
         (View::Characters(x), View::Characters(y)) => x == y,
         _ => return None,
     })
@@ -967,9 +941,9 @@ macro_rules! ordered_view {
     };
     ($view:expr, |$x:ident, $key:ident| $body:expr) => {
         Some(match $view {
-            View::Booleans($x) => { let $key = OrderKey::order_key; $body },
-            View::Characters($x) => { let $key = OrderKey::order_key; $body },
-            View::Integers(ints) => with_ints!(ints, |$x| { let $key = OrderKey::order_key; $body }),
+            View::Booleans($x) => { let $key = SortKey::sort_key; $body },
+            View::Characters($x) => { let $key = SortKey::sort_key; $body },
+            View::Integers(ints) => with_ints!(ints, |$x| { let $key = SortKey::sort_key; $body }),
             View::Floats(floats) => with_floats!(floats, |$x| { let $key = Float::order_key; $body }),
             View::Complexes(_) => return None,
         })
@@ -1007,6 +981,16 @@ pub fn view_lexgrade<'a>(n: usize, columns: impl Iterator<Item = (View<'a>, usiz
         })?;
     }
     Some(order)
+}
+
+/// Stable positions that order each lane of `[outer, len, inner]`, as [`view_lexgrade`] orders rows, laid out as the lanes' items are. Each column holds a key for every item, in primary-first order. `None` for complex keys.
+pub fn view_lexgrade_along(columns: &[View<'_>], dims @ [outer, len, inner]: [usize; 3], down: bool) -> Option<Vec<i64>> {
+    let lane = |o: usize, i: usize| view_lexgrade(len, columns.iter().map(|&c| (c, o * len * inner + i, inner)), down);
+    if outer * inner == 1 { return Some(lane(0, 0)?.into_iter().map(i64::from).collect()); }
+    if columns.iter().any(|c| matches!(c, View::Complexes(_))) { return None; }
+    Some(lanes::<i64, ()>(dims, len, |o, i, out, ()| {
+        for (p, g) in out.iter_mut().zip(lane(o, i).expect("keys that order")) { *p = g.into(); }
+    }))
 }
 
 /// One column's order keys, contiguous or strided. A contiguous pass uses the same vectorized/threaded loop as vector grading.
@@ -1208,19 +1192,23 @@ pub fn view_quantiles_along(x: View<'_>, dims @ [outer, _, inner]: [usize; 3], p
     } else { items }))
 }
 
-/// Maps lanes through the shared stack scheduler. Each callback fills its output slice and reuses its scratch. Only strided inputs need a gathered lane.
-fn map_lanes<T: Copy + Sync, U: Element + Default, S: Default>(x: &[T], [outer, len, inner]: [usize; 3], width: usize,
+/// Maps lanes of `x` through `lanes`. Only strided inputs need a gathered lane.
+fn map_lanes<T: Copy + Sync, U: Element + Default, S: Default>(x: &[T], dims @ [_, len, inner]: [usize; 3], width: usize,
     map: impl Fn(&[T], &mut [U], &mut S) + Sync) -> Vec<U> {
-    if outer * inner * width == 0 { return Vec::new(); }
-    let out = crate::parallel::stack::<U, (Vec<T>, S), std::convert::Infallible>(outer * inner, width, &|lane, out, (input, work)| {
-        let (o, i) = (lane / inner, lane % inner);
+    lanes::<U, (Vec<T>, S)>(dims, width, |o, i, out, (input, work)| {
         let input = if inner == 1 { &x[o * len..(o + 1) * len] } else {
             input.clear();
             input.extend((0..len).map(|j| x[(o * len + j) * inner + i]));
             &input[..]
         };
         map(input, out, work);
-    }, || Ok(())).unwrap();
+    })
+}
+
+/// `width` results for each lane `(o, i)` of `[outer, len, inner]`, from `fill` through the shared stack scheduler, laid out as the lanes' items are, with the inner axis last. Each callback fills its output slice and reuses its scratch.
+fn lanes<U: Element + Default, S: Default>([outer, _, inner]: [usize; 3], width: usize, fill: impl Fn(usize, usize, &mut [U], &mut S) + Sync) -> Vec<U> {
+    if outer * inner * width == 0 { return Vec::new(); }
+    let out = crate::parallel::stack::<U, S, std::convert::Infallible>(outer * inner, width, &|lane, out, work| fill(lane / inner, lane % inner, out, work), || Ok(())).unwrap();
     if inner == 1 || width == 1 { return out; }
     let mut transposed = Vec::with_capacity(out.len());
     transposed.resize(out.len(), U::FILL);

@@ -29,11 +29,20 @@ fn thread_setting() -> usize { rustymath::parallel::thread_setting() }
 /// The effective thread count for calls made on this thread: the process's limit, or 1 on a pool's worker thread.
 #[pyfunction]
 fn threads() -> usize { rustymath::parallel::threads() }
+/// Sets the comparison tolerance for calls in the whole process, returning its previous setting. 0, the starting setting, compares floats exactly. `CT`, 1e-14, is APL's usual tolerance. A function's `ct` argument overrides the setting for its call. A ValueError outside 0 to below 1.
+#[pyfunction]
+fn set_tolerance(t: f64) -> PyResult<f64> { functions::set_tolerance(t) }
+/// The comparison tolerance that `set_tolerance` set for the process, which calls use where `ct` is None.
+#[pyfunction]
+fn tolerance() -> PyResult<f64> { Ok(functions::tolerance(None)?.value()) }
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     functions::add_to(m)?;
-    for f in [wrap_pyfunction!(set_threads, m)?, wrap_pyfunction!(thread_setting, m)?, wrap_pyfunction!(threads, m)?] {
+    for f in [
+        wrap_pyfunction!(set_threads, m)?, wrap_pyfunction!(thread_setting, m)?, wrap_pyfunction!(threads, m)?,
+        wrap_pyfunction!(set_tolerance, m)?, wrap_pyfunction!(tolerance, m)?,
+    ] {
         m.add_function(f)?;
     }
     array::add(m)?;

@@ -13,7 +13,7 @@ pub struct Sign;
 pub struct Angle;
 
 forms!(Abs at real: |_, [x]| Total(x.abs()));
-forms!(Sign at real: |_, [x]| Total(if x == 0.0 { x } else { x.signum() }));
+forms!(#[inline] Sign at real: |_, [x]| Total(if x == 0.0 { x } else { x.signum() }));
 forms!(Angle at real: |_, [x]| Total(crate::arc::atan2::<_, FUSED>(0.0, x)));
 
 macro_rules! objects {

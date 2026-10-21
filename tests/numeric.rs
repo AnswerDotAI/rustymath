@@ -404,8 +404,9 @@ mod operation {
         assert_eq!(kernels!(Binary rustymath::Add).computes(b), Some(i64));
         // `Cis` has `f32` and `f64` forms only, so `f16` widens to `f32`.
         assert_eq!(kernels!(Unary rustymath::Cis).computes(f16), Some(f32));
-        // A value names its object too. `Equal` has integer, real and complex forms.
-        assert_eq!(kernels!(Binary of rustymath::tolerant::Equal(rustymath::tolerant::Tolerance::DEFAULT)).computes(b), Some(i64));
+        // A value names its object too. `Equal` has Boolean, integer, real and complex forms, so Booleans compute as themselves. Characters have no kernel of their own: they compare as code points (`characters::binary`).
+        let equal = kernels!(Binary of rustymath::tolerant::Equal(rustymath::tolerant::Tolerance::DEFAULT));
+        assert_eq!([b, DType::Character].map(|d| equal.computes(d)), [Some(b), None]);
         // A sum of a narrow integer type has its own fold, whose totals are `i64`.
         let sum = kernels!(Fold reduce::Sum);
         let (totals, ok) = sum.run(&reduce::Sum, Buffer::Integers(rustymath::buffer::IntBuf::I16(vec![1, 2, 3, 4])).view(), [2, 2, 1], None).unwrap();
@@ -506,6 +507,36 @@ mod operation {
         assert_eq!(reshaped.view().items::<i64>().unwrap().as_ref(), &[0, 1, 2, 3, 4, 5]);
         assert_eq!(Array::differences(transposed.view(), 1).unwrap().view().items::<i64>().unwrap().as_ref(), &[3, 3, 3]);
         assert_eq!(transposed.reshape([6].into()).unwrap().view().items::<i64>().unwrap().as_ref(), &[0, 3, 1, 4, 2, 5]);
+    }
+
+    /// `binary` of characters and `x` or `y`, laid out as vectors.
+    fn characters<K>(k: K, x: &Buffer, y: &Buffer) -> Option<(Buffer, bool)>
+    where K: rustymath::characters::Characters + rustymath::Binary<i32, Out: rustymath::buffer::Element> + rustymath::Binary<i64, Out: rustymath::buffer::Element> + Sync {
+        let (lx, ly) = (Layout::from([x.len()]), Layout::from([y.len()]));
+        let agreement = Agreement::new(&lx, &ly).unwrap();
+        rustymath::characters::binary(&k, ArrayView::compact(&lx, x.view()), ArrayView::compact(&ly, y.view()), agreement.layout.shape(), &agreement)
+    }
+
+    #[test]
+    fn characters_compute_as_code_points() {
+        use rustymath::{Add, Subtract, buffer::{Element, IntBuf}, reduce::{Maximum, Minimum}, tolerant::{Less, Tolerance}};
+        let text = |s: &str| Buffer::Characters(s.chars().collect());
+        let (ab, ba, ints) = (text("ab"), text("ba"), Buffer::Integers(IntBuf::I64(vec![1, 2])));
+        let run = |result: Option<(Buffer, bool)>| { let (b, ok) = result.unwrap(); assert!(ok); b };
+        // Characters order by code point, and the maximum gives a character.
+        assert_eq!(bool::vec(run(characters(Less(Tolerance::DEFAULT), &ab, &ba))), Some(vec![true, false]));
+        assert_eq!(char::vec(run(characters(Maximum, &ab, &ba))), Some(vec!['b', 'b']));
+        // A character minus a character is an integer, and an integer offsets a character on either side of `+`.
+        assert_eq!(i32::vec(run(characters(Subtract, &ba, &ab))), Some(vec![1, -1]));
+        assert_eq!(char::vec(run(characters(Add, &ab, &ints))), Some(vec!['b', 'd']));
+        assert_eq!(char::vec(run(characters(Add, &ints, &ab))), Some(vec!['b', 'd']));
+        assert!(characters(Add, &ab, &ba).is_none() && characters(Subtract, &ints, &ab).is_none());
+        // Numbers order before characters, whatever the items.
+        assert_eq!(bool::vec(run(characters(Less(Tolerance::DEFAULT), &ints, &ab))), Some(vec![true, true]));
+        assert_eq!(char::vec(run(characters(Maximum, &ints, &ab))), Some(vec!['a', 'b']));
+        assert_eq!(i64::vec(run(characters(Minimum, &ab, &ints))), Some(vec![1, 2]));
+        // A result past the last code point fails.
+        assert!(!characters(Add, &text("\u{10FFFF}"), &Buffer::Integers(IntBuf::I64(vec![1]))).unwrap().1);
     }
 }
 
