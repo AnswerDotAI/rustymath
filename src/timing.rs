@@ -29,25 +29,51 @@ pub fn copy<T: Copy + Neg<Output = T>>(data: &[T], out: &mut [T]) { for (o, &v) 
 #[derive(Clone, Copy, Debug)]
 pub struct CopyTime { pub seconds: f64, pub items: usize, pub bytes: usize, pub stored: bool }
 
-/// The copy times of the machines that run the speed tests: the CPU's name as [`cpu`] reads it, an item's size in bytes, the number of items, and the time for each item in seconds. Each is at the slower end of what that machine's copy normally takes with its data in cache, which is the copy that the expected costs in the budget files assume. A copy measured beside each case varied more than 3 times between cases on CI's runner, where every function's own time varied at most 1.18 times, so a stored time keeps that noise out of every cost.
+/// The most bytes that a copy's source and destination take together for [`copy_time`] to use a stored time. Below it, the copy's data stays in cache, and its time is a property of the CPU. Above it, the copy runs at the speed of memory, which a shared runner varies between runs, and cases of the same size vary with it. On CI's runner under V8, the 36-million-item copy and the cases at that size both varied up to 2.1 times between runs, and dividing by the copy measured in the same run cut the cases' spread from 2.24 times to 1.32. The speed tests' copies take at most 16 MB below it, or 576 MB above it.
+const CACHED_BYTES: usize = 64 << 20;
+
+/// The copy times of the machines that run the speed tests in native builds, for copies whose source and destination fit in `CACHED_BYTES`: the CPU's name as [`cpu`] reads it, an item's size in bytes, the number of items, and the time for each item in seconds. Each is at the slower end of what that machine's copy normally takes, which is the copy that the expected costs in the budget files assume. On CI's runner, a copy measured beside each case varied more than 3 times between cases, while every function's own time varied at most 1.18 times. A stored time keeps that noise out of every cost.
+#[cfg(not(target_arch = "wasm32"))]
 pub const COPIES: &[(&str, usize, usize, f64)] = &[
     // CI's Ubicloud runner, from 630 copies timed beside cases in 21 runs of rustymath's speed test, 15 to 21 October 2026: 0.13 to 0.16 ns for 8-byte items, and 0.33 to 0.45 ns when the copy read its source from the L3 cache that other machines share.
     ("AMD Ryzen 9 7950X3D 16-Core Processor", 8, 65_536, 0.16e-9),
     ("AMD Ryzen 9 7950X3D 16-Core Processor", 4, 65_536, 0.08e-9),
+    // 16-byte items, complex f64: 0.285 ns, measured once on 22 October 2026. Each complex f64 function's time per item that day, divided by its cost in the earlier runs whose 8-byte copies came from cache, gives 0.24 to 0.29 ns.
+    ("AMD Ryzen 9 7950X3D 16-Core Processor", 16, 65_536, 0.29e-9),
     // The development Mac, 22 October 2026, through basedpl's `time_cases` and rustymath's speed test: 0.115 to 0.13 ns for 8-byte items at each size, and 0.056 to 0.066 ns for 4-byte items.
     ("Apple M5 Max", 8, 65_536, 0.12e-9),
     ("Apple M5 Max", 8, 1_048_576, 0.125e-9),
-    ("Apple M5 Max", 8, 36_000_000, 0.13e-9),
     ("Apple M5 Max", 4, 65_536, 0.065e-9),
     // 16-byte items, complex f64, measured at 0.240 ns by rustymath's speed test on 22 October 2026.
     ("Apple M5 Max", 16, 65_536, 0.25e-9),
+    // GitHub's runners in basedpl's `Release` workflow, from the copies that `bpl --costs` measured in its three runs of 22 October 2026: the slowest copy at each size that the cases' own times in that run bore out. The macOS runner's 1,048,576-item copy also measured 0.369 ns once, when its cases' times rose 1.28 times and its copy 1.78 times. The Linux ARM runner is the Neoverse-N2 that `lscpu` names.
+    ("Apple M1 (Virtual)", 8, 65_536, 0.18e-9),
+    ("Apple M1 (Virtual)", 8, 1_048_576, 0.25e-9),
+    ("CPU implementer 0x41, part 0xd49", 8, 65_536, 0.18e-9),
+    ("CPU implementer 0x41, part 0xd49", 8, 1_048_576, 0.26e-9),
+    // The Linux x86-64 runner's CPU changes between runs, so each of these comes from one run. The EPYC 7763's 65,536-item copy measured 0.317 ns, but its cases ran as fast as the 9V74's, whose copy took 0.206 ns, so it takes 0.21 ns.
+    ("AMD EPYC 7763 64-Core Processor", 8, 65_536, 0.21e-9),
+    ("AMD EPYC 7763 64-Core Processor", 8, 1_048_576, 0.22e-9),
+    ("AMD EPYC 9V45 96-Core Processor", 8, 65_536, 0.10e-9),
+    ("AMD EPYC 9V45 96-Core Processor", 8, 1_048_576, 0.12e-9),
+    ("AMD EPYC 9V74 80-Core Processor", 8, 65_536, 0.21e-9),
+    ("AMD EPYC 9V74 80-Core Processor", 8, 1_048_576, 0.24e-9),
 ];
 
-/// This machine's CPU, as its operating system names it: `machdep.cpu.brand_string` on macOS, and the first `model name` in `/proc/cpuinfo` on Linux. `None` in the browser build, on other systems, and on Linux machines whose `/proc/cpuinfo` has no model name, as many ARM servers' doesn't.
-pub fn cpu() -> Option<&'static str> {
-    static CPU: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    CPU.get_or_init(read_cpu).as_deref()
-}
+/// [`COPIES`] for the browser build, whose copy runs under the JavaScript engine that runs the build.
+#[cfg(target_arch = "wasm32")]
+pub const COPIES: &[(&str, usize, usize, f64)] = &[
+    // CI's Ubicloud runner under Node's V8, from the copies that `tests/wasm-speed.mjs` measured in seven runs of 22 October 2026: 0.172 to 0.218 ns at 65,536 items, and 0.196 to 0.249 ns at 1,048,576.
+    ("AMD Ryzen 9 7950X3D 16-Core Processor", 8, 65_536, 0.22e-9),
+    ("AMD Ryzen 9 7950X3D 16-Core Processor", 8, 1_048_576, 0.25e-9),
+];
+
+/// This machine's CPU, as its operating system names it: `machdep.cpu.brand_string` on macOS. On Linux, it's the first `model name` in `/proc/cpuinfo`, or else the `CPU implementer` and `CPU part` codes that ARM machines give there in place of a model name, as `CPU implementer 0x41, part 0xd49`. In the browser build, it's the name passed to [`name_cpu`]. `None` without a name.
+pub fn cpu() -> Option<&'static str> { CPU.get_or_init(read_cpu).as_deref() }
+static CPU: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Names this machine's CPU for [`cpu`] where the system gives no name, as in the browser build, whose tests pass Node's name for it. Has no effect once `cpu` has been read.
+pub fn name_cpu(name: &str) { _ = CPU.set(read_cpu().or_else(|| Some(name.to_owned()))); }
 
 #[cfg(target_os = "macos")]
 fn read_cpu() -> Option<String> {
@@ -62,28 +88,31 @@ fn read_cpu() -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn read_cpu() -> Option<String> {
-    std::fs::read_to_string("/proc/cpuinfo").ok()?.lines().find_map(|l| Some(l.strip_prefix("model name")?.split_once(':')?.1.trim().to_owned()))
+    let info = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    let field = |name: &str| info.lines().find_map(|l| Some(l.strip_prefix(name)?.split_once(':')?.1.trim().to_owned()));
+    field("model name").or_else(|| Some(format!("CPU implementer {}, part {}", field("CPU implementer")?, field("CPU part")?)))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn read_cpu() -> Option<String> { None }
 
-/// One copy's time for each of `items` items of type `T`: this machine's entry in [`COPIES`], or else the copy measured once, the first time each size is asked for. A measured time prints a line on standard error, so that the machine's entry can be added.
+/// One copy's time for each of `items` items of type `T`. A copy whose source and destination fit in `CACHED_BYTES` takes this machine's entry in [`COPIES`]. Any other copy, or one with no entry, is measured once, the first time its size is asked for. A copy that fits but has no entry prints a line on standard error, giving the time to add.
 pub fn copy_time<T: Copy + Default + Neg<Output = T>>(items: usize) -> CopyTime {
     let bytes = size_of::<T>();
-    if let Some(name) = cpu() && let Some(&(_, _, _, seconds)) = COPIES.iter().find(|&&(c, b, n, _)| c == name && b == bytes && n == items) {
+    let cached = 2 * items * bytes <= CACHED_BYTES;
+    if cached && let Some(name) = cpu() && let Some(&(_, _, _, seconds)) = COPIES.iter().find(|&&(c, b, n, _)| c == name && b == bytes && n == items) {
         return CopyTime { seconds, items, bytes, stored: true };
     }
     static MEASURED: std::sync::Mutex<Vec<CopyTime>> = std::sync::Mutex::new(Vec::new());
     let mut measured = MEASURED.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&t) = measured.iter().find(|t| (t.bytes, t.items) == (bytes, items)) { return t; }
     let t = CopyTime { seconds: measured_copy::<T>(items), items, bytes, stored: false };
-    eprintln!("{}: add it to rustymath::timing::COPIES", copy_line(&t));
+    if cached { eprintln!("{}: add it to rustymath::timing::COPIES", copy_line(&t)); }
     measured.push(t);
     t
 }
 
-/// One copy's time for each item, measured on `items` items of type `T` whose source and destination stay in cache: the fastest of `RUNS` copies of the same two buffers. Copying both ways first maps every page, so no copy reads the shared page of zeros that a fresh allocation reads as.
+/// One copy's time for each item, measured on `items` items of type `T`: the fastest of `RUNS` copies of the same two buffers, which stay in cache where they fit. Copying both ways first maps every page, so no copy reads the shared page of zeros that a fresh allocation reads as.
 fn measured_copy<T: Copy + Default + Neg<Output = T>>(items: usize) -> f64 {
     let (mut data, mut out) = (vec![T::default(); items], vec![T::default(); items]);
     copy(&data, &mut out);

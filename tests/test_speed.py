@@ -36,32 +36,35 @@ def fastest(run):
         del result
     return best
 
-def cost(code, namespace, section):
-    "The time that `code` takes in copies of `N` items of the type that `section` names, with the copy timed just before it."
-    u, v, case = np.ones(N, section), np.empty(N, section), compile(code, code, 'eval')
-    copy = fastest(lambda: np.negative(u, out=v))
-    return fastest(lambda: eval(case, namespace)) / copy
+def cost(code, namespace, copy):
+    "The time that `code` takes for each of `N` items, in copies that take `copy` seconds an item, and in seconds."
+    case = compile(code, code, 'eval')
+    seconds = fastest(lambda: eval(case, namespace)) / N
+    return seconds / copy, seconds
 
 @pytest.fixture
-def pauses():
-    "Hold the timing lock exclusively through `rm.timing`, as `speed.rs` does, with the garbage collector off. Gives the pauses, in seconds, before each retry. As a fixture, its wait for the lock falls outside the test's timeout."
+def timing():
+    "Hold the timing lock exclusively through `rm.timing`, as `speed.rs` does, with the garbage collector off. Gives the hold, whose `pauses`, `copy` and `line` the test uses. As a fixture, its wait for the lock falls outside the test's timeout."
     with rm.timing() as hold:
         gc.disable()
-        try: yield hold.pauses
+        try: yield hold
         finally: gc.enable()
 
-def over_budget(cases, namespace, pauses, show):
-    "Time `cases`, then time each one over its budget again after each of `pauses`, in seconds, printing the earlier and new costs. Gives the lines of the cases still over budget. With `show`, prints every case's line, in the format `basedpl.bpltests.logged_costs` reads."
+def over_budget(cases, namespace, timing, show):
+    "Time `cases` in copies of the time that `timing.copy` gives for their section's item type, then time each one over its budget again after each of `timing.pauses`, in seconds, printing the earlier and new costs. Gives the lines of the cases still over budget. With `show`, prints each item type's copy line and every case's line, in the formats `basedpl.bpltests.logged_costs` reads."
+    units = {s: timing.copy(np.dtype(s).itemsize, N) for s in dict.fromkeys(s for s, _, _ in cases)}
+    if show:
+        for _, line in units.values(): print(line, file=sys.stderr)
     def attempt(case):
         section, code, budget = case
-        copies = cost(code, namespace, section)
-        return f'{section} {code}: {copies:.2f}, budget {budget}', copies > float(budget)
+        copies, seconds = cost(code, namespace, units[section][0])
+        return timing.line(section, code, copies, budget, seconds), copies > float(budget)
     over = []
     for case in cases:
         line, failed = attempt(case)
         if show: print(line, file=sys.stderr)
         if failed: over.append((case, line))
-    for pause in pauses:
+    for pause in timing.pauses:
         if not over: break
         for _, line in over: print(f'{line}: over, timed again after {pause:g} s', file=sys.stderr)
         time.sleep(pause)
@@ -73,8 +76,8 @@ def over_budget(cases, namespace, pauses, show):
         over = again
     return [line for _, line in over]
 
-def test_speed(capsys, pauses):
+def test_speed(capsys, timing):
     "Every case costs no more than its budget. `RUSTYMATH_COSTS` prints every cost."
     namespace, cases = arrays(), budgets()
-    with capsys.disabled(): over = over_budget(cases, namespace, pauses, 'RUSTYMATH_COSTS' in os.environ)
+    with capsys.disabled(): over = over_budget(cases, namespace, timing, 'RUSTYMATH_COSTS' in os.environ)
     assert not over, '\n'.join(over)

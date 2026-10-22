@@ -20,7 +20,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: native
-      - run: grep -m1 'model name' /proc/cpuinfo
       # With `RUSTYMATH_COSTS`, the Rust and Python speed tests log every cost, which `basedpl.bpltests.logged_costs` reads.
       - run: RUSTYMATH_COSTS=1 cargo test
       - uses: actions/setup-python@v7

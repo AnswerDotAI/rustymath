@@ -1072,8 +1072,8 @@ const TALL_BLOCK: usize = 1 << 18;
 /// The largest Frobenius norm of `Q₁ᴴQ₁ - I` at which `tall_qr` keeps its result.
 const NEARLY_ORTHONORMAL: f64 = 0.25;
 
-/// Whether `qr`, `lstsq` and the SVD of a tall matrix try `tall_qr` for a matrix of `size` `[m, n]`. The first test admits the sizes where CholeskyQR2 measured faster on one thread on the Mac. The second admits larger ones, where its threaded passes are faster on the default thread count.
-fn tall_for_qr([m, n]: [usize; 2]) -> bool { (n >= 16 && m >= (4 * n).max(n * n / 4)) || threaded_work(m, n, 1 << 21) }
+/// Whether `qr`, `lstsq` and the SVD of a tall matrix try `tall_qr` for a matrix of `size` `[m, n]`. The first test admits matrices at least as wide as CholeskyQR2 needs to beat Householder on one thread, which depends on the kernels that run its Gram matrices and triangular solves. With Accelerate it wins from 16 columns: a 4096×16 `qr` took 159 µs against Householder's 299. On rustymath's own kernels Householder wins at 16 columns, about 1.5 times for 4096×16 `lstsq` on CI's x86 runner, 2 to 8% for 4096×16 `lstsq`, `qr` and the SVD on the Mac, and 6 to 13% for 16384×16 in the browser build, and CholeskyQR2 wins from 20 columns in the browser build, by 20 to 40% at 16384×20 and ×24, measured 22 and 23 October 2026. x86 and the Mac's own kernels at 20 to 24 columns are unmeasured. The second test admits larger matrices, where CholeskyQR2's threaded passes are faster on the default thread count.
+fn tall_for_qr([m, n]: [usize; 2]) -> bool { (n >= if super::accelerated() { 16 } else { 20 } && m >= (4 * n).max(n * n / 4)) || threaded_work(m, n, 1 << 21) }
 
 /// Whether a matrix of `size` `[m, n]` holds enough work for CholeskyQR2's threaded passes to be faster than Householder: at least 16 rows per column, and `m n²` of at least `work`. Narrow matrices such as 1000000×10 pass. Where Accelerate runs the products, CholeskyQR2 is faster for them on one thread too. Elsewhere the call must be able to split across threads: in wasm and on one thread, Householder is faster for them.
 fn threaded_work(m: usize, n: usize, work: usize) -> bool {

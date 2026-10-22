@@ -86,11 +86,11 @@ Gammaincinv	3600	3600
 Betainc	2400	2400
 # 4800 copies, for about four evaluations of Betainc.
 Betaincinv	9600	9600
-# 10 copies, for 78 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: exp of the real part and sin and cos of the imaginary part. It costs about 21.5 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+# 10 copies, for 78 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: exp of the real part and sin and cos of the imaginary part. The count leaves out `split`'s passes over the parts and the results. It costs about 16.5 copies on macOS. CI measured about 24 copies on 22 October, before `exp_parts` stopped calling `quarter` for every item. CI's earlier runs showed 8 to 11 copies only because each divided by a copy read from memory. Its Linux budget is held until CI times it again.
 complex Exp	20	43
 # 12.5 copies, for 100 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: hypot, ln with care near |z| = 1, atan2. It costs about 30 copies on macOS and about 30.5 on CI, by its old budget, more than twice that, so both budgets are unchanged until the cost is studied.
 complex Ln	63	61
-# 4.5 copies, for 36 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: hypot, a square root, a division, selects. It costs about 10.5 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+# 4.5 copies, for 36 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: hypot, a square root, a division, selects. It costs about 10.5 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied. On macOS it costs about 8.6 copies. Its slice form calls the scalar `sqrt` for each item, which also scales each item against underflow. On 23 October 2026, running it through `split!` and `sqrt_parts`, as `Sqrt1mx2` does, cost 10% more at f64 and 65% more at f32.
 complex Sqrt	9	21
 # 16 copies, for 126 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: sin, cos, sinh and cosh.
 complex Sin	32	32
@@ -106,7 +106,7 @@ complex Lgamma	110	350
 complex Gamma	280	480
 # 2 copies, for 16 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: hypot; reading two floats and writing one take 0.75.
 complex Abs	4	4
-# 11.5 copies, for 92 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: two complex square roots, each with a hypot, a product and a rebalance, in separate real and imaginary passes. It costs about 25.8 copies on macOS and about 31 on CI, by its old budget, more than twice that, so both budgets are unchanged until the cost is studied.
+# 11.5 copies, for 92 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: two complex square roots, each a hypot pass and then one pass that writes both parts, then a product and a rebalance. It costs about 23.8 copies on macOS since `sqrt_parts` became one pass on 23 October 2026 (25.8 before), and about 31 on CI, by its old budget, more than twice that, so both budgets are unchanged until the cost is studied.
 complex Sqrt1mx2	53	62
 # 23 copies, for 184 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: a complex ln, a complex product, a complex exp. It costs about 50.6 copies on macOS and about 65 on CI, by its old budget, more than twice that, so both budgets are unchanged until the cost is studied.
 complex Pow	110	130
@@ -150,7 +150,7 @@ linalg::eigh	660	1300
 linalg::eig	3600	5100
 # 320 copies, for about 10n³ flops per n² items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 1350 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 linalg::eigenvalues	2400	2700
-# 5 copies, for 2mn² flops on 4096×16 (32 per item) and reading the matrix, at a quarter copy per FMA on rustymath's own kernels. On macOS its block products and triangular solves run on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 34 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+# 5 copies, for 2mn² flops on 4096×16 (32 per item) and reading the matrix, at a quarter copy per FMA on rustymath's own kernels. On macOS its block products and triangular solves run on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. On CI's x86 runner it cost 35.4 copies on 22 October 2026, through CholeskyQR2, which then took this size on rustymath's own kernels. Earlier runs put Householder there about 1.5 times faster, and `tall_for_qr` now gives this size to Householder wherever Accelerate doesn't run. Householder's reflections are matrix-vector passes, far below the FMA rate this analysis assumes: on the Mac's own kernels, f64 costs about 32 copies. Its Linux budget is unchanged until CI times Householder.
 linalg::lstsq	69	68
 # 21 copies, for 8n³/3 real flops per n² complex items, two floats per complex copy, at a quarter copy per FMA on rustymath's own kernels. On macOS its block products and triangular solves run on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 50 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 complex linalg::Lu::solve	58	100
@@ -249,11 +249,11 @@ Gammaincinv	7400	11000
 Betainc	6000	8300
 # 3400 copies, for about four evaluations of Betainc's narrow route. It costs about 8512 copies on macOS and about 13000 on CI, by its old budget, more than twice that, so both budgets are unchanged until the cost is studied.
 Betaincinv	18000	26000
-# 10 copies, for 78 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: exp of the real part and sin and cos of the imaginary part. It costs about 23.5 copies on macOS and about 26 on CI, by its old budget, more than twice that, so both budgets are unchanged until the cost is studied.
+# 10 copies, for 78 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: exp of the real part and sin and cos of the imaginary part. The count leaves out `split`'s passes over the parts and the results. It costs about 20 copies on macOS. CI measured about 21 copies on 22 October, before `exp_parts` stopped calling `quarter` for every item. CI's earlier runs showed about 9 copies only because each divided by a copy read from memory. Both budgets are held until CI times it again.
 complex Exp	47	52
 # 12.5 copies, for 100 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: hypot, ln with care near |z| = 1, atan2. It costs about 30.5 copies on macOS and about 31 on CI, by its old budget, more than twice that, so both budgets are unchanged until the cost is studied.
 complex Ln	59	62
-# 4.5 copies, for 36 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: hypot, a square root, a division, selects. It costs about 11.5 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+# 4.5 copies, for 36 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: hypot, a square root, a division, selects. It costs about 11.5 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied. On macOS it costs about 8.2 copies. Its slice form calls the scalar `sqrt` for each item, which also scales each item against underflow. On 23 October 2026, running it through `split!` and `sqrt_parts`, as `Sqrt1mx2` does, cost 65% more at f32 and 10% more at f64.
 complex Sqrt	9	23
 # 16 copies, for 126 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: sin, cos, sinh and cosh.
 complex Sin	32	32
@@ -269,7 +269,7 @@ complex Lgamma	210	640
 complex Gamma	560	810
 # 2 copies, for 16 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: hypot; reading two floats and writing one take 0.75.
 complex Abs	4	4
-# 11.5 copies, for 92 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: two complex square roots, each with a hypot, a product and a rebalance, in separate real and imaginary passes. It costs about 29.4 copies on macOS and about 46 on CI, by its old budget, more than twice that, so both budgets are unchanged until the cost is studied.
+# 11.5 copies, for 92 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: two complex square roots, each a hypot pass and then one pass that writes both parts, then a product and a rebalance. It costs about 28.0 copies on macOS since `sqrt_parts` became one pass on 23 October 2026 (29.4 before), and about 46 on CI, by its old budget, more than twice that, so both budgets are unchanged until the cost is studied.
 complex Sqrt1mx2	59	92
 # 23 copies, for 184 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: a complex ln, a complex product, a complex exp. It costs about 52.3 copies on macOS and about 65 on CI, by its old budget, more than twice that, so both budgets are unchanged until the cost is studied.
 complex Pow	110	130
@@ -313,7 +313,7 @@ linalg::eigh	940	1500
 linalg::eig	5100	5600
 # 320 copies, for about 10n³ flops per n² items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 1700 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 linalg::eigenvalues	3000	3400
-# 5 copies, for 2mn² flops on 4096×16 (32 per item) and reading the matrix, at a quarter copy per FMA on rustymath's own kernels. On macOS its block products and triangular solves run on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 50 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+# 5 copies, for 2mn² flops on 4096×16 (32 per item) and reading the matrix, at a quarter copy per FMA on rustymath's own kernels. On macOS its block products and triangular solves run on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. On CI's x86 runner it cost 52.8 copies on 22 October 2026, through CholeskyQR2, which then took this size on rustymath's own kernels. Earlier runs put Householder there about 1.35 times faster, and `tall_for_qr` now gives this size to Householder wherever Accelerate doesn't run. Householder's reflections are matrix-vector passes, far below the FMA rate this analysis assumes: on the Mac's own kernels, f64 costs about 32 copies. Its Linux budget is unchanged until CI times Householder.
 linalg::lstsq	100	100
 # 21 copies, for 8n³/3 real flops per n² complex items, two floats per complex copy, at a quarter copy per FMA on rustymath's own kernels. On macOS its block products and triangular solves run on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 75 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 complex linalg::Lu::solve	81	150

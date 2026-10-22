@@ -1,6 +1,6 @@
 //! Inner products of row-major matrices. The inner product `f.g` of an `m`×`k` matrix `a` and a `k`×`n` matrix `b` is the `m`×`n` matrix whose item at row `i` and column `j` folds `f` over `g(a[i][p], b[p][j])` for each `p`. `+.×` is the matrix product. The specialized pairs have associative `f`, and their loops combine its steps in whatever order suits them. A float result can therefore differ in its last bits from a fold taken in order. [`inner_with`] runs other native pairs through bounded term blocks and a caller's right fold, which preserves the association of non-associative functions.
 //!
-//! The loops follow GotoBLAS and BLIS. Packing copies a block of each argument into a contiguous buffer sized for a cache level. The blocking reuses each buffer while it is in cache. A micro-kernel computes a small tile of the result in registers, one step of `p` at a time. A micro-kernel in plain Rust vectorizes through LLVM's SLP vectorizer, which the builds of rustymath and basedpl turn on at opt-level 2. It vectorizes only tiles of up to 32 items, too few to keep the multiply-add units busy. On AArch64, in wasm and on x86-64 with AVX2 and FMA, the float pairs run micro-kernels on explicit vectors instead. Their maximum and minimum are each target's own instruction: `fmax` on AArch64, `max` in wasm and `maxpd` on x86-64. On AArch64 and in wasm a NaN term makes a result NaN. On x86-64 only a NaN first term makes a result NaN. Later NaN terms are skipped. Targets without these vectors run the plain kernels.
+//! The loops follow GotoBLAS and BLIS. Packing copies a block of each argument into a contiguous buffer sized for a cache level. The blocking reuses each buffer while it is in cache. A micro-kernel computes a small tile of the result in registers, one step of `p` at a time. A micro-kernel in plain Rust vectorizes through LLVM's SLP vectorizer, which the builds of rustymath and basedpl turn on at opt-level 2. It vectorizes only tiles of up to 32 items, too few to keep the multiply-add units busy. On AArch64, in wasm and on x86-64 with AVX2 and FMA, the float pairs run micro-kernels on explicit vectors instead. Their maximum and minimum are AArch64's `fmax` and wasm's `max`, and on x86-64 `maxpd` with a blend that puts back the NaN term `maxpd` skips. On every target a NaN term makes a result NaN, as `Core::maximum` does. Targets without these vectors run the plain kernels.
 //!
 //! A product large enough splits its rows across the threads that [`crate::parallel::set_threads`] sets. On macOS, Accelerate computes real and complex plus-times products instead. `Tiled` also sends the decompositions' triangular solves, SVDs and Hermitian eigen decompositions to it, and the general eigen decompositions of real matrices from `accelerate::GEEV_FROM` rows. macOS builds with the `native` feature also compile rustymath's own kernels, and `RUSTYMATH_NATIVE=1` selects them for the whole process.
 //!
@@ -193,9 +193,6 @@ trait Pair<T> {
     fn step(acc: Self::Out, a: T, b: T) -> Self::Out { Self::f(acc, Self::g(a, b)) }
 }
 
-/// Whether the extremes' vector kernels keep a NaN term, as AArch64's `fmax` and wasm's `f64x2.max` do. x86-64's `maxpd` keeps the running value, as `Core::maximum` does. The scalar steps follow the vector kernels, so a product gives the same result on whichever kernel runs it.
-const KEEPS_NAN: bool = cfg!(any(target_arch = "aarch64", target_arch = "wasm32"));
-
 macro_rules! floats {
     ($($t:ty),+) => {$(
         impl Pair<$t> for PlusTimes {
@@ -214,7 +211,7 @@ macro_rules! floats {
             #[inline(always)]
             fn g(a: $t, b: $t) -> $t { a + b }
             #[inline(always)]
-            fn f(acc: $t, term: $t) -> $t { if KEEPS_NAN && term.is_nan() { term } else { Core::maximum(term, acc) } }
+            fn f(acc: $t, term: $t) -> $t { Core::maximum(term, acc) }
         }
         impl Pair<$t> for MinPlus {
             type Out = $t;
@@ -222,7 +219,7 @@ macro_rules! floats {
             #[inline(always)]
             fn g(a: $t, b: $t) -> $t { a + b }
             #[inline(always)]
-            fn f(acc: $t, term: $t) -> $t { if KEEPS_NAN && term.is_nan() { term } else { Core::minimum(term, acc) } }
+            fn f(acc: $t, term: $t) -> $t { Core::minimum(term, acc) }
         }
     )+};
 }
@@ -960,7 +957,7 @@ mod plain {
 )))]
 use plain::*;
 
-/// Micro-kernels on explicit vectors: 16 bytes on AArch64 and in wasm, and 32 with AVX2. Each entry gives its first step from `a` and `b`, then each later step from the tile's running value `c`, `a` and `b`.
+/// Micro-kernels on explicit vectors: 16 bytes on AArch64 and in wasm, and 32 with AVX2. Each is `super::micro` on vectors, with each row of the tile `V` vectors, and its entry gives one step from the tile's running value `c`, `a` and `b`. A tile starts where its entry says, at the pair's unit for a tile of items, as `micro`'s does, so the first step keeps or drops a NaN term as the later steps do.
 #[cfg(any(
     target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"),
     all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")
@@ -972,89 +969,17 @@ mod lanes {
     use core::arch::wasm32::*;
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
-    macro_rules! lanes {
-        ($($name:ident: $t:ty, $lanes:literal, $splat:ident, $load:ident, $store:ident, |$a:ident, $b:ident| $first:expr, |$c:ident| $step:expr;)+) => {$(
-            /// `super::micro` on vectors of `$lanes` items. Each row of the tile is `V` vectors.
+    macro_rules! kernels {
+        ($($name:ident: $t:ty => $out:ty, $lanes:literal, $splat:ident, $load:ident, $start:expr, $load_out:ident, $store_out:ident, |$a:ident, $b:ident, $c:ident| $step:expr;)+) => {$(
             #[inline(always)]
-            pub(super) fn $name<const MR: usize, const NR: usize, const V: usize>(a: &[$t], b: &[$t], t: &mut [[$t; NR]; MR], first: bool) {
+            pub(super) fn $name<const MR: usize, const NR: usize, const V: usize>(a: &[$t], b: &[$t], t: &mut [[$out; NR]; MR], first: bool) {
                 assert!(NR == $lanes * V && a.len() / MR == b.len() / NR);
                 let steps = a.len() / MR;
                 // SAFETY: this module compiles only for targets with these instructions. Each load and store moves `$lanes` items inside `a`, `b` or a row of `t`.
                 unsafe {
                     let (ap, bp) = (a.as_ptr(), b.as_ptr());
-                    let mut acc = [[$splat(0.0); V]; MR];
-                    let mut p = 0;
-                    if first {
-                        for r in 0..MR {
-                            let $a = $splat(*ap.add(r));
-                            for v in 0..V { acc[r][v] = { let $b = $load(bp.add($lanes * v).cast()); $first } }
-                        }
-                        p = 1;
-                    } else {
-                        for r in 0..MR { for v in 0..V { acc[r][v] = $load(t[r].as_ptr().add($lanes * v).cast()) } }
-                    }
-                    while p < steps {
-                        let y: [_; V] = core::array::from_fn(|v| $load(bp.add(p * NR + $lanes * v).cast()));
-                        for r in 0..MR {
-                            let $a = $splat(*ap.add(p * MR + r));
-                            for v in 0..V { acc[r][v] = { let ($c, $b) = (acc[r][v], y[v]); $step } }
-                        }
-                        p += 1;
-                    }
-                    for r in 0..MR { for v in 0..V { $store(t[r].as_mut_ptr().add($lanes * v).cast(), acc[r][v]) } }
-                }
-            }
-        )+};
-    }
-    // rustymath's own plus-times products, which macOS compiles only with the `native` feature.
-    #[cfg(all(target_arch = "aarch64", native))]
-    lanes! {
-        times64: f64, 2, vdupq_n_f64, vld1q_f64, vst1q_f64, |a, b| vmulq_f64(a, b), |c| vfmaq_f64(c, a, b);
-        times32: f32, 4, vdupq_n_f32, vld1q_f32, vst1q_f32, |a, b| vmulq_f32(a, b), |c| vfmaq_f32(c, a, b);
-    }
-    #[cfg(target_arch = "aarch64")]
-    lanes! {
-        max_plus64: f64, 2, vdupq_n_f64, vld1q_f64, vst1q_f64, |a, b| vaddq_f64(a, b), |c| vmaxq_f64(c, vaddq_f64(a, b));
-        max_plus32: f32, 4, vdupq_n_f32, vld1q_f32, vst1q_f32, |a, b| vaddq_f32(a, b), |c| vmaxq_f32(c, vaddq_f32(a, b));
-        min_plus64: f64, 2, vdupq_n_f64, vld1q_f64, vst1q_f64, |a, b| vaddq_f64(a, b), |c| vminq_f64(c, vaddq_f64(a, b));
-        min_plus32: f32, 4, vdupq_n_f32, vld1q_f32, vst1q_f32, |a, b| vaddq_f32(a, b), |c| vminq_f32(c, vaddq_f32(a, b));
-    }
-    // Baseline wasm has no fused multiply-add.
-    #[cfg(target_arch = "wasm32")]
-    lanes! {
-        times64: f64, 2, f64x2_splat, v128_load, v128_store, |a, b| f64x2_mul(a, b), |c| f64x2_add(c, f64x2_mul(a, b));
-        times32: f32, 4, f32x4_splat, v128_load, v128_store, |a, b| f32x4_mul(a, b), |c| f32x4_add(c, f32x4_mul(a, b));
-        max_plus64: f64, 2, f64x2_splat, v128_load, v128_store, |a, b| f64x2_add(a, b), |c| f64x2_max(c, f64x2_add(a, b));
-        max_plus32: f32, 4, f32x4_splat, v128_load, v128_store, |a, b| f32x4_add(a, b), |c| f32x4_max(c, f32x4_add(a, b));
-        min_plus64: f64, 2, f64x2_splat, v128_load, v128_store, |a, b| f64x2_add(a, b), |c| f64x2_min(c, f64x2_add(a, b));
-        min_plus32: f32, 4, f32x4_splat, v128_load, v128_store, |a, b| f32x4_add(a, b), |c| f32x4_min(c, f32x4_add(a, b));
-    }
-    // rustymath's own plus-times products, which macOS compiles only with the `native` feature.
-    #[cfg(all(target_arch = "x86_64", native))]
-    lanes! {
-        times64: f64, 4, _mm256_set1_pd, _mm256_loadu_pd, _mm256_storeu_pd, |a, b| _mm256_mul_pd(a, b), |c| _mm256_fmadd_pd(a, b, c);
-        times32: f32, 8, _mm256_set1_ps, _mm256_loadu_ps, _mm256_storeu_ps, |a, b| _mm256_mul_ps(a, b), |c| _mm256_fmadd_ps(a, b, c);
-    }
-    // AVX2's `maxpd` and `minpd` give their second argument beside NaN.
-    #[cfg(target_arch = "x86_64")]
-    lanes! {
-        max_plus64: f64, 4, _mm256_set1_pd, _mm256_loadu_pd, _mm256_storeu_pd, |a, b| _mm256_add_pd(a, b), |c| _mm256_max_pd(_mm256_add_pd(a, b), c);
-        max_plus32: f32, 8, _mm256_set1_ps, _mm256_loadu_ps, _mm256_storeu_ps, |a, b| _mm256_add_ps(a, b), |c| _mm256_max_ps(_mm256_add_ps(a, b), c);
-        min_plus64: f64, 4, _mm256_set1_pd, _mm256_loadu_pd, _mm256_storeu_pd, |a, b| _mm256_add_pd(a, b), |c| _mm256_min_pd(_mm256_add_pd(a, b), c);
-        min_plus32: f32, 8, _mm256_set1_ps, _mm256_loadu_ps, _mm256_storeu_ps, |a, b| _mm256_add_ps(a, b), |c| _mm256_min_ps(_mm256_add_ps(a, b), c);
-    }
-    /// Micro-kernels whose tile starts at zero, for `PlusEqual`, as `super::micro` on vectors of `$lanes` items, with each row of the tile `V` vectors. Where items are equal, a comparison gives a lane of all ones, which is -1 as an integer. Subtracting it adds 1 to the count.
-    macro_rules! equalities {
-        ($($name:ident: $t:ty => $out:ty, $lanes:literal, $splat:ident, $load:ident, $zero:expr, $load_count:ident, $store_count:ident, |$a:ident, $b:ident, $c:ident| $step:expr;)+) => {$(
-            #[inline(always)]
-            pub(super) fn $name<const MR: usize, const NR: usize, const V: usize>(a: &[$t], b: &[$t], t: &mut [[$out; NR]; MR], first: bool) {
-                assert!(NR == $lanes * V && a.len() / MR == b.len() / NR);
-                let steps = a.len() / MR;
-                // SAFETY: as in `lanes!`.
-                unsafe {
-                    let (ap, bp) = (a.as_ptr(), b.as_ptr());
-                    let mut acc = [[$zero; V]; MR];
-                    if !first { for r in 0..MR { for v in 0..V { acc[r][v] = $load_count(t[r].as_ptr().add($lanes * v).cast()) } } }
+                    let mut acc = [[$start; V]; MR];
+                    if !first { for r in 0..MR { for v in 0..V { acc[r][v] = $load_out(t[r].as_ptr().add($lanes * v).cast()) } } }
                     for p in 0..steps {
                         let y: [_; V] = core::array::from_fn(|v| $load(bp.add(p * NR + $lanes * v).cast()));
                         for r in 0..MR {
@@ -1062,13 +987,57 @@ mod lanes {
                             for v in 0..V { acc[r][v] = { let ($c, $b) = (acc[r][v], y[v]); $step } }
                         }
                     }
-                    for r in 0..MR { for v in 0..V { $store_count(t[r].as_mut_ptr().add($lanes * v).cast(), acc[r][v]) } }
+                    for r in 0..MR { for v in 0..V { $store_out(t[r].as_mut_ptr().add($lanes * v).cast(), acc[r][v]) } }
                 }
             }
         )+};
     }
+    /// `kernels!` for tiles of items, which start at the entry's pair's unit.
+    macro_rules! lanes {
+        ($($name:ident: $t:ty, $pair:ident, $lanes:literal, $splat:ident, $load:ident, $store:ident, |$a:ident, $b:ident, $c:ident| $step:expr;)+) => {
+            kernels! { $($name: $t => $t, $lanes, $splat, $load, $splat(<super::$pair as super::Pair<$t>>::UNIT), $load, $store, |$a, $b, $c| $step;)+ }
+        };
+    }
+    // rustymath's own plus-times products, which macOS compiles only with the `native` feature.
+    #[cfg(all(target_arch = "aarch64", native))]
+    lanes! {
+        times64: f64, PlusTimes, 2, vdupq_n_f64, vld1q_f64, vst1q_f64, |a, b, c| vfmaq_f64(c, a, b);
+        times32: f32, PlusTimes, 4, vdupq_n_f32, vld1q_f32, vst1q_f32, |a, b, c| vfmaq_f32(c, a, b);
+    }
     #[cfg(target_arch = "aarch64")]
-    equalities! {
+    lanes! {
+        max_plus64: f64, MaxPlus, 2, vdupq_n_f64, vld1q_f64, vst1q_f64, |a, b, c| vmaxq_f64(c, vaddq_f64(a, b));
+        max_plus32: f32, MaxPlus, 4, vdupq_n_f32, vld1q_f32, vst1q_f32, |a, b, c| vmaxq_f32(c, vaddq_f32(a, b));
+        min_plus64: f64, MinPlus, 2, vdupq_n_f64, vld1q_f64, vst1q_f64, |a, b, c| vminq_f64(c, vaddq_f64(a, b));
+        min_plus32: f32, MinPlus, 4, vdupq_n_f32, vld1q_f32, vst1q_f32, |a, b, c| vminq_f32(c, vaddq_f32(a, b));
+    }
+    // Baseline wasm has no fused multiply-add.
+    #[cfg(target_arch = "wasm32")]
+    lanes! {
+        times64: f64, PlusTimes, 2, f64x2_splat, v128_load, v128_store, |a, b, c| f64x2_add(c, f64x2_mul(a, b));
+        times32: f32, PlusTimes, 4, f32x4_splat, v128_load, v128_store, |a, b, c| f32x4_add(c, f32x4_mul(a, b));
+        max_plus64: f64, MaxPlus, 2, f64x2_splat, v128_load, v128_store, |a, b, c| f64x2_max(c, f64x2_add(a, b));
+        max_plus32: f32, MaxPlus, 4, f32x4_splat, v128_load, v128_store, |a, b, c| f32x4_max(c, f32x4_add(a, b));
+        min_plus64: f64, MinPlus, 2, f64x2_splat, v128_load, v128_store, |a, b, c| f64x2_min(c, f64x2_add(a, b));
+        min_plus32: f32, MinPlus, 4, f32x4_splat, v128_load, v128_store, |a, b, c| f32x4_min(c, f32x4_add(a, b));
+    }
+    // rustymath's own plus-times products, which macOS compiles only with the `native` feature.
+    #[cfg(all(target_arch = "x86_64", native))]
+    lanes! {
+        times64: f64, PlusTimes, 4, _mm256_set1_pd, _mm256_loadu_pd, _mm256_storeu_pd, |a, b, c| _mm256_fmadd_pd(a, b, c);
+        times32: f32, PlusTimes, 8, _mm256_set1_ps, _mm256_loadu_ps, _mm256_storeu_ps, |a, b, c| _mm256_fmadd_ps(a, b, c);
+    }
+    // AVX2's `maxpd` and `minpd` give their second argument beside NaN: the running value `c`, which keeps a NaN, and the blend puts back a NaN term.
+    #[cfg(target_arch = "x86_64")]
+    lanes! {
+        max_plus64: f64, MaxPlus, 4, _mm256_set1_pd, _mm256_loadu_pd, _mm256_storeu_pd, |a, b, c| { let t = _mm256_add_pd(a, b); _mm256_blendv_pd(_mm256_max_pd(t, c), t, _mm256_cmp_pd::<_CMP_UNORD_Q>(t, t)) };
+        max_plus32: f32, MaxPlus, 8, _mm256_set1_ps, _mm256_loadu_ps, _mm256_storeu_ps, |a, b, c| { let t = _mm256_add_ps(a, b); _mm256_blendv_ps(_mm256_max_ps(t, c), t, _mm256_cmp_ps::<_CMP_UNORD_Q>(t, t)) };
+        min_plus64: f64, MinPlus, 4, _mm256_set1_pd, _mm256_loadu_pd, _mm256_storeu_pd, |a, b, c| { let t = _mm256_add_pd(a, b); _mm256_blendv_pd(_mm256_min_pd(t, c), t, _mm256_cmp_pd::<_CMP_UNORD_Q>(t, t)) };
+        min_plus32: f32, MinPlus, 8, _mm256_set1_ps, _mm256_loadu_ps, _mm256_storeu_ps, |a, b, c| { let t = _mm256_add_ps(a, b); _mm256_blendv_ps(_mm256_min_ps(t, c), t, _mm256_cmp_ps::<_CMP_UNORD_Q>(t, t)) };
+    }
+    // `PlusEqual`'s tiles count equal pairs. Where items are equal, a comparison gives a lane of all ones, which is -1 as an integer, so subtracting it adds 1 to the count.
+    #[cfg(target_arch = "aarch64")]
+    kernels! {
         equal64: f64 => i64, 2, vdupq_n_f64, vld1q_f64, vdupq_n_s64(0), vld1q_s64, vst1q_s64, |a, b, c| vsubq_s64(c, vreinterpretq_s64_u64(vceqq_f64(a, b)));
         equal32: f32 => i32, 4, vdupq_n_f32, vld1q_f32, vdupq_n_s32(0), vld1q_s32, vst1q_s32, |a, b, c| vsubq_s32(c, vreinterpretq_s32_u32(vceqq_f32(a, b)));
         equal_i64: i64 => i64, 2, vdupq_n_s64, vld1q_s64, vdupq_n_s64(0), vld1q_s64, vst1q_s64, |a, b, c| vsubq_s64(c, vreinterpretq_s64_u64(vceqq_s64(a, b)));
@@ -1076,7 +1045,7 @@ mod lanes {
         equal_i16: i16 => i16, 8, vdupq_n_s16, vld1q_s16, vdupq_n_s16(0), vld1q_s16, vst1q_s16, |a, b, c| vsubq_s16(c, vreinterpretq_s16_u16(vceqq_s16(a, b)));
     }
     #[cfg(target_arch = "wasm32")]
-    equalities! {
+    kernels! {
         equal64: f64 => i64, 2, f64x2_splat, v128_load, i64x2_splat(0), v128_load, v128_store, |a, b, c| i64x2_sub(c, f64x2_eq(a, b));
         equal32: f32 => i32, 4, f32x4_splat, v128_load, i32x4_splat(0), v128_load, v128_store, |a, b, c| i32x4_sub(c, f32x4_eq(a, b));
         equal_i64: i64 => i64, 2, i64x2_splat, v128_load, i64x2_splat(0), v128_load, v128_store, |a, b, c| i64x2_sub(c, i64x2_eq(a, b));
@@ -1084,7 +1053,7 @@ mod lanes {
         equal_i16: i16 => i16, 8, i16x8_splat, v128_load, i16x8_splat(0), v128_load, v128_store, |a, b, c| i16x8_sub(c, i16x8_eq(a, b));
     }
     #[cfg(target_arch = "x86_64")]
-    equalities! {
+    kernels! {
         equal64: f64 => i64, 4, _mm256_set1_pd, _mm256_loadu_pd, _mm256_setzero_si256(), _mm256_loadu_si256, _mm256_storeu_si256, |a, b, c| {
             _mm256_sub_epi64(c, _mm256_castpd_si256(_mm256_cmp_pd::<_CMP_EQ_OQ>(a, b)))
         };
@@ -1198,15 +1167,10 @@ fn pack<T: Copy + Default, const W: usize>(
     slice::written(&mut buffer[..strips * W * kc])
 }
 
-/// Folds the steps of the strips `a` and `b`, which `pack` wrote, into the tile `t`. With `first`, the first step starts the tile.
+/// Folds the steps of the strips `a` and `b`, which `pack` wrote, into the tile `t`. With `first`, the tile starts at the pair's unit, as `direct`'s sums do.
 #[inline(always)]
 fn micro<T: Copy, P: Pair<T>, const MR: usize, const NR: usize>(a: &[T], b: &[T], t: &mut [[P::Out; NR]; MR], first: bool) {
-    let mut acc = *t;
-    let mut steps = a.as_chunks::<MR>().0.iter().zip(b.as_chunks::<NR>().0);
-    if first {
-        let (a, b) = steps.next().expect("a block has at least one step");
-        for r in 0..MR { for s in 0..NR { acc[r][s] = P::g(a[r], b[s]) } }
-    }
-    for (a, b) in steps { for r in 0..MR { for s in 0..NR { acc[r][s] = P::step(acc[r][s], a[r], b[s]) } } }
+    let mut acc = if first { [[P::UNIT; NR]; MR] } else { *t };
+    for (a, b) in a.as_chunks::<MR>().0.iter().zip(b.as_chunks::<NR>().0) { for r in 0..MR { for s in 0..NR { acc[r][s] = P::step(acc[r][s], a[r], b[s]) } } }
     *t = acc;
 }

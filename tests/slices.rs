@@ -54,10 +54,10 @@ mod forms {
     use rustymath::{reduce::{Maximum, Minimum}, *};
     use std::fmt::Debug;
 
-    /// Whether `a` and `b` agree: both NaN, the same value with the same sign, or finite and nonzero within 8 units in the last place of each other. A scalar form and its slice form can round differently, as `Pow`'s do at f32, where only the scalar form reads tables. Zeros, infinities and signs must match exactly.
+    /// Whether `a` and `b` agree: both NaN, the same value, or finite and nonzero within 8 units in the last place of each other. A scalar form and its slice form can round differently, as `Pow`'s do at f32, where only the scalar form reads tables. Infinities and signs must match exactly, apart from a zero's sign, which can differ between routes: a vector maximum orders `-0` below `0`, where the scalar form gives its second argument on a tie.
     fn same<F: Float>(a: F, b: F) -> bool {
         if a.is_nan() || b.is_nan() { return a.is_nan() && b.is_nan(); }
-        if a == b { return a.is_sign_negative() == b.is_sign_negative(); }
+        if a == b { return true; }
         let near = (a - b).abs() <= F::narrow(8.0) * F::epsilon() * a.abs().max(b.abs()).max(F::min_positive_value());
         a.is_finite() && b.is_finite() && a != F::zero() && b != F::zero() && near
     }
@@ -240,16 +240,16 @@ mod reductions {
     #[test]
     fn edges() {
         assert_eq!((sum::<f64>(&[]), prod::<i32>(&[]), max::<f32>(&[]), min::<i16>(&[])), ((0.0, true), (1, true), f32::NEG_INFINITY, i16::MAX));
-        // NaN at item 40 of 101 lies inside a fold's running results, which vectorize, and not in the remainder. AArch64's `fmax` gives NaN there, and other targets skip it.
+        // NaN at item 40 of 101 lies inside a fold's running results, which vectorize, and not in the remainder. A NaN item makes a fold NaN on every target.
         let mut v = vec![1.0f64; 101];
         v[40] = f64::NAN;
         let v32: Vec<f32> = v.iter().map(|&x| x as f32).collect();
         let (most, least, half) = (max(&v), min(&v32), max(&[f16::ONE, f16::NAN]));
-        assert!((most.is_nan() || most == 1.0) && (least.is_nan() || least == 1.0) && (half.is_nan() || half == f16::ONE));
-        assert_eq!((maximum(1.0, f64::NAN).is_nan(), minimum(f32::NAN, 1.0), maximum(-1.0, 2.0), minimum(f16::ONE, f16::ZERO)), (true, 1.0, 2.0, f16::ZERO));
+        assert!(most.is_nan() && least.is_nan() && half.is_nan());
+        assert_eq!((maximum(1.0, f64::NAN).is_nan(), minimum(f32::NAN, 1.0).is_nan(), maximum(-1.0, 2.0), minimum(f16::ONE, f16::ZERO)), (true, true, 2.0, f16::ZERO));
         let mut out = Vec::new();
         cummax(&[1.0, 3.0, f64::NAN, 5.0, 2.0, 1.0], None, &mut out);
-        assert!(out.iter().zip([1.0, 3.0, 3.0, 5.0, 5.0, 5.0]).all(|(&got, want)| got.is_nan() || got == want), "{out:?}");
+        assert!(out[..2] == [1.0, 3.0] && out[2..].iter().all(|v| v.is_nan()), "{out:?}");
         assert_eq!((sum(&[i64::MAX, 1]), sum(&[i64::MAX, 1, -2]), prod(&[i64::MAX, 2])), ((i64::MIN, false), (i64::MAX - 1, true), (-2, false)));
         assert!(!cumsum(&[i64::MAX, 1], None, &mut Vec::new()));
         assert!(!cumprod(&[i32::MAX, i32::MAX, i32::MAX], None, &mut Vec::new()));
@@ -460,7 +460,7 @@ mod reductions {
                 assert!(ok && got.len() == maxima.len() && got.iter().zip(&maxima).all(|(&g, &m)| same(g, m)), "{shape:?} {width} {:?}", got.iter().zip(&maxima).find(|&(&g, &m)| !same(g, m)));
                 assert_eq!(sliding::<bool, Max>(&b, shape, width).0, anys, "{shape:?} {width}");
                 // Each pick is the first row of its window whose item, folded alone, gives the window's fold.
-                let pick = |r: &dyn Fn(f64) -> f64, folds: &[f64]| { let mut at = 0; let mut picks = Vec::new(); each(&mut |a, i, k| { picks.push(window(a, i, k).position(|p| r(f[p]) == folds[at]).map_or(a, |j| a + j)); at += 1; }); picks };
+                let pick = |r: &dyn Fn(f64) -> f64, folds: &[f64]| { let mut at = 0; let mut picks = Vec::new(); each(&mut |a, i, k| { picks.push(window(a, i, k).position(|p| same(r(f[p]), folds[at])).map_or(a, |j| a + j)); at += 1; }); picks };
                 let (maxima, minima) = (sliding::<f64, Max>(&f, shape, width).0, sliding::<f64, Min>(&f, shape, width).0);
                 assert_eq!(sliding_picks::<f64, Max>(&f, shape, width), pick(&|x| <Max as Reduction<f64>>::one(x).0, &maxima), "{shape:?} {width}");
                 assert_eq!(sliding_picks::<f64, Min>(&f, shape, width), pick(&|x| <Min as Reduction<f64>>::one(x).0, &minima), "{shape:?} {width}");

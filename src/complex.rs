@@ -71,9 +71,10 @@ pub(crate) fn exp<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R> {
     if lost { if x > R::zero() { c(x, R::nan()) } else { c(R::zero(), R::zero().copysign(y)) } } else { r }
 }
 
-/// e^(iy) for a real y, from cos y and sin y as `trig` computes them, as `exp` gives it: exact at the quarter turns that `quarter` finds, and with a zero y, sign included, as its imaginary part.
-#[inline(always)]
-fn cis_parts<R: Native>(y: R, cy: R, sy: R) -> Complex<R> { let (cy, sy) = quarter(y).unwrap_or((cy, sy)); c(cy, if y == R::zero() { y } else { sy }) }
+/// Gives `fix` each quarter turn among the items y of `ys`, as `quarter` finds them: its position, cos y and sin y, exactly 1, 0 or -1, with a zero y as its own sine, sign included. Quarter turns are rare, so callers run it only after a scan over `ys` finds one.
+fn quarter_turns<R: Native>(ys: &[R], mut fix: impl FnMut(usize, R, R)) {
+    for (i, &y) in ys.iter().enumerate() { if let Some((cy, sy)) = quarter(y) { fix(i, cy, if y == R::zero() { y } else { sy }) } }
+}
 
 /// Sine and cosine over slices, computed together. vForce implements it on macOS, in `vforce.rs`.
 pub(crate) trait SinCos: Native {
@@ -399,8 +400,9 @@ fn exp_parts<R: SinCos>(x: &[R], y: &[R], re: &mut Vec<R>, im: &mut Vec<R>) wher
     let (n, mut e, mut cy, mut sy) = (x.len(), Vec::new(), Vec::new(), Vec::new());
     Exp.many(Arg::Many(x), n, &mut e);
     R::sin_cos_many(y, &mut sy, &mut cy);
-    re.extend(x.iter().zip(y).zip(e.iter().zip(&cy)).map(|((&x, &y), (&e, &c))| part(x, quarter(y).map_or(c, |q| q.0), e)));
-    im.extend(x.iter().zip(y).zip(e.iter().zip(&sy)).map(|((&x, &y), (&e, &s))| if y == R::zero() { y } else { part(x, quarter(y).map_or(s, |q| q.1), e) }));
+    if y.iter().fold(false, |t, &y| t | turns(y).1) { quarter_turns(y, |i, a, b| (cy[i], sy[i]) = (a, b)) }
+    re.extend(x.iter().zip(e.iter().zip(&cy)).map(|(&x, (&e, &c))| part(x, c, e)));
+    im.extend(x.iter().zip(y).zip(e.iter().zip(&sy)).map(|((&x, &y), (&e, &s))| if y == R::zero() { y } else { part(x, s, e) }));
 }
 
 /// sinh z's parts, or with `cosh` cosh z's, computed through real slice forms from slices of z's parts, as `sinh` and `cosh` combine them.
@@ -445,11 +447,15 @@ fn moduli<R: Native>(x: &[R], y: &[R], out: &mut Vec<R>) where Hypot: Binary<R, 
 fn sqrt_parts<R: Native>(x: &[R], y: &[R], re: &mut Vec<R>, im: &mut Vec<R>) where Hypot: Binary<R, Out = R> {
     let (mut h, half, zero) = (Vec::new(), R::narrow(0.5), R::zero());
     moduli(x, y, &mut h);
-    let t: Vec<R> = x.iter().zip(&h).map(|(&x, &h)| x.abs().mla::<{ crate::FUSED }>(half, h * half).sqrt()).collect();
     // `sqrt` divides |y| or y by 2t, whichever its branch needs. |y|/2t is |y/2t| exactly, so one division serves both branches.
-    let q: Vec<R> = y.iter().zip(&t).map(|(&y, &t)| y / (t + t)).collect();
-    re.extend(x.iter().zip(&t).zip(&q).map(|((&x, &t), &q)| if x >= zero { t } else { q.abs() }));
-    im.extend(x.iter().zip(y).zip(t.iter().zip(&q)).map(|((&x, &y), (&t, &q))| if x >= zero { q } else { t.copysign(y) }));
+    crate::slice::appended(re, x.len(), |re| crate::slice::appended(im, x.len(), |im| {
+        for ((((&x, &y), &h), re), im) in x.iter().zip(y).zip(&h).zip(re).zip(im) {
+            let t = x.abs().mla::<{ crate::FUSED }>(half, h * half).sqrt();
+            let q = y / (t + t);
+            re.write(if x >= zero { t } else { q.abs() });
+            im.write(if x >= zero { q } else { t.copysign(y) });
+        }
+    }))
 }
 
 /// Whether `sqrt` takes a path for `z` that `sqrt_parts` leaves out: a tiny `z`, which it scales first, an infinite imaginary part, or zero.
@@ -620,11 +626,12 @@ many |_, [y], n, out| {
             Arg::Many(ys) => ys,
         };
         SinCos::cis(ys, slots, &mut parts);
-        // An infinite y fails, as `Cos` and `Sin` judge it. Only quarter turns, zero among them, need `cis_parts`. They're rare.
+        // An infinite y fails, as `Cos` and `Sin` judge it. Only quarter turns, zero among them, need fixing. They're rare.
         let (infinite, turned) = ys.iter().fold((false, false), |(i, t), &y| (i | y.is_infinite(), t | turns(y).1));
         ok &= !infinite;
         if turned {
-            for (z, &y) in crate::slice::written(slots).iter_mut().zip(ys) { if turns(y).1 { *z = cis_parts(y, z.re, z.im) } }
+            let zs = crate::slice::written(slots);
+            quarter_turns(ys, |k, cy, sy| zs[k] = c(cy, sy));
         }
     }
     ok

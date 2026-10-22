@@ -17,5 +17,4 @@ jobs:
         with:
           shared-key: native
           save-if: false
-      - run: grep -m1 'model name' /proc/cpuinfo
       - run: RUSTYMATH_COSTS=1 cargo test --test speed
