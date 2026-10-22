@@ -116,17 +116,13 @@ pub fn stddev<T: Scalar>(data: &[T], dims: [usize; 3], ddof: usize) -> Vec<T::Re
     out
 }
 
-/// The elementwise p-norm along the selected axes: 0 counts nonzero values, ±infinity selects the greatest/least magnitude, and a finite p gives `(sum |x|^p)^(1/p)`. A pair of axes still gives this norm, not a matrix-induced norm.
+/// The elementwise p-norm along the selected axes: 0 counts nonzero values, ±infinity selects the greatest/least magnitude, and a finite p gives `(sum |x|^p)^(1/p)`. A pair of axes still gives this norm, not a matrix-induced norm. For p = 2, each square is computed and summed in f64, where an f32's square neither overflows nor underflows.
 pub fn norm<T: Scalar>(data: &[T], dims: [usize; 3], p: f64) -> Vec<T::Real> {
     if p == 1.0 { return values::<_, _, Sum>(data, dims, #[inline(always)] |x| x.modulus()); }
     if p == 0.0 { return values::<_, _, Sum>(data, dims, #[inline(always)] |x| if x == T::zero() { T::Real::zero() } else { T::Real::one() }); }
     if p == f64::INFINITY { return values::<_, _, reduce::Max>(data, dims, #[inline(always)] |x| x.modulus()); }
     if p == f64::NEG_INFINITY { return values::<_, _, reduce::Min>(data, dims, #[inline(always)] |x| x.modulus()); }
-    if p == 2.0 {
-        let mut out = values::<_, _, Sum>(data, dims, #[inline(always)] |x| square(x));
-        for v in &mut out { *v = v.sqrt(); }
-        return out;
-    }
+    if p == 2.0 { return reduce::along::<T, reduce::Squares>(data, dims).0.into_iter().map(|v| T::Real::narrow(v.sqrt())).collect(); }
     let mut out = values::<_, _, Sum>(data, dims, #[inline(always)] |x| crate::pow(x.modulus(), T::Real::narrow(p)));
     for v in &mut out { *v = crate::pow(*v, T::Real::narrow(1.0 / p)); }
     out
@@ -161,7 +157,7 @@ where Sum: Reduction<T, Total = T>, PlusTimes: Inner<T, Out = T> {
     if observations > 0 {
         for (row, &m) in centered.chunks_mut(observations).zip(&means) { for x in row { *x = *x - m; } }
     }
-    let conjugate = if size_of::<T>() == size_of::<T::Real>() { Cow::Borrowed(&centered[..]) }
+    let conjugate = if !T::COMPLEX { Cow::Borrowed(&centered[..]) }
         else { Cow::Owned(centered.iter().map(|&x| x.conj()).collect()) };
     let mut out = PlusTimes.inner_ops(&centered, &conjugate, [Orientation::Normal, Orientation::Transpose], [variables, observations, variables]);
     let count = T::Real::narrow(observations.saturating_sub(ddof) as f64);

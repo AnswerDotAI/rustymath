@@ -134,6 +134,10 @@ def test_linalg(kind):
         assert np.allclose(got, want[0]) and np.allclose(s, want[3]) and np.allclose(la.solve(x, y), want[0])
     singular = deficient[:4]
     assert np.allclose(la.pinv(singular), np.linalg.pinv(singular)) and la.matrix_rank(deficient) == 3 and (la.matrix_rank(a) == 5).all()
+    # The norms and condition numbers that NumPy's `ord` and `p` name, for each matrix of a stack. A singular matrix's condition number is infinite.
+    for p in None, 1, 2, np.inf, 'fro':
+        assert np.allclose(la.norm(a, p), np.linalg.norm(a, p, axis=(-2, -1))) and np.allclose(la.cond(a, p), np.linalg.cond(a, p))
+    assert np.isinf(la.cond([[1., 0], [0, 0]])) and np.isinf(la.cond([[1., 0], [0, 0]], 1)) and np.isinf(la.cond(np.zeros((2, 2))))
     if kind is complex:
         # complex64 computes at its own width, with real results, such as singular values, in float32.
         eye = np.eye(3, dtype=np.complex64)

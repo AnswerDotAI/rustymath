@@ -25,6 +25,7 @@ pub mod gather;
 pub mod hashing;
 mod hyperbolic;
 pub mod integer;
+pub mod interrupt;
 mod lambert;
 pub mod layout;
 pub mod linalg;
@@ -64,9 +65,7 @@ pub use special::{Erfc, Erfcinv, Erfinv};
 pub use sqrts::Sqrt;
 pub use trig::{Cos, Sin, Tan};
 
-/// The check for a `_with` function's plain version, which can't fail.
-pub(crate) fn ok() -> Result<(), std::convert::Infallible> { Ok(()) }
-/// How many items a `_with` function handles between calls to its check, which keeps the call out of the loop over items.
+/// How many items a function handles between checks for an interrupt ([`interrupt::check`]), which keeps the check out of the loop over items.
 pub const BETWEEN_CHECKS: usize = 1024;
 
 /// Declares each function at the crate root, where it multiplies and adds as the target's `FUSED` says, and in `fused` and `unfused`, which choose for themselves. Each entry names the module whose function of the same name implements it, generic over `R: Native` and `const FUSED: bool`. Every wrapper is `#[inline(always)]`, because LLVM leaves a large function such as `gamma` out of line in a caller's loop, and the call stops that loop vectorizing. An entry marked `as` also declares a function object of that name, whose forms rustymath compiles and never inlines into a caller. Its scalar form calls the function, and its slice form runs the function on each item. An entry marked `: total` never gives NaN from arguments that aren't NaN. Its object's body gives a [`Total`](slice::Total) output, and the object's slice loop tests no item. An object with forms of its own, such as [`Pow`], is written with `forms!` beside its function.

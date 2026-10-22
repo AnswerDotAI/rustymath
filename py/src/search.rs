@@ -1,6 +1,6 @@
 //! rustymath's searches, sorts and classifications, on arguments that `convert` reads. Booleans, integers and characters match exactly. Floats match within the tolerance `ct`, or the process's tolerance (`set_tolerance`) where `ct` is `None`, which is 0, exact, unless set. Tolerant classification and item matching check for Ctrl-C, stopping with `KeyboardInterrupt`. Sorts and insertion searches compare exactly: signed zeros compare equal, and every NaN comes after positive infinity. Complex numbers raise. Positions come back as `i64` arrays.
 use crate::array::{core, give, give_items};
-use crate::convert::{Arg, Call, convert, one, released, signals};
+use crate::convert::{Arg, Call, convert, one, released};
 use crate::functions::{Axis, along_axis, missing, tolerance};
 use pyo3::prelude::*;
 use rustymath::array::Array as Core;
@@ -32,12 +32,14 @@ pub fn unique<'py>(py: Python<'py>, ar: &Bound<'py, PyAny>, ct: Option<f64>) -> 
     let x = one(ar)?;
     let items = x.row_major()?;
     let (view, t) = (items.view(), tolerance(ct)?);
-    let classes = released(py, || search::view_classes(view, t, signals)).ok_or_else(|| missing("unique", view.dtype()))??;
-    let Numbered { firsts, numbers, counts } = search::numbered(&classes);
+    let classes = released(py, || search::view_classes(view, t)).ok_or_else(|| missing("unique", view.dtype()))?.map_err(py_err)?;
+    let numbered = search::numbered(&classes);
+    let counts = numbered.counts();
+    let Numbered { firsts, numbers } = numbered;
     let firsts: Vec<i64> = firsts.into_iter().map(|p| p as i64).collect();
     let n = firsts.len();
     let values = Core::new(Layout::from([n].as_slice()), Buffer::gathered(view, &firsts)).map_err(py_err)?;
-    Ok([give(py, values, false)?, give(py, core(firsts, &[n])?, false)?, give(py, vector(numbers)?, false)?, give(py, vector(counts)?, false)?])
+    Ok([give(py, values, false)?, give(py, core(firsts, &[n])?, false)?, give(py, vector(numbers.into_iter().map(|k| k as usize))?, false)?, give(py, vector(counts)?, false)?])
 }
 
 /// `x` and `y` converted, and for each item of `y`, the first position in flattened `x` of an item that matches it within the tolerance `ct`, or the size of `x` where none does.
@@ -45,7 +47,7 @@ fn first_matches<'py>(py: Python<'py>, function: &str, x: &Bound<'py, PyAny>, y:
     let call = convert(&[x, y])?;
     let found = {
         let (xs, ys, t) = (call.args[0].at(call.args[0].view().dtype())?, call.args[1].at(call.args[1].view().dtype())?, tolerance(ct)?);
-        released(py, || search::view_index_of(xs.view(), ys.view(), t, signals)).ok_or_else(|| missing(function, xs.view().dtype()))??
+        released(py, || search::view_index_of(xs.view(), ys.view(), t)).ok_or_else(|| missing(function, xs.view().dtype()))?.map_err(py_err)?
     };
     Ok((call, found))
 }
@@ -73,8 +75,8 @@ pub fn contains(py: Python<'_>, a: &Bound<'_, PyAny>, query: &Bound<'_, PyAny>) 
     let wanted = if query.is_instance_of::<pyo3::types::PyString>() && query.len()? == 1 { Layout::EMPTY } else { y.layout() };
     let (xs, ys) = (x.row_major()?, y.row_major()?);
     let (lx, t) = (x.layout(), tolerance(None)?);
-    Ok(released(py, || search::view_member(&lx, xs.view(), &wanted, ys.view(), t, signals))
-        .map_err(|e| if e.kind == Kind::Rank { pyo3::exceptions::PyTypeError::new_err(e.message.to_string()) } else { py_err(e) })??)
+    released(py, || search::view_member(&lx, xs.view(), &wanted, ys.view(), t))
+        .map_err(|e| if e.kind == Kind::Rank { pyo3::exceptions::PyTypeError::new_err(e.message.to_string()) } else { py_err(e) })
 }
 
 /// A Boolean mask shaped like `target`, marking starts where `pattern` fits and matches. A lower-rank pattern has leading singleton axes; a higher-rank pattern never matches. Floats use `ct`.
@@ -98,7 +100,7 @@ fn _set<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>, how:
     let (xs, ys) = (call.args[0].at(call.args[0].view().dtype())?, call.args[1].at(call.args[1].view().dtype())?);
     let (x, y, t) = (xs.view(), ys.view(), tolerance(ct)?);
     generated_len(&[x.len().saturating_add(y.len())]).map_err(py_err)?;
-    let values = released(py, || search::view_set(x, y, how, t, signals)).ok_or_else(|| missing("set operation", x.dtype()))??;
+    let values = released(py, || search::view_set(x, y, how, t)).ok_or_else(|| missing("set operation", x.dtype()))?.map_err(py_err)?;
     let n = values.len();
     give_items(py, [n].into(), values, false)
 }
@@ -110,7 +112,7 @@ pub fn counts<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, ct: Option<f64>) -> P
     let x = one(x)?;
     let items = x.row_major()?;
     let (view, t) = (items.view(), tolerance(ct)?);
-    let counts = released(py, || search::view_class_counts(view, t, signals)).ok_or_else(|| missing("counts", view.dtype()))??;
+    let counts = released(py, || search::view_class_counts(view, t)).ok_or_else(|| missing("counts", view.dtype()))?.map_err(py_err)?;
     give(py, vector(counts)?, false)
 }
 
@@ -121,7 +123,7 @@ pub fn group_indices<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, ct: Option<f64
     let x = one(x)?;
     let items = x.row_major()?;
     let (view, t) = (items.view(), tolerance(ct)?);
-    let grouped = released(py, || search::view_grouped(view, t, signals)).ok_or_else(|| missing("group_indices", view.dtype()))??;
+    let grouped = released(py, || search::view_grouped(view, t)).ok_or_else(|| missing("group_indices", view.dtype()))?.map_err(py_err)?;
     grouped.groups.each().map(|these| give(py, vector(these.iter().map(|&p| p as usize))?, false)).collect()
 }
 
@@ -135,7 +137,7 @@ fn sorted<'py>(py: Python<'py>, function: &str, keys: &[Arg], axis: Option<Axis>
     let (dims, mut layout, position) = along_axis(layout, total, axis)?;
     if let Some(a) = position { layout = layout.without_keys(a); }
     let columns: Vec<_> = keys.iter().rev().map(|k| k.view()).collect();
-    let order = released(py, || search::view_lexgrade_along(&columns, dims, false)).ok_or_else(|| missing(function, keys[0].view().dtype()))?;
+    let order = released(py, || search::view_lexgrade_along(&columns, dims, false)).map_err(py_err)?.ok_or_else(|| missing(function, keys[0].view().dtype()))?;
     give_items(py, layout, i64::buffer(order), false)
 }
 
@@ -172,11 +174,11 @@ fn ordered<'py>(py: Python<'py>, name: &str, a: &Bound<'py, PyAny>, axis: Option
         }
         layout = layout.without_keys(a);
     }
-    let result = released(py, || match how {
-        Ordering::Sort(down) => search::view_sort_along(view, dims, down).unwrap(),
-        Ordering::Partition(_, indices) => search::view_partition_along(view, dims, rank, indices).unwrap(),
+    let result = released(py, || -> Result<Buffer, Error> { Ok(match how {
+        Ordering::Sort(down) => search::view_sort_along(view, dims, down)?.unwrap(),
+        Ordering::Partition(_, indices) => search::view_partition_along(view, dims, rank, indices)?.unwrap(),
         Ordering::Extreme(down) => i64::buffer(search::view_argextremes(view, dims, down).unwrap()),
-    });
+    }) }).map_err(py_err)?;
     let layout = if matches!(how, Ordering::Extreme(_)) { position.map_or(Layout::EMPTY, |a| layout.axes((0..layout.shape().len()).filter(move |&i| i != a))) } else { layout };
     give_items(py, layout, result, matches!(how, Ordering::Extreme(_)) && position.is_none())
 }

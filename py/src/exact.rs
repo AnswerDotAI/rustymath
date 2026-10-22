@@ -1,5 +1,5 @@
 //! Exact arithmetic on Python integers and `fractions.Fraction`. An argument is an `int`, a `Fraction`, nested lists or tuples of them, or a buffer of integers or Booleans, such as a NumPy array. Results are Fractions, in nested lists for arrays. Elementwise functions pair their arguments' axes as rustymath broadcasts them: axes with the same name first, then the rest from the front. Matrix functions take one matrix, not stacks. Long operations poll for Ctrl-C.
-use crate::convert::{Arg, released, signals};
+use crate::convert::{Arg, released};
 use crate::integer::radix;
 use num_rational::BigRational;
 use num_traits::{One, ToPrimitive};
@@ -100,14 +100,14 @@ fn binary<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>, f:
     let ((lx, x), (ly, y)) = (values(x)?, values(y)?);
     let agreement = Agreement::new(&lx, &ly).map_err(py_err)?;
     let fill = || py_err(Error::new(Kind::Domain, "exact arithmetic has no fill for a missing key"));
-    let out = released(py, || each(0..agreement.len, || Ok(signals()?), |i| f(&x[agreement.left.get(i).ok_or_else(fill)?], &y[agreement.right.get(i).ok_or_else(fill)?])))?;
+    let out = released(py, || each(0..agreement.len, || rustymath::interrupt::check().map_err(py_err), |i| f(&x[agreement.left.get(i).ok_or_else(fill)?], &y[agreement.right.get(i).ok_or_else(fill)?])))?;
     output(py, agreement.layout.shape(), out)
 }
 
 /// `f` on each item of `x`, in `x`'s shape, with the GIL released.
 fn pointwise<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, f: impl Fn(&R) -> PyResult<R> + Sync) -> PyResult<Bound<'py, PyAny>> {
     let (layout, x) = values(x)?;
-    let out = released(py, || each(&x, || Ok(signals()?), &f))?;
+    let out = released(py, || each(&x, || rustymath::interrupt::check().map_err(py_err), &f))?;
     output(py, layout.shape(), out)
 }
 
@@ -129,7 +129,7 @@ fn binom<'py>(py: Python<'py>, n: &Bound<'py, PyAny>, k: &Bound<'py, PyAny>) -> 
     binary(py, n, k, |n, k| {
         if !k.is_integer() { return Err(PyValueError::new_err("binom needs a whole k")); }
         let k = k.to_integer().to_i64().ok_or_else(|| PyOverflowError::new_err("binom needs k to fit int64"))?;
-        exact::binom_with(n, k, || Ok(signals()?))
+        exact::binom(n, k).map_err(py_err)
     })
 }
 
@@ -143,21 +143,21 @@ fn solve<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, b: &Bound<'py, PyAny>) -> 
         [r, k] if r == m => (k, vec![n, k]),
         _ => return Err(py_err(Error::new(Kind::Length, "b must be a vector or a matrix with a row for each row of a"))),
     };
-    output(py, &shape, released(py, || matrix::solve_with(&a, &b, [m, n], k, signals))?)
+    output(py, &shape, released(py, || matrix::solve(&a, &b, [m, n], k)).map_err(py_err)?)
 }
 
 /// The pseudoinverse of the matrix `a`, which is its inverse where `a` is square and nonsingular.
 #[pyfunction]
 fn pinv<'py>(py: Python<'py>, a: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let ([m, n], a) = matrix_of(a)?;
-    output(py, &[n, m], released(py, || matrix::pinv_with(&a, [m, n], signals))?)
+    output(py, &[n, m], released(py, || matrix::pinv(&a, [m, n])).map_err(py_err)?)
 }
 
 /// The determinant of a square matrix.
 #[pyfunction]
 fn det<'py>(py: Python<'py>, a: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let (n, a) = square(a)?;
-    output(py, &[], vec![released(py, || matrix::determinant_with(&a, n, signals))?])
+    output(py, &[], vec![released(py, || matrix::determinant(&a, n)).map_err(py_err)?])
 }
 
 /// The permanent of a square matrix of fewer than 64 rows, in exponential time. Ctrl-C cancels it.
@@ -165,7 +165,7 @@ fn det<'py>(py: Python<'py>, a: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny
 fn permanent<'py>(py: Python<'py>, a: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let (n, a) = square(a)?;
     if n >= 64 { return Err(PyValueError::new_err("permanent needs fewer than 64 rows")); }
-    output(py, &[], vec![released(py, || matrix::permanent_with(&a, n, signals))?])
+    output(py, &[], vec![released(py, || matrix::permanent(&a, n)).map_err(py_err)?])
 }
 
 /// The reduced row echelon form of the matrix `a`, with its zero rows left out, the pivot columns, and the signed product of the pivots before scaling. Pivots come from the first `columns` columns, or from every column where `columns` isn't given or the matrix has fewer.
@@ -174,7 +174,7 @@ fn permanent<'py>(py: Python<'py>, a: &Bound<'py, PyAny>) -> PyResult<Bound<'py,
 fn echelon<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, columns: Option<usize>) -> PyResult<(Bound<'py, PyAny>, Vec<usize>, Bound<'py, PyAny>)> {
     let ([m, n], a) = matrix_of(a)?;
     let columns = columns.unwrap_or(n);
-    let e = released(py, || matrix::echelon_with(a, [m, n], columns, signals))?;
+    let e = released(py, || matrix::echelon(a, [m, n], columns)).map_err(py_err)?;
     Ok((output(py, &[e.pivots.len(), n], e.rows)?, e.pivots, output(py, &[], vec![e.determinant])?))
 }
 
@@ -182,7 +182,7 @@ fn echelon<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, columns: Option<usize>) 
 #[pyfunction]
 fn polyval<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, c: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let c = vector(c)?;
-    pointwise(py, x, |x| polynomial::value_with(&c, x, || Ok(signals()?)))
+    pointwise(py, x, |x| polynomial::value(&c, x).map_err(py_err))
 }
 
 /// The coefficients of `m` times the product of `x - root` over the vector `roots`.
@@ -190,7 +190,7 @@ fn polyval<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, c: &Bound<'py, PyAny>) -
 #[pyo3(signature = (roots, m=None))]
 fn polyfromroots<'py>(py: Python<'py>, roots: &Bound<'py, PyAny>, m: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
     let (m, roots) = (multiplier(m)?, vector(roots)?);
-    let c = released(py, || polynomial::from_roots_with(m, &roots, signals))?;
+    let c = released(py, || polynomial::from_roots(m, &roots)).map_err(py_err)?;
     output(py, &[c.len()], c)
 }
 
@@ -198,7 +198,7 @@ fn polyfromroots<'py>(py: Python<'py>, roots: &Bound<'py, PyAny>, m: Option<&Bou
 #[pyfunction]
 fn polyder<'py>(py: Python<'py>, c: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let c = vector(c)?;
-    let d = released(py, || polynomial::derivative_with(&c, signals))?;
+    let d = released(py, || polynomial::derivative(&c)).map_err(py_err)?;
     output(py, &[d.len()], d)
 }
 
@@ -207,7 +207,7 @@ fn polyder<'py>(py: Python<'py>, c: &Bound<'py, PyAny>) -> PyResult<Bound<'py, P
 #[pyo3(signature = (x, roots, m=None))]
 fn polyvalfromroots<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, roots: &Bound<'py, PyAny>, m: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
     let (roots, m) = (vector(roots)?, multiplier(m)?);
-    pointwise(py, x, |x| polynomial::factored_with(&m, &roots, x, || Ok(signals()?)))
+    pointwise(py, x, |x| polynomial::factored(&m, &roots, x).map_err(py_err))
 }
 
 /// The mixed-radix value of each vector of digits along the last axis of `digits`. `bases` is a nonempty vector with one base for each digit, and its first base is unused.
@@ -218,7 +218,7 @@ fn decode<'py>(py: Python<'py>, bases: &Bound<'py, PyAny>, digits: &Bound<'py, P
     let out = released(py, || -> PyResult<Vec<R>> {
         let mut out = Vec::with_capacity(digits.len() / bases.len());
         for group in digits.chunks(bases.len().saturating_mul(1024)) {
-            signals()?;
+            rustymath::interrupt::check().map_err(py_err)?;
             out.extend(polynomial::decode(&bases, group));
         }
         Ok(out)

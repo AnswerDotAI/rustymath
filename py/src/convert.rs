@@ -12,25 +12,33 @@ use rustymath::layout::Layout;
 use rustymath::structure::transpose;
 use rustymath::with_dtype;
 use rustymath_buffer::{Read, frame::{Frame, frame}, py_err, read, read_array, walk::{Collect, walked}};
-use std::borrow::Cow;
+use std::{borrow::Cow, cell::Cell};
 
 /// The shared compact dtype named `name`, or a Python argument error.
 pub fn dtype(name: &str) -> PyResult<DType> {
     DType::named(name).ok_or_else(|| PyValueError::new_err(format!("unknown dtype {name:?}")))
 }
 
-/// A Python exception carried through a rustymath function that's generic over its error, as [`Stacked`](rustymath::linalg::Stacked) is: a rustymath error, or the exception that [`signals`] raised.
-pub struct Raised(PyErr);
-
-impl From<Error> for Raised { fn from(e: Error) -> Self { Self(py_err(e)) } }
-
-impl From<Raised> for PyErr { fn from(r: Raised) -> Self { r.0 } }
+thread_local! {
+    /// Whether this thread is running work that [`released`] runs, the one place where [`signals`] checks for a pending signal.
+    static RELEASED: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Runs `work`, a call's computation in Rust, with the GIL released, so other Python threads run meanwhile, as they do during NumPy's computations. Every binding converts its arguments before `work` and gives its results after it, holding the GIL. A call reads each `rustymath.Array` argument as it was when converted: the argument shares the array's storage, and another thread's write to the array during the call copies the storage first. Another thread's write to a buffer argument, such as a NumPy array, during the call leaves the call's results undefined.
-pub fn released<R: Send>(py: Python<'_>, work: impl FnOnce() -> R + Send) -> R { py.detach(work) }
+pub fn released<R: Send>(py: Python<'_>, work: impl FnOnce() -> R + Send) -> R {
+    py.detach(|| {
+        let outer = RELEASED.replace(true);
+        let result = work();
+        RELEASED.set(outer);
+        result
+    })
+}
 
-/// Raises the exception for a pending signal, such as Ctrl-C, holding the GIL only for the check. Work that [`released`] runs checks with it between steps.
-pub fn signals() -> Result<(), Raised> { Python::attach(|py| py.check_signals()).map_err(Raised) }
+/// This module's interrupt check, which its init installs as rustymath's ([`rustymath::interrupt::install`]): the Interrupt error for the exception of a pending signal, such as Ctrl-C. Only work that [`released`] runs takes the GIL to check. Rustymath's worker threads, and calls that hold the GIL, pass without taking it.
+pub fn signals() -> Result<(), Error> {
+    if !RELEASED.get() { return Ok(()); }
+    Python::attach(|py| py.check_signals()).map_err(rustymath_buffer::raised)
+}
 
 /// One data argument, converted, and whether it was a Python scalar, as `scalar` tests.
 pub struct Arg { source: Source, pub scalar: bool }

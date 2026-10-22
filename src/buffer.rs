@@ -461,6 +461,7 @@ impl PartialEq for Buffer { fn eq(&self, other: &Self) -> bool { self.view() == 
 
 impl<'a> View<'a> {
     /// Borrows a consecutive range without copying or changing its dtype.
+    #[inline]
     pub fn slice(self, range: std::ops::Range<usize>) -> Self {
         with_dtype!(self.dtype(), T => T::view(&T::of(self).expect("the view has its dtype")[range]))
     }
@@ -492,7 +493,7 @@ impl PartialEq for View<'_> {
 }
 
 /// An element type of compact buffers: `bool`, the integer widths `u8`, `i16`, `i32` and `i64`, the float widths `half::f16`, `f32` and `f64`, `Complex32` and `Complex64`, and `char`.
-pub trait Element: Copy + Send + Sync + crate::gather::Item {
+pub trait Element: Copy + Send + Sync + 'static + crate::gather::Item {
     /// The item that a missing keyed entry reads as: zero, false or a space.
     const FILL: Self;
     /// The dtype of buffers of this type.
@@ -654,8 +655,8 @@ impl Buffer {
         b
     }
     /// The items of `view` at `indices`, as [`take`](crate::gather::take) reads them: a negative index counts back from the end.
-    pub fn gathered<I: Copy + Into<i64>>(view: View<'_>, indices: &[I]) -> Self {
-        fn taken<T: Element, I: Copy + Into<i64>>(items: &[T], indices: &[I]) -> Buffer {
+    pub fn gathered<I: crate::gather::IndexValue>(view: View<'_>, indices: &[I]) -> Self {
+        fn taken<T: Element, I: crate::gather::IndexValue>(items: &[T], indices: &[I]) -> Buffer {
             let mut out = Vec::with_capacity(indices.len());
             crate::gather::take(&mut out, items, indices, |x| x);
             T::buffer(out)

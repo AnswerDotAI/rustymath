@@ -3,7 +3,7 @@
 //! A tolerance is a value of a type that implements `Tolerant`: a `Tolerance`, or `Exactly`, whose methods compile to plain IEEE comparisons and `floor`. A function written once over `Tolerant` compiles to a version for each. `with_tolerance!` picks one when the program runs, outside any loop. The methods are generic over the float type and compute at its width. `TolerantComplex` gives the complex versions. The function objects `Equal`, `NotEqual`, `Less`, `LessEqual`, `Greater`, `GreaterEqual`, `Matches`, `Compare`, `Floor`, `Ceil`, `Residue`, `FloorDivide`, `Gcd` and `Lcm` each hold a `Tolerance` and give the same results as the methods, one item at a time or over slices. A slice form picks its loop with `with_tolerance!` once. A comparison's slice form compares many items with one number through the range of floats equal to it (`Tolerant::range`), so each item takes one or two plain comparisons. All but `Matches` and `Compare` also have integer forms, from the `integer` module, which ignore the tolerance. `Floor` and `Ceil` also take Booleans.
 //!
 //! Tolerant equality isn't transitive: `x` can equal `y` and `y` equal `z` while `x` doesn't equal `z`. Hash maps and sorting need a transitive `PartialEq`. This module therefore has no float type with a tolerant `==`. Each comparison is a method of the tolerance.
-use crate::{Arg, BETWEEN_CHECKS, buffer::Element, convert::{float, int}, float::{Float, Native}, ok, search::{self, Chains, Key, Links}, slice::{Total, pairs_into}};
+use crate::{Arg, BETWEEN_CHECKS, buffer::Element, convert::{float, int}, error::Error, float::{Float, Native}, interrupt::check, search::{self, Chains, Key, Links}, slice::{Total, pairs_into}};
 use num_bigint::BigInt;
 use num_complex::Complex;
 use num_rational::BigRational;
@@ -457,8 +457,7 @@ fn complex_equals<T: TolerantComplex, R: Native>(
         (equal != negate, decided)
     }) { return true; }
     let out = crate::slice::written(out);
-    let at = |a: Arg<'_, Complex<R>>, i: usize| match a { Arg::One(v) => v, Arg::Many(s) => s[i] };
-    for i in 0..n { let (a, b) = (at(x, i), at(y, i)); if !t.squared_equal(a, b).1 { out[i] = t.scaled_equal(a, b) != negate } }
+    for i in 0..n { let (a, b) = (x.nth(i), y.nth(i)); if !t.squared_equal(a, b).1 { out[i] = t.scaled_equal(a, b) != negate } }
     true
 }
 
@@ -533,15 +532,12 @@ tolerant!(Lcm at Complex<f32>, Complex<f64>: |t, [x, y]| {
     if g == Complex::new(0.0, 0.0) { g } else { x / g * y }
 });
 
-/// For each item of `y`, the position of the first item of `x` that it matches within tolerance `t`, or the length of `x` where none does. NaN matches NaN. Up to `search::SCANNED` items of `y` each take one pass over `x`, which compares every item with the range of floats equal to it. When every item of both equals a whole number below `whole_limit(t)`, the search indexes those whole numbers (`search::index_of`), then checks that each item of `y` matches the first item of `x` with its whole number. When one doesn't, as two floats on either side of one whole number may not, the search takes the buckets below. Otherwise, with `Exactly`, the search indexes order keys. With a `Tolerance`, it files the items of `x` in buckets of neighbouring floats (`Near`), and compares each item of `y` with the items in the two buckets nearest it. The lookups in the index or the buckets split across threads.
-pub fn index_of<F: Float>(t: impl Tolerant, x: &[F], y: &[F]) -> Vec<u32> { let Ok(found) = index_of_with(t, x, y, ok); found }
-
-/// The units of `BETWEEN_CHECKS` needles that each thread looks up in one round of `index_of_with`. A round much shorter than this leaves too little for the other threads after `parallel::split` times its first unit: with 1 unit each, `v⍳w` on a million floats took as long on 4 threads as on one.
+/// The units of `BETWEEN_CHECKS` needles that each thread looks up in one round of `index_of`. A round much shorter than this leaves too little for the other threads after `parallel::split` times its first unit: with 1 unit each, `v⍳w` on a million floats took as long on 4 threads as on one.
 const ROUND_UNITS: usize = 16;
 
-/// `index_of`, calling `check` on this thread before each round of `ROUND_UNITS` × `BETWEEN_CHECKS` items of `y` for each of `parallel::threads`, and returning `check`'s error at once. A round's lookups split across threads.
+/// For each item of `y`, the position of the first item of `x` that it matches within tolerance `t`, or the length of `x` where none does. NaN matches NaN. Up to `search::SCANNED` items of `y` each take one pass over `x`, which compares every item with the range of floats equal to it. When every item of both equals a whole number below `whole_limit(t)`, the search indexes those whole numbers (`search::index_of`), then checks that each item of `y` matches the first item of `x` with its whole number. When one doesn't, as two floats on either side of one whole number may not, the search takes the buckets below. Otherwise, with `Exactly`, the search indexes order keys. With a `Tolerance`, it files the items of `x` in buckets of neighbouring floats (`Near`), and compares each item of `y` with the items in the two buckets nearest it. The lookups in the index or the buckets split across threads, in rounds of `ROUND_UNITS` × `BETWEEN_CHECKS` items of `y` for each of `parallel::threads`. It checks for an interrupt on this thread before each round, and returns its error at once.
 #[inline(never)]
-pub fn index_of_with<F: Float, E>(t: impl Tolerant, x: &[F], y: &[F], mut check: impl FnMut() -> Result<(), E>) -> Result<Vec<u32>, E> {
+pub fn index_of<F: Float>(t: impl Tolerant, x: &[F], y: &[F]) -> Result<Vec<u32>, Error> {
     if y.len() <= search::SCANNED { return Ok(y.iter().map(|&v| scan(t, x, v) as u32).collect()); }
     if let Some((keys, exact)) = wholes(t, x, whole_limit(t)) && let Some((whole_y, _)) = wholes(t, y, whole_limit(t)) {
         // Two floats near one whole number each equal it, but needn't equal each other. Unless every item of `x` is a whole number, each needle must be identical to its first candidate or within tolerance of it, or the buckets below search instead. Floats near other whole numbers can't match.
@@ -562,36 +558,38 @@ pub fn index_of_with<F: Float, E>(t: impl Tolerant, x: &[F], y: &[F], mut check:
     Ok(found)
 }
 
-/// The position of the earliest item of each item's class within tolerance `t`. When every item equals a whole number below `whole_limit(t)`, a class holds the items equal to one whole number. Otherwise, with `Exactly`, a class holds equal floats, and with a `Tolerance`, a class is a run that `runs` gives. Two items of one class therefore needn't match each other.
-pub fn classes<F: Float>(t: impl Tolerant, x: &[F]) -> Vec<u32> { let Ok(classes) = classes_with(t, x, ok); classes }
-
-/// `classes`, calling `check` after about every `BETWEEN_CHECKS` items, and returning `check`'s error at once.
+/// The position of the earliest item of each item's class within tolerance `t`. When every item equals a whole number below `whole_limit(t)`, a class holds the items equal to one whole number. Otherwise, with `Exactly`, a class holds equal floats, and with a `Tolerance`, a class is a run that `runs` gives. Two items of one class therefore needn't match each other. It checks for an interrupt after about every `BETWEEN_CHECKS` items, and returns its error at once.
 #[inline(never)]
-pub fn classes_with<F: Float, E>(t: impl Tolerant, x: &[F], mut check: impl FnMut() -> Result<(), E>) -> Result<Vec<u32>, E> {
+pub fn classes<F: Float>(t: impl Tolerant, x: &[F]) -> Result<Vec<u32>, Error> {
     if let Some((keys, _)) = wholes(t, x, whole_limit(t)) { return Ok(search::classes(&keys)); }
     if t.value() == 0.0 { return Ok(search::first_classes(x, F::order_key)); }
-    let (mut classes, mut since) = (vec![0; x.len()], 0);
+    let mut classes = vec![0; x.len()];
+    checked_runs(t, x, |run| for &i in run { classes[i] = run[0] as u32 })?;
+    Ok(classes)
+}
+
+/// Whether each item of `x` is the first of its class, with the classes that `classes` gives. It checks for an interrupt as `classes` does.
+#[inline(never)]
+pub fn firsts<F: Float>(t: impl Tolerant, x: &[F]) -> Result<Vec<bool>, Error> {
+    if let Some((keys, _)) = wholes(t, x, whole_limit(t)) { return Ok(search::firsts(&keys)); }
+    if t.value() == 0.0 { return Ok(search::first_mask(&search::first_classes(x, F::order_key))); }
+    let mut firsts = vec![false; x.len()];
+    checked_runs(t, x, |run| firsts[run[0]] = true)?;
+    Ok(firsts)
+}
+
+/// `runs` for `classes` and `firsts`, with an interrupt check after about every `BETWEEN_CHECKS` items.
+fn checked_runs<F: Float>(t: impl Tolerant, x: &[F], mut each: impl FnMut(&[usize])) -> Result<(), Error> {
+    let mut since = 0;
     runs(t, x, |run| {
         since += run.len();
         if since >= BETWEEN_CHECKS {
             since = 0;
             check()?;
         }
-        for &i in run { classes[i] = run[0] as u32; }
+        each(run);
         Ok(())
-    })?;
-    Ok(classes)
-}
-
-/// Whether each item of `x` is the first of its class, with the classes that `classes` gives.
-pub fn firsts<F: Float>(t: impl Tolerant, x: &[F]) -> Vec<bool> { let Ok(mask) = firsts_with(t, x, ok); mask }
-
-/// `firsts`, calling `check` as `classes_with` does, and returning `check`'s error at once.
-#[inline(never)]
-pub fn firsts_with<F: Float, E>(t: impl Tolerant, x: &[F], check: impl FnMut() -> Result<(), E>) -> Result<Vec<bool>, E> {
-    if let Some((keys, _)) = wholes(t, x, whole_limit(t)) { return Ok(search::firsts(&keys)); }
-    if t.value() == 0.0 { return Ok(search::first_mask(&search::first_classes(x, F::order_key))); }
-    Ok(classes_with(t, x, check)?.into_iter().enumerate().map(|(i, c)| c as usize == i).collect())
+    })
 }
 
 /// Calls `each` with the positions of each run of `x`, in ascending order of position. A run is a longest sequence of floats, taken in ascending order, in which each matches the next within tolerance `t`. Every float that a float matches lies in one interval (`Tolerant::range`), so a run holds every match of each of its floats. An error from `each` ends the walk, and `runs` returns it. The floats sort by their order keys, which read back as floats in memory order.
@@ -601,10 +599,14 @@ pub fn runs<F: Float, E>(t: impl Tolerant, x: &[F], mut each: impl FnMut(&[usize
     let (mut run, mut start) = (Vec::new(), 0);
     for end in 1..=keys.len() {
         if end < keys.len() && t.matches(F::from_order_key(keys[end - 1]), F::from_order_key(keys[end])) { continue; }
-        run.clear();
-        run.extend(order[start..end].iter().map(|&i| i as usize));
-        run.sort_unstable();
-        each(&run)?;
+        // Most runs hold one item, which needs no list of positions to sort.
+        if end - start == 1 { each(&[order[start] as usize])?; }
+        else {
+            run.clear();
+            run.extend(order[start..end].iter().map(|&i| i as usize));
+            run.sort_unstable();
+            each(&run)?;
+        }
         start = end;
     }
     Ok(())

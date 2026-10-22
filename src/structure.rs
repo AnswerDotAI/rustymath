@@ -1,6 +1,6 @@
 //! Plans for structural operations: take and drop, rotate and reverse, windows, transpose and catenate. A plan gives the result's layout, and `Steps` that read the result's items from the argument's items in order. `gather::walk` copies a compact array by a plan, and basedpl copies its other arrays by the same plan. Each plan checks its arguments.
 use crate::error::{Error, Kind};
-use crate::gather::{IndexSource, Steps, Table};
+use crate::gather::{IndexSource, IndexValue, Steps, Table};
 use crate::{buffer::View, float::Float, tolerant::{Tolerance, Tolerant}};
 use crate::agreement::{Agreement, Mapping};
 use crate::layout::{agreed, generated_len, names_conflict, strides, Keys, Lanes, Layout};
@@ -248,38 +248,41 @@ pub fn select_axis(layout: &Layout, axis: usize, selector: Selector) -> Result<P
 }
 
 /// The positions that index values give along an axis of length `size`. A negative value counts back from the end, and a value outside the axis is an Index error.
-pub fn index_positions<I: Copy + Into<i64>>(values: &[I], size: usize) -> Result<Vec<usize>, Error> {
+pub fn index_positions<I: IndexValue>(values: &[I], size: usize) -> Result<Vec<usize>, Error> {
     let mut positions = vec![0; values.len()];
     let mut inside = true;
     for (p, &i) in positions.iter_mut().zip(values) {
-        *p = counted_back(i.into(), size);
+        *p = counted_back(i.position(), size);
         inside &= *p < size;
     }
     if inside { return Ok(positions); }
     Err(first_outside(values, size))
 }
 
-/// A table that reads the Boolean or integer index values in `values` as positions along an axis of length `size`, as [`index_positions`] reads them, converting each one as it reads it. A value outside the axis is an Index error. The one pass that checks the values writes nothing, and also finds whether they give evenly spaced positions, so that a walk can read them as one stride.
+/// A table that reads the index values in `values` as positions along an axis of length `size`, as [`positions`] reads them, converting each one as it reads it. A value outside the axis is an Index error. The one pass that checks the values writes nothing, and also finds whether they give evenly spaced positions, so that a walk can read them as one stride. Floats read in place only where every one is a whole number. Otherwise the table lists the positions that [`filled_positions`] gives, within the default tolerance and with a NaN as a fill.
 pub fn index_table(values: Arc<dyn IndexSource>, size: usize) -> Result<Table, Error> {
-    fn check<I: Copy + Into<i64>>(values: &[I], size: usize) -> Result<Option<(usize, isize)>, Error> {
-        // Folding to the least and greatest values with no branch keeps the loop vectorised.
-        let (lo, hi) = values.iter().fold((i64::MAX, i64::MIN), |(lo, hi), &i| { let i = i.into(); (lo.min(i), hi.max(i)) });
-        if !values.is_empty() && !(lo >= -(size as i64) && hi < size as i64) { return Err(first_outside(values, size)); }
-        let at = |k: usize| -> i64 { values[k].into() };
-        if values.len() < 2 { return Ok(None); }
+    /// `None` where some value is a float that isn't a whole number. Otherwise the first position and the step where the positions are evenly spaced, or the Index error for a value outside the axis.
+    fn check<I: IndexValue>(values: &[I], size: usize) -> Option<Result<Option<(usize, isize)>, Error>> {
+        let (lo, hi, whole) = I::bounds(values);
+        if !whole { return None; }
+        if !values.is_empty() && !(lo >= -(size as i64) && hi < size as i64) { return Some(Err(first_outside(values, size))); }
+        let at = |k: usize| values[k].position();
+        if values.len() < 2 { return Some(Ok(None)); }
         // Values of one sign give evenly spaced positions where they're evenly spaced themselves. Checking the second step first skips the full pass for values in no order.
         let step = at(1) - at(0);
-        let even = (lo >= 0 || hi < 0) && (values.len() < 3 || at(2) - at(1) == step) && values.windows(2).fold(true, |even, w| even & (w[1].into() - w[0].into() == step));
-        Ok(even.then(|| (counted_back(at(0), size), step as isize)))
+        let even = (lo >= 0 || hi < 0) && (values.len() < 3 || at(2) - at(1) == step) && values.windows(2).fold(true, |even, w| even & (w[1].position() - w[0].position() == step));
+        Some(Ok(even.then(|| (counted_back(at(0), size), step as isize))))
     }
-    let even = crate::gather::with_index_values!(values.view(), |x| check(x, size))?;
-    Ok(Table::indices(values, size, even))
+    match crate::gather::with_index_values!(values.view(), |x| check(x, size)) {
+        Some(even) => Ok(Table::indices(values, size, even?)),
+        None => positions(values.view(), size).map(Table::new),
+    }
 }
 
 /// The Index error for the first of `values` outside an axis of length `size`.
-fn first_outside<I: Copy + Into<i64>>(values: &[I], size: usize) -> Error {
-    let k = values.iter().position(|&i| counted_back(i.into(), size) >= size).expect("a position is outside the axis");
-    outside(Into::<i64>::into(values[k]), size)
+fn first_outside<I: IndexValue>(values: &[I], size: usize) -> Error {
+    let k = values.iter().position(|&i| counted_back(i.position(), size) >= size).expect("a position is outside the axis");
+    outside(values[k].position(), size)
 }
 
 /// The Index error for `position` on an axis of length `size`.
@@ -576,6 +579,71 @@ impl Windows {
         let keys = self.frame_keys(layout)?.into_iter().chain(self.cell_keys(layout)).collect();
         let names = (0..n).chain(0..self.cell.len()).map(|a| layout.name(a).cloned()).collect();
         Ok(Plan { layout: Layout::from(shape).with_keys(keys)?.inherit_names(names), steps })
+    }
+}
+
+/// How a copy walks its source: one entry for each axis of the copy, the source axis that each entry walks, and the offset of the positions on source axes that no entry walks. Axes that walk one source axis together read windows, as [`Windows::plan`] lays them out. Every reader of windows from `Steps` classifies them here: [`Walk::read`] gives what the axes along one source axis read, and [`Walk::windows`] gives the windows that `plan` laid out.
+#[derive(Clone, Debug)]
+pub struct Walk {
+    /// The offset of the positions on source axes that no entry walks.
+    pub base: usize,
+    /// One entry for each axis of the copy. The first entry along each walked axis holds that axis's position in its start.
+    pub steps: Vec<Steps>,
+    /// The source axis that each entry walks, or `None` for an entry whose offsets are all 0, as for an axis of one item or a spread.
+    pub along: Vec<Option<usize>>,
+    /// The source's strides.
+    pub strides: Vec<usize>,
+}
+
+impl Walk {
+    /// The walk that `tables` give for a copy of `shape` from a source of shape `source`. `None` where an entry doesn't walk one source axis, where a walked axis's position can't move into the start of a `Stride`, as for a `Padded` or `Rotated` entry over part of an axis, and where the source is empty.
+    pub fn new(tables: &[Steps], shape: &[usize], source: &[usize]) -> Option<Self> {
+        let (base, mut steps) = Steps::per_axis(tables, shape)?;
+        let strides = strides(source);
+        if base >= source.iter().product::<usize>() { return None; }
+        let along: Vec<Option<usize>> = steps.iter().map(|e| e.axis_of(source, &strides)).collect::<Option<_>>()?;
+        let mut rest = 0;
+        for (a, p) in crate::layout::coordinates(base, source).filter(|&(_, p)| p > 0) {
+            let Some(r) = along.iter().position(|&b| b == Some(a)) else { rest += p * strides[a]; continue };
+            let Steps::Stride { start, .. } = &mut steps[r] else { return None };
+            *start += p * strides[a];
+            if steps[r].axis_of(source, &strides) != Some(Some(a)) { return None; }
+        }
+        Some(Self { base: rest, steps, along, strides })
+    }
+    /// The axes of the copy that walk source axis `a`, in order.
+    pub fn walking(&self, a: usize) -> impl Iterator<Item = usize> + '_ { (0..self.along.len()).filter(move |&r| self.along[r] == Some(a)) }
+    /// What the entries walking source axis `a`, of `n` items, read as windows, such as a copy's frames and the positions in each window: where the windows start, and each entry's length and move in positions. Each entry must be a `Stride` that steps forward by a whole number of positions. An axis that no entry walks reads position 0. `None` for any other entries, and where the windows don't lie inside the axis.
+    pub fn read(&self, a: usize, n: usize) -> Option<(usize, Vec<[usize; 2]>)> {
+        let unit = self.strides[a];
+        if unit == 0 { return None; }
+        let (mut first, mut last, mut read) = (0, 0, Vec::new());
+        for r in self.walking(a) {
+            let Steps::Stride { start, len, step } = self.steps[r] else { return None };
+            if step <= 0 || step as usize % unit != 0 || start % unit != 0 || len == 0 { return None; }
+            let moves = step as usize / unit;
+            (first, last) = (first + start / unit, last + (len - 1) * moves);
+            read.push([len, moves]);
+        }
+        (first + last < n).then_some((first, read))
+    }
+    /// The positions that the entries walking source axis `a`, of `n` items, read, where each one moves by 1 (`read`).
+    pub fn range(&self, a: usize, n: usize) -> Option<std::ops::Range<usize>> {
+        let (first, read) = self.read(a, n)?;
+        read.iter().all(|&[_, moves]| moves == 1).then(|| first..first + 1 + read.iter().map(|&[len, _]| len - 1).sum::<usize>())
+    }
+    /// The windows of a copy from `source`, laid out as [`Windows::plan`] lays them out without padding: frame axes, then window axes, then the source's other axes whole. Along each of the source's first axes, the frames start at 0 and move by a whole number of positions, and each frame is a window of consecutive positions. Gives each such axis's number of frames, window size and move. `None` for any other copy.
+    pub fn windows(&self, source: &[usize]) -> Option<Vec<[usize; 3]>> {
+        let s = self.steps.len().checked_sub(source.len())?;
+        if self.base != 0 || s == 0 || 2 * s > self.steps.len() { return None; }
+        if (s..source.len()).any(|a| !matches!(self.steps[s + a], Steps::Stride { start: 0, len, step } if len == source[a] && step == self.strides[a] as isize)) { return None; }
+        (0..s).map(|a| {
+            if self.along[a] != Some(a) || self.along[s + a] != Some(a) { return None; }
+            match self.read(a, source[a])? {
+                (0, read) => match read[..] { [[n, moves], [w, 1]] => Some([n, w, moves]), _ => None },
+                _ => None,
+            }
+        }).collect()
     }
 }
 

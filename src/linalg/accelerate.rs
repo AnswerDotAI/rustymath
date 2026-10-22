@@ -1,4 +1,4 @@
-//! Accelerate's BLAS and LAPACK serve every plus-times product, triangular solve, SVD and Hermitian eigen decomposition on macOS, and the general eigen problem of real matrices. A complex matrix's general eigen problem takes the native solver, which ran 2.4 to 2.9 times as fast as Accelerate's `?geev`. The ILP64 interface takes 64-bit sizes, so no matrix is too large for it. LAPACK stores a matrix column by column, and reads a row-major one as its transpose. `?heevd`, and `?gesdd` on a wide matrix, work with that transpose. `?geev`, and `?gesdd` on a tall matrix, take a transposed copy. Each working copy's leading dimension comes from `stride`. Unpadded, a 512×512 matrix took twice as long in `?geev` as one of 511 or 513, 27% longer in `?gesdd` and 8% longer in `?syevd`.
+//! Accelerate's BLAS and LAPACK serve every plus-times product and triangular solve on macOS, and the SVD, Hermitian eigen decomposition and real general eigen problem from the orders `GESDD_FROM`, `HEEVD_FROM` and `GEEV_FROM` up. The native solvers, faster on smaller matrices, take the rest. A complex matrix's general eigen problem takes the native solver, which ran 2.4 to 2.9 times as fast as Accelerate's `?geev`. The ILP64 interface takes 64-bit sizes, so no matrix is too large for it. LAPACK stores a matrix column by column, and reads a row-major one as its transpose. `?heevd`, and `?gesdd` on a wide matrix, work with that transpose. `?geev`, and `?gesdd` on a tall matrix, take a transposed copy. Each working copy's leading dimension comes from `stride`. Unpadded, a 512×512 matrix took twice as long in `?geev` as one of 511 or 513, 27% longer in `?gesdd` and 8% longer in `?syevd`.
 use super::{Eig, Eigh, Matrix, Op, Part, Scalar, Side, Triangle, factor::{spaced, stride, transpose_by, transpose_by_into}, filled};
 use crate::{Float, Native};
 use num_complex::Complex;
@@ -31,13 +31,10 @@ fn follow_threads() {
     })
 }
 
-/// Whether `T` is complex, with parts of half its width.
-fn complex<T: Scalar>() -> bool { size_of::<T>() != size_of::<T::Real>() }
-
 /// `a`, a `rows`×`cols` matrix in its own orientation, as BLAS's data, leading dimension and operation code. Only an operation that the BLAS function lacks makes a row-major copy. No function takes a conjugate alone. SYRK and HERK take the matrix as it is, or SYRK its transpose and HERK its adjoint, which `gram` selects.
 fn prepared<T: Scalar>(a: Matrix<'_, T>, [rows, cols]: [usize; 2], gram: bool) -> (Cow<'_, [T]>, Int, i32) {
-    let adjoint = if complex::<T>() { 113 } else { 112 };
-    let op = match a.op { Op::Normal => 111, Op::Transpose => 112, Op::Adjoint => adjoint, Op::Conjugate => { if complex::<T>() { 0 } else { 111 } } };
+    let adjoint = if T::COMPLEX { 113 } else { 112 };
+    let op = match a.op { Op::Normal => 111, Op::Transpose => 112, Op::Adjoint => adjoint, Op::Conjugate => { if T::COMPLEX { 0 } else { 111 } } };
     if op == 0 || (gram && op != 111 && op != adjoint) {
         let data = if a.op.transposed() { transpose_by(a.data, a.ld, [cols, rows], |x| x) } else {
             let mut data = Vec::with_capacity(rows * cols);
@@ -95,7 +92,7 @@ fn gesdd<T: Accelerated>(mut x: Vec<T>, ldx: usize, [m, n]: [usize; 2], vectors:
     let (job, [ldw, ldu]) = if vectors { (b'S', [stride(n), p]) } else { (b'N', [1, 1]) };
     let mut s = filled(p, T::Real::zero());
     let (mut w, mut u) = if vectors { (filled(ldw * p, T::zero()), filled(p * m, T::zero())) } else { (vec![T::zero()], vec![T::zero()]) };
-    let rwork = if !complex::<T>() { 0 } else if vectors { (5 * p * p + 5 * p).max(2 * m.max(n) * p + 2 * p * p + p) } else { 7 * p };
+    let rwork = if !T::COMPLEX { 0 } else if vectors { (5 * p * p + 5 * p).max(2 * m.max(n) * p + 2 * p * p + p) } else { 7 * p };
     let (mut rwork, mut iwork) = (filled(rwork, T::Real::zero()), filled(8 * p, 0));
     // SAFETY: each array holds what `?gesdd` reads and writes for this job and size, and `work` holds `lwork` items.
     let mut call = |work: &mut [T], lwork: Int| unsafe {
@@ -138,6 +135,12 @@ pub(super) fn eigh<T: Accelerated>(a: &[T], n: usize, vectors: bool) -> Option<E
 
 /// The order from which real matrices' general eigen problem takes `?geev`. Up to 128 rows, `?geev` took 1.2 to 2.7 times as long as the native solver with Accelerate's products, on one thread of an M5 Max. At 256, `?geev` was level for eigenvalues alone and 1.2 times as fast with eigenvectors. From 512, with its copy padded, it was about twice as fast.
 pub(super) const GEEV_FROM: usize = 256;
+
+/// The order from which the SVD takes `?gesdd`: the larger of a matrix's two sides, after a tall matrix has reduced to its square R. Below it, the native SVD ran faster on stacks of square matrices, on one thread of an M5 Max: 3.7 times at 2 rows, 1.6 times at 8 and 1.2 times at 16. The two were level at 24 rows, and from 32 `?gesdd` was faster, 1.1 times at 32 and 1.8 times at 128.
+pub(super) const GESDD_FROM: usize = 24;
+
+/// The order from which the Hermitian eigen problem takes `?heevd`. Below it, the native solver ran faster on stacks of matrices, on one thread of an M5 Max: 2.2 times at 2 rows, 1.3 times at 8 and 1.2 times at 64. Above 64 rows the native solver's divide and conquer starts (`factor::EIGH_CONQUER`), and `?heevd` was faster: 1.1 times at 80, 1.4 times at 128 and 1.8 times at 256.
+pub(super) const HEEVD_FROM: usize = 65;
 
 /// The eigen decomposition of the nonempty row-major real `n`×`n` matrix `a`, with its eigenvectors only where `vectors` is true, or `None` where `?geev` doesn't converge.
 pub(super) fn eig<T: Geev>(a: &[T], n: usize, vectors: bool) -> Option<Eig<T>> { follow_threads(); T::xgeev(a, n, vectors) }

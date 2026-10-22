@@ -44,13 +44,13 @@ pub fn polyval<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, c: &Bound<'py, PyAny
     let (work, result) = working("polyval", xs.view().dtype())?;
     let core = match work {
         DType::Float(w) => rustymath::with_float_width!(w, F => {
-            let (c, mut y) = (cs.items::<F>()?, xs.items::<F>()?.into_owned());
-            released(py, || polynomial::evaluate(&c, &mut y));
+            let (c, x, mut y) = (cs.items::<F>()?, xs.items::<F>()?, Vec::new());
+            released(py, || polynomial::evaluate(&c, &x, &mut y));
             finished(xs.layout(), y, result)?
         }),
         _ => rustymath::with_inexact!(work, T => {
             let (c, x) = (cs.items::<T>()?, xs.items::<T>()?);
-            finished(xs.layout(), released(py, || x.iter().map(|x| polynomial::value(&c, x)).collect()), result)?
+            finished(xs.layout(), released(py, || x.iter().map(|x| polynomial::value(&c, x)).collect::<Result<_, _>>()).map_err(py_err)?, result)?
         }),
     };
     give(py, core, xs.scalar)
@@ -68,7 +68,7 @@ pub fn polyvalfromroots<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, roots: &Bou
     let (work, result) = working("polyvalfromroots", xs.view().dtype())?;
     let core = rustymath::with_inexact!(work, T => {
         let (roots, m, x) = (rs.items::<T>()?, ms.items::<T>()?[0], xs.items::<T>()?);
-        finished(xs.layout(), released(py, || x.iter().map(|x| polynomial::factored(&m, &roots, x)).collect()), result)?
+        finished(xs.layout(), released(py, || x.iter().map(|x| polynomial::factored(&m, &roots, x)).collect::<Result<_, _>>()).map_err(py_err)?, result)?
     });
     give(py, core, xs.scalar)
 }
@@ -96,7 +96,7 @@ pub fn polyfromroots<'py>(py: Python<'py>, roots: &Bound<'py, PyAny>, m: Option<
     vector(&rs.layout(), "the roots")?;
     leading(&ms.layout())?;
     let (work, result) = working("polyfromroots", rs.view().dtype())?;
-    let core = rustymath::with_inexact!(work, T => { let (m, r) = (ms.items::<T>()?[0], rs.items::<T>()?); vector_of(released(py, || polynomial::from_roots(m, &r)), result)? });
+    let core = rustymath::with_inexact!(work, T => { let (m, r) = (ms.items::<T>()?[0], rs.items::<T>()?); vector_of(released(py, || polynomial::from_roots(m, &r)).map_err(py_err)?, result)? });
     give(py, core, false)
 }
 
@@ -106,7 +106,7 @@ pub fn polyder<'py>(py: Python<'py>, c: &Bound<'py, PyAny>) -> PyResult<Bound<'p
     let cs = one(c)?;
     vector(&cs.layout(), "the coefficients")?;
     let (work, result) = working("polyder", cs.view().dtype())?;
-    let core = rustymath::with_inexact!(work, T => { let c = cs.items::<T>()?; vector_of(released(py, || polynomial::derivative(&c)), result)? });
+    let core = rustymath::with_inexact!(work, T => { let c = cs.items::<T>()?; vector_of(released(py, || polynomial::derivative(&c)).map_err(py_err)?, result)? });
     give(py, core, false)
 }
 

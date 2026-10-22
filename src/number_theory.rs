@@ -2,8 +2,8 @@
 //!
 //! Each function on a single integer is generic over [`Natural`], which `u64`, `u128` and `BigUint` implement. A `u128` or `BigUint` small enough for a narrower type computes in that type. Primality uses the Baillie–PSW test, which no known composite passes and which has no exceptions below 2^64. Factorisation uses trial division, then Brent's form of Pollard's rho. `u64` and `u128` compute in Montgomery form, with no allocation.
 //!
-//! A function that can run long has a `_with` version, which takes a check as its last argument. It calls the check at least about once a millisecond, and returns the check's error as soon as it gets one.
-use crate::{BETWEEN_CHECKS, ok};
+//! A function that can run long calls [`interrupt::check`](crate::interrupt::check) at least about once a millisecond, and returns its error as soon as it gets one.
+use crate::{BETWEEN_CHECKS, error::Error, interrupt::check};
 use num_bigint::BigUint;
 use num_integer::{Integer, Roots};
 use num_traits::{CheckedAdd, ToPrimitive};
@@ -27,9 +27,9 @@ mod sealed {
         fn bit(&self, i: u64) -> bool;
         fn rem_small(&self, m: u64) -> u64;
         /// Whether `n`, which is odd and has no factor below 41, passes the Baillie–PSW test, computed in this type.
-        fn probable_prime<E>(n: &Self, check: &mut impl FnMut() -> Result<(), E>) -> Result<bool, E>;
+        fn probable_prime(n: &Self) -> Result<bool, crate::error::Error>;
         /// A factor of `n` other than 1 and `n`, which is odd and composite, computed in this type.
-        fn divisor<E>(n: &Self, check: &mut impl FnMut() -> Result<(), E>) -> Result<Self, E>;
+        fn divisor(n: &Self) -> Result<Self, crate::error::Error>;
     }
 }
 use sealed::Tier;
@@ -164,11 +164,11 @@ macro_rules! primitive {
             fn rem_small(&self, m: u64) -> u64 {
                 (self % m as $t) as u64
             }
-            fn probable_prime<E>(n: &$t, check: &mut impl FnMut() -> Result<(), E>) -> Result<bool, E> {
-                baillie_psw(&$ring::new(*n), check)
+            fn probable_prime(n: &$t) -> Result<bool, Error> {
+                baillie_psw(&$ring::new(*n))
             }
-            fn divisor<E>(n: &$t, check: &mut impl FnMut() -> Result<(), E>) -> Result<$t, E> {
-                rho(&$ring::new(*n), check)
+            fn divisor(n: &$t) -> Result<$t, Error> {
+                rho(&$ring::new(*n))
             }
         }
     };
@@ -182,8 +182,8 @@ impl Tier for BigUint {
     fn bits(&self) -> u64 { BigUint::bits(self) }
     fn bit(&self, i: u64) -> bool { BigUint::bit(self, i) }
     fn rem_small(&self, m: u64) -> u64 { (self % m).to_u64().unwrap() }
-    fn probable_prime<E>(n: &BigUint, check: &mut impl FnMut() -> Result<(), E>) -> Result<bool, E> { baillie_psw(&Residues(n.clone()), check) }
-    fn divisor<E>(n: &BigUint, check: &mut impl FnMut() -> Result<(), E>) -> Result<BigUint, E> { rho(&Residues(n.clone()), check) }
+    fn probable_prime(n: &BigUint) -> Result<bool, Error> { baillie_psw(&Residues(n.clone())) }
+    fn divisor(n: &BigUint) -> Result<BigUint, Error> { rho(&Residues(n.clone())) }
 }
 
 /// `n` as `d·2^s` with `d` odd.
@@ -256,7 +256,7 @@ fn strong_lucas<R: Ring>(ring: &R) -> bool {
     false
 }
 
-fn baillie_psw<R: Ring, E>(ring: &R, check: &mut impl FnMut() -> Result<(), E>) -> Result<bool, E> {
+fn baillie_psw<R: Ring>(ring: &R) -> Result<bool, Error> {
     let (d, s) = odd_part(ring.n().clone() - R::N::from(1));
     check()?;
     if !strong_probable_prime(ring, &d, s, &ring.elem(2)) { return Ok(false); }
@@ -265,7 +265,7 @@ fn baillie_psw<R: Ring, E>(ring: &R, check: &mut impl FnMut() -> Result<(), E>) 
 }
 
 /// A factor of the odd composite `n` other than 1 and `n`, by Brent's form of Pollard's rho, which takes one gcd for each batch of 128 steps.
-fn rho<R: Ring, E>(ring: &R, check: &mut impl FnMut() -> Result<(), E>) -> Result<R::N, E> {
+fn rho<R: Ring>(ring: &R) -> Result<R::N, Error> {
     let (n, one) = (ring.n(), R::N::from(1));
     for c in 1.. {
         let c = ring.elem(c);
@@ -321,28 +321,26 @@ const fn product(xs: &[u64]) -> u64 {
 }
 
 /// A factor of the odd composite `n` other than 1 and `n`, found in the narrowest type `n` fits.
-fn narrow_divisor<N: Natural, E>(n: &N, check: &mut impl FnMut() -> Result<(), E>) -> Result<N, E> {
-    match n.narrow() { Some(x) => Ok(N::widen(narrow_divisor(&x, check)?)), None => N::divisor(n, check) }
+fn narrow_divisor<N: Natural>(n: &N) -> Result<N, Error> {
+    match n.narrow() { Some(x) => Ok(N::widen(narrow_divisor(&x)?)), None => N::divisor(n) }
 }
 
 /// Whether `n` is prime.
-pub fn is_prime_with<N: Natural, E>(n: &N, mut check: impl FnMut() -> Result<(), E>) -> Result<bool, E> {
-    if let Some(x) = n.narrow() { return is_prime_with(&x, check); }
+pub fn is_prime<N: Natural>(n: &N) -> Result<bool, Error> {
+    if let Some(x) = n.narrow() { return is_prime(&x); }
     if let Some(x) = n.to_u64().filter(|&x| x < 41 * 41) { return Ok(x >= 2 && SMALL_PRIMES.iter().all(|&p| x == p || x % p != 0)); }
     let r = n.rem_small(PRIMORIAL);
     if SMALL_PRIMES.iter().any(|&p| r % p == 0) { return Ok(false); }
-    N::probable_prime(n, &mut check)
+    N::probable_prime(n)
 }
-/// [`is_prime_with`] with no check.
-pub fn is_prime<N: Natural>(n: &N) -> bool { let Ok(p) = is_prime_with(n, ok); p }
 
 /// The prime factors of `n` in increasing order, each with its multiplicity. `factor(1)` is empty.
 ///
 /// # Panics
 /// If `n` is 0.
-pub fn factor_with<N: Natural, E>(n: &N, mut check: impl FnMut() -> Result<(), E>) -> Result<Vec<(N, u32)>, E> {
+pub fn factor<N: Natural>(n: &N) -> Result<Vec<(N, u32)>, Error> {
     assert!(!n.is_zero(), "factor needs a positive integer");
-    if let Some(x) = n.narrow() { return Ok(factor_with(&x, check)?.into_iter().map(|(p, k)| (N::widen(p), k)).collect()); }
+    if let Some(x) = n.narrow() { return Ok(factor(&x)?.into_iter().map(|(p, k)| (N::widen(p), k)).collect()); }
     let (mut n, mut found) = (n.clone(), Vec::new());
     let r = n.rem_small(PRIMORIAL);
     for p in SMALL_PRIMES.into_iter().filter(|p| r % p == 0) {
@@ -355,8 +353,8 @@ pub fn factor_with<N: Natural, E>(n: &N, mut check: impl FnMut() -> Result<(), E
     while let Some(m) = pending.pop() {
         check()?;
         if m.is_one() { continue; }
-        if is_prime_with(&m, &mut check)? { found.push(m); } else {
-            let d = narrow_divisor(&m, &mut check)?;
+        if is_prime(&m)? { found.push(m); } else {
+            let d = narrow_divisor(&m)?;
             pending.push(m / d.clone());
             pending.push(d);
         }
@@ -366,53 +364,45 @@ pub fn factor_with<N: Natural, E>(n: &N, mut check: impl FnMut() -> Result<(), E
     for p in found { match result.last_mut() { Some((q, count)) if *q == p => *count += 1, _ => result.push((p, 1)) } }
     Ok(result)
 }
-/// [`factor_with`] with no check.
-pub fn factor<N: Natural>(n: &N) -> Vec<(N, u32)> { let Ok(f) = factor_with(n, ok); f }
 
 /// The smallest prime above `n`, or `None` if it doesn't fit `N`.
-pub fn next_prime_with<N: Natural, E>(n: &N, mut check: impl FnMut() -> Result<(), E>) -> Result<Option<N>, E> {
+pub fn next_prime<N: Natural>(n: &N) -> Result<Option<N>, Error> {
     let two = N::from(2);
     if *n < two { return Ok(Some(two)); }
     let Some(mut c) = n.checked_add(&N::from(if n.is_even() { 1 } else { 2 })) else { return Ok(None) };
     loop {
         check()?;
-        if is_prime_with(&c, &mut check)? { return Ok(Some(c)); }
+        if is_prime(&c)? { return Ok(Some(c)); }
         let Some(next) = c.checked_add(&two) else { return Ok(None) };
         c = next;
     }
 }
-/// [`next_prime_with`] with no check.
-pub fn next_prime<N: Natural>(n: &N) -> Option<N> { let Ok(p) = next_prime_with(n, ok); p }
 
 /// The largest prime below `n`, or `None` if `n` is 2 or less.
-pub fn prev_prime_with<N: Natural, E>(n: &N, mut check: impl FnMut() -> Result<(), E>) -> Result<Option<N>, E> {
-    if let Some(x) = n.narrow() { return Ok(prev_prime_with(&x, check)?.map(N::widen)); }
+pub fn prev_prime<N: Natural>(n: &N) -> Result<Option<N>, Error> {
+    if let Some(x) = n.narrow() { return Ok(prev_prime(&x)?.map(N::widen)); }
     let two = N::from(2);
     if *n <= two { return Ok(None); }
     if *n == N::from(3) { return Ok(Some(two)); }
     let mut c = n.clone() - N::from(if n.is_even() { 1 } else { 2 });
     loop {
         check()?;
-        if is_prime_with(&c, &mut check)? { return Ok(Some(c)); }
+        if is_prime(&c)? { return Ok(Some(c)); }
         c = c - two.clone();
     }
 }
-/// [`prev_prime_with`] with no check.
-pub fn prev_prime<N: Natural>(n: &N) -> Option<N> { let Ok(p) = prev_prime_with(n, ok); p }
 
 /// Euler's totient: how many integers from 1 to `n` are coprime to `n`.
 ///
 /// # Panics
 /// If `n` is 0.
-pub fn totient_with<N: Natural, E>(n: &N, check: impl FnMut() -> Result<(), E>) -> Result<N, E> {
-    if let Some(x) = n.narrow() { return Ok(N::widen(totient_with(&x, check)?)); }
-    Ok(factor_with(n, check)?.into_iter().fold(n.clone(), |t, (p, _)| t / p.clone() * (p - N::from(1))))
+pub fn totient<N: Natural>(n: &N) -> Result<N, Error> {
+    if let Some(x) = n.narrow() { return Ok(N::widen(totient(&x)?)); }
+    Ok(factor(n)?.into_iter().fold(n.clone(), |t, (p, _)| t / p.clone() * (p - N::from(1))))
 }
-/// [`totient_with`] with no check.
-pub fn totient<N: Natural>(n: &N) -> N { let Ok(t) = totient_with(n, ok); t }
 
 /// n!, the product of the whole numbers from 1 to `n`.
-pub fn factorial_with<E>(n: u64, mut check: impl FnMut() -> Result<(), E>) -> Result<BigUint, E> {
+pub fn factorial(n: u64) -> Result<BigUint, Error> {
     let mut product = BigUint::from(1u8);
     for i in 2..=n {
         if i % BETWEEN_CHECKS as u64 == 0 { check()?; }
@@ -421,8 +411,6 @@ pub fn factorial_with<E>(n: u64, mut check: impl FnMut() -> Result<(), E>) -> Re
     Ok(product)
 }
 
-/// [`factorial_with`] with no check.
-pub fn factorial(n: u64) -> BigUint { let Ok(p) = factorial_with(n, ok); p }
 
 /// The primes below 7. The sieve stores only numbers that none of them divide, so it gives these separately.
 const WHEEL: [u64; 3] = [2, 3, 5];
@@ -539,14 +527,18 @@ impl Primes {
         k
     }
 
-    /// The next prime, or `None` past `u64::MAX`.
-    pub fn next_with<E>(&mut self, check: impl FnMut() -> Result<(), E>) -> Result<Option<u64>, E> { self.nth_with(0, check) }
+}
 
-    /// The prime `k` places on: `nth_with(0, …)` is the next prime. Gives `None` past `u64::MAX`.
-    pub fn nth_with<E>(&mut self, mut k: u64, mut check: impl FnMut() -> Result<(), E>) -> Result<Option<u64>, E> {
+impl Iterator for Primes {
+    type Item = Result<u64, Error>;
+    /// The next prime, or `None` past `u64::MAX`.
+    fn next(&mut self) -> Option<Result<u64, Error>> { self.nth(0) }
+    /// The prime `k` places on: `nth(0)` is the next prime. Gives `None` past `u64::MAX`.
+    fn nth(&mut self, k: usize) -> Option<Result<u64, Error>> {
+        let mut k = k as u64;
         while self.wheel < WHEEL.len() {
             self.wheel += 1;
-            if k == 0 { return Ok(Some(WHEEL[self.wheel - 1])); }
+            if k == 0 { return Some(Ok(WHEEL[self.wheel - 1])); }
             k -= 1;
         }
         loop {
@@ -554,23 +546,17 @@ impl Primes {
             if k == 0 && self.at < self.bytes.len() * 8 {
                 let p = self.lo + 30 * (self.at / 8) as u64 + RESIDUES[self.at % 8];
                 self.at += 1;
-                return Ok(Some(p));
+                return Some(Ok(p));
             }
-            if self.next.is_none() { return Ok(None); }
-            check()?;
+            self.next?;
+            if let Err(e) = check() { return Some(Err(e)); }
             self.sieve();
         }
     }
 }
 
-impl Iterator for Primes {
-    type Item = u64;
-    fn next(&mut self) -> Option<u64> { let Ok(p) = self.next_with(ok); p }
-    fn nth(&mut self, k: usize) -> Option<u64> { let Ok(p) = self.nth_with(k as u64, ok); p }
-}
-
 /// How many primes are below `n`.
-pub fn prime_count_with<E>(n: u64, mut check: impl FnMut() -> Result<(), E>) -> Result<u64, E> {
+pub fn prime_count(n: u64) -> Result<u64, Error> {
     let mut count = WHEEL.iter().filter(|&&p| p < n).count() as u64;
     let mut primes = Primes::new(0);
     while let Some(lo) = primes.next.filter(|&lo| lo + 1 < n) {
@@ -585,8 +571,6 @@ pub fn prime_count_with<E>(n: u64, mut check: impl FnMut() -> Result<(), E>) -> 
     }
     Ok(count)
 }
-/// [`prime_count_with`] with no check.
-pub fn prime_count(n: u64) -> u64 { let Ok(c) = prime_count_with(n, ok); c }
 
 /// The odd primes below `limit`, by a plain sieve.
 fn odd_primes_below(limit: u64) -> Vec<u64> {

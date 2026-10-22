@@ -148,14 +148,15 @@ mod exact {
     fn q(n: i64, d: i64) -> BigRational { BigRational::new(n.into(), d.into()) }
 
     #[test]
-    fn exact_functions() {
+    fn exact_functions() -> Result<(), rustymath::error::Error> {
         assert_eq!((residue(&q(3, 1), &q(-7, 1)), residue(&q(1, 2), &q(5, 3)), residue(&q(0, 1), &q(5, 3))), (q(2, 1), q(1, 6), q(5, 3)));
         assert_eq!((gcd(&q(1, 2), &q(1, 3)), gcd(&q(-4, 1), &q(6, 1)), gcd(&q(0, 1), &q(0, 1))), (q(1, 6), q(2, 1), q(0, 1)));
         assert_eq!((lcm(&q(1, 2), &q(1, 3)), lcm(&q(-4, 1), &q(6, 1)), lcm(&q(0, 1), &q(5, 1))), (q(1, 1), q(-12, 1), q(0, 1)));
         // C(5, 2), C(5, 7), C(1/2, 2) = -1/8, C(-1, 2) = 1, C(-3, -5) = (-1)^2 C(4, 2) = 6, C(-3, -1) = 0 and C(1/2, -1) = 0.
         let c: Vec<BigRational> = [(q(5, 1), 2), (q(5, 1), 7), (q(1, 2), 2), (q(-1, 1), 2), (q(-3, 1), -5), (q(-3, 1), -1), (q(1, 2), -1)].iter()
-            .map(|(n, k)| binom(n, *k)).collect();
+            .map(|(n, k)| binom(n, *k)).collect::<Result<_, _>>()?;
         assert_eq!(c, [q(10, 1), q(0, 1), q(-1, 8), q(1, 1), q(6, 1), q(0, 1), q(0, 1)]);
+        Ok(())
     }
 }
 
@@ -308,7 +309,9 @@ mod integer {
 
 mod number_theory {
     use num_bigint::BigUint;
+    use rustymath::error::{Error, Kind};
     use rustymath::number_theory::*;
+    use std::cell::Cell;
 
     const M61: u64 = (1 << 61) - 1;
     const M89: u128 = (1 << 89) - 1;
@@ -317,72 +320,78 @@ mod number_theory {
     const TOP: u64 = u64::MAX - 58;
 
     #[test]
-    fn primality() {
+    fn primality() -> Result<(), Error> {
         let mut primes = Primes::new(0).peekable();
         for n in 0..1u64 << 17 {
-            let prime = primes.next_if_eq(&n).is_some();
-            assert!(is_prime(&n) == prime && is_prime(&(n as u128)) == prime && is_prime(&BigUint::from(n)) == prime, "{n}");
+            let prime = primes.next_if_eq(&Ok(n)).is_some();
+            assert!(is_prime(&n)? == prime && is_prime(&(n as u128))? == prime && is_prime(&BigUint::from(n))? == prime, "{n}");
         }
-        assert!(is_prime(&M61) && is_prime(&TOP) && is_prime(&M89) && is_prime(&M127));
-        assert!(is_prime(&((BigUint::from(1u8) << 521) - 1u8)));
+        assert!(is_prime(&M61)? && is_prime(&TOP)? && is_prime(&M89)? && is_prime(&M127)?);
+        assert!(is_prime(&((BigUint::from(1u8) << 521) - 1u8))?);
         // Strong pseudoprimes to every prime base up to 23, 37 and 41.
-        assert!(!is_prime(&3825123056546413051u64));
-        assert!(!is_prime(&318665857834031151167461u128));
-        assert!(!is_prime(&3317044064679887385961981u128));
-        assert!(!is_prime(&(BigUint::from(M89) * BigUint::from(M127))));
+        assert!(!is_prime(&3825123056546413051u64)?);
+        assert!(!is_prime(&318665857834031151167461u128)?);
+        assert!(!is_prime(&3317044064679887385961981u128)?);
+        assert!(!is_prime(&(BigUint::from(M89) * BigUint::from(M127)))?);
         // Strong Lucas pseudoprimes with Selfridge's parameters, from OEIS A217255.
-        for n in [5459u64, 5777, 10877, 16109, 18971, 22499, 24569, 25199, 40309, 58519] { assert!(!is_prime(&n), "{n}"); }
+        for n in [5459u64, 5777, 10877, 16109, 18971, 22499, 24569, 25199, 40309, 58519] { assert!(!is_prime(&n)?, "{n}"); }
+        Ok(())
     }
 
     #[test]
-    fn factors() {
-        assert!(factor(&1u64).is_empty());
-        assert_eq!(factor(&u64::MAX), [(3, 1), (5, 1), (17, 1), (257, 1), (641, 1), (65537, 1), (6700417, 1)]);
-        assert_eq!(factor(&((1u128 << 64) + 1)), [(274177, 1), (67280421310721, 1)]);
-        assert_eq!(factor(&(((1u128 << 31) - 1) * M61 as u128)), [((1 << 31) - 1, 1), (M61 as u128, 1)]);
+    fn factors() -> Result<(), Error> {
+        assert!(factor(&1u64)?.is_empty());
+        assert_eq!(factor(&u64::MAX)?, [(3, 1), (5, 1), (17, 1), (257, 1), (641, 1), (65537, 1), (6700417, 1)]);
+        assert_eq!(factor(&((1u128 << 64) + 1))?, [(274177, 1), (67280421310721, 1)]);
+        assert_eq!(factor(&(((1u128 << 31) - 1) * M61 as u128))?, [((1 << 31) - 1, 1), (M61 as u128, 1)]);
         let big = BigUint::from(1000003u64).pow(2) * 1000033u64 * BigUint::from(M127);
-        assert_eq!(factor(&big), [(1000003u64.into(), 2), (1000033u64.into(), 1), (M127.into(), 1)]);
-        assert_eq!(totient(&36u64), 12);
-        assert_eq!(totient(&u64::MAX), 2 * 4 * 16 * 256 * 640 * 65536 * 6700416);
+        assert_eq!(factor(&big)?, [(1000003u64.into(), 2), (1000033u64.into(), 1), (M127.into(), 1)]);
+        assert_eq!(totient(&36u64)?, 12);
+        assert_eq!(totient(&u64::MAX)?, 2 * 4 * 16 * 256 * 640 * 65536 * 6700416);
+        Ok(())
     }
 
     #[test]
-    fn neighbours() {
-        assert_eq!([next_prime(&0u64), next_prime(&2), next_prime(&13)], [Some(2), Some(3), Some(17)]);
-        assert_eq!([prev_prime(&2u64), prev_prime(&3), prev_prime(&100)], [None, Some(2), Some(97)]);
-        assert_eq!(next_prime(&(u64::MAX - 70)), Some(TOP));
-        assert_eq!(next_prime(&TOP), None);
-        assert_eq!(next_prime(&(TOP as u128)), Some((1 << 64) + 13));
-        assert_eq!(prev_prime(&(1u128 << 64)), Some(TOP as u128));
+    fn neighbours() -> Result<(), Error> {
+        assert_eq!([next_prime(&0u64)?, next_prime(&2)?, next_prime(&13)?], [Some(2), Some(3), Some(17)]);
+        assert_eq!([prev_prime(&2u64)?, prev_prime(&3)?, prev_prime(&100)?], [None, Some(2), Some(97)]);
+        assert_eq!(next_prime(&(u64::MAX - 70))?, Some(TOP));
+        assert_eq!(next_prime(&TOP)?, None);
+        assert_eq!(next_prime(&(TOP as u128))?, Some((1 << 64) + 13));
+        assert_eq!(prev_prime(&(1u128 << 64))?, Some(TOP as u128));
+        Ok(())
     }
 
     #[test]
-    fn counting() {
+    fn counting() -> Result<(), Error> {
         let mut n = 1;
         for expected in [4, 25, 168, 1229, 9592, 78498, 664579] {
             n *= 10;
-            assert_eq!(prime_count(n), expected);
+            assert_eq!(prime_count(n)?, expected);
         }
         // Counting and enumeration agree on each side of the first segments' ends.
         let (mut end, mut size) = (0, FIRST as u64);
         for _ in 0..4 {
             end += 30 * size;
             size = (2 * size).min(BYTES as u64);
-            for n in [end - 1, end, end + 1] { assert_eq!(prime_count(n), Primes::new(0).take_while(|&p| p < n).count() as u64); }
+            for n in [end - 1, end, end + 1] { assert_eq!(prime_count(n)?, Primes::new(0).map(Result::unwrap).take_while(|&p| p < n).count() as u64); }
         }
-        let starts = [0, 3, 4, 6, 7, 29, 30, 98].map(|n| Primes::new(n).next().unwrap());
-        assert_eq!(starts, [2, 3, 5, 7, 7, 29, 31, 101]);
-        assert_eq!(Primes::new(0).nth(999_999), Some(15_485_863));
+        assert_eq!([0, 3, 4, 6, 7, 29, 30, 98].map(|n| Primes::new(n).next()), [2, 3, 5, 7, 7, 29, 31, 101].map(|p| Some(Ok(p))));
+        assert_eq!(Primes::new(0).nth(999_999), Some(Ok(15_485_863)));
         let mut primes = Primes::new(0);
-        assert_eq!([primes.nth(3), primes.nth(0), primes.nth(2)], [Some(7), Some(11), Some(19)]);
+        assert_eq!([primes.nth(3), primes.nth(0), primes.nth(2)], [7, 11, 19].map(|p| Some(Ok(p))));
+        Ok(())
     }
 
     #[test]
     fn cancellation() {
-        let stop = || Err("stopped");
-        assert_eq!(factor_with(&((1u128 << 64) + 1), stop), Err("stopped"));
-        assert_eq!(prime_count_with(1 << 20, stop), Err("stopped"));
-        assert_eq!(Primes::new(0).nth_with(0, stop), Ok(Some(2)));
+        thread_local! { static STOP: Cell<bool> = const { Cell::new(false) }; }
+        rustymath::interrupt::install(|| if STOP.get() { Err(Error::new(Kind::Interrupt, "stopped")) } else { Ok(()) });
+        STOP.set(true);
+        assert_eq!(factor(&((1u128 << 64) + 1)).map_err(|e| e.kind), Err(Kind::Interrupt));
+        assert_eq!(prime_count(1 << 20).map_err(|e| e.kind), Err(Kind::Interrupt));
+        assert_eq!(Primes::new(0).nth(0), Some(Ok(2)));
+        STOP.set(false);
     }
 }
 
@@ -889,24 +898,21 @@ mod polynomial {
         // Mixed radix: each step multiplies by its own base, and the first base goes unused.
         assert_eq!(decode(&[9.0, 2.0, 2.0], &[1.0, 0.0, 1.5, 1.0, 1.0, 1.0]), [5.5, 7.0]);
         // (x - 1)(x - 2), with a trailing zero that infinity never meets.
-        let c = [2.0, -3.0, 1.0, 0.0];
-        let mut x = [0.0, 1.5, 3.0, f64::INFINITY];
-        evaluate(&c, &mut x);
-        assert_eq!(x, [2.0, -0.25, 2.0, f64::INFINITY]);
-        let mut x = [1.0, 2.0];
-        evaluate(&[0.0], &mut x);
-        assert_eq!(x, [0.0; 2]);
+        let (c, mut y) = ([2.0, -3.0, 1.0, 0.0], vec![]);
+        evaluate(&c, &[0.0, 1.5, 3.0, f64::INFINITY], &mut y);
+        assert_eq!(y, [2.0, -0.25, 2.0, f64::INFINITY]);
+        let mut y = vec![];
+        evaluate(&[0.0], &[1.0, 2.0], &mut y);
+        assert_eq!(y, [0.0; 2]);
 
         // Across block boundaries, at f32 and f16, against f64.
         let k = [0.5, -1.25, 0.75, 2.0, -0.125];
         let x: Vec<f64> = (0..1000).map(|i| i as f64 / 250.0 - 2.0).collect();
-        let mut want = x.clone();
-        evaluate(&k, &mut want);
-        let mut got: Vec<f32> = x.iter().map(|&x| x as f32).collect();
-        evaluate(&k.map(|k| k as f32), &mut got);
+        let (mut want, mut got, mut half) = (vec![], vec![], vec![]);
+        evaluate(&k, &x, &mut want);
+        evaluate(&k.map(|k| k as f32), &x.iter().map(|&x| x as f32).collect::<Vec<f32>>(), &mut got);
         assert!(got.iter().zip(&want).all(|(&g, &w)| (g as f64 - w).abs() <= 1e-5 * w.abs().max(1.0)));
-        let mut half: Vec<f16> = x.iter().map(|&x| f16::from_f64(x)).collect();
-        evaluate(&k.map(f16::from_f64), &mut half);
+        evaluate(&k.map(f16::from_f64), &x.iter().map(|&x| f16::from_f64(x)).collect::<Vec<f16>>(), &mut half);
         assert!(half.iter().zip(&want).all(|(&g, &w)| (g.to_f64() - w).abs() <= 1e-2 * w.abs().max(1.0)));
 
         let r = roots(&c.map(|k| Complex::new(k, 0.0))).unwrap();
@@ -914,15 +920,15 @@ mod polynomial {
         // x² + 1, and a polynomial with complex coefficients, (x - i)(x - 2).
         let r = roots(&[1.0f32, 0.0, 1.0].map(|k| Complex::new(k, 0.0))).unwrap();
         assert!(r.iter().all(|z| z.re.abs() < 1e-6 && (z.im.abs() - 1.0).abs() < 1e-6));
-        let r = roots(&from_roots(Complex::new(1.0, 0.0), &[Complex::new(0.0, 1.0), Complex::new(2.0, 0.0)])).unwrap();
+        let r = roots(&from_roots(Complex::new(1.0, 0.0), &[Complex::new(0.0, 1.0), Complex::new(2.0, 0.0)]).unwrap()).unwrap();
         assert!((r[0] - Complex::new(0.0, 1.0)).norm() < 1e-12 && (r[1] - Complex::new(2.0, 0.0)).norm() < 1e-12);
         assert!(roots::<f64>(&[Complex::new(3.0, 0.0)]).unwrap().is_empty());
         // 1 + ∞x has the root -1/∞, which is -0.
         let r = roots(&[1.0, f64::INFINITY].map(|k| Complex::new(k, 0.0))).unwrap();
         assert!(r.len() == 1 && r[0].re == 0.0 && r[0].re.is_sign_negative() && r[0].im == 0.0);
 
-        assert_eq!(from_roots(1.0, &[1.0, 2.0]), [2.0, -3.0, 1.0]);
-        assert_eq!(derivative(&[2.0, -3.0, 1.0]), [-3.0, 2.0]);
+        assert_eq!(from_roots(1.0, &[1.0, 2.0]).unwrap(), [2.0, -3.0, 1.0]);
+        assert_eq!(derivative(&[2.0, -3.0, 1.0]).unwrap(), [-3.0, 2.0]);
         let f = fit(&[0.0f64, 1.0, 2.0, 3.0, 4.0], &[2.0, 0.0, 0.0, 2.0, 6.0], 2);
         assert!(f.iter().zip([2.0, -3.0, 1.0]).all(|(&a, b)| (a - b).abs() < 1e-12));
     }
@@ -950,5 +956,23 @@ mod random {
         dealt.sort_unstable();
         dealt.dedup();
         assert!(dealt.len() == 50 && dealt.iter().all(|&d| d < 60));
+    }
+
+    // A seed gives the numbers that `rand`'s `Uniform` gives for each bound, from one bound or one for each draw, also for bounds near 2⁶³, where about half the draws reject a word.
+    #[test]
+    fn rolls_match_rand() {
+        use rand::distr::{Distribution, Uniform};
+        let mixed: Vec<u64> = (0..2000).map(|k| if k % 7 == 0 { (1 << 63) + 1 } else { k + 1 }).collect();
+        for b in [1, 6, 1 << 63, (1 << 63) + 1, u64::MAX] {
+            let (mut ours, mut theirs) = (seeded(2), seeded(2));
+            let ones = vec![b; 2000];
+            let mut out = Vec::new();
+            roll(Arg::One(b), 2000, &mut ours, &mut out);
+            roll(Arg::Many(&ones), 2000, &mut ours, &mut out);
+            roll(Arg::Many(&mixed), 2000, &mut ours, &mut out);
+            out.push(below(b, &mut ours));
+            let bounds = [&ones[..], &ones, &mixed, &[b]].concat();
+            assert_eq!(out, bounds.iter().map(|&b| Uniform::new(0, b).unwrap().sample(&mut theirs)).collect::<Vec<_>>());
+        }
     }
 }

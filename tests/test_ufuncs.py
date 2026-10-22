@@ -254,6 +254,9 @@ def test_native_accumulation():
     assert rm.accumulate(rm.less, [3, 2, 1]).tolist() == [3, 0, 1]
     assert rm.accumulate(rm.less, [3, 2, 1], start=1).tolist() == [1, 1, 0]
     assert rm.accumulate(rm.logical_xor, [True, False, True], start=True).tolist() == [False, False, True]
+    for name in ['bitwise_and', 'bitwise_or', 'bitwise_xor']:
+        for x in [np.array([12, 10, 14, -3], np.int16), np.array([200, 100, 7], np.uint8), np.array([True, False, True])]:
+            assert rm.accumulate(getattr(rm, name), x).tolist() == getattr(np, name).accumulate(x).tolist()
     assert rm.accumulate(rm.subtract, np.empty((2, 0)), axis=-1).shape == (2, 0)
     assert rm.accumulate(rm.add, [2**62] * 3).tolist() == np.cumsum([2**62] * 3).tolist()
     for f, start in [(np.add, None), (lambda a, b: a + b, None), (rm.add, [1])]:

@@ -1,7 +1,7 @@
 //! Search and sort over slices of keys. A key is an item read as a whole number (`Key`), or an unsigned word whose order is the order you want (`RadixKey`). `Float::order_key` gives each float such a word, as wide as the float. Positions take 32 bits inside these functions, so a slice holds at most `u32::MAX` items. `tolerant` builds its searches over floats on these functions.
 //!
-//! `index_of`, `classes` and `firsts` index the first position of each key. `index_of` passes over `x` once for each item of `y` when `y` has at most `SCANNED` items. The index is a table when the keys span at most twice the slice's length, or 1024, and a hash map otherwise. `numbered` numbers the classes in order of first position, with each one's size. `grouped_keys` numbers them the same way from a table of keys, with each one's positions, and `class_counts` gives only their sizes. `counts` counts the items with each key in such a table. `sort_rows` sorts keys that span such a table by counting them. It sorts other keys with an LSD radix sort that skips any byte that is the same in every key. `view_sort_along`, `view_partition_along` and `view_quantiles_along` work on each item's `SortKey`, which reads back to the item exactly. A sort counts, or sorts the keys by comparison or by the same radix sort. With several threads, the radix sort splits each pass of more than `RADIX_PIECE` keys across them, and `index_of` splits its lookups.
-use crate::{Float, agreement::Mapping, array::ArrayView, layout::Layout, buffer::{Buffer, DType, Element, Floats, View}, error::{Error, Kind}, tolerant::{self, Tolerance}};
+//! `index_of`, `classes` and `firsts` index the first position of each key. `index_of` passes over `x` once for each item of `y` when `y` has at most `SCANNED` items. The index is a table when the keys span at most twice the slice's length, or 1024, and a hash map otherwise. `numbered` numbers the classes in order of first position, with each one's size. `grouped_keys` numbers them the same way from a table of keys, with each one's positions, `numbered_keys` with each item's number, and `class_counts` gives only their sizes. `counts` counts the items with each key in such a table. `sort_rows` sorts keys that span such a table by counting them. It sorts other keys with an LSD radix sort that skips any byte that is the same in every key. `view_sort_along`, `view_partition_along` and `view_quantiles_along` work on each item's `SortKey`, which reads back to the item exactly. A sort counts, or sorts the keys by comparison or by the same radix sort. With several threads, the radix sort splits each pass of more than `RADIX_PIECE` keys across them, and `index_of` splits its lookups.
+use crate::{Float, agreement::Mapping, array::ArrayView, layout::Layout, buffer::{Buffer, DType, Element, Floats, View}, error::{Error, Kind}, interrupt::check, tolerant::{self, Tolerance}};
 use crate::hashing::{HashMap, HashMapExt};
 use hashbrown::hash_map::Entry;
 use std::{convert::Infallible, hash::Hash, mem::MaybeUninit, ops::Not};
@@ -203,26 +203,44 @@ pub struct Numbered {
     /// The first position of each class, in ascending order.
     pub firsts: Vec<usize>,
     /// Each item's class number.
-    pub numbers: Vec<usize>,
+    pub numbers: Vec<u32>,
+}
+
+impl Numbered {
+    /// Folds each class of `data` in position order by `R`, and whether every fold fits. Classes are numbered in order of first position, so an item whose class has no total yet starts it.
+    #[inline]
+    pub fn fold<T: Copy, R: crate::reduce::Reduction<T>>(&self, data: &[T]) -> (Vec<R::Total>, bool) {
+        let (mut totals, mut fits) = (Vec::with_capacity(self.firsts.len()), true);
+        for (&c, &x) in self.numbers.iter().zip(data) {
+            let c = c as usize;
+            let ok;
+            if c == totals.len() { let (total, k) = R::one(x); totals.push(total); ok = k; }
+            else { (totals[c], ok) = R::checked(totals[c], x); }
+            fits &= ok;
+        }
+        (totals, fits)
+    }
+
     /// The number of items in each class.
-    pub counts: Vec<usize>,
+    pub fn counts(&self) -> Vec<usize> {
+        let mut counts = vec![0; self.firsts.len()];
+        for &k in &self.numbers { counts[k as usize] += 1; }
+        counts
+    }
 }
 
 /// Numbers the classes in `classes`, which gives each item the first position of its class, as `classes` and `tolerant::classes` do.
 pub fn numbered(classes: &[u32]) -> Numbered {
-    let mut number = vec![0; classes.len()];
-    let (mut firsts, mut numbers, mut counts) = (Vec::new(), Vec::with_capacity(classes.len()), Vec::new());
+    let mut number = vec![0u32; classes.len()];
+    let (mut firsts, mut numbers) = (Vec::new(), Vec::with_capacity(classes.len()));
     for (i, c) in classes.iter().map(|&c| c as usize).enumerate() {
         if c == i {
-            number[i] = firsts.len();
+            number[i] = firsts.len() as u32;
             firsts.push(i);
-            counts.push(0);
         }
-        let k = number[c];
-        numbers.push(k);
-        counts[k] += 1;
+        numbers.push(number[c]);
     }
-    Numbered { firsts, numbers, counts }
+    Numbered { firsts, numbers }
 }
 
 /// Whether `offsets` are dense enough to use a table over the `size` positions they fall below.
@@ -292,7 +310,7 @@ pub fn view_find(pattern: View<'_>, pattern_shape: &[usize], target: View<'_>, s
 /// The number of items in each class of `x`, in order of the classes' first positions, as `numbered` counts them. Keys that span a table take `counts`, then a pass for first positions that stops once it has found every key `x` holds, with nothing written for each item.
 #[inline(never)]
 pub fn class_counts<K: Key>(x: &[K]) -> Vec<usize> {
-    let Some((min, counts)) = counts(x) else { return numbered(&classes(x)).counts };
+    let Some((min, counts)) = counts(x) else { return numbered(&classes(x)).counts() };
     let mut first = vec![usize::MAX; counts.len()];
     write_first(x, min, &mut first, Some(counts.iter().filter(|&&c| c > 0).count()));
     let mut keys: Vec<usize> = (0..counts.len()).filter(|&g| counts[g] > 0).collect();
@@ -427,8 +445,8 @@ impl Groups {
         })
     }
 
-    /// The positions of each group in a buffer of its own. Groups that already have one hand it over. Groups that share a buffer copy their positions from it.
-    pub fn into_buffers(self) -> Vec<Vec<u32>> { if self.buffers.len() == self.sizes.len() { return self.buffers; } self.each().map(<[u32]>::to_vec).collect() }
+    /// The buffers that hold the positions, with no copy: each group's own where every group has one, or else the one buffer that holds every group in turn.
+    pub fn into_buffers(self) -> Vec<Vec<u32>> { if self.buffers.len() == self.sizes.len() { self.buffers } else { vec![self.into_positions()] } }
 
     /// Every position, group by group, in one buffer. Groups that share a buffer hand it over.
     pub fn into_positions(mut self) -> Vec<u32> { if self.buffers.len() == 1 { return self.buffers.pop().expect("one buffer"); } self.buffers.concat() }
@@ -445,37 +463,38 @@ pub struct Grouped {
 
 impl Grouped {
     /// The classes that `groups` numbers, giving each item's class, whose first positions are `firsts`.
-    pub fn new(firsts: Vec<usize>, groups: &[usize]) -> Grouped { grouped_classes(groups, firsts, |g| g) }
-
-    /// Folds each class of `data` in position order by `R`, and whether every fold fits.
-    #[inline]
-    pub fn fold<T: Copy, R: crate::reduce::Reduction<T>>(&self, data: &[T]) -> (Vec<R::Total>, bool) {
-        let mut fits = true;
-        let totals = self.groups.each().map(|rows| {
-            let (mut total, mut ok) = R::one(data[rows[0] as usize]);
-            for &r in &rows[1..] {
-                let (t, k) = R::checked(total, data[r as usize]);
-                (total, ok) = (t, ok && k);
-            }
-            fits &= ok;
-            total
-        }).collect();
-        (totals, fits)
-    }
+    pub fn new(firsts: Vec<usize>, groups: &[u32]) -> Grouped { grouped_classes(groups, firsts, |g| g as usize) }
 }
 
-/// The classes of `x` as [`Grouped`] gives them, or `None` when its keys span too many values for a table. The table entry of each key takes its first position, then its class number, so no pass gives each item its first position.
-#[inline(never)]
-pub fn grouped_keys<K: Key>(x: &[K]) -> Option<Grouped> {
+/// The classes of `x` numbered from 0 in order of first position, as a table from each key's offset from `min` to its class number, with `min` and each class's first position, or `None` when its keys span too many values for a table. The table entry of each key takes its first position, then its class number, so no pass gives each item its first position.
+fn numbered_table<K: Key>(x: &[K]) -> Option<(i64, Vec<usize>, Vec<usize>)> {
+    checked_len(x);
     let (min, mut table) = table(x, usize::MAX)?;
     write_first(x, min, &mut table, None);
-    let mut firsts: Vec<usize> = table.iter().copied().filter(|&f| f != usize::MAX).collect();
-    firsts.sort_unstable();
+    // A radix sort orders the first positions in fewer steps than comparisons when the keys span a wide range.
+    let firsts: Vec<usize> = sorted(table.iter().filter(|&&f| f != usize::MAX).map(|&f| f as u32).collect()).0.into_iter().map(|f| f as usize).collect();
     for (g, &f) in firsts.iter().enumerate() { table[x[f].key().wrapping_sub(min) as usize] = g; }
+    Some((min, table, firsts))
+}
+
+/// The classes of `x` as [`Grouped`] gives them, or `None` when its keys span too many values for a table. Each class's positions come from one pass over `x`.
+#[inline(never)]
+pub fn grouped_keys<K: Key>(x: &[K]) -> Option<Grouped> {
+    let (min, table, firsts) = numbered_table(x)?;
     let table = &table[..];
     // With two keys, each item's class is its offset from the lower key, flipped when the higher key comes first.
     Some(if let [lower, _] = *table { grouped_classes(x, firsts, move |k| k.key().wrapping_sub(min) as usize ^ lower) }
     else { grouped_classes(x, firsts, move |k| table[k.key().wrapping_sub(min) as usize]) })
+}
+
+/// The classes of `x` as [`Numbered`] gives them, numbered as `grouped_keys` numbers them, or `None` when its keys span too many values for a table. A fold of each class reads these numbers in one pass, where each class's positions would take a pass to build and a gather to read.
+#[inline(never)]
+pub fn numbered_keys<K: Key>(x: &[K]) -> Option<Numbered> {
+    let (min, table, firsts) = numbered_table(x)?;
+    let (at, mut numbers) = (move |k: K| k.key().wrapping_sub(min) as usize, Vec::new());
+    if let [lower, _] = table[..] { crate::pairs(crate::Arg::Many(x), crate::Arg::One(()), x.len(), &mut numbers, |k, ()| ((at(k) ^ lower) as u32, true)); }
+    else { let table = &table[..]; crate::pairs(crate::Arg::Many(x), crate::Arg::One(()), x.len(), &mut numbers, |k, ()| (table[at(k)] as u32, true)); }
+    Some(Numbered { firsts, numbers })
 }
 
 /// The positions of `items` grouped by the group that `group` gives each item, keeping their order within each group, with the number in each of the `n` groups. `grouped` is the version for groups given as numbers.
@@ -791,41 +810,47 @@ macro_rules! key_pairs {
     };
 }
 
-/// The body of a search of one view: `Some(Ok($keys(x)))` for Booleans, integers and characters, `Some($floats(t, x, $check))` within the tolerance `$t` for floats, and `None` for complex numbers.
+/// The body of a search of one view: `Some(Ok($keys(x)))` for Booleans, integers and characters, `Some($floats(t, x))` within the tolerance `$t` for floats, and `None` for complex numbers.
 macro_rules! keys_or_floats {
-    ($x:expr, $t:expr, $check:expr, $keys:path, $floats:path) => {{
+    ($x:expr, $t:expr, $keys:path, $floats:path) => {{
         if let Some(found) = keys_of!($x, |x| $keys(x)) { return Some(Ok(found)); }
         let View::Floats(x) = $x else { return None };
-        Some(with_floats!(x, |x| crate::with_tolerance!($t, |t| $floats(t, x, $check))))
+        Some(with_floats!(x, |x| crate::with_tolerance!($t, |t| $floats(t, x))))
     }};
 }
 
-/// The class of each item of `x`, as the first position of an item that matches it: exactly for Booleans, integers and characters, through [`classes`], and within `t` for floats, through [`tolerant::classes_with`], which calls `check` as it goes. `None` for complex numbers.
-pub fn view_classes<E>(x: View<'_>, t: Tolerance, check: impl FnMut() -> Result<(), E>) -> Option<Result<Vec<u32>, E>> {
-    keys_or_floats!(x, t, check, classes, tolerant::classes_with)
+/// The class of each item of `x`, as the first position of an item that matches it: exactly for Booleans, integers and characters, through [`classes`], and within `t` for floats, through [`tolerant::classes`], which checks for an interrupt as it goes. `None` for complex numbers.
+pub fn view_classes(x: View<'_>, t: Tolerance) -> Option<Result<Vec<u32>, Error>> {
+    keys_or_floats!(x, t, classes, tolerant::classes)
 }
 
 /// Whether each item of `x` is the first of its class, as [`view_classes`] matches them. `None` for complex numbers.
-pub fn view_firsts<E>(x: View<'_>, t: Tolerance, check: impl FnMut() -> Result<(), E>) -> Option<Result<Vec<bool>, E>> {
-    keys_or_floats!(x, t, check, firsts, tolerant::firsts_with)
+pub fn view_firsts(x: View<'_>, t: Tolerance) -> Option<Result<Vec<bool>, Error>> {
+    keys_or_floats!(x, t, firsts, tolerant::firsts)
 }
 
 /// The size of each class of `x`, in order of first position, as [`view_classes`] matches them. Booleans, integers and characters that span a table count from it, as [`class_counts`] does. `None` for complex numbers.
-pub fn view_class_counts<E>(x: View<'_>, t: Tolerance, check: impl FnMut() -> Result<(), E>) -> Option<Result<Vec<usize>, E>> {
+pub fn view_class_counts(x: View<'_>, t: Tolerance) -> Option<Result<Vec<usize>, Error>> {
     if let Some(counts) = keys_of!(x, |x| class_counts(x)) { return Some(Ok(counts)); }
-    Some(view_classes(x, t, check)?.map(|classes| numbered(&classes).counts))
+    Some(view_classes(x, t)?.map(|classes| numbered(&classes).counts()))
 }
 
 /// The classes of `x`, as [`view_classes`] matches them, numbered in order of first position, with the positions of each. Booleans, integers and characters that span a table group straight from it, as [`grouped_keys`] does. `None` for complex numbers.
-pub fn view_grouped<E>(x: View<'_>, t: Tolerance, check: impl FnMut() -> Result<(), E>) -> Option<Result<Grouped, E>> {
+pub fn view_grouped(x: View<'_>, t: Tolerance) -> Option<Result<Grouped, Error>> {
     if let Some(Some(grouped)) = keys_of!(x, |x| grouped_keys(x)) { return Some(Ok(grouped)); }
-    Some(view_classes(x, t, check)?.map(|classes| { let Numbered { firsts, numbers, .. } = numbered(&classes); Grouped::new(firsts, &numbers) }))
+    Some(view_classes(x, t)?.map(|classes| { let Numbered { firsts, numbers, .. } = numbered(&classes); Grouped::new(firsts, &numbers) }))
 }
 
-/// For each item of `y`, the first position in `x` of an item that matches it, or the length of `x` where none does: exactly for Booleans, integers or characters of one kind, with integers of different widths read as `i64`, and within `t` for floats of one width, calling `check` as it goes. An integer haystack also takes `f64` needles when every needle is exactly whole and below [`tolerant::whole_limit`]. `None` for other pairs.
-pub fn view_index_of<E>(x: View<'_>, y: View<'_>, t: Tolerance, check: impl FnMut() -> Result<(), E>) -> Option<Result<Vec<u32>, E>> {
+/// The classes of `x`, as [`view_classes`] matches them, numbered in order of first position, with each item's class number. Booleans, integers and characters that span a table number straight from it, as [`numbered_keys`] does. `None` for complex numbers.
+pub fn view_numbered(x: View<'_>, t: Tolerance) -> Option<Result<Numbered, Error>> {
+    if let Some(Some(numbered)) = keys_of!(x, |x| numbered_keys(x)) { return Some(Ok(numbered)); }
+    Some(view_classes(x, t)?.map(|classes| numbered(&classes)))
+}
+
+/// For each item of `y`, the first position in `x` of an item that matches it, or the length of `x` where none does: exactly for Booleans, integers or characters of one kind, with integers of different widths read as `i64`, and within `t` for floats of one width, checking for an interrupt as it goes. An integer haystack also takes `f64` needles when every needle is exactly whole and below [`tolerant::whole_limit`]. `None` for other pairs.
+pub fn view_index_of(x: View<'_>, y: View<'_>, t: Tolerance) -> Option<Result<Vec<u32>, Error>> {
     if let (DType::Float(w), true) = (x.dtype(), x.dtype() == y.dtype()) {
-        return with_float_width!(w, F => Some(crate::with_tolerance!(t, |t| tolerant::index_of_with(t, F::of(x)?, F::of(y)?, check))));
+        return with_float_width!(w, F => Some(crate::with_tolerance!(t, |t| tolerant::index_of(t, F::of(x)?, F::of(y)?))));
     }
     if let (View::Integers(x), View::Floats(Floats::F64(y))) = (x, y) {
         return with_ints!(x, |x| whole_needles(x, y, t).map(Ok));
@@ -851,9 +876,9 @@ pub fn view_matches(x: View<'_>, y: View<'_>, t: Tolerance) -> Option<bool> {
 }
 
 /// Whether one of `cells` consecutive cells of `x` matches `y`. The caller checks cell shapes and aligns keys before searching, as [`view_member`] does.
-pub fn view_contains<E>(x: View<'_>, y: View<'_>, cells: usize, t: Tolerance, mut check: impl FnMut() -> Result<(), E>) -> Option<Result<bool, E>> {
+pub fn view_contains(x: View<'_>, y: View<'_>, cells: usize, t: Tolerance) -> Option<Result<bool, Error>> {
     if y.len() == 1 {
-        if let Some(found) = view_index_of(x, y, t, &mut check) { return Some(found.map(|found| (found[0] as usize) < cells)); }
+        if let Some(found) = view_index_of(x, y, t) { return Some(found.map(|found| (found[0] as usize) < cells)); }
     }
     for i in 0..cells {
         if i.is_multiple_of(crate::BETWEEN_CHECKS) { if let Err(e) = check() { return Some(Err(e)); } }
@@ -870,15 +895,15 @@ pub fn member_layout(layout: &Layout, query: &Layout) -> Result<Option<Layout>, 
     Ok(cell.matches(query).then_some(cell))
 }
 
-/// Whether `query` matches one major cell of `x`, as `≡` matches arrays, for compact items in row-major order. The query's layout must match a cell's ([`member_layout`]). Its items line up with the cell's by key. Items compare at the two views' common dtype, as [`view_matches`] compares them, and characters never match numbers. `check` runs as the search goes. A Rank error for a rank-0 `x`.
-pub fn view_member<E>(x: &Layout, xs: View<'_>, query: &Layout, ys: View<'_>, t: Tolerance, check: impl FnMut() -> Result<(), E>) -> Result<Result<bool, E>, Error> {
-    let Some(cell) = member_layout(x, query)? else { return Ok(Ok(false)) };
-    let Some(dtype) = xs.dtype().common(ys.dtype()) else { return Ok(Ok(false)) };
+/// Whether `query` matches one major cell of `x`, as `≡` matches arrays, for compact items in row-major order. The query's layout must match a cell's ([`member_layout`]). Its items line up with the cell's by key. Items compare at the two views' common dtype, as [`view_matches`] compares them, and characters never match numbers. It checks for an interrupt as the search goes. A Rank error for a rank-0 `x`.
+pub fn view_member(x: &Layout, xs: View<'_>, query: &Layout, ys: View<'_>, t: Tolerance) -> Result<bool, Error> {
+    let Some(cell) = member_layout(x, query)? else { return Ok(false) };
+    let Some(dtype) = xs.dtype().common(ys.dtype()) else { return Ok(false) };
     let haystack = ArrayView::compact(x, xs).cast(dtype)?;
     let axes: Vec<usize> = (0..cell.shape().len()).collect();
     let mapping = Mapping::new(query, &axes, &cell, ys.len());
     let needle = ArrayView::new(&cell, ys, &mapping).cast(dtype)?;
-    view_contains(haystack.view(), needle.view(), x.shape()[0], t, check).ok_or_else(|| Error::new(Kind::Domain, "membership can't compare these kinds"))
+    view_contains(haystack.view(), needle.view(), x.shape()[0], t).ok_or_else(|| Error::new(Kind::Domain, "membership can't compare these kinds"))?
 }
 
 /// Exact whole float needles small enough that tolerance cannot equate them with another integer. Other needles decline this integer fast path.
@@ -894,15 +919,15 @@ fn whole_needles<K: Key>(x: &[K], y: &[f64], t: Tolerance) -> Option<Vec<u32>> {
 pub enum Set { Union, Intersection, Difference }
 
 /// Unique values of a set operation on two views of one dtype. Shared searches do all matching; gathered output has no keys or names. `None` for unsupported pairs.
-pub fn view_set<E>(x: View<'_>, y: View<'_>, how: Set, t: Tolerance, mut check: impl FnMut() -> Result<(), E>) -> Option<Result<Buffer, E>> {
+pub fn view_set(x: View<'_>, y: View<'_>, how: Set, t: Tolerance) -> Option<Result<Buffer, Error>> {
     if x.dtype() != y.dtype() { return None; }
     let mut joined = Buffer::with_capacity(x.dtype(), if how == Set::Union { x.len() + y.len() } else { 0 });
     let values = if how == Set::Union {
         joined.extend_from(x, 0..x.len()); joined.extend_from(y, 0..y.len()); joined.view()
     } else { x };
-    let firsts = match view_firsts(values, t, &mut check)? { Ok(firsts) => firsts, Err(e) => return Some(Err(e)) };
+    let firsts = match view_firsts(values, t)? { Ok(firsts) => firsts, Err(e) => return Some(Err(e)) };
     let matches = if how == Set::Union { None } else {
-        match view_index_of(y, values, t, &mut check)? { Ok(found) => Some(found), Err(e) => return Some(Err(e)) }
+        match view_index_of(y, values, t)? { Ok(found) => Some(found), Err(e) => return Some(Err(e)) }
     };
     let positions: Vec<u32> = firsts.iter().enumerate().filter_map(|(i, &first)| {
         (first && matches.as_ref().is_none_or(|found| ((found[i] as usize) < y.len()) == (how == Set::Intersection))).then_some(i as u32)
@@ -931,22 +956,22 @@ pub fn view_bins_below(boundaries: View<'_>, values: View<'_>) -> Option<Vec<u32
 /// Runs an ordered operation at the view's item width, with `$key` bound to the items' order key where the closure names it. Complex numbers have no ordering.
 macro_rules! ordered_view {
     ($view:expr, |$x:ident| $body:expr) => {
-        Some(match $view {
-            View::Booleans($x) => $body,
-            View::Characters($x) => $body,
-            View::Integers(ints) => with_ints!(ints, |$x| $body),
-            View::Floats(floats) => with_floats!(floats, |$x| $body),
-            View::Complexes(_) => return None,
-        })
+        match $view {
+            View::Booleans($x) => Some($body),
+            View::Characters($x) => Some($body),
+            View::Integers(ints) => Some(with_ints!(ints, |$x| $body)),
+            View::Floats(floats) => Some(with_floats!(floats, |$x| $body)),
+            View::Complexes(_) => None,
+        }
     };
     ($view:expr, |$x:ident, $key:ident| $body:expr) => {
-        Some(match $view {
-            View::Booleans($x) => { let $key = SortKey::sort_key; $body },
-            View::Characters($x) => { let $key = SortKey::sort_key; $body },
-            View::Integers(ints) => with_ints!(ints, |$x| { let $key = SortKey::sort_key; $body }),
-            View::Floats(floats) => with_floats!(floats, |$x| { let $key = Float::order_key; $body }),
-            View::Complexes(_) => return None,
-        })
+        match $view {
+            View::Booleans($x) => { let $key = SortKey::sort_key; Some($body) },
+            View::Characters($x) => { let $key = SortKey::sort_key; Some($body) },
+            View::Integers(ints) => Some(with_ints!(ints, |$x| { let $key = SortKey::sort_key; $body })),
+            View::Floats(floats) => Some(with_floats!(floats, |$x| { let $key = Float::order_key; $body })),
+            View::Complexes(_) => None,
+        }
     };
 }
 
@@ -983,14 +1008,14 @@ pub fn view_lexgrade<'a>(n: usize, columns: impl Iterator<Item = (View<'a>, usiz
     Some(order)
 }
 
-/// Stable positions that order each lane of `[outer, len, inner]`, as [`view_lexgrade`] orders rows, laid out as the lanes' items are. Each column holds a key for every item, in primary-first order. `None` for complex keys.
-pub fn view_lexgrade_along(columns: &[View<'_>], dims @ [outer, len, inner]: [usize; 3], down: bool) -> Option<Vec<i64>> {
+/// Stable positions that order each lane of `[outer, len, inner]`, as [`view_lexgrade`] orders rows, laid out as the lanes' items are. Each column holds a key for every item, in primary-first order. `None` for complex keys. An interrupt stops a run of several lanes with the interrupt hook's error.
+pub fn view_lexgrade_along(columns: &[View<'_>], dims @ [outer, len, inner]: [usize; 3], down: bool) -> Result<Option<Vec<i64>>, Error> {
     let lane = |o: usize, i: usize| view_lexgrade(len, columns.iter().map(|&c| (c, o * len * inner + i, inner)), down);
-    if outer * inner == 1 { return Some(lane(0, 0)?.into_iter().map(i64::from).collect()); }
-    if columns.iter().any(|c| matches!(c, View::Complexes(_))) { return None; }
-    Some(lanes::<i64, ()>(dims, len, |o, i, out, ()| {
+    if outer * inner == 1 { return Ok(lane(0, 0).map(|g| g.into_iter().map(i64::from).collect())); }
+    if columns.iter().any(|c| matches!(c, View::Complexes(_))) { return Ok(None); }
+    Ok(Some(lanes::<i64, ()>(dims, len, |o, i, out, ()| {
         for (p, g) in out.iter_mut().zip(lane(o, i).expect("keys that order")) { *p = g.into(); }
-    }))
+    })?))
 }
 
 /// One column's order keys, contiguous or strided. A contiguous pass uses the same vectorized/threaded loop as vector grading.
@@ -1021,11 +1046,11 @@ fn spread_into<T: Element + Key>(x: &[T], out: &mut [T], down: bool) -> bool {
 }
 
 /// A sorted vector: one lane of `view_sort_along`.
-pub fn view_sort(x: View<'_>, down: bool) -> Option<Buffer> { view_sort_along(x, [1, x.len(), 1], down) }
+pub fn view_sort(x: View<'_>, down: bool) -> Result<Option<Buffer>, Error> { view_sort_along(x, [1, x.len(), 1], down) }
 
-/// Sorts each lane into its own output. A lane of 256 items or more whose values span a small table sorts by counting. Other lanes sort their items' `SortKey`s, computed once, by an unstable comparison sort below `value_radix_from` and by the radix sort from there, then write the items back from the keys. Equal keys come from equal items, so the result doesn't depend on how the sort orders them, and `¯0` comes before `0`. Lanes run through the shared stack scheduler, which reuses each thread's buffers. A single lane runs on the calling thread, where the radix sort can split its passes across threads. `None` for complex numbers.
-pub fn view_sort_along(x: View<'_>, dims: [usize; 3], down: bool) -> Option<Buffer> {
-    fn run<T: SortKey>(x: &[T], dims @ [outer, len, inner]: [usize; 3], down: bool) -> Buffer {
+/// Sorts each lane into its own output. A lane of 256 items or more whose values span a small table sorts by counting. Other lanes sort their items' `SortKey`s, computed once, by an unstable comparison sort below `value_radix_from` and by the radix sort from there, then write the items back from the keys. Equal keys come from equal items, so the result doesn't depend on how the sort orders them, and `¯0` comes before `0`. Lanes run through the shared stack scheduler, which reuses each thread's buffers. A single lane runs on the calling thread, where the radix sort can split its passes across threads. `None` for complex numbers. An interrupt stops a run of several lanes with the interrupt hook's error.
+pub fn view_sort_along(x: View<'_>, dims: [usize; 3], down: bool) -> Result<Option<Buffer>, Error> {
+    fn run<T: SortKey>(x: &[T], dims @ [outer, len, inner]: [usize; 3], down: bool) -> Result<Buffer, Error> {
         let sort = |lane: &[T], out: &mut [T], (keys, spare): &mut (Vec<T::Key>, Vec<T::Key>)| {
             if T::counted(lane, out, down) { return; }
             T::keys_into(lane, keys, down);
@@ -1036,13 +1061,13 @@ pub fn view_sort_along(x: View<'_>, dims: [usize; 3], down: bool) -> Option<Buff
             }
             T::write_back(keys, out, down);
         };
-        T::buffer(if outer * inner == 1 {
+        Ok(T::buffer(if outer * inner == 1 {
             let mut out = vec![T::FILL; len];
             sort(x, &mut out, &mut Default::default());
             out
-        } else { map_lanes::<_, _, (Vec<T::Key>, Vec<T::Key>)>(x, dims, len, |lane, out, work| sort(lane, out, work)) })
+        } else { map_lanes::<_, _, (Vec<T::Key>, Vec<T::Key>)>(x, dims, len, |lane, out, work| sort(lane, out, work))? }))
     }
-    ordered_view!(x, |x| run(x, dims, down))
+    ordered_view!(x, |x| run(x, dims, down)).transpose()
 }
 
 /// Places each of the sorted, distinct `ranks` at its sorted position, leaving the runs between them unordered. Ranks must be below `x.len()`.
@@ -1077,32 +1102,32 @@ pub fn view_argpartition(x: View<'_>, rank: usize) -> Option<Vec<u32>> {
     Some(out)
 }
 
-/// Partitions each lane around `rank` in its output buffer, comparing its items' `SortKey`s, computed once. Value partitioning writes the items back from the keys, and index partitioning writes i64 positions.
-pub fn view_partition_along(x: View<'_>, dims: [usize; 3], rank: usize, indices: bool) -> Option<Buffer> {
-    fn run<T: SortKey>(x: &[T], dims: [usize; 3], rank: usize, indices: bool) -> Buffer {
-        if indices { i64::buffer(map_lanes::<_, _, Vec<T::Key>>(x, dims, dims[1], |lane, out, keys| {
+/// Partitions each lane around `rank` in its output buffer, comparing its items' `SortKey`s, computed once. Value partitioning writes the items back from the keys, and index partitioning writes i64 positions. `None` for complex numbers. An interrupt stops it with the interrupt hook's error.
+pub fn view_partition_along(x: View<'_>, dims: [usize; 3], rank: usize, indices: bool) -> Result<Option<Buffer>, Error> {
+    fn run<T: SortKey>(x: &[T], dims: [usize; 3], rank: usize, indices: bool) -> Result<Buffer, Error> {
+        Ok(if indices { i64::buffer(map_lanes::<_, _, Vec<T::Key>>(x, dims, dims[1], |lane, out, keys| {
             T::keys_into(lane, keys, false);
             for (i, p) in out.iter_mut().enumerate() { *p = i as i64; }
             select(out, &[rank], |a, b| keys[*a as usize].cmp(&keys[*b as usize]));
-        })) } else { T::buffer(map_lanes::<_, _, Vec<T::Key>>(x, dims, dims[1], |lane, out, keys| {
+        })?) } else { T::buffer(map_lanes::<_, _, Vec<T::Key>>(x, dims, dims[1], |lane, out, keys| {
             T::keys_into(lane, keys, false);
             select(keys, &[rank], |a, b| a.cmp(b));
             T::write_back(keys, out, false);
-        })) }
+        })?) })
     }
-    ordered_view!(x, |x| run(x, dims, rank, indices))
+    ordered_view!(x, |x| run(x, dims, rank, indices)).transpose()
 }
 
-/// Only `range` of a stable grade, by selection followed by sorting the requested run. Original positions break ties because taking from a stable grade observes them.
-pub fn select_positions(n: usize, range: std::ops::Range<usize>, compare: impl Fn(usize, usize) -> Ordering + Copy) -> Vec<u32> {
-    if range.is_empty() { return Vec::new(); }
-    let compare = |&a: &u32, &b: &u32| compare(a as usize, b as usize).then_with(|| a.cmp(&b));
-    let mut order: Vec<u32> = (0..n as u32).collect();
-    let ranks = if range.start == range.end - 1 { vec![range.start] } else { vec![range.start, range.end - 1] };
-    select(&mut order, &ranks, compare);
-    let mut selected = order[range].to_vec();
-    selected.sort_unstable_by(compare);
-    selected
+/// The positions of the items of `x` whose ranks in a stable grade, ascending or descending where `down`, fall in `range`, in rank order. It selects the run's ends among (key, position) pairs, then sorts the run, without ordering the rest. Positions break ties because taking from a stable grade observes them. `None` for complex numbers.
+pub fn view_selected(x: View<'_>, range: std::ops::Range<usize>, down: bool) -> Option<Vec<u32>> {
+    let flip = if down { u64::MAX } else { 0 };
+    let mut pairs: Vec<(u64, u32)> = ordered_view!(x, |x, key| x.iter().enumerate().map(|(i, &v)| (key(v).word() ^ flip, i as u32)).collect())?;
+    let mut ranks = if range.is_empty() { Vec::new() } else { vec![range.start, range.end - 1] };
+    ranks.dedup();
+    select(&mut pairs, &ranks, Ord::cmp);
+    let run = &mut pairs[range];
+    run.sort_unstable();
+    Some(run.iter().map(|&(_, i)| i).collect())
 }
 
 /// The first minimum or maximum position of each lane, without gathering lanes or allocating a result per lane. Comparisons use sorting's NaN-last order.
@@ -1167,23 +1192,23 @@ pub fn quantiles<F: Float>(x: &mut [F], probabilities: &[f64]) -> Result<Vec<F>,
     Ok(out)
 }
 
-/// Quantiles of each lane, with a leading probability axis. Integers select exactly before converting the selected values to f64; floats keep their width. `None` for complex numbers, which have no order. A probability outside `[0, 1]`, or NaN, gives a Domain error.
+/// Quantiles of each lane, with a leading probability axis. Integers select exactly before converting the selected values to f64; floats keep their width. `None` for complex numbers, which have no order. A probability outside `[0, 1]`, or NaN, gives a Domain error, and an interrupt the interrupt hook's error.
 pub fn view_quantiles_along(x: View<'_>, dims @ [outer, _, inner]: [usize; 3], probabilities: &[f64]) -> Result<Option<Buffer>, Error> {
     use crate::buffer::Source;
-    fn run<T: SortKey, F: Element + Float + Default>(x: &[T], dims: [usize; 3], plan: &Quantiles, read: impl Fn(T) -> F::Working + Sync) -> Vec<F> {
+    fn run<T: SortKey, F: Element + Float + Default>(x: &[T], dims: [usize; 3], plan: &Quantiles, read: impl Fn(T) -> F::Working + Sync) -> Result<Vec<F>, Error> {
         map_lanes::<_, _, Vec<T::Key>>(x, dims, plan.points.len(), |lane, out, keys| {
             T::keys_into(lane, keys, false);
             plan.apply(keys, out, |a, b| a.cmp(b), |k| read(T::from_sort_key(k)));
         })
     }
-    fn floats<F: Element + Float + Default>(x: &[F], dims: [usize; 3], plan: &Quantiles) -> Buffer {
-        F::buffer(run::<_, F>(x, dims, plan, Float::working))
+    fn floats<F: Element + Float + Default>(x: &[F], dims: [usize; 3], plan: &Quantiles) -> Result<Buffer, Error> {
+        Ok(F::buffer(run::<_, F>(x, dims, plan, Float::working)?))
     }
     let plan = Quantiles::new(dims[1], probabilities)?;
     let items = match x {
-        View::Booleans(x) => f64::buffer(run::<_, f64>(x, dims, &plan, Source::<f64>::read)),
-        View::Integers(ints) => with_ints!(ints, |x| f64::buffer(run::<_, f64>(x, dims, &plan, Source::<f64>::read))),
-        View::Floats(x) => with_floats!(x, |x| floats(x, dims, &plan)), _ => return Ok(None),
+        View::Booleans(x) => f64::buffer(run::<_, f64>(x, dims, &plan, Source::<f64>::read)?),
+        View::Integers(ints) => with_ints!(ints, |x| f64::buffer(run::<_, f64>(x, dims, &plan, Source::<f64>::read)?)),
+        View::Floats(x) => with_floats!(x, |x| floats(x, dims, &plan)?), _ => return Ok(None),
     };
     let count = probabilities.len();
     Ok(Some(if count > 1 && outer > 1 {
@@ -1194,7 +1219,7 @@ pub fn view_quantiles_along(x: View<'_>, dims @ [outer, _, inner]: [usize; 3], p
 
 /// Maps lanes of `x` through `lanes`. Only strided inputs need a gathered lane.
 fn map_lanes<T: Copy + Sync, U: Element + Default, S: Default>(x: &[T], dims @ [_, len, inner]: [usize; 3], width: usize,
-    map: impl Fn(&[T], &mut [U], &mut S) + Sync) -> Vec<U> {
+    map: impl Fn(&[T], &mut [U], &mut S) + Sync) -> Result<Vec<U>, Error> {
     lanes::<U, (Vec<T>, S)>(dims, width, |o, i, out, (input, work)| {
         let input = if inner == 1 { &x[o * len..(o + 1) * len] } else {
             input.clear();
@@ -1205,15 +1230,15 @@ fn map_lanes<T: Copy + Sync, U: Element + Default, S: Default>(x: &[T], dims @ [
     })
 }
 
-/// `width` results for each lane `(o, i)` of `[outer, len, inner]`, from `fill` through the shared stack scheduler, laid out as the lanes' items are, with the inner axis last. Each callback fills its output slice and reuses its scratch.
-fn lanes<U: Element + Default, S: Default>([outer, _, inner]: [usize; 3], width: usize, fill: impl Fn(usize, usize, &mut [U], &mut S) + Sync) -> Vec<U> {
-    if outer * inner * width == 0 { return Vec::new(); }
-    let out = crate::parallel::stack::<U, S, std::convert::Infallible>(outer * inner, width, &|lane, out, work| fill(lane / inner, lane % inner, out, work), || Ok(())).unwrap();
-    if inner == 1 || width == 1 { return out; }
+/// `width` results for each lane `(o, i)` of `[outer, len, inner]`, from `fill` through the shared stack scheduler, laid out as the lanes' items are, with the inner axis last. Each callback fills its output slice and reuses its scratch. An interrupt stops it with the interrupt hook's error.
+fn lanes<U: Element + Default, S: Default>([outer, _, inner]: [usize; 3], width: usize, fill: impl Fn(usize, usize, &mut [U], &mut S) + Sync) -> Result<Vec<U>, Error> {
+    if outer * inner * width == 0 { return Ok(Vec::new()); }
+    let ((out,), _) = crate::parallel::stack::<(Vec<U>,), S>(outer * inner, [width], &|lane, (out,), work| { fill(lane / inner, lane % inner, out, work); true })?;
+    if inner == 1 || width == 1 { return Ok(out); }
     let mut transposed = Vec::with_capacity(out.len());
     transposed.resize(out.len(), U::FILL);
     for o in 0..outer {
         crate::linalg::transpose_into(&out[o * inner * width..][..inner * width], width, &mut transposed[o * inner * width..][..inner * width], inner, [inner, width], |x| x);
     }
-    transposed
+    Ok(transposed)
 }

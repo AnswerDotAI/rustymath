@@ -1187,38 +1187,40 @@ mod exact {
 
     /// Row reduction, solves and determinants on exact rationals, checked against results worked out by hand.
     #[test]
-    fn exact_linear_algebra() {
+    fn exact_linear_algebra() -> Result<(), rustymath::error::Error> {
         let a = q(&[2, 1, 1, 3]);
-        assert_eq!(determinant(&a, 2), q(&[5])[0]);
-        assert_eq!(determinant(&q(&[1, 2, 2, 4]), 2), q(&[0])[0]);
-        assert_eq!(determinant::<BigRational>(&[], 0), q(&[1])[0]);
+        assert_eq!(determinant(&a, 2)?, q(&[5])[0]);
+        assert_eq!(determinant(&q(&[1, 2, 2, 4]), 2)?, q(&[0])[0]);
+        assert_eq!(determinant::<BigRational>(&[], 0)?, q(&[1])[0]);
         // A row swap negates: the determinant of [0 1; 1 0] is -1.
-        assert_eq!(determinant(&q(&[0, 1, 1, 0]), 2), q(&[-1])[0]);
-        let x = solve(&a, &q(&[3, 5]), [2, 2], 1);
+        assert_eq!(determinant(&q(&[0, 1, 1, 0]), 2)?, q(&[-1])[0]);
+        let x = solve(&a, &q(&[3, 5]), [2, 2], 1)?;
         assert_eq!(x, vec![BigRational::new(4.into(), 5.into()), BigRational::new(7.into(), 5.into())]);
         // A singular matrix: the least-norm solution of x + y = 2, 2x + 2y = 4 is (1, 1).
-        assert_eq!(solve(&q(&[1, 1, 2, 2]), &q(&[2, 4]), [2, 2], 1), q(&[1, 1]));
+        assert_eq!(solve(&q(&[1, 1, 2, 2]), &q(&[2, 4]), [2, 2], 1)?, q(&[1, 1]));
         // A wide matrix: the least-norm solution of x + y + z = 3 is (1, 1, 1).
-        assert_eq!(solve(&q(&[1, 1, 1]), &q(&[3]), [1, 3], 1), q(&[1, 1, 1]));
+        assert_eq!(solve(&q(&[1, 1, 1]), &q(&[3]), [1, 3], 1)?, q(&[1, 1, 1]));
         // The pseudoinverse of a column (1, 1) is the row (1/2, 1/2).
         let half = BigRational::new(1.into(), 2.into());
-        assert_eq!(pinv(&q(&[1, 1]), [2, 1]), vec![half.clone(), half.clone()]);
+        assert_eq!(pinv(&q(&[1, 1]), [2, 1])?, vec![half.clone(), half.clone()]);
         // An inverse exists only for a matrix of full rank.
-        assert_eq!(rustymath::linalg::exact::inverse(&q(&[1, 1, 2, 2]), 2), None);
-        assert_eq!(rustymath::linalg::exact::inverse(&q(&[2, 0, 0, 1]), 2), Some((vec![half, BigRational::default(), BigRational::default(), BigRational::from_integer(1.into())], BigRational::from_integer(2.into()))));
-        let e = echelon(q(&[1, 2, 3, 2, 4, 7]), [2, 3], 3);
+        assert_eq!(inverse(&q(&[1, 1, 2, 2]), 2)?, None);
+        assert_eq!(inverse(&q(&[2, 0, 0, 1]), 2)?, Some((vec![half, BigRational::default(), BigRational::default(), BigRational::from_integer(1.into())], BigRational::from_integer(2.into()))));
+        let e = echelon(q(&[1, 2, 3, 2, 4, 7]), [2, 3], 3)?;
         assert_eq!((e.pivots, e.rows), (vec![0, 2], q(&[1, 2, 0, 0, 0, 1])));
+        Ok(())
     }
 
     /// The permanent against its definition, a sum over permutations, and on the all-ones matrix, whose permanent is n!.
     #[test]
-    fn permanents() {
-        assert_eq!(permanent(&q(&[1, 2, 3, 4]), 2), q(&[10])[0]);
-        assert_eq!(permanent::<BigRational>(&[], 0), q(&[1])[0]);
+    fn permanents() -> Result<(), rustymath::error::Error> {
+        assert_eq!(permanent(&q(&[1, 2, 3, 4]), 2)?, q(&[10])[0]);
+        assert_eq!(permanent::<BigRational>(&[], 0)?, q(&[1])[0]);
         let a = q(&[2, -1, 3, 0, 5, 7, -2, 4, 1]);
         let by_definition: i64 = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]].iter()
             .map(|p: &[usize; 3]| (0..3).map(|i| [2, -1, 3, 0, 5, 7, -2, 4, 1][i * 3 + p[i]]).product::<i64>()).sum();
-        assert_eq!(permanent(&a, 3), q(&[by_definition])[0]);
-        assert_eq!(permanent(&vec![1.0f64; 36], 6), 720.0);
+        assert_eq!(permanent(&a, 3)?, q(&[by_definition])[0]);
+        assert_eq!(permanent(&vec![1.0f64; 36], 6)?, 720.0);
+        Ok(())
     }
 }

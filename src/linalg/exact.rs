@@ -1,6 +1,6 @@
-//! Linear algebra in any field, such as the exact rationals of `BigRational`: Gauss-Jordan row reduction with the solves, inverses and determinants built on it, and the permanent. Row reduction pivots on the first nonzero item of each column, which loses nothing in exact arithmetic. In floats it can lose all accuracy, so floats take [`lu`](super::lu) and the other decompositions, which pivot on the largest item. Each function has a `_with` form that calls `check` once for each column, or between groups of subsets for the permanent, and returns the check's error as soon as it gets one, as [`number_theory`](crate::number_theory)'s functions do.
+//! Linear algebra in any field, such as the exact rationals of `BigRational`: Gauss-Jordan row reduction with the solves, inverses and determinants built on it, and the permanent. Row reduction pivots on the first nonzero item of each column, which loses nothing in exact arithmetic. In floats it can lose all accuracy, so floats take [`lu`](super::lu) and the other decompositions, which pivot on the largest item. Each function checks for an interrupt once for each column, or between groups of subsets for the permanent, and returns its error as soon as it gets one, as [`number_theory`](crate::number_theory)'s functions do.
 use super::identity;
-use crate::{BETWEEN_CHECKS, field::{negated, sum, times}, ok};
+use crate::{BETWEEN_CHECKS, error::Error, field::{negated, sum, times}, interrupt::check};
 use num_traits::NumAssignRef;
 
 /// A matrix in reduced row echelon form, as [`echelon`] gives it.
@@ -14,8 +14,8 @@ pub struct Echelon<T> {
 }
 
 /// The reduced row echelon form of the `m`×`width` matrix `e`, reducing only its first `columns` columns.
-pub fn echelon_with<T: Clone + NumAssignRef, E>(
-    mut e: Vec<T>, [m, width]: [usize; 2], columns: usize, mut check: impl FnMut() -> Result<(), E>) -> Result<Echelon<T>, E> {
+pub fn echelon<T: Clone + NumAssignRef>(
+    mut e: Vec<T>, [m, width]: [usize; 2], columns: usize) -> Result<Echelon<T>, Error> {
     assert_eq!(e.len(), m * width, "`e` must hold `m`×`width` items");
     let (mut pivots, mut determinant) = (Vec::new(), T::one());
     for c in 0..columns.min(width) {
@@ -44,64 +44,54 @@ pub fn echelon_with<T: Clone + NumAssignRef, E>(
     Ok(Echelon { rows: e, pivots, determinant })
 }
 
-/// [`echelon_with`] with no check.
-pub fn echelon<T: Clone + NumAssignRef>(e: Vec<T>, size: [usize; 2], columns: usize) -> Echelon<T> { let Ok(e) = echelon_with(e, size, columns, ok); e }
 
 /// The determinant of the `n`×`n` matrix `a`.
-pub fn determinant_with<T: Clone + NumAssignRef, E>(a: &[T], n: usize, check: impl FnMut() -> Result<(), E>) -> Result<T, E> {
-    let e = echelon_with(a.to_vec(), [n, n], n, check)?;
+pub fn determinant<T: Clone + NumAssignRef>(a: &[T], n: usize) -> Result<T, Error> {
+    let e = echelon(a.to_vec(), [n, n], n)?;
     Ok(if e.pivots.len() < n { T::zero() } else { e.determinant })
 }
 
-/// [`determinant_with`] with no check.
-pub fn determinant<T: Clone + NumAssignRef>(a: &[T], n: usize) -> T { let Ok(d) = determinant_with(a, n, ok); d }
 
 /// The solution `x` of `c x = r` and the determinant of `c`, for the `n`×`n` matrix `c` and the `n`×`k` matrix `r`, from the echelon form of `[c r]`. `None` where `c` is singular.
-fn square_with<T: Clone + NumAssignRef, E>(c: &[T], r: &[T], n: usize, k: usize, check: impl FnMut() -> Result<(), E>) -> Result<Option<(Vec<T>, T)>, E> {
+fn square<T: Clone + NumAssignRef>(c: &[T], r: &[T], n: usize, k: usize) -> Result<Option<(Vec<T>, T)>, Error> {
     let joined = (0..n).flat_map(|i| c[i * n..(i + 1) * n].iter().chain(&r[i * k..(i + 1) * k]).cloned()).collect();
-    let e = echelon_with(joined, [n, n + k], n, check)?;
+    let e = echelon(joined, [n, n + k], n)?;
     Ok((e.pivots.len() == n).then(|| ((0..n * k).map(|ij| e.rows[ij / k * (n + k) + n + ij % k].clone()).collect(), e.determinant)))
 }
 
 /// The least-squares solution `x` of `a x = b` with the least norm, for the real `m`×`n` matrix `a` and the `m`×`k` matrix `b`, as an `n`×`k` matrix. A square `a` of full rank gives the exact solution. Otherwise `x` comes from a rank factorization `a = C F`, where `C` holds `a`'s pivot columns and `F` the nonzero rows of its echelon form: `x = Fᵀ (F Fᵀ)⁻¹ (Cᵀ C)⁻¹ Cᵀ b`.
-pub fn solve_with<T: Clone + NumAssignRef, E>(a: &[T], b: &[T], [m, n]: [usize; 2], k: usize, mut check: impl FnMut() -> Result<(), E>) -> Result<Vec<T>, E> {
+pub fn solve<T: Clone + NumAssignRef>(a: &[T], b: &[T], [m, n]: [usize; 2], k: usize) -> Result<Vec<T>, Error> {
     assert_eq!(a.len(), m * n, "`a` must hold `m`×`n` items");
     assert_eq!(b.len(), m * k, "`b` must hold `m`×`k` items");
-    if m == n { if let Some((x, _)) = square_with(a, b, n, k, &mut check)? { return Ok(x); } }
-    let Echelon { rows: f, pivots, .. } = echelon_with(a.to_vec(), [m, n], n, &mut check)?;
+    if m == n { if let Some((x, _)) = square(a, b, n, k)? { return Ok(x); } }
+    let Echelon { rows: f, pivots, .. } = echelon(a.to_vec(), [m, n], n)?;
     let r = pivots.len();
     let c = |row: usize, i: usize| &a[row * n + pivots[i]];
     let gram: Vec<T> = (0..r * r).map(|ij| sum((0..m).map(|row| times(c(row, ij / r), c(row, ij % r))))).collect();
     let y: Vec<T> = (0..r * k).map(|ij| sum((0..m).map(|row| times(c(row, ij / k), &b[row * k + ij % k])))).collect();
-    let z = square_with(&gram, &y, r, k, &mut check)?.expect("pivot columns are independent").0;
+    let z = square(&gram, &y, r, k)?.expect("pivot columns are independent").0;
     let rows: Vec<T> = (0..r * r).map(|ij| sum((0..n).map(|j| times(&f[ij / r * n + j], &f[ij % r * n + j])))).collect();
-    let w = square_with(&rows, &z, r, k, &mut check)?.expect("an echelon form's rows are independent").0;
+    let w = square(&rows, &z, r, k)?.expect("an echelon form's rows are independent").0;
     Ok((0..n * k).map(|ij| sum((0..r).map(|i| times(&f[i * n + ij / k], &w[i * k + ij % k])))).collect())
 }
 
-/// [`solve_with`] with no check.
-pub fn solve<T: Clone + NumAssignRef>(a: &[T], b: &[T], size: [usize; 2], k: usize) -> Vec<T> { let Ok(x) = solve_with(a, b, size, k, ok); x }
 
 /// The pseudoinverse of the real `m`×`n` matrix `a`, as an `n`×`m` matrix: its inverse where `a` is square and of full rank.
-pub fn pinv_with<T: Clone + NumAssignRef, E>(a: &[T], [m, n]: [usize; 2], check: impl FnMut() -> Result<(), E>) -> Result<Vec<T>, E> {
-    solve_with(a, &identity(m), [m, n], m, check)
+pub fn pinv<T: Clone + NumAssignRef>(a: &[T], [m, n]: [usize; 2]) -> Result<Vec<T>, Error> {
+    solve(a, &identity(m), [m, n], m)
 }
 
-/// [`pinv_with`] with no check.
-pub fn pinv<T: Clone + NumAssignRef>(a: &[T], size: [usize; 2]) -> Vec<T> { let Ok(x) = pinv_with(a, size, ok); x }
 
 /// The inverse of the `n`×`n` matrix `a` and its determinant, from one elimination, or `None` where `a` is singular or empty.
-pub fn inverse_with<T: Clone + NumAssignRef, E>(a: &[T], n: usize, check: impl FnMut() -> Result<(), E>) -> Result<Option<(Vec<T>, T)>, E> {
+pub fn inverse<T: Clone + NumAssignRef>(a: &[T], n: usize) -> Result<Option<(Vec<T>, T)>, Error> {
     assert_eq!(a.len(), n * n, "`a` must hold `n`×`n` items");
     if n == 0 { return Ok(None); }
-    square_with(a, &identity(n), n, n, check)
+    square(a, &identity(n), n, n)
 }
 
-/// [`inverse_with`] with no check.
-pub fn inverse<T: Clone + NumAssignRef>(a: &[T], n: usize) -> Option<(Vec<T>, T)> { let Ok(x) = inverse_with(a, n, ok); x }
 
 /// The permanent of the `n`×`n` matrix `a`: the determinant's sum over permutations, with every sign positive. It follows Ryser's formula, a sum over the subsets of the columns that visits them in Gray code order, so each step adds or removes one column. That takes about 2ⁿ n operations. Panics if `n` is 64 or more.
-pub fn permanent_with<T: Clone + NumAssignRef, E>(a: &[T], n: usize, mut check: impl FnMut() -> Result<(), E>) -> Result<T, E> {
+pub fn permanent<T: Clone + NumAssignRef>(a: &[T], n: usize) -> Result<T, Error> {
     assert_eq!(a.len(), n * n, "`a` must hold `n`×`n` items");
     assert!(n < 64, "the permanent takes fewer than 64 rows");
     // Each row's sum over the columns in the current subset.
@@ -120,5 +110,3 @@ pub fn permanent_with<T: Clone + NumAssignRef, E>(a: &[T], n: usize, mut check: 
     Ok(if n == 0 { T::one() } else { total })
 }
 
-/// [`permanent_with`] with no check.
-pub fn permanent<T: Clone + NumAssignRef>(a: &[T], n: usize) -> T { let Ok(p) = permanent_with(a, n, ok); p }

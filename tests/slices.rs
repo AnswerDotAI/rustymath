@@ -530,9 +530,9 @@ mod search {
         let x: Vec<i64> = (0..1000).map(|i| (i * 37 % 13) - 6).collect();
         for down in [false, true] {
             let order = view_grade(i64::view(&x), down).unwrap();
-            assert_eq!(i64::vec(view_sort(i64::view(&x), down).unwrap()).unwrap(), order.iter().map(|&i| x[i as usize]).collect::<Vec<_>>());
+            assert_eq!(i64::vec(view_sort(i64::view(&x), down).unwrap().unwrap()).unwrap(), order.iter().map(|&i| x[i as usize]).collect::<Vec<_>>());
             for range in [0..10, 495..505, 999..1000] {
-                let selected = select_positions(x.len(), range.clone(), |a, b| if down { x[b].cmp(&x[a]) } else { x[a].cmp(&x[b]) });
+                let selected = view_selected(i64::view(&x), range.clone(), down).unwrap();
                 assert_eq!(selected, order[range]);
             }
         }
@@ -551,7 +551,8 @@ mod search {
         // More than `SCANNED` needles build the index in place of scanning.
         let many: Vec<i32> = (0..20).map(|i| [10, 40, 30][i % 3]).collect();
         assert_eq!(index_of(&x, &many), (0..20).map(|i| [1, 4, 0][i % 3]).collect::<Vec<_>>());
-        assert_eq!(numbered(&classes(&x)), Numbered { firsts: vec![0, 1, 2], numbers: vec![0, 1, 2, 1], counts: vec![1, 2, 1] });
+        let n = numbered(&classes(&x));
+        assert_eq!((&n, n.counts()), (&Numbered { firsts: vec![0, 1, 2], numbers: vec![0, 1, 2, 1] }, vec![1, 2, 1]));
         assert_eq!(classes(&x), [0, 1, 2, 1]);
         assert_eq!(sort_rows(x.len(), vec![x.iter().map(|&v| v as u32).collect()]), [1, 3, 2, 0]);
         // 300 rows take the counting sort. Equal keys keep their order of position, also under complemented keys, which reverse it.
@@ -581,10 +582,11 @@ mod search {
         let together = |k: &[i32]| {
             let n = numbered(&classes(k));
             let mut each = vec![Vec::new(); n.firsts.len()];
-            for (i, &g) in n.numbers.iter().enumerate() { each[g].push(i as u32) }
+            for (i, &g) in n.numbers.iter().enumerate() { each[g as usize].push(i as u32) }
             let g = grouped_keys(k).expect("a table holds the keys");
             assert_eq!((&g.firsts, g.groups.each().collect::<Vec<_>>()), (&n.firsts, each.iter().map(Vec::as_slice).collect()));
-            assert_eq!(g.groups.into_buffers(), each);
+            let buffers = g.groups.into_buffers();
+            assert!(buffers == each || buffers == [each.concat()]);
         };
         together(&(0..300).map(|i| i32::from(i % 3 == 0)).collect::<Vec<_>>());
         together(&(0..300).map(|i| 3 + (i * 7 + 2) % 5).collect::<Vec<_>>());
@@ -618,9 +620,9 @@ mod search {
             }
         }
         let x = [1u8, 2, 1];
-        assert_eq!(view_index_of(u8::view(&x), f64::view(&[1., 256., -1., 2.]), Tolerance::DEFAULT, || Ok::<_, ()>(())).unwrap().unwrap(), [0, 3, 3, 1]);
-        assert!(view_index_of(u8::view(&x), f64::view(&[1. + 1e-15]), Tolerance::DEFAULT, || Ok::<_, ()>(())).is_none());
-        let groups = Grouped::new(vec![0, 1], &[0, 1, 0]);
+        assert_eq!(view_index_of(u8::view(&x), f64::view(&[1., 256., -1., 2.]), Tolerance::DEFAULT).unwrap().unwrap(), [0, 3, 3, 1]);
+        assert!(view_index_of(u8::view(&x), f64::view(&[1. + 1e-15]), Tolerance::DEFAULT).is_none());
+        let groups = numbered(&[0, 1, 0]);
         assert_eq!(groups.fold::<_, rustymath::reduce::Sum>(&[i64::MAX, 2, 1]), (vec![i64::MIN, 2], false));
         assert_eq!(find_with(&[2], &[2, 3], |i, j| Ok::<_, ()>([1, 2][i] == [1, 2, 1, 1, 2, 3][j])).unwrap(), [true, false, false, true, false, false]);
         assert_eq!(view_find(i16::view(&[1, 2]), &[2], u8::view(&[1, 2, 1, 1, 2, 3]), &[2, 3], Tolerance::EXACT), Some(vec![true, false, false, true, false, false]));
@@ -661,7 +663,7 @@ mod search {
             assert_eq!(sort_rows(n, vec![keys.clone()]), stable, "{threads}");
             assert_eq!(sort_rows(n, vec![keys.clone(), second.clone()]), rows, "{threads}");
             assert_eq!(index_of(&haystack, &needles), found, "{threads}");
-            by_threads.push(tolerant::index_of(Tolerance::DEFAULT, &floats, &near));
+            by_threads.push(tolerant::index_of(Tolerance::DEFAULT, &floats, &near).unwrap());
         }
         rustymath::parallel::set_threads(0);
         assert_eq!(by_threads[0], by_threads[1]);
@@ -891,8 +893,8 @@ mod tolerant {
             }).chain([F::nan(), F::infinity(), F::neg_infinity(), F::neg_zero()]).collect();
             let y: Vec<F> = x.iter().rev().copied().chain([F::narrow(7.0)]).collect();
             let brute: Vec<u32> = y.iter().map(|&v| x.iter().position(|&h| t.matches(h, v)).unwrap_or(x.len()) as u32).collect();
-            assert_eq!(index_of(t, &x, &y), brute, "{t:?}");
-            assert_eq!(index_of(t, &x, &y[..5]), brute[..5], "{t:?}, scanning");
+            assert_eq!(index_of(t, &x, &y).unwrap(), brute, "{t:?}");
+            assert_eq!(index_of(t, &x, &y[..5]).unwrap(), brute[..5], "{t:?}, scanning");
         }
         for t in [T, Tolerance::new(1e-3).unwrap(), Tolerance::new(0.3).unwrap()] {
             check::<f64>(t);
@@ -900,24 +902,24 @@ mod tolerant {
             check::<f16>(t);
         }
         let x = [0.3, 1.0, 0.1 + 0.2];
-        assert_eq!((index_of(T, &x, &[0.1 + 0.2, 2.0]), index_of(Exactly, &x, &[0.1 + 0.2, 2.0])), (vec![0, 3], vec![2, 3]));
+        assert_eq!((index_of(T, &x, &[0.1 + 0.2, 2.0]).unwrap(), index_of(Exactly, &x, &[0.1 + 0.2, 2.0]).unwrap()), (vec![0, 3], vec![2, 3]));
         // Floats that each equal a whole number index as integers. At a tolerance of 0.3, which makes 3 equal 4, `whole_limit` lets only 0 qualify, so the search falls back to buckets.
         let wx: Vec<f64> = (0..300u64).map(|i| (crate::support::random(i) % 50) as f64 - 25.0).collect();
         let wy: Vec<f64> = (0..40).map(|i| i as f64 - 30.0).collect();
         for t in [T, Tolerance::EXACT, Tolerance::new(0.3).unwrap()] {
             let brute: Vec<u32> = wy.iter().map(|&v| wx.iter().position(|&h| t.matches(h, v)).unwrap_or(wx.len()) as u32).collect();
-            assert_eq!(index_of(t, &wx, &wy), brute, "{t:?}");
+            assert_eq!(index_of(t, &wx, &wy).unwrap(), brute, "{t:?}");
         }
         // Floats near one whole number each equal it, but needn't equal each other. An indexed search finds only true matches, as a scan of 16 or fewer does.
         let near = [1.0 - 8e-15, 1.0, 1.0 + 8e-15];
-        assert_eq!((index_of(T, &near[..1], &[near[2]; 17]), index_of(T, &near[..2], &[near[2]; 17])), (vec![1; 17], vec![1; 17]));
+        assert_eq!((index_of(T, &near[..1], &[near[2]; 17]).unwrap(), index_of(T, &near[..2], &[near[2]; 17]).unwrap()), (vec![1; 17], vec![1; 17]));
         let ints: Vec<i64> = wx.iter().map(|&v| v as i64).collect();
-        assert_eq!((classes(T, &wx), firsts(T, &wx)), (search::classes(&ints), search::firsts(&ints)));
+        assert_eq!((classes(T, &wx).unwrap(), firsts(T, &wx).unwrap()), (search::classes(&ints), search::firsts(&ints)));
     }
 }
 
 mod gather {
-    use rustymath::gather::{scatter, scatter_walk, walk, walk_range, Same, Steps};
+    use rustymath::{gather::{scatter, scatter_walk, walk, walk_range, Same, Steps}, structure::Walk};
     /// The items of `s` that `steps` reach from `base`, with -1 for a fill.
     fn read(s: &[i64], base: usize, steps: &[Steps]) -> Vec<i64> {
         let mut out = vec![];
@@ -1022,15 +1024,21 @@ mod gather {
             let (base, steps) = Steps::through(&outer, &shape, 5, &inner).expect("these reads compose");
             assert_eq!(read(&s, base, &steps), read(&array, 0, &outer));
         }
+        // A rotation of a fill-padded read composes where it carries only fill across the end, as `¯1⌽(n+2)↑v` does. Where it splits the source's items, no regular entry reads them.
+        let (shape, inner) = ([8], [Steps::clipped(0, 8, 6, 1)]);
+        let padded = read(&s, 5, &inner);
+        let (base, steps) = Steps::through(&[Steps::rotated(7, 8, 1)], &shape, 5, &inner).expect("only fill crosses the end");
+        assert_eq!(read(&s, base, &steps), read(&padded, 0, &[Steps::rotated(7, 8, 1)]));
+        assert!(Steps::through(&[Steps::rotated(1, 8, 1)], &shape, 5, &inner).is_none());
         // An entry over a frame of 2 by 3 splits into one entry for each axis, which read the same items.
         let tables = [along(6, 4), along(4, 1)];
         let (base, steps) = Steps::per_axis(&tables, &[2, 3, 4]).expect("a stride splits");
         assert_eq!(read(&s, base, &steps), read(&s, 0, &tables));
-        // `walked` moves a walked axis's position into the first entry along it, and leaves the position on an axis no entry walks in the base. A read that crosses a row, or a rotation over part of an axis, has no form by axis.
-        let (base, steps, axes) = Steps::walked(&[Steps::Stride { start: 12, len: 1, step: 0 }, along(3, 1)], &[3], &[4, 5]).expect("part of one row");
-        assert!(base == 10 && axes == [Some(1)] && matches!(steps[..], [Steps::Stride { start: 2, len: 3, step: 1 }]));
-        assert!(Steps::walked(&[Steps::Stride { start: 3, len: 1, step: 0 }, along(3, 1)], &[3], &[4, 5]).is_none());
-        assert!(Steps::walked(&[Steps::Stride { start: 2, len: 1, step: 0 }, Steps::Rotated { shift: 1, len: 6, stride: 1 }], &[6], &[10]).is_none());
+        // `Walk::new` moves a walked axis's position into the first entry along it, and leaves the position on an axis no entry walks in the base. A read that crosses a row, or a rotation over part of an axis, has no form by axis.
+        let walk = Walk::new(&[Steps::Stride { start: 12, len: 1, step: 0 }, along(3, 1)], &[3], &[4, 5]).expect("part of one row");
+        assert!(walk.base == 10 && walk.along == [Some(1)] && matches!(walk.steps[..], [Steps::Stride { start: 2, len: 3, step: 1 }]));
+        assert!(Walk::new(&[Steps::Stride { start: 3, len: 1, step: 0 }, along(3, 1)], &[3], &[4, 5]).is_none());
+        assert!(Walk::new(&[Steps::Stride { start: 2, len: 1, step: 0 }, Steps::Rotated { shift: 1, len: 6, stride: 1 }], &[6], &[10]).is_none());
         assert!(along(3, 0).spreads() && Steps::table(vec![1, 1]).spreads() && !Steps::Rotated { shift: 1, len: 4, stride: 1 }.spreads());
         assert!(Steps::rereads(&[along(8, 1), along(3, 1)], &[10]) && !Steps::rereads(&[along(10, 1)], &[10]));
     }
@@ -1076,9 +1084,10 @@ mod gather {
         }
         // Windows that move by 2 and a spread repeat items, which needs a scatter.
         assert!(Steps::transposed(&[along(3, 2), along(3, 1)], &[3, 3], &[7]).is_none() && Steps::transposed(&[along(3, 0)], &[3], &[2]).is_none());
-        // `windows_of` gives each window axis's frames, window size and move, and refuses windows that don't start at 0.
-        assert_eq!(Steps::windows_of(&[along(3, 6), along(4, 1), along(2, 6), along(3, 1)], &[3, 4, 2, 3], &[4, 6]), Some(vec![[3, 2, 1], [4, 3, 1]]));
-        assert_eq!(Steps::windows_of(&[along(3, 2), along(3, 1)], &[3, 3], &[7]), Some(vec![[3, 3, 2]]));
-        assert_eq!(Steps::windows_of(&[Steps::Stride { start: 2, len: 4, step: 1 }, along(3, 1)], &[4, 3], &[8]), None);
+        // `Walk::windows` gives each window axis's frames, window size and move, and refuses windows that don't start at 0.
+        let windows = |t: &[Steps], shape: &[usize], source: &[usize]| Walk::new(t, shape, source).and_then(|w| w.windows(source));
+        assert_eq!(windows(&[along(3, 6), along(4, 1), along(2, 6), along(3, 1)], &[3, 4, 2, 3], &[4, 6]), Some(vec![[3, 2, 1], [4, 3, 1]]));
+        assert_eq!(windows(&[along(3, 2), along(3, 1)], &[3, 3], &[7]), Some(vec![[3, 3, 2]]));
+        assert_eq!(windows(&[Steps::Stride { start: 2, len: 4, step: 1 }, along(3, 1)], &[4, 3], &[8]), None);
     }
 }

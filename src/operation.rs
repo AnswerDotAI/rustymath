@@ -7,7 +7,8 @@ use crate::buffer::{Buffer, DType, Element, FloatWidth, Source, View, Width};
 use crate::reduce::{Reduction, scan_along};
 use crate::slice::{Arg, Binary, Results, Ternary, Unary};
 use crate::linalg::Inner;
-use crate::parallel::{stack_with, Slots};
+use crate::parallel::{stack, Slots};
+use crate::error::Error;
 
 /// An object's kernel at one dtype for one argument: its result at each of `len` positions, which read the argument through the mapping, and whether every result succeeded.
 pub type UnaryKernel<K> = for<'a> fn(&K, View<'a>, &Mapping, usize) -> (Buffer, bool);
@@ -19,10 +20,10 @@ pub type TernaryKernel<K> = for<'a> fn(&K, [View<'a>; 3], &Agreement, &Agreement
 pub type AccumulationKernel<K> = for<'a> fn(&K, View<'a>, [usize; 3], Option<View<'a>>) -> (Buffer, bool);
 /// A reduction's folds of each window of a number of neighbouring rows along the middle of `[outer, len, inner]`, with that number.
 pub type SlidingKernel<K> = for<'a> fn(&K, View<'a>, [usize; 3], usize) -> (Buffer, bool);
-/// A matrix product's kernel at one dtype: the product of each pair of cells that the frames pair, each of sizes `[n, k, m]`, and whether every product fit. `check` runs between rounds of cells, and a `false` from it stops the products, which then give `None`.
-pub type ProductKernel<P> = for<'a> fn(&P, [View<'a>; 2], &Frames, [usize; 3], &mut dyn FnMut() -> bool) -> Option<(Buffer, bool)>;
+/// A matrix product's kernel at one dtype: the product of each pair of cells that the frames pair, each of sizes `[n, k, m]`, and whether every product fit. It checks for an interrupt between rounds of cells, and an interrupt's error stops the products.
+pub type ProductKernel<P> = for<'a> fn(&P, [View<'a>; 2], &Frames, [usize; 3]) -> Result<(Buffer, bool), Error>;
 /// An object's kernel at one dtype for combining items into an array in place, as [`Kernels::scatter`] describes.
-pub type ScatterKernel<K> = for<'a> fn(&K, &mut Buffer, &[usize], View<'a>) -> bool;
+pub type ScatterKernel<K> = for<'a> fn(&K, &mut Buffer, crate::gather::Writes<'a>, View<'a>) -> bool;
 
 /// An object's kernel at each dtype where it has one, in the order of [`DType::ALL`], with whether it leaves a failed result wrapped to its type.
 pub struct Kernels<F>([Option<(F, bool)>; DType::ALL.len()]);
@@ -120,18 +121,18 @@ impl<K> Kernels<SlidingKernel<K>> {
 }
 
 impl<P> Kernels<ProductKernel<P>> {
-    /// `p`'s products of the cells of `x` and `y`, which share a dtype and pair as `frames` says, each of sizes `[n, k, m]`, and whether every product fit. `None` where `p` has no kernel for their dtype, or where `check` stopped them.
-    pub fn product(&self, p: &P, [x, y]: [View<'_>; 2], frames: &Frames, size: [usize; 3], check: &mut dyn FnMut() -> bool) -> Option<(Buffer, bool)> {
+    /// `p`'s products of the cells of `x` and `y`, which share a dtype and pair as `frames` says, each of sizes `[n, k, m]`, and whether every product fit. `None` where `p` has no kernel for their dtype, and an error where an interrupt stopped them.
+    pub fn product(&self, p: &P, [x, y]: [View<'_>; 2], frames: &Frames, size: [usize; 3]) -> Option<Result<(Buffer, bool), Error>> {
         let (kernel, at) = self.chosen(x.dtype())?;
-        kernel(p, [cast(x, at, &mut None), cast(y, at, &mut None)], frames, size, check)
+        Some(kernel(p, [cast(x, at, &mut None), cast(y, at, &mut None)], frames, size))
     }
 }
 
 impl<K> Kernels<ScatterKernel<K>> {
-    /// Combines each item of `values`, or its only item, into the item of `out` at the matching offset by `k`, in turn. It gives whether every result succeeded. A failed result is written as `k`'s slice form writes it: wrapped to its type, or NaN. `values` reads at `out`'s dtype. `None` where `k` has no kernel at `out`'s dtype.
-    pub fn scatter(&self, k: &K, out: &mut Buffer, offsets: &[usize], values: View<'_>) -> Option<bool> {
+    /// Combines each item of `values`, or its only item, into the item of `out` at each of `writes` by `k`, in turn. It gives whether every result succeeded. A failed result is written as `k`'s slice form writes it: wrapped to its type, or NaN. `values` reads at `out`'s dtype. `None` where `k` has no kernel at `out`'s dtype.
+    pub fn scatter(&self, k: &K, out: &mut Buffer, writes: crate::gather::Writes<'_>, values: View<'_>) -> Option<bool> {
         let kernel = self.at(out.dtype())?;
-        Some(kernel(k, out, offsets, cast(values, out.dtype(), &mut None)))
+        Some(kernel(k, out, writes, cast(values, out.dtype(), &mut None)))
     }
 }
 
@@ -242,11 +243,11 @@ fn checked_step<K: Binary<T>, T: Copy>(k: &K, a: T, b: T, ok: &std::cell::Cell<b
     })
 }
 
-fn scatter_at<K: Binary<T, Out = T>, T: Element>(k: &K, out: &mut Buffer, offsets: &[usize], values: View<'_>) -> bool {
+fn scatter_at<K: Binary<T, Out = T>, T: Element>(k: &K, out: &mut Buffer, writes: crate::gather::Writes<'_>, values: View<'_>) -> bool {
     let ok = std::cell::Cell::new(true);
     let (out, values) = (T::of_mut(out).expect("the output has its kernel's dtype"), items::<T>(values));
     let step = |a, y| checked_step(k, a, y, &ok);
-    crate::gather::scatter_with(out, crate::gather::targets(offsets, Arg::of(values)), step);
+    writes.combine(out, Arg::of(values), step);
     ok.get()
 }
 
@@ -259,11 +260,11 @@ fn left_scan_at<K: Binary<T, Out: Element + Source<T>>, T: Element>(k: &K, x: Vi
     (T::buffer(out), ok.get())
 }
 
-fn product_at<P: Inner<T, Out: Element + Default> + Sync, T: Element>(p: &P, [x, y]: [View<'_>; 2], frames: &Frames, size @ [n, k, m]: [usize; 3], check: &mut dyn FnMut() -> bool) -> Option<(Buffer, bool)> {
+fn product_at<P: Inner<T, Out: Element + Default> + Sync, T: Element>(p: &P, [x, y]: [View<'_>; 2], frames: &Frames, size @ [n, k, m]: [usize; 3]) -> Result<(Buffer, bool), Error> {
     let (x, y) = (items::<T>(x), items::<T>(y));
-    let write = |i: usize, out: &mut [P::Out], _: &mut ()| p.checked_into(&x[frames.items(0, i, n * k)], &y[frames.items(1, i, k * m)], size, out);
-    let (out, ok) = stack_with(frames.count, n * m, &write, || if check() { Ok(()) } else { Err(()) }).ok()?;
-    Some((P::Out::buffer(out), ok))
+    let write = |i: usize, (out,): (&mut [P::Out],), _: &mut ()| p.checked_into(&x[frames.items(0, i, n * k)], &y[frames.items(1, i, k * m)], size, out);
+    let ((out,), ok) = stack::<(Vec<P::Out>,), ()>(frames.count, [n * m], &write)?;
+    Ok((P::Out::buffer(out), ok))
 }
 
 /// The machinery of [`kernels!`](crate::kernels), which tests a trait impl at each element type by autoref specialization. [`Found`] gives the kernel on `Probe` where the impl holds. Method lookup tries `Probe` before `&Probe`, so [`Missing`]'s `None` on `&Probe` applies only where it doesn't.

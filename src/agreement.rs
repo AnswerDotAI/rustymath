@@ -286,7 +286,7 @@ impl<L> Agreement<L> {
 }
 
 /// The frames of several arguments to a function of their trailing axes, such as a matrix function of the last two: the result's frame, as broadcasting pairs the arguments' frames, its number of cells, and each argument's cell under each of them.
-pub struct Frames { pub layout: Layout, pub count: usize, cells: Vec<Vec<usize>> }
+pub struct Frames { pub layout: Layout, pub count: usize, cells: Vec<Option<Vec<usize>>> }
 
 impl Frames {
     /// Pairs the frames of `args`, each a layout with the number of trailing axes in one of its cells. A Rank error where a layout has fewer axes than its cell, and a Length error where frames don't agree, or where keyed frames would need a cell that an argument lacks.
@@ -305,9 +305,11 @@ impl Frames {
             layout = a.layout;
         }
         let count = generated_len(layout.shape())?;
-        // Each chain maps a position of the result's frame back through every later pairing to its argument's own frame.
-        let cells = chains.iter().map(|chain| (0..count).map(|i| chain.iter().rev().try_fold(i, |j, m| m.get(j))).collect::<Option<Vec<_>>>()).collect::<Option<_>>()
-            .ok_or_else(|| Error::new(Kind::Length, "keyed frames need a cell that an argument lacks"))?;
+        // Each chain maps a position of the result's frame back through every later pairing to its argument's own frame. A chain of identities, an argument whose frame is the result's, needs no list.
+        let cells = chains.iter().map(|chain| {
+            if chain.iter().all(|m| *m == Mapping::Linear(1)) { return Some(None) }
+            (0..count).map(|i| chain.iter().rev().try_fold(i, |j, m| m.get(j))).collect::<Option<Vec<_>>>().map(Some)
+        }).collect::<Option<_>>().ok_or_else(|| Error::new(Kind::Length, "keyed frames need a cell that an argument lacks"))?;
         Ok(Self { layout, count, cells })
     }
 
@@ -315,9 +317,9 @@ impl Frames {
     #[inline]
     pub fn one() -> Self { Self { layout: Layout::EMPTY, count: 1, cells: Vec::new() } }
 
-    /// Argument `k`'s cell under position `i` of the result's frame. An argument with no list of cells, as in [`Frames::one`], has the result's frame.
+    /// Argument `k`'s cell under position `i` of the result's frame. An argument with no list of cells, as in [`Frames::one`] or where its frame is the result's, has the result's cell.
     #[inline]
-    pub fn cell(&self, k: usize, i: usize) -> usize { self.cells.get(k).map_or(i, |c| c[i]) }
+    pub fn cell(&self, k: usize, i: usize) -> usize { match self.cells.get(k) { Some(Some(c)) => c[i], _ => i } }
 
     /// The positions of the `per` items of argument `k`'s cell under position `i` of the result's frame, in an argument that holds its cells in order.
     #[inline]

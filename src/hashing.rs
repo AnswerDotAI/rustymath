@@ -1,4 +1,4 @@
-//! The hash maps and sets rustymath uses. `Hashing` is foldhash's fast `RandomState`, hashbrown's default hasher, with `hash_one` marked `#[inline(always)]`. hashbrown 0.17 hashes every key through `BuildHasher::hash_one`, and core's default body for it has no inline hint, so LTO-off builds can call it out of line on every lookup.
+//! The hash maps and sets rustymath uses. `Hashing` is foldhash's fast `RandomState`, hashbrown's default hasher, with `hash_one` marked `#[inline(always)]`. hashbrown 0.17 hashes every key through `BuildHasher::hash_one`, and core's default body for it has no inline hint, so incremental builds can call it out of line on every lookup.
 use std::hash::{BuildHasher, Hash, Hasher};
 
 #[derive(Clone, Default, Debug)]

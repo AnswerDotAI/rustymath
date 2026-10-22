@@ -1,11 +1,11 @@
 //! Python array interchange and selectors, shared by rustymath and basedpl. [`read`] borrows native contiguous buffers and normalizes other supported buffers. [`read_array`] preserves sibling-array metadata. [`export`] fills a `Py_buffer`, and [`lend`] fills one read-only for items that the export itself keeps alive. [`labels`] and [`frame`] read dict keys and data frames, [`selection`] decodes Python indexing, [`walk`] walks nested Python values, and [`py_err`] converts array errors to Python exceptions.
-use pyo3::exceptions::{PyBufferError, PyIndexError, PyOverflowError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyBufferError, PyIndexError, PyKeyboardInterrupt, PyOverflowError, PyTimeoutError, PyTypeError, PyValueError};
 use pyo3::{IntoPyObjectExt, ffi, prelude::*, types::{PyComplex, PyInt, PyList, PyString}};
 use rustymath::buffer::{Buffer, ComplexWidth, DType, Element, FloatWidth, View, Width};
 use rustymath::error::{Error, Kind};
 use rustymath::{layout::element_count, with_dtype};
 use std::ffi::{CStr, c_char, c_int, c_void};
-use std::{mem::size_of, ptr, slice, sync::Arc};
+use std::{mem::size_of, ptr, slice, sync::{Arc, Mutex}};
 
 pub mod frame;
 pub mod selection;
@@ -26,10 +26,22 @@ pub fn labels(labels: &Bound<'_, PyAny>) -> PyResult<Vec<Option<Arc<str>>>> {
     }).collect()
 }
 
-/// The Python exception for a rustymath error: `OverflowError` for Overflow, `IndexError` for Index, and `ValueError` for the other kinds.
+/// The exception that a signal handler raised during an interrupt check, which [`py_err`] raises for the check's Interrupt error.
+static RAISED: Mutex<Option<PyErr>> = Mutex::new(None);
+
+/// The Interrupt error that stops a computation at `e`, the exception that a signal handler raised during an interrupt check. [`py_err`] raises `e` for it.
+pub fn raised(e: PyErr) -> Error {
+    *RAISED.lock().expect("no panic while holding the raised exception") = Some(e);
+    Error::new(Kind::Interrupt, "interrupted by a signal")
+}
+
+/// The Python exception for a rustymath error: the exception that [`raised`] keeps, or `KeyboardInterrupt`, for Interrupt, `TimeoutError` for Timeout, `OverflowError` for Overflow, `IndexError` for Index, and `ValueError` for the other kinds.
 pub fn py_err(e: Error) -> PyErr {
     let text = e.to_string();
-    match e.kind { Kind::Overflow => PyOverflowError::new_err(text), Kind::Index => PyIndexError::new_err(text), _ => PyValueError::new_err(text) }
+    match e.kind {
+        Kind::Interrupt => RAISED.lock().expect("no panic while holding the raised exception").take().unwrap_or_else(|| PyKeyboardInterrupt::new_err(text)),
+        Kind::Timeout => PyTimeoutError::new_err(text), Kind::Overflow => PyOverflowError::new_err(text), Kind::Index => PyIndexError::new_err(text), _ => PyValueError::new_err(text)
+    }
 }
 
 /// Item `i` of `view` as a Python `bool`, `int`, `float`, `complex` or one-character `str`.

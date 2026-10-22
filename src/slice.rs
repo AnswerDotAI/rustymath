@@ -20,6 +20,9 @@ pub enum Arg<'a, T> { One(T), Many(&'a [T]) }
 impl<'a, T: Copy> Arg<'a, T> {
     /// The argument that `items` gives: its only item for every result when it holds one, otherwise one item for each result.
     pub fn of(items: &'a [T]) -> Self { if let [x] = *items { Arg::One(x) } else { Arg::Many(items) } }
+    /// Item `i` of this argument, or its one item.
+    #[inline(always)]
+    pub fn nth(self, i: usize) -> T { match self { Arg::One(v) => v, Arg::Many(s) => s[i] } }
     /// Items `start..start + n` of this argument, each converted by `f`. A `Many` argument converts into `buf`.
     #[inline]
     pub fn converted<'b, A: Send>(self, start: usize, n: usize, buf: &'b mut Vec<A>, f: impl Fn(T) -> A + Sync) -> Arg<'b, A> where T: Sync {
@@ -195,7 +198,7 @@ pub(crate) const fn wraps<K, E, O: Item, R: Outcome<O>, const N: usize>(_: fn(&K
 
 /// The items of `x` that result `i` takes.
 #[inline(always)]
-fn items<E: Copy, const N: usize>(x: &[Arg<'_, E>; N], i: usize) -> [E; N] { std::array::from_fn(|k| match x[k] { Arg::One(v) => v, Arg::Many(s) => s[i] }) }
+fn items<E: Copy, const N: usize>(x: &[Arg<'_, E>; N], i: usize) -> [E; N] { std::array::from_fn(|k| x[k].nth(i)) }
 
 /// Writes `f` for each of `n` results into `out`, for arguments `x`, and gives whether `f` said `true` for every result. One and two arguments run through [`pairs_into`], and three through `triples_into`, whose loops vectorize.
 #[inline(always)]

@@ -8,7 +8,7 @@ use crate::error::{Error, Kind};
 use crate::gather::Steps;
 use crate::layout::{Lanes, Layout};
 use crate::parallel::stack;
-use super::{exact, Lu, LuWork, Scalar, Svd};
+use super::{exact, Lu, LuWork, QrWork, Scalar, Svd};
 
 /// The int64 dtype of row positions and ranks.
 const I64: DType = DType::Integer(Width::I64);
@@ -36,6 +36,8 @@ macro_rules! stacked_doc {
     (svd_pinv) => { "The pseudoinverse of each matrix, from its thin SVD factors `u`, `s` and `v`, as `svd` gives them, using `lstsq`'s cutoff. A complex `s` is a Domain error." };
     (svdvals) => { "The singular values of each matrix, in descending order." };
     (matrix_rank) => { "The rank of each matrix: how many singular values exceed machine epsilon times the larger side times the largest, as `lstsq` counts them." };
+    (norm) => { "The norm of each matrix that `ord` names, as NumPy's `linalg.norm` names them: the largest sum of a column's magnitudes (`1`), the largest singular value (`2`), the largest sum of a row's magnitudes (`inf`), or the square root of the sum of the squared magnitudes (`\"fro\"`, the default in Python)." };
+    (cond) => { "The condition number of each matrix in the norm `p`, which `norm` names as its `ord`: the matrix's norm times its inverse's, as NumPy's `linalg.cond` defines it. The 2-norm, the default in Python, is the largest singular value over the smallest, for a matrix of any shape. Any other norm needs square matrices, and gives infinity for a matrix with a negligible LU pivot." };
     (eig) => { "The eigenvalues of each square matrix, in the order of its Schur form, and its unit eigenvectors in columns, both complex. A real matrix's complex pair comes as the one with a positive imaginary part, then its conjugate." };
     (eigvals) => { "The complex eigenvalues of each square matrix, in the order `eig` gives them." };
     (eigh) => { "The eigenvalues of each Hermitian matrix in ascending order, and its unit eigenvectors in columns, reading only the matrix's lower triangle." };
@@ -44,21 +46,23 @@ macro_rules! stacked_doc {
     (echelon) => { "The reduced row echelon form of one matrix: its nonzero rows, its pivot columns and the signed product of its pivots. With `columns`, it reduces only that many leading columns, or all of them where the matrix has fewer. It pivots on the first nonzero item, with no tolerance, so the decompositions give numerically stable solves of floats." };
 }
 
-/// The matrix functions of stacks. Each call computes in the dtype that rustymath's ladder gives its arguments, where exact numbers compute as floats of `float`, which the caller chooses by its own policy, as rustymath's Python API and basedpl each do. `check` runs between rounds of cells, and its error stops the call.
-pub struct Stacked<C> { float: FloatWidth, check: C }
+/// The matrix functions of stacks. Each call computes in the dtype that rustymath's ladder gives its arguments, where exact numbers compute as floats of `float`, which the caller chooses by its own policy, as rustymath's Python API and basedpl each do. Each call checks for an interrupt between rounds of cells, and an interrupt's error stops it.
+pub struct Stacked { float: FloatWidth }
 
-impl<C, E> Stacked<C> where C: FnMut() -> Result<(), E>, E: From<Error> {
+impl Stacked {
     /// Matrix functions where exact numbers compute as floats of `float`, the caller's policy.
-    pub fn new(float: FloatWidth, check: C) -> Self { Self { float, check } }
-
-    /// `f` of each cell of `frames`, in order, as [`cells`] runs it, checking with `check`.
-    pub fn run<R: Send, S: Default>(&mut self, frames: &Frames, f: impl Fn(usize, &mut S) -> R + Sync) -> Result<Vec<R>, E> {
-        cells(frames, &mut self.check, f)
-    }
+    pub fn new(float: FloatWidth) -> Self { Self { float } }
 
     /// The `per` items of each cell of `frames`, which `f` writes into the cell's slot of the output, with scratch `S` that a thread's cells share.
-    fn slots<B: Default + Send, S: Default>(&mut self, frames: &Frames, per: usize, f: impl Fn(usize, &mut [B], &mut S) + Sync) -> Result<Vec<B>, E> {
-        stack(frames.count, per, &f, &mut self.check)
+    fn slots<B: Clone + Default + Send + 'static, S: Default>(&self, frames: &Frames, per: usize, f: impl Fn(usize, &mut [B], &mut S) + Sync) -> Result<Vec<B>, Error> {
+        Ok(stack::<(Vec<B>,), S>(frames.count, [per], &|i, (out,), s| { f(i, out, s); true })?.0.0)
+    }
+
+    /// The stack `a` that the matrix function named `function` takes alone.
+    fn matrices<'a>(&self, function: &str, a: ArrayView<'a>) -> Result<Matrices<'a>, Error> {
+        let (compute, store) = self.dtypes(function, &[a])?;
+        let layout = a.layout();
+        Ok(Matrices { compute, store, layout, size: matrix(function, layout)?, frames: Frames::new(&[(layout, 2)])?, items: a.cast(compute)? })
     }
 
     /// The dtypes that a call of `function` on `args` computes in and gives its results at. It computes in the dtype that rustymath's ladder ([`DType::computes_in`]) gives the arguments' common dtype, where exact numbers compute as floats of the caller's width. Results take the common dtype where it's a float or complex dtype, and the computing dtype otherwise. A Domain error for characters.
@@ -71,7 +75,7 @@ impl<C, E> Stacked<C> where C: FnMut() -> Result<(), E>, E: From<Error> {
     }
 
     #[doc = crate::stacked_doc!(solve)]
-    pub fn solve(&mut self, a: ArrayView<'_>, b: ArrayView<'_>) -> Result<Array, E> {
+    pub fn solve(&self, a: ArrayView<'_>, b: ArrayView<'_>) -> Result<Array, Error> {
         let (compute, store) = self.dtypes("solve", &[a, b])?;
         let (la, lb) = (a.layout(), b.layout());
         let (ra, rb) = (la.shape().len(), lb.shape().len());
@@ -87,7 +91,7 @@ impl<C, E> Stacked<C> where C: FnMut() -> Result<(), E>, E: From<Error> {
     }
 
     #[doc = crate::stacked_doc!(lstsq)]
-    pub fn lstsq(&mut self, a: ArrayView<'_>, b: ArrayView<'_>) -> Result<(Array, Array), E> {
+    pub fn lstsq(&self, a: ArrayView<'_>, b: ArrayView<'_>) -> Result<(Array, Array), Error> {
         let (compute, store) = self.dtypes("lstsq", &[a, b])?;
         let (la, lb) = (a.layout(), b.layout());
         let (ra, rb) = (la.shape().len(), lb.shape().len());
@@ -97,19 +101,20 @@ impl<C, E> Stacked<C> where C: FnMut() -> Result<(), E>, E: From<Error> {
         let (ai, bi) = (a.cast(compute)?, paired(b.cast(compute)?, lb, rb - core, la, ra - 2, "lstsq")?);
         crate::with_inexact!(compute, T => {
             let (a, b) = (ai.of::<T>(), bi.of::<T>());
-            let (x, sv): (Vec<_>, Vec<_>) = self.run(&frames, |i, _: &mut ()| super::lstsq(&a[frames.items(0, i, m * n)], &b[frames.items(1, i, m * k)], [m, n], k))?.into_iter().unzip();
-            Ok((array(x.concat(), &frames.layout, solution(la.axes(ra - 1..ra), lb, vector), store)?, array(sv.concat(), &frames.layout, [m.min(n)], store.real())?))
+            let ((x, sv), _) = stack::<(Vec<T>, Vec<<T as Scalar>::Real>), ()>(frames.count, [n * k, m.min(n)], &|i, (x, sv), _| {
+                let (cx, cs) = super::lstsq(&a[frames.items(0, i, m * n)], &b[frames.items(1, i, m * k)], [m, n], k);
+                x.copy_from_slice(&cx);
+                sv.copy_from_slice(&cs);
+                true
+            })?;
+            Ok((array(x, &frames.layout, solution(la.axes(ra - 1..ra), lb, vector), store)?, array(sv, &frames.layout, [m.min(n)], store.real())?))
         })
     }
 
     #[doc = crate::stacked_doc!(pinv)]
-    pub fn pinv(&mut self, a: ArrayView<'_>) -> Result<Array, E> {
-        let (compute, store) = self.dtypes("pinv", &[a])?;
-        let la = a.layout();
+    pub fn pinv(&self, a: ArrayView<'_>) -> Result<Array, Error> {
+        let Matrices { compute, store, layout: la, size: [m, n], frames, items: ai } = self.matrices("pinv", a)?;
         let ra = la.shape().len();
-        let [m, n] = matrix("pinv", la)?;
-        let frames = Frames::new(&[(la, 2)])?;
-        let ai = a.cast(compute)?;
         crate::with_inexact!(compute, T => {
             let a = ai.of::<T>();
             let x = self.slots(&frames, m * n, |i, out: &mut [T], w: &mut LuWork<T>| w.pinv_into(&a[frames.items(0, i, m * n)], [m, n], out))?;
@@ -118,70 +123,61 @@ impl<C, E> Stacked<C> where C: FnMut() -> Result<(), E>, E: From<Error> {
     }
 
     #[doc = crate::stacked_doc!(det)]
-    pub fn det(&mut self, a: ArrayView<'_>) -> Result<Array, E> {
-        let (compute, store) = self.dtypes("det", &[a])?;
-        let la = a.layout();
-        let n = square("det", matrix("det", la)?)?;
-        let frames = Frames::new(&[(la, 2)])?;
-        let ai = a.cast(compute)?;
+    pub fn det(&self, a: ArrayView<'_>) -> Result<Array, Error> {
+        let Matrices { compute, store, size, frames, items: ai, .. } = self.matrices("det", a)?;
+        let n = square("det", size)?;
         crate::with_inexact!(compute, T => {
             let a = ai.of::<T>();
-            let d = self.run(&frames, |i, w: &mut LuWork<T>| w.factor(&a[frames.items(0, i, n * n)], n).determinant())?;
+            let d = self.slots(&frames, 1, |i, out: &mut [T], w: &mut LuWork<T>| out[0] = w.factor(&a[frames.items(0, i, n * n)], n).determinant())?;
             Ok(array(d, &frames.layout, Layout::EMPTY, store)?)
         })
     }
 
     #[doc = crate::stacked_doc!(inverse)]
-    pub fn inverse(&mut self, a: ArrayView<'_>) -> Result<Option<(Array, Array)>, E> {
-        let (compute, store) = self.dtypes("inverse", &[a])?;
-        let la = a.layout();
-        let ra = la.shape().len();
-        let n = square("inverse", matrix("inverse", la)?)?;
-        let frames = Frames::new(&[(la, 2)])?;
-        let ai = a.cast(compute)?;
+    pub fn inverse(&self, a: ArrayView<'_>) -> Result<Option<(Array, Array)>, Error> {
+        let Matrices { compute, store, layout: la, size, frames, items: ai } = self.matrices("inverse", a)?;
+        let (ra, n) = (la.shape().len(), square("inverse", size)?);
         crate::with_inexact!(compute, T => {
             let a = ai.of::<T>();
-            let cells = self.run(&frames, |i, w: &mut LuWork<T>| { let mut x = vec![T::default(); n * n]; w.inverse_into(&a[frames.items(0, i, n * n)], [n, n], &mut x).map(|d| (x, d)) })?;
-            Ok(match cells.into_iter().collect::<Option<Vec<_>>>() {
-                None => None,
-                Some(cells) => { let (x, d): (Vec<_>, Vec<_>) = cells.into_iter().unzip(); Some((array(x.concat(), &frames.layout, la.axes([ra - 1, ra - 2].into_iter()), store)?, array(d, &frames.layout, Layout::EMPTY, store)?)) }
-            })
+            let ((x, d), ok) = stack::<(Vec<T>, Vec<T>), LuWork<T>>(frames.count, [n * n, 1], &|i, (x, d), w| {
+                w.inverse_into(&a[frames.items(0, i, n * n)], [n, n], x).map(|det| d[0] = det).is_some()
+            })?;
+            Ok(if ok { Some((array(x, &frames.layout, la.axes([ra - 1, ra - 2].into_iter()), store)?, array(d, &frames.layout, Layout::EMPTY, store)?)) } else { None })
         })
     }
 
     #[doc = crate::stacked_doc!(slogdet)]
-    pub fn slogdet(&mut self, a: ArrayView<'_>) -> Result<(Array, Array), E> {
-        let (compute, store) = self.dtypes("slogdet", &[a])?;
-        let la = a.layout();
-        let n = square("slogdet", matrix("slogdet", la)?)?;
-        let frames = Frames::new(&[(la, 2)])?;
-        let ai = a.cast(compute)?;
+    pub fn slogdet(&self, a: ArrayView<'_>) -> Result<(Array, Array), Error> {
+        let Matrices { compute, store, size, frames, items: ai, .. } = self.matrices("slogdet", a)?;
+        let n = square("slogdet", size)?;
         crate::with_inexact!(compute, T => {
             let a = ai.of::<T>();
-            let (sign, log): (Vec<_>, Vec<_>) = self.run(&frames, |i, w: &mut LuWork<T>| w.factor(&a[frames.items(0, i, n * n)], n).log_determinant())?.into_iter().unzip();
+            let ((sign, log), _) = stack::<(Vec<T>, Vec<<T as Scalar>::Real>), LuWork<T>>(frames.count, [1, 1], &|i, (sign, log), w| {
+                (sign[0], log[0]) = w.factor(&a[frames.items(0, i, n * n)], n).log_determinant();
+                true
+            })?;
             Ok((array(sign, &frames.layout, Layout::EMPTY, store)?, array(log, &frames.layout, Layout::EMPTY, store.real())?))
         })
     }
 
     #[doc = crate::stacked_doc!(lu)]
-    pub fn lu(&mut self, a: ArrayView<'_>) -> Result<(Array, Array), E> {
-        let (compute, store) = self.dtypes("lu", &[a])?;
-        let la = a.layout();
-        let n = square("lu", matrix("lu", la)?)?;
-        let frames = Frames::new(&[(la, 2)])?;
-        let ai = a.cast(compute)?;
+    pub fn lu(&self, a: ArrayView<'_>) -> Result<(Array, Array), Error> {
+        let Matrices { compute, store, size, frames, items: ai, .. } = self.matrices("lu", a)?;
+        let n = square("lu", size)?;
         crate::with_inexact!(compute, T => {
             let a = ai.of::<T>();
-            let (factors, p): (Vec<_>, Vec<_>) = self.run(&frames, |i, w: &mut LuWork<T>| {
+            let ((factors, p), _) = stack::<(Vec<T>, Vec<i64>), LuWork<T>>(frames.count, [n * n, n], &|i, (factors, p), w| {
                 let f = w.factor(&a[frames.items(0, i, n * n)], n);
-                (f.factors.to_vec(), f.perm.iter().map(|&r| r as i64).collect::<Vec<_>>())
-            })?.into_iter().unzip();
-            Ok((array(factors.concat(), &frames.layout, [n, n], store)?, array(p.concat(), &frames.layout, [n], I64)?))
+                factors.copy_from_slice(&f.factors);
+                for (p, &r) in p.iter_mut().zip(f.perm.iter()) { *p = r as i64; }
+                true
+            })?;
+            Ok((array(factors, &frames.layout, [n, n], store)?, array(p, &frames.layout, [n], I64)?))
         })
     }
 
     #[doc = crate::stacked_doc!(lu_solve)]
-    pub fn lu_solve(&mut self, factors: ArrayView<'_>, p: ArrayView<'_>, b: ArrayView<'_>) -> Result<Array, E> {
+    pub fn lu_solve(&self, factors: ArrayView<'_>, p: ArrayView<'_>, b: ArrayView<'_>) -> Result<Array, Error> {
         let (compute, store) = self.dtypes("lu_solve", &[factors, b])?;
         let (lf, lb) = (factors.layout(), b.layout());
         let (n, positions) = factored("lu_solve", lf, p)?;
@@ -190,15 +186,15 @@ impl<C, E> Stacked<C> where C: FnMut() -> Result<(), E>, E: From<Error> {
         let (fi, bi) = (factors.cast(compute)?, b.cast(compute)?);
         crate::with_inexact!(compute, T => {
             let (a, b, p) = (fi.of::<T>(), bi.of::<T>(), &positions);
-            let x = self.run(&frames, |i, _: &mut ()| {
-                Lu::new(n, &a[frames.items(0, i, n * n)], &p[frames.items(1, i, n)]).solve(&b[frames.items(2, i, n * k)], k)
+            let x = self.slots(&frames, n * k, |i, out: &mut [T], _: &mut ()| {
+                out.copy_from_slice(&Lu::new(n, &a[frames.items(0, i, n * n)], &p[frames.items(1, i, n)]).solve(&b[frames.items(2, i, n * k)], k))
             })?;
-            Ok(array(x.concat(), &frames.layout, solution(Layout::from([n]), lb, vector), store)?)
+            Ok(array(x, &frames.layout, solution(Layout::from([n]), lb, vector), store)?)
         })
     }
 
     #[doc = crate::stacked_doc!(lu_inverse)]
-    pub fn lu_inverse(&mut self, factors: ArrayView<'_>, p: ArrayView<'_>) -> Result<Array, E> {
+    pub fn lu_inverse(&self, factors: ArrayView<'_>, p: ArrayView<'_>) -> Result<Array, Error> {
         let (compute, store) = self.dtypes("lu_inverse", &[factors])?;
         let lf = factors.layout();
         let (n, positions) = factored("lu_inverse", lf, p)?;
@@ -206,13 +202,13 @@ impl<C, E> Stacked<C> where C: FnMut() -> Result<(), E>, E: From<Error> {
         let fi = factors.cast(compute)?;
         crate::with_inexact!(compute, T => {
             let (a, p) = (fi.of::<T>(), &positions);
-            let x = self.run(&frames, |i, _: &mut ()| Lu::new(n, &a[frames.items(0, i, n * n)], &p[frames.items(1, i, n)]).inverse())?;
-            Ok(array(x.concat(), &frames.layout, [n, n], store)?)
+            let x = self.slots(&frames, n * n, |i, out: &mut [T], _: &mut ()| out.copy_from_slice(&Lu::new(n, &a[frames.items(0, i, n * n)], &p[frames.items(1, i, n)]).inverse()))?;
+            Ok(array(x, &frames.layout, [n, n], store)?)
         })
     }
 
     #[doc = crate::stacked_doc!(lu_det)]
-    pub fn lu_det(&mut self, factors: ArrayView<'_>, p: ArrayView<'_>) -> Result<Array, E> {
+    pub fn lu_det(&self, factors: ArrayView<'_>, p: ArrayView<'_>) -> Result<Array, Error> {
         let (compute, store) = self.dtypes("lu_det", &[factors])?;
         let lf = factors.layout();
         let (n, positions) = factored("lu_det", lf, p)?;
@@ -220,13 +216,13 @@ impl<C, E> Stacked<C> where C: FnMut() -> Result<(), E>, E: From<Error> {
         let fi = factors.cast(compute)?;
         crate::with_inexact!(compute, T => {
             let (a, p) = (fi.of::<T>(), &positions);
-            let d = self.run(&frames, |i, _: &mut ()| Lu::new(n, &a[frames.items(0, i, n * n)], &p[frames.items(1, i, n)]).determinant())?;
+            let d = self.slots(&frames, 1, |i, out: &mut [T], _: &mut ()| out[0] = Lu::new(n, &a[frames.items(0, i, n * n)], &p[frames.items(1, i, n)]).determinant())?;
             Ok(array(d, &frames.layout, Layout::EMPTY, store)?)
         })
     }
 
     #[doc = crate::stacked_doc!(lu_slogdet)]
-    pub fn lu_slogdet(&mut self, factors: ArrayView<'_>, p: ArrayView<'_>) -> Result<(Array, Array), E> {
+    pub fn lu_slogdet(&self, factors: ArrayView<'_>, p: ArrayView<'_>) -> Result<(Array, Array), Error> {
         let (compute, store) = self.dtypes("lu_slogdet", &[factors])?;
         let lf = factors.layout();
         let (n, positions) = factored("lu_slogdet", lf, p)?;
@@ -234,91 +230,80 @@ impl<C, E> Stacked<C> where C: FnMut() -> Result<(), E>, E: From<Error> {
         let fi = factors.cast(compute)?;
         crate::with_inexact!(compute, T => {
             let (a, p) = (fi.of::<T>(), &positions);
-            let (sign, log): (Vec<_>, Vec<_>) = self.run(&frames, |i, _: &mut ()| {
-                Lu::new(n, &a[frames.items(0, i, n * n)], &p[frames.items(1, i, n)]).log_determinant()
-            })?.into_iter().unzip();
+            let ((sign, log), _) = stack::<(Vec<T>, Vec<<T as Scalar>::Real>), ()>(frames.count, [1, 1], &|i, (sign, log), _| {
+                (sign[0], log[0]) = Lu::new(n, &a[frames.items(0, i, n * n)], &p[frames.items(1, i, n)]).log_determinant();
+                true
+            })?;
             Ok((array(sign, &frames.layout, Layout::EMPTY, store)?, array(log, &frames.layout, Layout::EMPTY, store.real())?))
         })
     }
 
     #[doc = crate::stacked_doc!(lu_lower)]
-    pub fn lu_lower(&mut self, factors: ArrayView<'_>) -> Result<Array, E> { self.triangle("lu_lower", factors, true) }
+    pub fn lu_lower(&self, factors: ArrayView<'_>) -> Result<Array, Error> { self.triangle("lu_lower", factors, true) }
 
     #[doc = crate::stacked_doc!(lu_upper)]
-    pub fn lu_upper(&mut self, factors: ArrayView<'_>) -> Result<Array, E> { self.triangle("lu_upper", factors, false) }
+    pub fn lu_upper(&self, factors: ArrayView<'_>) -> Result<Array, Error> { self.triangle("lu_upper", factors, false) }
 
     /// The unit lower triangle `l` or the upper triangle `u` of each matrix's packed LU factors.
-    fn triangle(&mut self, function: &str, factors: ArrayView<'_>, lower: bool) -> Result<Array, E> {
-        let (compute, store) = self.dtypes(function, &[factors])?;
-        let lf = factors.layout();
-        let n = square(function, matrix(function, lf)?)?;
-        let frames = Frames::new(&[(lf, 2)])?;
-        let fi = factors.cast(compute)?;
+    fn triangle(&self, function: &str, factors: ArrayView<'_>, lower: bool) -> Result<Array, Error> {
+        let Matrices { compute, store, size, frames, items: fi, .. } = self.matrices(function, factors)?;
+        let n = square(function, size)?;
         crate::with_inexact!(compute, T => {
             let a = fi.of::<T>();
-            let x = self.run(&frames, |i, _: &mut ()| {
+            let x = self.slots(&frames, n * n, |i, out: &mut [T], _: &mut ()| {
                 let f = Lu::new(n, &a[frames.items(0, i, n * n)], &[][..]);
-                if lower { f.lower() } else { f.upper() }
+                out.copy_from_slice(&if lower { f.lower() } else { f.upper() })
             })?;
-            Ok(array(x.concat(), &frames.layout, [n, n], store)?)
+            Ok(array(x, &frames.layout, [n, n], store)?)
         })
     }
 
     #[doc = crate::stacked_doc!(cholesky)]
-    pub fn cholesky(&mut self, a: ArrayView<'_>) -> Result<Array, E> {
-        let (compute, store) = self.dtypes("cholesky", &[a])?;
-        let la = a.layout();
-        let n = square("cholesky", matrix("cholesky", la)?)?;
-        let frames = Frames::new(&[(la, 2)])?;
-        let ai = a.cast(compute)?;
+    pub fn cholesky(&self, a: ArrayView<'_>) -> Result<Array, Error> {
+        let Matrices { compute, store, size, frames, items: ai, .. } = self.matrices("cholesky", a)?;
+        let n = square("cholesky", size)?;
         crate::with_inexact!(compute, T => {
             let a = ai.of::<T>();
-            let l = self.run(&frames, |i, _: &mut ()| super::cholesky(&a[frames.items(0, i, n * n)], n).unwrap_or_else(|| nans(n * n)))?;
-            Ok(array(l.concat(), &frames.layout, [n, n], store)?)
+            let l = self.slots(&frames, n * n, |i, out: &mut [T], _: &mut ()| match super::cholesky(&a[frames.items(0, i, n * n)], n) {
+                Some(l) => out.copy_from_slice(&l),
+                None => out.fill(T::from_real(<T as Scalar>::Real::nan())),
+            })?;
+            Ok(array(l, &frames.layout, [n, n], store)?)
         })
     }
 
     #[doc = crate::stacked_doc!(qr)]
-    pub fn qr(&mut self, a: ArrayView<'_>, complete: bool) -> Result<(Array, Array), E> {
-        let (compute, store) = self.dtypes("qr", &[a])?;
-        let la = a.layout();
-        let [m, n] = matrix("qr", la)?;
+    pub fn qr(&self, a: ArrayView<'_>, complete: bool) -> Result<(Array, Array), Error> {
+        let Matrices { compute, store, size: [m, n], frames, items: ai, .. } = self.matrices("qr", a)?;
         let rows = if complete { m } else { m.min(n) };
-        let frames = Frames::new(&[(la, 2)])?;
-        let ai = a.cast(compute)?;
         crate::with_inexact!(compute, T => {
             let a = ai.of::<T>();
-            let (q, r): (Vec<_>, Vec<_>) = self.run(&frames, |i, _: &mut ()| {
-                let x = &a[frames.items(0, i, m * n)];
-                if complete { super::qr_complete(x, [m, n]) } else { super::qr(x, [m, n]) }
-            })?.into_iter().unzip();
-            Ok((array(q.concat(), &frames.layout, [m, rows], store)?, array(r.concat(), &frames.layout, [rows, n], store)?))
+            let qr = |i: usize, (q, r): (&mut [T], &mut [T]), w: &mut QrWork<T>| { w.qr_into(&a[frames.items(0, i, m * n)], [m, n], complete, q, r); true };
+            let ((q, r), _) = stack::<(Vec<T>, Vec<T>), _>(frames.count, [m * rows, rows * n], &qr)?;
+            Ok((array(q, &frames.layout, [m, rows], store)?, array(r, &frames.layout, [rows, n], store)?))
         })
     }
 
     #[doc = crate::stacked_doc!(svd)]
-    pub fn svd(&mut self, a: ArrayView<'_>, rank: Option<usize>) -> Result<(Array, Array, Array), E> {
-        let (compute, store) = self.dtypes("svd", &[a])?;
-        let la = a.layout();
-        let [m, n] = matrix("svd", la)?;
+    pub fn svd(&self, a: ArrayView<'_>, rank: Option<usize>) -> Result<(Array, Array, Array), Error> {
+        let Matrices { compute, store, size: [m, n], frames, items: ai, .. } = self.matrices("svd", a)?;
         let k = rank.map_or(m.min(n), |r| r.min(m).min(n));
-        let frames = Frames::new(&[(la, 2)])?;
-        let ai = a.cast(compute)?;
         crate::with_inexact!(compute, T => {
             let a = ai.of::<T>();
-            let cells = self.run(&frames, |i, _: &mut ()| {
+            let ((u, sv, v), _) = stack::<(Vec<T>, Vec<<T as Scalar>::Real>, Vec<T>), ()>(frames.count, [m * k, k, n * k], &|i, (u, sv, v), _| {
                 let x = &a[frames.items(0, i, m * n)];
                 let f = if rank.is_some() { super::truncated_svd(x, [m, n], k) } else { super::svd(x, [m, n]) };
-                (f.u, f.s, f.v)
+                u.copy_from_slice(&f.u);
+                sv.copy_from_slice(&f.s);
+                v.copy_from_slice(&f.v);
+                true
             })?;
-            let (mut u, mut sv, mut v) = (Vec::new(), Vec::new(), Vec::new());
-            for (cu, cs, cv) in cells { u.extend(cu); sv.extend(cs); v.extend(cv); }
             Ok((array(u, &frames.layout, [m, k], store)?, array(sv, &frames.layout, [k], store.real())?, array(v, &frames.layout, [n, k], store)?))
         })
     }
 
     #[doc = crate::stacked_doc!(svd_solve)]
-    pub fn svd_solve(&mut self, u: ArrayView<'_>, s: ArrayView<'_>, v: ArrayView<'_>, b: ArrayView<'_>) -> Result<Array, E> {
+    pub fn svd_solve(&self, u: ArrayView<'_>, s: ArrayView<'_>, v: ArrayView<'_>, b: ArrayView<'_>) -> Result<Array, Error> {
         let (compute, store) = self.dtypes("svd_solve", &[u, s, v, b])?;
         let (lu, ls, lv, lb) = (u.layout(), s.layout(), v.layout(), b.layout());
         let ([m, n], p) = factors("svd_solve", u, s, v)?;
@@ -328,15 +313,15 @@ impl<C, E> Stacked<C> where C: FnMut() -> Result<(), E>, E: From<Error> {
         let (ui, si, vi, bi) = (u.cast(compute)?, s.cast(compute.real())?, v.cast(compute)?, paired(b.cast(compute)?, lb, rb - core, lu, ru - 2, "svd_solve")?);
         crate::with_inexact!(compute, T => {
             let (u, sv, v, b) = (ui.of::<T>(), si.of::<<T as Scalar>::Real>(), vi.of::<T>(), bi.of::<T>());
-            let x = self.run(&frames, |i, _: &mut ()| {
-                Svd::<T, _, _>::new([m, n], &u[frames.items(0, i, m * p)], &sv[frames.items(1, i, p)], &v[frames.items(2, i, n * p)]).solve(&b[frames.items(3, i, m * k)], k)
+            let x = self.slots(&frames, n * k, |i, out: &mut [T], _: &mut ()| {
+                out.copy_from_slice(&Svd::<T, _, _>::new([m, n], &u[frames.items(0, i, m * p)], &sv[frames.items(1, i, p)], &v[frames.items(2, i, n * p)]).solve(&b[frames.items(3, i, m * k)], k))
             })?;
-            Ok(array(x.concat(), &frames.layout, solution(lv.axes(rv - 2..rv - 1), lb, vector), store)?)
+            Ok(array(x, &frames.layout, solution(lv.axes(rv - 2..rv - 1), lb, vector), store)?)
         })
     }
 
     #[doc = crate::stacked_doc!(svd_pinv)]
-    pub fn svd_pinv(&mut self, u: ArrayView<'_>, s: ArrayView<'_>, v: ArrayView<'_>) -> Result<Array, E> {
+    pub fn svd_pinv(&self, u: ArrayView<'_>, s: ArrayView<'_>, v: ArrayView<'_>) -> Result<Array, Error> {
         let (compute, store) = self.dtypes("svd_pinv", &[u, s, v])?;
         let (lu, ls, lv) = (u.layout(), s.layout(), v.layout());
         let ([m, n], p) = factors("svd_pinv", u, s, v)?;
@@ -345,126 +330,138 @@ impl<C, E> Stacked<C> where C: FnMut() -> Result<(), E>, E: From<Error> {
         let (ui, si, vi) = (u.cast(compute)?, s.cast(compute.real())?, v.cast(compute)?);
         crate::with_inexact!(compute, T => {
             let (u, sv, v) = (ui.of::<T>(), si.of::<<T as Scalar>::Real>(), vi.of::<T>());
-            let x = self.run(&frames, |i, _: &mut ()| {
-                Svd::<T, _, _>::new([m, n], &u[frames.items(0, i, m * p)], &sv[frames.items(1, i, p)], &v[frames.items(2, i, n * p)]).pseudoinverse()
+            let x = self.slots(&frames, n * m, |i, out: &mut [T], _: &mut ()| {
+                out.copy_from_slice(&Svd::<T, _, _>::new([m, n], &u[frames.items(0, i, m * p)], &sv[frames.items(1, i, p)], &v[frames.items(2, i, n * p)]).pseudoinverse())
             })?;
-            Ok(array(x.concat(), &frames.layout, lv.axes(rv - 2..rv - 1).concat(&lu.axes(ru - 2..ru - 1)), store)?)
+            Ok(array(x, &frames.layout, lv.axes(rv - 2..rv - 1).concat(&lu.axes(ru - 2..ru - 1)), store)?)
         })
     }
 
     #[doc = crate::stacked_doc!(svdvals)]
-    pub fn svdvals(&mut self, a: ArrayView<'_>) -> Result<Array, E> {
-        let (compute, store) = self.dtypes("svdvals", &[a])?;
-        let la = a.layout();
-        let [m, n] = matrix("svdvals", la)?;
-        let frames = Frames::new(&[(la, 2)])?;
-        let ai = a.cast(compute)?;
+    pub fn svdvals(&self, a: ArrayView<'_>) -> Result<Array, Error> {
+        let Matrices { compute, store, size: [m, n], frames, items: ai, .. } = self.matrices("svdvals", a)?;
         crate::with_inexact!(compute, T => {
             let a = ai.of::<T>();
-            let sv = self.run(&frames, |i, _: &mut ()| super::singular_values(&a[frames.items(0, i, m * n)], [m, n]))?;
-            Ok(array(sv.concat(), &frames.layout, [m.min(n)], store.real())?)
+            let sv = self.slots(&frames, m.min(n), |i, out: &mut [<T as Scalar>::Real], _: &mut ()| out.copy_from_slice(&super::singular_values(&a[frames.items(0, i, m * n)], [m, n])))?;
+            Ok(array(sv, &frames.layout, [m.min(n)], store.real())?)
         })
     }
 
     #[doc = crate::stacked_doc!(matrix_rank)]
-    pub fn matrix_rank(&mut self, a: ArrayView<'_>) -> Result<Array, E> {
-        let (compute, _) = self.dtypes("matrix_rank", &[a])?;
-        let la = a.layout();
-        let [m, n] = matrix("matrix_rank", la)?;
-        let frames = Frames::new(&[(la, 2)])?;
-        let ai = a.cast(compute)?;
+    pub fn matrix_rank(&self, a: ArrayView<'_>) -> Result<Array, Error> {
+        let Matrices { compute, size: [m, n], frames, items: ai, .. } = self.matrices("matrix_rank", a)?;
         crate::with_inexact!(compute, T => {
             let a = ai.of::<T>();
-            let r = self.run(&frames, |i, _: &mut ()| super::rank(&a[frames.items(0, i, m * n)], [m, n]) as i64)?;
+            let r = self.slots(&frames, 1, |i, out: &mut [i64], _: &mut ()| out[0] = super::rank(&a[frames.items(0, i, m * n)], [m, n]) as i64)?;
             Ok(array(r, &frames.layout, Layout::EMPTY, I64)?)
         })
     }
 
+    #[doc = crate::stacked_doc!(norm)]
+    pub fn norm(&self, a: ArrayView<'_>, ord: super::Norm) -> Result<Array, Error> {
+        let Matrices { compute, store, size: [m, n], frames, items: ai, .. } = self.matrices("norm", a)?;
+        crate::with_inexact!(compute, T => {
+            let a = ai.of::<T>();
+            let r = self.slots(&frames, 1, |i, out: &mut [<T as Scalar>::Real], _: &mut ()| out[0] = super::norm(&a[frames.items(0, i, m * n)], [m, n], ord))?;
+            Ok(array(r, &frames.layout, Layout::EMPTY, store.real())?)
+        })
+    }
+
+    #[doc = crate::stacked_doc!(cond)]
+    pub fn cond(&self, a: ArrayView<'_>, p: super::Norm) -> Result<Array, Error> {
+        let Matrices { compute, store, size: [m, n], frames, items: ai, .. } = self.matrices("cond", a)?;
+        if p != super::Norm::Two { square("cond", [m, n])?; }
+        crate::with_inexact!(compute, T => {
+            let a = ai.of::<T>();
+            let r = self.slots(&frames, 1, |i, out: &mut [<T as Scalar>::Real], _: &mut ()| out[0] = super::cond(&a[frames.items(0, i, m * n)], [m, n], p))?;
+            Ok(array(r, &frames.layout, Layout::EMPTY, store.real())?)
+        })
+    }
+
     #[doc = crate::stacked_doc!(eig)]
-    pub fn eig(&mut self, a: ArrayView<'_>) -> Result<(Array, Array), E> {
-        let (compute, store) = self.dtypes("eig", &[a])?;
-        let la = a.layout();
-        let n = square("eig", matrix("eig", la)?)?;
-        let frames = Frames::new(&[(la, 2)])?;
-        let ai = a.cast(compute)?;
+    pub fn eig(&self, a: ArrayView<'_>) -> Result<(Array, Array), Error> {
+        let Matrices { compute, store, size, frames, items: ai, .. } = self.matrices("eig", a)?;
+        let n = square("eig", size)?;
         crate::with_inexact!(compute, T => {
             let a = ai.of::<T>();
             let nan = Complex::new(<T as Scalar>::Real::nan(), <T as Scalar>::Real::nan());
-            let (w, v): (Vec<_>, Vec<_>) = self.run(&frames, |i, _: &mut ()| {
-                super::eig(&a[frames.items(0, i, n * n)], n).map_or_else(|| (vec![nan; n], vec![nan; n * n]), |f| (f.values, f.vectors))
-            })?.into_iter().unzip();
-            Ok((array(w.concat(), &frames.layout, [n], store.complex())?, array(v.concat(), &frames.layout, [n, n], store.complex())?))
+            let ((w, v), _) = stack::<(Vec<Complex<<T as Scalar>::Real>>, Vec<Complex<<T as Scalar>::Real>>), ()>(frames.count, [n, n * n], &|i, (w, v), _| {
+                match super::eig(&a[frames.items(0, i, n * n)], n) {
+                    Some(f) => { w.copy_from_slice(&f.values); v.copy_from_slice(&f.vectors); }
+                    None => { w.fill(nan); v.fill(nan); }
+                }
+                true
+            })?;
+            Ok((array(w, &frames.layout, [n], store.complex())?, array(v, &frames.layout, [n, n], store.complex())?))
         })
     }
 
     #[doc = crate::stacked_doc!(eigvals)]
-    pub fn eigvals(&mut self, a: ArrayView<'_>) -> Result<Array, E> {
-        let (compute, store) = self.dtypes("eigvals", &[a])?;
-        let la = a.layout();
-        let n = square("eigvals", matrix("eigvals", la)?)?;
-        let frames = Frames::new(&[(la, 2)])?;
-        let ai = a.cast(compute)?;
+    pub fn eigvals(&self, a: ArrayView<'_>) -> Result<Array, Error> {
+        let Matrices { compute, store, size, frames, items: ai, .. } = self.matrices("eigvals", a)?;
+        let n = square("eigvals", size)?;
         crate::with_inexact!(compute, T => {
             let a = ai.of::<T>();
             let nan = Complex::new(<T as Scalar>::Real::nan(), <T as Scalar>::Real::nan());
-            let w = self.run(&frames, |i, _: &mut ()| super::eigenvalues(&a[frames.items(0, i, n * n)], n).unwrap_or_else(|| vec![nan; n]))?;
-            Ok(array(w.concat(), &frames.layout, [n], store.complex())?)
+            let w = self.slots(&frames, n, |i, out: &mut [Complex<<T as Scalar>::Real>], _: &mut ()| match super::eigenvalues(&a[frames.items(0, i, n * n)], n) {
+                Some(w) => out.copy_from_slice(&w),
+                None => out.fill(nan),
+            })?;
+            Ok(array(w, &frames.layout, [n], store.complex())?)
         })
     }
 
     #[doc = crate::stacked_doc!(eigh)]
-    pub fn eigh(&mut self, a: ArrayView<'_>) -> Result<(Array, Array), E> {
-        let (compute, store) = self.dtypes("eigh", &[a])?;
-        let la = a.layout();
-        let n = square("eigh", matrix("eigh", la)?)?;
-        let frames = Frames::new(&[(la, 2)])?;
-        let ai = a.cast(compute)?;
+    pub fn eigh(&self, a: ArrayView<'_>) -> Result<(Array, Array), Error> {
+        let Matrices { compute, store, size, frames, items: ai, .. } = self.matrices("eigh", a)?;
+        let n = square("eigh", size)?;
         crate::with_inexact!(compute, T => {
             let a = ai.of::<T>();
-            let (w, v): (Vec<_>, Vec<_>) = self.run(&frames, |i, _: &mut ()| {
-                super::eigh(&a[frames.items(0, i, n * n)], n).map_or_else(|| (vec![<T as Scalar>::Real::nan(); n], nans::<T>(n * n)), |f| (f.values, f.vectors))
-            })?.into_iter().unzip();
-            Ok((array(w.concat(), &frames.layout, [n], store.real())?, array(v.concat(), &frames.layout, [n, n], store)?))
+            let ((w, v), _) = stack::<(Vec<<T as Scalar>::Real>, Vec<T>), ()>(frames.count, [n, n * n], &|i, (w, v), _| {
+                match super::eigh(&a[frames.items(0, i, n * n)], n) {
+                    Some(f) => { w.copy_from_slice(&f.values); v.copy_from_slice(&f.vectors); }
+                    None => { w.fill(<T as Scalar>::Real::nan()); v.fill(T::from_real(<T as Scalar>::Real::nan())); }
+                }
+                true
+            })?;
+            Ok((array(w, &frames.layout, [n], store.real())?, array(v, &frames.layout, [n, n], store)?))
         })
     }
 
     #[doc = crate::stacked_doc!(eigvalsh)]
-    pub fn eigvalsh(&mut self, a: ArrayView<'_>) -> Result<Array, E> {
-        let (compute, store) = self.dtypes("eigvalsh", &[a])?;
-        let la = a.layout();
-        let n = square("eigvalsh", matrix("eigvalsh", la)?)?;
-        let frames = Frames::new(&[(la, 2)])?;
-        let ai = a.cast(compute)?;
+    pub fn eigvalsh(&self, a: ArrayView<'_>) -> Result<Array, Error> {
+        let Matrices { compute, store, size, frames, items: ai, .. } = self.matrices("eigvalsh", a)?;
+        let n = square("eigvalsh", size)?;
         crate::with_inexact!(compute, T => {
             let a = ai.of::<T>();
-            let w = self.run(&frames, |i, _: &mut ()| super::hermitian_eigenvalues(&a[frames.items(0, i, n * n)], n).unwrap_or_else(|| vec![<T as Scalar>::Real::nan(); n]))?;
-            Ok(array(w.concat(), &frames.layout, [n], store.real())?)
+            let w = self.slots(&frames, n, |i, out: &mut [<T as Scalar>::Real], _: &mut ()| match super::hermitian_eigenvalues(&a[frames.items(0, i, n * n)], n) {
+                Some(w) => out.copy_from_slice(&w),
+                None => out.fill(<T as Scalar>::Real::nan()),
+            })?;
+            Ok(array(w, &frames.layout, [n], store.real())?)
         })
     }
 
     #[doc = crate::stacked_doc!(permanent)]
-    pub fn permanent(&mut self, a: ArrayView<'_>) -> Result<Array, E> {
-        let (compute, store) = self.dtypes("permanent", &[a])?;
-        let la = a.layout();
-        let n = square("permanent", matrix("permanent", la)?)?;
+    pub fn permanent(&self, a: ArrayView<'_>) -> Result<Array, Error> {
+        let Matrices { compute, store, size, frames, items: ai, .. } = self.matrices("permanent", a)?;
+        let n = square("permanent", size)?;
         if n >= 64 { return Err(Error::new(Kind::Domain, format!("permanent takes fewer than 64 rows, not {n}")).into()); }
-        let frames = Frames::new(&[(la, 2)])?;
-        let ai = a.cast(compute)?;
         crate::with_inexact!(compute, T => {
             let a = ai.of::<T>();
-            let x = self.run(&frames, |i, _: &mut ()| exact::permanent(&a[frames.items(0, i, n * n)], n))?;
+            let x = cells(&frames, |i, _: &mut ()| exact::permanent(&a[frames.items(0, i, n * n)], n))?.into_iter().collect::<Result<Vec<_>, _>>()?;
             Ok(array(x, &frames.layout, Layout::EMPTY, store)?)
         })
     }
 
     #[doc = crate::stacked_doc!(echelon)]
-    pub fn echelon(&mut self, a: ArrayView<'_>, columns: Option<usize>) -> Result<(Array, Array, Array), E> {
+    pub fn echelon(&self, a: ArrayView<'_>, columns: Option<usize>) -> Result<(Array, Array, Array), Error> {
         let (compute, store) = self.dtypes("echelon", &[a])?;
         let &[m, n] = a.layout().shape() else { return Err(Error::new(Kind::Rank, "echelon takes one matrix").into()) };
         let columns = columns.unwrap_or(n);
         let ai = a.cast(compute)?;
         crate::with_inexact!(compute, T => {
-            let f = exact::echelon_with(ai.of::<T>().to_vec(), [m, n], columns, &mut self.check)?;
+            let f = exact::echelon(ai.of::<T>().to_vec(), [m, n], columns)?;
             let r = f.pivots.len();
             let pivots = f.pivots.into_iter().map(|c| c as i64).collect();
             Ok((array(f.rows, &Layout::EMPTY, [r, n], store)?, array(pivots, &Layout::EMPTY, [r], I64)?, array(vec![f.determinant], &Layout::EMPTY, Layout::EMPTY, store)?))
@@ -472,11 +469,11 @@ impl<C, E> Stacked<C> where C: FnMut() -> Result<(), E>, E: From<Error> {
     }
 }
 
-/// `f` of each cell of `frames`, in order. The cells split across rustymath's threads, with scratch `S` that a thread's cells share. `check` runs between rounds of cells, and its error stops the call.
-pub fn cells<R: Send, S: Default, E>(frames: &Frames, check: impl FnMut() -> Result<(), E>, f: impl Fn(usize, &mut S) -> R + Sync) -> Result<Vec<R>, E> {
-    let cells = stack(frames.count, 1, &|i: usize, out: &mut [Option<R>], s: &mut S| out[0] = Some(f(i, s)), check)?;
-    Ok(cells.into_iter().map(|c| c.expect("`stack` writes every cell")).collect())
-}
+/// `f` of each cell of `frames`, in order. The cells split across rustymath's threads, with scratch `S` that a thread's cells share. It checks for an interrupt between rounds of cells, and an interrupt's error stops the call.
+pub fn cells<R: Send, S: Default>(frames: &Frames, f: impl Fn(usize, &mut S) -> R + Sync) -> Result<Vec<R>, Error> { crate::parallel::each(frames.count, f) }
+
+/// One stack of matrices that a matrix function takes alone, as [`Stacked::matrices`] reads it: its compute and store dtypes, its layout, its matrices' rows and columns, its frames, and its items in the compute dtype.
+struct Matrices<'a> { compute: DType, store: DType, layout: &'a Layout, size: [usize; 2], frames: Frames, items: Items<'a> }
 
 /// The rows and columns of the matrices in `layout`. A Rank error for fewer than two axes.
 fn matrix(function: &str, layout: &Layout) -> Result<[usize; 2], Error> {
@@ -534,9 +531,6 @@ fn factors(function: &str, u: ArrayView<'_>, s: ArrayView<'_>, v: ArrayView<'_>)
     if p != q || s.layout().shape().last() != Some(&p) { return Err(Error::new(Kind::Length, format!("{function} needs u and v with as many columns as s has values"))); }
     Ok(([m, n], p))
 }
-
-/// `n` NaNs, the results of a matrix that fails.
-fn nans<T: Scalar>(n: usize) -> Vec<T> { vec![T::from_real(T::Real::nan()); n] }
 
 /// An array of `buffer`'s items, the cells of `frame` in order, each with the axes `cell`, at the dtype `store`.
 pub fn stored(buffer: Buffer, frame: &Layout, cell: impl Into<Layout>, store: DType) -> Result<Array, Error> {

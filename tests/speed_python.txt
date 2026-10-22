@@ -72,3 +72,5 @@ rm.exp(xf)	12	12
 rm.where(mask, xf, yf)	4.2	4.2
 # 0.7 copies, for one read per item, plus the call.
 rm.sum(xf)	1.4	1.4
+# 1 copy, for one read per item, its conversion to f64 and a fused multiply-add into an f64 running sum, in lanes that hold half as many items as f32 lanes, plus the call. The squares are f64 so that the square of `1e20` doesn't overflow. Before 22 October 2026, the squares were f32 and went through a buffer, at about 1.2 copies.
+rm.norm(xf)	2	2

@@ -229,7 +229,7 @@ pub(crate) fn native_binary(name: &str) -> PyResult<&'static NativeBinary> {
 
 /// Runs `$run!` with the reduction by which the native function `$name` folds, from rustymath's table of facts ([`facts!`](rustymath::facts)), where a function of Booleans folds Booleans only. `None` for a function with no specialized reduction.
 macro_rules! known_reduction {
-    (($name:expr, $run:ident) folds { $($fold:ident: [$($p:tt)*] [$($n:literal),*];)* } booleans { $($truth:ident: [$($tp:tt)*] [$($tn:literal),*];)* } characters $characters:tt) => {
+    (($name:expr, $run:ident) folds { $($fold:ident: [$($p:tt)*] [$($n:literal),*];)* } booleans { $($truth:ident: [$($tp:tt)*] [$($tn:literal),*];)* } comparisons $comparisons:tt characters $characters:tt) => {
         match $name { $($($n => $run!(reduce::$fold),)*)* $($($tn => $run!(reduce::$truth, only &[DType::Boolean]),)*)* _ => None }
     };
 }

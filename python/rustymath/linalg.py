@@ -2,7 +2,6 @@
 
 `solve` and `pinv` give a result for every matrix. A square matrix with no negligible LU pivot solves and inverts through LU, with no cutoff, as NumPy's `solve` and `inv` do. Any other matrix gets `lstsq`'s least-squares solution with the least norm, or the pseudoinverse with `lstsq`'s cutoff. A matrix that `cholesky` can't factor, or whose eigenvalues don't converge, gives NaN results, with no warning. R in a QR factorization has a real diagonal. `matmul` and `inner` multiply matrices, including through APL's inner products, such as the min-plus product of shortest paths."""
 from typing import NamedTuple
-from . import _core
 from ._core import Array, linalg as _g
 from ._naming import _binary_name, _named
 
@@ -57,17 +56,12 @@ class Echelon(NamedTuple):
     determinant: object
 
 solve, lstsq, pinv, det, slogdet, cholesky, qr = _g.solve, _g.lstsq, _g.pinv, _g.det, _g.slogdet, _g.cholesky, _g.qr
-svdvals, matrix_rank, eigvals, eigvalsh, permanent, matmul = _g.svdvals, _g.matrix_rank, _g.eigvals, _g.eigvalsh, _g.permanent, _g.matmul
+svdvals, matrix_rank, eigvals, eigvalsh, permanent, matmul, norm, cond = _g.svdvals, _g.matrix_rank, _g.eigvals, _g.eigvalsh, _g.permanent, _g.matmul, _g.norm, _g.cond
 lu = _named(lambda a: Lu(*_g.lu(a)), 'lu', _g.lu.__doc__)
 eig = _named(lambda a: Eigen(*_g.eig(a)), 'eig', _g.eig.__doc__)
 eigh = _named(lambda a: Eigen(*_g.eigh(a)), 'eigh', _g.eigh.__doc__)
 svd = _named(lambda a, rank=None: Svd(*_g.svd(a, rank)), 'svd', _g.svd.__doc__)
 echelon = _named(lambda a, columns=None: Echelon(*_g.echelon(a, columns)), 'echelon', _g.echelon.__doc__)
-
-def cond(a):
-    "The 2-norm condition number, the largest singular value divided by the smallest"
-    s = svdvals(a)
-    return _core.divide(_core.max(s, axis=-1), _core.min(s, axis=-1))
 
 def inner(
     f, # Native binary function that folds the products, from the right

@@ -2,7 +2,7 @@
 use crate::buffer::{Buffer, DType, Element, Items, View};
 use crate::agreement::Mapping;
 use crate::error::{Error, Kind};
-use crate::gather::Steps;
+use crate::gather::{Steps, Writes};
 use crate::layout::{Keys, Lanes, Layout, element_count};
 use std::sync::Arc;
 use std::borrow::Cow;
@@ -195,25 +195,24 @@ impl Array {
         let (buffer, _) = result.ok_or_else(|| Error::new(Kind::Domain, "differences need numerical items"))?;
         Self::new(agreement.layout, buffer)
     }
-    /// The offset of each item that a selection writes, and `source`'s items at this array's dtype: one item for every offset, or `source` broadcast over the selection, one item for each offset in the same order. A fill from broadcasting reads the dtype's fill. Shape, position and conversion checks all finish here, before any item changes.
-    fn targets<'s>(&self, plan: &crate::structure::Plan, source: &'s Self) -> Result<(Vec<usize>, Items<'s>), Error> {
+    /// Where a selection writes, as `plan`'s walk, and `source`'s items at this array's dtype: one item for every write, or `source` broadcast over the selection, one item for each write in the same order. A fill from broadcasting reads the dtype's fill. Shape, position and conversion checks all finish here, before any item changes.
+    fn targets<'p, 's>(&self, plan: &'p crate::structure::Plan, source: &'s Self) -> Result<(Writes<'p>, Items<'s>), Error> {
         let scalar = Layout::EMPTY;
         let agreement = crate::agreement::Agreement::new(&plan.layout, if source.len() == 1 { &scalar } else { source.layout() })?;
         if agreement.layout.shape() != plan.layout.shape() { return Err(Error::new(Kind::Length, "assignment must fit the selected layout")); }
-        let len = self.len();
-        let offsets = Steps::combined(0, &plan.steps);
-        if offsets.iter().any(|&o| o != Steps::FILL && o >= len) { return Err(Error::new(Kind::Index, "assignment position is outside its array")); }
+        let (len, writes) = (self.len(), Writes::Walk { base: 0, steps: &plan.steps });
+        if !writes.runs_while(&mut |_, run| run.iter().all(|&o| o == Steps::FILL || o < len)) { return Err(Error::new(Kind::Index, "assignment position is outside its array")); }
         let items = source.view().cast(self.dtype())?;
-        if matches!(agreement.right, Mapping::Linear(1) | Mapping::Single) { return Ok((offsets, items)); }
-        Ok((offsets, Items::Owned(Buffer::cast_mapped(items.view(), &agreement.right, agreement.len, self.dtype())?)))
+        if matches!(agreement.right, Mapping::Linear(1) | Mapping::Single) { return Ok((writes, items)); }
+        Ok((writes, Items::Owned(Buffer::cast_mapped(items.view(), &agreement.right, agreement.len, self.dtype())?)))
     }
     /// Writes `source`, broadcast over a selection, detaching shared storage first. Later repeated targets win. Conversion, shape and position checks finish before any item changes.
     pub fn assign(&mut self, plan: &crate::structure::Plan, source: &Self) -> Result<(), Error> {
-        let (offsets, items) = self.targets(plan, source)?;
+        let (writes, items) = self.targets(plan, source)?;
         let values = items.view();
         with_dtype!(self.dtype(), T => {
             let (out, values) = (T::of_mut(self.make_mut()).expect("matching dtype"), T::of(values).expect("matching dtype"));
-            crate::gather::scatter(out, &offsets, values, |v| v);
+            writes.write(out, values, crate::gather::Same);
         });
         Ok(())
     }
@@ -221,7 +220,7 @@ impl Array {
     pub fn combine_at<K>(&mut self, k: &K, kernels: &crate::operation::Kernels<crate::operation::ScatterKernel<K>>, plan: &crate::structure::Plan, source: &Self) -> Result<bool, Error> {
         let dtype = self.dtype();
         if kernels.at(dtype).is_none() { return Err(Error::new(Kind::Domain, format!("this function doesn't take {}", dtype.name()))); }
-        let (offsets, items) = self.targets(plan, source)?;
-        Ok(kernels.scatter(k, self.make_mut(), &offsets, items.view()).expect("the function has a kernel at the array's dtype"))
+        let (writes, items) = self.targets(plan, source)?;
+        Ok(kernels.scatter(k, self.make_mut(), writes, items.view()).expect("the function has a kernel at the array's dtype"))
     }
 }

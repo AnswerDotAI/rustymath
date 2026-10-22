@@ -1,4 +1,4 @@
-import math
+import math, os, signal, threading
 from fractions import Fraction as F
 import numpy as np, pytest, rustymath as rm
 
@@ -93,3 +93,10 @@ def test_mixed_radix():
     with pytest.raises(OverflowError): rm.integer.decode([0, 2], [2**62, 0])
     with pytest.raises(OverflowError): rm.integer.encode([0], np.array([2**63], dtype=np.uint64))
     with pytest.raises(TypeError): rm.integer.encode([10], [1.5])
+
+def test_ctrl_c_stops_a_long_call():
+    # A permanent of 40 rows takes 2**40 steps. The interrupt check between them takes the GIL to see the signal.
+    timer = threading.Timer(.05, lambda: os.kill(os.getpid(), signal.SIGINT))
+    timer.start()
+    with pytest.raises(KeyboardInterrupt): rm.exact.permanent([[1] * 40] * 40)
+    timer.join()

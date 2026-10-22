@@ -1,4 +1,4 @@
-//! The SVD, as LAPACK's `dgebrd`/`zgebrd`, `dorgbr`/`zungbr` and `dbdsqr` compute it. Householder reflections from the left and the right reduce the matrix to a real upper bidiagonal one. The Golub-Kahan form of the QR algorithm then drives its superdiagonal to zero. Each rotation of two columns of the bidiagonal matrix also rotates two rows of Vᵀ, and each rotation of two rows rotates two rows of Uᵀ, so the rotations read contiguous memory, as `eigen`'s do. Each right reflection of a complex matrix maps the conjugate of its row, as in LAPACK's `zgebrd`. The same sweeps then diagonalise its real bidiagonal matrix, rotating complex rows by real rotations. A matrix more than 11/6 times as tall as it is wide first reduces to the R of its QR factorization, through CholeskyQR2 where `qr` or `lstsq` would use it. A wider one is replaced by its conjugate transpose.
+//! The SVD, as LAPACK's `dgebrd`/`zgebrd`, `dorgbr`/`zungbr` and `dbdsqr` compute it. Householder reflections from the left and the right reduce the matrix to a real upper bidiagonal one. The Golub-Kahan form of the QR algorithm then drives its superdiagonal to zero. Each rotation of two columns of the bidiagonal matrix also rotates two rows of Vᵀ, and each rotation of two rows rotates two rows of Uᵀ, so the rotations read contiguous memory, as `eigen`'s do. Each right reflection of a complex matrix maps the conjugate of its row, as in LAPACK's `zgebrd`. The same sweeps then diagonalise its real bidiagonal matrix, rotating complex rows by real rotations. A wide matrix is replaced by its conjugate transpose, which `tall_svd` reduces first where it is tall.
 //!
 //! Above `SVD_SPLIT` columns, divide and conquer gives the bidiagonal matrix's singular vectors, and the reflections apply to them without forming Q, as LAPACK's `dbdsdc` and `dormbr` do. The recursion, the deflation and the arrow matrix's SVD follow faer's `bidiag_svd.rs`, and share `secular::root` with `eigen`'s divide and conquer. See `THIRD-PARTY.md`.
 use super::*;
@@ -7,27 +7,11 @@ use super::*;
 pub(in crate::linalg) fn native<T: Tiled>(a: &[T], [m, n]: [usize; 2], vectors: bool) -> Option<(Vec<T>, Vec<T::Real>, Vec<T>)> where
     T::Real: Tiled<Real = T::Real> {
     if m < n {
-        // The conjugate transpose's SVD is V Σ Uᴴ.
-        let (u, s, v) = native(&adjoint(a, m, n), [n, m], vectors)?;
+        // The conjugate transpose's SVD is V Σ Uᴴ. `tall_svd` reduces it first where it's tall.
+        let (u, s, v) = tall_svd(&adjoint(a, m, n), [n, m], vectors)?;
         return Some((v, s, u));
     }
-    if 6 * m < 11 * n { return bidiagonal_svd(a, [m, n], vectors); }
-    // A tall matrix's SVD is the SVD of its R, with U multiplied by Q. CholeskyQR2 gives Q and R where `qr` would use it, or only R for singular values where `lstsq` would. Householder reflections give them otherwise.
-    let cholesky = if vectors { tall_for_qr([m, n]) } else { tall_for_lstsq([m, n]) };
-    if cholesky && let Some((r, q)) = tall_qr(a, [m, n], if vectors { Tall::Q } else { Tall::R }) {
-        let (ur, s, v) = bidiagonal_svd(&r, [n, n], vectors)?;
-        let u = if vectors { T::multiply(Matrix::rows(&q, n), Matrix::rows(&ur, n), [m, n, n]) } else { Vec::new() };
-        return Some((u, s, v));
-    }
-    let (reflections, r) = reflect(a, [m, n]);
-    let (ur, s, v) = bidiagonal_svd(&r, [n, n], vectors)?;
-    let mut u = Vec::new();
-    if vectors {
-        u = filled(m * n, T::zero());
-        u[..n * n].copy_from_slice(&ur);
-        reflections.apply(&mut u, n);
-    }
-    Some((u, s, v))
+    bidiagonal_svd(a, [m, n], vectors)
 }
 
 /// The SVD of the finite `m`×`n` matrix `a`, where `m` is at least `n`, through its bidiagonal form B, as `native` gives it. Singular values descend. With vectors and more than `SVD_SPLIT` columns, divide and conquer gives B's singular vectors, and the reflections then apply to them. Otherwise the QR algorithm rotates the reflections' Q into B's singular vectors. `None` where the QR algorithm doesn't converge.

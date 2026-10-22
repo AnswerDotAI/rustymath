@@ -44,6 +44,9 @@ def test_weighted_average_norms_and_covariance():
     a = np.array([1 + 2j, 3 - 1j, 0j])
     for order in [0, 1, 2, 3, np.inf, -np.inf]:
         assert np.isclose(rm.norm(a, ord=order), np.linalg.norm(a, ord=order))
+    # An f32 norm computes its squares in f64, where the square of `1e20` doesn't overflow and the square of `1e-30` doesn't underflow.
+    big, small = np.float32([1e20]), np.float32([1e-30])
+    assert rm.norm(big) == big[0] and rm.norm(small) == small[0] and rm.linalg.norm(big[None]) == big[0]
     x = np.array([[1., 2., 4., 8.], [2., 1., 3., 6.]])
     for a in [x, x + 1j * x[:, ::-1]]:
         for rowvar in [True, False]:
@@ -65,8 +68,6 @@ def test_histogram_edges_and_counts():
 
 def test_scalar_compositions():
     assert rm.percentile([1, 2, 3, 4], [0, 50, 100]).tolist() == [1, 2.5, 4]
-    assert np.isclose(rm.linalg.cond([[4., 1], [1, 3]]), np.linalg.cond([[4., 1], [1, 3]]))
-    assert np.isinf(rm.linalg.cond([[1., 0], [0, 0]]))
 
 def test_bitwise_decimal_rounding_and_angles():
     a = rm.array([-7, -1, 0, 3, 7], dtype='int16')

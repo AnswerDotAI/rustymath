@@ -16,6 +16,10 @@ pub enum Kind {
     Domain,
     /// An integer result that doesn't fit its dtype.
     Overflow,
+    /// A computation that the installed interrupt check stopped, as at a Ctrl-C ([`interrupt`](crate::interrupt)).
+    Interrupt,
+    /// A computation that the installed interrupt check stopped at a deadline.
+    Timeout,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

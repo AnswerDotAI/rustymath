@@ -10,6 +10,8 @@ pub trait Scalar:
 {
     /// The type of the real and imaginary parts.
     type Real: Native;
+    /// Whether the type is complex, with a real and an imaginary part.
+    const COMPLEX: bool;
     fn conj(self) -> Self;
     fn re(self) -> Self::Real;
     fn im(self) -> Self::Real;
@@ -29,6 +31,7 @@ pub trait Scalar:
 
 impl<T: Native> Scalar for T {
     type Real = T;
+    const COMPLEX: bool = false;
     #[inline(always)]
     fn conj(self) -> T { self }
     #[inline(always)]
@@ -55,6 +58,7 @@ impl<T: Native> Scalar for T {
 
 impl<T: Native> Scalar for Complex<T> {
     type Real = T;
+    const COMPLEX: bool = true;
     #[inline(always)]
     fn conj(self) -> Self { Complex::new(self.re, -self.im) }
     #[inline(always)]

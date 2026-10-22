@@ -121,10 +121,10 @@ impl Divisor {
 struct Short { x: i32, magnitude: u32, multiplier: u32 }
 
 impl Short {
-    /// The divisor `x`, or `None` where its magnitude is outside 2 to 2¹⁶ - 1.
+    /// The divisor `x`, or `None` where its magnitude is outside 2 to 2¹⁶ - 1. The multiplier is ⌈2³²/d⌉ computed in 32 bits, as `u32::MAX / d + 1`. As a 64-bit quotient, its zero extension disappears once `new` inlines, and the residue loop then multiplies 64-bit lanes, which NEON has no instruction for.
     fn new(x: i64) -> Option<Self> {
         let magnitude = u32::try_from(x.unsigned_abs()).ok().filter(|m| (2..1 << 16).contains(m))?;
-        Some(Self { x: x as i32, magnitude, multiplier: (1u64 << 32).div_ceil(u64::from(magnitude)) as u32 })
+        Some(Self { x: x as i32, magnitude, multiplier: u32::MAX / magnitude + 1 })
     }
 
     /// The residue of `y`, whose magnitude is below 2¹⁶, modulo the divisor, as [`residue`] gives it.

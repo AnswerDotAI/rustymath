@@ -1,5 +1,5 @@
 //! The magnitude, sign and angle of a number, as function objects. Their real forms are here, and `complex.rs` attaches their complex ones.
-use crate::{FUSED, slice::Total};
+use crate::slice::Total;
 use num_complex::{Complex32, Complex64};
 
 /// |x|, or the magnitude |z| of a complex z, which is real, as a function object.
@@ -14,7 +14,7 @@ pub struct Angle;
 
 forms!(Abs at real: |_, [x]| Total(x.abs()));
 forms!(#[inline] Sign at real: |_, [x]| Total(if x == 0.0 { x } else { x.signum() }));
-forms!(Angle at real: |_, [x]| Total(crate::arc::atan2::<_, FUSED>(0.0, x)));
+forms!(Angle at real: |_, [x]| Total(crate::arc::real_angle(x)));
 
 macro_rules! objects {
     ($($(#[doc = $doc:literal])+ $name:ident;)+) => {$(

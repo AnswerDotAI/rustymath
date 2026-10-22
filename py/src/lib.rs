@@ -38,6 +38,7 @@ fn tolerance() -> PyResult<f64> { Ok(functions::tolerance(None)?.value()) }
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    rustymath::interrupt::install(convert::signals);
     functions::add_to(m)?;
     for f in [
         wrap_pyfunction!(set_threads, m)?, wrap_pyfunction!(thread_setting, m)?, wrap_pyfunction!(threads, m)?,

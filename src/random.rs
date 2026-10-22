@@ -1,13 +1,42 @@
 //! Random numbers from a caller's generator: floats between 0 and 1, rolls, each uniform below its own bound, and deals, distinct integers below a total.
 use crate::Arg;
-use rand::{Rng, RngExt, distr::{Distribution, Uniform}};
+use rand::Rng;
 
-/// Appends `n` integers to `out`, each uniform from 0 up to but not including its bound: the one bound, or each of the bounds in turn. One bound for every item draws through one sampler, set up once. Each bound must be at least 1.
+/// Appends `n` integers to `out`, each uniform from 0 up to but not including its bound: the one bound, or each of the bounds in turn. Each bound must be at least 1. Each draw is the number that `rand`'s `Uniform` gives for its bound, by Lemire's method. A draw maps a word `w` to the high word of `w × b`, unless the low word is below 2⁶⁴ mod b. Then it discards `w` and maps the next word instead. Drawing every word before mapping any lets the mapping run as a separate pass. A discarded word, about once in 2⁶⁴ ÷ bound draws, ends the pass, and the draws from it on replay in turn, from the words already drawn and then from `rng`.
 pub fn roll<R: Rng + ?Sized>(bounds: Arg<'_, u64>, n: usize, rng: &mut R, out: &mut Vec<u64>) {
     match bounds {
-        Arg::One(b) => out.extend(Uniform::new(0, b).expect("a roll's bound must be at least 1").sample_iter(rng).take(n)),
-        Arg::Many(bs) => out.extend(bs[..n].iter().map(|&b| rng.random_range(0..b))),
+        Arg::One(b) => rolled(std::iter::repeat_n(b, n), rng, out),
+        Arg::Many(bs) => rolled(bs[..n].iter().copied(), rng, out),
     }
+}
+
+/// One integer from 0 up to but not including `b`, as [`roll`] draws it.
+pub fn below<R: Rng + ?Sized>(b: u64, rng: &mut R) -> u64 { kept(b, || rng.next_u64()) }
+
+/// [`roll`], with one bound for each draw.
+fn rolled<R: Rng + ?Sized>(bounds: impl ExactSizeIterator<Item = u64> + Clone, rng: &mut R, out: &mut Vec<u64>) {
+    let (start, n) = (out.len(), bounds.len());
+    // `fill` would draw the same words, but `rand`'s block generators copy each 4-byte word through a call to `memmove`, which costs several times as much.
+    out.extend((0..n).map(|_| rng.next_u64()));
+    // A low word of at least b is always kept, because 2⁶⁴ mod b is below b. The pass ends at the first other word, and only `kept` computes the remainder.
+    let k = out[start..].iter().zip(bounds.clone()).position(|(&w, b)| product(w, b).1 < b).unwrap_or(n);
+    for (w, b) in out[start..start + k].iter_mut().zip(bounds.clone()) { *w = product(*w, b).0 }
+    let mut next = undrawn(out, start + k, rng);
+    out.extend(bounds.skip(k).map(|b| kept(b, || next.next().unwrap())));
+}
+
+/// The draw below `b` from the first word that `next` gives and Lemire's method keeps.
+fn kept(b: u64, mut next: impl FnMut() -> u64) -> u64 {
+    loop { let (hi, lo) = product(next(), b); if lo >= b || lo >= b.wrapping_neg() % b { break hi } }
+}
+
+/// The high and low words of `w × b`. The high word is the draw.
+#[inline]
+fn product(w: u64, b: u64) -> (u64, u64) { let p = u128::from(w) * u128::from(b); ((p >> 64) as u64, p as u64) }
+
+/// The words of `out` from `at` on, taken out of it, then the words that `rng` draws next.
+fn undrawn<'a, R: Rng + ?Sized>(out: &mut Vec<u64>, at: usize, rng: &'a mut R) -> impl Iterator<Item = u64> + 'a {
+    out.split_off(at).into_iter().chain(std::iter::from_fn(move || Some(rng.next_u64())))
 }
 
 /// The float in the open interval (0, 1) that `rand`'s `Open01` makes from the word `w`: its top 52 bits as the fraction of a number in [1, 2), less 1 − ε/2. Seeded draws depend on this staying bit for bit what `Open01` gives.

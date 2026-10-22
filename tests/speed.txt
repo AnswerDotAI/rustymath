@@ -62,8 +62,8 @@ reduce::max	1	1
 reduce::cumsum	2	2
 # 1 copies, for one read and one write per item; the scan runs in vector steps.
 reduce::cummax	2	2
-# 3.75 copies, for the negate (1), a read and write in place (1), 7 FMAs (1.75).
-polynomial::evaluate	7.5	7.5
+# 2.75 copies, for a read and a write (1) and 7 FMAs (1.75). It was 3.75 while `evaluate` worked in place, which its callers paid for with a copy of the input.
+polynomial::evaluate	5.5	5.5
 # 132 copies, for 530 vector ops: a double-word Lanczos sum and quotient, double-word ln of the exponent, exp_plus, sinpi for the reflection.
 Gamma	270	270
 # 54 copies, for 215 vector ops: a plain Lanczos sum, double-word ln, ln_split, sinpi.
@@ -134,13 +134,13 @@ search::view_quantiles_along	30	60
 stats::variance	3	3
 # 1.5 copies, for reading the data and the weights once, with a multiply-add per item. It costs about 5.8 copies on macOS, because each chunk gathers the data and the weights into buffers, and a second pass gathers the weights again for their total. Two other methods measured slower on 21 October 2026: folding pairs of products and weights in one walk cost 6.9, because a buffer of pairs folds more slowly than the walk it saves, and reading each 64-item row in place cost 8.7, because each in-place read works out its row's offset with divisions and each row's fold pays its own setup. Reading the runs in place without copying them only ties with the gather at 64 items. A fold that sums each run straight into its output's accumulator, with no product buffer, would reach the expected cost, as step 4 in basedpl's `meta/next-phases.md` records. Both budgets stay held until then.
 stats::average	74	330
-# 22 copies, for 2n³/3 flops per n² items, as FMAs, plus the solve, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 55 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+# 22 copies, for 2n³/3 flops per n² items, as FMAs, plus the solve, at a quarter copy per FMA on rustymath's own kernels. On macOS its block products and triangular solves run on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 55 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 linalg::Lu::solve	53	110
-# 64 copies, for 2n³ flops per n² items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 150 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+# 64 copies, for 2n³ flops per n² items, at a quarter copy per FMA on rustymath's own kernels. On macOS its block products and triangular solves run on Accelerate, including the two solves that form the inverse from the permuted identity, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 150 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 linalg::Lu::inverse	89	300
-# 11 copies, for n³/3 flops per n² items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 28 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+# 11 copies, for n³/3 flops per n² items, at a quarter copy per FMA on rustymath's own kernels. On macOS its block products and triangular solves run on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 28 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 linalg::cholesky	28	56
-# 43 copies, for 4n³/3 flops per n² items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 245 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+# 43 copies, for 4n³/3 flops per n² items, at a quarter copy per FMA on rustymath's own kernels. On macOS its block products run on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 245 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 linalg::qr	130	490
 # 384 copies, for about 12n³ flops per n² items, with the vectors, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 1000 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 linalg::svd	970	2000
@@ -150,17 +150,17 @@ linalg::eigh	660	1300
 linalg::eig	3600	5100
 # 320 copies, for about 10n³ flops per n² items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 1350 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 linalg::eigenvalues	2400	2700
-# 5 copies, for 2mn² flops on 4096×16 (32 per item) and reading the matrix, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 34 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+# 5 copies, for 2mn² flops on 4096×16 (32 per item) and reading the matrix, at a quarter copy per FMA on rustymath's own kernels. On macOS its block products and triangular solves run on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 34 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 linalg::lstsq	69	68
-# 21 copies, for 8n³/3 real flops per n² complex items, two floats per complex copy, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 50 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+# 21 copies, for 8n³/3 real flops per n² complex items, two floats per complex copy, at a quarter copy per FMA on rustymath's own kernels. On macOS its block products and triangular solves run on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 50 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 complex linalg::Lu::solve	58	100
-# 43 copies, for 16n³/3 real flops per n² complex items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 255 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+# 43 copies, for 16n³/3 real flops per n² complex items, at a quarter copy per FMA on rustymath's own kernels. On macOS its block products run on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 255 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 complex linalg::qr	180	510
 # 384 copies, for about 48n³ real flops per n² complex items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 800 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 complex linalg::svd	1100	1600
 # 288 copies, for about 36n³ real flops per n² complex items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged.
 complex linalg::eigh	1100	580
-# 800 copies, for about 100n³ real flops per n² complex items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 2400 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+# 800 copies, for about 100n³ real flops per n² complex items, at a quarter copy per FMA on rustymath's own kernels. On macOS its block products run on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 2400 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 complex linalg::eig	4600	4800
 # 2 copies, for three reads and one write per item.
 Clip	4	4
@@ -226,7 +226,7 @@ reduce::cumsum	2	6.3
 # 1 copies, for one read and one write per item; the scan runs in vector steps.
 reduce::cummax	2	2
 # 3.75 copies, for the negate (1), a read and write in place (1), 7 FMAs (1.75).
-polynomial::evaluate	7.5	7.5
+polynomial::evaluate	5.5	5.5
 # 75 copies, for 150 ops in f64 at half the lanes: a plain Lanczos sum, ln, exp, sinpi.
 Gamma	150	150
 # 50 copies, for 100 ops in f64 at half the lanes.
@@ -265,8 +265,8 @@ complex Asin	45	120
 complex Atanh	32	74
 # 104 copies, for f64's 420 ops computed in f64, which cost twice as many f32 copies. It costs about 320 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 complex Lgamma	210	640
-# 125 copies, for f64's 500 ops computed in f64, which cost twice as many f32 copies. It costs about 405 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
-complex Gamma	250	810
+# 125 copies, for f64's 500 ops computed in f64, which cost twice as many f32 copies. It costs twice the f64 case's cost: about 254 copies on macOS, against f64's 132, and about 405 on CI. Its macOS budget is twice the f64 case's held budget until that cost is studied, and its Linux budget is unchanged.
+complex Gamma	560	810
 # 2 copies, for 16 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: hypot; reading two floats and writing one take 0.75.
 complex Abs	4	4
 # 11.5 copies, for 92 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: two complex square roots, each with a hypot, a product and a rebalance, in separate real and imaginary passes. It costs about 29.4 copies on macOS and about 46 on CI, by its old budget, more than twice that, so both budgets are unchanged until the cost is studied.
@@ -297,13 +297,13 @@ search::view_quantiles_along	60	120
 stats::variance	3	3
 # 1.5 copies, for reading the data and the weights once, with a multiply-add per item. It costs about 7.4 copies on macOS, because each chunk gathers the data and the weights into buffers, and a second pass gathers the weights again for their total. Two other methods measured slower on 21 October 2026: folding pairs of products and weights in one walk cost 10.6, because a buffer of pairs folds more slowly than the walk it saves, and reading each 64-item row in place cost 11.7, because each in-place read works out its row's offset with divisions and each row's fold pays its own setup. Reading the runs in place without copying them only ties with the gather at 64 items. A fold that sums each run straight into its output's accumulator, with no product buffer, would reach the expected cost, as step 4 in basedpl's `meta/next-phases.md` records. Both budgets stay held until then.
 stats::average	150	650
-# 22 copies, for 2n³/3 flops per n² items, as FMAs, plus the solve, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 70 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+# 22 copies, for 2n³/3 flops per n² items, as FMAs, plus the solve, at a quarter copy per FMA on rustymath's own kernels. On macOS its block products and triangular solves run on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 70 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 linalg::Lu::solve	73	140
-# 64 copies, for 2n³ flops per n² items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 210 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+# 64 copies, for 2n³ flops per n² items, at a quarter copy per FMA on rustymath's own kernels. On macOS its block products and triangular solves run on Accelerate, including the two solves that form the inverse from the permuted identity, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 210 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 linalg::Lu::inverse	91	420
-# 11 copies, for n³/3 flops per n² items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 40.5 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+# 11 copies, for n³/3 flops per n² items, at a quarter copy per FMA on rustymath's own kernels. On macOS its block products and triangular solves run on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 40.5 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 linalg::cholesky	35	81
-# 43 copies, for 4n³/3 flops per n² items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 330 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+# 43 copies, for 4n³/3 flops per n² items, at a quarter copy per FMA on rustymath's own kernels. On macOS its block products run on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 330 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 linalg::qr	160	660
 # 384 copies, for about 12n³ flops per n² items, with the vectors, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 1400 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 linalg::svd	1500	2800
@@ -313,17 +313,17 @@ linalg::eigh	940	1500
 linalg::eig	5100	5600
 # 320 copies, for about 10n³ flops per n² items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 1700 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 linalg::eigenvalues	3000	3400
-# 5 copies, for 2mn² flops on 4096×16 (32 per item) and reading the matrix, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 50 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+# 5 copies, for 2mn² flops on 4096×16 (32 per item) and reading the matrix, at a quarter copy per FMA on rustymath's own kernels. On macOS its block products and triangular solves run on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 50 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 linalg::lstsq	100	100
-# 21 copies, for 8n³/3 real flops per n² complex items, two floats per complex copy, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 75 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+# 21 copies, for 8n³/3 real flops per n² complex items, two floats per complex copy, at a quarter copy per FMA on rustymath's own kernels. On macOS its block products and triangular solves run on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 75 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 complex linalg::Lu::solve	81	150
-# 43 copies, for 16n³/3 real flops per n² complex items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 360 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+# 43 copies, for 16n³/3 real flops per n² complex items, at a quarter copy per FMA on rustymath's own kernels. On macOS its block products run on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 360 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 complex linalg::qr	240	720
 # 384 copies, for about 48n³ real flops per n² complex items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 1200 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 complex linalg::svd	1600	2400
 # 288 copies, for about 36n³ real flops per n² complex items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 600 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 complex linalg::eigh	1400	1200
-# 800 copies, for about 100n³ real flops per n² complex items, at a quarter copy per FMA on rustymath's own kernels. macOS runs it on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 2650 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
+# 800 copies, for about 100n³ real flops per n² complex items, at a quarter copy per FMA on rustymath's own kernels. On macOS its block products run on Accelerate, which this analysis doesn't cover, so its macOS budget is unchanged. It costs about 2650 copies on CI, by its old budget, more than twice that, so its Linux budget is unchanged until the cost is studied.
 complex linalg::eig	5000	5300
 # 1 copies, for reading two items and writing one per lane of 2. It costs about 2.4 copies on macOS and about 2.6 on CI, by its old budget, more than twice that, so both budgets are unchanged until the cost is studied.
 Array::differences short lanes	5.2	5.2

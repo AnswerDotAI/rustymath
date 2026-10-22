@@ -1,7 +1,7 @@
 //! Probability distributions. Each has a density, a cumulative distribution, a quantile function and a sampler. The first three are also function objects, `Pdf`, `Cdf` and `Quantile`, which hold the distribution. Their slice forms choose the distribution's formulas once, outside the loop, so the loops of the closed-form distributions vectorize. An item of a slice form fails where its result is NaN and its argument isn't, as for a quantile of p outside 0 to 1. A discrete distribution's density is its mass at a whole x, and its quantile function and sampler give whole numbers.
 use crate::{
     Arg, Erfc, Erfcinv, Float, Ln, Unary, atan, betainc, betaincinv, cos, erfc, erfcinv, exp, expm1, gammainc, gammaincc, gammaincinv, lgamma, ln, log1p, pow, sin,
-    tan,
+    tan, slice::CHUNK,
 };
 use rand::{Rng, distr::{Distribution as _, Open01, StandardUniform}};
 use std::f64::consts::{FRAC_1_SQRT_2, PI, SQRT_2, TAU};
@@ -82,9 +82,12 @@ many |k, [x], n, out| match (&k.0 .0, x) {
 pub struct Cdf(pub Distribution);
 forms!(Cdf at real: |k, [x]| narrowed(x, |x| each_law!(&k.0 .0, d => d.cdf(x))),
 many |k, [x], n, out| match (&k.0 .0, x) {
-    (Law::Normal(d), Arg::Many(x)) => composed(&x[..n], out, #[inline(always)] |x| d.erfc_arg(x), Erfc,
+    (Law::Normal(d), Arg::Many(x)) => composed(&x[..n], out, d.erfc_line(), Erfc,
         #[inline(always)] |_, e| 0.5 * e),
-    (Law::LogNormal(d), Arg::Many(x)) => composed(&x[..n], out, #[inline(always)] |x| d.normal().erfc_arg(ln(x)), Erfc, #[inline(always)] |x, e| if x <= 0.0 { 0.0 } else { 0.5 * e }),
+    (Law::LogNormal(d), Arg::Many(x)) => {
+        let line = d.normal().erfc_line();
+        composed(&x[..n], out, #[inline(always)] move |x| line(ln(x)), Erfc, #[inline(always)] |x, e| if x <= 0.0 { 0.0 } else { 0.5 * e })
+    }
     (law, x) => each_law!(law, d => each!([x], n, out, |[x]| narrowed(x, |x| d.cdf(x)))),
 });
 
@@ -98,13 +101,18 @@ many |k, [p], n, out| match (&k.0 .0, p) {
     (law, p) => each_law!(law, d => each!([p], n, out, |[p]| narrowed(p, |p| quantile_of(d, p)))),
 });
 
-/// `finish(x, g(inner(x)))` for each item of `x`, written into `out`, with `g` from its f64 slice form. Gives whether `g` succeeded on every item.
+/// `finish(x, g(inner(x)))` for each item of `x`, written into `out`, with `g` from its f64 slice form. Each step runs over `CHUNK` items at a time, so the arguments and values between the steps stay in cache. Gives whether `g` succeeded on every item.
 fn composed<F: Float, G: Unary<f64, Out = f64>>(
     x: &[F], out: &mut [std::mem::MaybeUninit<F>], inner: impl Fn(f64) -> f64, g: G, finish: impl Fn(f64, f64) -> f64) -> bool {
-    let (mut args, mut values) = (Vec::with_capacity(x.len()), Vec::with_capacity(x.len()));
-    args.extend(x.iter().map(|&v| inner(v.wide())));
-    let ok = g.many(Arg::Many(&args), args.len(), &mut values);
-    for (slot, (&v, &e)) in out.iter_mut().zip(x.iter().zip(&values)) { slot.write(F::narrow(finish(v.wide(), e))); }
+    let (mut args, mut values) = (Vec::with_capacity(CHUNK), Vec::with_capacity(CHUNK));
+    let mut ok = true;
+    for (x, out) in x.chunks(CHUNK).zip(out.chunks_mut(CHUNK)) {
+        args.clear();
+        values.clear();
+        args.extend(x.iter().map(|&v| inner(v.wide())));
+        ok &= g.many(Arg::Many(&args), args.len(), &mut values);
+        for (slot, (&v, &e)) in out.iter_mut().zip(x.iter().zip(&values)) { slot.write(F::narrow(finish(v.wide(), e))); }
+    }
     ok
 }
 
@@ -253,9 +261,9 @@ fn standard_gamma<R: Rng + ?Sized>(shape: f64, rng: &mut R) -> f64 {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Normal { mean: f64, sd: f64 }
 impl Normal {
-    /// The argument of `erfc` in the cdf: (mean - x)/(sd√2), as a product so that a loop computes the reciprocal once.
+    /// The argument of `erfc` in the cdf, (mean - x)/(sd√2), as a map that multiplies by the reciprocal it computes when it's made. A loop over a closure that read `sd` through a reference divided for each item in x86-64 builds.
     #[inline(always)]
-    fn erfc_arg(&self, x: f64) -> f64 { (self.mean - x) * (FRAC_1_SQRT_2 / self.sd) }
+    fn erfc_line(&self) -> impl Fn(f64) -> f64 + Copy + use<> { let (mean, scale) = (self.mean, FRAC_1_SQRT_2 / self.sd); move |x| (mean - x) * scale }
     /// The quantile from e = erfcinv(2p): mean - sd·√2·e.
     #[inline(always)]
     fn from_erfcinv(&self, e: f64) -> f64 { self.mean - self.sd * SQRT_2 * e }
@@ -265,7 +273,7 @@ impl Formulas for Normal {
     // Inlined always, as rustymath's function wrappers are: the log-normal density's slice form calls it in a loop, which a call per item stops vectorizing.
     #[inline(always)]
     fn pdf(&self, x: f64) -> f64 { let z = (x - self.mean) * self.sd.recip(); exp(-0.5 * z * z) * (self.sd * SQRT_TAU).recip() }
-    fn cdf(&self, x: f64) -> f64 { 0.5 * erfc(self.erfc_arg(x)) }
+    fn cdf(&self, x: f64) -> f64 { 0.5 * erfc(self.erfc_line()(x)) }
     fn quantile(&self, p: f64) -> f64 { self.from_erfcinv(erfcinv(2.0 * p)) }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { self.mean + self.sd * standard_normal(rng) }
     /// Each pair of uniform draws gives two values, from the cosine and the sine of one angle.

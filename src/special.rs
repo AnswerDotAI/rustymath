@@ -455,10 +455,14 @@ fn erfc_tail<R: Native, const FUSED: bool>(a: R) -> R {
     )
 }
 
-/// `first()` where `use_first` holds, and `second()` elsewhere. f32, and f64 on x86-64, compute both and select, so that a loop that calls it vectorizes. Elsewhere f64 computes only the one it needs. On the Mac, computing both made f64 `erfc` 1.3 times slower, because two f64 lanes in a NEON vector don't repay computing every region. On CI's x86-64 runner, the branching f64 `erfc` cost 2.7 times as many copies as on the Mac, where AVX2 holds four lanes and a mispredicted branch costs more.
+/// Whether a formula with regions branches on each item's region, rather than computing every region and selecting: for f64, except on x86-64. On the Mac, computing both made f64 `erfc` 1.3 times slower, because two f64 lanes in a NEON vector don't repay computing every region. On CI's x86-64 runner, the branching f64 `erfc` cost 2.7 times as many copies as on the Mac, where AVX2 holds four lanes and a mispredicted branch costs more.
+#[inline(always)]
+fn branches<R: Native>() -> bool { R::WIDE && !cfg!(target_arch = "x86_64") }
+
+/// `first()` where `use_first` holds, and `second()` elsewhere: by a branch where `branches` holds, and otherwise by computing both and selecting, so that a loop that calls it vectorizes.
 #[inline(always)]
 fn either<R: Native>(use_first: bool, first: impl Fn() -> R, second: impl Fn() -> R) -> R {
-    if R::WIDE && !cfg!(target_arch = "x86_64") { return if use_first { first() } else { second() }; }
+    if branches::<R>() { return if use_first { first() } else { second() }; }
     let (a, b) = (first(), second());
     if use_first { a } else { b }
 }
@@ -582,17 +586,28 @@ many |_, [x], n, out| match x {
     x => each!([x], n, out, |[x]| crate::slice::Total(erfc::<_, { crate::FUSED }>(x))),
 });
 
-/// `erfc` on each item of `x`, written into `out`, a block of `BLOCK` items at a time. A block whose magnitudes all lie below `ERFC_SPLIT` computes only `erfc_near`, and one whose magnitudes all reach it computes only `erfc_far`. A mixed block runs `erfc`, which computes both on f32 and on x86-64 f64.
+/// `erfc` on each item of `x`, written into `out`, a block of `BLOCK` items at a time. A block whose magnitudes all lie below `ERFC_SPLIT` computes only `erfc_near`, and one whose magnitudes all reach it computes only `erfc_far`. Where `branches` holds, a mixed block's items are partitioned: `placed` puts the positions of those below `ERFC_SPLIT` at the front and the others' at the back, and each formula runs on its own items, gathered into one buffer, as `regions` does, because a branch on each item was mispredicted on mixed arguments. Elsewhere a mixed block runs `erfc`, which computes both formulas in every lane. Partitioning every block added about 12 instructions an item, more than computing in place where a block lies in one region.
 fn erfc_blocks<R: Native, const FUSED: bool>(x: &[R], out: &mut [MaybeUninit<R>]) -> bool {
-    const BLOCK: usize = 256;
+    const BLOCK: usize = 512;
     #[inline(always)]
     fn fill<R: Native>(xs: &[R], os: &mut [MaybeUninit<R>], f: impl Fn(R) -> R) { for (o, &v) in os.iter_mut().zip(xs) { o.write(f(v)); } }
+    let (mut place, mut t) = ([0u16; BLOCK], [R::zero(); BLOCK]);
     let split = R::narrow(ERFC_SPLIT);
+    #[inline(always)]
+    fn near<R: Native, const FUSED: bool>(v: R) -> R { erfc_ends(v, erfc_near::<R, FUSED>(v)) }
+    #[inline(always)]
+    fn far<R: Native, const FUSED: bool>(v: R) -> R { erfc_ends(v, erfc_far::<R, FUSED>(v)) }
     for (xs, os) in x.chunks(BLOCK).zip(out.chunks_mut(BLOCK)) {
         let (low, high) = xs.iter().fold((R::infinity(), R::zero()), |(low, high), &v| (low.min(v.abs()), high.max(v.abs())));
-        if high < split { fill(xs, os, #[inline(always)] |v| erfc_ends(v, erfc_near::<R, FUSED>(v))); }
-        else if low >= split { fill(xs, os, #[inline(always)] |v| erfc_ends(v, erfc_far::<R, FUSED>(v))); }
-        else { fill(xs, os, erfc::<R, FUSED>); }
+        if high < split { fill(xs, os, near::<R, FUSED>) }
+        else if low >= split { fill(xs, os, far::<R, FUSED>) }
+        else if branches::<R>() {
+            let n = placed(0..xs.len() as u16, &mut place, |i| xs[usize::from(i)].abs() < split);
+            let (nears, fars) = place[..xs.len()].split_at(n);
+            gathered(nears, &mut t, os, |i| xs[i], #[inline(always)] |t| { for v in t { *v = near::<R, FUSED>(*v) } }, |_, v| v);
+            gathered(fars, &mut t, os, |i| xs[i], #[inline(always)] |t| { for v in t { *v = far::<R, FUSED>(*v) } }, |_, v| v);
+        }
+        else { fill(xs, os, erfc::<R, FUSED>) }
     }
     true
 }
@@ -613,59 +628,64 @@ fn inverses<R: Native>(x: Arg<'_, R>, n: usize, out: &mut [MaybeUninit<R>], f: i
     match x { Arg::Many(x) if R::WIDE => regions::<R, { crate::FUSED }>(&x[..n], out, f, parts), x => each!([x], n, out, |[x]| f(x)) }
 }
 
-/// `maddock` on each item of `x`, written into `out`, with no branch on an item's region. In each block of `BLOCK` items, one pass places the central items' positions from the front and the others' from the back, and a second pass splits the others the same way by whether q is at least 1/4. Each region's formula then runs on its items' arguments, gathered into one buffer. On uniform arguments, `maddock`'s branches were mispredicted about three times in four, which took half its time. Items outside the domain, and NaN, take `f`. Gives `false` where an output is NaN and its item isn't.
+/// `maddock` on each item of `x`, written into `out`, with no branch on an item's region. In each block of `BLOCK` items, one pass computes each item's `parts` once into three buffers and `placed` puts the central items' positions at the front and the others' at the back, and a second `placed` splits the others by whether q is at least 1/4. Each region's formula then runs on its items' arguments, gathered into one buffer. On uniform arguments, `maddock`'s branches were mispredicted about three times in four, which took half its time. Items outside the domain, and NaN, take `f`, in a last pass that runs only in a block that holds one. Gives `false` where an output is NaN and its item isn't.
 fn regions<R: Native, const FUSED: bool>(x: &[R], out: &mut [MaybeUninit<R>], f: impl Fn(R) -> R, parts: impl Fn(f64) -> (f64, f64, f64)) -> bool {
     const BLOCK: usize = 512;
-    let (mut place, mut split, mut t) = ([0u16; BLOCK], [0u16; BLOCK], [0.0; BLOCK]);
+    let (mut place, mut split) = ([0u16; BLOCK], [0u16; BLOCK]);
+    let (mut ps, mut qs, mut signs, mut t) = ([0.0; BLOCK], [0.0; BLOCK], [0.0; BLOCK], [0.0; BLOCK]);
     let mut ok = true;
     for (xs, os) in x.chunks(BLOCK).zip(out.chunks_mut(BLOCK)) {
-        let item = |i: u16| parts(xs[usize::from(i)].wide());
-        let (mut lo, mut hi) = (0, xs.len());
-        for i in 0..xs.len() as u16 {
-            let central = item(i).0 <= 0.5;
-            (place[lo], place[hi - 1]) = (i, i);
-            lo += usize::from(central);
-            hi -= usize::from(!central);
-        }
-        let (central, others) = place[..xs.len()].split_at(lo);
-        let (mut up, mut down) = (0, others.len());
-        for &i in others {
-            let upper = item(i).1 >= 0.25;
-            (split[up], split[down - 1]) = (i, i);
-            up += usize::from(upper);
-            down -= usize::from(!upper);
-        }
-        let (upper, below) = split[..others.len()].split_at(up);
-        gathered(central, &mut t, os, &item, #[inline(always)] |(p, _, _)| p, #[inline(always)] |t| {
-            for v in t { *v = maddock_central::<FUSED>(*v) }
+        let mut outside = false;
+        let central = placed(0..xs.len() as u16, &mut place, |i| {
+            let i = usize::from(i);
+            let (p, q, sign) = parts(xs[i].wide());
+            (ps[i], qs[i], signs[i]) = (p, q, sign);
+            outside |= !(p < 1.0);
+            p <= 0.5
         });
-        gathered(upper, &mut t, os, &item, #[inline(always)] |(_, q, _)| q, #[inline(always)] |t| {
-            for v in t { *v = maddock_upper::<FUSED>(*v) }
-        });
-        gathered(below, &mut t, os, &item, #[inline(always)] |(_, q, _)| q, #[inline(always)] |t| {
+        let (central, others) = place[..xs.len()].split_at(central);
+        let upper = placed(others.iter().copied(), &mut split, |i| qs[usize::from(i)] >= 0.25);
+        let (upper, below) = split[..others.len()].split_at(upper);
+        let signed = |i: usize, v: f64| R::narrow(v.copysign(signs[i]));
+        gathered(central, &mut t, os, |i| ps[i], #[inline(always)] |t| { for v in t { *v = maddock_central::<FUSED>(*v) } }, signed);
+        gathered(upper, &mut t, os, |i| qs[i], #[inline(always)] |t| { for v in t { *v = maddock_upper::<FUSED>(*v) } }, signed);
+        gathered(below, &mut t, os, |i| qs[i], #[inline(always)] |t| {
             for v in t.iter_mut() { *v = maddock_g::<FUSED>(*v) }
             for v in t { *v = maddock_below::<FUSED>(*v) }
-        });
-        for (i, (&v, o)) in xs.iter().zip(os.iter_mut()).enumerate() {
-            if !(item(i as u16).0 < 1.0) {
-                let r = f(v);
-                o.write(r);
-                ok &= !r.is_nan() | v.is_nan();
+        }, signed);
+        if outside {
+            for (i, (&v, o)) in xs.iter().zip(os.iter_mut()).enumerate() {
+                if !(ps[i] < 1.0) {
+                    let r = f(v);
+                    o.write(r);
+                    ok &= !r.is_nan() | v.is_nan();
+                }
             }
         }
     }
     ok
 }
 
-/// `formula` on the argument that `read` takes from each item at `positions`, gathered into `t`. Each result goes to its item's place in `os`, with the item's sign.
+/// `formula` on the values that `arg` gives at `positions`, gathered into `t`. Each result goes to its item's place in `os`, through `result`, which also gets the item's position.
 #[inline(always)]
-fn gathered<R: Native>(
-    positions: &[u16], t: &mut [f64], os: &mut [MaybeUninit<R>], item: impl Fn(u16) -> (f64, f64, f64), read: impl Fn((f64, f64, f64)) -> f64,
-    formula: impl Fn(&mut [f64])) {
+fn gathered<T: Copy, R>(positions: &[u16], t: &mut [T], os: &mut [MaybeUninit<R>], arg: impl Fn(usize) -> T, formula: impl Fn(&mut [T]), result: impl Fn(usize, T) -> R) {
     let t = &mut t[..positions.len()];
-    for (v, &i) in t.iter_mut().zip(positions) { *v = read(item(i)) }
+    for (v, &i) in t.iter_mut().zip(positions) { *v = arg(usize::from(i)) }
     formula(t);
-    for (&v, &i) in t.iter().zip(positions) { os[usize::from(i)].write(R::narrow(v.copysign(item(i).2))); }
+    for (&v, &i) in t.iter().zip(positions) { let i = usize::from(i); os[i].write(result(i, v)); }
+}
+
+/// Places each of `positions` for which `first` holds at the front of `place`, in order, and each other one at the back, with no branch, and gives how many went to the front.
+#[inline(always)]
+fn placed(positions: impl ExactSizeIterator<Item = u16>, place: &mut [u16], mut first: impl FnMut(u16) -> bool) -> usize {
+    let (mut lo, mut hi) = (0, positions.len());
+    for i in positions {
+        let front = first(i);
+        (place[lo], place[hi - 1]) = (i, i);
+        lo += usize::from(front);
+        hi -= usize::from(!front);
+    }
+    lo
 }
 
 /// erfinv(p) for p from 0 to 1, given p and q = 1 - p, by John Maddock's rational approximations in Boost.Math's 64-bit `erf_inv_imp`. They need no iteration. Each region gives y + r, for a constant y and a ratio r of polynomials. Up to p = 1/2, the result is g(y + r) with g = p(p + 10). Beyond p = 1/2, the regions read only q. Both callers compute it exactly there. From q = 1/4 up, the result is √(-2 ln q) / (y + r). Below q = 1/4, the result is g(y + r) with g = √(-ln q), and g also chooses the region.

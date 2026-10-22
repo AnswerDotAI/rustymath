@@ -1,6 +1,7 @@
 //! Splitting work across threads. [`pieces`] cuts a call's items into pieces of the sizes its caller gives, and [`ranges`] into as many pieces as the time of its first unit justifies. The pieces run on a Rayon pool with Rayon's default number of threads: `RAYON_NUM_THREADS` where it's set, and otherwise one for each core. [`set_threads`] changes that number for the whole process. A call made on one of a pool's threads, such as a function that another call's piece runs, doesn't split again. In the browser build, which has no threads, every call runs its pieces in turn on the calling thread.
 use crate::slice::{Arg, CHUNK};
-use std::{mem::MaybeUninit, ops::Range, sync::atomic::{AtomicUsize, Ordering::Relaxed}, time::{Duration, Instant}};
+use crate::{error::Error, interrupt::check, timing::Instant};
+use std::{mem::MaybeUninit, ops::Range, sync::atomic::{AtomicUsize, Ordering::Relaxed}, time::Duration};
 
 /// The number of threads that calls split across, for the whole process, or 0 for the default pool's number.
 static THREADS: AtomicUsize = AtomicUsize::new(0);
@@ -41,11 +42,12 @@ pub fn pieces_of<B: Send>(out: &mut [B], size: usize, most: usize, write: &(dyn 
 }
 
 /// An output slice shared only through disjoint ranges.
-struct Shared<B>(*mut B);
+pub struct Shared<B>(*mut B);
 // SAFETY: each piece reaches only the items in its own range, so no two threads reach the same item.
 unsafe impl<B: Send> Sync for Shared<B> {}
 impl<B> Shared<B> {
     /// The items in `range`. SAFETY: the range must lie within the output, and no other caller may hold any of these items at the same time.
+    #[inline]
     unsafe fn part(&self, range: Range<usize>) -> &mut [B] { unsafe { std::slice::from_raw_parts_mut(self.0.add(range.start), range.len()) } }
 }
 
@@ -73,56 +75,96 @@ pub fn split<B: Send>(out: &mut [B], unit: usize, write: &(dyn Fn(usize, &mut [B
     ranges(n, unit, &|range| write(range.start, unsafe { shared.part(range) }))
 }
 
-/// The most cells that [`stack_with`] runs alone at its start, to time a cell.
+/// The most cells that [`each_cell`] runs alone at its start, to time a cell.
 const CELLS: usize = 8;
 
-/// The pieces that each thread is given in a round of a [`stack_with`] call, so that a thread that finishes early takes more of the round.
+/// The pieces that each thread is given in a round of an [`each_cell`] call, so that a thread that finishes early takes more of the round.
 const PIECES: usize = 4;
 
-/// The time that each round of a [`stack_with`] call gives each thread, where its cells are that short. A stack stops within about a round of an error from `check`, or within one cell where a cell takes longer.
+/// The time that each round of an [`each_cell`] call gives each thread, where its cells are that short. A stack stops within about a round of an interrupt, or within one cell where a cell takes longer.
 const ROUND_TIME: Duration = Duration::from_millis(20);
 
-/// Runs `write(i, items, scratch)` on each cell `i` of a stack of `count` cells, and gives the output with whether every call said `true`. `items` is cell `i`'s part of the output: `per` items from `i * per`. Cells that run in turn on one thread share one `S` for their scratch buffers, such as an `LuWork`. `check` runs on this thread before the first cell and between rounds, and its error stops the call.
+/// Runs `write(i, scratch)` on each cell `i` of a stack of `count` cells, and gives whether every call said `true`. Cells that run in turn on one thread share one `S` for their scratch buffers, such as an `LuWork`. It checks for an interrupt on this thread between rounds, and an interrupt's error stops the call. It makes no check before the first cell, which a caller's own check covers, so a stack of one small cell costs no check.
 ///
-/// The first cells run alone on this thread, to time a cell: up to `CELLS` of them, or [`PIECE_TIME`] of work, because one cell alone reads high from a cold start. Each later round holds about `ROUND_TIME` of cells for each of this thread's [`threads`], at least one each. A round's cells split into about `PIECES` pieces for each thread, each of at least `PIECE_TIME` of work. A cell that runs on this thread can split its own work, and one on another thread doesn't. On all 18 threads of an M5 Max, splitting stacks of 8 to 16 matrices of 128² to 512² was 1.5 to 5 times as fast as running their cells in turn, each split across the threads. Three inverses of 1024² were 25% slower. The browser build has no clock to time a cell, and runs the cells in turn with `check` before each. A stack of one cell runs that way too, with nothing to time.
-pub fn stack_with<B: Default + Send, S: Default, E>(
-    count: usize, per: usize, write: &(dyn Fn(usize, &mut [B], &mut S) -> bool + Sync), mut check: impl FnMut() -> Result<(), E>) -> Result<(Vec<B>, bool), E> {
-    let mut out: Vec<B> = (0..count * per).map(|_| B::default()).collect();
-    let (mut ok, mut scratch) = (true, S::default());
-    if cfg!(target_arch = "wasm32") || count <= 1 {
-        for i in 0..count {
-            check()?;
-            ok &= write(i, &mut out[i * per..][..per], &mut scratch);
-        }
-        return Ok((out, ok));
-    }
+/// The first cells run alone on this thread, to time a cell: up to `CELLS` of them, or [`PIECE_TIME`] of work, because one cell alone reads high from a cold start. Each later round holds about `ROUND_TIME` of cells for each of this thread's [`threads`], at least one each. A round's cells split into about `PIECES` pieces for each thread, each of at least `PIECE_TIME` of work. A cell that runs on this thread can split its own work, and one on another thread doesn't. On all 18 threads of an M5 Max, splitting stacks of 8 to 16 matrices of 128² to 512² was 1.5 to 5 times as fast as running their cells in turn, each split across the threads. Three inverses of 1024² were 25% slower. In the browser build, which has one thread, each round's cells run in turn. A stack of one cell runs alone, with nothing to time.
+fn each_cell<S: Default>(count: usize, write: impl Fn(usize, &mut S) -> bool + Sync) -> Result<bool, Error> {
+    let mut scratch = S::default();
+    if count <= 1 { return Ok(count == 0 || write(0, &mut scratch)); }
     let threads = threads();
-    check()?;
-    let (start, mut timed) = (Instant::now(), 0);
-    while timed < count && (timed == 0 || (timed < CELLS && start.elapsed() < PIECE_TIME)) {
-        ok &= write(timed, &mut out[timed * per..][..per], &mut scratch);
+    let start = Instant::now();
+    let mut ok = write(0, &mut scratch);
+    // The timed cells after a short first cell skip the clock read between them. A stack of 64 tiny products spent about a sixth of its time reading the clock.
+    let short = start.elapsed() * CELLS as u32 <= PIECE_TIME;
+    let mut timed = 1;
+    while timed < count.min(CELLS) && (short || start.elapsed() < PIECE_TIME) {
+        ok &= write(timed, &mut scratch);
         timed += 1;
     }
     let cell = start.elapsed().as_secs_f64().max(1e-9) / timed as f64;
     let round = ((ROUND_TIME.as_secs_f64() / cell) as usize).max(1).saturating_mul(threads);
     let least = (PIECE_TIME.as_secs_f64() / cell).ceil() as usize;
-    let shared = Shared(out.as_mut_ptr());
     for first in (timed..count).step_by(round) {
         check()?;
         let cells = round.min(count - first);
         ok &= pieces(cells, cells.div_ceil(threads * PIECES).max(least).max(1), usize::MAX, &|range| {
             let mut scratch = S::default();
-            // SAFETY: `pieces` gives each call its own range of cells, and each cell has its own `per` items.
-            range.map(|c| first + c).fold(true, |ok, i| write(i, unsafe { shared.part(i * per..(i + 1) * per) }, &mut scratch) & ok)
+            range.map(|c| first + c).fold(true, |ok, i| write(i, &mut scratch) & ok)
         });
     }
+    Ok(ok)
+}
+
+/// A stack's outputs: a tuple of one to three `Vec`s, each holding its own number of items for every cell in turn. [`stack`] gives each cell its part of each output, as a QR stack writes Q and R and an SVD stack U, S and V.
+pub trait Outputs: Sized {
+    /// The items that each cell writes in each output.
+    type Per: Copy + Sync;
+    /// One cell's part of each output.
+    type Cell<'a> where Self: 'a;
+    /// The outputs' items, shared with the threads that write their cells.
+    type Shared: Sync;
+    /// The outputs of `count` cells, each item at its default. `vec!` asks the allocator for zeroed memory where that default is zero bits, as for real numbers and integers, so no pass writes a large output before its cells do.
+    fn new(count: usize, per: Self::Per) -> Self;
+    /// Pointers to the outputs' items.
+    fn shared(&mut self) -> Self::Shared;
+    /// Cell `i`'s part of each output. SAFETY: `i` must be below the outputs' number of cells, and no other caller may hold cell `i`'s part at the same time.
+    unsafe fn cell<'a>(shared: &'a Self::Shared, per: Self::Per, i: usize) -> Self::Cell<'a> where Self: 'a;
+}
+
+macro_rules! outputs {
+    ($n:literal: $($t:ident $k:tt),+) => {
+        impl<$($t: Clone + Default + Send + 'static),+> Outputs for ($(Vec<$t>,)+) {
+            type Per = [usize; $n];
+            type Cell<'a> = ($(&'a mut [$t],)+) where Self: 'a;
+            type Shared = ($(Shared<$t>,)+);
+            fn new(count: usize, per: [usize; $n]) -> Self { ($(vec![<$t>::default(); count * per[$k]],)+) }
+            fn shared(&mut self) -> Self::Shared { ($(Shared(self.$k.as_mut_ptr()),)+) }
+            unsafe fn cell<'a>(shared: &'a Self::Shared, per: [usize; $n], i: usize) -> Self::Cell<'a> where Self: 'a {
+                // SAFETY: as the caller promises.
+                ($(unsafe { shared.$k.part(i * per[$k]..(i + 1) * per[$k]) },)+)
+            }
+        }
+    };
+}
+outputs!(1: A 0);
+outputs!(2: A 0, B 1);
+outputs!(3: A 0, B 1, C 2);
+
+/// Runs `write(i, parts, scratch)` on each cell `i` of a stack of `count` cells, as [`each_cell`] runs them, and gives the outputs with whether every call said `true`. `parts` is cell `i`'s part of each output `k`: `per[k]` items from `i * per[k]`.
+pub fn stack<O: Outputs + 'static, S: Default>(count: usize, per: O::Per, write: &(dyn Fn(usize, O::Cell<'_>, &mut S) -> bool + Sync)) -> Result<(O, bool), Error> {
+    let mut out = O::new(count, per);
+    let shared = out.shared();
+    // SAFETY: `each_cell` gives each cell below `count` to one call.
+    let ok = each_cell(count, |i, scratch| write(i, unsafe { O::cell(&shared, per, i) }, scratch))?;
     Ok((out, ok))
 }
 
-/// [`stack_with`] for a `write` that always succeeds: the output alone.
-pub fn stack<B: Default + Send, S: Default, E>(
-    count: usize, per: usize, write: &(dyn Fn(usize, &mut [B], &mut S) + Sync), check: impl FnMut() -> Result<(), E>) -> Result<Vec<B>, E> {
-    Ok(stack_with(count, per, &|i, cell, scratch| { write(i, cell, scratch); true }, check)?.0)
+/// `f(i, scratch)` of each cell `i` of a stack of `count` cells, in order, as [`each_cell`] runs them: [`stack`] for a result of any type, one for each cell.
+pub fn each<R: Send, S: Default>(count: usize, f: impl Fn(usize, &mut S) -> R + Sync) -> Result<Vec<R>, Error> {
+    let mut out: Vec<Option<R>> = (0..count).map(|_| None).collect();
+    let shared = Shared(out.as_mut_ptr());
+    // SAFETY: `each_cell` gives each cell below `count` to one call.
+    each_cell(count, |i, scratch| { let cell = unsafe { shared.part(i..i + 1) }; cell[0] = Some(f(i, scratch)); true })?;
+    Ok(out.into_iter().map(|c| c.expect("`each_cell` runs every cell")).collect())
 }
 
 /// Appends `n` items to `out`, and gives whether every call of `write` said `true`. `write(range, slots)` fills `slots` with the items in `range`, in order. The calls split across threads as [`split`] splits a call, in units of `unit` items. A call that leaves any of its slots unfilled panics, and `out` keeps its length.
