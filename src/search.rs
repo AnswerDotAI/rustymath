@@ -121,7 +121,7 @@ pub fn index_of<K: Key>(x: &[K], y: &[K]) -> Vec<u32> {
     let miss = x.len() as u32;
     if y.len() <= SCANNED { return y.iter().map(|n| x.iter().position(|h| h == n).map_or(miss, |p| p as u32)).collect(); }
     let Some((min, mut table)) = table(x, usize::MAX) else { return first_matches(x, y) };
-    let first = write_first(x, min, &mut table, None);
+    let first = write_first(x, min, &mut table, None, |_, _| ());
     // `move` keeps `min`, `first` and `miss` in registers. Captured by reference, they would load again for every item.
     let at = move |n: K| usize::try_from(n.key().wrapping_sub(min)).ok().and_then(|i| first.get(i));
     let mut found = Vec::with_capacity(y.len());
@@ -145,16 +145,16 @@ pub(crate) fn look_up<K: Copy + Sync>(found: &mut Vec<u32>, y: &[K], look: impl 
 #[inline(never)]
 pub fn classes<K: Key>(x: &[K]) -> Vec<u32> {
     let Some((min, mut table)) = table(x, usize::MAX) else { return first_classes(x, |n| n) };
-    let first = write_first(x, min, &mut table, None);
+    let first = write_first(x, min, &mut table, None, |_, _| ());
     x.iter().map(move |&n| first[n.key().wrapping_sub(min) as usize] as u32).collect()
 }
 
-/// Whether each item of `x` is the first with its key. Once a table holds the first position of each key, marking those positions gives the result, with no second pass over `x`. Wider keys mark the items that are their own class.
+/// Whether each item of `x` is the first with its key. The pass that writes each key's first position marks it as it goes, with no second pass over `x`. Wider keys mark the items that are their own class.
 #[inline(never)]
 pub fn firsts<K: Key>(x: &[K]) -> Vec<bool> {
     let Some((min, mut table)) = table(x, usize::MAX) else { return first_mask(&first_classes(x, |n| n)) };
     let mut mask = vec![false; x.len()];
-    for &f in write_first(x, min, &mut table, None) { if let Some(m) = mask.get_mut(f) { *m = true } }
+    write_first(x, min, &mut table, None, |p, new| mask[p] |= new);
     mask
 }
 
@@ -207,15 +207,13 @@ pub struct Numbered {
 }
 
 impl Numbered {
-    /// Folds each class of `data` in position order by `R`, and whether every fold fits. Classes are numbered in order of first position, so an item whose class has no total yet starts it.
+    /// Folds each class of `data` in position order by `R`, starting from `R`'s exact identity, and whether every fold fits.
     #[inline]
     pub fn fold<T: Copy, R: crate::reduce::Reduction<T>>(&self, data: &[T]) -> (Vec<R::Total>, bool) {
-        let (mut totals, mut fits) = (Vec::with_capacity(self.firsts.len()), true);
+        let (mut totals, mut fits) = (vec![R::identity(); self.firsts.len()], true);
         for (&c, &x) in self.numbers.iter().zip(data) {
-            let c = c as usize;
             let ok;
-            if c == totals.len() { let (total, k) = R::one(x); totals.push(total); ok = k; }
-            else { (totals[c], ok) = R::checked(totals[c], x); }
+            (totals[c as usize], ok) = R::checked(totals[c as usize], x);
             fits &= ok;
         }
         (totals, fits)
@@ -312,10 +310,7 @@ pub fn view_find(pattern: View<'_>, pattern_shape: &[usize], target: View<'_>, s
 pub fn class_counts<K: Key>(x: &[K]) -> Vec<usize> {
     let Some((min, counts)) = counts(x) else { return numbered(&classes(x)).counts() };
     let mut first = vec![usize::MAX; counts.len()];
-    write_first(x, min, &mut first, Some(counts.iter().filter(|&&c| c > 0).count()));
-    let mut keys: Vec<usize> = (0..counts.len()).filter(|&g| counts[g] > 0).collect();
-    keys.sort_unstable_by_key(|&g| first[g]);
-    keys.into_iter().map(|g| counts[g]).collect()
+    first_positions(x, min, &mut first, Some(counts.iter().filter(|&&c| c > 0).count())).into_iter().map(|f| counts[x[f].key().wrapping_sub(min) as usize]).collect()
 }
 
 /// For each of `values`, the number of `boundaries` at or below it, as BQN's dyadic `⍋` and NumPy's `searchsorted` with `side='right'` give it. `boundaries` must be in ascending order. When they are, and they span few enough keys for a table, a table of the count of boundaries at or below each key answers each value with one read. Otherwise each value takes a binary search, which halves its range with a select in place of a branch, so mispredicted comparisons don't stall it. Sixteen values search together, level by level, because every search of `boundaries` halves the same lengths. Their loads at each level are then independent.
@@ -366,8 +361,8 @@ fn table<K: Key>(x: &[K], empty: usize) -> Option<(i64, Vec<usize>)> {
 /// The number of entries in a table indexed by `len` keys that span `span + 1` values, when that's at most twice `len`, or 1024.
 fn table_size(span: u64, len: usize) -> Option<usize> { usize::try_from(span).ok()?.checked_add(1).filter(|&r| r <= len.saturating_mul(2).max(1024)) }
 
-/// Writes the first position of each key in `x` to its entry in `first`, whose entries start at key `min` and hold `usize::MAX` until written. The pass runs forward and stops after the first block of 64 positions that fills the entry of the last key `x` holds. Keys that fill their range, such as Booleans, soon do. Keys that leave gaps in their range, as the characters of text do, never fill it. A caller that knows how many keys `x` holds passes that number as `present`. Otherwise, where the keys span at most 128 values, the pass counts them once after `STALL` blocks in a row with no new key. It stops when it has found them all. Each entry takes its new position by a select, not a branch. The table is a slice, not a `Vec`, so that the compiler keeps its bounds in registers.
-fn write_first<'t, K: Key>(x: &[K], min: i64, first: &'t mut [usize], present: Option<usize>) -> &'t [usize] {
+/// Writes the first position of each key in `x` to its entry in `first`, whose entries start at key `min` and hold `usize::MAX` until written. The pass runs forward and stops after the first block of 64 positions that fills the entry of the last key `x` holds. Keys that fill their range, such as Booleans, soon do. Keys that leave gaps in their range, as the characters of text do, never fill it. A caller that knows how many keys `x` holds passes that number as `present`. Otherwise, where the keys span at most 128 values, the pass counts them once after `STALL` blocks in a row with no new key. It stops when it has found them all. `found` hears of each position the pass reads, with whether it holds its key's first item, so a caller can record or mark first positions in the same pass. Each entry takes its new position by a select, not a branch. The table is a slice, not a `Vec`, so that the compiler keeps its bounds in registers.
+fn write_first<'t, K: Key>(x: &[K], min: i64, first: &'t mut [usize], present: Option<usize>, mut found: impl FnMut(usize, bool)) -> &'t [usize] {
     let (mut empty, mut stall, mut counted) = match present { Some(h) => (h, 0, true), None => (first.len(), 0, first.len() > 128) };
     for (b, block) in x.chunks(64).enumerate() {
         let before = empty;
@@ -376,6 +371,7 @@ fn write_first<'t, K: Key>(x: &[K], min: i64, first: &'t mut [usize], present: O
             let new = *entry == usize::MAX;
             empty -= usize::from(new);
             *entry = if new { b * 64 + j } else { *entry };
+            found(b * 64 + j, new);
         }
         stall = if empty == before { stall + 1 } else { 0 };
         // Entries of keys that `x` doesn't hold stay empty.
@@ -400,6 +396,15 @@ fn held<K: Key>(x: &[K], min: i64) -> usize {
         for (q, mask) in seen.iter_mut().enumerate() { *mask |= if d >> 5 == q as u32 { bit } else { 0 } }
     }
     seen.iter().map(|mask| mask.count_ones() as usize).sum()
+}
+
+/// The first position of each key of `x`, in ascending order, from the one pass of `write_first`, which writes `first`'s entries as it does for its other callers. The pass meets keys in order of their first positions, so recording each new one keeps the list in order with no sort.
+fn first_positions<K: Key>(x: &[K], min: i64, first: &mut [usize], present: Option<usize>) -> Vec<usize> {
+    // Every position goes to the end of the list, which grows only where the position is new, so the pass needs no branch.
+    let (mut positions, mut count) = (vec![0; first.len().min(x.len()) + 1], 0);
+    write_first(x, min, first, present, |p, new| { positions[count] = p; count += usize::from(new); });
+    positions.truncate(count);
+    positions
 }
 
 /// For each item of `y`, the position of the first equal item of `x`, or the length of `x` where none is equal, from a hash map. `index_of` takes it for keys that span too much for a table.
@@ -470,9 +475,7 @@ impl Grouped {
 fn numbered_table<K: Key>(x: &[K]) -> Option<(i64, Vec<usize>, Vec<usize>)> {
     checked_len(x);
     let (min, mut table) = table(x, usize::MAX)?;
-    write_first(x, min, &mut table, None);
-    // A radix sort orders the first positions in fewer steps than comparisons when the keys span a wide range.
-    let firsts: Vec<usize> = sorted(table.iter().filter(|&&f| f != usize::MAX).map(|&f| f as u32).collect()).0.into_iter().map(|f| f as usize).collect();
+    let firsts = first_positions(x, min, &mut table, None);
     for (g, &f) in firsts.iter().enumerate() { table[x[f].key().wrapping_sub(min) as usize] = g; }
     Some((min, table, firsts))
 }
@@ -487,7 +490,7 @@ pub fn grouped_keys<K: Key>(x: &[K]) -> Option<Grouped> {
     else { grouped_classes(x, firsts, move |k| table[k.key().wrapping_sub(min) as usize]) })
 }
 
-/// The classes of `x` as [`Numbered`] gives them, numbered as `grouped_keys` numbers them, or `None` when its keys span too many values for a table. A fold of each class reads these numbers in one pass, where each class's positions would take a pass to build and a gather to read.
+/// The classes of `x` as [`Numbered`] gives them, numbered as `grouped_keys` numbers them, or `None` when its keys span too many values for a table. A fold of each class reads these numbers in one pass, where each class's positions would take a pass to build and a gather to read. A pass that numbers each key as it first meets it, in place of `numbered_table`, measured slower: it stores to a table entry for every item, and repeated keys then wait on those stores.
 #[inline(never)]
 pub fn numbered_keys<K: Key>(x: &[K]) -> Option<Numbered> {
     let (min, table, firsts) = numbered_table(x)?;
@@ -858,15 +861,18 @@ pub fn view_index_of(x: View<'_>, y: View<'_>, t: Tolerance) -> Option<Result<Ve
     key_pairs!(x, y, |x, y| Ok(index_of(x, y)))
 }
 
-/// Whether equal-length compact cells match. `None` when their kinds need the caller's numeric conversion.
+/// Whether equal-length compact cells match. Booleans and integers match floats as `f64`s within `t`. `None` when their kinds need the caller's numeric conversion.
 pub fn view_matches(x: View<'_>, y: View<'_>, t: Tolerance) -> Option<bool> {
     use tolerant::{Tolerant, TolerantComplex};
     if x.len() != y.len() { return Some(false); }
+    // Item `i` of a view of Booleans or integers, as an integer.
+    let whole = |v: View<'_>, i: usize| match v { View::Booleans(v) => i64::from(v[i]), View::Integers(v) => v.get(i), _ => unreachable!("Booleans or integers") };
     Some(match (x, y) {
         (View::Booleans(x), View::Booleans(y)) => x == y,
         (View::Integers(x), View::Integers(y)) => x == y,
-        (View::Booleans(x), View::Integers(y)) => x.iter().enumerate().all(|(i, &x)| i64::from(x) == y.get(i)),
-        (View::Integers(x), View::Booleans(y)) => y.iter().enumerate().all(|(i, &y)| x.get(i) == i64::from(y)),
+        (x @ (View::Booleans(_) | View::Integers(_)), y @ (View::Booleans(_) | View::Integers(_))) => (0..x.len()).all(|i| whole(x, i) == whole(y, i)),
+        (n @ (View::Booleans(_) | View::Integers(_)), View::Floats(f)) | (View::Floats(f), n @ (View::Booleans(_) | View::Integers(_))) =>
+            crate::with_tolerance!(t, |t| with_floats!(f, |f| f.iter().enumerate().all(|(i, &f)| t.matches::<f64>(whole(n, i) as f64, f.into())))),
         (View::Floats(x), View::Floats(y)) => crate::with_tolerance!(t, |t| with_floats!(x, |x| with_floats!(y, |y|
             x.iter().zip(y).all(|(&x, &y)| t.matches::<f64>(x.into(), y.into()))))),
         (View::Complexes(x), View::Complexes(y)) => crate::with_tolerance!(t, |t| (0..x.len()).all(|i| t.complex_equal(x.get(i), y.get(i)))),

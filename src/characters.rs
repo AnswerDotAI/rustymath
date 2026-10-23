@@ -19,6 +19,8 @@ pub enum Rule {
 
 /// The rule by which a function object takes characters. An object without one takes no characters. Each object gets its rule from rustymath's table of facts ([`facts!`](crate::facts)).
 pub trait Characters { const RULE: Rule; }
+/// [`Wrapped`](crate::Wrapped) takes characters by its object's rule. Character arithmetic checks each code point after its integer kernel runs, so a wrapped integer result still fails there.
+impl<K: Characters> Characters for crate::Wrapped<K> { const RULE: Rule = K::RULE; }
 
 /// [`binary`] for objects of type `K`, as [`characters!`](crate::characters!) gives it.
 pub type Kernel<K> = fn(&K, ArrayView<'_>, ArrayView<'_>, &[usize], &Agreement) -> Option<(Buffer, bool)>;

@@ -44,10 +44,15 @@ mod convert {
             (float::<f64, u8>(255), float::<f32, u16>(65535), float::<f64, u32>(u32::MAX), float::<f16, i32>(-3)),
             (255.0, 65535.0, 4294967295.0, f16::from_f32(-3.0))
         );
-        let mut counts = Vec::new();
+        let mut counts = Vec::<f64>::new();
         count(&mut counts, 0, false, 21);
         count(&mut counts, 20, true, 21);
         assert_eq!(counts, (0..21).chain((0..21).rev()).map(|i| i as f64).collect::<Vec<_>>());
+        let mut narrow = Vec::<f32>::new();
+        count(&mut narrow, (1 << 24) - 3, false, 8);
+        count(&mut narrow, 1 << 31, true, 3);
+        let expected = ((1i64 << 24) - 3..(1 << 24) + 5).chain(((1 << 31) - 2..=1 << 31).rev());
+        assert_eq!(narrow, expected.map(|i| i as f64 as f32).collect::<Vec<_>>());
     }
 }
 
@@ -111,7 +116,7 @@ mod distribution {
         assert_eq!(one[0], 0.0);
     }
 
-    /// `f`'s slice form against `scalar` for each item of `xs`, at f64 and at f32. Gives whether the slice form reported every item as succeeding.
+    /// `f`'s slice form against `scalar` for each item of `xs` at f64, and against `f`'s own scalar form at f32, which needn't compute in f64. Gives whether the slice form reported every item as succeeding.
     fn matches_scalar(f: impl Unary<f64, Out = f64> + Unary<f32, Out = f32>, scalar: impl Fn(f64) -> f64, xs: &[f64]) -> bool {
         let same = |a: f64, b: f64| a == b || (a.is_nan() && b.is_nan());
         let (mut out, mut out32) = (Vec::new(), Vec::new());
@@ -119,7 +124,7 @@ mod distribution {
         let xs32: Vec<f32> = xs.iter().map(|&x| x as f32).collect();
         assert_eq!(f.many(Arg::Many(&xs32), xs32.len(), &mut out32), ok);
         assert!(out.iter().zip(xs).all(|(&r, &x)| same(r, scalar(x))), "{out:?}");
-        assert!(out32.iter().zip(&xs32).all(|(&r, &x)| same(r.into(), scalar(x.into()) as f32 as f64)), "{out32:?}");
+        assert!(out32.iter().zip(&xs32).all(|(&r, &x)| same(r.into(), Unary::<f32>::one(&f, x).into())), "{out32:?}");
         ok
     }
 

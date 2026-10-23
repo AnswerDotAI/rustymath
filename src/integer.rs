@@ -89,6 +89,14 @@ pub(crate) fn wrapped_power(x: i64, y: i64) -> (i64, bool) {
 #[inline]
 pub fn residue(x: i64, y: i64) -> i64 { if x == 0 { y } else { floored(y.wrapping_rem(x), x) } }
 
+/// The floor of x/y, or `None` for a zero y or a quotient that overflows. A dividend below 2^53 in magnitude divides in `f64`, where integer division is slow: the quotient then rounds by less than its distance from the nearest whole number, so its floor is exact. A divisor that `f64` rounds then exceeds the dividend in magnitude, and the quotient's floor is 0 or ¯1 either way.
+#[inline]
+pub fn floor_quotient(x: i64, y: i64) -> Option<i64> {
+    if y == 0 { return None; }
+    if x.unsigned_abs() < 1 << 53 { return Some((x as f64 / y as f64).floor() as i64); }
+    x.checked_div(y).map(|q| if x % y != 0 && (x < 0) != (y < 0) { q - 1 } else { q })
+}
+
 /// `r`, a remainder of a division by x with the dividend's sign, moved to x's sign.
 #[inline]
 fn floored<T: num_traits::PrimInt + num_traits::Signed>(r: T, x: T) -> T { if !r.is_zero() && r.is_negative() != x.is_negative() { r + x } else { r } }
@@ -183,7 +191,7 @@ macro_rules! narrower {
 }
 narrower!(u8, i16, i32);
 forms!(FloorDivide at u8: |_, [x, y]| x.checked_div(y));
-forms!(FloorDivide at i16, i32, i64: |_, [x, y]| x.checked_div(y).map(|q| if x % y != 0 && (x < 0) != (y < 0) { q - 1 } else { q }));
+forms!(FloorDivide at i16, i32, i64: |_, [x, y]| floor_quotient(x.into(), y.into()).and_then(|q| q.try_into().ok()));
 
 /// Each comparison's exact forms, which give Booleans: at each integer type of compact buffers, and at Booleans, where `false` orders before `true`. Characters compare as their code points, through these forms at `i32` ([`characters`](crate::characters)).
 macro_rules! exactly {

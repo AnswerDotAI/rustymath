@@ -170,7 +170,7 @@ Complex forms attach to the same objects as real forms. `Abs` and `Angle` return
 
 Complex errors are measured against a magnitude-based scale, with function-specific scales for ln Gamma, powers, Gamma and binomial. Quarter-turn directions are deliberately exact. See `complex.rs` for that contract rather than applying a separate ulp bound to each component.
 
-`Distribution` validates parameters and holds a `Law`. `Pdf`, `Cdf` and `Quantile` select the law outside their item loops. Formulas use f64 working arithmetic and narrow their outputs. Sampling, rolls and deals take a caller-owned RNG. Keep RNG ownership separate from the numerical algorithms.
+`Distribution` validates parameters and holds a `Law`. `Pdf`, `Cdf` and `Quantile` select the law outside their item loops. Normal and log-normal use f32 working arithmetic for f32 inputs, with parameters and precomputed coefficients narrowed before the item loop. Other laws use f64 arithmetic and narrow their outputs. Sampling, rolls and deals take a caller-owned RNG. Keep RNG ownership separate from the numerical algorithms.
 
 ### Integers, exact numbers and polynomials
 

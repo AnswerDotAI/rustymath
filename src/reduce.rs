@@ -139,28 +139,43 @@ pub struct Xnor;
 forms!(Xor at bool: |_, [x, y]| x != y);
 forms!(Xnor at bool: |_, [x, y]| x == y);
 
-/// `x` folded by `add` from `unit`, through as many running results as `running_results` gives, which `merge` combines at the end.
+/// `x` folded by `add` from `unit`, through the running results that `running_results` gives, which `merge` combines.
 #[inline(always)]
 pub(crate) fn folded<A: Copy, S: Copy>(x: &[A], unit: S, add: impl Fn(S, A) -> S + Copy, merge: impl Fn(S, S) -> S) -> S {
-    running_results(x, unit, add, move |parts, rest| rest.iter().fold(parts.iter().fold(unit, |s, &p| merge(s, p)), |s, &v| add(s, v)))
+    let merge = &merge;
+    running_results(x, unit, add, merge, move |parts, rest| rest.iter().fold(parts.iter().fold(unit, |s, &p| merge(s, p)), |s, &v| add(s, v)))
 }
 
-/// The running results of `add` from `unit` over `x`: as many as `slice::running` gives, or fewer for a short `x`, so that each takes at least 8 items. A short slice then doesn't set up and merge more results than it has items for. Each takes the items at its own position in every whole group of that many. `finish` gets the results, and the items after the last whole group. Their count is always even.
+/// The running results of `add` from `unit` over `x`: as many as `slice::running` gives, or fewer for a short `x`, so that each takes at least 8 items. A short slice then doesn't set up and merge more results than it has items for. Each takes the items at its own position in every whole group of that many. `finish` gets the results, and the items after the last whole group. Their count is always even. `merge` combines two running results, as [`tree`] does for a long `x`.
 #[inline(always)]
-fn running_results<A: Copy, S: Copy, T>(x: &[A], unit: S, add: impl Fn(S, A) -> S, finish: impl FnOnce(&[S], &[A]) -> T) -> T {
+fn running_results<A: Copy, S: Copy, T>(x: &[A], unit: S, add: impl Fn(S, A) -> S, merge: impl Fn(S, S) -> S, finish: impl FnOnce(&[S], &[A]) -> T) -> T {
     match crate::slice::running(size_of::<S>()).min(x.len() / 8) {
-        ..8 => running_by::<A, S, T, 4>(x, unit, add, finish), 8..16 => running_by::<A, S, T, 8>(x, unit, add, finish),
-        16..32 => running_by::<A, S, T, 16>(x, unit, add, finish), _ => running_by::<A, S, T, 32>(x, unit, add, finish)
+        ..8 => running_by::<A, S, T, 4>(x, unit, add, merge, finish), 8..16 => running_by::<A, S, T, 8>(x, unit, add, merge, finish),
+        16..32 => running_by::<A, S, T, 16>(x, unit, add, merge, finish), _ => running_by::<A, S, T, 32>(x, unit, add, merge, finish)
     }
 }
 
-/// `running_results` with `R` of them. The loop updates them in one local array, which compiles to vector instructions. Float callers pass a strict `+` or `*`, not `algebraic_add`: under thin LTO the inner loop is unrolled before the loop vectorizer runs, and reassociation let it treat each running result as a reduction across chunks, which on wasm read every lane from a different chunk. A strict operation also fixes the order of a float total in every build, which changed some totals in their last bits from earlier builds, whose order varied by build and target.
+/// `running_results` with `R` of them, folded by [`tree`]. Float callers pass a strict `+` or `*`, not `algebraic_add`: under thin LTO the inner loop is unrolled before the loop vectorizer runs, and reassociation let it treat each running result as a reduction across chunks, which on wasm read every lane from a different chunk. A strict operation also fixes the order of a float total in every build, which changed some totals in their last bits from earlier builds, whose order varied by build and target.
 #[inline(always)]
-fn running_by<A: Copy, S: Copy, T, const R: usize>(x: &[A], unit: S, add: impl Fn(S, A) -> S, finish: impl FnOnce(&[S], &[A]) -> T) -> T {
+fn running_by<A: Copy, S: Copy, T, const R: usize>(x: &[A], unit: S, add: impl Fn(S, A) -> S, merge: impl Fn(S, S) -> S, finish: impl FnOnce(&[S], &[A]) -> T) -> T {
     let (chunks, rest) = x.as_chunks::<R>();
+    finish(&tree(chunks, unit, &add, &merge), rest)
+}
+
+/// The most items that one loop of [`tree`] folds. Each leaf adds a call and a merge. Leaves of 16,384 items cost a 65,536-item sum about 2% fewer instructions than 4,096, but left a million tenths' sum in `f32` with 3.4 times the error.
+const LEAF: usize = 4096;
+
+/// The `R` running results of `add` from `unit` over `chunks`, each taking the item at its own position in every chunk. Up to [`LEAF`] items fold in one loop, which updates the results in one local array and compiles to vector instructions. More items split into halves, whose results `merge` combines position by position. Each result's chain of steps then stays short, so the rounding error of a float total grows with the logarithm of its length past a leaf, not in proportion to it.
+fn tree<A: Copy, S: Copy, const R: usize>(chunks: &[[A; R]], unit: S, add: &impl Fn(S, A) -> S, merge: &impl Fn(S, S) -> S) -> [S; R] {
+    if chunks.len() * R > LEAF {
+        let (a, b) = chunks.split_at(chunks.len() / 2);
+        let (mut a, b) = (tree(a, unit, add, merge), tree(b, unit, add, merge));
+        for k in 0..R { a[k] = merge(a[k], b[k]) }
+        return a;
+    }
     let mut parts = [unit; R];
     for chunk in chunks { for k in 0..R { parts[k] = add(parts[k], chunk[k]) } }
-    finish(&parts, rest)
+    parts
 }
 
 /// The groups of four items in each block of [`grouped`]'s first pass. Its buffer of running sums stays in L1 for every total type.
@@ -1427,7 +1442,8 @@ fn quotient<T: Copy, R: Native>(
 /// The sum by `add` and `merge` of the items of `x` at even positions, less the sum of those at odd positions. There is an even number of running results, so each one takes the items of one parity.
 #[inline(always)]
 fn alternated<A: Copy, S: Copy + std::ops::Sub<Output = S>>(x: &[A], unit: S, add: impl Fn(S, A) -> S + Copy, merge: impl Fn(S, S) -> S) -> S {
-    running_results(x, unit, add, move |parts, rest| {
+    let merge = &merge;
+    running_results(x, unit, add, merge, move |parts, rest| {
         let ((pairs, _), (tail, last)) = (parts.as_chunks::<2>(), rest.as_chunks::<2>());
         let (even, odd) = pairs.iter().fold((unit, unit), |(e, o), &[p, q]| (merge(e, p), merge(o, q)));
         let (even, odd) = tail.iter().fold((even, odd), |(e, o), &[p, q]| (add(e, p), add(o, q)));

@@ -50,17 +50,23 @@ macro_rules! each_law {
     };
 }
 
-/// One distribution's formulas. `quantile` takes p from 0 to 1.
+/// One distribution's formulas. `quantile` takes p from 0 to 1. The `_at` forms compute at float type `F`: by default in `f64`, rounded to `F`, and in `F` itself for a law whose formulas need nothing wider, so that its slice forms run at the arguments' width.
 trait Formulas {
     fn pdf(&self, x: f64) -> f64;
     fn cdf(&self, x: f64) -> f64;
     fn quantile(&self, p: f64) -> f64;
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64;
     fn samples<R: Rng + ?Sized>(&self, rng: &mut R, out: &mut [f64]) { for o in out { *o = self.sample(rng); } }
+    #[inline(always)]
+    fn pdf_at<F: Float>(&self, x: F) -> F { narrowed(x, |x| self.pdf(x)) }
+    #[inline(always)]
+    fn cdf_at<F: Float>(&self, x: F) -> F { narrowed(x, |x| self.cdf(x)) }
+    #[inline(always)]
+    fn quantile_at<F: Float>(&self, p: F) -> F { narrowed(p, |p| self.quantile(p)) }
 }
 
 /// The quantile of p from a distribution's formulas, which take p from 0 to 1. Any other p gives NaN.
-fn quantile_of(d: &impl Formulas, p: f64) -> f64 { if (0.0..=1.0).contains(&p) { d.quantile(p) } else { f64::NAN } }
+fn quantile_of<F: Float>(d: &impl Formulas, p: F) -> F { if (F::zero()..=F::one()).contains(&p) { d.quantile_at(p) } else { F::nan() } }
 
 /// `f` of `x`, computed in `f64` and rounded to `x`'s type.
 #[inline(always)]
@@ -69,18 +75,19 @@ fn narrowed<F: Float>(x: F, f: impl Fn(f64) -> f64) -> F { F::narrow(f(x.wide())
 /// [`Distribution::pdf`] as a function object. The log-normal distribution's slice form takes ln x from [`Ln`]'s slice form, which vectorizes where a loop of whole log-normal densities doesn't.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Pdf(pub Distribution);
-forms!(Pdf at real: |k, [x]| narrowed(x, |x| each_law!(&k.0 .0, d => d.pdf(x))),
+forms!(Pdf at real: |k, [x]| each_law!(&k.0 .0, d => d.pdf_at(x)),
 many |k, [x], n, out| match (&k.0 .0, x) {
+    (Law::Normal(d), x) => { let pdf = d.density(); each!([x], n, out, |[x]| pdf(x)) }
     // A nonpositive or NaN x goes to `Ln` as 1, so no item fails there. Its density is then 0, or NaN for NaN.
-    (Law::LogNormal(d), Arg::Many(x)) => composed(&x[..n], out, #[inline(always)] |x| if x > 0.0 { x } else { 1.0 }, Ln,
-        #[inline(always)] |x, l| { let p = d.normal().pdf(l) / x; if x <= 0.0 { 0.0 } else { p } }),
-    (law, x) => each_law!(law, d => each!([x], n, out, |[x]| narrowed(x, |x| d.pdf(x)))),
+    (Law::LogNormal(d), Arg::Many(x)) => { let pdf = d.normal().density(); composed(&x[..n], out, #[inline(always)] |x| if x > 0.0 { x } else { 1.0 }, Ln,
+        #[inline(always)] move |x, l| { let p = pdf(l) / x; if x <= 0.0 { 0.0 } else { p } }) }
+    (law, x) => each_law!(law, d => each!([x], n, out, |[x]| d.pdf_at(x))),
 });
 
 /// [`Distribution::cdf`] as a function object. The normal and log-normal distributions' slice forms take erfc from [`Erfc`]'s slice form, which computes only the formulas that each block of arguments needs.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cdf(pub Distribution);
-forms!(Cdf at real: |k, [x]| narrowed(x, |x| each_law!(&k.0 .0, d => d.cdf(x))),
+forms!(Cdf at real: |k, [x]| each_law!(&k.0 .0, d => d.cdf_at(x)),
 many |k, [x], n, out| match (&k.0 .0, x) {
     (Law::Normal(d), Arg::Many(x)) => composed(&x[..n], out, d.erfc_line(), Erfc,
         #[inline(always)] |_, e| 0.5 * e),
@@ -88,30 +95,30 @@ many |k, [x], n, out| match (&k.0 .0, x) {
         let line = d.normal().erfc_line();
         composed(&x[..n], out, #[inline(always)] move |x| line(ln(x)), Erfc, #[inline(always)] |x, e| if x <= 0.0 { 0.0 } else { 0.5 * e })
     }
-    (law, x) => each_law!(law, d => each!([x], n, out, |[x]| narrowed(x, |x| d.cdf(x)))),
+    (law, x) => each_law!(law, d => each!([x], n, out, |[x]| d.cdf_at(x))),
 });
 
 /// [`Distribution::quantile`] as a function object. The normal and log-normal distributions' slice forms take erfcinv(2p) from [`Erfcinv`]'s slice form, whose loops don't branch on each item's region.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Quantile(pub Distribution);
-forms!(Quantile at real: |k, [p]| narrowed(p, |p| each_law!(&k.0 .0, d => quantile_of(d, p))),
+forms!(Quantile at real: |k, [p]| each_law!(&k.0 .0, d => quantile_of(d, p)),
 many |k, [p], n, out| match (&k.0 .0, p) {
-    (Law::Normal(d), Arg::Many(p)) => composed(&p[..n], out, #[inline(always)] |p| 2.0 * p, Erfcinv, #[inline(always)] |_, e| d.from_erfcinv(e)),
-    (Law::LogNormal(d), Arg::Many(p)) => composed(&p[..n], out, #[inline(always)] |p| 2.0 * p, Erfcinv, #[inline(always)] |_, e| exp(d.normal().from_erfcinv(e))),
-    (law, p) => each_law!(law, d => each!([p], n, out, |[p]| narrowed(p, |p| quantile_of(d, p)))),
+    (Law::Normal(d), Arg::Many(p)) => { let from = d.from_erfcinv(); composed(&p[..n], out, #[inline(always)] |p| 2.0 * p, Erfcinv, #[inline(always)] move |_, e| from(e)) }
+    (Law::LogNormal(d), Arg::Many(p)) => { let from = d.normal().from_erfcinv(); composed(&p[..n], out, #[inline(always)] |p| 2.0 * p, Erfcinv, #[inline(always)] move |_, e| exp(from(e))) }
+    (law, p) => each_law!(law, d => each!([p], n, out, |[p]| quantile_of(d, p))),
 });
 
-/// `finish(x, g(inner(x)))` for each item of `x`, written into `out`, with `g` from its f64 slice form. Each step runs over `CHUNK` items at a time, so the arguments and values between the steps stay in cache. Gives whether `g` succeeded on every item.
-fn composed<F: Float, G: Unary<f64, Out = f64>>(
-    x: &[F], out: &mut [std::mem::MaybeUninit<F>], inner: impl Fn(f64) -> f64, g: G, finish: impl Fn(f64, f64) -> f64) -> bool {
+/// `finish(x, g(inner(x)))` for each item of `x`, written into `out`, with `g` from its slice form at `x`'s type. Each step runs over `CHUNK` items at a time, so the arguments and values between the steps stay in cache. Gives whether `g` succeeded on every item.
+fn composed<F: Float, G: Unary<F, Out = F>>(
+    x: &[F], out: &mut [std::mem::MaybeUninit<F>], inner: impl Fn(F) -> F, g: G, finish: impl Fn(F, F) -> F) -> bool {
     let (mut args, mut values) = (Vec::with_capacity(CHUNK), Vec::with_capacity(CHUNK));
     let mut ok = true;
     for (x, out) in x.chunks(CHUNK).zip(out.chunks_mut(CHUNK)) {
         args.clear();
         values.clear();
-        args.extend(x.iter().map(|&v| inner(v.wide())));
+        args.extend(x.iter().map(|&v| inner(v)));
         ok &= g.many(Arg::Many(&args), args.len(), &mut values);
-        for (slot, (&v, &e)) in out.iter_mut().zip(x.iter().zip(&values)) { slot.write(F::narrow(finish(v.wide(), e))); }
+        for (slot, (&v, &e)) in out.iter_mut().zip(x.iter().zip(&values)) { slot.write(finish(v, e)); }
     }
     ok
 }
@@ -261,20 +268,30 @@ fn standard_gamma<R: Rng + ?Sized>(shape: f64, rng: &mut R) -> f64 {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Normal { mean: f64, sd: f64 }
 impl Normal {
-    /// The argument of `erfc` in the cdf, (mean - x)/(sd√2), as a map that multiplies by the reciprocal it computes when it's made. A loop over a closure that read `sd` through a reference divided for each item in x86-64 builds.
+    /// The argument of `erfc` in the cdf, (mean - x)/(sd√2), at float type `F`, as a map that multiplies by the reciprocal it computes when it's made. A loop over a closure that read `sd` through a reference divided for each item in x86-64 builds.
     #[inline(always)]
-    fn erfc_line(&self) -> impl Fn(f64) -> f64 + Copy + use<> { let (mean, scale) = (self.mean, FRAC_1_SQRT_2 / self.sd); move |x| (mean - x) * scale }
-    /// The quantile from e = erfcinv(2p): mean - sd·√2·e.
+    fn erfc_line<F: Float>(&self) -> impl Fn(F) -> F + Copy + use<F> { let (mean, scale) = (F::narrow(self.mean), F::narrow(FRAC_1_SQRT_2 / self.sd)); move |x| (mean - x) * scale }
+    /// The quantile from e = erfcinv(2p), mean - sd·√2·e, at float type `F`, as a map that holds its constants.
     #[inline(always)]
-    fn from_erfcinv(&self, e: f64) -> f64 { self.mean - self.sd * SQRT_2 * e }
+    fn from_erfcinv<F: Float>(&self) -> impl Fn(F) -> F + Copy + use<F> { let (mean, step) = (F::narrow(self.mean), F::narrow(self.sd * SQRT_2)); move |e| mean - step * e }
+    /// The density at float type `F`, as a map that holds its constants, so that a loop over items computes them once.
+    #[inline(always)]
+    fn density<F: Float>(&self) -> impl Fn(F) -> F + Copy + use<F> {
+        let (mean, rsd, half, height) = (F::narrow(self.mean), F::narrow(self.sd.recip()), F::narrow(-0.5), F::narrow((self.sd * SQRT_TAU).recip()));
+        move |x| { let z = (x - mean) * rsd; exp(half * z * z) * height }
+    }
 }
 
 impl Formulas for Normal {
-    // Inlined always, as rustymath's function wrappers are: the log-normal density's slice form calls it in a loop, which a call per item stops vectorizing.
+    fn pdf(&self, x: f64) -> f64 { self.pdf_at(x) }
+    fn cdf(&self, x: f64) -> f64 { self.cdf_at(x) }
+    fn quantile(&self, p: f64) -> f64 { self.quantile_at(p) }
     #[inline(always)]
-    fn pdf(&self, x: f64) -> f64 { let z = (x - self.mean) * self.sd.recip(); exp(-0.5 * z * z) * (self.sd * SQRT_TAU).recip() }
-    fn cdf(&self, x: f64) -> f64 { 0.5 * erfc(self.erfc_line()(x)) }
-    fn quantile(&self, p: f64) -> f64 { self.from_erfcinv(erfcinv(2.0 * p)) }
+    fn pdf_at<F: Float>(&self, x: F) -> F { self.density()(x) }
+    #[inline(always)]
+    fn cdf_at<F: Float>(&self, x: F) -> F { F::narrow(0.5) * erfc(self.erfc_line()(x)) }
+    #[inline(always)]
+    fn quantile_at<F: Float>(&self, p: F) -> F { self.from_erfcinv()(erfcinv(F::narrow(2.0) * p)) }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { self.mean + self.sd * standard_normal(rng) }
     /// Each pair of uniform draws gives two values, from the cosine and the sine of one angle.
     fn samples<R: Rng + ?Sized>(&self, rng: &mut R, out: &mut [f64]) {
@@ -419,9 +436,15 @@ impl LogNormal {
 }
 
 impl Formulas for LogNormal {
-    fn pdf(&self, x: f64) -> f64 { if x <= 0.0 { 0.0 } else { self.normal().pdf(ln(x)) / x } }
-    fn cdf(&self, x: f64) -> f64 { if x <= 0.0 { 0.0 } else { self.normal().cdf(ln(x)) } }
-    fn quantile(&self, p: f64) -> f64 { exp(self.normal().quantile(p)) }
+    fn pdf(&self, x: f64) -> f64 { self.pdf_at(x) }
+    fn cdf(&self, x: f64) -> f64 { self.cdf_at(x) }
+    fn quantile(&self, p: f64) -> f64 { self.quantile_at(p) }
+    #[inline(always)]
+    fn pdf_at<F: Float>(&self, x: F) -> F { if x <= F::zero() { F::zero() } else { self.normal().density()(ln(x)) / x } }
+    #[inline(always)]
+    fn cdf_at<F: Float>(&self, x: F) -> F { if x <= F::zero() { F::zero() } else { self.normal().cdf_at(ln(x)) } }
+    #[inline(always)]
+    fn quantile_at<F: Float>(&self, p: F) -> F { exp(self.normal().quantile_at(p)) }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { exp(self.normal().sample(rng)) }
 }
 

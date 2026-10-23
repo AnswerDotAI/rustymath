@@ -5,10 +5,12 @@ use crate::float::{Float, sealed::{Core, Sealed}};
 pub trait Int: Copy + Sealed + sealed::Ways {}
 
 pub(crate) mod sealed {
-    /// One integer type's conversions from and to `f32` and `f64`, which [`int`](super::int) and [`float`](super::float) pick by the float type.
+    /// One integer type's conversions from and to `f32` and `f64`, which [`int`](super::int), [`saturated`](super::saturated) and [`float`](super::float) pick by the float type.
     pub trait Ways: Copy {
         fn from_f32(x: f32) -> Option<Self>;
         fn from_f64(x: f64) -> Option<Self>;
+        fn saturated_f32(x: f32) -> Self;
+        fn saturated_f64(x: f64) -> Self;
         fn to_f32(self) -> f32;
         fn to_f64(self) -> f64;
     }
@@ -18,14 +20,23 @@ pub(crate) mod sealed {
 #[inline(always)]
 pub fn int<I: Int, F: Float>(x: F) -> Option<I> { if <F::Working as Core>::WIDE { I::from_f64(x.wide()) } else { I::from_f32(x.wide() as f32) } }
 
+/// `x` as an integer of type `I`, as Rust's `as` converts a float: NaN gives 0, a fraction gives the integer toward 0, and a value past `I`'s range gives its largest or smallest value. A type that fits an `i32` converts in vector form on every target, where `as` would convert one item at a time, as it does from an `f64` on AArch64 and from any float on x86-64.
+#[inline(always)]
+pub fn saturated<I: Int, F: Float>(x: F) -> I { if <F::Working as Core>::WIDE { I::saturated_f64(x.wide()) } else { I::saturated_f32(x.wide() as f32) } }
+
 /// `i` as the nearest float of type `F`.
 #[inline(always)]
 pub fn float<F: Float, I: Int>(i: I) -> F { if <F::Working as Core>::WIDE { F::narrow(i.to_f64()) } else { F::narrow(i.to_f32().into()) } }
 
-/// Appends the `n` floats `start`, `start + 1`, `start + 2` and so on to `out`, or `start`, `start - 1` and so on where `down` is true, each exact while it stays below 2^53 in magnitude. A target with `NATIVE_64` converts each item from an integer, as [`float`] does. Wasm and x86-64 without AVX-512 have no vector instruction for that, so there each block of 8 items adds 0 to 7 steps to the block's first item, which comes from the block's position.
-pub fn count(out: &mut Vec<f64>, start: i64, down: bool, n: usize) {
+/// Appends the `n` whole numbers `start`, `start + 1`, `start + 2` and so on to `out` as floats of type `F`, or `start`, `start - 1` and so on where `down` is true. Each is the whole number rounded once to `F`. A float narrower than `f64` counts in `i32` where every item fits one, because every target converts `i32` to it in vector form. Otherwise a target with `NATIVE_64` converts each item from an integer, as [`float`] does. Wasm and x86-64 without AVX-512 have no vector instruction for that, so there each block of 8 items adds 0 to 7 steps to the block's first item, which comes from the block's position.
+pub fn count<F: Float>(out: &mut Vec<F>, start: i64, down: bool, n: usize) {
+    let end = if down { start - n as i64 } else { start + n as i64 };
+    if !<F::Working as Core>::WIDE && i32::try_from(start).is_ok() && i32::try_from(end).is_ok() {
+        let start = start as i32;
+        return if down { out.extend((0..n as i32).map(move |i| float::<F, i32>(start - i))) } else { out.extend((0..n as i32).map(move |i| float::<F, i32>(start + i))) };
+    }
     if NATIVE_64 {
-        return if down { out.extend((0..n).map(move |i| wide_float(start - i as i64))) } else { out.extend((0..n).map(move |i| wide_float(start + i as i64))) };
+        return if down { out.extend((0..n).map(move |i| F::narrow(wide_float(start - i as i64)))) } else { out.extend((0..n).map(move |i| F::narrow(wide_float(start + i as i64)))) };
     }
     let step = if down { -1 } else { 1 };
     let offsets: [f64; 8] = std::array::from_fn(|k| wide_float(step * k as i64));
@@ -33,8 +44,8 @@ pub fn count(out: &mut Vec<f64>, start: i64, down: bool, n: usize) {
     crate::slice::appended(out, n, |slots| {
         let (blocks, rest) = slots.as_chunks_mut::<8>();
         let whole = blocks.len();
-        for (j, block) in blocks.iter_mut().enumerate() { let first = first(j); for k in 0..8 { block[k].write(first + offsets[k]); } }
-        for (slot, &offset) in rest.iter_mut().zip(&offsets) { slot.write(first(whole) + offset); }
+        for (j, block) in blocks.iter_mut().enumerate() { let first = first(j); for k in 0..8 { block[k].write(F::narrow(first + offsets[k])); } }
+        for (slot, &offset) in rest.iter_mut().zip(&offsets) { slot.write(F::narrow(first(whole) + offset)); }
     });
 }
 
@@ -72,6 +83,10 @@ macro_rules! ints {
             #[inline(always)]
             fn from_f64(x: f64) -> Option<$t> { ints!(@$kind f64, $t, x) }
             #[inline(always)]
+            fn saturated_f32(x: f32) -> $t { ints!(@saturated $kind f32, $t, x) }
+            #[inline(always)]
+            fn saturated_f64(x: f64) -> $t { ints!(@saturated $kind f64, $t, x) }
+            #[inline(always)]
             fn to_f32(self) -> f32 { let $i = self; $f32 }
             #[inline(always)]
             fn to_f64(self) -> f64 { let $i = self; $f64 }
@@ -90,6 +105,19 @@ macro_rules! ints {
     (@wide f64, $t:ty, $x:ident) => {{
         let n = if NATIVE_64 { $x as i64 } else { shifted($x) };
         ($x.abs() <= WIDE_LIMIT).then_some(n).and_then(|n| <$t>::try_from(n).ok())
+    }};
+    (@saturated narrow f32, $t:ty, $x:ident) => { if SATURATING { $x as $t } else { ints!(@clamped f32, $t, $x) } };
+    // A target with `NATIVE_64` converts an `f64` to an `i64` with saturation in vector form, which the clamp then narrows as `as` would.
+    (@saturated narrow f64, $t:ty, $x:ident) => { if NATIVE_64 { ($x as i64).clamp(<$t>::MIN.into(), <$t>::MAX.into()) as $t } else { ints!(@clamped f64, $t, $x) } };
+    (@saturated wide $f:ty, $t:ty, $x:ident) => { $x as $t };
+    (@clamped $f:ty, $t:ty, $x:ident) => {{
+        // Where `$f` can't hold `$t::MAX`, as an `f32` can't hold `i32::MAX`, the maximum rounds up to a float outside `$t`. The clamp then stops one float below it, and a float at or past it gives `$t::MAX`.
+        let top = <$t>::MAX as $f;
+        let below = if top as i128 > <$t>::MAX as i128 { top.next_down() } else { top };
+        let c = if $x.is_nan() { 0.0 } else { $x.max(<$t>::MIN as $f).min(below) };
+        // SAFETY: `c` is never NaN, and the clamp keeps it within `$t`.
+        let i = unsafe { c.to_int_unchecked::<$t>() };
+        if $x >= top { <$t>::MAX } else { i }
     }};
 }
 

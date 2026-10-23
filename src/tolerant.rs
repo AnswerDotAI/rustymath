@@ -509,10 +509,10 @@ pub struct Residue(pub Tolerance);
 tolerant!(#[inline] Residue at real: |t, [x, y]| Total(t.residue(x, y)));
 tolerant!(Residue at Complex<f32>, Complex<f64>: |t, [x, y]| t.complex_residue(x, y));
 
-/// The floor of `x ÷ y` from [`Tolerant::floor_quotient`], at the tolerance it holds, as a function object. Where the quotient equals a whole number, it gives that number and `Residue` gives 0. A float result never fails, as IEEE division doesn't. Its integer forms, from the `integer` module, divide exactly and fail on a zero divisor or an overflowing quotient.
+/// The floor of `x ÷ y`, within the tolerance it holds, as a function object. A quotient that equals a whole number gives that number, as `Residue` then gives 0: [`Tolerant::floor_quotient`] makes the same test on the product, so the two agree apart from rounding in the last bit. A float result never fails, as IEEE division doesn't. Its integer forms, from the `integer` module, divide exactly and fail on a zero divisor or an overflowing quotient.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FloorDivide(pub Tolerance);
-tolerant!(FloorDivide at real: |t, [x, y]| Total(t.floor_quotient(x, y).0));
+tolerant!(FloorDivide at real: |t, [x, y]| Total(t.floor(x / y)));
 
 /// [`Tolerant::gcd`], or [`TolerantComplex::complex_gcd`] for complex items, at the tolerance it holds, as a function object. A non-finite argument gives NaN, which marks the item failed. Its `i64` form is [`integer::gcd`](crate::integer::gcd).
 #[derive(Clone, Copy, Debug, PartialEq)]

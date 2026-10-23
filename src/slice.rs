@@ -64,6 +64,8 @@ macro_rules! arities {
             fn many(&self, $($x: Arg<'_, T>,)+ n: usize, out: &mut Vec<Self::Out>) -> bool;
             /// `many`, writing the `n` results after the items already written to `out`, on this thread.
             fn many_into(&self, $($x: Arg<'_, T>,)+ n: usize, out: &mut crate::parallel::Slots<'_, Self::Out>) -> bool;
+            /// `many_into`, with each result turned into a `C` by `convert`, which also says whether the conversion succeeded. The slice form writes a block of up to [`CHUNK`] results at a time into a buffer on the stack, and `convert` reads the block while it's in the cache, so the conversion costs no pass through memory of its own. One loop that runs the scalar form and `convert` together measured about 8% slower for `⌊` to `i64`, with the same instructions: the cost is the conversion's instructions, and the buffer stays in L1.
+            fn many_converted<C>(&self, $($x: Arg<'_, T>,)+ n: usize, out: &mut crate::parallel::Slots<'_, C>, convert: impl Fn(Self::Out) -> (C, bool)) -> bool;
             /// `one`, or `None` where the item fails, as `many` reports.
             fn checked(&self, $($x: T),+) -> Option<Self::Out>;
             /// `one` with whether it succeeded, as `many` judges it: a failed result is what `many` writes in its slot, such as an integer wrapped to its type.
@@ -93,6 +95,15 @@ macro_rules! arities {
             #[inline]
             fn many_into(&self, $($x: Arg<'_, $e>,)+ n: usize, out: &mut crate::parallel::Slots<'_, Self::Out>) -> bool {
                 out.fill(n, |slots| crate::parallel::in_chunks(0, slots, |at, part| self.slice([$($x.part(at, part.len())),+], part.len(), part)))
+            }
+            #[inline]
+            fn many_converted<C>(&self, $($x: Arg<'_, $e>,)+ n: usize, out: &mut crate::parallel::Slots<'_, C>, convert: impl Fn(Self::Out) -> (C, bool)) -> bool {
+                out.fill(n, |slots| crate::parallel::in_chunks(0, slots, |at, part| {
+                    let mut buf = [const { MaybeUninit::uninit() }; crate::slice::CHUNK];
+                    let (n, buf) = (part.len(), &mut buf[..part.len()]);
+                    let ok = self.slice([$($x.part(at, n)),+], n, buf);
+                    pairs_into(Arg::Many(written(buf)), Arg::One(()), n, part, |r, ()| convert(r)) & ok
+                }))
             }
             #[inline]
             fn checked(&self, $($x: $e),+) -> Option<Self::Out> { self.checked_scalar([$($x),+]) }
@@ -126,6 +137,23 @@ impl<E: Item, K: Forms<E, 2>> Forms<E, 2> for Flipped<K> {
     fn judged_scalar(&self, [x, y]: [E; 2]) -> (K::Out, bool) { self.0.judged_scalar([y, x]) }
     #[inline]
     fn slice(&self, [x, y]: [Arg<'_, E>; 2], n: usize, out: &mut [MaybeUninit<K::Out>]) -> bool { self.0.slice([y, x], n, out) }
+}
+
+/// `K` with no result failing. Each result is `K`'s, wrapped to its type, as static kinds and NumPy keep integer results. LLVM removes `K`'s test of whether a result fits, because the loop never reads it. The adapter suits an object whose scalar form is its whole computation, as integer arithmetic's is.
+#[derive(Clone, Copy, Debug)]
+pub struct Wrapped<K>(pub K);
+
+impl<E: Item, K: Forms<E, N>, const N: usize> Forms<E, N> for Wrapped<K> {
+    type Out = K::Out;
+    const TOTAL: bool = true;
+    const WRAPS: bool = false;
+    const INLINE: bool = K::INLINE;
+    #[inline]
+    fn scalar(&self, x: [E; N]) -> K::Out { self.0.scalar(x) }
+    #[inline]
+    fn judged_scalar(&self, x: [E; N]) -> (K::Out, bool) { (self.0.scalar(x), true) }
+    #[inline]
+    fn slice(&self, x: [Arg<'_, E>; N], n: usize, out: &mut [MaybeUninit<K::Out>]) -> bool { each(x, n, out, #[inline(always)] |x| Total(self.0.scalar(x))) }
 }
 
 /// Whether `r`, the result for arguments `args`, keeps the rule that a NaN result needs a NaN argument.

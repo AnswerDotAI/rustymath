@@ -19,7 +19,7 @@ use rustymath::linalg::Scalar;
 use rustymath::stats;
 use rustymath::structure::Plan;
 use rustymath::tolerant::{Ceil, Equal, Floor, FloorDivide, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue, Tolerance};
-use rustymath::{Flipped, kernels, reduce, with_ints};
+use rustymath::{Flipped, kernels, reduce, with_ints, Wrapped};
 use rustymath_buffer::py_err;
 use ::std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -398,7 +398,7 @@ functions! {
     /// atanh x.
     arctanh(x) = rustymath::Atanh;
     /// |x|, a real number for a complex x. The magnitude of a signed integer type's least value wraps to that value, as NumPy's does.
-    absolute(x) = rustymath::Abs;
+    absolute(x) = Wrapped(rustymath::Abs);
     /// -1, 0 or 1 for a real x, and x/|x| for a complex x.
     sign(x) = rustymath::Sign;
     /// The angle of x from the positive real axis, from -π to π.
@@ -430,11 +430,11 @@ functions! {
     /// The x with erfc(x) = q.
     erfcinv(q) = rustymath::Erfcinv;
     /// x + y. A character plus an integer, on either side, is a character. An integer result that doesn't fit its dtype wraps, as NumPy's does.
-    add(x, y) = rustymath::Add;
+    add(x, y) = Wrapped(rustymath::Add);
     /// x - y. A character minus an integer is a character, and a character minus a character is an integer. An integer result that doesn't fit its dtype wraps, as NumPy's does.
-    subtract(x, y) = rustymath::Subtract;
+    subtract(x, y) = Wrapped(rustymath::Subtract);
     /// x × y. An integer result that doesn't fit its dtype wraps, as NumPy's does.
-    multiply(x, y) = rustymath::Multiply;
+    multiply(x, y) = Wrapped(rustymath::Multiply);
     /// x / y. Integers compute as floats.
     divide(x, y) = rustymath::Divide;
     /// x^y. An integer power that doesn't fit its dtype wraps, as NumPy's does. A negative integer y beside an x other than 1 or -1 raises ValueError.
@@ -646,7 +646,7 @@ fn _at<'py>(py: Python<'py>, function: &str, a: &Bound<'py, PyAny>, index: &Boun
         out
     }}; }
     let out = match function {
-        "add" => run!(Scatter, rustymath::Add), "subtract" => run!(Scatter, rustymath::Subtract), "multiply" => run!(Scatter, rustymath::Multiply),
+        "add" => run!(Scatter, Wrapped(rustymath::Add)), "subtract" => run!(Scatter, Wrapped(rustymath::Subtract)), "multiply" => run!(Scatter, Wrapped(rustymath::Multiply)),
         "divide" => run!(Scatter, rustymath::Divide), "maximum" => run!(Combine, reduce::Max), "minimum" => run!(Combine, reduce::Min),
         _ => return Err(PyValueError::new_err(format!("at takes add, subtract, multiply, divide, maximum or minimum, not {function}"))),
     };

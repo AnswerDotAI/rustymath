@@ -130,16 +130,39 @@ fn ln1p<R: Native, const FUSED: bool>(w: Complex<R>) -> Complex<R> {
     c(re, arc::atan2::<R, FUSED>(v, R::one() + u))
 }
 
-/// √z, with a real part that is never negative. t = √((|x| + |z|)/2) is one part, and y/2t the other, which doesn't cancel. A tiny z scales up by 2^(2p) first, so that its halves stay normal, and its root back by 2^-p. Zero gives itself, and an infinite y gives ∞ + iy, even beside NaN.
+/// The parts of √(x + iy), whose real part is never negative, from x, y and h = |x + iy|. t = √((|x| + h)/2) is one part, and y/2t the other, which doesn't cancel. |y|/2t is |y/2t| exactly, so one division serves both signs of x.
+#[inline(always)]
+fn root<R: Native, const FUSED: bool>(x: R, y: R, h: R) -> (R, R) {
+    let t = x.abs().mla::<FUSED>(R::narrow(0.5), h * R::narrow(0.5)).sqrt();
+    let q = y / (t + t);
+    if x >= R::zero() { (t, q) } else { (q.abs(), t.copysign(y)) }
+}
+
+/// √z, through `root` on z and |z|. A tiny z scales up by 2^(2p) first, so that its halves stay normal, and its root back by 2^-p. Zero gives itself, and an infinite y gives ∞ + iy, even beside NaN.
 #[inline]
 pub(crate) fn sqrt<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R> {
     let (x, y) = (z.re, z.im);
     let (w, p) = scaled(z);
-    let h = modulus::<R, FUSED>(w.re, w.im);
-    let t = w.re.abs().mla::<FUSED>(R::narrow(0.5), h * R::narrow(0.5)).sqrt();
-    let (re, im) = if w.re >= R::zero() { (t, w.im / (t + t)) } else { (w.im.abs() / (t + t), t.copysign(w.im)) };
+    let (re, im) = root::<R, FUSED>(w.re, w.im, modulus::<R, FUSED>(w.re, w.im));
     let k = R::pow2(R::SHIFT - p);
     if y.is_infinite() { c(R::infinity(), y) } else if (x == R::zero()) & (y == R::zero()) { c(R::zero(), y) } else { c(re * k, im * k) }
+}
+
+/// Whether `plain_sqrt` gives √z exactly as `sqrt` does. Each part is 0 or between 2^-511 and 2^511 at f64, where no square underflows or overflows, so `hypot`'s scaling by a power of two changes no rounding. At f32, whose squares sum in f64, each part is 0 or finite and at least `scaled`'s threshold. One part isn't 0, so neither `scaled` nor `sqrt`'s special cases apply.
+#[inline(always)]
+fn plain_root<R: Native>(z: Complex<R>) -> bool {
+    let (lo, hi) = if R::WIDE { (1.4916681462400413e-154, 6.703903964971299e153) } else { (9.860761315262648e-32, f32::MAX as f64) };
+    let (a, b) = (z.re.abs(), z.im.abs());
+    let part = |p: R| (p == R::zero()) | ((p >= R::narrow(lo)) & (p <= R::narrow(hi)));
+    part(a) & part(b) & ((a != R::zero()) | (b != R::zero()))
+}
+
+/// √z for a z that `plain_root` accepts, through `root`, with |z| at f64 as the root of the sum of the squares.
+#[inline(always)]
+fn plain_sqrt<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R> {
+    let h = if R::WIDE { z.re.mla::<FUSED>(z.re, z.im * z.im).sqrt() } else { modulus::<R, FUSED>(z.re, z.im) };
+    let (re, im) = root::<R, FUSED>(z.re, z.im, h);
+    c(re, im)
 }
 
 /// Whether z^w takes a special case of `pow`: w = 0, z = 0 with Re w > 0, or a real z and w whose power is real, which is a z from 0 up or a whole w.
@@ -445,15 +468,13 @@ fn moduli<R: Native>(x: &[R], y: &[R], out: &mut Vec<R>) where Hypot: Binary<R, 
 
 /// The square roots of `x + iy` through real slice forms, as `sqrt` computes them where `rough_root` is false.
 fn sqrt_parts<R: Native>(x: &[R], y: &[R], re: &mut Vec<R>, im: &mut Vec<R>) where Hypot: Binary<R, Out = R> {
-    let (mut h, half, zero) = (Vec::new(), R::narrow(0.5), R::zero());
+    let mut h = Vec::new();
     moduli(x, y, &mut h);
-    // `sqrt` divides |y| or y by 2t, whichever its branch needs. |y|/2t is |y/2t| exactly, so one division serves both branches.
     crate::slice::appended(re, x.len(), |re| crate::slice::appended(im, x.len(), |im| {
         for ((((&x, &y), &h), re), im) in x.iter().zip(y).zip(&h).zip(re).zip(im) {
-            let t = x.abs().mla::<{ crate::FUSED }>(half, h * half).sqrt();
-            let q = y / (t + t);
-            re.write(if x >= zero { t } else { q.abs() });
-            im.write(if x >= zero { q } else { t.copysign(y) });
+            let (r, i) = root::<R, { crate::FUSED }>(x, y, h);
+            re.write(r);
+            im.write(i);
         }
     }))
 }
@@ -601,8 +622,12 @@ macro_rules! unary {
     )+};
 }
 unary! {
-    Lgamma: lgamma; Gamma: gamma; Factorial: factorial; Sign: sign; Sqrt: sqrt;
+    Lgamma: lgamma; Gamma: gamma; Factorial: factorial; Sign: sign;
 }
+// `Sqrt`'s slice form takes `plain_sqrt` for each block of 64 items that `plain_root` accepts, and the full `sqrt` for any other block.
+forms!(Sqrt at Complex<f32>, Complex<f64>: |_, [z]| sqrt::<_, { crate::FUSED }>(z),
+    many |_, [z], n, out| crate::slice::each_usual(z, n, out, (plain_root, #[inline(always)] |z| plain_sqrt::<_, { crate::FUSED }>(z)), crate::slice::none(),
+        #[inline(always)] |z| sqrt::<_, { crate::FUSED }>(z)));
 // The functions below have slice forms computed through real slice forms, by `split!`. cis z is the exponential of iz, sin z and tan z are sinh and tanh of iz turned back, and cos z is cosh of iz, as the scalar forms compute them.
 forms!(Exp at Complex<f32>, Complex<f64>: |_, [z]| exp::<_, { crate::FUSED }>(z),
     many |_, [z], n, out| split!([z], n, out, |[(x, y)], re, im| exp_parts(x, y, re, im), |_, r| !finite(r), |[z]| exp::<_, { crate::FUSED }>(z)));

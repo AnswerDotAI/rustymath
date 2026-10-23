@@ -176,6 +176,18 @@ mod forms {
         let ramp32: Vec<f32> = ramp.iter().map(|&v| v as f32).collect();
         unary(Erfc, "Erfc", &ramp);
         unary(Erfc, "Erfc", &ramp32);
+        // Complex `Sqrt` takes a plain form for blocks of 64 items whose parts are all 0 or of moderate size, which gives exactly the full form's parts. Random items, with special or extreme items in some blocks and a run of real items, reach both forms.
+        fn roots<F: Float + Debug>(z: &[Complex<F>]) where Sqrt: Unary<Complex<F>, Out = Complex<F>> {
+            let exact = |a: F, b: F| (a == b && a.is_sign_negative() == b.is_sign_negative()) || (a.is_nan() && b.is_nan());
+            let mut out = Vec::new();
+            Sqrt.many(Arg::Many(z), z.len(), &mut out);
+            for (&z, &r) in z.iter().zip(&out) { let s = Sqrt.one(z); assert!(exact(r.re, s.re) && exact(r.im, s.im), "complex Sqrt({z:?}): {r:?} against {s:?}") }
+        }
+        let mut z: Vec<Complex<f64>> = (0..2000).map(|_| Complex::new(8.0 * rng.random::<f64>() - 4.0, 8.0 * rng.random::<f64>() - 4.0)).collect();
+        for (i, (re, im)) in [(0.0, 0.0), (f64::INFINITY, 1.0), (1.0, f64::NAN), (1e-300, 0.0), (2.0, 1e-160), (1e160, 1.0)].into_iter().enumerate() { z[300 * i + 5] = Complex::new(re, im) }
+        for v in &mut z[1600..1700] { v.im = 0.0 }
+        roots(&z);
+        roots(&z.iter().map(|z| Complex::new(z.re as f32, z.im as f32)).collect::<Vec<_>>());
         for b in [2.0, 10.0] {
             let mut out = Vec::new();
             let ok = Logb.many(Arg::One(b), Arg::Many(&x), x.len(), &mut out);
