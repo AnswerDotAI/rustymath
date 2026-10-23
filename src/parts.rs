@@ -40,7 +40,7 @@ objects! {
     Trunc;
     /// Rounding to the nearest whole number, with ties to even.
     Rint;
-    /// Clipping x between lower and upper bounds, `minimum(maximum(x, lower), upper)` in one pass.
+    /// Clipping x between lower and upper bounds in one pass: `minimum(upper, maximum(lower, x))`. A lower bound above the upper one gives the upper. A NaN argument gives NaN, x or a bound, depending on the target.
     Clip;
     /// `x` where `m` is nonzero and `y` where it's zero, item by item: a select, with the mask `m` as lanes of the items' type.
     Choose;
@@ -113,7 +113,7 @@ forms!(Real at Complex64 => f64: |_, [x]| Total(x.re));
 forms!(Imag at Complex32 => f32: |_, [x]| Total(x.im));
 forms!(Imag at Complex64 => f64: |_, [x]| Total(x.im));
 
-forms!(Clip at real: |_, [x, lo, hi]| Total(crate::reduce::minimum(crate::reduce::maximum(x, lo), hi)));
+forms!(Clip at real: |_, [x, lo, hi]| Total(crate::reduce::minimum(hi, crate::reduce::maximum(lo, x))));
 forms!(Clip at u8, i16, i32, i64: |_, [x, lo, hi]| x.max(lo).min(hi));
 forms!(Clip at bool: |_, [x, lo, hi]| (x | lo) & hi);
 

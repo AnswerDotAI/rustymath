@@ -217,6 +217,22 @@ pub(crate) fn each<E: Item, O: Item, R: Outcome<O>, const N: usize>(x: [Arg<'_, 
     mapped(&x, n, out, #[inline(always)] |a| f(a).split()) || (R::RESCUE && written(&mut out[..n]).iter().enumerate().all(|(i, &r)| kept(r, items(&x, i))))
 }
 
+/// [`each`] for one argument, where `fast` gives the result for every item that `usual` accepts and never fails there. Each block of 16 items that `usual` accepts whole writes `fast` of each item, and any other block writes `body` of each, judged as `each` judges it. The test for each block keeps a function's special values out of its usual items' loop.
+#[inline(always)]
+pub(crate) fn each_usual<E: Item, O: Item, R: Outcome<O>>(x: Arg<'_, E>, n: usize, out: &mut [MaybeUninit<O>], usual: impl Fn(E) -> bool, fast: impl Fn(E) -> O, body: impl Fn(E) -> R) -> bool {
+    const BLOCK: usize = 16;
+    let Arg::Many(xs) = x else { return each([x], n, out, #[inline(always)] |[x]| body(x)) };
+    let (blocks, rest) = xs[..n].as_chunks::<BLOCK>();
+    let (slots, last) = out[..n].split_at_mut(blocks.len() * BLOCK);
+    let ok = blocks.iter().zip(slots.as_chunks_mut::<BLOCK>().0).fold(true, |ok, (b, o)| {
+        if b.iter().fold(true, |all, &v| all & usual(v)) {
+            for k in 0..BLOCK { o[k].write(fast(b[k])); }
+            ok
+        } else { ok & each([Arg::Many(b)], BLOCK, o, #[inline(always)] |[x]| body(x)) }
+    });
+    ok & each([Arg::Many(rest)], rest.len(), last, #[inline(always)] |[x]| body(x))
+}
+
 /// [`each`] with the item body marked `#[inline(always)]`. Every slice form runs its loop this way: `forms!`'s default slice form, and a custom slice form once it has read its settings. LLVM leaves a large unmarked body out of line, and its call stops the loop vectorizing.
 macro_rules! each {
     ($x:expr, $n:expr, $out:expr, |$args:pat_param| $body:expr $(,)?) => {

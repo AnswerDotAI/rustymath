@@ -8,9 +8,8 @@ fn at(n: i64, size: usize) -> PyResult<usize> {
     position(n, size).ok_or_else(|| PyIndexError::new_err(format!("position {n} is outside an axis of length {size}")))
 }
 fn array_selector(layout: &Layout, axis: usize, obj: &Bound<'_, PyAny>) -> PyResult<(Selector, bool)> {
-    let indices = convert::one(obj)?;
-    let items = indices.row_major()?;
-    rustymath_buffer::selection::array_selector(layout, axis, indices.layout(), items.view(), false)
+    let indices = convert::one(obj)?.into_core()?.compact();
+    rustymath_buffer::selection::array_selector(layout, axis, indices.layout().clone(), std::sync::Arc::new(indices))
 }
 fn selector(layout: &Layout, axis: usize, obj: &Bound<'_, PyAny>) -> PyResult<Selector> {
     rustymath_buffer::selection::selector(layout, axis, obj, || array_selector(layout, axis, obj)).map(|(s, _)| s)

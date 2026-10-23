@@ -446,13 +446,8 @@ pub(crate) fn givens<R: Native>(y: R, z: R) -> (R, R, R) {
     if r == R::zero() { (R::one(), R::zero(), R::zero()) } else { (y / r, z / r, r) }
 }
 
-/// The greatest `f(v)` over the items `v` of `x`, ignoring NaN, or 0 for an empty `x`. Eight running maximums find it, which vectorizes.
-fn greatest<T: Copy, R: Native>(x: &[T], f: impl Fn(T) -> R) -> R {
-    let mut m = [R::zero(); 8];
-    let (chunks, rest) = x.as_chunks::<8>();
-    for c in chunks { for k in 0..8 { m[k] = m[k].max(f(c[k])) } }
-    rest.iter().fold(m.iter().fold(R::zero(), |a, &b| a.max(b)), |a, &b| a.max(f(b)))
-}
+/// The greatest `f(v)` over the items `v` of `x`, ignoring NaN, or 0 for an empty `x`.
+fn greatest<T: Copy, R: Native>(x: &[T], f: impl Fn(T) -> R) -> R { crate::reduce::folded(x, R::zero(), |t, v| f(v).maximum(t), R::maximum) }
 
 /// The power of two that brings the greatest `abs1` in `a` to between 1 and 2, when that magnitude lies outside the range from `safe_low` to its reciprocal. `None` inside that range, for a matrix of zeros, and where an item has an infinite part. Scaling by a power of two is exact. Where `abs1` overflows, a second pass finds the greatest larger part, at least half the largest float, which gives the same power of two.
 fn safe_scale<T: Scalar>(a: &[T]) -> Option<T::Real> {

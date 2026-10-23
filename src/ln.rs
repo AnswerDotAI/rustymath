@@ -27,20 +27,31 @@ fn based<R: Native, const FUSED: bool>(s: R, e: R, (hi, lo): (R, R), k: R, fine:
 
 /// e ln 2 + ln((1+s)/(1-s)): the natural logarithm of m × 2^e, for s = (m-1)/(m+1) or a more accurate form of it.
 #[inline]
-pub(crate) fn ln_parts<R: Native, const FUSED: bool>(s: R, e: R) -> R { based::<R, FUSED>(s, e, ln2(), R::one(), R::WIDE) }
+pub(crate) fn ln_parts<R: Native, const FUSED: bool>(s: R, e: R) -> R { let (base, k) = natural(); based::<R, FUSED>(s, e, base, k, R::WIDE) }
 
-/// The logarithm of x to the base that `(base, k)` gives, as `based` takes them, with its special values: -∞ at 0, ∞ at ∞, and NaN for a negative x or NaN.
+/// The logarithm of 2 to base e, as `based` takes it, and the logarithm of e to base e.
+#[inline(always)]
+fn natural<R: Native>() -> ((R, R), R) { (ln2(), R::one()) }
+
+/// Whether `log` needs none of its special values at x: x is positive, normal and finite.
+#[inline(always)]
+fn usual<R: Native>(x: R) -> bool { (x >= R::min_positive_value()) & (x < R::infinity()) }
+
+/// The logarithm of m × 2^e, split as `(m, e)`, to the base that `(base, k)` gives, as `based` takes them, with none of `log`'s special values.
+#[inline(always)]
+fn log_of<R: Native, const FUSED: bool>((m, e): (R, R), (base, k): ((R, R), R)) -> R { based::<R, FUSED>((m - R::one()) / (m + R::one()), e, base, k, R::WIDE) }
+
+/// The logarithm of x to the base that `to` gives, as `log_of` takes it, with its special values: -∞ at 0, ∞ at ∞, and NaN for a negative x or NaN.
 #[inline]
-fn log<R: Native, const FUSED: bool>(x: R, (base, k): ((R, R), R)) -> R {
-    let (m, e) = split_positive(x);
-    let y = based::<R, FUSED>((m - R::one()) / (m + R::one()), e, base, k, R::WIDE);
+fn log<R: Native, const FUSED: bool>(x: R, to: ((R, R), R)) -> R {
+    let y = log_of::<R, FUSED>(split_positive(x), to);
     let y = if x == R::infinity() { x } else { y };
     let y = if x == R::zero() { R::neg_infinity() } else { y };
     if x >= R::zero() { y } else { R::nan() }
 }
 
 #[inline]
-pub(crate) fn ln<R: Native, const FUSED: bool>(x: R) -> R { log::<R, FUSED>(x, (ln2(), R::one())) }
+pub(crate) fn ln<R: Native, const FUSED: bool>(x: R) -> R { log::<R, FUSED>(x, natural()) }
 
 /// ln x for a positive, finite, nonzero x, computed in f64 for an f32 or f16 result. Such an x is never a subnormal f64. At this accuracy, ln 2 needs no lower part.
 #[inline(always)]
@@ -88,7 +99,7 @@ fn by_base<R: Native, T>(b: R, [two, ten, other]: [T; 3]) -> T { if b == R::narr
 #[inline(always)]
 fn for_base<R: Native, const FUSED: bool>(b: R) -> (((R, R), R), R) {
     let lb = ln::<R, FUSED>(b);
-    (by_base(b, [base2(), base10(), (ln2(), R::one())]), by_base(b, [R::one(), R::one(), lb]))
+    (by_base(b, [base2(), base10(), natural()]), by_base(b, [R::one(), R::one(), lb]))
 }
 
 /// The logarithm of x to base b. Base 2 gives `log2` and base 10 gives `log10`, which are exact at powers of their base. Any other base gives ln x / ln b. It is always inlined. Out of line, its call would stop a caller's loop vectorizing.
@@ -101,10 +112,10 @@ pub struct Logb;
 forms!(Logb at real: |_, [b, x]| logb::<_, { crate::FUSED }>(b, x),
 many |_, [b, x], n, out| match (b, x) {
     (Arg::One(c), _) => {
-        // Bases 2 and 10 divide by 1, which their loop skips.
+        // Bases 2 and 10 divide by 1, which their loop skips, and take the logarithms' fast form for usual items. Any other base divides by ln b, which can be 0 or NaN, so its loop judges every result.
         let (to, d) = for_base::<_, { crate::FUSED }>(c);
         if d == 1.0 {
-            each!([b, x], n, out, |[_, x]| log::<_, { crate::FUSED }>(x, to))
+            crate::slice::each_usual(x, n, out, usual, #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), to), #[inline(always)] |x| log::<_, { crate::FUSED }>(x, to))
         } else {
             each!([b, x], n, out, |[_, x]| log::<_, { crate::FUSED }>(x, to) / d)
         }
@@ -120,19 +131,51 @@ many |_, [b, x], n, out| match (b, x) {
     _ => each!([b, x], n, out, |[b, x]| logb::<_, { crate::FUSED }>(b, x)),
 });
 
+/// The part of `log1p` that computes ln(1 + x) from u = 1 + x, split as `(m, e)`, with none of its special values.
+#[inline(always)]
+fn log1p_of<R: Native, const FUSED: bool>(x: R, u: R, (m, e): (R, R)) -> R {
+    let top = R::narrow(if R::WIDE { 1000.0 } else { 100.0 });
+    let c = (x - (u - R::one())) * R::pow2(R::SHIFT - if e > top { top } else { e });
+    ln_parts::<R, FUSED>((m - R::one() + c) / (m + R::one() + c), e)
+}
+
 /// ln(1 + x). Rounding u = 1 + x loses c = x - (u - 1). With u = m × 2^e and c' = c × 2^-e, the quotient s = (m - 1 + c')/(m + 1 + c') restores it, and a small x keeps its relative accuracy with one division. Beyond 2^53, c is 0. e stops at `top` there, to keep 2^-e a normal float.
 #[inline]
 pub(crate) fn log1p<R: Native, const FUSED: bool>(x: R) -> R {
     let u = x + R::one();
-    let (m, e) = split_positive(u);
-    let top = R::narrow(if R::WIDE { 1000.0 } else { 100.0 });
-    let c = (x - (u - R::one())) * R::pow2(R::SHIFT - if e > top { top } else { e });
-    let y = ln_parts::<R, FUSED>((m - R::one() + c) / (m + R::one() + c), e);
+    let y = log1p_of::<R, FUSED>(x, u, split_positive(u));
     // -0 must give -0, which the quotient turns into 0.
     let y = if (x == R::infinity()) | (x == R::zero()) { x } else { y };
     let y = if u == R::zero() { R::neg_infinity() } else { y };
     if u >= R::zero() { y } else { R::nan() }
 }
+
+/// `log1p` for an x that `usual1p` accepts.
+#[inline(always)]
+fn log1p_usual<R: Native, const FUSED: bool>(x: R) -> R { let u = x + R::one(); log1p_of::<R, FUSED>(x, u, u.split()) }
+
+/// Whether `log1p` needs none of its special values at x: 1 + x is positive, normal and finite, and x isn't 0.
+#[inline(always)]
+fn usual1p<R: Native>(x: R) -> bool { usual(x + R::one()) & (x != R::zero()) }
+
+/// Declares a logarithm's function object. Its slice form takes the logarithm's special values only in blocks of items that hold one, through `each_usual`: `$usual` says whether an item needs none, and `$fast` computes such an item.
+macro_rules! logarithm {
+    ($(#[doc = $doc:literal])* $object:ident: $name:ident, $usual:expr, $fast:expr) => {
+        $(#[doc = $doc])*
+        #[derive(Clone, Copy, Debug)]
+        pub struct $object;
+        forms!($object at real: |_, [x]| $name::<_, { crate::FUSED }>(x),
+            many |_, [x], n, out| crate::slice::each_usual(x, n, out, $usual, $fast, #[inline(always)] |x| $name::<_, { crate::FUSED }>(x)));
+    };
+}
+logarithm!(/// [`ln`](crate::ln) as a function object.
+    Ln: ln, usual, #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), natural()));
+logarithm!(/// [`log2`](crate::log2) as a function object.
+    Log2: log2, usual, #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), base2()));
+logarithm!(/// [`log10`](crate::log10) as a function object.
+    Log10: log10, usual, #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), base10()));
+logarithm!(/// [`log1p`](crate::log1p) as a function object.
+    Log1p: log1p, usual1p, log1p_usual::<_, { crate::FUSED }>);
 
 /// ln 2 as a double word.
 const LN2: (f64, f64) = (0.693147180559945286226764, 2.319046813846299558417771e-17);

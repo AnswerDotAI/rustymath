@@ -621,7 +621,7 @@ fn _sliding_pick<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, width: usize, axis
     let x = one(x)?;
     let items = x.row_major()?;
     let (lanes, layout) = windowed(&x.layout(), width, &axis)?;
-    let rows = released(py, || reduce::view_sliding_picks(items.view(), lanes.dims(), width, max)).ok_or_else(|| missing(if max { "sliding_argmax" } else { "sliding_argmin" }, items.view().dtype()))?;
+    let rows = released(py, || reduce::view_picks(items.view(), lanes.dims(), reduce::Picks::Windows(width), max)).ok_or_else(|| missing(if max { "sliding_argmax" } else { "sliding_argmin" }, items.view().dtype()))?;
     give_items(py, layout, i64::buffer(rows.into_iter().map(|r| r as i64).collect()), false)
 }
 
@@ -630,9 +630,10 @@ fn _sliding_pick<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, width: usize, axis
 fn _at<'py>(py: Python<'py>, function: &str, a: &Bound<'py, PyAny>, index: &Bound<'py, PyAny>, b: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let mut args = convert(&[a, b])?.args.into_iter();
     let (a, b) = (args.next().expect("two arguments give two"), args.next().expect("two arguments give two"));
-    macro_rules! run { ($k:expr) => {{
+    // A maximum or minimum folds each place's values as its reduction folds them (`Combine`), so a NaN value never takes the place of the values before it.
+    macro_rules! run { ($kind:ident, $k:expr) => {{
         let k = $k;
-        let kernels = kernels!(Scatter of k);
+        let kernels = kernels!($kind of k);
         let dtype = kernels.computes(a.view().dtype()).ok_or_else(|| missing(function, a.view().dtype()))?;
         let mut out = if a.view().dtype() == dtype { a.into_core()? } else {
             let Items::Owned(buffer) = a.view().cast(dtype).map_err(py_err)? else { unreachable!("different dtypes need a cast") };
@@ -645,8 +646,8 @@ fn _at<'py>(py: Python<'py>, function: &str, a: &Bound<'py, PyAny>, index: &Boun
         out
     }}; }
     let out = match function {
-        "add" => run!(rustymath::Add), "subtract" => run!(rustymath::Subtract), "multiply" => run!(rustymath::Multiply),
-        "divide" => run!(rustymath::Divide), "maximum" => run!(reduce::Maximum), "minimum" => run!(reduce::Minimum),
+        "add" => run!(Scatter, rustymath::Add), "subtract" => run!(Scatter, rustymath::Subtract), "multiply" => run!(Scatter, rustymath::Multiply),
+        "divide" => run!(Scatter, rustymath::Divide), "maximum" => run!(Combine, reduce::Max), "minimum" => run!(Combine, reduce::Min),
         _ => return Err(PyValueError::new_err(format!("at takes add, subtract, multiply, divide, maximum or minimum, not {function}"))),
     };
     give(py, out, false)

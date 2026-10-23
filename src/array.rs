@@ -200,13 +200,12 @@ impl Array {
         let scalar = Layout::EMPTY;
         let agreement = crate::agreement::Agreement::new(&plan.layout, if source.len() == 1 { &scalar } else { source.layout() })?;
         if agreement.layout.shape() != plan.layout.shape() { return Err(Error::new(Kind::Length, "assignment must fit the selected layout")); }
-        let (len, writes) = (self.len(), Writes::Walk { base: 0, steps: &plan.steps });
-        if !writes.runs_while(&mut |_, run| run.iter().all(|&o| o == Steps::FILL || o < len)) { return Err(Error::new(Kind::Index, "assignment position is outside its array")); }
+        let writes = Writes::Walk { base: 0, steps: &plan.steps };
         let items = source.view().cast(self.dtype())?;
         if matches!(agreement.right, Mapping::Linear(1) | Mapping::Single) { return Ok((writes, items)); }
         Ok((writes, Items::Owned(Buffer::cast_mapped(items.view(), &agreement.right, agreement.len, self.dtype())?)))
     }
-    /// Writes `source`, broadcast over a selection, detaching shared storage first. Later repeated targets win. Conversion, shape and position checks finish before any item changes.
+    /// Writes `source`, broadcast over a selection, detaching shared storage first. Later repeated targets win. `plan` must come from [`structure::select`](crate::structure::select) on this array's layout, with selectors whose positions were checked as they were built, as [`structure::index_table`](crate::structure::index_table) checks them. Those position checks, and the conversion and shape checks here, finish before any item changes. A plan from another array panics at its first write outside the array.
     pub fn assign(&mut self, plan: &crate::structure::Plan, source: &Self) -> Result<(), Error> {
         let (writes, items) = self.targets(plan, source)?;
         let values = items.view();
@@ -216,11 +215,16 @@ impl Array {
         });
         Ok(())
     }
-    /// Combines `source`, broadcast over a selection, into the items it selects by `k`, in turn, detaching shared storage first. A target selected more than once combines every item that selects it, as NumPy's `ufunc.at` does. `kernels` are `k`'s, from [`kernels!`](crate::kernels)`(Scatter of k)`. It gives whether every result succeeded, as [`Kernels::scatter`](crate::operation::Kernels::scatter) says. Conversion, shape and position checks finish before any item changes. A Domain error where `k` has no kernel at this array's dtype.
+    /// Combines `source`, broadcast over a selection, into the items it selects by `k`, in turn, detaching shared storage first. A target selected more than once combines every item that selects it, as NumPy's `ufunc.at` does. `kernels` are `k`'s, from [`kernels!`](crate::kernels)`(Scatter of k)`. It gives whether every result succeeded, as [`Kernels::scatter`](crate::operation::Kernels::scatter) says. Its `plan` and checks are as [`Array::assign`] gives them. A Domain error where `k` has no kernel at this array's dtype.
     pub fn combine_at<K>(&mut self, k: &K, kernels: &crate::operation::Kernels<crate::operation::ScatterKernel<K>>, plan: &crate::structure::Plan, source: &Self) -> Result<bool, Error> {
         let dtype = self.dtype();
         if kernels.at(dtype).is_none() { return Err(Error::new(Kind::Domain, format!("this function doesn't take {}", dtype.name()))); }
         let (writes, items) = self.targets(plan, source)?;
         Ok(kernels.scatter(k, self.make_mut(), writes, items.view()).expect("the function has a kernel at the array's dtype"))
     }
+}
+
+/// A contiguous array of whole numbers serves as index values that a selection's table reads in place, as [`Array::compact`] gives one.
+impl crate::gather::IndexSource for Array {
+    fn view(&self) -> View<'_> { Array::view(self).contiguous().expect("index values are contiguous") }
 }

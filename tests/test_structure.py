@@ -71,6 +71,9 @@ def test_at_combines_at_each_selected_item():
         expected = np.asarray(x).copy()
         getattr(np, name).at(expected, ([0, 0, 1], [0, 0, 0]), [2, 4, 3])
         assert rm.at(getattr(rm, name), x, ([0, 0, 1], [0, 0, 0]), [2, 4, 3]).tolist() == expected.tolist()
+    # A place written more than once folds its values as maximum folds them. A NaN value may be left out or make the place NaN, but never replaces the values written before it.
+    got = rm.at(rm.maximum, np.zeros(2), [0, 0, 0, 1], [5., np.nan, 3., np.nan]).tolist()
+    assert (np.isnan(got[0]) or got[0] == 5) and (np.isnan(got[1]) or got[1] == 0)
     with pytest.raises(ValueError): rm.at(rm.power, a, 0, 1)
 
 def test_shape_operations_keep_independent_values():

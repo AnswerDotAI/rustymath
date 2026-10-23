@@ -459,6 +459,12 @@ impl Writes<'_> {
             true
         });
     }
+    /// [`Writes::combine`] by the reduction `R`: each write steps the item of `out` at its place, the place's running fold, by its value through `R::checked`. A place written more than once folds its values as `R` folds, with `R`'s rule beside NaN. It gives whether every step fits.
+    pub fn fold<R: crate::reduce::Reduction<T, Total = T>, T: Copy>(self, out: &mut [T], values: Arg<'_, T>) -> bool {
+        let fits = std::cell::Cell::new(true);
+        self.combine(out, values, |acc, x| { let (t, f) = R::checked(acc, x); fits.set(fits.get() & f); t });
+        fits.get()
+    }
     /// [`Writes::combine`] for an `f` that gives `None` for a pair it can't combine. At the first such pair, it restores every item that earlier writes changed and gives false. It restores from a copy of `out` where `out` holds no more items than there are writes, as a histogram's counters do, and otherwise from a record of each item it changes.
     pub fn try_combine<D: Copy, S: Copy>(self, out: &mut [D], values: Arg<'_, S>, f: impl Fn(D, S) -> Option<D>) -> bool {
         let saved = (out.len() <= self.len()).then(|| out.to_vec());

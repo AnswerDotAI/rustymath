@@ -57,7 +57,7 @@ pub use arith::{Add, Divide, Multiply, Subtract, BitAnd, BitOr, BitXor, BitNot, 
 pub use {half, num_complex};
 pub use complex::{Cis, divide};
 pub use float::{FUSED, Float, Native};
-pub use ln::Logb;
+pub use ln::{Ln, Log1p, Log2, Log10, Logb};
 pub use parts::{Abs, Angle, Sign, Isnan, Isfinite, Isinf, Real, Imag, Conj, Trunc, Rint, Clip, Choose, Scale, Round};
 pub use pow::{Pow, Root};
 pub use slice::{Arg, Binary, CHUNK, Flipped, Results, Ternary, Unary, choose, pairs};
@@ -114,13 +114,13 @@ functions! {
     /// e^x - 1, without the loss of digits near 0 that `exp(x) - 1` has.
     expm1(x) in exp as Expm1: total;
     /// The natural logarithm of x. `ln(0)` is -∞, `ln(∞)` is ∞, and a negative x or NaN gives NaN.
-    ln(x) in ln as Ln;
+    ln(x) in ln;
     /// ln(1 + x), without the loss of digits near 0 that `ln(1 + x)` has. `log1p(-1)` is -∞.
-    log1p(x) in ln as Log1p;
+    log1p(x) in ln;
     /// The logarithm of x to base 2. It is k exactly at 2^k.
-    log2(x) in ln as Log2;
+    log2(x) in ln;
     /// The logarithm of x to base 10. It is k exactly at 10^k, and at the float nearest 10^k where 10^k isn't a float.
-    log10(x) in ln as Log10;
+    log10(x) in ln;
     /// The logarithm of x to base b, ln x / ln b. Base 2 and base 10 take `log2` and `log10`, which are exact at powers of their base.
     logb(b, x) in ln;
     /// sin x. `sin(±0)` is ±0, and `sin(±∞)` and `sin(NaN)` are NaN. Beyond a magnitude of 2^23 at f64 or 2^20 at f32, x takes an exact reduction, which is slower and has a branch. A loop that calls `sin` therefore doesn't vectorize. [`Sin`]'s slice form does: it reduces every item the fast way, then gives only the rare large ones the exact reduction.

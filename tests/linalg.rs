@@ -215,13 +215,14 @@ mod products {
 
     #[test]
     fn nan_terms_stay_in_their_rows() {
-        // Rows 0 and 3 each have a NaN term, in the first step and in a later one. A NaN term changes no result on any target, so each result is the fold of its other terms.
+        // Rows 0 and 3 each have a NaN term, in the first step and in a later one. Each of their results is NaN or the fold of their other terms. The other rows give their folds exactly.
         let size @ [m, k, n] = [9, 300, 11];
         let mut a: Vec<f64> = (0..m * k).map(|i| (i % 23) as f64).collect();
         let b: Vec<f64> = (0..k * n).map(|i| (i % 19) as f64).collect();
         (a[0], a[3 * k + 280]) = (f64::NAN, f64::NAN);
         let fold = |i: usize, j: usize, max: bool| (0..k).map(|p| a[i * k + p] + b[p * n + j]).filter(|t| !t.is_nan()).fold(if max { f64::NEG_INFINITY } else { f64::INFINITY }, |s, t| if max { s.max(t) } else { s.min(t) });
-        let check = |c: &[f64], max: bool| for i in 0..m { for j in 0..n { assert_eq!(c[i * n + j], fold(i, j, max), "row {i}") } };
+        let nan_row = |i: usize| (0..k).any(|p| a[i * k + p].is_nan());
+        let check = |c: &[f64], max: bool| for i in 0..m { for j in 0..n { let (got, want) = (c[i * n + j], fold(i, j, max)); assert!(got == want || (nan_row(i) && got.is_nan()), "row {i}: {got}, where {want}") } };
         check(&MaxPlus.inner(&a, &b, size), true);
         check(&MinPlus.inner(&a, &b, size), false);
         let a32: Vec<f32> = a.iter().map(|&x| x as f32).collect();

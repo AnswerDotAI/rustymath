@@ -1,6 +1,7 @@
 use crate::py_err;
 use pyo3::{exceptions::{PyIndexError, PyKeyError, PyTypeError}, prelude::*, types::{PyBool, PyInt, PyList, PySlice, PyString, PyTuple}};
-use rustymath::{buffer::View, layout::{Layout, position}, structure::{self, IndexPart, Plan, Selector}};
+use std::sync::Arc;
+use rustymath::{buffer::View, gather::{IndexSource, Table}, layout::{Layout, position}, structure::{self, IndexPart, Plan, Selector}};
 
 pub fn key(layout: &Layout, axis: usize, name: &str) -> PyResult<usize> {
     layout.keys(axis).and_then(|k| k.position(name)).ok_or_else(|| PyKeyError::new_err(name.to_owned()))
@@ -39,31 +40,26 @@ pub fn selector(layout: &Layout, axis: usize, obj: &Bound<'_, PyAny>, array: imp
     }
     if (obj.is_instance_of::<PyList>() || obj.is_instance_of::<PyTuple>()) && let Ok(names) = obj.extract::<Vec<String>>() {
         let positions = names.iter().map(|n| key(layout, axis, n)).collect::<PyResult<Vec<_>>>()?;
-        return Ok((Selector::Indices { layout: Layout::from([positions.len()]), positions: rustymath::gather::Table::new(positions) }, false));
+        return Ok((Selector::Indices { layout: Layout::from([positions.len()]), positions: Table::new(positions) }, false));
     }
     unreachable!("`native` admits only the kinds decoded above")
 }
 
-/// A compact selector: a character string picks a key, Booleans form a mask, and other numbers give positions.
-pub fn array_selector(target: &Layout, axis: usize, layout: Layout, view: View<'_>, atom: bool) -> PyResult<(Selector, bool)> {
+/// The selector that an array's items give: a character string picks a key, Booleans form a mask, and a table reads other numbers in place as positions.
+pub fn array_selector(target: &Layout, axis: usize, layout: Layout, indices: Arc<dyn IndexSource>) -> PyResult<(Selector, bool)> {
     let size = *target.shape().get(axis).ok_or_else(|| PyIndexError::new_err("too many axis selectors"))?;
-    if let View::Characters(text) = view && layout.shape().len() <= 1 {
-        return Ok((Selector::At(key(target, axis, &text.iter().collect::<String>())?), true));
-    }
-    let (within, positions) = match view {
+    let positions = match indices.view() {
+        View::Characters(text) if layout.shape().len() <= 1 => return Ok((Selector::At(key(target, axis, &text.iter().collect::<String>())?), true)),
         View::Booleans(mask) => {
             if layout.shape() != [size] { return Err(PyIndexError::new_err("a Boolean selector must be a vector matching its axis")); }
             let positions: Vec<_> = mask.iter().enumerate().filter_map(|(i, &b)| b.then_some(i)).collect();
-            (Layout::from([positions.len()]), positions)
+            return Ok((Selector::Indices { layout: Layout::from([positions.len()]), positions: Table::new(positions) }, false));
         }
-        View::Integers(_) | View::Floats(_) => {
-            (layout, structure::positions(view, size).map_err(py_err)?)
-        }
-        _ if view.is_empty() => (layout, vec![]),
+        View::Integers(_) | View::Floats(_) => structure::index_table(indices.clone(), size).map_err(py_err)?,
+        view if view.is_empty() => Table::new(vec![]),
         _ => return Err(PyTypeError::new_err("an axis selector must be an integer, key, slice, Boolean mask or integer or float array")),
     };
-    if atom && let [i] = positions[..] && i != rustymath::gather::Steps::FILL { return Ok((Selector::At(i), true)); }
-    Ok((Selector::Indices { layout: within, positions: rustymath::gather::Table::new(positions) }, atom))
+    Ok((Selector::Indices { layout, positions }, false))
 }
 
 /// Keeps structural markers in their written order until the applicable frame is known.

@@ -158,6 +158,19 @@ mod forms {
         let q: Vec<f64> = (0..2000).map(|_| 2.0 * rng.random::<f64>()).collect();
         unary(Erfcinv, "Erfcinv", &q);
         unary(Erfinv, "Erfinv", &q.iter().map(|&q| q - 1.0).collect::<Vec<_>>());
+        // The logarithms' slice forms take each block of 16 items whose every item is positive, normal and finite through a form with no special values. Blocks of such items, some holding a special value, reach both forms.
+        let mut x: Vec<f64> = (0..2000).map(|_| 1000.0 * rng.random::<f64>()).collect();
+        for (i, v) in [0.0, -1.0, 1e-310, f64::INFINITY, f64::NAN, 1.0].into_iter().enumerate() { x[300 * i + 5] = v }
+        unary(Ln, "Ln", &x);
+        unary(Log2, "Log2", &x);
+        unary(Log10, "Log10", &x);
+        unary(Log1p, "Log1p", &x.iter().map(|&v| v - 1.0).collect::<Vec<_>>());
+        for b in [2.0, 10.0] {
+            let mut out = Vec::new();
+            let ok = Logb.many(Arg::One(b), Arg::Many(&x), x.len(), &mut out);
+            assert!(x.iter().zip(&out).all(|(&v, &r)| same(r, Logb.one(b, v))), "Logb at base {b}");
+            assert_eq!(ok, x.iter().all(|&v| Logb.checked(b, v).is_some()), "Logb at base {b}");
+        }
         assert!(<Exp as Results<f64, 1>>::TOTAL && <Maximum as Results<f32, 2>>::TOTAL && !<Pow as Results<f64, 2>>::TOTAL && !<Sqrt as Results<f16, 1>>::TOTAL);
         assert!(<Add as Results<i64, 2>>::WRAPS && <Pow as Results<u8, 2>>::WRAPS && !<Add as Results<f64, 2>>::WRAPS && !<Binom as Results<i64, 2>>::WRAPS);
     }
@@ -184,7 +197,7 @@ mod reductions {
     use half::f16;
     use num_complex::Complex;
     use rustymath::reduce::*;
-    use rustymath::{Arg, Binary, tolerant::{Less, Tolerance}};
+    use rustymath::{Add, Arg, Binary, Subtract, tolerant::{Less, Tolerance}};
 
     /// Each reduction and scan against the same taken item by item, in order: sums and running sums of `sums`, and the product of `prods`. Their items keep every sum and product exact at every width, so any grouping gives the same result.
     fn exact<T: Copy + PartialEq + std::fmt::Debug, S: Copy + PartialEq + std::fmt::Debug>(
@@ -240,19 +253,7 @@ mod reductions {
     #[test]
     fn edges() {
         assert_eq!((sum::<f64>(&[]), prod::<i32>(&[]), max::<f32>(&[]), min::<i16>(&[])), ((0.0, true), (1, true), f32::NEG_INFINITY, i16::MAX));
-        // NaN at item 40 of 101 lies inside a fold's running results, which vectorize, and not in the remainder. A NaN item changes no running result on any target, and a fold or scan starts at -∞, so NaN items alone give -∞.
-        let mut v = vec![1.0f64; 101];
-        v[40] = f64::NAN;
-        let v32: Vec<f32> = v.iter().map(|&x| x as f32).collect();
-        let (most, least, half) = (max(&v), min(&v32), max(&[f16::ONE, f16::NAN]));
-        assert!(most == 1.0 && least == 1.0 && half == f16::ONE);
         assert_eq!((maximum(1.0, f64::NAN).is_nan(), minimum(f32::NAN, 1.0), maximum(-1.0, 2.0), minimum(f16::ONE, f16::ZERO)), (true, 1.0, 2.0, f16::ZERO));
-        let mut out = Vec::new();
-        cummax(&[1.0, 3.0, f64::NAN, 5.0, 2.0, 1.0], None, &mut out);
-        assert_eq!(out, [1.0, 3.0, 3.0, 5.0, 5.0, 5.0]);
-        out.clear();
-        cummax(&[f64::NAN, 1.0, 2.0], None, &mut out);
-        assert_eq!((out, max(&[f64::NAN; 3])), (vec![f64::NEG_INFINITY, 1.0, 2.0], f64::NEG_INFINITY));
         assert_eq!((sum(&[i64::MAX, 1]), sum(&[i64::MAX, 1, -2]), prod(&[i64::MAX, 2])), ((i64::MIN, false), (i64::MAX - 1, true), (-2, false)));
         assert!(!cumsum(&[i64::MAX, 1], None, &mut Vec::new()));
         assert!(!cumprod(&[i32::MAX, i32::MAX, i32::MAX], None, &mut Vec::new()));
@@ -261,21 +262,51 @@ mod reductions {
         assert_eq!(out, [7.0, 11.0, 13.0]);
     }
 
-    /// Each running maximum is NaN or `maximum`'s result with the running result as `y`, either side of the scan's block boundaries.
+    /// A float maximum or minimum at f64, f32 and f16, by fold, scan, column fold, window and the pieces of a long lane, with NaNs where those routes split their items. Each result must be NaN or the greatest or least of its items that aren't NaN, and never any other number. A scan's seed counts as one more item. The cases include the fold that once gave 671743.5: a long lane whose pieces fold apart, with a NaN beside its greatest item. They also include a leading NaN in short folds and scans, and NaNs at the first and third items of the groups of four that x86's and f16's scans fold apart.
     #[test]
-    fn scans_beside_nan() {
-        let x: Vec<f64> = (0..200).map(|i| (i * 37 % 101) as f64 - 50.0).collect();
-        for nan in [None, Some(0), Some(3), Some(63), Some(64), Some(130), Some(199)] {
-            for start in [None, Some(10.0), Some(f64::NAN)] {
-                let mut y = x.clone();
-                if let Some(k) = nan { y[k] = f64::NAN }
-                let mut out = Vec::new();
-                cummax(&y, start, &mut out);
-                let mut total = start.unwrap_or(f64::NEG_INFINITY);
-                let want: Vec<f64> = y.iter().map(|&v| { total = maximum(v, total); total }).collect();
-                assert!(out.len() == y.len() && out.iter().zip(want).all(|(&a, b)| a == b || (a.is_nan() && b.is_nan())), "{nan:?} {start:?}");
+    fn extrema_beside_nan() {
+        fn routes<T: Copy + Into<f64> + Send + Sync>(from: fn(f64) -> T) where Max: Reduction<T, Total = T>, Min: Reduction<T, Total = T> {
+            let step = |a: f64, v: f64, greatest: bool| if v.is_nan() { a } else if greatest { a.max(v) } else { a.min(v) };
+            let unit = |greatest: bool| if greatest { f64::NEG_INFINITY } else { f64::INFINITY };
+            let want = |items: &mut dyn Iterator<Item = T>, greatest: bool| items.fold(unit(greatest), |a, v| step(a, v.into(), greatest));
+            let check = |got: T, want: f64, case: &str| { let got: f64 = got.into(); assert!(got.is_nan() || got == want, "{case}: {got}, where {want} or NaN"); };
+            let piece = 1 << 18;
+            for (len, nans) in [(3, vec![0]), (3, vec![0, 1, 2]), (64, vec![0]), (64, vec![2, 4]), (200, vec![63, 64, 130]), (3 * piece + 5, vec![piece - 1, piece, 2 * piece + 7])] {
+                let mut x: Vec<T> = (0..len).map(|i| from((i * 37 % 101) as f64 - 50.0)).collect();
+                let last = nans[nans.len() - 1];
+                if last + 1 < len { x[last + 1] = from(1e4) }
+                if last > 0 { x[last - 1] = from(-1e4) }
+                for &k in &nans { x[k] = from(f64::NAN) }
+                for greatest in [true, false] {
+                    let case = format!("{len} items, NaN at {nans:?}, maximum {greatest}");
+                    let all = want(&mut x.iter().copied(), greatest);
+                    check(if greatest { max(&x) } else { min(&x) }, all, &case);
+                    check(if greatest { along::<T, Max>(&x, [1, len, 1]).0[0] } else { along::<T, Min>(&x, [1, len, 1]).0[0] }, all, &case);
+                    for start in [None, Some(from(10.0)), Some(from(f64::NAN))] {
+                        let mut out = Vec::new();
+                        if greatest { <Max as Reduction<T>>::scan(&x, start, &mut out); } else { <Min as Reduction<T>>::scan(&x, start, &mut out); }
+                        let mut seen = start.map_or(unit(greatest), |s| step(unit(greatest), s.into(), greatest));
+                        for (i, &got) in out.iter().enumerate() { seen = step(seen, x[i].into(), greatest); check(got, seen, &format!("{case}, scan from {:?}, item {i}", start.map(Into::<f64>::into))); }
+                    }
+                    for inner in [1, 3, 7] {
+                        let rows = len / inner;
+                        let data = &x[..rows * inner];
+                        let column = |j: usize| (0..rows).map(move |r| data[r * inner + j]);
+                        let folds = if greatest { along::<T, Max>(data, [1, rows, inner]).0 } else { along::<T, Min>(data, [1, rows, inner]).0 };
+                        for j in 0..inner { check(folds[j], want(&mut column(j), greatest), &format!("{case}, column {j} of {inner}")); }
+                        for width in [3, 50].into_iter().filter(|&w| w <= rows && len <= 200) {
+                            let windows = if greatest { sliding::<T, Max>(data, [1, rows, inner], width).0 } else { sliding::<T, Min>(data, [1, rows, inner], width).0 };
+                            for w in 0..=rows - width { for j in 0..inner {
+                                check(windows[w * inner + j], want(&mut (w..w + width).map(|r| data[r * inner + j]), greatest), &format!("{case}, window {w} of {width} rows of {inner}"));
+                            } }
+                        }
+                    }
+                }
             }
         }
+        routes::<f64>(|v| v);
+        routes::<f32>(|v| v as f32);
+        routes::<f16>(f16::from_f64);
     }
 
     /// Every lane of an array of shape `[outer, len, inner]`, its items in order.
@@ -340,10 +371,10 @@ mod reductions {
             assert!(scan_along::<i64, Sum>(&x, shape, Some(10), &mut out));
             assert_eq!(out, want, "{shape:?}");
             let mut ordered = Vec::new();
-            assert!(left_scan(&x, shape, Some(10), i64::checked_add, &mut ordered));
+            assert!(left_scan(&Add, &x, shape, Some(10), &mut ordered));
             assert_eq!(ordered, want, "{shape:?}");
             ordered.clear();
-            assert!(left_scan(&x, shape, None, i64::checked_sub, &mut ordered));
+            assert!(left_scan(&Subtract, &x, shape, None, &mut ordered));
             let mut running = Vec::new();
             difference_scan_along(&x, shape, None, &mut running);
             assert_eq!(running, ordered, "{shape:?}");
@@ -358,7 +389,7 @@ mod reductions {
             assert_eq!(differences, want, "{shape:?}");
             for seed in [None, Some(10)] {
                 ordered.clear();
-                assert!(left_scan(&x, shape, seed, |a, b| Some(i64::from(a < b)), &mut ordered));
+                assert!(left_scan(&Less(Tolerance::EXACT), &x, shape, seed, &mut ordered));
                 let starts = seed.map(|s| x.chunks((len * inner).max(1)).flat_map(|lane| lane[..inner].iter().map(move |&v| s < v)).collect::<Vec<_>>());
                 let (bits, ok) = comparison_scan(&x, shape, starts.as_deref(), 0, 1,
                     &|t, xs, out| Less(Tolerance::EXACT).many(t, Arg::Many(xs), xs.len(), out));
@@ -401,6 +432,14 @@ mod reductions {
                     let mut out = Vec::new();
                     table.scan_along(&b, shape, start, &mut out);
                     assert_eq!(out, want, "{shape:?} {start:?} {code}");
+                    // `fold` gives each lane's right fold by the table, `x₀ f (x₁ f (… f last))`, with `start` as every lane's tail where it's given.
+                    if Logical::folds(shape) {
+                        let folds: Vec<bool> = lanes.iter().map(|l| {
+                            let (last, items) = match start { Some(s) => (s, &l[..]), None => (l[len - 1], &l[..len - 1]) };
+                            items.iter().rev().fold(last, |r, &v| table.0[usize::from(v)][usize::from(r)])
+                        }).collect();
+                        assert_eq!(table.fold(&b, len, start.map(|s| vec![s; outer]).as_deref()), folds, "{shape:?} {start:?} {code}");
+                    }
                     // The Boolean reductions scan by their tables: `or` is 14, `and` 8, `!=` 6 and `==` 9.
                     let mut reduced = Vec::new();
                     match code {
@@ -429,11 +468,11 @@ mod reductions {
         assert!(!along::<i64, Sum>(&[i64::MAX, 1], [1, 2, 1]).1);
         assert!(!along::<i64, Sum>(&[i64::MAX, 0, 1, 0], [1, 2, 2]).1);
         assert!(!scan_along::<i64, Sum>(&[i64::MAX, 0, 1, 0], [1, 2, 2], None, &mut Vec::new()));
-        assert!(!left_scan(&[i64::MAX, 1], [1, 2, 1], None, i64::checked_add, &mut Vec::new()));
-        assert!(!left_scan(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i64::MAX, 1], [8, 2, 1], None, i64::checked_add, &mut Vec::new()));
+        assert!(!left_scan(&Add, &[i64::MAX, 1], [1, 2, 1], None, &mut Vec::new()));
+        assert!(!left_scan(&Add, &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i64::MAX, 1], [8, 2, 1], None, &mut Vec::new()));
     }
 
-    /// Each window's fold matches the same reduction of that window's items alone, for windows folded directly and by van Herk-Gil-Werman, a last block cut short, a window as wide as its lane, and windows down rows. A float maximum skips each NaN item, as `Max::step` does. Each window's pick is its first row that gives its maximum or minimum. A sum that wraps reports it.
+    /// Each window's fold matches the same reduction of that window's items alone, for windows folded directly and by van Herk-Gil-Werman, a last block cut short, a window as wide as its lane, and windows down rows. A float maximum skips each NaN item, as `Max::step` does. Each window's pick is its first row that gives its maximum or minimum, and so is each whole lane's pick and each running pick. A sum that wraps reports it.
     #[test]
     fn windows_fold_as_their_items_do() {
         let same = |a: f64, b: f64| a == b || a.is_nan() && b.is_nan();
@@ -461,9 +500,20 @@ mod reductions {
                 // Each pick is the first row of its window whose item, folded alone, gives the window's fold.
                 let pick = |r: &dyn Fn(f64) -> f64, folds: &[f64]| { let mut at = 0; let mut picks = Vec::new(); each(&mut |a, i, k| { picks.push(window(a, i, k).position(|p| same(r(f[p]), folds[at])).map_or(a, |j| a + j)); at += 1; }); picks };
                 let (maxima, minima) = (sliding::<f64, Max>(&f, shape, width).0, sliding::<f64, Min>(&f, shape, width).0);
-                assert_eq!(sliding_picks::<f64, Max>(&f, shape, width), pick(&|x| <Max as Reduction<f64>>::one(x).0, &maxima), "{shape:?} {width}");
-                assert_eq!(sliding_picks::<f64, Min>(&f, shape, width), pick(&|x| <Min as Reduction<f64>>::one(x).0, &minima), "{shape:?} {width}");
+                assert_eq!(picks::<f64, Max>(&f, shape, Picks::Windows(width)), pick(&|x| <Max as Reduction<f64>>::one(x).0, &maxima), "{shape:?} {width}");
+                assert_eq!(picks::<f64, Min>(&f, shape, Picks::Windows(width)), pick(&|x| <Min as Reduction<f64>>::one(x).0, &minima), "{shape:?} {width}");
             }
+            if len == 0 { continue; }
+            assert_eq!(picks::<f64, Max>(&f, shape, Picks::Lanes), picks::<f64, Max>(&f, shape, Picks::Windows(len)), "{shape:?}");
+            // A running pick is the first row so far whose item, folded alone, gives the running maximum.
+            let one = |p: usize| <Max as Reduction<f64>>::one(f[p]).0;
+            let running: Vec<usize> = (0..outer * len * inner).map(|p| {
+                let (i, r, k) = (p / (len * inner), p / inner % len, p % inner);
+                let rows = (0..=r).map(|j| (i * len + j) * inner + k);
+                let m = rows.clone().map(one).fold(f64::NEG_INFINITY, f64::max);
+                rows.clone().position(|q| one(q) == m).unwrap_or(0)
+            }).collect();
+            assert_eq!(picks::<f64, Max>(&f, shape, Picks::Running), running, "{shape:?}");
         }
         assert!(!sliding::<i64, Sum>(&[i64::MAX, 1, 0], [1, 3, 1], 2).1);
         assert!(!sliding::<i64, Sum>(&[i64::MAX; 20], [1, 20, 1], 10).1);

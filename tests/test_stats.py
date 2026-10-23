@@ -13,6 +13,9 @@ def test_parts_rounding_and_clip():
     x = np.arange(12).reshape(3, 4).astype(np.int16)
     assert np.array_equal(rm.clip(x, [2, 5, 9], 10), np.minimum(np.maximum(x, np.array([2, 5, 9])[:, None]), 10))
     assert rm.clip(x, 2, 10).dtype == 'int16' and rm.clip(3, 5, 2) == 2
+    # A NaN argument gives NaN, x or a bound.
+    x, lo, hi = [np.nan, 0.5, 3.0], [0.0, np.nan, 0.0], [1.0, 1.0, np.nan]
+    assert all(np.isnan(r) or r in (x[i], lo[i], hi[i]) for i, r in enumerate(rm.clip(x, lo, hi).tolist()))
 
 def test_statistical_reductions(threads):
     x = np.linspace(-2, 3, 60_000).reshape(100, 20, 30)

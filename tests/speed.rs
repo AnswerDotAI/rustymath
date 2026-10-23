@@ -492,3 +492,43 @@ fn speed() {
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+/// Times `run` as `time_appended` does, with its output appended after the first `skip` items of `out`, and gives the time and the output's byte offset modulo 4 KiB.
+fn placed(out: &mut Vec<f64>, skip: usize, run: impl Fn(usize, &mut Vec<f64>)) -> (f64, usize) {
+    out.resize(skip, 0.0);
+    let ns = fastest(N, |k| {
+        out.truncate(skip);
+        run(k, out);
+        black_box(&mut *out);
+    });
+    (ns, out[skip..].as_ptr() as usize % 4096)
+}
+
+/// Temporary, for one CI run: f64 `Abs`, `Maximum`, `Clip` and `Choose` timed with their output at a range of byte offsets, modulo 4 KiB, from inputs that start on 4 KiB boundaries, in two passes. It prints each time with `RUSTYMATH_COSTS` set and never fails. It tests whether the output's placement relative to the inputs sets the cost of `Clip` and `Choose` on CI's runner.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "debug assertions change the costs it times")]
+fn placements() {
+    let _lock = timing::exclusive().unwrap();
+    let values = [inputs(-1.0, 1.0, GOLDEN, N), inputs(-0.6, -0.4, BRONZE, N), inputs(0.4, 0.6, BRONZE, N), inputs(0.0, 1.0, BRONZE, N).iter().map(|m| m.round()).collect()];
+    let mut held = vec![0.0; values.len() * RUNS * N + 512];
+    let start = held.as_ptr().align_offset(4096);
+    for (i, v) in values.iter().enumerate() { held[start + i * RUNS * N..][..RUNS * N].copy_from_slice(v); }
+    let [a, b, c, m]: [&[f64]; 4] = std::array::from_fn(|i| &held[start + i * RUNS * N..][..RUNS * N]);
+    let mut out: Vec<f64> = Vec::with_capacity(N + 512);
+    let base = out.as_ptr() as usize % 4096;
+    let mut stderr = std::io::stderr();
+    for pass in 0..2 {
+        for offset in [0, 8, 32, 64, 128, 192, 256, 384, 512, 1024, 2048, 3072, 4064] {
+            let skip = (offset + 4096 - base) % 4096 / 8;
+            let times = [
+                ("Abs", placed(&mut out, skip, |k, o| { Abs.many(Arg::Many(black_box(set(a, k))), N, o); })),
+                ("Maximum", placed(&mut out, skip, |k, o| { reduce::Maximum.many(Arg::Many(black_box(set(a, k))), Arg::Many(set(b, k)), N, o); })),
+                ("Clip", placed(&mut out, skip, |k, o| { Clip.many(Arg::Many(black_box(set(a, k))), Arg::Many(set(b, k)), Arg::Many(set(c, k)), N, o); })),
+                ("Choose", placed(&mut out, skip, |k, o| { Choose.many(Arg::Many(black_box(set(a, k))), Arg::Many(set(b, k)), Arg::Many(set(m, k)), N, o); })),
+            ];
+            if std::env::var_os("RUSTYMATH_COSTS").is_some() {
+                for (name, (ns, at)) in times { writeln!(stderr, "placement pass {pass}: f64 {name} with its output {at} bytes past its inputs: {ns:.3} ns").unwrap(); }
+            }
+        }
+    }
+}

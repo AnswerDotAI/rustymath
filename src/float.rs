@@ -112,15 +112,21 @@ pub(crate) mod sealed {
         /// The lesser of `self` and `y`, as `maximum` gives the greater.
         fn minimum(self, y: Self) -> Self;
     }
-    /// The folds and scans of floats by maximum and minimum, and their running sums. The defaults' fold loops vectorize. Each fold or scan of a maximum or minimum starts at `-∞` or `∞` and passes the running result as `Core::maximum`'s or `Core::minimum`'s `y`, so a NaN item leaves it unchanged and no running result is NaN. A scan reads each item through a step from that start, which turns a NaN item into that start, so the groups that `grouped` starts at an item follow the same rule. The default running sum is `grouped`'s. `reduce.rs` overrides them where a target has instructions that do better.
+    /// The folds and scans of floats by maximum and minimum, and their running sums. Every route that folds by a maximum or minimum keeps one rule: no running result is ever NaN. Each fold or scan starts at `-∞` or `∞`. An item joins a running result only through `Core::maximum` or `step_max`, which take the running result as `y` and keep it beside a NaN item. Merges combine running results alone. The rule makes every route give the maximum of the items that aren't NaN, whatever its grouping, piece sizes, vector width or target. A scan reads each item through a step from its start, which turns a NaN item into that start, so the groups that `grouped` starts at an item keep the rule. The defaults' fold loops vectorize. The default running sum is `grouped`'s. `reduce.rs` overrides them where a target has instructions that do better.
     pub trait Folds: Core + num_traits::Float {
-        fn fold_max(x: &[Self]) -> Self { crate::reduce::folded(x, Self::neg_infinity(), |t, v| Self::maximum(v, t), Self::maximum) }
-        fn fold_min(x: &[Self]) -> Self { crate::reduce::folded(x, Self::infinity(), |t, v| Self::minimum(v, t), Self::minimum) }
+        /// One step of a fold or scan by maximum: `Core::maximum` of the item `v` and the running result `t`, which gives `t` beside a NaN item. Chains, where each step waits for the one before, take it through `Reduction::chain`. AArch64 overrides it with `fmaxnm`, one instruction to the select's two. LLVM can't vectorize that override, so loops that vectorize call `Core::maximum` instead.
+        #[inline(always)]
+        fn step_max(t: Self, v: Self) -> Self { Self::maximum(v, t) }
+        /// One step of a fold or scan by minimum, as `step_max` is one by maximum.
+        #[inline(always)]
+        fn step_min(t: Self, v: Self) -> Self { Self::minimum(v, t) }
+        fn fold_max(x: &[Self]) -> Self { crate::reduce::folded(x, Self::neg_infinity(), Self::step_max, Self::maximum) }
+        fn fold_min(x: &[Self]) -> Self { crate::reduce::folded(x, Self::infinity(), Self::step_min, Self::minimum) }
         fn scan_max(x: &[Self], start: Option<Self>, out: &mut Vec<Self>) {
-            crate::reduce::records(x, start, out, |v| Self::maximum(v, Self::neg_infinity()), |t, v| Self::maximum(v, t), crate::reduce::below)
+            crate::reduce::records(x, start, out, |v| Self::step_max(Self::neg_infinity(), v), Self::step_max, crate::reduce::below)
         }
         fn scan_min(x: &[Self], start: Option<Self>, out: &mut Vec<Self>) {
-            crate::reduce::records(x, start, out, |v| Self::minimum(v, Self::infinity()), |t, v| Self::minimum(v, t), crate::reduce::above)
+            crate::reduce::records(x, start, out, |v| Self::step_min(Self::infinity(), v), Self::step_min, crate::reduce::above)
         }
         fn scan_sum(x: &[Self], start: Option<Self>, out: &mut Vec<Self>) { crate::reduce::grouped(x, start, out, |v| v, |a, b| a + b, |t| t, false) }
     }
@@ -284,7 +290,8 @@ pub(crate) fn pow2_times<R: Native, const FUSED: bool>(y: R, n: R) -> R {
 /// (m, e) with x = m × 2^e, m from 0.75 to 1.5 and e whole, for a positive x, subnormals included. A subnormal x scales up by 2^64 first, so that its bits split as a normal float's do.
 #[inline]
 pub(crate) fn split_positive<R: Native>(x: R) -> (R, R) {
-    let subnormal = x < R::min_positive_value();
-    let (m, e) = (if subnormal { x * R::narrow(18446744073709551616.0) } else { x }).split();
-    (m, if subnormal { e - R::narrow(64.0) } else { e })
+    // The scale is chosen before the one product. Choosing between x and its scaled value made LLVM split both and choose between their parts, a second split for every item.
+    let k = if x < R::min_positive_value() { R::narrow(64.0) } else { R::zero() };
+    let (m, e) = (x * R::pow2(R::SHIFT + k)).split();
+    (m, e - k)
 }

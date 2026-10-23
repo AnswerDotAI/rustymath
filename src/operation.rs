@@ -129,7 +129,7 @@ impl<P> Kernels<ProductKernel<P>> {
 }
 
 impl<K> Kernels<ScatterKernel<K>> {
-    /// Combines each item of `values`, or its only item, into the item of `out` at each of `writes` by `k`, in turn. It gives whether every result succeeded. A failed result is written as `k`'s slice form writes it: wrapped to its type, or NaN. `values` reads at `out`'s dtype. `None` where `k` has no kernel at `out`'s dtype.
+    /// Combines each item of `values`, or its only item, into the item of `out` at each of `writes` by `k`, in turn: a function object combines the item with the value, and a reduction steps the item by the value as it folds. It gives whether every result succeeded. A failed result is written as `k`'s slice form writes it: wrapped to its type, or NaN. `values` reads at `out`'s dtype. `None` where `k` has no kernel at `out`'s dtype.
     pub fn scatter(&self, k: &K, out: &mut Buffer, writes: crate::gather::Writes<'_>, values: View<'_>) -> Option<bool> {
         let kernel = self.at(out.dtype())?;
         Some(kernel(k, out, writes, cast(values, out.dtype(), &mut None)))
@@ -225,39 +225,30 @@ fn sliding_at<R: Reduction<T>, T: Element>(_: &R, x: View<'_>, dims: [usize; 3],
 }
 
 fn right_fold_at<K: Binary<T, Out: Element + Source<T>>, T: Element>(k: &K, x: View<'_>, dims: [usize; 3], tail: Option<View<'_>>) -> (Buffer, bool) {
-    let ok = std::cell::Cell::new(true);
     let mut tc = None;
     let tail = tail.map(|t| cast(t, T::DTYPE, &mut tc));
-    let out = crate::reduce::right_fold(items::<T>(x), dims, tail.map(items::<T>), |a, b| Some(checked_step(k, a, b, &ok)), Source::read)
-        .expect("every step writes its value");
-    (K::Out::buffer(out), ok.get())
-}
-
-fn checked_step<K: Binary<T>, T: Copy>(k: &K, a: T, b: T, ok: &std::cell::Cell<bool>) -> K::Out {
-    k.checked(a, b).unwrap_or_else(|| {
-        ok.set(false);
-        // `checked` omits a failed value. Its slice form retains it, including NaN, without discarding other lanes.
-        let mut one = Vec::with_capacity(1);
-        k.many(Arg::One(a), Arg::One(b), 1, &mut one);
-        one.pop().expect("one result was written")
-    })
+    let (out, ok) = crate::reduce::right_fold(k, items::<T>(x), dims, tail.map(items::<T>));
+    (K::Out::buffer(out), ok)
 }
 
 fn scatter_at<K: Binary<T, Out = T>, T: Element>(k: &K, out: &mut Buffer, writes: crate::gather::Writes<'_>, values: View<'_>) -> bool {
     let ok = std::cell::Cell::new(true);
     let (out, values) = (T::of_mut(out).expect("the output has its kernel's dtype"), items::<T>(values));
-    let step = |a, y| checked_step(k, a, y, &ok);
-    writes.combine(out, Arg::of(values), step);
+    writes.combine(out, Arg::of(values), |a, y| { let (v, fine) = k.judged(a, y); ok.set(ok.get() & fine); v });
     ok.get()
 }
 
+/// [`scatter_at`] for a reduction, through [`Writes::fold`](crate::gather::Writes::fold).
+fn fold_writes_at<R: Reduction<T, Total = T>, T: Element>(_: &R, out: &mut Buffer, writes: crate::gather::Writes<'_>, values: View<'_>) -> bool {
+    writes.fold::<R, T>(T::of_mut(out).expect("the output has its kernel's dtype"), Arg::of(items::<T>(values)))
+}
+
 fn left_scan_at<K: Binary<T, Out: Element + Source<T>>, T: Element>(k: &K, x: View<'_>, dims: [usize; 3], seed: Option<View<'_>>) -> (Buffer, bool) {
-    let ok = std::cell::Cell::new(true);
     let mut sc = None;
     let seed = seed.map(|s| cast(s, T::DTYPE, &mut sc));
     let mut out = Vec::with_capacity(x.len());
-    crate::reduce::left_scan(items::<T>(x), dims, seed.map(|s| items::<T>(s)[0]), |a, b| Some(Source::read(checked_step(k, a, b, &ok))), &mut out);
-    (T::buffer(out), ok.get())
+    let ok = crate::reduce::left_scan(k, items::<T>(x), dims, seed.map(|s| items::<T>(s)[0]), &mut out);
+    (T::buffer(out), ok)
 }
 
 fn product_at<P: Inner<T, Out: Element + Default> + Sync, T: Element>(p: &P, [x, y]: [View<'_>; 2], frames: &Frames, size @ [n, k, m]: [usize; 3]) -> Result<(Buffer, bool), Error> {
@@ -292,6 +283,8 @@ pub mod probe {
     pub enum Sliding {}
     pub enum Product {}
     pub enum Scatter {}
+    /// A reduction's [`ScatterKernel`], which folds each place's item with the values written to it, as the reduction folds.
+    pub enum Combine {}
     /// The test that [`characters!`](crate::characters!) makes.
     pub enum Characters {}
 
@@ -345,6 +338,10 @@ pub mod probe {
     impl<K: crate::Binary<T, Out = T>, T: Element> Found<ScatterKernel<K>> for Probe<K, T, Scatter> {
         #[inline(always)]
         fn kernel(&self) -> Option<(ScatterKernel<K>, bool)> { Some((scatter_at::<K, T>, K::WRAPS)) }
+    }
+    impl<R: Reduction<T, Total = T>, T: Element> Found<ScatterKernel<R>> for Probe<R, T, Combine> {
+        #[inline(always)]
+        fn kernel(&self) -> Option<(ScatterKernel<R>, bool)> { Some((fold_writes_at::<R, T>, true)) }
     }
     impl<K: crate::characters::Characters + crate::Binary<i32, Out: Element> + crate::Binary<i64, Out: Element> + Sync> Found<crate::characters::Kernel<K>> for Probe<K, (), Characters> {
         #[inline(always)]

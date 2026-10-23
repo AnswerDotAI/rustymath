@@ -8,6 +8,7 @@ on:
 permissions:
   contents: read
 
+# Every test step after the first runs even when an earlier step fails, to report every test's result in one run.
 jobs:
   test:
     runs-on: ubicloud-standard-4
@@ -20,12 +21,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: native
-      # With `RUSTYMATH_COSTS`, the Rust and Python speed tests log every cost, which `basedpl.bpltests.logged_costs` reads.
-      - run: RUSTYMATH_COSTS=1 cargo test
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - run: pip install -e '.[dev]'
       - run: cargo develop
+      # With `RUSTYMATH_COSTS`, the Rust and Python speed tests log every cost, which `basedpl.bpltests.logged_costs` reads.
+      - run: RUSTYMATH_COSTS=1 cargo test
       - run: RUSTYMATH_COSTS=1 pytest -q
+        if: ${{ !cancelled() }}
       - run: nbdev-test
+        if: ${{ !cancelled() }}
