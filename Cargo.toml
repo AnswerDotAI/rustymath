@@ -3,7 +3,7 @@ members = ["buffer", "py"]
 default-members = [".", "buffer", "py"]
 
 [workspace.package]
-version = "0.1.45"
+version = "0.1.46"
 edition = "2024"
 
 [workspace.dependencies]
