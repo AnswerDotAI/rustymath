@@ -59,7 +59,7 @@ pub fn cummax<T>(x: &[T], start: Option<T>, out: &mut Vec<T>) where Max: Reducti
 #[inline]
 pub fn cummin<T>(x: &[T], start: Option<T>, out: &mut Vec<T>) where Min: Reduction<T, Total = T> { Min::scan(x, start, out); }
 
-/// The greater of x and y, as [`max`] gives the greatest item. NaN beside any number gives NaN, as NumPy's `maximum` does. Where they're equal, it gives y.
+/// The greater of x and y, as [`max`] gives the greatest item. Where they're equal, or either is NaN, it gives y. NumPy calls it `maximum`, though NumPy's gives NaN beside NaN.
 #[inline(always)]
 pub fn maximum<F: Float>(x: F, y: F) -> F { F::from_working(Core::maximum(x.working(), y.working())) }
 
@@ -67,17 +67,17 @@ pub fn maximum<F: Float>(x: F, y: F) -> F { F::from_working(Core::maximum(x.work
 #[inline(always)]
 pub fn minimum<F: Float>(x: F, y: F) -> F { F::from_working(Core::minimum(x.working(), y.working())) }
 
-/// [`maximum`] as a function object, which also takes integers and Booleans. The maximum of two Booleans is their `or`. Its float slice form is `Folds::pairs`, which runs a target's one-instruction maximum where it has one.
+/// [`maximum`] as a function object, which also takes integers and Booleans. The maximum of two Booleans is their `or`.
 #[derive(Clone, Copy, Debug)]
 pub struct Maximum;
-forms!(#[inline] Maximum at real: |_, [x, y]| crate::slice::Total(maximum(x, y)), many |_, [x, y], n, out| { Folds::pairs::<true>(x, y, n, out); true });
+forms!(#[inline] Maximum at real: |_, [x, y]| crate::slice::Total(maximum(x, y)));
 forms!(#[inline] Maximum at u8, i16, i32, i64: |_, [x, y]| x.max(y));
 forms!(#[inline] Maximum at bool: |_, [x, y]| x | y);
 
 /// [`minimum`] as a function object, which also takes integers and Booleans. The minimum of two Booleans is their `and`.
 #[derive(Clone, Copy, Debug)]
 pub struct Minimum;
-forms!(#[inline] Minimum at real: |_, [x, y]| crate::slice::Total(minimum(x, y)), many |_, [x, y], n, out| { Folds::pairs::<false>(x, y, n, out); true });
+forms!(#[inline] Minimum at real: |_, [x, y]| crate::slice::Total(minimum(x, y)));
 forms!(#[inline] Minimum at u8, i16, i32, i64: |_, [x, y]| x.min(y));
 forms!(#[inline] Minimum at bool: |_, [x, y]| x & y);
 
@@ -104,16 +104,9 @@ pub trait Reduction<T> {
     fn slice(x: &[T]) -> (Self::Total, bool);
     /// Appends the running folds of `x` to `out`, the first combining `start` where it is given, and gives whether every one fits.
     fn scan(x: &[T], start: Option<Self::Total>, out: &mut Vec<Self::Total>) -> bool;
-    /// Folds each row of `data`, a matrix with `columns` items in each row, into the matching item of `out`, and gives whether every fold fits. The default is `fold_rows`, which folds each row of 16 items or more by `slice`. Float sums and products, integer maximums and minimums, and bitwise folds fold rows of 16 to 63 items by `checked` instead, eight rows side by side (`rows_side_by_side`). Each of their steps is one instruction, so keeping several rows' steps in flight costs less than a call of `slice` for each row. A float maximum or minimum folds rows of 2 to 4 items by `Folds::rows_max` or `rows_min` where the target folds such rows several at a time, and others by `fold_rows`. Other reductions keep `fold_rows`: an integer sum's step checks for overflow, where its `slice` vectorizes within the row.
+    /// Folds each row of `data`, a matrix with `columns` items in each row, into the matching item of `out`, and gives whether every fold fits. The default is `fold_rows`, which folds each row of 16 items or more by `slice`. Float sums and products, integer maximums and minimums, and bitwise folds fold rows of 16 to 63 items by `checked` instead, eight rows side by side (`rows_side_by_side`). Each of their steps is one instruction, so keeping several rows' steps in flight costs less than a call of `slice` for each row. Other reductions keep `fold_rows`: a float maximum's step takes several instructions for its NaN rule, and an integer sum's checks for overflow, where their `slice` vectorizes within the row.
     #[inline]
     fn rows(data: &[T], columns: usize, out: &mut [Self::Total]) -> bool where Self: Sized, T: Copy { fold_rows::<T, Self>(data, columns, out) }
-    /// Steps each of `totals` by the matching item of `x`, as far as the shorter goes, and gives whether every fold fits: the running folds of a column fold or of a window. The default steps by `checked`. A float maximum and minimum step by `Folds::steps_max` and `steps_min`, which run a target's one-instruction form where it has one.
-    #[inline(always)]
-    fn steps(totals: &mut [Self::Total], x: &[T]) -> bool where T: Copy {
-        let (n, mut fits) = (totals.len().min(x.len()), true);
-        for k in 0..n { let (t, f) = Self::checked(totals[k], x[k]); (totals[k], fits) = (t, fits & f) }
-        fits
-    }
 }
 
 /// [`sum`] as a [`Reduction`].
@@ -122,10 +115,10 @@ pub struct Sum;
 /// [`prod`] as a [`Reduction`].
 #[derive(Clone, Copy, Debug)]
 pub struct Product;
-/// [`max`] as a [`Reduction`]. Its step on floats is [`maximum`] of the item and the total, and the vectorized folds on AArch64 and in wasm use instructions that give the same, so a NaN item makes a fold NaN on every target and at every length.
+/// [`max`] as a [`Reduction`]. Its step on floats is [`maximum`] of the item and the total, which a NaN item leaves unchanged. Every fold and scan starts at `-∞`, and AArch64's and wasm's vector folds keep the running result beside a NaN item, as that step does. So a NaN item changes no running result on any target, and a fold of NaN items alone gives `-∞`.
 #[derive(Clone, Copy, Debug)]
 pub struct Max;
-/// [`min`] as a [`Reduction`], as [`Max`] is [`max`].
+/// [`min`] as a [`Reduction`], as [`Max`] is [`max`], starting at `∞`.
 #[derive(Clone, Copy, Debug)]
 pub struct Min;
 /// The fold of integers by bitwise `&`, and of Booleans by `and`.
@@ -218,7 +211,7 @@ fn first_where<T: Copy>(x: &[T], test: impl Fn(T) -> bool) -> usize {
 
 /// Each float reduction at `f32` and `f64`: its unit, its identity where that isn't its unit, its step, its fold of a slice, and its scan.
 macro_rules! floats {
-    ($($r:ident: $unit:ident, $(identity: $identity:expr,)? $(rows: $rows:expr,)? $(steps: $steps:expr,)? |$a:ident, $b:ident| $step:expr, $fold:expr, $scan:expr;)+) => {$(
+    ($($r:ident: $unit:ident, $(identity: $identity:expr,)? $(rows: $rows:ident,)? |$a:ident, $b:ident| $step:expr, $fold:expr, $scan:expr;)+) => {$(
         impl<F: Native> Reduction<F> for $r {
             type Total = F;
             #[inline(always)]
@@ -227,15 +220,10 @@ macro_rules! floats {
             fn step($a: F, $b: F) -> F { $step }
             #[inline(always)]
             fn merge(a: F, b: F) -> (F, bool) { (Self::step(a, b), true) }
-            /// The item itself: every float reduction's identity leaves an item as it is, NaN and `-0` included.
-            #[inline(always)]
-            fn one(x: F) -> (F, bool) { (x, true) }
             $(#[inline(always)]
             fn identity() -> F { $identity })?
             $(#[inline]
-            fn rows(data: &[F], columns: usize, out: &mut [F]) -> bool { ($rows)(data, columns, out) })?
-            $(#[inline(always)]
-            fn steps(totals: &mut [F], x: &[F]) -> bool { ($steps)(totals, x); true })?
+            fn rows(data: &[F], columns: usize, out: &mut [F]) -> bool { $rows::<F, Self>(data, columns, out) })?
             #[inline]
             fn slice(x: &[F]) -> (F, bool) { (($fold)(x), true) }
             #[inline]
@@ -247,10 +235,10 @@ macro_rules! floats {
     )+};
 }
 floats! {
-    Sum: zero, identity: -F::zero(), rows: rows_side_by_side::<F, Self>, |a, b| a.algebraic_add(b), |x: &[F]| if x.is_empty() { <Self as Reduction<F>>::unit() } else { folded(x, <Self as Reduction<F>>::identity(), |a: F, b: F| a + b, |a: F, b: F| a + b) }, F::scan_sum;
-    Product: one, rows: rows_side_by_side::<F, Self>, |a, b| a.algebraic_mul(b), |x| folded(x, F::one(), |a: F, b: F| a * b, |a: F, b: F| a * b), |x, start, out| grouped(x, start, out, |v| v, |a: F, b: F| a * b, |t| t, false);
-    Max: neg_infinity, rows: |d, c, o: &mut [F]| F::rows::<true>(d, c, o) || fold_rows::<F, Self>(d, c, o), steps: F::steps::<true>, |acc, x| F::step::<true>(acc, x), F::fold::<true>, F::scan::<true>;
-    Min: infinity, rows: |d, c, o: &mut [F]| F::rows::<false>(d, c, o) || fold_rows::<F, Self>(d, c, o), steps: F::steps::<false>, |acc, x| F::step::<false>(acc, x), F::fold::<false>, F::scan::<false>;
+    Sum: zero, identity: -F::zero(), rows: rows_side_by_side, |a, b| a.algebraic_add(b), |x: &[F]| if x.is_empty() { <Self as Reduction<F>>::unit() } else { folded(x, <Self as Reduction<F>>::identity(), |a: F, b: F| a + b, |a: F, b: F| a + b) }, F::scan_sum;
+    Product: one, rows: rows_side_by_side, |a, b| a.algebraic_mul(b), |x| folded(x, F::one(), |a: F, b: F| a * b, |a: F, b: F| a * b), |x, start, out| grouped(x, start, out, |v| v, |a: F, b: F| a * b, |t| t, false);
+    Max: neg_infinity, |acc, x| x.maximum(acc), F::fold_max, |x: &[F], start, out: &mut Vec<F>| seeded(x, start, F::neg_infinity(), out, F::scan_max);
+    Min: infinity, |acc, x| x.minimum(acc), F::fold_min, |x: &[F], start, out: &mut Vec<F>| seeded(x, start, F::infinity(), out, F::scan_min);
 }
 
 /// Writes the reduction of `f16`s by each `$r`, which runs the same reduction of `f32`s and totals in `$total`. `$narrow` converts an `f32` total to a `$total`. `$wide` converts a `$total` back to `f32`. `$add` combines `f32` totals in `slice`: a strict operation for a sum or product, as `running_by` needs.
@@ -273,7 +261,7 @@ macro_rules! halves {
             }
             #[inline]
             fn scan(x: &[f16], start: Option<$total>, out: &mut Vec<$total>) -> bool {
-                grouped(x, start.map($wide), out, f16::to_f32, <$r as Reduction<f32>>::step, $narrow, false);
+                grouped(x, start.map($wide), out, |v: f16| <$r as Reduction<f32>>::one(v.to_f32()).0, <$r as Reduction<f32>>::step, $narrow, false);
                 true
             }
         }
@@ -327,7 +315,7 @@ impl<F: Native> Reduction<Complex<F>> for Product {
     }
 }
 
-/// AArch64's `fmax` and `fmin`, and wasm's `max` and `min`, give NaN where either argument is NaN. On AArch64 each is one instruction. In a browser on an Arm host, such as a Mac, wasm's `max` and `min` run faster than `pmax` and `pmin`, which give their first argument where either is NaN. On x86-64 hosts, wasm's `max` and `min` take about eight instructions each. A fold runs the vector forms on `PARTS` running vectors. Each step of a scan depends on the step before. In wasm, the step takes lane 0 of the vector instruction on two splats. On AArch64 that code keeps a `dup` before each `fmax` at `f32`, which has no one-lane vector type, so the step there is inline assembly. Each type's entry names its scan. AArch64's `f64` scan is `grouped`, at the speed of memory. Skipping blocks gained it nothing. Each block with a new maximum paid for a test it didn't use. The others skip blocks through `records`. AArch64's `f32` tests a block by comparing each item, as `below` does. Wasm tests it by its fold, then one comparison. In wasm, comparing each item took five instructions for two items. Each entry also names its running sum. `f32`'s is `sum_scan`, which scans four-lane vectors and makes `+\` about 1.3 times faster. `f64`'s is `grouped`, because a two-lane vector scan needs more operations per item than `grouped`'s two additions.
+/// AArch64's `fmaxnm` and `fminnm` give the argument that isn't NaN, and wasm's `pmax` and `pmin` give their first argument where either is NaN. A fold starts at `-∞` or `∞` and passes its running result first, so each gives what `Core::maximum` and `Core::minimum` give, in one instruction. A scan steps the same way. `fmaxnm` drops a NaN item wherever it stands, but `pmax` keeps a NaN running result, so a wasm scan reads each item through a step from the start, which turns a NaN item into it, as `records` describes. `seeded` gives every scan its start, and fills a scan with a NaN seed. Wasm's `max` and `min` give NaN beside NaN, and on x86-64 hosts take about eight instructions each. A fold runs the vector forms on `PARTS` running vectors. Each step of a scan depends on the step before. In wasm, the step takes lane 0 of the vector instruction on two splats. On AArch64 that code keeps a `dup` before each `fmaxnm` at `f32`, which has no one-lane vector type, so the step there is inline assembly. Each type's entry names its scan. AArch64's `f64` scan is `grouped`, at the speed of memory. Skipping blocks gained it nothing. Each block with a new maximum paid for a test it didn't use. The others skip blocks through `records`. AArch64's `f32` tests a block by comparing each item, as `below` does. Wasm tests it by its fold, then one comparison. In wasm, comparing each item took five instructions for two items. Each entry also names its running sum. `f32`'s is `sum_scan`, which scans four-lane vectors and makes `+\` about 1.3 times faster. `f64`'s is `grouped`, because a two-lane vector scan needs more operations per item than `grouped`'s two additions.
 #[cfg(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128")))]
 mod lanes {
     use super::*;
@@ -337,141 +325,67 @@ mod lanes {
     use core::arch::{aarch64::*, asm};
     /// How many running vectors a fold keeps.
     const PARTS: usize = 8;
-    /// A target's vectors of `Self`, `N` items each, and the instructions that the `Folds` kernels below run, so a maximum and a minimum share each kernel. `vpick` is the maximum or minimum of two vectors, as `MAX` picks, and `pick1` of two items in one instruction, for steps that run in turn: LLVM doesn't vectorize a loop of it. `columns` folds by `op` the columns of the `N` rows of `K` items at `p`, where the target's loads split rows into columns, as AArch64's `ld2`, `ld3` and `ld4` do.
-    pub(crate) trait Vectors: Core + num_traits::Float {
-        type V: Copy;
-        const N: usize;
-        fn splat(x: Self) -> Self::V;
-        unsafe fn load(p: *const Self) -> Self::V;
-        unsafe fn store(p: *mut Self, v: Self::V);
-        fn vpick<const MAX: bool>(a: Self::V, b: Self::V) -> Self::V;
-        fn pick1<const MAX: bool>(a: Self, b: Self) -> Self;
-        #[cfg(target_arch = "aarch64")]
-        unsafe fn columns<const K: usize>(p: *const Self, op: impl Fn(Self::V, Self::V) -> Self::V) -> Self::V;
-        /// The running sums of `x` after `start`, for `Folds::scan_sum`.
-        fn sums(x: &[Self], start: Option<Self>, out: &mut Vec<Self>) { grouped(x, start, out, |v| v, |a, b| a + b, |t| t, false) }
-        /// The scan of `x` after `start`: `records`, which skips each block whose fold holds no new result. An entry can name `grouped`'s blocks instead, or `records` testing each item of a block.
-        fn scans<const MAX: bool>(x: &[Self], start: Option<Self>, out: &mut Vec<Self>) { records(x, start, out, Self::step::<MAX>, |b: &[Self], t| if MAX { Self::fold::<MAX>(b) < t } else { Self::fold::<MAX>(b) > t }) }
-    }
-    /// Each entry gives a type's vector type, lane count, `splat`, `load`, `store`, `max` and `min` instructions, its one-item step (`asm` with its register class, or `core` where `Core::maximum` is already one instruction), its scan, its running sum, and the loads that split rows where it has them. `$u` is `[unsafe]` where the target's vector instructions need it, or `[]`.
-    macro_rules! vectors {
-        ($u:tt; $($t:ty: $v:ty, $n:literal, $splat:ident, $load:ident, $store:ident, $max:ident, $min:ident, $step:ident($($reg:literal)?), $scan:ident, $sum:ident $(, split($ld2:ident, $ld3:ident, $ld4:ident))?;)+) => {$(
-            impl Vectors for $t {
-                type V = $v;
-                const N: usize = $n;
-                vectors!(@scans $scan);
-                #[inline(always)] fn splat(x: $t) -> $v { vectors!(@call $u $splat(x)) }
-                #[inline(always)] unsafe fn load(p: *const $t) -> $v { unsafe { $load(p.cast()) } }
-                #[inline(always)] unsafe fn store(p: *mut $t, v: $v) { unsafe { $store(p.cast(), v) } }
-                #[inline(always)] fn vpick<const MAX: bool>(a: $v, b: $v) -> $v { if MAX { vectors!(@call $u $max(a, b)) } else { vectors!(@call $u $min(a, b)) } }
-                #[inline(always)] fn pick1<const MAX: bool>(a: $t, b: $t) -> $t { if MAX { vectors!(@$step $($reg)? "fmax", a, b, maximum) } else { vectors!(@$step $($reg)? "fmin", a, b, minimum) } }
-                $(#[inline(always)] unsafe fn columns<const K: usize>(p: *const $t, op: impl Fn($v, $v) -> $v) -> $v { vectors!(@split K, p, op, $ld2, $ld3, $ld4) })?
-                vectors!(@sums $sum);
+    macro_rules! lanes {
+        ($($t:ty: $lanes:literal, $splat:ident, $load:ident, $max:ident, $min:ident, $step:ident($arg:tt), $scan:ident, $sum:ident;)+) => {$(
+            impl Folds for $t {
+                fn fold_max(x: &[$t]) -> $t { lanes!(@fold x, $t, $lanes, NEG_INFINITY, $splat, $load, $max, |a, b| lanes!(@$step $arg, "fmaxnm", $splat, $max, a, b)) }
+                fn fold_min(x: &[$t]) -> $t { lanes!(@fold x, $t, $lanes, INFINITY, $splat, $load, $min, |a, b| lanes!(@$step $arg, "fminnm", $splat, $min, a, b)) }
+                fn scan_max(x: &[$t], start: Option<$t>, out: &mut Vec<$t>) {
+                    #[inline(always)]
+                    fn step(a: $t, b: $t) -> $t { lanes!(@$step $arg, "fmaxnm", $splat, $max, a, b) }
+                    lanes!(@scan $scan, x, start, out, lanes!(@read $step, $t, NEG_INFINITY, step), step, below, |b: &[$t], t: $t| Self::fold_max(b) < t)
+                }
+                fn scan_min(x: &[$t], start: Option<$t>, out: &mut Vec<$t>) {
+                    #[inline(always)]
+                    fn step(a: $t, b: $t) -> $t { lanes!(@$step $arg, "fminnm", $splat, $min, a, b) }
+                    lanes!(@scan $scan, x, start, out, lanes!(@read $step, $t, INFINITY, step), step, above, |b: &[$t], t: $t| Self::fold_min(b) > t)
+                }
+                fn scan_sum(x: &[$t], start: Option<$t>, out: &mut Vec<$t>) { lanes!(@sum $sum, x, start, out) }
             }
         )+};
-        (@call [$($u:ident)?] $e:expr) => { $($u)? { $e } };
-        (@asm $reg:literal $ins:literal, $x:ident, $y:ident, $core:ident) => {{
+        (@fold $x:ident, $t:ty, $lanes:literal, $unit:ident, $splat:ident, $load:ident, $op:ident, $step:expr) => {{
+            let (chunks, rest) = $x.as_chunks::<{ PARTS * $lanes }>();
+            // SAFETY: this module compiles only for targets with these instructions. Each load reads `$lanes` items of one chunk, and a vector holds `$lanes` items of `$t`.
+            let lanes: [$t; $lanes] = unsafe {
+                let mut parts = [$splat(<$t>::$unit); PARTS];
+                for c in chunks { for k in 0..PARTS { parts[k] = $op(parts[k], $load(c.as_ptr().add(k * $lanes).cast())) } }
+                core::mem::transmute(parts.into_iter().reduce(|a, b| $op(a, b)).expect("a fold keeps `PARTS` vectors"))
+            };
+            lanes.into_iter().chain(rest.iter().copied()).fold(<$t>::$unit, $step)
+        }};
+        (@asm $reg:literal, $ins:literal, $splat:ident, $op:ident, $x:ident, $y:ident) => {{
             let r;
             // SAFETY: the instruction reads two registers and writes a third, with no memory access.
             unsafe { asm!(concat!($ins, " {0:", $reg, "}, {1:", $reg, "}, {2:", $reg, "}"), lateout(vreg) r, in(vreg) $x, in(vreg) $y, options(pure, nomem, nostack)) }
             r
         }};
-        (@core $ins:literal, $x:ident, $y:ident, $core:ident) => { Core::$core($x, $y) };
-        // SAFETY: `columns`' caller gives `p` at `N` rows of `K` items.
-        (@split $k:ident, $p:ident, $op:ident, $ld2:ident, $ld3:ident, $ld4:ident) => {
-            match $k {
-                2 => { let v = unsafe { $ld2($p) }; $op(v.0, v.1) }
-                3 => { let v = unsafe { $ld3($p) }; $op($op(v.0, v.1), v.2) }
-                _ => { let v = unsafe { $ld4($p) }; $op($op(v.0, v.1), $op(v.2, v.3)) }
-            }
-        };
-        (@scans fold) => {};
-        (@scans grouped) => { fn scans<const MAX: bool>(x: &[Self], start: Option<Self>, out: &mut Vec<Self>) { grouped(x, start, out, |v| v, Self::step::<MAX>, |t| t, false) } };
-        (@scans compare) => { fn scans<const MAX: bool>(x: &[Self], start: Option<Self>, out: &mut Vec<Self>) { records(x, start, out, Self::step::<MAX>, |b, t| if MAX { below(b, t) } else { above(b, t) }) } };
-        (@sums grouped) => {};
-        (@sums vector) => { fn sums(x: &[f32], start: Option<f32>, out: &mut Vec<f32>) { sum_scan(x, start, out) } };
-    }
-    /// Stores `v(j)` for each whole vector of the first `n` items at `o`, with `j` its first item. Each iteration computes four vectors before it stores any: a load can't move past a store that may write its address, and loads in order pair up.
-    #[inline(always)]
-    unsafe fn run<T: Vectors>(o: *mut T, n: usize, v: impl Fn(usize) -> T::V) {
-        let (vectors, mut c) = (n / T::N, 0);
-        // SAFETY: the caller's `o` holds `n` slots, and each store writes `N` of them.
-        while c + 4 <= vectors {
-            let i = c * T::N;
-            let w = [v(i), v(i + T::N), v(i + 2 * T::N), v(i + 3 * T::N)];
-            for (k, w) in w.into_iter().enumerate() { unsafe { T::store(o.add(i + k * T::N), w) } }
-            c += 4
-        }
-        while c < vectors { unsafe { T::store(o.add(c * T::N), v(c * T::N)) }; c += 1 }
-    }
-    impl<T: Vectors> Folds for T {
-        fn fold<const MAX: bool>(x: &[T]) -> T {
-            let unit = if MAX { T::neg_infinity() } else { T::infinity() };
-            let chunks = x.chunks_exact(PARTS * T::N);
-            let (rest, mut lanes) = (chunks.remainder(), [unit; 4]);
-            // SAFETY: each load reads `N` items of one chunk, and `lanes` holds a vector's items, at most 4.
-            unsafe {
-                let mut parts = [T::splat(unit); PARTS];
-                for c in chunks { for k in 0..PARTS { parts[k] = T::vpick::<MAX>(parts[k], T::load(c.as_ptr().add(k * T::N))) } }
-                T::store(lanes.as_mut_ptr(), parts.into_iter().reduce(T::vpick::<MAX>).expect("a fold keeps `PARTS` vectors"));
-            }
-            lanes[..T::N].iter().chain(rest).fold(unit, |s, &v| Self::step::<MAX>(s, v))
-        }
-        fn scan<const MAX: bool>(x: &[T], start: Option<T>, out: &mut Vec<T>) { T::scans::<MAX>(x, start, out) }
-        #[inline(always)]
-        fn step<const MAX: bool>(acc: T, x: T) -> T { T::pick1::<MAX>(x, acc) }
-        fn scan_sum(x: &[T], start: Option<T>, out: &mut Vec<T>) { T::sums(x, start, out) }
-        fn pairs<const MAX: bool>(x: Arg<'_, T>, y: Arg<'_, T>, n: usize, out: &mut [std::mem::MaybeUninit<T>]) {
-            let o = out[..n].as_mut_ptr().cast::<T>();
-            // SAFETY: `run` stores `N` of `out`'s first `n` slots at a time, and each load reads `N` items of an argument that holds at least `n`.
-            unsafe {
-                match (x, y) {
-                    (Arg::One(a), Arg::One(b)) => { let v = T::vpick::<MAX>(T::splat(a), T::splat(b)); run::<T>(o, n, |_| v) }
-                    (Arg::One(a), Arg::Many(b)) => { let (a, b) = (T::splat(a), b[..n].as_ptr()); run::<T>(o, n, |j| T::vpick::<MAX>(a, T::load(b.add(j)))) }
-                    (Arg::Many(a), Arg::One(b)) => { let (a, b) = (a[..n].as_ptr(), T::splat(b)); run::<T>(o, n, |j| T::vpick::<MAX>(T::load(a.add(j)), b)) }
-                    (Arg::Many(a), Arg::Many(b)) => { let (a, b) = (a[..n].as_ptr(), b[..n].as_ptr()); run::<T>(o, n, |j| T::vpick::<MAX>(T::load(a.add(j)), T::load(b.add(j)))) }
-                }
-            }
-            for i in n / T::N * T::N..n { out[i].write(Self::pick::<MAX>(x.nth(i), y.nth(i))); }
-        }
-        #[inline(always)]
-        fn steps<const MAX: bool>(acc: &mut [T], x: &[T]) {
-            let n = acc.len().min(x.len());
-            let (a, p) = (acc.as_mut_ptr(), x.as_ptr());
-            // SAFETY: `run` loads and stores `N` of the first `n` items of `acc` and `x` at a time, and both hold at least `n`.
-            unsafe { run::<T>(a, n, |j| T::vpick::<MAX>(T::load(p.add(j)), T::load(a.add(j).cast_const()))) }
-            for i in n / T::N * T::N..n { acc[i] = Self::pick::<MAX>(x[i], acc[i]) }
-        }
-        #[cfg(target_arch = "aarch64")]
-        fn rows<const MAX: bool>(data: &[T], columns: usize, out: &mut [T]) -> bool {
-            /// Folds rows of `K` items, `N` rows at a time: each split spreads that many rows across `K` vectors, one for each column, so one instruction folds a column of every row.
-            fn rows_of<T: Vectors, const MAX: bool, const K: usize>(data: &[T], out: &mut [T]) {
-                let n = out.len().min(data.len() / K);
-                let (d, o) = (data.as_ptr(), out.as_mut_ptr());
-                // SAFETY: each split reads the `N` rows of `K` items that start at row `j`, within the first `n` rows of `data`, and `run` stores `N` of `out`'s first `n` slots at a time.
-                unsafe { run::<T>(o, n, |j| T::columns::<K>(d.add(j * K), T::vpick::<MAX>)) }
-                for r in n / T::N * T::N..n { let row = &data[r * K..(r + 1) * K]; out[r] = row[1..].iter().fold(row[0], |s, &x| T::pick::<MAX>(x, s)) }
-            }
-            match columns {
-                2 => rows_of::<T, MAX, 2>(data, out),
-                3 => rows_of::<T, MAX, 3>(data, out),
-                4 => rows_of::<T, MAX, 4>(data, out),
-                _ => return false,
-            }
-            true
-        }
+        (@lane $lane:ident, $ins:literal, $splat:ident, $op:ident, $x:ident, $y:ident) => { $lane::<0>($op($splat($x), $splat($y))) };
+        // AArch64's `fmaxnm` drops a NaN item wherever it stands, so its scans read items as they are. Wasm's `pmax` keeps a NaN running result, so its scans read each item through a step from the start.
+        (@read asm, $t:ty, $unit:ident, $f:ident) => { |v: $t| v };
+        (@read lane, $t:ty, $unit:ident, $f:ident) => { |v: $t| $f(<$t>::$unit, v) };
+        (@scan grouped, $x:ident, $start:ident, $out:ident, $from:expr, $step:ident, $compare:expr, $fold:expr) => { grouped($x, $start, $out, $from, $step, |t| t, false) };
+        (@scan compare, $x:ident, $start:ident, $out:ident, $from:expr, $step:ident, $compare:expr, $fold:expr) => { records($x, $start, $out, $from, $step, $compare) };
+        (@scan fold, $x:ident, $start:ident, $out:ident, $from:expr, $step:ident, $compare:expr, $fold:expr) => { records($x, $start, $out, $from, $step, $fold) };
+        (@sum grouped, $x:ident, $start:ident, $out:ident) => { grouped($x, $start, $out, |v| v, |a, b| a + b, |t| t, false) };
+        (@sum vector, $x:ident, $start:ident, $out:ident) => { sum_scan($x, $start, $out) };
     }
     #[cfg(target_arch = "aarch64")]
-    vectors! { [unsafe];
-        f64: float64x2_t, 2, vdupq_n_f64, vld1q_f64, vst1q_f64, vmaxq_f64, vminq_f64, asm("d"), grouped, grouped, split(vld2q_f64, vld3q_f64, vld4q_f64);
-        f32: float32x4_t, 4, vdupq_n_f32, vld1q_f32, vst1q_f32, vmaxq_f32, vminq_f32, asm("s"), compare, vector, split(vld2q_f32, vld3q_f32, vld4q_f32);
+    lanes! {
+        f64: 2, vdupq_n_f64, vld1q_f64, vmaxnmq_f64, vminnmq_f64, asm("d"), grouped, grouped;
+        f32: 4, vdupq_n_f32, vld1q_f32, vmaxnmq_f32, vminnmq_f32, asm("s"), compare, vector;
     }
     /// Four-lane `f32` vectors, for `sum_scan`. `up1` and `up2` move a vector up one lane or two, filling the gap from `fill`. `last` copies lane 3 to every lane.
     #[cfg(target_arch = "aarch64")]
     mod quad {
         use core::arch::aarch64::*;
         pub type V = float32x4_t;
-        // SAFETY: AArch64 always has these instructions.
+        // SAFETY: AArch64 always has these instructions. The loads and stores leave their bounds to the caller.
+        #[inline(always)]
+        pub fn splat(x: f32) -> V { unsafe { vdupq_n_f32(x) } }
+        #[inline(always)]
+        pub unsafe fn load(p: *const f32) -> V { unsafe { vld1q_f32(p) } }
+        #[inline(always)]
+        pub unsafe fn store(p: *mut f32, v: V) { unsafe { vst1q_f32(p, v) } }
         #[inline(always)]
         pub fn add(a: V, b: V) -> V { unsafe { vaddq_f32(a, b) } }
         #[inline(always)]
@@ -488,6 +402,12 @@ mod lanes {
         use core::arch::wasm32::*;
         pub type V = v128;
         #[inline(always)]
+        pub fn splat(x: f32) -> V { f32x4_splat(x) }
+        #[inline(always)]
+        pub unsafe fn load(p: *const f32) -> V { unsafe { v128_load(p.cast()) } }
+        #[inline(always)]
+        pub unsafe fn store(p: *mut f32, v: V) { unsafe { v128_store(p.cast(), v) } }
+        #[inline(always)]
         pub fn add(a: V, b: V) -> V { f32x4_add(a, b) }
         #[inline(always)]
         pub fn up1(fill: V, v: V) -> V { i32x4_shuffle::<3, 4, 5, 6>(fill, v) }
@@ -501,7 +421,6 @@ mod lanes {
     /// The running sums of `x` after `start`, 16 items at a time. Each vector of four scans within itself in two shifted additions. Each vector then adds the total of everything before it: the running total, plus the sums of the vectors before it in its block. Only one addition in each block waits for the block before.
     fn sum_scan(x: &[f32], start: Option<f32>, out: &mut Vec<f32>) {
         use quad::*;
-        let (splat, load, store) = (<f32 as Vectors>::splat, <f32 as Vectors>::load, <f32 as Vectors>::store);
         appended(out, x.len(), |slots| {
             let ((chunks, rest), (outs, tail)) = (x.as_chunks::<16>(), slots.as_chunks_mut::<16>());
             let (fill, mut c) = (splat(-0.0), splat(start.unwrap_or(-0.0)));
@@ -534,9 +453,9 @@ mod lanes {
         })
     }
     #[cfg(target_arch = "wasm32")]
-    vectors! { [];
-        f64: v128, 2, f64x2_splat, v128_load, v128_store, f64x2_max, f64x2_min, core(), fold, grouped;
-        f32: v128, 4, f32x4_splat, v128_load, v128_store, f32x4_max, f32x4_min, core(), fold, vector;
+    lanes! {
+        f64: 2, f64x2_splat, v128_load, f64x2_pmax, f64x2_pmin, lane(f64x2_extract_lane), fold, grouped;
+        f32: 4, f32x4_splat, v128_load, f32x4_pmax, f32x4_pmin, lane(f32x4_extract_lane), fold, vector;
     }
 }
 
@@ -662,7 +581,7 @@ macro_rules! closed {
             fn rows(data: &[$t], columns: usize, out: &mut [$t]) -> bool { rows_side_by_side::<$t, Self>(data, columns, out) }
         }
     };
-    (@records $x:ident, $start:ident, $out:ident, $t:ty, $step:expr) => { records($x, $start, $out, $step, |b: &[$t], t: $t| b.iter().fold(t, |m, &v| ($step)(m, v)) == t) };
+    (@records $x:ident, $start:ident, $out:ident, $t:ty, $step:expr) => { records($x, $start, $out, |v| v, $step, |b: &[$t], t: $t| b.iter().fold(t, |m, &v| ($step)(m, v)) == t) };
     (@grouped $x:ident, $start:ident, $out:ident, $t:ty, $step:expr) => { grouped($x, $start, $out, |v| v, $step, |t| t, true) };
     (signed $($t:ty),+) => {$( closed!(@one Xnor, $t, !0, |a: $t, b: $t| !(a ^ b), grouped); )+};
     ($($t:ty),+) => {$(
@@ -722,9 +641,10 @@ booleans! {
     Xnor: true, |a, b| a == b, [[true, false], [false, true]];
 }
 
-/// The running folds of `x` from `start` by `step`, a maximum or minimum. A block of 256 items that `keeps(block, total)` passes repeats the running result, with no step for each item. Other blocks scan as `grouped` does. On random items, almost every block repeats the running result. After four blocks in a row change the running result, blocks scan with no test until one leaves it unchanged. Their lengths start at 256 items and double up to 16,384. Items that rise steadily then pay for four tests and a few calls of `grouped`. A call for every 256 items added a third to their scan. Random items start such a run about one time in 25. After two blocks, they started one about half the time. The compiler vectorizes each block's test because the block's length isn't fixed. A loop of a fixed length unrolls into one item at a time.
-pub(crate) fn records<T: Copy + PartialEq>(x: &[T], start: Option<T>, out: &mut Vec<T>, step: impl Fn(T, T) -> T + Copy, keeps: impl Fn(&[T], T) -> bool) {
+/// The running folds of `x` from `start` by `step`, a maximum or minimum, reading each item through `from`. A float maximum's `from` is its step from `-∞`, which turns a NaN item into `-∞`: `grouped` starts each group of four at its first item, and a NaN there would leave the group's running results NaN, which the step from the total then drops with the group's later items. A block of 256 items that `keeps(block, total)` passes repeats the running result, with no step for each item. Other blocks scan as `grouped` does. On random items, almost every block repeats the running result. After four blocks in a row change the running result, blocks scan with no test until one leaves it unchanged. Their lengths start at 256 items and double up to 16,384. Items that rise steadily then pay for four tests and a few calls of `grouped`. A call for every 256 items added a third to their scan. Random items start such a run about one time in 25. After two blocks, they started one about half the time. The compiler vectorizes each block's test because the block's length isn't fixed. A loop of a fixed length unrolls into one item at a time.
+pub(crate) fn records<T: Copy + PartialEq>(x: &[T], start: Option<T>, out: &mut Vec<T>, from: impl Fn(T) -> T + Copy, step: impl Fn(T, T) -> T + Copy, keeps: impl Fn(&[T], T) -> bool) {
     let Some(&first) = x.first() else { return };
+    let first = from(first);
     let (mut total, mut at, mut changes) = (start.map_or(first, |s| step(s, first)), 0, 0);
     while at < x.len() {
         let test = changes < 4;
@@ -734,10 +654,19 @@ pub(crate) fn records<T: Copy + PartialEq>(x: &[T], start: Option<T>, out: &mut 
             out.resize(out.len() + block.len(), total);
             changes = 0;
         } else {
-            grouped(block, Some(total), out, |v| v, step, |t| t, false);
+            grouped(block, Some(total), out, from, step, |t| t, false);
             let last = out[out.len() - 1];
             (total, changes) = (last, if last == total { 0 } else { changes + 1 });
         }
+    }
+}
+
+/// A float maximum's or minimum's scan by `scan`, from `start` or else from `unit`. A NaN seed is the running result throughout, as `Core::maximum` keeps a NaN `y`: AArch64's scans step by `fmaxnm`, which would drop it.
+#[inline(always)]
+fn seeded<F: Native>(x: &[F], start: Option<F>, unit: F, out: &mut Vec<F>, scan: impl FnOnce(&[F], Option<F>, &mut Vec<F>)) {
+    match start {
+        Some(s) if s.is_nan() => out.resize(out.len() + x.len(), s),
+        _ => scan(x, Some(start.unwrap_or(unit)), out),
     }
 }
 
@@ -862,7 +791,7 @@ pub fn sliding<T: Copy, R: Reduction<T>>(data: &[T], [outer, len, inner]: [usize
         for (lane, folds) in lanes {
             for (t, &x) in folds.iter_mut().zip(lane) { *t = one_of::<T, R>(x, &mut ok); }
             for i in 1..width {
-                ok &= R::steps(folds, &lane[i * inner..]);
+                for (t, &x) in folds.iter_mut().zip(&lane[i * inner..]) { *t = step_of::<T, R>(*t, x, &mut ok); }
             }
         }
         return (out, ok);
@@ -886,9 +815,9 @@ impl<T: Copy + PartialEq + Send + Sync, R: Reduction<T, Total = T>> Reduction<(T
     fn one((x, row): (T, usize)) -> ((T, usize), bool) { ((R::one(x).0, row), true) }
     #[inline(always)]
     fn step(acc: (T, usize), x: (T, usize)) -> (T, usize) { Self::merge(acc, Self::one(x).0).0 }
-    /// The earlier fold `a` where it gives the fold of both, and `b` where `b`'s item is beyond it. A NaN `a` gives the fold of both, though it compares unequal to it.
+    /// The earlier fold `a` where it gives the fold of both, and `b` where `b`'s item is beyond it.
     #[inline(always)]
-    fn merge(a: (T, usize), b: (T, usize)) -> ((T, usize), bool) { let m = R::merge(a.0, b.0).0; (if m == a.0 || (m != m && a.0 != a.0) { a } else { b }, true) }
+    fn merge(a: (T, usize), b: (T, usize)) -> ((T, usize), bool) { (if R::merge(a.0, b.0).0 == a.0 { a } else { b }, true) }
     fn slice(x: &[(T, usize)]) -> ((T, usize), bool) { (x.iter().fold(Self::unit(), |t, &v| Self::step(t, v)), true) }
     fn scan(x: &[(T, usize)], start: Option<(T, usize)>, out: &mut Vec<(T, usize)>) -> bool {
         let mut total = start;
@@ -897,7 +826,7 @@ impl<T: Copy + PartialEq + Send + Sync, R: Reduction<T, Total = T>> Reduction<(T
     }
 }
 
-/// The row of the first item in each window of `width` rows that gives the window's fold by `R`, for a reduction that picks one of its items, as [`Max`] and [`Min`] do. The result has [`sliding`]'s shape, and each row counts from the start of its lane. For a float maximum or minimum, a window that holds a NaN gives its first NaN's row, because NaN is its fold.
+/// The row of the first item in each window of `width` rows that gives the window's fold by `R`, for a reduction that picks one of its items, as [`Max`] and [`Min`] do. The result has [`sliding`]'s shape, and each row counts from the start of its lane. A window whose items all leave the fold at `R::unit()`, as NaN items do for a float maximum, gives its first row.
 pub fn sliding_picks<T: Copy + PartialEq + Send + Sync, R: Reduction<T, Total = T>>(data: &[T], shape: [usize; 3], width: usize) -> Vec<usize> {
     let [_, len, inner] = shape;
     let pairs: Vec<(T, usize)> = data.iter().enumerate().map(|(k, &x)| (x, k / inner.max(1) % len.max(1))).collect();
@@ -1020,12 +949,20 @@ fn lanes<T: Copy, R: Reduction<T>>(totals: &mut [R::Total], first: usize, data: 
 /// Steps each of `totals` by the matching item of `row`, and gives whether every fold fits. In a lane's first row, each fold is the fold of its item alone.
 #[inline(always)]
 fn step_row<T: Copy, R: Reduction<T>>(totals: &mut [R::Total], row: &[T], first: bool) -> bool {
-    if !first { return R::steps(totals, row); }
-    totals.iter_mut().zip(row).fold(true, |ok, (s, &x)| {
-        let (t, f) = R::one(x);
-        *s = t;
-        ok & f
-    })
+    let row = totals.iter_mut().zip(row);
+    if first {
+        row.fold(true, |ok, (s, &x)| {
+            let (t, f) = R::one(x);
+            *s = t;
+            ok & f
+        })
+    } else {
+        row.fold(true, |ok, (s, &x)| {
+            let (t, f) = R::checked(*s, x);
+            *s = t;
+            ok & f
+        })
+    }
 }
 
 /// Steps `totals` by every row of `rows`, which hold `totals.len()` items each, and gives whether every fold fits. Where `first` is true, the first row starts each fold, as in [`step_row`]. Narrow rows fold a block of whole rows at a time, into one running total for each item of the block. Each column's running totals then merge.
@@ -1061,7 +998,7 @@ fn strip_by<T: Copy, R: Reduction<T>, const N: usize>(out: &mut [R::Total], rows
     let (mut run, mut fits) = ([R::identity(); N], true);
     for row in rows.chunks_exact(inner) {
         let strip = &row[start..start + width];
-        fits &= R::steps(&mut run[..width], strip);
+        for k in 0..width { let (t, f) = R::checked(run[k], strip[k]); (run[k], fits) = (t, fits & f) }
     }
     for k in 0..width {
         let (t, f) = if first { (run[k], true) } else { R::merge(out[k], run[k]) };
@@ -1075,12 +1012,12 @@ fn strip_by<T: Copy, R: Reduction<T>, const N: usize>(out: &mut [R::Total], rows
 fn blocks_by<T: Copy, R: Reduction<T>, const N: usize>(totals: &mut [R::Total], rows: &[T], first: bool, width: usize) -> bool {
     let inner = totals.len();
     let (blocks, rest) = rows.split_at(rows.len() - rows.len() % width);
-    // `run` can stay in registers through the loop once `steps` inlines, unlike `all`.
+    // `run` can stay in registers through the loop because nothing takes its address, unlike `all`.
     let (mut run, mut fits) = ([R::identity(); N], true);
-    for block in blocks.chunks_exact(width) { fits &= R::steps(&mut run[..width], block) }
+    for block in blocks.chunks_exact(width) { for k in 0..width { let (t, f) = R::checked(run[k], block[k]); (run[k], fits) = (t, fits & f) } }
     let mut all = run;
     let parts = &mut all[..width];
-    fits &= R::steps(parts, rest);
+    for (k, &x) in rest.iter().enumerate() { let (t, f) = R::checked(parts[k], x); (parts[k], fits) = (t, fits & f) }
     for (c, total) in totals.iter_mut().enumerate() {
         let (column, ok) = parts[c..].iter().step_by(inner).fold((R::identity(), true), |(s, ok), &p| {
             let (t, f) = R::merge(s, p);

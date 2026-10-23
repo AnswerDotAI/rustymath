@@ -240,16 +240,19 @@ mod reductions {
     #[test]
     fn edges() {
         assert_eq!((sum::<f64>(&[]), prod::<i32>(&[]), max::<f32>(&[]), min::<i16>(&[])), ((0.0, true), (1, true), f32::NEG_INFINITY, i16::MAX));
-        // NaN at item 40 of 101 lies inside a fold's running results, which vectorize, and not in the remainder. A NaN item makes a fold NaN on every target.
+        // NaN at item 40 of 101 lies inside a fold's running results, which vectorize, and not in the remainder. A NaN item changes no running result on any target, and a fold or scan starts at -∞, so NaN items alone give -∞.
         let mut v = vec![1.0f64; 101];
         v[40] = f64::NAN;
         let v32: Vec<f32> = v.iter().map(|&x| x as f32).collect();
         let (most, least, half) = (max(&v), min(&v32), max(&[f16::ONE, f16::NAN]));
-        assert!(most.is_nan() && least.is_nan() && half.is_nan());
-        assert_eq!((maximum(1.0, f64::NAN).is_nan(), minimum(f32::NAN, 1.0).is_nan(), maximum(-1.0, 2.0), minimum(f16::ONE, f16::ZERO)), (true, true, 2.0, f16::ZERO));
+        assert!(most == 1.0 && least == 1.0 && half == f16::ONE);
+        assert_eq!((maximum(1.0, f64::NAN).is_nan(), minimum(f32::NAN, 1.0), maximum(-1.0, 2.0), minimum(f16::ONE, f16::ZERO)), (true, 1.0, 2.0, f16::ZERO));
         let mut out = Vec::new();
         cummax(&[1.0, 3.0, f64::NAN, 5.0, 2.0, 1.0], None, &mut out);
-        assert!(out[..2] == [1.0, 3.0] && out[2..].iter().all(|v| v.is_nan()), "{out:?}");
+        assert_eq!(out, [1.0, 3.0, 3.0, 5.0, 5.0, 5.0]);
+        out.clear();
+        cummax(&[f64::NAN, 1.0, 2.0], None, &mut out);
+        assert_eq!((out, max(&[f64::NAN; 3])), (vec![f64::NEG_INFINITY, 1.0, 2.0], f64::NEG_INFINITY));
         assert_eq!((sum(&[i64::MAX, 1]), sum(&[i64::MAX, 1, -2]), prod(&[i64::MAX, 2])), ((i64::MIN, false), (i64::MAX - 1, true), (-2, false)));
         assert!(!cumsum(&[i64::MAX, 1], None, &mut Vec::new()));
         assert!(!cumprod(&[i32::MAX, i32::MAX, i32::MAX], None, &mut Vec::new()));
@@ -268,13 +271,9 @@ mod reductions {
                 if let Some(k) = nan { y[k] = f64::NAN }
                 let mut out = Vec::new();
                 cummax(&y, start, &mut out);
-                let mut total = start;
-                let want = y.iter().map(|&v| {
-                    let t = total.map_or(v, |t| maximum(v, t));
-                    total = Some(t);
-                    t
-                });
-                assert!(out.len() == y.len() && out.iter().zip(want).all(|(&a, b)| a == b || a.is_nan()), "{nan:?} {start:?}");
+                let mut total = start.unwrap_or(f64::NEG_INFINITY);
+                let want: Vec<f64> = y.iter().map(|&v| { total = maximum(v, total); total }).collect();
+                assert!(out.len() == y.len() && out.iter().zip(want).all(|(&a, b)| a == b || (a.is_nan() && b.is_nan())), "{nan:?} {start:?}");
             }
         }
     }

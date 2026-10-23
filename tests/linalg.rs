@@ -215,23 +215,18 @@ mod products {
 
     #[test]
     fn nan_terms_stay_in_their_rows() {
-        // Rows 0 and 3 each have a NaN term, in the first step and in a later one. The other rows stay finite on every target. Where the target's maximum and minimum keep NaN, on AArch64 and in wasm, rows 0 and 3 are NaN.
+        // Rows 0 and 3 each have a NaN term, in the first step and in a later one. A NaN term changes no result on any target, so each result is the fold of its other terms.
         let size @ [m, k, n] = [9, 300, 11];
         let mut a: Vec<f64> = (0..m * k).map(|i| (i % 23) as f64).collect();
         let b: Vec<f64> = (0..k * n).map(|i| (i % 19) as f64).collect();
         (a[0], a[3 * k + 280]) = (f64::NAN, f64::NAN);
-        let keeps = cfg!(any(target_arch = "aarch64", target_arch = "wasm32"));
-        let check = |c: &[f64]| {
-            for (i, row) in c.chunks(n).enumerate() {
-                let nan = i == 0 || i == 3;
-                if nan && !keeps { continue; }
-                assert!(row.iter().all(|x| x.is_nan() == nan), "row {i}: {row:?}")
-            }
-        };
-        for c in [MaxPlus.inner(&a, &b, size), MinPlus.inner(&a, &b, size)] { check(&c) }
+        let fold = |i: usize, j: usize, max: bool| (0..k).map(|p| a[i * k + p] + b[p * n + j]).filter(|t| !t.is_nan()).fold(if max { f64::NEG_INFINITY } else { f64::INFINITY }, |s, t| if max { s.max(t) } else { s.min(t) });
+        let check = |c: &[f64], max: bool| for i in 0..m { for j in 0..n { assert_eq!(c[i * n + j], fold(i, j, max), "row {i}") } };
+        check(&MaxPlus.inner(&a, &b, size), true);
+        check(&MinPlus.inner(&a, &b, size), false);
         let a32: Vec<f32> = a.iter().map(|&x| x as f32).collect();
         let b32: Vec<f32> = b.iter().map(|&x| x as f32).collect();
-        for c in [MaxPlus.inner(&a32, &b32, size), MinPlus.inner(&a32, &b32, size)] { check(&c.iter().map(|&x| x as f64).collect::<Vec<_>>()) }
+        for (c, max) in [(MaxPlus.inner(&a32, &b32, size), true), (MinPlus.inner(&a32, &b32, size), false)] { check(&c.iter().map(|&x| x as f64).collect::<Vec<_>>(), max) }
     }
 }
 mod factor {

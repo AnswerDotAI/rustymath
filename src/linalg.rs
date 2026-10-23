@@ -1,6 +1,6 @@
 //! Inner products of row-major matrices. The inner product `f.g` of an `m`×`k` matrix `a` and a `k`×`n` matrix `b` is the `m`×`n` matrix whose item at row `i` and column `j` folds `f` over `g(a[i][p], b[p][j])` for each `p`. `+.×` is the matrix product. The specialized pairs have associative `f`, and their loops combine its steps in whatever order suits them. A float result can therefore differ in its last bits from a fold taken in order. [`inner_with`] runs other native pairs through bounded term blocks and a caller's right fold, which preserves the association of non-associative functions.
 //!
-//! The loops follow GotoBLAS and BLIS. Packing copies a block of each argument into a contiguous buffer sized for a cache level. The blocking reuses each buffer while it is in cache. A micro-kernel computes a small tile of the result in registers, one step of `p` at a time. A micro-kernel in plain Rust vectorizes through LLVM's SLP vectorizer, which the builds of rustymath and basedpl turn on at opt-level 2. It vectorizes only tiles of up to 32 items, too few to keep the multiply-add units busy. On AArch64, in wasm and on x86-64 with AVX2 and FMA, the float pairs run micro-kernels on explicit vectors instead. Their maximum and minimum are AArch64's `fmax` and wasm's `max`, and on x86-64 `maxpd` with a blend that puts back the NaN term `maxpd` skips. On every target a NaN term makes a result NaN, as `Core::maximum` does. Targets without these vectors run the plain kernels.
+//! The loops follow GotoBLAS and BLIS. Packing copies a block of each argument into a contiguous buffer sized for a cache level. The blocking reuses each buffer while it is in cache. A micro-kernel computes a small tile of the result in registers, one step of `p` at a time. A micro-kernel in plain Rust vectorizes through LLVM's SLP vectorizer, which the builds of rustymath and basedpl turn on at opt-level 2. It vectorizes only tiles of up to 32 items, too few to keep the multiply-add units busy. On AArch64, in wasm and on x86-64 with AVX2 and FMA, the float pairs run micro-kernels on explicit vectors instead. Their maximum and minimum are AArch64's `fmaxnm`, wasm's `pmax` and x86-64's `maxpd`, with the running value as the argument each gives beside NaN. A tile starts at `-∞` or `∞`, so its running value is never NaN and a NaN term leaves it unchanged, as `Core::maximum` does. Targets without these vectors run the plain kernels.
 //!
 //! A product large enough splits its rows across the threads that [`crate::parallel::set_threads`] sets. On macOS, Accelerate computes real and complex plus-times products instead. `Tiled` also sends the decompositions' triangular solves, SVDs and Hermitian eigen decompositions to it, and the general eigen decompositions of real matrices from `accelerate::GEEV_FROM` rows. macOS builds with the `native` feature also compile rustymath's own kernels, and `RUSTYMATH_NATIVE=1` selects them for the whole process.
 //!
@@ -957,7 +957,7 @@ mod plain {
 )))]
 use plain::*;
 
-/// Micro-kernels on explicit vectors: 16 bytes on AArch64 and in wasm, and 32 with AVX2. Each is `super::micro` on vectors, with each row of the tile `V` vectors, and its entry gives one step from the tile's running value `c`, `a` and `b`. A tile starts where its entry says, at the pair's unit for a tile of items, as `micro`'s does, so the first step keeps or drops a NaN term as the later steps do.
+/// Micro-kernels on explicit vectors: 16 bytes on AArch64 and in wasm, and 32 with AVX2. Each is `super::micro` on vectors, with each row of the tile `V` vectors, and its entry gives one step from the tile's running value `c`, `a` and `b`. A tile starts where its entry says, at the pair's unit for a tile of items, as `micro`'s does, so the first step drops a NaN term as the later steps do.
 #[cfg(any(
     target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"),
     all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma")
@@ -1006,20 +1006,20 @@ mod lanes {
     }
     #[cfg(target_arch = "aarch64")]
     lanes! {
-        max_plus64: f64, MaxPlus, 2, vdupq_n_f64, vld1q_f64, vst1q_f64, |a, b, c| vmaxq_f64(c, vaddq_f64(a, b));
-        max_plus32: f32, MaxPlus, 4, vdupq_n_f32, vld1q_f32, vst1q_f32, |a, b, c| vmaxq_f32(c, vaddq_f32(a, b));
-        min_plus64: f64, MinPlus, 2, vdupq_n_f64, vld1q_f64, vst1q_f64, |a, b, c| vminq_f64(c, vaddq_f64(a, b));
-        min_plus32: f32, MinPlus, 4, vdupq_n_f32, vld1q_f32, vst1q_f32, |a, b, c| vminq_f32(c, vaddq_f32(a, b));
+        max_plus64: f64, MaxPlus, 2, vdupq_n_f64, vld1q_f64, vst1q_f64, |a, b, c| vmaxnmq_f64(c, vaddq_f64(a, b));
+        max_plus32: f32, MaxPlus, 4, vdupq_n_f32, vld1q_f32, vst1q_f32, |a, b, c| vmaxnmq_f32(c, vaddq_f32(a, b));
+        min_plus64: f64, MinPlus, 2, vdupq_n_f64, vld1q_f64, vst1q_f64, |a, b, c| vminnmq_f64(c, vaddq_f64(a, b));
+        min_plus32: f32, MinPlus, 4, vdupq_n_f32, vld1q_f32, vst1q_f32, |a, b, c| vminnmq_f32(c, vaddq_f32(a, b));
     }
     // Baseline wasm has no fused multiply-add.
     #[cfg(target_arch = "wasm32")]
     lanes! {
         times64: f64, PlusTimes, 2, f64x2_splat, v128_load, v128_store, |a, b, c| f64x2_add(c, f64x2_mul(a, b));
         times32: f32, PlusTimes, 4, f32x4_splat, v128_load, v128_store, |a, b, c| f32x4_add(c, f32x4_mul(a, b));
-        max_plus64: f64, MaxPlus, 2, f64x2_splat, v128_load, v128_store, |a, b, c| f64x2_max(c, f64x2_add(a, b));
-        max_plus32: f32, MaxPlus, 4, f32x4_splat, v128_load, v128_store, |a, b, c| f32x4_max(c, f32x4_add(a, b));
-        min_plus64: f64, MinPlus, 2, f64x2_splat, v128_load, v128_store, |a, b, c| f64x2_min(c, f64x2_add(a, b));
-        min_plus32: f32, MinPlus, 4, f32x4_splat, v128_load, v128_store, |a, b, c| f32x4_min(c, f32x4_add(a, b));
+        max_plus64: f64, MaxPlus, 2, f64x2_splat, v128_load, v128_store, |a, b, c| f64x2_pmax(c, f64x2_add(a, b));
+        max_plus32: f32, MaxPlus, 4, f32x4_splat, v128_load, v128_store, |a, b, c| f32x4_pmax(c, f32x4_add(a, b));
+        min_plus64: f64, MinPlus, 2, f64x2_splat, v128_load, v128_store, |a, b, c| f64x2_pmin(c, f64x2_add(a, b));
+        min_plus32: f32, MinPlus, 4, f32x4_splat, v128_load, v128_store, |a, b, c| f32x4_pmin(c, f32x4_add(a, b));
     }
     // rustymath's own plus-times products, which macOS compiles only with the `native` feature.
     #[cfg(all(target_arch = "x86_64", native))]
@@ -1027,13 +1027,13 @@ mod lanes {
         times64: f64, PlusTimes, 4, _mm256_set1_pd, _mm256_loadu_pd, _mm256_storeu_pd, |a, b, c| _mm256_fmadd_pd(a, b, c);
         times32: f32, PlusTimes, 8, _mm256_set1_ps, _mm256_loadu_ps, _mm256_storeu_ps, |a, b, c| _mm256_fmadd_ps(a, b, c);
     }
-    // AVX2's `maxpd` and `minpd` give their second argument beside NaN: the running value `c`, which keeps a NaN, and the blend puts back a NaN term.
+    // AVX2's `maxpd` and `minpd` give their second argument beside NaN: the running value `c`.
     #[cfg(target_arch = "x86_64")]
     lanes! {
-        max_plus64: f64, MaxPlus, 4, _mm256_set1_pd, _mm256_loadu_pd, _mm256_storeu_pd, |a, b, c| { let t = _mm256_add_pd(a, b); _mm256_blendv_pd(_mm256_max_pd(t, c), t, _mm256_cmp_pd::<_CMP_UNORD_Q>(t, t)) };
-        max_plus32: f32, MaxPlus, 8, _mm256_set1_ps, _mm256_loadu_ps, _mm256_storeu_ps, |a, b, c| { let t = _mm256_add_ps(a, b); _mm256_blendv_ps(_mm256_max_ps(t, c), t, _mm256_cmp_ps::<_CMP_UNORD_Q>(t, t)) };
-        min_plus64: f64, MinPlus, 4, _mm256_set1_pd, _mm256_loadu_pd, _mm256_storeu_pd, |a, b, c| { let t = _mm256_add_pd(a, b); _mm256_blendv_pd(_mm256_min_pd(t, c), t, _mm256_cmp_pd::<_CMP_UNORD_Q>(t, t)) };
-        min_plus32: f32, MinPlus, 8, _mm256_set1_ps, _mm256_loadu_ps, _mm256_storeu_ps, |a, b, c| { let t = _mm256_add_ps(a, b); _mm256_blendv_ps(_mm256_min_ps(t, c), t, _mm256_cmp_ps::<_CMP_UNORD_Q>(t, t)) };
+        max_plus64: f64, MaxPlus, 4, _mm256_set1_pd, _mm256_loadu_pd, _mm256_storeu_pd, |a, b, c| _mm256_max_pd(_mm256_add_pd(a, b), c);
+        max_plus32: f32, MaxPlus, 8, _mm256_set1_ps, _mm256_loadu_ps, _mm256_storeu_ps, |a, b, c| _mm256_max_ps(_mm256_add_ps(a, b), c);
+        min_plus64: f64, MinPlus, 4, _mm256_set1_pd, _mm256_loadu_pd, _mm256_storeu_pd, |a, b, c| _mm256_min_pd(_mm256_add_pd(a, b), c);
+        min_plus32: f32, MinPlus, 8, _mm256_set1_ps, _mm256_loadu_ps, _mm256_storeu_ps, |a, b, c| _mm256_min_ps(_mm256_add_ps(a, b), c);
     }
     // `PlusEqual`'s tiles count equal pairs. Where items are equal, a comparison gives a lane of all ones, which is -1 as an integer, so subtracting it adds 1 to the count.
     #[cfg(target_arch = "aarch64")]

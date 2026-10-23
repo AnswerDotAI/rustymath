@@ -107,29 +107,22 @@ pub(crate) mod sealed {
         fn upper(self) -> Self;
         /// `(s, 1/s)` for the power of two s that brings `self` into [2, 4), after raising a smaller `self` to 2^(2 - bias). Both are normal for every finite `self`, and they come from its exponent bits with no branch.
         fn scales(self) -> (Self, Self);
-        /// The greater of `self` and `y`. NaN beside any number gives NaN, as IEEE 754's `maximum` and NumPy's `maximum` do. `extreme` gives each target's form, which decides a tie of `0` and `-0`. A loop of them vectorizes on every target.
+        /// The greater of `self` and `y`, from a comparison and a select. Where they're equal, or either is NaN, it gives `y`, as x86-64's `maxsd` does. A loop of them vectorizes on every target.
         fn maximum(self, y: Self) -> Self;
         /// The lesser of `self` and `y`, as `maximum` gives the greater.
         fn minimum(self, y: Self) -> Self;
     }
-    /// The folds and scans of floats by maximum and minimum, their running sums, and the elementwise maximum and minimum that dyadic calls, column folds and windows run. `MAX` picks the maximum or the minimum. Each gives `pick`'s result, so a NaN item makes the result NaN, as it does every running result from it on. The defaults' loops vectorize, apart from `step`'s, which serve steps that run in turn. On AArch64 and in wasm, `reduce.rs`' `Vectors` kernels replace them: those targets give a maximum in one instruction, where LLVM vectorizes `pick`'s compare-and-select into four.
+    /// The folds and scans of floats by maximum and minimum, and their running sums. The defaults' fold loops vectorize. Each fold or scan of a maximum or minimum starts at `-∞` or `∞` and passes the running result as `Core::maximum`'s or `Core::minimum`'s `y`, so a NaN item leaves it unchanged and no running result is NaN. A scan reads each item through a step from that start, which turns a NaN item into that start, so the groups that `grouped` starts at an item follow the same rule. The default running sum is `grouped`'s. `reduce.rs` overrides them where a target has instructions that do better.
     pub trait Folds: Core + num_traits::Float {
-        /// `Core::maximum` or `Core::minimum` of `x` and `y`, as `MAX` picks.
-        #[inline(always)]
-        fn pick<const MAX: bool>(x: Self, y: Self) -> Self { if MAX { x.maximum(y) } else { x.minimum(y) } }
-        fn fold<const MAX: bool>(x: &[Self]) -> Self { crate::reduce::folded(x, if MAX { Self::neg_infinity() } else { Self::infinity() }, |t, v| Self::pick::<MAX>(v, t), Self::pick::<MAX>) }
-        fn scan<const MAX: bool>(x: &[Self], start: Option<Self>, out: &mut Vec<Self>) { crate::reduce::records(x, start, out, Self::step::<MAX>, |b, t| if MAX { crate::reduce::below(b, t) } else { crate::reduce::above(b, t) }) }
-        /// `pick` of a running result and one more item, for steps that each wait on the one before.
-        #[inline(always)]
-        fn step<const MAX: bool>(acc: Self, x: Self) -> Self { Self::pick::<MAX>(x, acc) }
+        fn fold_max(x: &[Self]) -> Self { crate::reduce::folded(x, Self::neg_infinity(), |t, v| Self::maximum(v, t), Self::maximum) }
+        fn fold_min(x: &[Self]) -> Self { crate::reduce::folded(x, Self::infinity(), |t, v| Self::minimum(v, t), Self::minimum) }
+        fn scan_max(x: &[Self], start: Option<Self>, out: &mut Vec<Self>) {
+            crate::reduce::records(x, start, out, |v| Self::maximum(v, Self::neg_infinity()), |t, v| Self::maximum(v, t), crate::reduce::below)
+        }
+        fn scan_min(x: &[Self], start: Option<Self>, out: &mut Vec<Self>) {
+            crate::reduce::records(x, start, out, |v| Self::minimum(v, Self::infinity()), |t, v| Self::minimum(v, t), crate::reduce::above)
+        }
         fn scan_sum(x: &[Self], start: Option<Self>, out: &mut Vec<Self>) { crate::reduce::grouped(x, start, out, |v| v, |a, b| a + b, |t| t, false) }
-        /// Writes `pick` of each pair of `x`'s and `y`'s items into `out`, for `n` results: the dyadic maximum and minimum.
-        fn pairs<const MAX: bool>(x: Arg<'_, Self>, y: Arg<'_, Self>, n: usize, out: &mut [std::mem::MaybeUninit<Self>]) { crate::slice::pairs_into(x, y, n, out, |a, b| (Self::pick::<MAX>(a, b), true)); }
-        /// Steps each of `acc` by the matching item of `x`, as far as the shorter goes: each running result of a column fold or a window.
-        #[inline(always)]
-        fn steps<const MAX: bool>(acc: &mut [Self], x: &[Self]) { for (a, &v) in acc.iter_mut().zip(x) { *a = Self::pick::<MAX>(v, *a) } }
-        /// Folds each row of `data`, rows of `columns` items, into the matching item of `out`, where a target folds rows of that length several at a time, and gives whether it did.
-        fn rows<const MAX: bool>(_data: &[Self], _columns: usize, _out: &mut [Self]) -> bool { false }
     }
 }
 
@@ -163,30 +156,8 @@ macro_rules! order_key {
     };
 }
 
-/// `Core::maximum` and `Core::minimum`, each giving NaN beside NaN. In wasm they're `max` and `min`, one instruction each, which LLVM vectorizes from these one-item forms. AArch64's `fmax` and `fmin` do the same, but LLVM doesn't vectorize their one-item forms, so AArch64 compares and selects, as other targets do. A comparison gives `y` where the two are equal. Wasm's forms give `0` for the maximum of `0` and `-0`.
-mod extreme {
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-    use core::arch::wasm32::*;
-    macro_rules! extreme {
-        ($($name:ident: $t:ty, $op:tt, $f:ident, $splat:ident, $lane:ident;)+) => {$(
-            #[inline(always)]
-            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-            pub(super) fn $name(x: $t, y: $t) -> $t { $lane::<0>($f($splat(x), $splat(y))) }
-            #[inline(always)]
-            #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
-            pub(super) fn $name(x: $t, y: $t) -> $t { if x.is_nan() || x $op y { x } else { y } }
-        )+};
-    }
-    extreme! {
-        max64: f64, >, f64x2_max, f64x2_splat, f64x2_extract_lane;
-        min64: f64, <, f64x2_min, f64x2_splat, f64x2_extract_lane;
-        max32: f32, >, f32x4_max, f32x4_splat, f32x4_extract_lane;
-        min32: f32, <, f32x4_min, f32x4_splat, f32x4_extract_lane;
-    }
-}
-
 macro_rules! native {
-    ($t:ident, $bits:ty, $mantissa:literal, $bias:literal, $max:ident, $min:ident) => {
+    ($t:ident, $bits:ty, $mantissa:literal, $bias:literal) => {
         impl sealed::Sealed for $t {}
         impl Float for $t {
             type Working = $t;
@@ -253,14 +224,14 @@ macro_rules! native {
                 ($t::from_bits((2 * $bias + 1 - e) << $mantissa), $t::from_bits((e - 1) << $mantissa))
             }
             #[inline(always)]
-            fn maximum(self, y: $t) -> $t { extreme::$max(self, y) }
+            fn maximum(self, y: $t) -> $t { if self > y { self } else { y } }
             #[inline(always)]
-            fn minimum(self, y: $t) -> $t { extreme::$min(self, y) }
+            fn minimum(self, y: $t) -> $t { if self < y { self } else { y } }
         }
     };
 }
-native!(f32, u32, 23, 127, max32, min32);
-native!(f64, u64, 52, 1023, max64, min64);
+native!(f32, u32, 23, 127);
+native!(f64, u64, 52, 1023);
 
 impl sealed::Sealed for half::f16 {}
 impl Float for half::f16 {

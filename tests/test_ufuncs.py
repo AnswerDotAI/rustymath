@@ -101,7 +101,7 @@ def test_reductions(threads):
     assert np.allclose(rm.sum(m, axis=0), m.sum(0)) and np.allclose(rm.sum(m, axis=-1), m.sum(1)) and np.isclose(rm.sum(m, axis=(0, 1)), m.sum())
     assert np.allclose(rm.cumsum(m, axis=1), m.cumsum(1)) and rm.cumsum(m).shape == (10_000,)
     v = np.array([3.0, 1.0, np.nan, 5.0])
-    assert np.isnan(rm.max(v)) and np.isnan(rm.minimum(np.nan, 1.0)) and np.isnan(rm.minimum(1.0, np.nan))
+    assert rm.max(v) == 5 and rm.minimum(np.nan, 1.0) == 1 and np.isnan(rm.minimum(1.0, np.nan))
     assert rm.max(x[::7]) == x[::7].max() and rm.min(x) == x.min()
     # Integers and Booleans sum as int64, and a total that doesn't fit wraps.
     assert rm.sum(np.array([100, 100], np.uint8)) == 200 and rm.sum([True, True, False]) == 2
@@ -219,14 +219,14 @@ def test_minmax_and_truth_table_scan():
         for axis in [0, -1]:
             lo, hi = map(A, rm.minmax(x, axis=axis))
             assert lo.dtype == hi.dtype == dt and np.array_equal(lo, x.min(axis=axis)) and np.array_equal(hi, x.max(axis=axis))
-    lo, hi = rm.minmax([1., np.nan, 2.])
-    assert np.isnan(lo) and np.isnan(hi)
-    # NaN beside any number gives NaN, as NumPy's `maximum` does: a running maximum or minimum is NaN from a NaN item on, in a short lane and in a long one, whose float16 scan regroups its items.
+    assert rm.minmax([1., np.nan, 2.]) == (1, 2)
+    # A NaN item changes no running maximum or minimum, which start at -inf and inf: in a short lane and in a long one, whose float16 scan regroups its items.
     x = np.arange(80.)
     x[5] = np.nan
     for dt in [np.float16, np.float32, np.float64]:
         for a in [x.astype(dt), x[5:8].astype(dt)]:
-            for name in ['maximum', 'minimum']: assert np.array_equal(rm.accumulate(getattr(rm, name), a), getattr(np, name).accumulate(a), equal_nan=True)
+            for name, f, start in [('maximum', np.fmax, -np.inf), ('minimum', np.fmin, np.inf)]:
+                assert np.array_equal(rm.accumulate(getattr(rm, name), a), f.accumulate(np.r_[start, a])[1:].astype(dt))
     b = np.array([[True, False, True], [False, True, True]])
     for bits in range(16):
         table = np.array([(bits >> k) & 1 for k in range(4)], dtype=bool).reshape(2, 2)
@@ -282,7 +282,7 @@ def test_native_accumulation():
             starts = np.indices(w.shape[:-1])[axis]
             assert np.array_equal(A(rm.sliding_argmax(data, width, axis)), w.argmax(-1) + starts)
             assert np.array_equal(A(rm.sliding_argmin(data, width, axis)), w.argmin(-1) + starts)
-    assert rm.sliding_argmax([1., np.nan, 0.], 2).tolist() == [1, 1]
+    assert rm.sliding_argmax([1., np.nan, 0.], 2).tolist() == [0, 2]
     for width in [0, 41]:
         with pytest.raises(ValueError, match='window'): rm.sliding(rm.add, x, width)
     with pytest.raises(ValueError): rm.sliding(rm.subtract, x, 3)

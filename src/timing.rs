@@ -32,6 +32,9 @@ pub struct CopyTime { pub seconds: f64, pub items: usize, pub bytes: usize, pub 
 /// The most bytes that a copy's source and destination take together for [`copy_time`] to use a stored time. Below it, the copy's data stays in cache, and its time is a property of the CPU. Above it, the copy runs at the speed of memory, which a shared runner varies between runs, and cases of the same size vary with it. On CI's runner under V8, the 36-million-item copy and the cases at that size both varied up to 2.1 times between runs, and dividing by the copy measured in the same run cut the cases' spread from 2.24 times to 1.32. The speed tests' copies take at most 16 MB below it, or 576 MB above it.
 const CACHED_BYTES: usize = 64 << 20;
 
+/// Whether a copy of `items` items of `bytes` bytes each, with its destination, fits in `CACHED_BYTES`.
+fn cached(items: usize, bytes: usize) -> bool { 2 * items * bytes <= CACHED_BYTES }
+
 /// The copy times of the machines that run the speed tests in native builds, for copies whose source and destination fit in `CACHED_BYTES`: the CPU's name as [`cpu`] reads it, an item's size in bytes, the number of items, and the time for each item in seconds. Each is at the slower end of what that machine's copy normally takes, which is the copy that the expected costs in the budget files assume. On CI's runner, a copy measured beside each case varied more than 3 times between cases, while every function's own time varied at most 1.18 times. A stored time keeps that noise out of every cost.
 #[cfg(not(target_arch = "wasm32"))]
 pub const COPIES: &[(&str, usize, usize, f64)] = &[
@@ -40,6 +43,8 @@ pub const COPIES: &[(&str, usize, usize, f64)] = &[
     ("AMD Ryzen 9 7950X3D 16-Core Processor", 4, 65_536, 0.08e-9),
     // 16-byte items, complex f64: 0.285 ns, measured once on 22 October 2026. Each complex f64 function's time per item that day, divided by its cost in the earlier runs whose 8-byte copies came from cache, gives 0.24 to 0.29 ns.
     ("AMD Ryzen 9 7950X3D 16-Core Processor", 16, 65_536, 0.29e-9),
+    // 1,048,576 8-byte items: 0.157 ns, measured once by basedpl's speed test on 22 October 2026. The browser build's copy at this size on the same runner varied 1.27 times across seven runs, so the entry allows for that.
+    ("AMD Ryzen 9 7950X3D 16-Core Processor", 8, 1_048_576, 0.18e-9),
     // The development Mac, 22 October 2026, through basedpl's `time_cases` and rustymath's speed test: 0.115 to 0.13 ns for 8-byte items at each size, and 0.056 to 0.066 ns for 4-byte items.
     ("Apple M5 Max", 8, 65_536, 0.12e-9),
     ("Apple M5 Max", 8, 1_048_576, 0.125e-9),
@@ -96,18 +101,16 @@ fn read_cpu() -> Option<String> {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn read_cpu() -> Option<String> { None }
 
-/// One copy's time for each of `items` items of type `T`. A copy whose source and destination fit in `CACHED_BYTES` takes this machine's entry in [`COPIES`]. Any other copy, or one with no entry, is measured once, the first time its size is asked for. A copy that fits but has no entry prints a line on standard error, giving the time to add.
+/// One copy's time for each of `items` items of type `T`. A copy whose source and destination fit in `CACHED_BYTES` takes this machine's entry in [`COPIES`]. Any other copy, or one with no entry, is measured once, the first time its size is asked for. [`copy_line`] says when a measured copy belongs in [`COPIES`].
 pub fn copy_time<T: Copy + Default + Neg<Output = T>>(items: usize) -> CopyTime {
     let bytes = size_of::<T>();
-    let cached = 2 * items * bytes <= CACHED_BYTES;
-    if cached && let Some(name) = cpu() && let Some(&(_, _, _, seconds)) = COPIES.iter().find(|&&(c, b, n, _)| c == name && b == bytes && n == items) {
+    if cached(items, bytes) && let Some(name) = cpu() && let Some(&(_, _, _, seconds)) = COPIES.iter().find(|&&(c, b, n, _)| c == name && b == bytes && n == items) {
         return CopyTime { seconds, items, bytes, stored: true };
     }
     static MEASURED: std::sync::Mutex<Vec<CopyTime>> = std::sync::Mutex::new(Vec::new());
     let mut measured = MEASURED.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&t) = measured.iter().find(|t| (t.bytes, t.items) == (bytes, items)) { return t; }
     let t = CopyTime { seconds: measured_copy::<T>(items), items, bytes, stored: false };
-    if cached { eprintln!("{}: add it to rustymath::timing::COPIES", copy_line(&t)); }
     measured.push(t);
     t
 }
@@ -120,9 +123,14 @@ fn measured_copy<T: Copy + Default + Neg<Output = T>>(items: usize) -> f64 {
     fastest(|_| { copy(std::hint::black_box(&data), &mut out); std::hint::black_box(&mut out); }) / items.max(1) as f64
 }
 
-/// A line saying what a copy of `t`'s items costs for each item, and whether that time was stored for this machine or measured, as the speed tests print it before their costs.
+/// A line saying what a copy of `t`'s items costs for each item, and whether that time was stored for this machine or measured, as the speed tests print it before their costs. A measured copy that fits in `CACHED_BYTES` adds that it belongs in [`COPIES`]: the line reaches the log where the speed tests' own lines do.
 pub fn copy_line(t: &CopyTime) -> String {
-    let source = match (t.stored, cpu()) { (true, Some(c)) => format!("stored for {c}"), (false, Some(c)) => format!("measured on {c}"), (_, None) => "measured on a CPU with no name".into() };
+    let source = match (t.stored, cpu()) {
+        (true, Some(c)) => format!("stored for {c}"),
+        (false, Some(c)) if cached(t.items, t.bytes) => format!("measured on {c}: add it to rustymath::timing::COPIES"),
+        (false, Some(c)) => format!("measured on {c}"),
+        (_, None) => "measured on a CPU with no name".into(),
+    };
     format!("copy of {} {}-byte items: {:.3} ns an item, {source}", t.items, t.bytes, t.seconds * 1e9)
 }
 
