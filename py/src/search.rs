@@ -136,7 +136,7 @@ fn sorted<'py>(py: Python<'py>, function: &str, keys: &[Arg], axis: Option<Axis>
     let layout = if layout.shape().is_empty() { Layout::from([total].as_slice()) } else { layout };
     let (dims, mut layout, position) = along_axis(layout, total, axis)?;
     if let Some(a) = position { layout = layout.without_keys(a); }
-    let columns: Vec<_> = keys.iter().rev().map(|k| k.view()).collect();
+    let columns: Vec<_> = keys.iter().rev().map(|k| (k.view(), 0, 1)).collect();
     let order = released(py, || search::view_lexgrade_along(&columns, dims, false)).map_err(py_err)?.ok_or_else(|| missing(function, keys[0].view().dtype()))?;
     give_items(py, layout, i64::buffer(order), false)
 }

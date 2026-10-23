@@ -158,13 +158,24 @@ mod forms {
         let q: Vec<f64> = (0..2000).map(|_| 2.0 * rng.random::<f64>()).collect();
         unary(Erfcinv, "Erfcinv", &q);
         unary(Erfinv, "Erfinv", &q.iter().map(|&q| q - 1.0).collect::<Vec<_>>());
-        // The logarithms' slice forms take each block of 16 items whose every item is positive, normal and finite through a form with no special values. Blocks of such items, some holding a special value, reach both forms.
+        // The logarithms' slice forms take each block of 64 items whose every item is positive, normal and finite through a form with no special values. Blocks of such items, some holding a special value, reach both forms.
         let mut x: Vec<f64> = (0..2000).map(|_| 1000.0 * rng.random::<f64>()).collect();
         for (i, v) in [0.0, -1.0, 1e-310, f64::INFINITY, f64::NAN, 1.0].into_iter().enumerate() { x[300 * i + 5] = v }
         unary(Ln, "Ln", &x);
         unary(Log2, "Log2", &x);
         unary(Log10, "Log10", &x);
         unary(Log1p, "Log1p", &x.iter().map(|&v| v - 1.0).collect::<Vec<_>>());
+        // `Exp` and `Expm1` take their fast form for blocks whose items all lie within ±708 at f64 and ±87 at f32. The same items, shifted into that range, put ∞ and NaN in two blocks.
+        let (e64, e32): (Vec<f64>, Vec<f32>) = x.iter().map(|&v| (v - 700.0, (v / 10.0 - 50.0) as f32)).unzip();
+        unary(Exp, "Exp", &e64);
+        unary(Exp, "Exp", &e32);
+        unary(Expm1, "Expm1", &e64);
+        unary(Expm1, "Expm1", &e32);
+        // `Erfc` computes one formula for a block of 512 items whose magnitudes all lie on one side of its split, and a mixed block takes both. A ramp from -5 to 5 holds blocks of each kind.
+        let ramp: Vec<f64> = (0..4000).map(|i| i as f64 / 400.0 - 5.0).collect();
+        let ramp32: Vec<f32> = ramp.iter().map(|&v| v as f32).collect();
+        unary(Erfc, "Erfc", &ramp);
+        unary(Erfc, "Erfc", &ramp32);
         for b in [2.0, 10.0] {
             let mut out = Vec::new();
             let ok = Logb.many(Arg::One(b), Arg::Many(&x), x.len(), &mut out);
@@ -997,6 +1008,10 @@ mod gather {
             (0, vec![Steps::table(vec![3, Steps::FILL, 9, 0, 5, 1, 2, 7, 8, 4]), along(3, 40)]),
             (0, vec![along(9, 1), along(10, 30)]),
             (0, vec![along(4, 10), Steps::Stride { start: 2, len: 3, step: 0 }]),
+            // Short cells whose runs pass `RUN` items: forwards along a stride, backwards, and along a table.
+            (0, vec![along(5, 7), along(3, 40), along(9, 1)]),
+            (0, vec![along(5, 7), along(2, 40), Steps::Stride { start: 19, len: 12, step: -1 }]),
+            (0, vec![Steps::table(vec![3, 9, 0, 5]), along(2, 40), along(10, 1)]),
         ];
         for (base, steps) in &cases {
             let whole = read(&s, *base, steps);

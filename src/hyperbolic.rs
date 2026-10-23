@@ -1,5 +1,5 @@
 //! The hyperbolic functions and their inverses. The functions build on `exp` and `expm1`, the inverses on `ln`'s reduction. Each computes at |x| and restores the sign of x where the function is odd.
-use crate::{exp::{exp_times, expm1, expm1_times}, float::Native, ln::ln_parts};
+use crate::{exp::{exp_times, expm1_fast, expm1_times}, float::Native, ln::ln_parts};
 
 /// sinh |x| = h(1 + 1/(2h + 1)), with h = (e^|x| - 1)/2. The halving joins `expm1`'s scaling, so sinh stays finite where e^|x| would overflow. Where h is ∞, 1/(2h + 1) is 0, and the result is ∞.
 #[inline]
@@ -12,13 +12,13 @@ pub(crate) fn sinh<R: Native, const FUSED: bool>(x: R) -> R {
 #[inline]
 pub(crate) fn cosh<R: Native, const FUSED: bool>(x: R) -> R { let e = exp_times::<R, FUSED>(x.abs(), -R::one()); e + R::narrow(0.25) / e }
 
-/// tanh |x| = e/(e + 2), with e = e^(2|x|) - 1. Beyond 20 at f64 and 9 at f32, tanh rounds to 1, so |x| stops there and e stays finite.
+/// tanh |x| = e/(e + 2), with e = e^(2|x|) - 1. Beyond 20 at f64 and 9 at f32, tanh rounds to 1. Stopping |x| there keeps 2|x| within `expm1_fast`'s range, where e needs none of `expm1`'s guards.
 #[inline]
 pub(crate) fn tanh<R: Native, const FUSED: bool>(x: R) -> R {
     let top = R::narrow(if R::WIDE { 20.0 } else { 9.0 });
     let a = x.abs();
     let a = if a > top { top } else { a };
-    let e = expm1::<R, FUSED>(a + a);
+    let e = expm1_fast::<R, FUSED>(a + a);
     (e / (e + R::narrow(2.0))).copysign(x)
 }
 

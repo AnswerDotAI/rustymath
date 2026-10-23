@@ -43,8 +43,8 @@ pub fn triangle(layout: Layout, values: View<'_>, offset: i64, upper: bool) -> R
         if rows > 0 && cols > 0 {
             for (i, row) in data.chunks(cols).enumerate() {
                 let end = (i as i128 % rows as i128 + offset as i128 + i128::from(!upper)).clamp(0, cols as i128) as usize;
-                if upper { out.resize(out.len() + end, T::FILL); out.extend_from_slice(&row[end..]); }
-                else { out.extend_from_slice(&row[..end]); out.resize(out.len() + cols - end, T::FILL); }
+                if upper { out.resize(out.len() + end, T::FILL); crate::gather::copied(&mut out, &row[end..]); }
+                else { crate::gather::copied(&mut out, &row[..end]); out.resize(out.len() + cols - end, T::FILL); }
             }
         }
         T::buffer(out)

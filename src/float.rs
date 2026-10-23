@@ -99,6 +99,8 @@ pub(crate) mod sealed {
         fn pow2(z: Self) -> Self;
         /// `(m, e)` with `self` = m × 2^e, m from 0.75 to 1.5 and e whole, for a positive normal `self`.
         fn split(self) -> (Self, Self);
+        /// Whether `self` is positive, normal and finite, from the top 32 bits of its bits, which hold its sign and exponent, through one subtraction and one unsigned comparison. A loop of them vectorizes on every target, four f64 values to a 128-bit register, where LLVM merges the comparisons `self >= MIN_POSITIVE` and `self < ∞` into a class test that it leaves scalar on x86-64.
+        fn positive_normal(self) -> bool;
         /// `self` negated when the whole number n is odd, for `z` = `SHIFT + n`.
         fn flip(self, z: Self) -> Self;
         /// Whether the whole number n is odd, for `self` = `SHIFT + n`.
@@ -135,8 +137,9 @@ pub(crate) mod sealed {
 /// A float's bits as a key in its total order: the sign bit flipped, and a negative float's other bits flipped too. `Float::from_order_key` undoes it.
 #[inline(always)]
 fn ordered_bits<K: num_traits::PrimInt>(bits: K) -> K {
-    let sign = K::one() << (K::zero().count_zeros() as usize - 1);
-    if bits & sign == K::zero() { bits | sign } else { !bits }
+    let top = K::zero().count_zeros() - 1;
+    // Loops that compute keys vectorize only without a branch here. The arithmetic shift spreads the sign bit over every bit.
+    bits ^ (bits.signed_shr(top) | K::one() << top as usize)
 }
 
 /// `Float`'s order-key items, for a float whose bits have type `$k`, through `ordered_bits`. An order key adds `¯0` to `0` first and gives every NaN the greatest key. A total key clears a NaN's sign bit, so every NaN follows `∞`.
@@ -145,10 +148,8 @@ macro_rules! order_key {
         type OrderKey = $k;
         #[inline(always)]
         fn order_key(self) -> $k {
-            if self.is_nan() {
-                return <$k>::MAX;
-            }
-            ordered_bits((self + <Self as num_traits::Zero>::zero()).to_bits())
+            let key = ordered_bits((self + <Self as num_traits::Zero>::zero()).to_bits());
+            if self.is_nan() { <$k>::MAX } else { key }
         }
         #[inline(always)]
         fn total_key(self) -> $k {
@@ -215,6 +216,12 @@ macro_rules! native {
                 let exponent = ((self * (1.0 / 0.75)).to_bits() >> $mantissa) & (2 * $bias + 1);
                 let m = $t::from_bits(self.to_bits().wrapping_sub(exponent.wrapping_sub($bias) << $mantissa));
                 (m, Self::from_low(exponent, $bias as $t))
+            }
+            // Subtracting the smallest normal float's top bits wraps zero and the subnormals around to the top, where negative floats' top bits already lie. Only positive normal floats then lie below infinity's top bits less the same amount.
+            #[inline(always)]
+            fn positive_normal(self) -> bool {
+                const SHIFT: u32 = <$bits>::BITS - 32;
+                ((self.to_bits() >> SHIFT) as u32).wrapping_sub(1 << ($mantissa - SHIFT)) < (2 * $bias) << ($mantissa - SHIFT)
             }
             // The lowest bit of `z` is the parity of n. Shifted into the sign bit, it negates `self` with no branch.
             #[inline]

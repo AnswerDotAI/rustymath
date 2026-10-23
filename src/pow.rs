@@ -1,5 +1,5 @@
 //! Powers and roots. `pow` and `root` compute e^(y ln |x|): at f64 through `table`'s logarithm and exponential, and for narrower types through `ln_narrow` and `exp_narrow` in f64. A whole exponent from 2 to `MULTIPLIED` squares and multiplies instead. A degree of 2 or 3 takes `sqrt` or `cbrt`. `cbrt` refines an estimate taken from x's bits with Newton steps. `hypot` scales both arguments by a power of two before squaring them. See `THIRD-PARTY.md`.
-use crate::{Arg, dd::Double, exp::exp_narrow, float::Native, ln::ln_narrow, table};
+use crate::{Arg, dd::Double, exp::exp_narrow, float::Native, ln::ln_narrow, slice::Total, table};
 use num_complex::Complex;
 
 /// Whether a is finite and nonzero, for an a whose sign bit is clear. 0, ∞ and NaN give false.
@@ -150,15 +150,26 @@ fn times<R: Native, const K: u32, const NEGATIVE: bool>(x: R) -> R {
     if NEGATIVE { R::one() / r } else { r }
 }
 
-/// [`pow`](crate::pow) as a function object. Its scalar form takes one branch to a fast path wherever one applies. Its slice form `many` computes every item the fast way, then redoes only the rare items with special values. A constant whole exponent from 2 to `MULTIPLIED` squares and multiplies instead.
+/// `Pow`'s and `WholePow`'s slice form. A constant whole exponent from 2 to `MULTIPLIED` squares and multiplies. Those items never fail, and their loop vectorizes with no test of each result. Any other call computes every item the fast way, then redoes only the rare items with special values.
+macro_rules! pow_many {
+    ($x:expr, $y:expr, $n:expr, $out:expr) => {
+        match if let Arg::One(k) = $y { small_whole(k) } else { None } {
+            Some((m, true)) => counted!(m, K => each!([$x], $n, $out, |[x]| Total(times::<_, K, true>(x)))),
+            Some((m, false)) => counted!(m, K => each!([$x], $n, $out, |[x]| Total(times::<_, K, false>(x)))),
+            None => two_pass!([$x, $y], $n, $out, |[a, b]| fast::<_, { crate::FUSED }>(a, b, false), |[a, b]| pow_any::<_, { crate::FUSED }>(a, b)),
+        }
+    };
+}
+
+/// [`pow`](crate::pow) as a function object. Its scalar form takes one branch to a fast path wherever one applies, and its slice form is `pow_many`.
 #[derive(Clone, Copy, Debug)]
 pub struct Pow;
-forms!(Pow at real: |_, [x, y]| pow_one::<_, { crate::FUSED }>(x, y),
-many |_, [x, y], n, out| match if let Arg::One(k) = y { small_whole(k) } else { None } {
-    Some((m, true)) => counted!(m, K => each!([x], n, out, |[x]| times::<_, K, true>(x))),
-    Some((m, false)) => counted!(m, K => each!([x], n, out, |[x]| times::<_, K, false>(x))),
-    None => two_pass!([x, y], n, out, |[a, b]| fast::<_, { crate::FUSED }>(a, b, false), |[a, b]| pow_any::<_, { crate::FUSED }>(a, b)),
-});
+forms!(Pow at real: |_, [x, y]| pow_one::<_, { crate::FUSED }>(x, y), many |_, [x, y], n, out| pow_many!(x, y, n, out));
+
+/// [`Pow`] for a whole exponent, where every real base has a real power and no result fails. Its forms are `Pow`'s. A caller passes it whole exponents only.
+#[derive(Clone, Copy, Debug)]
+pub struct WholePow;
+forms!(WholePow at real: |_, [x, y]| Total(pow_one::<_, { crate::FUSED }>(x, y)), many |_, [x, y], n, out| pow_many!(x, y, n, out));
 
 /// [`root`](crate::root) as a function object, with a scalar form and a slice form that work as [`Pow`]'s do. A constant degree of 2 or 3 takes `sqrt` or `cbrt`.
 #[derive(Clone, Copy, Debug)]
@@ -169,8 +180,8 @@ many |_, [n, y], count, out| match n {
     Arg::One(d) if d == 3.0 => each!([y], count, out, |[y]| cbrt::<_, { crate::FUSED }>(y)),
     _ => two_pass!([n, y], count, out, |[a, b]| fast::<_, { crate::FUSED }>(b, a, true), |[a, b]| root_any::<_, { crate::FUSED }>(a, b)),
 });
-// A complex degree of 2 takes `Sqrt`, and any other degree but 0 takes `Pow` of its reciprocal. A degree of 0 gives NaN, which fails.
-forms!(Root at Complex<f32>, Complex<f64>: |_, [n, y]| if n == Complex::new(0.0, 0.0) {
+// A complex degree of 2 takes `Sqrt`, and any other finite degree but 0 takes `Pow` of its reciprocal. A degree of 0 or an infinite degree gives NaN, as the real form does, which fails.
+forms!(Root at Complex<f32>, Complex<f64>: |_, [n, y]| if n == Complex::new(0.0, 0.0) || !n.is_finite() {
     Complex::new(num_traits::Float::nan(), num_traits::Float::nan())
 } else if n == Complex::new(2.0, 0.0) {
     crate::Unary::one(&crate::Sqrt, y)

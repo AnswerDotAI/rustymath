@@ -183,10 +183,13 @@ impl Cell {
     fn width(&self) -> usize { self.runs * self.len }
     /// The offset of each of the cell's items, in order.
     fn offsets(&self) -> impl Iterator<Item = usize> + '_ { self.starts().iter().flat_map(move |&s| (0..self.len).map(move |i| s + if self.rev { self.len - 1 - i } else { i })) }
+    /// One past the highest offset that the cell reaches from its start.
+    #[inline]
+    fn reach(&self) -> usize { self.starts().iter().max().expect("a short cell holds a run") + self.len }
     /// Checks that every run of `m` cells, which start `step` apart from `at`, lies below `n`, so that a loop over them can skip each bounds check.
     #[inline]
     fn check(&self, at: usize, step: isize, m: usize, n: usize) {
-        let reach = self.starts().iter().max().expect("a short cell holds a run") + self.len;
+        let reach = self.reach();
         if m > 0 { checked_run(at, m, step, n.checked_sub(reach - 1).expect("cell stays in range")); }
     }
     /// Calls `each(item, at)` for run `j` of each of `m` cells, where cell `r` starts at `o + r × step`: `item` is `r × width + j × len`, where the run's items sit when the cells lie end to end, and `at` is where the run starts. Both positions step by addition. A cell of one run goes along the cells as one strided loop. A cell of several runs takes its runs together, cell by cell, so that each cell's lines stay in cache.
@@ -202,18 +205,30 @@ impl Cell {
             at = at.wrapping_add_signed(step);
         }
     }
-    /// [`each_run`](Self::each_run), which also passes `each` whether the cell is `rev`, as a constant: each direction gets a loop of its own, which carries no test of it.
+    /// [`each_run`](Self::each_run) by blocks of `L` items, which also passes `each` whether the cell is `rev`, as a constant: each direction gets a loop of its own, which carries no test of it. `at` is a block's lowest offset, and `item` where its items sit in the cell's order. A run of `L` items is one block. A longer run takes blocks `L` items apart, and its last block ends where the run does, overlapping the one before.
     #[inline(always)]
-    fn each_way(&self, o: usize, step: isize, m: usize, mut each: impl FnMut(usize, usize, bool)) {
-        if self.rev { self.each_run(o, step, m, |item, at| each(item, at, true)) } else { self.each_run(o, step, m, |item, at| each(item, at, false)) }
+    fn each_way<const L: usize>(&self, o: usize, step: isize, m: usize, mut each: impl FnMut(usize, usize, bool)) {
+        debug_assert!(L <= self.len, "`runs!` gives an L no longer than the run");
+        let last = self.len - L;
+        let mut blocks = |item: usize, at: usize, rev: bool| {
+            if L < RUN || last == 0 { return each(item, at, rev); }
+            let mut d = 0;
+            loop {
+                let b = d.min(last);
+                each(item + b, at + if rev { last - b } else { b }, rev);
+                if b == last { break }
+                d += L;
+            }
+        };
+        if self.rev { self.each_run(o, step, m, |item, at| blocks(item, at, true)) } else { self.each_run(o, step, m, |item, at| blocks(item, at, false)) }
     }
-    /// Moves run `j` of each of `m` cells, as [`each_run`](Self::each_run) reaches them, as one block of `L` units, between the places that `places(item, at)` gives, reversed in a `rev` cell.
+    /// Moves each block of `L` units of run `j` of each of `m` cells, as [`each_way`](Self::each_way) reaches them, between the places that `places(item, at)` gives, reversed in a `rev` cell.
     ///
     /// # Safety
     /// Each place that `places` gives must hold `L` units.
     #[inline(always)]
     unsafe fn each_move<const L: usize, U: Unit>(&self, o: usize, step: isize, m: usize, places: impl Fn(usize, usize) -> (*const U, *mut U)) {
-        self.each_way(o, step, m, |item, at, rev| {
+        self.each_way::<L>(o, step, m, |item, at, rev| {
             let (from, to) = places(item, at);
             // SAFETY: the caller's.
             let mut units = unsafe { from.cast::<[U; L]>().read() };
@@ -223,16 +238,15 @@ impl Cell {
     }
 }
 
-/// Runs `$body` with `$L`, a const that holds `$len`, a short cell's run length, from 1 to `RUN`.
+/// Runs `$body` with `$L`, a const that holds `$len`, a short cell's run length, from 1 to `RUN`, or `RUN` for a longer run, which then moves as several blocks (`Cell::each_way`).
 macro_rules! runs {
     ($len:expr, $L:ident => $body:expr) => { match $len {
         1 => { const $L: usize = 1; $body } 2 => { const $L: usize = 2; $body } 3 => { const $L: usize = 3; $body } 4 => { const $L: usize = 4; $body }
-        5 => { const $L: usize = 5; $body } 6 => { const $L: usize = 6; $body } 7 => { const $L: usize = 7; $body } 8 => { const $L: usize = 8; $body }
-        _ => unreachable!("a short cell's runs hold at most RUN items"),
+        5 => { const $L: usize = 5; $body } 6 => { const $L: usize = 6; $body } 7 => { const $L: usize = 7; $body } _ => { const $L: usize = RUN; $body }
     } };
 }
 
-/// Writes `slots` as windows of the units of `s` that `cell` reaches: window `k` holds the cell that starts at `o + k × step`. Each run moves as one block of `L` units.
+/// Writes `slots` as windows of the units of `s` that `cell` reaches: window `k` holds the cell that starts at `o + k × step`. Each run moves in blocks of `L` units (`Cell::each_way`).
 #[inline]
 fn windows<const L: usize, U: Unit>(slots: &mut [MaybeUninit<U>], s: &[U], o: usize, step: isize, cell: &Cell) {
     let width = cell.width();
@@ -243,7 +257,20 @@ fn windows<const L: usize, U: Unit>(slots: &mut [MaybeUninit<U>], s: &[U], o: us
     unsafe { cell.each_move::<L, U>(o, step, m, |item, at| (from.add(at), to.add(item))) }
 }
 
-/// Writes `m` cells into `out`, where [`windows`] reads them: cell `r` takes the places that `cell` reaches from `o + r × step`, from the units of `items` at `k + r × width` on, or from its only unit when it holds one. Each run moves as one block of `L` units.
+/// Writes into `slots` the cell that `cell` reaches from each offset along `axis`, from `base` in `s`, as [`windows`] writes the cells along a stride: cell `r` takes slots `r × width` on, and each run moves in blocks of `L` units. A missing offset leaves its cell's slots as they are.
+#[inline]
+fn cells_at<const L: usize, U: Unit>(slots: &mut [MaybeUninit<U>], s: &[U], base: usize, axis: &Steps, cell: &Cell) {
+    let width = cell.width();
+    assert_eq!(slots.len(), axis.len() * width, "a slot for each unit of each cell");
+    let (from, to, reach) = (s.as_ptr(), slots.as_mut_ptr().cast::<U>(), cell.reach());
+    axis.for_each(|r, o| if let Some(o) = o {
+        assert!(base + o + reach <= s.len(), "cell stays in range");
+        // SAFETY: the cell's runs reach below `s.len()`, and `slots` holds `width` units for each offset along `axis`.
+        unsafe { cell.each_move::<L, U>(base + o, 0, 1, |item, at| (from.add(at), to.add(r * width + item))) }
+    });
+}
+
+/// Writes `m` cells into `out`, where [`windows`] reads them: cell `r` takes the places that `cell` reaches from `o + r × step`, from the units of `items` at `k + r × width` on, or from its only unit when it holds one. Each run moves in blocks of `L` units (`Cell::each_way`).
 #[inline]
 fn windows_into<const L: usize, U: Unit>(out: &mut [U], items: &[U], o: usize, step: isize, m: usize, cell: &Cell, k: usize) {
     let width = cell.width();
@@ -251,7 +278,7 @@ fn windows_into<const L: usize, U: Unit>(out: &mut [U], items: &[U], o: usize, s
     let to = out.as_mut_ptr();
     // SAFETY, for each write: `check` found every run of every cell within `out`, and the slice of `items` holds `m` cells of `width` units.
     match items {
-        [x] => cell.each_run(o, step, m, |_, at| unsafe { to.add(at).cast::<[U; L]>().write([*x; L]) }),
+        [x] => cell.each_way::<L>(o, step, m, |_, at, _| unsafe { to.add(at).cast::<[U; L]>().write([*x; L]) }),
         _ => {
             let from = items[k..][..m * width].as_ptr();
             // SAFETY: as above.
@@ -1167,6 +1194,32 @@ unsafe fn written_as<A, B>(items: &mut [A]) -> &mut [B] {
     unsafe { std::slice::from_raw_parts_mut(items.as_mut_ptr().cast(), items.len()) }
 }
 
+/// The sizes, in bytes, of the runs that [`copied`] copies with a loop of its own, on x86-64 Linux with glibc alone. In this range glibc's `memcpy` copies with `rep movsb`, which Zen 3 and Zen 4 run many times slower when the destination sits a little past the source modulo 4 KB (glibc bug 30994, fixed in glibc 2.40). Below it `memcpy` copies with vector loops, and above it with vector loops whose stores bypass the cache. Elsewhere the range is empty: on this Mac, Apple's `memmove` copies about a third faster than the loop.
+const OWN_COPY: std::ops::Range<usize> = if cfg!(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu")) { 4 << 10..1 << 20 } else { 0..0 };
+
+/// Appends the items of `s` to `d`. A run whose size is in [`OWN_COPY`] copies in 64-byte blocks, stored where the destination's cache lines start. Other runs copy with `memcpy`.
+pub(crate) fn copied<T: Item>(d: &mut Vec<T>, s: &[T]) {
+    let bytes = size_of_val(s);
+    if !OWN_COPY.contains(&bytes) { return d.extend_from_slice(s); }
+    crate::slice::appended(d, s.len(), |slots| {
+        // SAFETY: an `Item` has no padding, so every byte of `s` is initialized, and `slots` holds the same number of bytes.
+        let (to, from) = unsafe { (std::slice::from_raw_parts_mut(slots.as_mut_ptr().cast::<MaybeUninit<u8>>(), bytes), std::slice::from_raw_parts(s.as_ptr().cast::<u8>(), bytes)) };
+        let bytewise = |to: &mut [MaybeUninit<u8>], from: &[u8]| for (slot, &byte) in to.iter_mut().zip(from) { slot.write(byte); };
+        // The blocks start where the destination's cache lines start, so that no store splits across two lines.
+        let head = to.as_ptr().align_offset(64);
+        let ((head_to, to), (head_from, from)) = (to.split_at_mut(head), from.split_at(head));
+        bytewise(head_to, head_from);
+        let ((blocks, tail), (sources, rest)) = (to.as_chunks_mut::<64>(), from.as_chunks::<64>());
+        for (block, source) in blocks.iter_mut().zip(sources) {
+            *block = source.map(MaybeUninit::new);
+            // SAFETY: no instructions. LLVM must assume that they read and write memory, so it keeps the loop instead of a call of `memcpy`.
+            #[cfg(target_arch = "x86_64")]
+            unsafe { std::arch::asm!("", options(nostack, preserves_flags)) }
+        }
+        bytewise(tail, rest);
+    })
+}
+
 /// Writes `items` into `out`, each converted by `conv`, as [`windows_into`] writes units: one cell at each start along a stride of `step` from `at`, with its items where `rest` reaches. Gives `false` where `rest` isn't a short cell (`short_cells`). Only the sources that [`Item::cells_into_f64`] names call it, so its loops compile for those pairs alone.
 fn converted_cells<S: Copy, D, C: Convert<S, D>>(out: &mut [D], items: &[S], conv: &C, at: usize, step: isize, rest: &[Cow<'_, Steps>]) -> bool {
     fn cells<const L: usize, S: Copy, D, C: Convert<S, D>>(out: &mut [D], items: &[S], conv: &C, at: usize, step: isize, cell: &Cell) {
@@ -1174,7 +1227,7 @@ fn converted_cells<S: Copy, D, C: Convert<S, D>>(out: &mut [D], items: &[S], con
         let m = items.len() / width;
         cell.check(at, step, m, out.len());
         let (from, to) = (items.as_ptr(), out.as_mut_ptr());
-        cell.each_way(at, step, m, |item, at, rev| {
+        cell.each_way::<L>(at, step, m, |item, at, rev| {
             // SAFETY: `items` holds `m` cells of `width` items, and `check` found every run of every cell within `out`.
             let (mut run, out) = unsafe { (from.add(item).cast::<[S; L]>().read(), &mut *to.add(at).cast::<[D; L]>()) };
             if rev { run.reverse() }
@@ -1243,16 +1296,16 @@ fn range_into<T: Item>(d: &mut Vec<T>, s: &[T], fill: T, base: usize, steps: &[C
     if left > whole * width { row(d, j + whole, 0, left - whole * width) }
 }
 
-/// The longest run of adjacent items that a short cell moves as one block of fixed size (`runs!`). A longer run copies with `extend_from_slice`.
+/// The longest run of adjacent items that a short cell moves as one block of fixed size (`runs!`). A short cell's longer run moves as several blocks of `RUN` units (`Cell::each_way`). Where one run is all that lies below an axis, a run longer than `RUN` copies through [`copied`].
 const RUN: usize = 8;
 /// The most items below one axis that `walk_into` reaches through a table of their offsets.
 const CELL: usize = 64;
 
-/// The cell below an axis, where `walk_into` and `scatter_into` reach every cell's items through one table of offsets: `rest` holds at least one axis and no fill, reaches at most `CELL` items, and ends in a run of at most `RUN` adjacent items, forwards or backwards.
+/// The cell below an axis, where `walk_into` and `scatter_into` reach every cell's items through one table of offsets: `rest` holds at least one axis and no fill, reaches at most `CELL` items, and ends in a run of adjacent items, forwards or backwards.
 fn short_cells(rest: &[Cow<Steps>]) -> Option<Cell> {
     let width: usize = rest.iter().map(|s| s.len()).product();
     let (len, rev) = match rest.last().map(|t| &**t) { Some(&Steps::Stride { len, step: 1, .. }) => (len, false), Some(&Steps::Stride { len, step: -1, .. }) => (len, true), _ => (1, false) };
-    if rest.is_empty() || !(1..=CELL).contains(&width) || len > RUN || rest.iter().any(|t| t.fills()) { return None; }
+    if rest.is_empty() || !(1..=CELL).contains(&width) || rest.iter().any(|t| t.fills()) { return None; }
     let (mut starts, runs) = ([0; CELL], width / len);
     // A reversed run reaches its highest offset first, and the table holds its lowest.
     for (i, start) in starts[..runs].iter_mut().enumerate() { *start = Steps::reach(0, rest, i * len).expect("a short cell holds no fill") - if rev { len - 1 } else { 0 } }
@@ -1278,25 +1331,23 @@ fn walk_axis<T: Item>(d: &mut Vec<T>, s: &[T], fill: T, base: usize, axis: &Step
         if let Steps::Stride { start: b, len: n, step: 1 } = **inner {
             if n > RUN {
                 d.reserve(axis.len() * n);
-                axis.for_each(|_, o| match o { Some(o) => d.extend_from_slice(&s[base + b + o..][..n]), None => d.extend(std::iter::repeat_n(fill, n)) });
+                axis.for_each(|_, o| match o { Some(o) => copied(d, &s[base + b + o..][..n]), None => d.extend(std::iter::repeat_n(fill, n)) });
                 return;
             }
         }
     }
-    // Each offset along `axis` starts a copy of the same few items, where `rest` reaches from it, as windows give (`short_cells`). Along a stride, `windows` moves each run of a cell's adjacent items as one block, straight into spare capacity, so the loop over starts makes no call. Other axes write the fills first, which a missing start keeps.
+    // Each offset along `axis` starts a copy of the same few items, where `rest` reaches from it, as windows give (`short_cells`). Each run of a cell's adjacent items moves as one block: along a stride through `windows`, straight into spare capacity, so the loop over starts makes no call, and along other axes through `cells_at`. Where an axis has fills, the fills go in first, which a missing start keeps.
     if let Some(cell) = short_cells(rest) {
         let width = cell.width();
         if let Steps::Stride { start: a, len: m, step } = *axis {
             // SAFETY: `windows` writes only units read from `s`, which hold items of `d`'s type.
             return runs!(cell.len, L => crate::slice::appended(d, m * width, |slots| windows::<L, T::Unit>(unsafe { written_as(slots) }, units(s), base + a, step, &cell)));
         }
+        // SAFETY, for both calls: `cells_at` writes only units read from `s`, which hold items of `d`'s type.
+        if !axis.fills() { return runs!(cell.len, L => crate::slice::appended(d, axis.len() * width, |slots| cells_at::<L, T::Unit>(unsafe { written_as(slots) }, units(s), base, axis, &cell))); }
         let start = d.len();
         d.resize(start + axis.len() * width, fill);
-        let out = &mut d[start..];
-        axis.for_each(|r, o| if let Some(o) = o {
-            let (out, s) = (&mut out[r * width..][..width], &s[base + o..]);
-            for (slot, c) in out.iter_mut().zip(cell.offsets()) { *slot = s[c] }
-        });
+        runs!(cell.len, L => cells_at::<L, T::Unit>(unsafe { written_as(&mut d[start..]) }, units(s), base, axis, &cell));
         return;
     }
     if !rest.is_empty() {
@@ -1308,7 +1359,7 @@ fn walk_axis<T: Item>(d: &mut Vec<T>, s: &[T], fill: T, base: usize, axis: &Step
     // Each loop gets the source from `base` onwards by value, so that the compiler keeps its bounds in registers.
     let s = &s[base..];
     match *axis {
-        Steps::Stride { start, len, step: 1 } => d.extend_from_slice(&s[start..start + len]),
+        Steps::Stride { start, len, step: 1 } => copied(d, &s[start..start + len]),
         Steps::Stride { start, len, step: -1 } => d.extend(s[start + 1 - len..=start].iter().rev().copied()),
         Steps::Stride { start, len, step: 0 } => d.extend(std::iter::repeat_n(s[start], len)),
         Steps::Stride { start, len, step } => {

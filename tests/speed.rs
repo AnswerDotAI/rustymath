@@ -14,25 +14,34 @@ type Costed = (&'static str, [Timed; 2]);
 /// A cost in copies, and the time per item in ns that gives it.
 type Timed = (f64, f64);
 
-/// The fastest of `RUNS` runs of `run`, as `timing::fastest` times them, in ns for each of `n` items.
-fn fastest(n: usize, run: impl FnMut(usize)) -> f64 { timing::fastest(run) * 1e9 / n as f64 }
+/// The fastest of `RUNS` runs of `run`, as `timing::fastest` times them, in ns for each of `n` items. First it reads one byte in every 64 of each of `inputs`, which hold the sets that `set` gives the runs. That brings every set into cache, whatever ran since the sets were built, without calling the function on them, so its branch predictor still meets each set fresh. Runs that read the same inputs each time pass none: their first run brings them into cache.
+fn fastest(n: usize, inputs: &[&[u8]], run: impl FnMut(usize)) -> f64 {
+    for x in inputs { for &b in x.iter().step_by(64) { black_box(b); } }
+    timing::fastest(run) * 1e9 / n as f64
+}
 
 /// Run `k`'s inputs, from `x`, which holds `RUNS` sets of them one after another. Each run reads inputs that no earlier run has read. A branch predictor learns the outcomes of up to tens of thousands of items it has seen. On repeated inputs, a function that branches on its data runs as fast as on sorted data.
 fn set<A>(x: &[A], k: usize) -> &[A] { let n = x.len() / RUNS; &x[k * n..][..n] }
 
-/// The fastest of `RUNS` runs of `f`, which writes `n` outputs into a slice, in ns per item.
-fn time_slice<T: Copy + Default>(n: usize, f: impl Fn(usize, &mut [T])) -> f64 {
+/// The bytes of `x`, which `fastest` reads before it times a case.
+fn bytes<T>(x: &[T]) -> &[u8] {
+    // SAFETY: every input is a slice of numbers, with no padding or uninitialized bytes.
+    unsafe { std::slice::from_raw_parts(x.as_ptr().cast(), size_of_val(x)) }
+}
+
+/// The fastest of `RUNS` runs of `f`, which writes `n` outputs into a slice, in ns per item. `inputs` are as `fastest` takes them.
+fn time_slice<T: Copy + Default>(n: usize, inputs: &[&[u8]], f: impl Fn(usize, &mut [T])) -> f64 {
     let mut out = vec![T::default(); n];
-    fastest(n, |k| {
+    fastest(n, inputs, |k| {
         f(k, &mut out);
         black_box(&mut out);
     })
 }
 
-/// The fastest of `RUNS` runs of `f`, which appends `n` outputs to an empty vector, in ns per item.
-fn time_appended<T>(n: usize, f: impl Fn(usize, &mut Vec<T>)) -> f64 {
+/// The fastest of `RUNS` runs of `f`, which appends `n` outputs to an empty vector, in ns per item. `inputs` are as `fastest` takes them.
+fn time_appended<T>(n: usize, inputs: &[&[u8]], f: impl Fn(usize, &mut Vec<T>)) -> f64 {
     let mut out = Vec::with_capacity(n);
-    fastest(n, |k| {
+    fastest(n, inputs, |k| {
         out.clear();
         f(k, &mut out);
         black_box(&mut out);
@@ -41,22 +50,22 @@ fn time_appended<T>(n: usize, f: impl Fn(usize, &mut Vec<T>)) -> f64 {
 
 /// The time per item of `f` on each of the inputs in `x`.
 fn time<A: Copy, T: Copy + Default>(x: &[A], f: impl Fn(A) -> T) -> f64 {
-    time_slice(x.len() / RUNS, |k, out| { for (o, &v) in out.iter_mut().zip(black_box(set(x, k))) { *o = f(v); } })
+    time_slice(x.len() / RUNS, &[bytes(x)], |k, out| { for (o, &v) in out.iter_mut().zip(black_box(set(x, k))) { *o = f(v); } })
 }
 
 /// The time per item of `k`'s slice form on the inputs in `x`.
-fn time_unary<F, K: Unary<F>>(x: &[F], k: &K) -> f64 { let n = x.len() / RUNS; time_appended(n, |r, out| { k.many(Arg::Many(black_box(set(x, r))), n, out); }) }
+fn time_unary<F, K: Unary<F>>(x: &[F], k: &K) -> f64 { let n = x.len() / RUNS; time_appended(n, &[bytes(x)], |r, out| { k.many(Arg::Many(black_box(set(x, r))), n, out); }) }
 
 /// The time per item of `k`'s slice form on the pairs of inputs in `x` and `y`.
 fn time_binary<F: Copy, K: Binary<F>>(x: &[F], y: &[F], k: &K) -> f64 {
     let n = x.len() / RUNS;
-    time_appended(n, |r, out| { k.many(Arg::Many(black_box(set(x, r))), Arg::Many(set(y, r)), n, out); })
+    time_appended(n, &[bytes(x), bytes(y)], |r, out| { k.many(Arg::Many(black_box(set(x, r))), Arg::Many(set(y, r)), n, out); })
 }
 
 /// The time per item of `k`'s slice form on the triples of inputs in `x`, `y` and `z`.
 fn time_ternary<F: Copy, K: Ternary<F>>(x: &[F], y: &[F], z: &[F], k: &K) -> f64 {
     let n = x.len() / RUNS;
-    time_appended(n, |r, out| {
+    time_appended(n, &[bytes(x), bytes(y), bytes(z)], |r, out| {
         k.many(Arg::Many(black_box(set(x, r))), Arg::Many(set(y, r)), Arg::Many(set(z, r)), n, out);
     })
 }
@@ -81,12 +90,12 @@ fn widths(lo: f64, hi: f64, step: f64, len: usize) -> (Vec<f64>, Vec<f32>) {
     (x, narrowed)
 }
 
-/// A row of the comparison table in `src/lib.md`, `name`: the times of its own slice form and of the standard library's version, at f64 and then f32, and its own costs in copies. Each width's copy is timed just before its own slice form.
+/// A row of the comparison table in `src/lib.md`, `name`: the times of its own slice form and of the standard library's version, at f64 and then f32, and its own costs in copies.
 fn compare(
     units: &Units<f64, f32>, name: &'static str, ours64: impl FnOnce() -> f64, std64: impl FnOnce() -> f64, ours32: impl FnOnce() -> f64,
     std32: impl FnOnce() -> f64) -> Compared {
-    let ((c64, t64), s64) = (units.0.beside(ours64), std64());
-    let ((c32, t32), s32) = (units.1.beside(ours32), std32());
+    let ((c64, t64), s64) = (units.0.cost(ours64), std64());
+    let ((c32, t32), s32) = (units.1.cost(ours32), std32());
     (name, [t64, s64, t32, s32], [(c64, t64), (c32, t32)])
 }
 
@@ -103,7 +112,7 @@ macro_rules! unary {
 /// The time per item of `f` on each pair of `x` and `y`, called one pair at a time.
 fn time_pairs<F: Copy, T: Copy + Default>(x: &[F], y: &[F], f: impl Fn(F, F) -> T) -> f64 {
     let n = x.len() / RUNS;
-    time_slice(n, |r, out| { let (x, y) = (black_box(set(x, r)), set(y, r)); for i in 0..n { out[i] = f(x[i], y[i]) } })
+    time_slice(n, &[bytes(x), bytes(y)], |r, out| { let (x, y) = (black_box(set(x, r)), set(y, r)); for i in 0..n { out[i] = f(x[i], y[i]) } })
 }
 
 /// The times of its slice form and of a reference version pair by pair, on pairs from the ranges `xs` and `ys`, at f64 and then f32. With `one`, it times `k`'s scalar form pair by pair in place of its slice form.
@@ -119,7 +128,8 @@ fn binary<K: Binary<f64, Out = f64> + Binary<f32, Out = f32>>(
 /// The times of a reduction or scan of `rustymath::reduce`, and the times of the same taken item by item in order, which the compiler can't vectorize for floats.
 fn reductions(units: &Units<f64, f32>) -> [Compared; 4] {
     let (x64, x32) = widths(-1.0, 1.0, GOLDEN, N);
-    let fold = |run: &dyn Fn(usize) -> f64| { fastest(N, |k| { black_box(run(k)); }) };
+    let (b64, b32) = (bytes(&x64), bytes(&x32));
+    let fold = |x: &[u8], run: &dyn Fn(usize) -> f64| { fastest(N, &[x], |k| { black_box(run(k)); }) };
     let mut s64 = Vec::with_capacity(N);
     let mut s32 = Vec::with_capacity(N);
     let scan64 = |x: &[f64], out: &mut Vec<f64>| {
@@ -140,35 +150,35 @@ fn reductions(units: &Units<f64, f32>) -> [Compared; 4] {
     };
     [
         compare(
-            units, "reduce::sum", || fold(&|k| reduce::sum(black_box(set(&x64, k))).0), || fold(&|k| black_box(set(&x64, k)).iter().sum::<f64>()),
-            || fold(&|k| f64::from(reduce::sum(black_box(set(&x32, k))).0)), || fold(&|k| f64::from(black_box(set(&x32, k)).iter().sum::<f32>()))), compare(
-            units, "reduce::max", || fold(&|k| reduce::max(black_box(set(&x64, k)))),
-            || fold(&|k| black_box(set(&x64, k)).iter().copied().fold(f64::NEG_INFINITY, f64::max)),
-            || fold(&|k| f64::from(reduce::max(black_box(set(&x32, k))))),
-            || fold(&|k| f64::from(black_box(set(&x32, k)).iter().copied().fold(f32::NEG_INFINITY, f32::max)))), compare(units, "reduce::cumsum", || {
-                time_appended(N, |k, out| { reduce::cumsum(set(&x64, k), None, out); })
+            units, "reduce::sum", || fold(b64, &|k| reduce::sum(black_box(set(&x64, k))).0), || fold(b64, &|k| black_box(set(&x64, k)).iter().sum::<f64>()),
+            || fold(b32, &|k| f64::from(reduce::sum(black_box(set(&x32, k))).0)), || fold(b32, &|k| f64::from(black_box(set(&x32, k)).iter().sum::<f32>()))), compare(
+            units, "reduce::max", || fold(b64, &|k| reduce::max(black_box(set(&x64, k)))),
+            || fold(b64, &|k| black_box(set(&x64, k)).iter().copied().fold(f64::NEG_INFINITY, f64::max)),
+            || fold(b32, &|k| f64::from(reduce::max(black_box(set(&x32, k))))),
+            || fold(b32, &|k| f64::from(black_box(set(&x32, k)).iter().copied().fold(f32::NEG_INFINITY, f32::max)))), compare(units, "reduce::cumsum", || {
+                time_appended(N, &[b64], |k, out| { reduce::cumsum(set(&x64, k), None, out); })
             }, || {
-                fastest(N, |k| {
+                fastest(N, &[b64], |k| {
                     s64.clear();
                     scan64(black_box(set(&x64, k)), &mut s64);
                     black_box(&s64);
                 })
             }, || {
-                time_appended(N, |k, out| { reduce::cumsum(set(&x32, k), None, out); })
+                time_appended(N, &[b32], |k, out| { reduce::cumsum(set(&x32, k), None, out); })
             }, || {
-                fastest(N, |k| {
+                fastest(N, &[b32], |k| {
                     s32.clear();
                     scan32(black_box(set(&x32, k)), &mut s32);
                     black_box(&s32);
                 })
-            }), compare(units, "reduce::cummax", || time_appended(N, |k, out| reduce::cummax(set(&x64, k), None, out)), || {
-                fastest(N, |k| {
+            }), compare(units, "reduce::cummax", || time_appended(N, &[b64], |k, out| reduce::cummax(set(&x64, k), None, out)), || {
+                fastest(N, &[b64], |k| {
                     s64.clear();
                     max64(black_box(set(&x64, k)), &mut s64);
                     black_box(&s64);
                 })
-            }, || time_appended(N, |k, out| reduce::cummax(set(&x32, k), None, out)), || {
-                fastest(N, |k| {
+            }, || time_appended(N, &[b32], |k, out| reduce::cummax(set(&x32, k), None, out)), || {
+                fastest(N, &[b32], |k| {
                     s32.clear();
                     max32(black_box(set(&x32, k)), &mut s32);
                     black_box(&s32);
@@ -184,7 +194,7 @@ impl<T: Copy + Default + Neg<Output = T>> Unit<T> {
     fn new() -> Self { Self(timing::copy_time::<T>(N), PhantomData) }
 
     /// The cost in copies, and the time per item in ns, of `run`, which gives a time per item in ns.
-    fn beside(&self, run: impl FnOnce() -> f64) -> Timed { let t = run(); (t / (self.0.seconds * 1e9), t) }
+    fn cost(&self, run: impl FnOnce() -> f64) -> Timed { let t = run(); (t / (self.0.seconds * 1e9), t) }
 }
 
 /// A unit at f64 and one at f32, for real or for complex items.
@@ -192,7 +202,7 @@ struct Units<A, B>(Unit<A>, Unit<B>);
 
 impl<A: Copy + Default + Neg<Output = A>, B: Copy + Default + Neg<Output = B>> Units<A, B> {
     /// The costs of `run64` and `run32`, each a time per item, against the unit at its own width.
-    fn costs(&self, run64: impl FnOnce() -> f64, run32: impl FnOnce() -> f64) -> [Timed; 2] { [self.0.beside(run64), self.1.beside(run32)] }
+    fn costs(&self, run64: impl FnOnce() -> f64, run32: impl FnOnce() -> f64) -> [Timed; 2] { [self.0.cost(run64), self.1.cost(run32)] }
 }
 
 /// The functions that the standard library lacks, with their costs in copies of floats against `units`. The incomplete gamma and beta functions iterate, and run on 1,024 inputs. The others run on 16,384.
@@ -274,7 +284,7 @@ fn inner_products(units: &Units<f64, f32>) -> [Costed; 6] {
     let size = [256; 3];
     let first = |(x, y): (Vec<f64>, Vec<f32>)| (set(&x, 0).to_vec(), set(&y, 0).to_vec());
     let ((a64, a32), (b64, b32)) = (first(widths(-1.0, 1.0, GOLDEN, N)), first(widths(-1.0, 1.0, SILVER, N)));
-    let run = |k: &dyn Fn() -> usize| { fastest(N, |_| { black_box(k()); }) };
+    let run = |k: &dyn Fn() -> usize| { fastest(N, &[], |_| { black_box(k()); }) };
     macro_rules! copies {
         ($k:expr) => {
             units.costs(|| run(&|| $k.inner(black_box(&a64), black_box(&b64), size).len()), || run(&|| $k.inner(black_box(&a32), black_box(&b32), size).len()))
@@ -285,7 +295,7 @@ fn inner_products(units: &Units<f64, f32>) -> [Costed; 6] {
     let wide = large.clone().map(|x| x.into_iter().map(|v| v << 20).collect::<Vec<_>>());
     macro_rules! integer_copies {
         ($k:expr, $large:expr, $small:expr) => {
-            [$large, $small].map(|[a, b]: &[Vec<i64>; 2]| units.0.beside(|| run(&|| $k.inner(black_box(a.as_slice()), black_box(b.as_slice()), size).len())))
+            [$large, $small].map(|[a, b]: &[Vec<i64>; 2]| units.0.cost(|| run(&|| $k.inner(black_box(a.as_slice()), black_box(b.as_slice()), size).len())))
         };
     }
     [
@@ -301,11 +311,11 @@ fn orderings(units: &Units<f64, f32>) -> [Costed; 6] {
     let (x64, x32) = widths(-1.0, 1.0, GOLDEN, N);
     let (w64, w32) = widths(0.0, 1.0, SILVER, N);
     let rows = [256, 256, 1];
-    let run = |k: &dyn Fn(usize)| fastest(N, |r| k(r));
+    let run = |inputs: &[&[u8]], k: &dyn Fn(usize)| fastest(N, inputs, |r| k(r));
     macro_rules! copies {
         (|$x:ident| $body:expr) => {
-            units.costs(|| run(&|r| { let $x = View::Floats(Floats::F64(set(&x64, r))); black_box($body); }),
-                || run(&|r| { let $x = View::Floats(Floats::F32(set(&x32, r))); black_box($body); }))
+            units.costs(|| run(&[bytes(&x64)], &|r| { let $x = View::Floats(Floats::F64(set(&x64, r))); black_box($body); }),
+                || run(&[bytes(&x32)], &|r| { let $x = View::Floats(Floats::F32(set(&x32, r))); black_box($body); }))
         };
     }
     let layout = layout::Layout::from([16, 64, 64]);
@@ -317,10 +327,10 @@ fn orderings(units: &Units<f64, f32>) -> [Costed; 6] {
         ("search::view_sort_along long lanes", copies!(|x| search::view_sort_along(x, [2, N / 2, 1], false).unwrap())),
         ("search::view_partition_along", copies!(|x| search::view_partition_along(x, rows, 128, false).unwrap())),
         ("search::view_quantiles_along", copies!(|x| search::view_quantiles_along(x, rows, &[0.5]).unwrap())),
-        ("stats::variance", units.costs(|| run(&|r| { black_box(stats::variance(set(&x64, r), rows, 0)); }),
-            || run(&|r| { black_box(stats::variance(set(&x32, r), rows, 0)); }))),
-        ("stats::average", units.costs(|| run(&|r| { black_box(stats::average(set(&x64, r), set(&w64, r), &axes, mappings)); }),
-            || run(&|r| { black_box(stats::average(set(&x32, r), set(&w32, r), &axes, mappings)); }))),
+        ("stats::variance", units.costs(|| run(&[bytes(&x64)], &|r| { black_box(stats::variance(set(&x64, r), rows, 0)); }),
+            || run(&[bytes(&x32)], &|r| { black_box(stats::variance(set(&x32, r), rows, 0)); }))),
+        ("stats::average", units.costs(|| run(&[bytes(&x64), bytes(&w64)], &|r| { black_box(stats::average(set(&x64, r), set(&w64, r), &axes, mappings)); }),
+            || run(&[bytes(&x32), bytes(&w32)], &|r| { black_box(stats::average(set(&x32, r), set(&w32, r), &axes, mappings)); }))),
     ]
 }
 
@@ -331,17 +341,17 @@ fn arrays(unit: &Unit<f32>) -> [(&'static str, &'static str, Timed); 4] {
     use layout::Layout;
     let x: Vec<f32> = (0..RUNS * N).map(|i| i as f32).collect();
     let integers: Vec<i32> = (0..RUNS * N).map(|i| i as i32).collect();
-    let differences = |layout: &Layout, axis| unit.beside(|| fastest(N, |r| {
+    let differences = |layout: &Layout, axis| unit.cost(|| fastest(N, &[bytes(&x)], |r| {
         black_box(Array::differences(ArrayView::compact(layout, View::Floats(Floats::F32(black_box(set(&x, r))))), axis).unwrap());
     }));
     let source = Layout::from([N / 64]);
     [
         ("f32", "Array::differences short lanes", differences(&Layout::from([N / 2, 2]), 1)),
         ("f32", "Array::differences", differences(&Layout::from([N]), 0)),
-        ("f32", "Array::broadcasted", unit.beside(|| fastest(N, |r| {
+        ("f32", "Array::broadcasted", unit.cost(|| fastest(N, &[bytes(&x)], |r| {
             black_box(Array::broadcasted(ArrayView::compact(&source, View::Floats(Floats::F32(black_box(&set(&x, r)[..N / 64])))), &[N / 64, 64]).unwrap());
         }))),
-        ("i64", "Buffer::cast i32", Unit::<i64>::new().beside(|| fastest(N, |r| {
+        ("i64", "Buffer::cast i32", Unit::<i64>::new().cost(|| fastest(N, &[bytes(&integers)], |r| {
             black_box(Buffer::cast(View::Integers(Ints::I32(black_box(set(&integers, r)))), DType::Integer(Width::I64)).unwrap());
         }))),
     ]
@@ -364,7 +374,7 @@ fn decompositions(units: &Units<f64, f32>, complex_units: &Units<num_complex::Co
     for i in 0..256 { s64[i * 257] += 256.0 }
     let narrow = |x: &[f64]| x.iter().map(|&v| v as f32).collect::<Vec<f32>>();
     let (a32, t32, b32, c32, s32) = (narrow(&a64), narrow(&t64), narrow(&b64), narrow(&c64), narrow(&s64));
-    let run = |items: usize, k: &dyn Fn() -> usize| { fastest(items, |_| { black_box(k()); }) };
+    let run = |items: usize, k: &dyn Fn() -> usize| { fastest(items, &[], |_| { black_box(k()); }) };
     let real = |k64: &dyn Fn() -> usize, k32: &dyn Fn() -> usize| units.costs(|| run(N, k64), || run(N, k32));
     let n = 128;
     let z64: Vec<Complex<f64>> = a64.iter().zip(&t64).take(n * n).map(|(&re, &im)| Complex::new(re, im)).collect();
@@ -442,9 +452,9 @@ fn measured(units: &Units<f64, f32>, complex_units: &Units<num_complex::Complex<
     let (c64, c32): (&[f64], &[f32]) = (black_box(&c64), black_box(&c32));
     let (x64, x32) = widths(-2.0, 2.0, GOLDEN, N);
     compared.push(compare(units, "polynomial::evaluate", || {
-        time_appended(N, |k, out| polynomial::evaluate(c64, black_box(set(&x64, k)), out))
+        time_appended(N, &[bytes(&x64)], |k, out| polynomial::evaluate(c64, black_box(set(&x64, k)), out))
     }, || time(&x64, |x| horner(c64, x)), || {
-        time_appended(N, |k, out| polynomial::evaluate(c32, black_box(set(&x32, k)), out))
+        time_appended(N, &[bytes(&x32)], |k, out| polynomial::evaluate(c32, black_box(set(&x32, k)), out))
     }, || time(&x32, |x| horner(c32, x))));
     let costed = compared.iter().map(|&(name, _, costs)| (name, costs)).chain(special(units)).chain(selections(units)).chain(complex(complex_units))
         .chain(inner_products(units)).chain(orderings(units)).chain(decompositions(units, complex_units))
@@ -491,44 +501,4 @@ fn speed() {
         failures.push(format!("{width} {name} has a budget in speed.txt, but the test doesn't time it"));
     }
     assert!(failures.is_empty(), "{failures:#?}");
-}
-
-/// Times `run` as `time_appended` does, with its output appended after the first `skip` items of `out`, and gives the time and the output's byte offset modulo 4 KiB.
-fn placed(out: &mut Vec<f64>, skip: usize, run: impl Fn(usize, &mut Vec<f64>)) -> (f64, usize) {
-    out.resize(skip, 0.0);
-    let ns = fastest(N, |k| {
-        out.truncate(skip);
-        run(k, out);
-        black_box(&mut *out);
-    });
-    (ns, out[skip..].as_ptr() as usize % 4096)
-}
-
-/// Temporary, for one CI run: f64 `Abs`, `Maximum`, `Clip` and `Choose` timed with their output at a range of byte offsets, modulo 4 KiB, from inputs that start on 4 KiB boundaries, in two passes. It prints each time with `RUSTYMATH_COSTS` set and never fails. It tests whether the output's placement relative to the inputs sets the cost of `Clip` and `Choose` on CI's runner.
-#[test]
-#[cfg_attr(debug_assertions, ignore = "debug assertions change the costs it times")]
-fn placements() {
-    let _lock = timing::exclusive().unwrap();
-    let values = [inputs(-1.0, 1.0, GOLDEN, N), inputs(-0.6, -0.4, BRONZE, N), inputs(0.4, 0.6, BRONZE, N), inputs(0.0, 1.0, BRONZE, N).iter().map(|m| m.round()).collect()];
-    let mut held = vec![0.0; values.len() * RUNS * N + 512];
-    let start = held.as_ptr().align_offset(4096);
-    for (i, v) in values.iter().enumerate() { held[start + i * RUNS * N..][..RUNS * N].copy_from_slice(v); }
-    let [a, b, c, m]: [&[f64]; 4] = std::array::from_fn(|i| &held[start + i * RUNS * N..][..RUNS * N]);
-    let mut out: Vec<f64> = Vec::with_capacity(N + 512);
-    let base = out.as_ptr() as usize % 4096;
-    let mut stderr = std::io::stderr();
-    for pass in 0..2 {
-        for offset in [0, 8, 32, 64, 128, 192, 256, 384, 512, 1024, 2048, 3072, 4064] {
-            let skip = (offset + 4096 - base) % 4096 / 8;
-            let times = [
-                ("Abs", placed(&mut out, skip, |k, o| { Abs.many(Arg::Many(black_box(set(a, k))), N, o); })),
-                ("Maximum", placed(&mut out, skip, |k, o| { reduce::Maximum.many(Arg::Many(black_box(set(a, k))), Arg::Many(set(b, k)), N, o); })),
-                ("Clip", placed(&mut out, skip, |k, o| { Clip.many(Arg::Many(black_box(set(a, k))), Arg::Many(set(b, k)), Arg::Many(set(c, k)), N, o); })),
-                ("Choose", placed(&mut out, skip, |k, o| { Choose.many(Arg::Many(black_box(set(a, k))), Arg::Many(set(b, k)), Arg::Many(set(m, k)), N, o); })),
-            ];
-            if std::env::var_os("RUSTYMATH_COSTS").is_some() {
-                for (name, (ns, at)) in times { writeln!(stderr, "placement pass {pass}: f64 {name} with its output {at} bytes past its inputs: {ns:.3} ns").unwrap(); }
-            }
-        }
-    }
 }

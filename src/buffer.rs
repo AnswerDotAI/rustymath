@@ -23,7 +23,7 @@ macro_rules! buffers {
             /// Copies `range` of `source` when it has this buffer's element type, and gives whether it could.
             pub fn extend_from(&mut self, source: $view<'_>, range: std::ops::Range<usize>) -> bool {
                 match (self, source) {
-                    $((Self::$variant(d), $view::$variant(s)) => d.extend_from_slice(&s[range]),)+
+                    $((Self::$variant(d), $view::$variant(s)) => crate::gather::copied(d, &s[range]),)+
                     #[allow(unreachable_patterns)]
                     _ => return false,
                 }
@@ -448,10 +448,10 @@ impl Buffer {
     /// Copies `range` of `source` when it has this buffer's dtype, and gives whether it could. Integers of another width don't copy.
     pub fn extend_from(&mut self, source: View<'_>, range: std::ops::Range<usize>) -> bool {
         match (self, source) {
-            (Self::Booleans(d), View::Booleans(s)) => d.extend_from_slice(&s[range]),
+            (Self::Booleans(d), View::Booleans(s)) => crate::gather::copied(d, &s[range]),
             (Self::Integers(d), View::Integers(s)) => return d.extend_from(s, range),
             (Self::Floats(d), View::Floats(s)) => return d.extend_from(s, range), (Self::Complexes(d), View::Complexes(s)) => return d.extend_from(s, range),
-            (Self::Characters(d), View::Characters(s)) => d.extend_from_slice(&s[range]), _ => return false
+            (Self::Characters(d), View::Characters(s)) => crate::gather::copied(d, &s[range]), _ => return false
         }
         true
     }

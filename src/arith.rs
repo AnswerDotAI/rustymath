@@ -59,9 +59,6 @@ pub struct Negate;
 /// 1 ÷ x. A float or complex result never fails. An integer's reciprocal is an integer only for 1 and -1, and fails for every other integer.
 #[derive(Clone, Copy, Debug)]
 pub struct Reciprocal;
-/// x × x.
-#[derive(Clone, Copy, Debug)]
-pub struct Square;
 /// π × x, or π × (x ÷ y) of two arguments, at every float and complex type.
 #[derive(Clone, Copy, Debug)]
 pub struct PiTimes;
@@ -74,7 +71,6 @@ forms!(#[inline] Negate at u8, i16, i32, i64: |_, [x]| { let (r, overflowed) = x
 forms!(#[inline] Reciprocal at real: |_, [x]| Total(1.0 / x));
 forms!(#[inline] Reciprocal at Complex<f32>, Complex<f64>: |_, [x]| Total(crate::divide(Complex::new(1.0, 0.0), x)));
 forms!(#[inline] Reciprocal at u8, i16, i32, i64: |_, [x]| (x.checked_mul(x) == Some(1)).then_some(x));
-forms!(#[inline] Square at real: |_, [x]| Total(x * x));
 forms!(#[inline] PiTimes at real: |_, [x]| Total(pi_times(x)));
 forms!(#[inline] PiTimes at real: |_, [x, y]| Total(pi_times(x / y)));
 forms!(#[inline] PiTimes at Complex<f32>: |_, [x]| Total(x * std::f32::consts::PI));

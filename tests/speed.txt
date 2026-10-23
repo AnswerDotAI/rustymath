@@ -9,13 +9,13 @@
 # - Matrix-vector products: about 7 at f64 and 5 at f32 for a 256×256 matrix, and 29 and 18 for a complex 128×128 one.
 # - Tall thin Gram products, a tall matrix's transpose times the matrix: about 7 at f64 and 4 at f32 for a 4096×16 matrix.
 [f64]
-# 7 copies, for 28 vector ops: clamp, reduction by ln 2, a degree-9 polynomial, scaling by 2^n.
-Exp	14	14
-# 8.5 copies, for 34 vector ops: exp's steps with a longer polynomial near 0.
-Expm1	17	17
-# 6.5 copies, for 26 vector ops: a test for each block of 16 items that every item is positive, normal and finite, then the split into mantissa and exponent, one division, a series in s² and the combine. A block of 16 items that holds a zero, a negative, a subnormal, an infinity or NaN takes the full form with its special values, which costs about 1.9 times as much on macOS.
+# 5.75 copies, for 23 vector ops: a test for each block of 64 items that every item lies within ±708, then reduction by ln 2, a degree-9 polynomial and one power of two. A block of items below -746, such as one that a causal mask fills with -∞, writes zeros. Any other block takes the clamp and two powers of two, which cost about 1.35 times as much on macOS.
+Exp	12	12
+# 5.75 copies, for 23 vector ops: exp's test and reduction, a degree-10 polynomial and one power of two, with the guards only in a block that holds an item beyond ±708.
+Expm1	12	12
+# 6.5 copies, for 26 vector ops: a test for each block of 64 items that every item is positive, normal and finite, then the split into mantissa and exponent, one division, a series in s² and the combine. A block of 64 items that holds a zero, a negative, a subnormal, an infinity or NaN takes the full form with its special values, which costs about 1.9 times as much on macOS.
 Ln	13	13
-# 10 copies, for 40 vector ops: ln's steps plus the correction for 1 + x, with the block test on 1 + x and on whether x is 0. A block of 16 items that holds a zero, a negative, a subnormal, an infinity or NaN takes the full form with its special values, which costs about 1.6 times as much on macOS.
+# 10 copies, for 40 vector ops: ln's steps plus the correction for 1 + x, with the block test on 1 + x and on whether x is 0. A block of 64 items that holds a zero, a negative, a subnormal, an infinity or NaN takes the full form with its special values, which costs about 1.6 times as much on macOS.
 Log1p	20	20
 # 6.5 copies, for 26 vector ops: ln's steps with a scaled combine.
 Log2	13	13
@@ -37,8 +37,8 @@ Atan	14	14
 Sinh	20	20
 # 8 copies, for 32 vector ops: exp and its reciprocal.
 Cosh	16	16
-# 10 copies, for 40 vector ops: expm1 and a division.
-Tanh	20	20
+# 7.5 copies, for 30 vector ops: expm1 without its guards, which |x| up to 20 never needs, a division and the sign.
+Tanh	15	15
 # 11.5 copies, for 46 vector ops: ln, a square root, selects.
 Asinh	23	23
 # 11.5 copies, for 46 vector ops: ln and a square root.
@@ -73,8 +73,8 @@ polynomial::evaluate	5.5	5.5
 Gamma	270	270
 # 54 copies, for 215 vector ops: a plain Lanczos sum, double-word ln, ln_split, sinpi.
 Lgamma	110	110
-# 32 copies, for 130 vector ops: every piece of the piecewise rational, selected per lane.
-Erf	64	64
+# 17.5 copies, for 70 vector ops: both of erf's formulas for every item, x + x a(x²) with 13 terms and 1 - e^-(|x| + |x| b(|x|)) with 14 terms and the full `exp`, then the selects. macOS measures about 25 copies, about 1.45 times the count, for a reason not yet found.
+Erf	35	35
 # 32 copies, for 130 vector ops: rational pieces with divisions, a double-word -a², exp_plus.
 Erfc	64	64
 # 20 copies, for 80 vector ops: piecewise rationals, ln and a square root in the tails.
@@ -172,13 +172,13 @@ Clip	4	4
 # 2 copies, for three reads and one write per item.
 Choose	4	4
 [f32]
-# 5.5 copies, for 22 vector ops: clamp, reduction by ln 2, a degree-9 polynomial, scaling by 2^n.
-Exp	11	11
-# 7 copies, for 27 vector ops: exp's steps with a longer polynomial near 0.
-Expm1	14	14
-# 5.25 copies, for 21 vector ops: a test for each block of 16 items that every item is positive, normal and finite, then the split into mantissa and exponent, one division, a series in s² and the combine. A block of 16 items that holds a zero, a negative, a subnormal, an infinity or NaN takes the full form with its special values, which costs about 1.7 times as much on macOS.
+# 4.5 copies, for 18 vector ops: a test for each block of 64 items that every item lies within ±87, then reduction by ln 2, a degree-4 polynomial and one power of two. A block of items below -105 writes zeros. Any other block takes the clamp and two powers of two.
+Exp	9	9
+# 4.5 copies, for 18 vector ops: exp's test and reduction, a degree-5 polynomial and one power of two, with the guards only in a block that holds an item beyond ±87.
+Expm1	9	9
+# 5.25 copies, for 21 vector ops: a test for each block of 64 items that every item is positive, normal and finite, then the split into mantissa and exponent, one division, a series in s² and the combine. A block of 64 items that holds a zero, a negative, a subnormal, an infinity or NaN takes the full form with its special values, which costs about 1.7 times as much on macOS.
 Ln	11	11
-# 8.75 copies, for 35 vector ops: ln's steps plus the correction for 1 + x, with the block test on 1 + x and on whether x is 0. A block of 16 items that holds a zero, a negative, a subnormal, an infinity or NaN takes the full form with its special values, which costs about 1.5 times as much on macOS.
+# 8.75 copies, for 35 vector ops: ln's steps plus the correction for 1 + x, with the block test on 1 + x and on whether x is 0. A block of 64 items that holds a zero, a negative, a subnormal, an infinity or NaN takes the full form with its special values, which costs about 1.5 times as much on macOS.
 Log1p	18	18
 # 5.25 copies, for 21 vector ops: ln's steps with a scaled combine.
 Log2	11	11
@@ -200,8 +200,8 @@ Atan	11	11
 Sinh	16	16
 # 6.5 copies, for 26 vector ops: exp and its reciprocal.
 Cosh	13	13
-# 8 copies, for 32 vector ops: expm1 and a division.
-Tanh	16	16
+# 5.5 copies, for 22 vector ops: expm1 without its guards, which |x| up to 9 never needs, a division and the sign.
+Tanh	11	11
 # 9 copies, for 37 vector ops: ln, a square root, selects.
 Asinh	18	18
 # 9 copies, for 37 vector ops: ln and a square root.
@@ -236,11 +236,11 @@ polynomial::evaluate	5.5	5.5
 Gamma	150	150
 # 50 copies, for 100 ops in f64 at half the lanes.
 Lgamma	100	100
-# 25 copies, for 100 vector ops: the piecewise rational.
-Erf	50	50
-# 25 copies, for 100 vector ops: the same pieces. It costs 50.3 copies on CI on 22 October 2026, more than twice that, so its Linux budget is unchanged until the cost is studied.
-Erfc	50	110
-# 17.5 copies, for 70 vector ops: the same.
+# 12.5 copies, for 50 vector ops: both of erf's formulas for every item, x + x a(x²) with 6 terms and 1 - e^-(|x| + |x| b(|x|)) with 7 terms and f32's `exp`, then the selects.
+Erf	25	25
+# 52 copies, for 209 vector instructions: the speed test's items, -5 to 10, make every block of 512 mixed, and f32's mixed blocks run both formulas. Their loop retires 209 instructions for each vector of four items (`bpl-tests disasm` of `erfc_blocks::<f32, true>`, 23 October 2026), about twice the 100 operations the formulas hold. Both formulas' coefficients don't fit in the 32 vector registers, so the loop reloads about 35 of them on each pass, and it adds selects and register moves. macOS measured 46.3 to 50.6 in five runs that day, with `erfc_blocks` on `slice::blocks` and on a loop of its own, and CI measured 50.3 on 22 October 2026.
+Erfc	104	104
+# 17.5 copies, for 70 vector ops.
 Erfinv	35	35
 # 18 copies, for 72 vector ops: the same.
 Erfcinv	36	36

@@ -139,12 +139,7 @@ impl Short {
 /// The digits of each of `values` in the mixed radix of `bases`, as APL's `⊤` gives them: each value's digits together, the most significant first. A base of 0 takes all of what remains as its digit. `None` where a quotient isn't an `i64`.
 pub fn encode(bases: &[i64], values: &[i64]) -> Option<Vec<i64>> {
     let divisors: Vec<_> = bases.iter().map(|&b| Divisor::new(b)).collect();
-    let mut digits = vec![0; bases.len() * values.len()];
-    for (out, &value) in digits.chunks_mut(bases.len().max(1)).zip(values) {
-        let mut value = value;
-        for (digit, divisor) in out.iter_mut().zip(&divisors).rev() { (value, *digit) = match divisor { Some(d) => d.div_mod(value)?, None => (0, value) }; }
-    }
-    Some(digits)
+    crate::polynomial::encoded(&divisors, values, |d, v| match d { Some(d) => d.div_mod(v), None => Some((0, v)) })
 }
 
 /// The value of each cell of `bases.len()` digits in `digits`, in the mixed radix of `bases`, as APL's `⊥` gives it. The first base is never used. `None` where a step isn't an `i64`.

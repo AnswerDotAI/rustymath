@@ -35,7 +35,7 @@ fn natural<R: Native>() -> ((R, R), R) { (ln2(), R::one()) }
 
 /// Whether `log` needs none of its special values at x: x is positive, normal and finite.
 #[inline(always)]
-fn usual<R: Native>(x: R) -> bool { (x >= R::min_positive_value()) & (x < R::infinity()) }
+fn usual<R: Native>(x: R) -> bool { x.positive_normal() }
 
 /// The logarithm of m × 2^e, split as `(m, e)`, to the base that `(base, k)` gives, as `based` takes them, with none of `log`'s special values.
 #[inline(always)]
@@ -115,7 +115,8 @@ many |_, [b, x], n, out| match (b, x) {
         // Bases 2 and 10 divide by 1, which their loop skips, and take the logarithms' fast form for usual items. Any other base divides by ln b, which can be 0 or NaN, so its loop judges every result.
         let (to, d) = for_base::<_, { crate::FUSED }>(c);
         if d == 1.0 {
-            crate::slice::each_usual(x, n, out, usual, #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), to), #[inline(always)] |x| log::<_, { crate::FUSED }>(x, to))
+            crate::slice::each_usual(x, n, out, (usual, #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), to)), crate::slice::none(),
+                #[inline(always)] |x| log::<_, { crate::FUSED }>(x, to))
         } else {
             each!([b, x], n, out, |[_, x]| log::<_, { crate::FUSED }>(x, to) / d)
         }
@@ -158,24 +159,14 @@ fn log1p_usual<R: Native, const FUSED: bool>(x: R) -> R { let u = x + R::one(); 
 #[inline(always)]
 fn usual1p<R: Native>(x: R) -> bool { usual(x + R::one()) & (x != R::zero()) }
 
-/// Declares a logarithm's function object. Its slice form takes the logarithm's special values only in blocks of items that hold one, through `each_usual`: `$usual` says whether an item needs none, and `$fast` computes such an item.
-macro_rules! logarithm {
-    ($(#[doc = $doc:literal])* $object:ident: $name:ident, $usual:expr, $fast:expr) => {
-        $(#[doc = $doc])*
-        #[derive(Clone, Copy, Debug)]
-        pub struct $object;
-        forms!($object at real: |_, [x]| $name::<_, { crate::FUSED }>(x),
-            many |_, [x], n, out| crate::slice::each_usual(x, n, out, $usual, $fast, #[inline(always)] |x| $name::<_, { crate::FUSED }>(x)));
-    };
-}
-logarithm!(/// [`ln`](crate::ln) as a function object.
-    Ln: ln, usual, #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), natural()));
-logarithm!(/// [`log2`](crate::log2) as a function object.
-    Log2: log2, usual, #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), base2()));
-logarithm!(/// [`log10`](crate::log10) as a function object.
-    Log10: log10, usual, #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), base10()));
-logarithm!(/// [`log1p`](crate::log1p) as a function object.
-    Log1p: log1p, usual1p, log1p_usual::<_, { crate::FUSED }>);
+usual_object!(/// [`ln`](crate::ln) as a function object.
+    Ln: ln, usual => #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), natural()));
+usual_object!(/// [`log2`](crate::log2) as a function object.
+    Log2: log2, usual => #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), base2()));
+usual_object!(/// [`log10`](crate::log10) as a function object.
+    Log10: log10, usual => #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), base10()));
+usual_object!(/// [`log1p`](crate::log1p) as a function object.
+    Log1p: log1p, usual1p => log1p_usual::<_, { crate::FUSED }>);
 
 /// ln 2 as a double word.
 const LN2: (f64, f64) = (0.693147180559945286226764, 2.319046813846299558417771e-17);

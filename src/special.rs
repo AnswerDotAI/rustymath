@@ -586,30 +586,28 @@ many |_, [x], n, out| match x {
     x => each!([x], n, out, |[x]| crate::slice::Total(erfc::<_, { crate::FUSED }>(x))),
 });
 
-/// `erfc` on each item of `x`, written into `out`, a block of `BLOCK` items at a time. A block whose magnitudes all lie below `ERFC_SPLIT` computes only `erfc_near`, and one whose magnitudes all reach it computes only `erfc_far`. Where `branches` holds, a mixed block's items are partitioned: `placed` puts the positions of those below `ERFC_SPLIT` at the front and the others' at the back, and each formula runs on its own items, gathered into one buffer, as `regions` does, because a branch on each item was mispredicted on mixed arguments. Elsewhere a mixed block runs `erfc`, which computes both formulas in every lane. Partitioning every block added about 12 instructions an item, more than computing in place where a block lies in one region.
+/// `erfc` on each item of `x`, written into `out`, through `slice::blocks` of 512 items. A block whose magnitudes all lie below `ERFC_SPLIT` computes only `erfc_near`, and one whose magnitudes all reach it computes only `erfc_far`. Where `branches` holds, a mixed block's items are partitioned: `placed` puts the positions of those below `ERFC_SPLIT` at the front and the others' at the back, and each formula runs on its own items, gathered into one buffer, as `regions` does, because a branch on each item was mispredicted on mixed arguments. Elsewhere a mixed block runs `erfc`, which computes both formulas in every lane. Partitioning every block added about 12 instructions an item, more than computing in place where a block lies in one region. Blocks of 64, the size `each_usual` uses, cost the normal CDF about 7% more instructions on shuffled and on sorted items than blocks of 512.
 fn erfc_blocks<R: Native, const FUSED: bool>(x: &[R], out: &mut [MaybeUninit<R>]) -> bool {
     const BLOCK: usize = 512;
-    #[inline(always)]
-    fn fill<R: Native>(xs: &[R], os: &mut [MaybeUninit<R>], f: impl Fn(R) -> R) { for (o, &v) in os.iter_mut().zip(xs) { o.write(f(v)); } }
     let (mut place, mut t) = ([0u16; BLOCK], [R::zero(); BLOCK]);
     let split = R::narrow(ERFC_SPLIT);
     #[inline(always)]
     fn near<R: Native, const FUSED: bool>(v: R) -> R { erfc_ends(v, erfc_near::<R, FUSED>(v)) }
     #[inline(always)]
     fn far<R: Native, const FUSED: bool>(v: R) -> R { erfc_ends(v, erfc_far::<R, FUSED>(v)) }
-    for (xs, os) in x.chunks(BLOCK).zip(out.chunks_mut(BLOCK)) {
-        let (low, high) = xs.iter().fold((R::infinity(), R::zero()), |(low, high), &v| (low.min(v.abs()), high.max(v.abs())));
-        if high < split { fill(xs, os, near::<R, FUSED>) }
-        else if low >= split { fill(xs, os, far::<R, FUSED>) }
-        else if branches::<R>() {
-            let n = placed(0..xs.len() as u16, &mut place, |i| xs[usize::from(i)].abs() < split);
-            let (nears, fars) = place[..xs.len()].split_at(n);
-            gathered(nears, &mut t, os, |i| xs[i], #[inline(always)] |t| { for v in t { *v = near::<R, FUSED>(*v) } }, |_, v| v);
-            gathered(fars, &mut t, os, |i| xs[i], #[inline(always)] |t| { for v in t { *v = far::<R, FUSED>(*v) } }, |_, v| v);
-        }
-        else { fill(xs, os, erfc::<R, FUSED>) }
-    }
-    true
+    crate::slice::blocks::<_, _, BLOCK>(x, out, #[inline(always)] |b| {
+            let (low, high) = b.iter().fold((R::infinity(), R::zero()), |(low, high), &v| (low.min(v.abs()), high.max(v.abs())));
+            (high < split, low >= split)
+        }, near::<R, FUSED>, far::<R, FUSED>,
+        #[inline(always)] |xs, os| {
+            if branches::<R>() {
+                let n = placed(0..xs.len() as u16, &mut place, |i| xs[usize::from(i)].abs() < split);
+                let (nears, fars) = place[..xs.len()].split_at(n);
+                gathered(nears, &mut t, os, |i| xs[i], #[inline(always)] |t| { for v in t { *v = near::<R, FUSED>(*v) } }, |_, v| v);
+                gathered(fars, &mut t, os, |i| xs[i], #[inline(always)] |t| { for v in t { *v = far::<R, FUSED>(*v) } }, |_, v| v);
+            } else { for (o, &v) in os.iter_mut().zip(xs) { o.write(erfc::<R, FUSED>(v)); } }
+            true
+        })
 }
 /// [`erfinv`](crate::erfinv) as a function object, with the slice form `many`, which runs `regions` on a slice of f64s.
 #[derive(Clone, Copy, Debug)]

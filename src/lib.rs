@@ -52,14 +52,15 @@ mod trig;
 #[cfg(accelerate)]
 mod vforce;
 
-pub use arith::{Add, Divide, Multiply, Subtract, BitAnd, BitOr, BitXor, BitNot, LeftShift, RightShift, Negate, Reciprocal, Square, PiTimes, WholeDivide, Bitwise, Not, Nand, Nor, bitwise};
+pub use arith::{Add, Divide, Multiply, Subtract, BitAnd, BitOr, BitXor, BitNot, LeftShift, RightShift, Negate, Reciprocal, PiTimes, WholeDivide, Bitwise, Not, Nand, Nor, bitwise};
 /// The crates whose types compact buffers hold, which the exported width macros name.
 pub use {half, num_complex};
 pub use complex::{Cis, divide};
 pub use float::{FUSED, Float, Native};
+pub use exp::{Exp, Expm1};
 pub use ln::{Ln, Log1p, Log2, Log10, Logb};
 pub use parts::{Abs, Angle, Sign, Isnan, Isfinite, Isinf, Real, Imag, Conj, Trunc, Rint, Clip, Choose, Scale, Round};
-pub use pow::{Pow, Root};
+pub use pow::{Pow, Root, WholePow};
 pub use slice::{Arg, Binary, CHUNK, Flipped, Results, Ternary, Unary, choose, pairs};
 pub use special::{Erfc, Erfcinv, Erfinv};
 pub use sqrts::Sqrt;
@@ -110,9 +111,9 @@ macro_rules! functions {
 
 functions! {
     /// e^x. `exp(∞)` is ∞, `exp(-∞)` is 0, and `exp(NaN)` is NaN.
-    exp(x) in exp as Exp: total;
+    exp(x) in exp;
     /// e^x - 1, without the loss of digits near 0 that `exp(x) - 1` has.
-    expm1(x) in exp as Expm1: total;
+    expm1(x) in exp;
     /// The natural logarithm of x. `ln(0)` is -∞, `ln(∞)` is ∞, and a negative x or NaN gives NaN.
     ln(x) in ln;
     /// ln(1 + x), without the loss of digits near 0 that `ln(1 + x)` has. `log1p(-1)` is -∞.

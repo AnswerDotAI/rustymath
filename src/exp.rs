@@ -33,10 +33,11 @@ fn reduce<R: Native, const FUSED: bool>(x: R) -> (R, R) {
     (n, n.mla::<FUSED>(-lo, n.mla::<FUSED>(-hi, x)))
 }
 
-/// 2^n e^r, with e^r = 1 + r h(r) and h from `poly`.
-#[inline]
-fn scaled<R: Native, const FUSED: bool, const N: usize>(n: R, r: R, poly: [f64; N]) -> R {
-    pow2_times::<R, FUSED>(r.mla::<FUSED>(horner::<R, FUSED, N>(r, poly), R::one()), n)
+/// e^r = 1 + r h(r), for |r| up to about ln 2 / 2.
+#[inline(always)]
+fn exp_reduced<R: Native, const FUSED: bool>(r: R) -> R {
+    let h = if R::WIDE { horner::<R, FUSED, 10>(r, EXP_64) } else { horner::<R, FUSED, 5>(r, EXP_32) };
+    r.mla::<FUSED>(h, R::one())
 }
 
 /// e^(x + lo) × 2^k, for a lo far below x and a whole k. lo joins the reduced argument, except where `clamp` changes x and the result is 0 or ∞ whatever lo is. Scaling by 2^k inside keeps e^x/2 finite where e^x would overflow. A caller passes -0 for a part it lacks. The compiler drops such a part, because adding -0 changes no value.
@@ -45,11 +46,26 @@ fn exp_parts<R: Native, const FUSED: bool>(x: R, lo: R, k: R) -> R {
     let c = clamp(x, limit());
     let (n, r) = reduce::<R, FUSED>(c);
     let r = if c == x { r + lo } else { r };
-    if R::WIDE { scaled::<R, FUSED, 10>(n + k, r, EXP_64) } else { scaled::<R, FUSED, 5>(n + k, r, EXP_32) }
+    pow2_times::<R, FUSED>(exp_reduced::<R, FUSED>(r), n + k)
 }
 
 #[inline]
 pub(crate) fn exp<R: Native, const FUSED: bool>(x: R) -> R { exp_parts::<R, FUSED>(x, R::neg_zero(), R::neg_zero()) }
+
+/// Whether `exp_fast` and `expm1_fast` give their functions at x: |x| is below 708 at f64 and 87 at f32, where 2^n is a normal float. NaN and the infinities fail the test. Accepting -∞ here, with a select in `exp_fast`, made other items about 18% slower on macOS.
+#[inline(always)]
+fn usual<R: Native>(x: R) -> bool { x.abs() < R::narrow(if R::WIDE { 708.0 } else { 87.0 }) }
+
+/// e^x for an x that `usual` accepts, with no clamp and one power of two.
+#[inline(always)]
+fn exp_fast<R: Native, const FUSED: bool>(x: R) -> R { let (n, r) = reduce::<R, FUSED>(x); exp_reduced::<R, FUSED>(r) * R::pow2(n + R::SHIFT) }
+
+/// Whether e^x rounds to 0: x is below -746 at f64 and -105 at f32, or -∞, where a causal mask puts it.
+#[inline(always)]
+fn under<R: Native>(x: R) -> bool { x < R::narrow(if R::WIDE { -746.0 } else { -105.0 }) }
+
+usual_object!(/// [`exp`](crate::exp) as a function object. Its slice form clamps x and scales by two powers of two only in blocks that hold an item that neither `usual` nor `under` accepts.
+    Exp: exp, usual => exp_fast::<_, { crate::FUSED }>, under => |_| 0.0; total);
 
 /// e^x × 2^k, for a whole k.
 #[inline]
@@ -58,16 +74,28 @@ pub(crate) fn exp_times<R: Native, const FUSED: bool>(x: R, k: R) -> R { exp_par
 #[inline]
 pub(crate) fn expm1<R: Native, const FUSED: bool>(x: R) -> R { expm1_times::<R, FUSED>(x, R::zero()) }
 
-/// (e^x - 1) × 2^k, for a whole k. e^x - 1 = 2^n (r h) + (2^n - 1). For |x| below about ln 2 / 2, n is 0 and the result is r h, which keeps its relative accuracy down to the smallest x. Below -40 at f64 and -18 at f32, e^x - 1 rounds to -1. n can exceed the greatest exponent by one while the result is still finite, so 2^n splits into 2^m and 2^(n-m), with m no greater than that exponent.
+/// e^x - 1 from x's reduction, 2^n (r h) + (2^n - 1), with s = 2^n. For |x| below about ln 2 / 2, n is 0 and the result is r h, which keeps its relative accuracy down to the smallest x.
+#[inline(always)]
+fn expm1_reduced<R: Native, const FUSED: bool>(r: R, s: R) -> R {
+    let h = if R::WIDE { horner::<R, FUSED, 11>(r, H_64) } else { horner::<R, FUSED, 6>(r, H_32) };
+    (r * h).mla::<FUSED>(s, s - R::one())
+}
+
+/// e^x - 1 for an x that `usual` accepts, with no clamp and one power of two. `tanh` calls it for every x, because it keeps its argument within that range.
+#[inline(always)]
+pub(crate) fn expm1_fast<R: Native, const FUSED: bool>(x: R) -> R { let (n, r) = reduce::<R, FUSED>(x); expm1_reduced::<R, FUSED>(r, R::pow2(n + R::SHIFT)) }
+
+usual_object!(/// [`expm1`](crate::expm1) as a function object, with `Exp`'s blocks.
+    Expm1: expm1, usual => expm1_fast::<_, { crate::FUSED }>; total);
+
+/// (e^x - 1) × 2^k, for a whole k. Below -40 at f64 and -18 at f32, e^x - 1 rounds to -1. n can exceed the greatest exponent by one while the result is still finite, so 2^n splits into 2^m and 2^(n-m), with m no greater than that exponent.
 #[inline]
 pub(crate) fn expm1_times<R: Native, const FUSED: bool>(x: R, k: R) -> R {
     let c = R::narrow;
     let (low, top) = if R::WIDE { (c(-40.0), c(1023.0)) } else { (c(-18.0), c(127.0)) };
     let (n, r) = reduce::<R, FUSED>(clamp(if x < low { low } else { x }, limit()));
-    let h = if R::WIDE { horner::<R, FUSED, 11>(r, H_64) } else { horner::<R, FUSED, 6>(r, H_32) };
     let m = if n > top { top } else { n };
-    let scale = R::pow2(m + R::SHIFT);
-    (r * h).mla::<FUSED>(scale, scale - R::one()) * R::pow2(n - m + k + R::SHIFT)
+    expm1_reduced::<R, FUSED>(r, R::pow2(m + R::SHIFT)) * R::pow2(n - m + k + R::SHIFT)
 }
 
 /// e^(hi + lo) for any double word. It renormalizes the word first, because `exp_parts` needs `lo` far below `hi`.

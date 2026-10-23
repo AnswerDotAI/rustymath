@@ -7,7 +7,7 @@
 //! A thin QR factorization of a tall matrix, and least squares with one, first try CholeskyQR2. It forms `AᴴA` and its Cholesky factor, solves for a first Q, then repeats both steps on that Q. Every step is a matrix product or a triangular solve, run on several threads in pieces of rows. A matrix too ill-conditioned for that to match Householder QR's accuracy falls back to the reflections. R's diagonal is positive on the CholeskyQR2 path, and of either sign from the reflections.
 //!
 //! QR and the native SVD first scale a matrix by a power of two when its largest item lies where sums of squares would overflow or lose digits to underflow. Their factors are those of the scaled matrix, scaled back exactly. LU and Cholesky divide by a subnormal pivot, whose reciprocal would overflow.
-use super::{Matrix, Scalar, Side, Tiled, Triangle, filled, identity, transpose_into};
+use super::{Inner, Matrix, PlusTimes, Scalar, Side, Tiled, Triangle, filled, identity, transpose_into};
 use crate::{Native, float::{FUSED, sealed::Core}, parallel, slice::appended};
 use num_complex::Complex;
 use num_traits::{Float as _, One as _, Zero as _};
@@ -355,6 +355,48 @@ pub fn eig<T: Factor>(a: &[T], n: usize) -> Option<Eig<T::Real>> { T::matrix_eig
 
 /// The eigenvalues of the `n`×`n` matrix `a`, as `eig` gives them. Without eigenvectors to build, each iteration transforms only the rows and columns it still acts on.
 pub fn eigenvalues<T: Factor>(a: &[T], n: usize) -> Option<Vec<Complex<T::Real>>> { T::matrix_eig(a, n, false).map(|f| f.values) }
+
+/// The `m`×`n` matrix `U diag(s) Vᴴ` that an SVD's factors give back: `u` is `m`×`p`, `s` holds the `p` singular values and `v` is `n`×`p`.
+pub fn from_svd<T: Factor>(u: &[T], s: &[T], v: &[T], [m, p, n]: [usize; 3]) -> Vec<T> where PlusTimes: Inner<T, Out = T> {
+    PlusTimes.inner(&scaled_columns(u, s, p), &adjoint(v, n, p), [m, p, n])
+}
+
+/// The `n`×`n` matrix `L Lᴴ` that a Cholesky factor `l` gives back.
+pub fn from_cholesky<T: Factor>(l: &[T], n: usize) -> Vec<T> where PlusTimes: Inner<T, Out = T> { PlusTimes.inner(l, &adjoint(l, n, n), [n; 3]) }
+
+/// The `n`×`n` matrix `V diag(values) V⁻¹` that an eigen decomposition gives back, from one LU factorization of `vectors`. `None` where the columns of `vectors` aren't independent enough to give the matrix back: where, scaled to unit length, their condition number in the 1-norm exceeds 1/√ε, past which the result loses about half its digits. A defective matrix's eigenvectors give about 1/ε. Also `None` where a pivot is negligible, and for NaN.
+pub fn from_eigen<T: Factor>(values: &[T], vectors: &[T], n: usize) -> Option<Vec<T>> where PlusTimes: Inner<T, Out = T> {
+    let mut inverse = filled(n * n, T::zero());
+    LuWork::default().inverse_into(vectors, [n, n], &mut inverse)?;
+    // Scaling column j of the vectors to unit length scales row j of the inverse by the column's length.
+    let lengths = crate::stats::norm(vectors, [1, n, n], 2.0);
+    let scaled: Vec<T> = vectors.chunks_exact(n).flat_map(|row| row.iter().zip(&lengths).map(|(&x, &l)| x.div_real(l))).collect();
+    let scaled_inverse: Vec<T> = inverse.chunks_exact(n).zip(&lengths).flat_map(|(row, &l)| row.iter().map(move |&x| x.mul_real(l))).collect();
+    let condition = norm(&scaled, [n, n], Norm::One) * norm(&scaled_inverse, [n, n], Norm::One);
+    (condition <= <T::Real as num_traits::Float>::epsilon().sqrt().recip()).then(|| PlusTimes.inner(&scaled_columns(vectors, values, n), &inverse, [n; 3]))
+}
+
+/// The `n`×`n` matrix whose LU factorization gives `l`, `u` and the row permutation `p`: row `p[i]` of the matrix is row `i` of `L U`. `None` where `p` doesn't hold each position from 0 to `n` - 1 once, as whole numbers.
+pub fn from_lu<T: Factor>(l: &[T], u: &[T], p: &[T], n: usize) -> Option<Vec<T>> where PlusTimes: Inner<T, Out = T> {
+    let mut seen = vec![false; n];
+    let order = p.iter().map(|&x| {
+        let i = x.re();
+        if x != T::from_real(i) || i.fract() != T::Real::zero() { return None; }
+        let i = num_traits::ToPrimitive::to_usize(&i).filter(|&i| i < n && !seen[i])?;
+        seen[i] = true;
+        Some(i)
+    }).collect::<Option<Vec<_>>>()?;
+    let product = PlusTimes.inner(l, u, [n; 3]);
+    let mut a = filled(n * n, T::zero());
+    for (i, &row) in order.iter().enumerate() { a[row * n..(row + 1) * n].copy_from_slice(&product[i * n..(i + 1) * n]) }
+    Some(a)
+}
+
+/// Whether the `n`×`n` matrix `a` equals its conjugate transpose.
+pub fn is_hermitian<T: Scalar>(a: &[T], n: usize) -> bool { (0..n).all(|i| (0..n).all(|j| a[i * n + j] == a[j * n + i].conj())) }
+
+/// `a`, whose rows hold `columns` items, with each column multiplied by the item of `d` at its position.
+fn scaled_columns<T: Scalar>(a: &[T], d: &[T], columns: usize) -> Vec<T> { a.chunks_exact(columns.max(1)).flat_map(|row| row.iter().zip(d).map(|(&x, &s)| x * s)).collect() }
 
 /// Whether every item of `x` is finite, in both parts where it's complex.
 fn finite<T: Scalar>(x: &[T]) -> bool { x.iter().all(|x| x.re().is_finite() && x.im().is_finite()) }

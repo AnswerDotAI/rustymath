@@ -107,6 +107,25 @@ pub fn decode<T: Clone + NumAssignRef>(bases: &[T], digits: &[T]) -> Vec<T> {
     }).collect()
 }
 
+/// The digits of each of `values` in the mixed radix of `bases`, as APL's `⊤` gives them: each value's digits together, the most significant first. `residue(b, v)` is `v`'s residue by the base `b`, which for a base of 0 is `v`, so a base of 0 takes all of what remains as its digit. `integer::encode` gives `i64`s, checked for overflow.
+pub fn encode<T: Clone + NumAssignRef>(bases: &[T], values: &[T], residue: impl Fn(&T, &T) -> T) -> Vec<T> {
+    encoded(bases, values, |b, mut v| {
+        let digit = residue(b, &v);
+        if b.is_zero() { v.set_zero() } else { v -= &digit; v /= b; }
+        Some((v, digit))
+    }).expect("a step in a field gives a value")
+}
+
+/// `encode`'s rule, where `div_mod(base, value)` gives the value that the next base divides and the digit, and `None` where it gives `None`. `integer::encode` divides through its `Divisor`s this way.
+pub(crate) fn encoded<B, T: Clone + Zero>(bases: &[B], values: &[T], div_mod: impl Fn(&B, T) -> Option<(T, T)>) -> Option<Vec<T>> {
+    let mut digits = vec![T::zero(); bases.len() * values.len()];
+    for (out, value) in digits.chunks_mut(bases.len().max(1)).zip(values) {
+        let mut value = value.clone();
+        for (digit, base) in out.iter_mut().zip(bases).rev() { (value, *digit) = div_mod(base, value)?; }
+    }
+    Some(digits)
+}
+
 /// The polynomial of degree `degree` that fits the points `(x[i], y[i])` by least squares, which [`lstsq`](crate::linalg::lstsq) solves in f64. Where fewer than `degree + 1` distinct points fix the polynomial, it's the fit whose coefficients have the least norm. Panics if `x` and `y` differ in length.
 pub fn fit<F: Float>(x: &[F], y: &[F], degree: usize) -> Vec<F> {
     assert_eq!(x.len(), y.len(), "fit needs one y for each x");

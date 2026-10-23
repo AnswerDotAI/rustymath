@@ -402,9 +402,9 @@ fn held<K: Key>(x: &[K], min: i64) -> usize {
     seen.iter().map(|mask| mask.count_ones() as usize).sum()
 }
 
-/// For each item of `y`, the position of the first item of `x` with its key, or the length of `x` where none has it, from a hash map.
+/// For each item of `y`, the position of the first equal item of `x`, or the length of `x` where none is equal, from a hash map. `index_of` takes it for keys that span too much for a table.
 #[inline(never)]
-fn first_matches<K: Key>(x: &[K], y: &[K]) -> Vec<u32> {
+pub fn first_matches<K: Copy + Sync + Eq + Hash>(x: &[K], y: &[K]) -> Vec<u32> {
     let (miss, mut first) = (x.len() as u32, HashMap::with_capacity(x.len()));
     for (i, &n) in x.iter().enumerate().rev() { first.insert(n, i as u32); }
     let (first, mut found) = (&first, Vec::with_capacity(y.len()));
@@ -413,7 +413,7 @@ fn first_matches<K: Key>(x: &[K], y: &[K]) -> Vec<u32> {
 }
 
 /// The first position of each item's `key` in `x`, from one pass that records and reads each key together. Two items' keys are equal exactly when the items match.
-pub(crate) fn first_classes<T: Copy, K: Eq + Hash>(x: &[T], key: impl Fn(T) -> K) -> Vec<u32> {
+pub fn first_classes<T: Copy, K: Eq + Hash>(x: &[T], key: impl Fn(T) -> K) -> Vec<u32> {
     let mut first = HashMap::with_capacity(x.len());
     x.iter().enumerate().map(|(i, &v)| *first.entry(key(v)).or_insert(i as u32)).collect()
 }
@@ -1008,11 +1008,11 @@ pub fn view_lexgrade<'a>(n: usize, columns: impl Iterator<Item = (View<'a>, usiz
     Some(order)
 }
 
-/// Stable positions that order each lane of `[outer, len, inner]`, as [`view_lexgrade`] orders rows, laid out as the lanes' items are. Each column holds a key for every item, in primary-first order. `None` for complex keys. An interrupt stops a run of several lanes with the interrupt hook's error.
-pub fn view_lexgrade_along(columns: &[View<'_>], dims @ [outer, len, inner]: [usize; 3], down: bool) -> Result<Option<Vec<i64>>, Error> {
-    let lane = |o: usize, i: usize| view_lexgrade(len, columns.iter().map(|&c| (c, o * len * inner + i, inner)), down);
+/// Stable positions that order each lane of `[outer, len, inner]`, as [`view_lexgrade`] orders rows, laid out as the lanes' items are. Each column, in primary-first order, is a compact view, the offset of the first item's key and the step between successive items' keys: `1` where the view holds one key for every item, or a row's width where each item is a row of a matrix. `None` for complex keys. An interrupt stops a run of several lanes with the interrupt hook's error.
+pub fn view_lexgrade_along(columns: &[(View<'_>, usize, usize)], dims @ [outer, len, inner]: [usize; 3], down: bool) -> Result<Option<Vec<i64>>, Error> {
+    let lane = |o: usize, i: usize| view_lexgrade(len, columns.iter().map(|&(c, start, step)| (c, start + (o * len * inner + i) * step, inner * step)), down);
     if outer * inner == 1 { return Ok(lane(0, 0).map(|g| g.into_iter().map(i64::from).collect())); }
-    if columns.iter().any(|c| matches!(c, View::Complexes(_))) { return Ok(None); }
+    if columns.iter().any(|(c, ..)| matches!(c, View::Complexes(_))) { return Ok(None); }
     Ok(Some(lanes::<i64, ()>(dims, len, |o, i, out, ()| {
         for (p, g) in out.iter_mut().zip(lane(o, i).expect("keys that order")) { *p = g.into(); }
     })?))
@@ -1118,16 +1118,66 @@ pub fn view_partition_along(x: View<'_>, dims: [usize; 3], rank: usize, indices:
     ordered_view!(x, |x| run(x, dims, rank, indices)).transpose()
 }
 
-/// The positions of the items of `x` whose ranks in a stable grade, ascending or descending where `down`, fall in `range`, in rank order. It selects the run's ends among (key, position) pairs, then sorts the run, without ordering the rest. Positions break ties because taking from a stable grade observes them. `None` for complex numbers.
-pub fn view_selected(x: View<'_>, range: std::ops::Range<usize>, down: bool) -> Option<Vec<u32>> {
-    let flip = if down { u64::MAX } else { 0 };
-    let mut pairs: Vec<(u64, u32)> = ordered_view!(x, |x, key| x.iter().enumerate().map(|(i, &v)| (key(v).word() ^ flip, i as u32)).collect())?;
-    let mut ranks = if range.is_empty() { Vec::new() } else { vec![range.start, range.end - 1] };
+/// Items that `ranked` tests against its bound together, before reading any of them alone.
+const BLOCK: usize = 64;
+
+/// The positions of the items of `x` whose ranks fall in `range`, in rank order. Items rank by `key`, descending where `down`, then by position, later first where `BACK`. `key` orders values as `<` does, apart from NaN. It reads `x` once, backwards where `BACK`, and keeps only the items that can still rank below `range.end`. Of those, it sorts only the run.
+fn ranked<T: Copy + PartialOrd, const BACK: bool>(x: &[T], key: impl Fn(T) -> u64, down: bool, range: std::ops::Range<usize>) -> Vec<u32> {
+    if range.is_empty() { return Vec::new(); }
+    let (n, m, flip) = (x.len(), range.end, if down { u64::MAX } else { 0 });
+    let at = |j: usize| if BACK { n - 1 - j } else { j };
+    let place = |t: u32| (if BACK { !t } else { t }) as usize;
+    let pair = |p: usize| (key(x[p]) ^ flip, if BACK { !(p as u32) } else { p as u32 });
+    let mut kept: Vec<(u64, u32)> = (0..m).map(|j| pair(at(j))).collect();
+    // The scan pays while blocks hold fewer than about one item of the run each.
+    if m * BLOCK < n {
+        // `m` kept items rank before any item read later whose key isn't below the key of `last`, the greatest kept pair. Comparing a block's values with `last`'s value vectorizes. The test passes every item whose key is below, and NaN.
+        let mut last = *kept.iter().max().expect("range.end is at least 1");
+        let (room, mut compacted) = (2 * m, m);
+        let mut j = m;
+        'scan: while j < n {
+            let len = BLOCK.min(n - j);
+            let start = if BACK { n - j - len } else { j };
+            let limit = x[place(last.1)];
+            let below = <&[T; BLOCK]>::try_from(&x[start..start + len]).map_or(true, |block| if down {
+                block.iter().fold(false, |below, &v| below | !(v <= limit))
+            } else { block.iter().fold(false, |below, &v| below | !(v >= limit)) });
+            if below {
+                for i in j..j + len {
+                    let p = pair(at(i));
+                    if p.0 >= last.0 { continue; }
+                    kept.push(p);
+                    if kept.len() < room { continue; }
+                    // Past the first few compactions, random input fills the room more slowly than one pair for each item read. Input that fills it faster runs against the order, as a descending run does. Such input keeps every remaining item for the selection below.
+                    if i - compacted < room && i >= 4 * room {
+                        kept.extend((i + 1..n).map(|i| pair(at(i))));
+                        break 'scan;
+                    }
+                    kept.select_nth_unstable(m - 1);
+                    kept.truncate(m);
+                    last = kept[m - 1];
+                    compacted = i;
+                }
+            }
+            j += len;
+        }
+    } else { kept.extend((m..n).map(|j| pair(at(j)))); }
+    let mut ranks = vec![range.start, range.end - 1];
     ranks.dedup();
-    select(&mut pairs, &ranks, Ord::cmp);
-    let run = &mut pairs[range];
+    select(&mut kept, &ranks, Ord::cmp);
+    let run = &mut kept[range];
     run.sort_unstable();
-    Some(run.iter().map(|&(_, i)| i).collect())
+    run.iter().map(|&(_, t)| place(t) as u32).collect()
+}
+
+/// The positions of the items of `x` whose ranks in a stable grade, ascending or descending where `down`, fall in `range`, in rank order. Positions break ties because taking from a stable grade observes them. A run nearer the end is found in the reversed order. `None` for complex numbers.
+pub fn view_selected(x: View<'_>, range: std::ops::Range<usize>, down: bool) -> Option<Vec<u32>> {
+    let n = x.len();
+    ordered_view!(x, |x, key| if range.end <= n - range.start { ranked::<_, false>(x, |v| key(v).word(), down, range) } else {
+        let mut run = ranked::<_, true>(x, |v| key(v).word(), !down, n - range.end..n - range.start);
+        run.reverse();
+        run
+    })
 }
 
 /// The first minimum or maximum position of each lane, without gathering lanes or allocating a result per lane. Comparisons use sorting's NaN-last order.

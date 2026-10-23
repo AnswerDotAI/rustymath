@@ -212,6 +212,10 @@ fn first_where<T: Copy>(x: &[T], test: impl Fn(T) -> bool) -> usize {
     x[from..].iter().position(|&v| test(v)).map_or(x.len(), |i| from + i)
 }
 
+/// A pick after a running fold steps from `before` to `after` at row `k`: `k` where the fold changed, and `pick` where it didn't. A pick that only moves where its fold changes stays on the first item that gives the fold.
+#[inline(always)]
+fn moved<T: PartialEq>(pick: usize, before: T, after: T, k: usize) -> usize { if after != before { k } else { pick } }
+
 /// Each float reduction at `f32` and `f64`: its unit, its identity where that isn't its unit, its step, its `chain` where that differs from its merge, its fold of a slice, and its scan.
 macro_rules! floats {
     ($($r:ident: $unit:ident, $(identity: $identity:expr,)? $(rows: $rows:ident,)? $(chain: $chain:expr,)? |$a:ident, $b:ident| $step:expr, $fold:expr, $scan:expr;)+) => {$(
@@ -699,7 +703,7 @@ pub fn along_with_tail<T: Copy + Sync, R: Reduction<T>>(data: &[T], dims: [usize
     let (mut totals, mut ok) = along::<T, R>(data, dims);
     if let Some(tail) = tail {
         assert_eq!(tail.len(), totals.len(), "one tail per lane");
-        for (total, &tail) in totals.iter_mut().zip(tail) { let (next, fits) = R::merge(*total, tail); *total = next; ok &= fits; }
+        ok &= merges_of::<T, R>(&mut totals, tail);
     }
     (totals, ok)
 }
@@ -736,6 +740,14 @@ fn one_of<T, R: Reduction<T>>(x: T, ok: &mut bool) -> R::Total { let (t, fits) =
 fn steps_of<T: Copy, R: Reduction<T>>(totals: &mut [R::Total], x: &[T]) -> bool {
     let (n, mut fits) = (totals.len().min(x.len()), true);
     for k in 0..n { let (t, f) = R::checked(totals[k], x[k]); (totals[k], fits) = (t, fits & f) }
+    fits
+}
+
+/// Merges each of `totals` with the matching total of `parts`, as far as the shorter goes, and gives whether every result fits. It loops by index, as [`steps_of`] does.
+#[inline(always)]
+fn merges_of<T, R: Reduction<T>>(totals: &mut [R::Total], parts: &[R::Total]) -> bool {
+    let (n, mut fits) = (totals.len().min(parts.len()), true);
+    for k in 0..n { let (t, f) = R::merge(totals[k], parts[k]); (totals[k], fits) = (t, fits & f) }
     fits
 }
 
@@ -782,24 +794,27 @@ fn hgw<T: Copy, R: Reduction<T>, const ONE: bool>(lane: &[T], folds: &mut [R::To
     }
 }
 
-/// The folds by `R` of each window of `width` neighbouring rows along the middle axis of `data`, an array of shape `[outer, len, inner]` held row by row. The result has shape `[outer, len - width + 1, inner]`, with whether every fold fits. Each fold combines its window's items in order. A window of at most [`DIRECT`] rows folds directly. A wider one takes van Herk-Gil-Werman's method: each lane splits into blocks of `width` rows, and each window is the fold of one block's suffix and the next block's prefix, so an item costs the same whatever the width.
-pub fn sliding<T: Copy, R: Reduction<T>>(data: &[T], [outer, len, inner]: [usize; 3], width: usize) -> (Vec<R::Total>, bool) {
+/// The folds by `R` of each window of `width` neighbouring rows along the middle axis of `data`, an array of shape `[outer, len, inner]` held row by row. The result has shape `[outer, len - width + 1, inner]`, with whether every fold fits. Each fold combines its window's items in order, except that a window as long as a lane of single items folds as [`along`] folds the lane. A window of at most [`DIRECT`] rows folds directly. A wider one takes van Herk-Gil-Werman's method: each lane splits into blocks of `width` rows, and each window is the fold of one block's suffix and the next block's prefix, so an item costs the same whatever the width.
+pub fn sliding<T: Copy + Sync, R: Reduction<T>>(data: &[T], [outer, len, inner]: [usize; 3], width: usize) -> (Vec<R::Total>, bool) {
     assert_eq!(data.len(), outer * len * inner, "the data must fill its dimensions");
     assert!((1..=len.max(1)).contains(&width), "a window lies within its lane");
     let count = (len + 1).saturating_sub(width);
     if outer * count * inner == 0 { return (Vec::new(), true); }
-    let mut out = vec![R::unit(); outer * count * inner];
+    // A window as long as a lane of single items is that lane's fold, which `along` runs side by side with its neighbours'. Wider lanes fold directly, starting from their first row.
+    if width == len && inner == 1 { return along::<T, R>(data, [outer, len, inner]); }
     let mut ok = true;
-    let lanes = data.chunks_exact(len * inner).zip(out.chunks_exact_mut(count * inner));
     if width <= DIRECT {
-        for (lane, folds) in lanes {
-            for (t, &x) in folds.iter_mut().zip(lane) { *t = one_of::<T, R>(x, &mut ok); }
-            for i in 1..width {
-                ok &= steps_of::<T, R>(folds, &lane[i * inner..]);
-            }
+        // Each lane's folds start from its first row, which fills the buffer as it's read.
+        let mut out = Vec::with_capacity(outer * count * inner);
+        for lane in data.chunks_exact(len * inner) {
+            let at = out.len();
+            out.extend(lane[..count * inner].iter().map(|&x| one_of::<T, R>(x, &mut ok)));
+            for i in 1..width { ok &= steps_of::<T, R>(&mut out[at..], &lane[i * inner..]); }
         }
         return (out, ok);
     }
+    let mut out = vec![R::unit(); outer * count * inner];
+    let lanes = data.chunks_exact(len * inner).zip(out.chunks_exact_mut(count * inner));
     let (mut suffix, mut row) = (vec![R::unit(); len * inner], vec![R::unit(); inner]);
     for (lane, folds) in lanes {
         if inner == 1 { hgw::<T, R, true>(lane, folds, &mut suffix, &mut row, width, inner, &mut ok) }
@@ -836,27 +851,42 @@ pub enum Picks { Windows(usize), Lanes, Running }
 
 /// The row of the first item that gives each fold by `R` along the middle axis of `data`, an array of shape `[outer, len, inner]`, for a reduction that picks one of its items, as [`Max`] and [`Min`] do. `of` chooses the folds, and the result lays out as their results do. Each row counts from the start of its lane. A fold whose items all leave it at `R::unit()`, as NaN items do for a float maximum, gives its first row.
 pub fn picks<T: Copy + PartialEq + Send + Sync, R: Reduction<T, Total = T>>(data: &[T], shape: [usize; 3], of: Picks) -> Vec<usize> {
-    let [_, len, inner] = shape;
+    let [outer, len, inner] = shape;
     match of {
         Picks::Windows(width) => {
             let pairs: Vec<(T, usize)> = data.iter().enumerate().map(|(k, &x)| (x, k / inner.max(1) % len.max(1))).collect();
             sliding::<(T, usize), Pick<R>>(&pairs, shape, width).0.into_iter().map(|(_, row)| row).collect()
         }
-        // A lane's pick is its first item that, folded alone, gives the lane's fold, found after the fold's vectorized pass.
-        Picks::Lanes => along::<T, R>(data, shape).0.into_iter().enumerate().map(|(j, total)| {
-            let (o, i) = (j / inner, j % inner);
-            let gives = |x: T| R::one(x).0 == total;
-            let row = if inner == 1 { first_where(&data[o * len..][..len], gives) } else { (0..len).position(|k| gives(data[(o * len + k) * inner + i])).unwrap_or(len) };
+        // A lane's pick is its first item that, folded alone, gives the lane's fold. Along a lane of consecutive items, a vectorized search finds it after the fold.
+        Picks::Lanes if inner == 1 => along::<T, R>(data, shape).0.into_iter().enumerate().map(|(o, total)| {
+            let row = first_where(&data[o * len..][..len], |x| R::one(x).0 == total);
             if row == len { 0 } else { row }
         }).collect(),
-        // A running fold's pick moves to an item only where that item changes the running fold.
+        // Lanes across an axis fold in one pass in memory order, and each lane's pick steps through `moved`.
+        Picks::Lanes => {
+            let mut rows = vec![0; outer * inner];
+            if len > 0 && inner > 0 {
+                for (block, lanes) in data.chunks_exact(len * inner).zip(rows.chunks_exact_mut(inner)) {
+                    let mut totals: Vec<T> = block[..inner].iter().map(|&x| R::one(x).0).collect();
+                    for (k, items) in block.chunks_exact(inner).enumerate().skip(1) {
+                        for ((row, total), &x) in lanes.iter_mut().zip(&mut totals).zip(items) {
+                            let next = R::merge(*total, R::one(x).0).0;
+                            *row = moved(*row, *total, next, k);
+                            *total = next;
+                        }
+                    }
+                }
+            }
+            rows
+        }
+        // A running fold's pick at each item steps through `moved` from the item before it in the lane.
         Picks::Running => {
             let mut totals = Vec::with_capacity(data.len());
             scan_along::<T, R>(data, shape, None, &mut totals);
             let mut rows = vec![0; data.len()];
             for at in 0..data.len() {
                 let k = at / inner % len;
-                if k > 0 { rows[at] = if totals[at] != totals[at - inner] { k } else { rows[at - inner] }; }
+                if k > 0 { rows[at] = moved(rows[at - inner], totals[at - inner], totals[at], k) }
             }
             rows
         }
@@ -942,10 +972,7 @@ pub fn fold_pieces<T: Copy, R: Reduction<T>>(
     for (u, part) in partials {
         let folds = &mut totals[u * inner..(u + 1) * inner];
         if u == last {
-            for (s, &x) in folds.iter_mut().zip(&part) {
-                let (t, f) = R::merge(*s, x);
-                (*s, fits) = (t, fits & f);
-            }
+            fits &= merges_of::<T, R>(folds, &part);
         } else {
             folds.copy_from_slice(&part);
             last = u;
@@ -1002,7 +1029,7 @@ fn step_rows<T: Copy, R: Reduction<T>>(totals: &mut [R::Total], rows: &[T], firs
     }
 }
 
-/// `step_rows` with up to `N` running totals. Rows wider than `N` fold in strips of `N` columns, each down every row, where there are at least 4 rows and the totals are narrower than complex numbers. Complex strips measured slower than stepping row by row. Other wide rows, and too few rows to fill two blocks, step one row at a time. A block is `N` items where `inner` divides `N`, and three quarters of `N` for rows of 3.
+/// `step_rows` with up to `N` running totals. Rows wider than `N` fold in strips of `N` columns, each down every row, where there are at least 4 rows and the totals are narrower than complex numbers. Complex strips measured slower than stepping row by row. Other wide rows, too few rows to fill two blocks, and lanes of fewer than 4 rows step one row at a time. Merging the columns of so few blocks cost more than the steps it saved, 13 instructions an item for the lanes of 2 rows that 2×2 pooling folds. A block is `N` items where `inner` divides `N`, and three quarters of `N` for rows of 3.
 #[inline(always)]
 fn rows_by<T: Copy, R: Reduction<T>, const N: usize>(totals: &mut [R::Total], rows: &[T], first: bool) -> bool {
     let inner = totals.len();
@@ -1012,7 +1039,7 @@ fn rows_by<T: Copy, R: Reduction<T>, const N: usize>(totals: &mut [R::Total], ro
             else { strip_by::<T, R, N>(out, rows, inner, s * N, out.len(), first) }
         });
     }
-    if inner > N || rows.len() < 2 * N {
+    if inner > N || rows.len() < 2 * N || rows.len() < 4 * inner {
         return rows.chunks_exact(inner).enumerate().fold(true, |fits, (j, row)| fits & step_row::<T, R>(totals, row, first && j == 0));
     }
     match inner {

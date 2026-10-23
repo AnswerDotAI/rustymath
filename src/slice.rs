@@ -217,20 +217,51 @@ pub(crate) fn each<E: Item, O: Item, R: Outcome<O>, const N: usize>(x: [Arg<'_, 
     mapped(&x, n, out, #[inline(always)] |a| f(a).split()) || (R::RESCUE && written(&mut out[..n]).iter().enumerate().all(|(i, &r)| kept(r, items(&x, i))))
 }
 
-/// [`each`] for one argument, where `fast` gives the result for every item that `usual` accepts and never fails there. Each block of 16 items that `usual` accepts whole writes `fast` of each item, and any other block writes `body` of each, judged as `each` judges it. The test for each block keeps a function's special values out of its usual items' loop.
+/// A rare form for `each_usual` that no block takes, for a function with no rare form.
+pub(crate) fn none<E, O>() -> (impl Fn(E) -> bool, impl Fn(E) -> O) { (|_| false, |_| unreachable!("`none` accepts no item")) }
+
+/// Writes a form of each item of `xs` into `out`, a block of `BLOCK` items at a time, and gives whether `mixed` said `true` for every block it wrote. `uniform` tests a whole block and gives whether every item of it takes `first`'s form, then whether every item takes `second`'s. A block that neither covers, and the last part block, goes to `mixed`. A test for each block keeps rare items, such as a function's special values, out of the loop over a uniform block. Each caller's test suits its forms: `each_usual` folds two tests over the items, and `erfc` folds a minimum and a maximum of their magnitudes.
 #[inline(always)]
-pub(crate) fn each_usual<E: Item, O: Item, R: Outcome<O>>(x: Arg<'_, E>, n: usize, out: &mut [MaybeUninit<O>], usual: impl Fn(E) -> bool, fast: impl Fn(E) -> O, body: impl Fn(E) -> R) -> bool {
-    const BLOCK: usize = 16;
+pub(crate) fn blocks<E: Copy, O, const BLOCK: usize>(
+    xs: &[E], out: &mut [MaybeUninit<O>], uniform: impl Fn(&[E; BLOCK]) -> (bool, bool), first: impl Fn(E) -> O, second: impl Fn(E) -> O,
+    mut mixed: impl FnMut(&[E], &mut [MaybeUninit<O>]) -> bool) -> bool {
+    let (blocks, rest) = xs.as_chunks::<BLOCK>();
+    let (slots, last) = out[..xs.len()].split_at_mut(blocks.len() * BLOCK);
+    let mut ok = true;
+    for (b, o) in blocks.iter().zip(slots.as_chunks_mut::<BLOCK>().0) {
+        let (one, two) = uniform(b);
+        if one { for k in 0..BLOCK { o[k].write(first(b[k])); } }
+        else if two { for k in 0..BLOCK { o[k].write(second(b[k])); } }
+        else { ok &= mixed(b, o) }
+    }
+    ok & mixed(rest, last)
+}
+
+/// [`each`] for one argument, through [`blocks`] of 64 items. A block whose every item `usual`'s test accepts writes `usual`'s form of each item. Failing that, a block whose every item `rare`'s test accepts writes `rare`'s form, as `exp` writes 0 for a block below its underflow bound. Any other block writes `body` of each item, judged as `each` judges it. The two forms never fail.
+#[inline(always)]
+pub(crate) fn each_usual<E: Item, O: Item, R: Outcome<O>>(
+    x: Arg<'_, E>, n: usize, out: &mut [MaybeUninit<O>], usual: (impl Fn(E) -> bool, impl Fn(E) -> O), rare: (impl Fn(E) -> bool, impl Fn(E) -> O),
+    body: impl Fn(E) -> R) -> bool {
     let Arg::Many(xs) = x else { return each([x], n, out, #[inline(always)] |[x]| body(x)) };
-    let (blocks, rest) = xs[..n].as_chunks::<BLOCK>();
-    let (slots, last) = out[..n].split_at_mut(blocks.len() * BLOCK);
-    let ok = blocks.iter().zip(slots.as_chunks_mut::<BLOCK>().0).fold(true, |ok, (b, o)| {
-        if b.iter().fold(true, |all, &v| all & usual(v)) {
-            for k in 0..BLOCK { o[k].write(fast(b[k])); }
-            ok
-        } else { ok & each([Arg::Many(b)], BLOCK, o, #[inline(always)] |[x]| body(x)) }
-    });
-    ok & each([Arg::Many(rest)], rest.len(), last, #[inline(always)] |[x]| body(x))
+    // With blocks of 16, f64's test and the fast form's constants outgrew AArch64's vector registers, and the loop rebuilt the constants for each block.
+    blocks::<_, _, 64>(&xs[..n], out, #[inline(always)] |b| b.iter().fold((true, true), |(one, two), &v| (one & (usual.0)(v), two & (rare.0)(v))), usual.1, rare.1,
+        #[inline(always)] |b, o| each([Arg::Many(b)], b.len(), o, #[inline(always)] |[x]| body(x)))
+}
+
+/// Declares a function object of one argument whose slice form runs `each_usual`. `$usual` says whether an item needs none of the function's special values, `$fast` computes such an item, and `$name` is the full function. An optional `$rare => $value` gives the form for a block whose items all take one rare value, as `exp` gives 0 below its underflow bound. A trailing `; total` wraps the full function's results in [`Total`].
+macro_rules! usual_object {
+    ($(#[doc = $doc:literal])* $object:ident: $name:ident, $usual:expr => $fast:expr $(, $rare:expr => $value:expr)? $(; $outcome:ident)?) => {
+        $(#[doc = $doc])*
+        #[derive(Clone, Copy, Debug)]
+        pub struct $object;
+        forms!($object at real: |_, [x]| usual_object!(@outcome [$($outcome)?], $name::<_, { crate::FUSED }>(x)),
+            many |_, [x], n, out| crate::slice::each_usual(x, n, out, ($usual, $fast), usual_object!(@rare $($rare, $value)?),
+                #[inline(always)] |x| usual_object!(@outcome [$($outcome)?], $name::<_, { crate::FUSED }>(x))));
+    };
+    (@rare) => { crate::slice::none() };
+    (@rare $rare:expr, $value:expr) => { ($rare, $value) };
+    (@outcome [], $e:expr) => { $e };
+    (@outcome [total], $e:expr) => { crate::slice::Total($e) };
 }
 
 /// [`each`] with the item body marked `#[inline(always)]`. Every slice form runs its loop this way: `forms!`'s default slice form, and a custom slice form once it has read its settings. LLVM leaves a large unmarked body out of line, and its call stops the loop vectorizing.
