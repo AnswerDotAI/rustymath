@@ -6,13 +6,7 @@ Rustymath provides fast elementary and special functions, statistics, searching 
 
 The Python package needs no NumPy. Its eager operations use the same broadcasting, selection and tolerant-comparison rules as the shared Rust core. For richer array notation, operators and fusion, use BasedPL.
 
-Float functions target four units in the last place (ulps). Rustymath prioritizes speed over last-bit agreement and reproducibility. These functions document wider bounds:
-
-- `lgamma` near its zeros at 1 and 2 is within 4 ulps of 2, not of the result. `digamma` near its zeros is within 4 ulps of 1, and below -20 within 4 ulps of ln(1 - x).
-- `binom` and `binom_dn` of a non-whole n with a whole k up to 64 are within 2k ulps.
-- `binom_dk` has no relative bound near n = 2k, where its two ψ terms cancel.
-- Normal and log-normal evaluation of `f32` inputs uses `f32` arithmetic, with parameters and precomputed coefficients rounded to `f32`. Their densities are within 12 ulps and their cdfs within 14 where |z| < 3, z being the standard score of x or of ln x. They lose accuracy as z² grows, to about 80 and 170 ulps at |z| = 12. Their quantiles are within 13 ulps, except near a quantile of 0, where cancellation leaves an absolute error of up to 8 ulps of the standard deviation. These figures exclude additional error from parameter rounding and ill-conditioned location/scale transformations.
-- Complex functions count ulps of the result's magnitude, so a much smaller part can carry most of the error. Complex powers, Γ and binomial coefficients allow ulps of their magnitude times one more than the exponent's magnitude. `exp` gives an exact direction at the float nearest a whole number of quarter turns, so e^(iπ/2) is exactly i.
+Float functions target four units in the last place (ulps), with [documented exceptions](accuracy.qmd). Rustymath prioritizes speed over last-bit agreement and reproducibility.
 
 [Arrays and indexing](https://answerdotai.github.io/rustymath/arrays.html) covers construction, dtypes, selection, reshaping, axis names, keys and interoperability.
 

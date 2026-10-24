@@ -489,9 +489,9 @@ functions! {
     floor(x; ct) = Floor(ct);
     /// The smallest whole number at least x. An item within relative tolerance `ct` of the whole number below rounds to it. Integers and Booleans keep their values.
     ceil(x; ct) = Ceil(ct);
-    /// The remainder of x divided by y, with the sign of y. A zero y gives x, by APL's rule. For floats, a quotient within relative tolerance `ct` of a whole number counts as whole, giving 0.
+    /// The remainder of x divided by y. A zero y gives x, by APL's rule. Floats use `floor_divide`'s quotient and native fused multiply-add where available. At nonzero `ct`, a product equal to x within tolerance snaps the float remainder to 0.
     remainder(x, y; ct) = Flipped(Residue(ct));
-    /// The floor of x / y. For floats, a quotient within relative tolerance `ct` of a whole number gives that number, where `remainder` gives 0. Integer division is exact, and fails on a zero divisor or an overflowing quotient.
+    /// The floor of rounded x / y. For floats, a quotient within relative tolerance `ct` of a whole number gives that number. Integer division is exact, and fails on a zero divisor or an overflowing quotient.
     floor_divide(x, y; ct) = FloorDivide(ct);
     /// The greatest common divisor of x and y, never negative for integers and floats. Each remainder step of floats and complex numbers uses relative tolerance `ct`.
     gcd(x, y; ct) = Gcd(ct);

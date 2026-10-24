@@ -159,7 +159,8 @@ fn running_results<A: Copy, S: Copy, T>(x: &[A], unit: S, add: impl Fn(S, A) -> 
 #[inline(always)]
 fn running_by<A: Copy, S: Copy, T, const R: usize>(x: &[A], unit: S, add: impl Fn(S, A) -> S, merge: impl Fn(S, S) -> S, finish: impl FnOnce(&[S], &[A]) -> T) -> T {
     let (chunks, rest) = x.as_chunks::<R>();
-    finish(&tree(chunks, unit, &add, &merge), rest)
+    let parts = if chunks.len() * R <= LEAF { leaf(chunks, unit, &add) } else { tree(chunks, unit, &add, &merge) };
+    finish(&parts, rest)
 }
 
 /// The most items that one loop of [`tree`] folds. Each leaf adds a call and a merge. Leaves of 16,384 items cost a 65,536-item sum about 2% fewer instructions than 4,096, but left a million tenths' sum in `f32` with 3.4 times the error.
@@ -173,6 +174,11 @@ fn tree<A: Copy, S: Copy, const R: usize>(chunks: &[[A; R]], unit: S, add: &impl
         for k in 0..R { a[k] = merge(a[k], b[k]) }
         return a;
     }
+    leaf(chunks, unit, add)
+}
+
+#[inline(always)]
+fn leaf<A: Copy, S: Copy, const R: usize>(chunks: &[[A; R]], unit: S, add: &impl Fn(S, A) -> S) -> [S; R] {
     let mut parts = [unit; R];
     for chunk in chunks { for k in 0..R { parts[k] = add(parts[k], chunk[k]) } }
     parts

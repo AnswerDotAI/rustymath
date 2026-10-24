@@ -3,7 +3,7 @@
 //! A tolerance is a value of a type that implements `Tolerant`: a `Tolerance`, or `Exactly`, whose methods compile to plain IEEE comparisons and `floor`. A function written once over `Tolerant` compiles to a version for each. `with_tolerance!` picks one when the program runs, outside any loop. The methods are generic over the float type and compute at its width. `TolerantComplex` gives the complex versions. The function objects `Equal`, `NotEqual`, `Less`, `LessEqual`, `Greater`, `GreaterEqual`, `Matches`, `Compare`, `Floor`, `Ceil`, `Residue`, `FloorDivide`, `Gcd` and `Lcm` each hold a `Tolerance` and give the same results as the methods, one item at a time or over slices. A slice form picks its loop with `with_tolerance!` once. A comparison's slice form compares many items with one number through the range of floats equal to it (`Tolerant::range`), so each item takes one or two plain comparisons. All but `Matches` and `Compare` also have integer forms, from the `integer` module, which ignore the tolerance. `Floor` and `Ceil` also take Booleans.
 //!
 //! Tolerant equality isn't transitive: `x` can equal `y` and `y` equal `z` while `x` doesn't equal `z`. Hash maps and sorting need a transitive `PartialEq`. This module therefore has no float type with a tolerant `==`. Each comparison is a method of the tolerance.
-use crate::{Arg, BETWEEN_CHECKS, buffer::Element, convert::{float, int}, error::Error, float::{Float, Native}, interrupt::check, search::{self, Chains, Key, Links}, slice::{Total, pairs_into}};
+use crate::{Arg, BETWEEN_CHECKS, buffer::Element, convert::{float, int}, error::Error, float::{FUSED, Float, Native, sealed::Core}, interrupt::check, search::{self, Chains, Key, Links}, slice::{Total, pairs_into}};
 use num_bigint::BigInt;
 use num_complex::Complex;
 use num_rational::BigRational;
@@ -59,18 +59,15 @@ pub trait Tolerant: Copy + Send + Sync {
     /// The order of `x` and `y`, which is `Equal` when they are equal. `None` when either is NaN.
     #[inline]
     fn compare<F: Float>(self, x: F, y: F) -> Option<Ordering> { if self.equal(x, y) { Some(Ordering::Equal) } else { x.partial_cmp(&y) } }
-    /// The floor of `x/y`, and whether the quotient equals a whole number within this tolerance. Such a quotient gives that whole number, where `residue` leaves no remainder.
+    /// The tolerant floor of rounded `x/y`.
     #[inline]
-    fn floor_quotient<F: Float>(self, x: F, y: F) -> (F, bool) {
-        let q = x / y;
-        let n = nearest(q);
-        if self.equal(y * n, x) { (n, true) } else { (self.floor(q), false) }
-    }
-    /// `y` modulo `x`, with the sign of `x`: `y - x·floor(y/x)`, with the floor that `floor_quotient` gives. A quotient equal to a whole number leaves no remainder. `x` = 0 gives `y`.
+    fn floor_quotient<F: Float>(self, x: F, y: F) -> F { self.floor(x / y) }
+    /// `y - x·floor(y/x)`, through `floor_quotient`, using native fused multiply-add where available. At nonzero tolerance, a product equal to `y` within tolerance leaves no remainder. `x` = 0 gives `y`.
     #[inline]
     fn residue<F: Float>(self, x: F, y: F) -> F {
-        let (f, whole) = self.floor_quotient(y, x);
-        let r = if whole { F::zero() } else { y - x * f };
+        let q = self.floor_quotient(y, x);
+        let r = F::from_working((-x.working()).mla::<FUSED>(q.working(), y.working()));
+        let r = if self.value() != 0.0 && self.equal(x * q, y) { F::zero() } else { r };
         if x == F::zero() { y } else { r }
     }
     /// The whole number nearest `y`, and whether `y` equals it within this tolerance.
@@ -509,10 +506,10 @@ pub struct Residue(pub Tolerance);
 tolerant!(#[inline] Residue at real: |t, [x, y]| Total(t.residue(x, y)));
 tolerant!(Residue at Complex<f32>, Complex<f64>: |t, [x, y]| t.complex_residue(x, y));
 
-/// The floor of `x ÷ y`, within the tolerance it holds, as a function object. A quotient that equals a whole number gives that number, as `Residue` then gives 0: [`Tolerant::floor_quotient`] makes the same test on the product, so the two agree apart from rounding in the last bit. A float result never fails, as IEEE division doesn't. Its integer forms, from the `integer` module, divide exactly and fail on a zero divisor or an overflowing quotient.
+/// The tolerant floor of rounded `x ÷ y`, through [`Tolerant::floor_quotient`], as a function object. Float forms never fail. Its integer forms, from the `integer` module, divide exactly and fail on a zero divisor or an overflowing quotient.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FloorDivide(pub Tolerance);
-tolerant!(FloorDivide at real: |t, [x, y]| Total(t.floor(x / y)));
+tolerant!(FloorDivide at real: |t, [x, y]| Total(t.floor_quotient(x, y)));
 
 /// [`Tolerant::gcd`], or [`TolerantComplex::complex_gcd`] for complex items, at the tolerance it holds, as a function object. A non-finite argument gives NaN, which marks the item failed. Its `i64` form is [`integer::gcd`](crate::integer::gcd).
 #[derive(Clone, Copy, Debug, PartialEq)]

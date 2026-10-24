@@ -81,7 +81,8 @@ def test_bitwise_decimal_rounding_and_angles():
     assert rm.floor_divide([-7, 7], -3).tolist() == [2, -3] and rm.floor_divide([-7., 7.], -3.).tolist() == [2., -3.]
     # 0.3 / 0.1 is 2.9999999999999996, which floors to 2 exactly, and to 3 within the tolerance 1e-14.
     x = rm.array([0.3, 1.])
-    assert (x // .1).tolist() == [2., 10.] and (x % .1).tolist() == [0.3 % .1, 0.]
+    assert (x // .1).tolist() == [2., 10.]
+    np.testing.assert_allclose((x % .1).tolist(), [0.3 % .1, 0.], atol=1e-15)
     rm.set_tolerance(rm.CT)
     try: assert (x // .1).tolist() == [3., 10.] and (x % .1).tolist() == [0., 0.]
     finally: rm.set_tolerance(0)

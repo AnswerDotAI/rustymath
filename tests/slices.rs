@@ -807,6 +807,10 @@ mod tolerant {
         // A quotient within tolerance of a whole number leaves no remainder, where exact comparison leaves a whole divisor.
         assert_eq!((T.residue(0.1, 0.3), T.residue(0.0, 2.5)), (0.0, 2.5));
         assert!((Exactly.residue(0.1, 0.3) - 0.1).abs() < 1e-15);
+        let (x, y) = (2.2500000000000018, 0.7500000000000007);
+        assert_eq!((FloorDivide(Tolerance::EXACT).one(x, y), Residue(Tolerance::EXACT).one(y, x)), (2.0, x - 2.0 * y));
+        if rustymath::FUSED { assert_ne!(Exactly.residue(0.1, 1.0), 0.0); }
+        assert_eq!(Exactly.residue(1e300, 1e-300), 1e-300);
         assert!((T.gcd(0.6, 0.4) - 0.2).abs() < 1e-15 && Exactly.gcd(0.6, 0.4) < 1e-15);
         assert_eq!((T.gcd(12.0, 18.0), T.gcd(-12.0, 18.0), T.gcd(0.0, 2.5), T.gcd(0.0, 0.0), T.gcd(12.0f32, 18.0)), (6.0, 6.0, 2.5, 0.0, 6.0));
         assert!(T.gcd(f64::NAN, 1.0).is_nan() && T.gcd(f64::NAN, f64::NAN).is_nan() && T.gcd(f64::INFINITY, 1.0).is_nan());
