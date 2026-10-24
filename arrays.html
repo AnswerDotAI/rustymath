@@ -1,0 +1,981 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.19">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+<meta name="description" content="Arrays and views, leading-axis broadcasting, names, keys and Python interoperability.">
+
+<title>Arrays and indexing – rustymath</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+/* CSS for syntax highlighting */
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+  { counter-reset: source-line 0; }
+pre.numberSource code > span
+  { position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+  { content: counter(source-line);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+  }
+pre.numberSource { margin-left: 3em;  padding-left: 4px; }
+div.sourceCode
+  {   }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+<script src="site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="site_libs/quarto-nav/headroom.min.js"></script>
+<script src="site_libs/clipboard/clipboard.min.js"></script>
+<script src="site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="site_libs/quarto-search/fuse.min.js"></script>
+<script src="site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="./">
+<script src="site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="site_libs/quarto-html/popper.min.js"></script>
+<script src="site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="site_libs/quarto-html/anchor.min.js"></script>
+<link href="site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="site_libs/quarto-html/quarto-syntax-highlighting-bf27225e3a48a9273f3daa8f8e829971.css" rel="stylesheet" id="quarto-text-highlighting-styles">
+<script src="site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="site_libs/bootstrap/bootstrap-f2788e636de456f6409e966386820849.min.css" rel="stylesheet" append-hash="true" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "navbar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "end",
+  "type": "overlay",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+
+
+<link rel="stylesheet" href="styles.css">
+<meta property="og:title" content="Arrays and indexing – rustymath">
+<meta property="og:description" content="Arrays and views, leading-axis broadcasting, names, keys and Python interoperability.">
+<meta property="og:site_name" content="rustymath">
+<meta name="twitter:title" content="Arrays and indexing – rustymath">
+<meta name="twitter:description" content="Arrays and views, leading-axis broadcasting, names, keys and Python interoperability.">
+<meta name="twitter:card" content="summary">
+</head>
+
+<body class="nav-sidebar floating nav-fixed quarto-light">
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+    <nav class="navbar navbar-expand-lg " data-bs-theme="dark">
+      <div class="navbar-container container-fluid">
+      <div class="navbar-brand-container mx-auto">
+    <a class="navbar-brand" href="./index.html">
+    <span class="navbar-title">rustymath</span>
+    </a>
+  </div>
+            <div id="quarto-search" class="" title="Search"></div>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" role="menu" aria-expanded="false" aria-label="Toggle navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+  <span class="navbar-toggler-icon"></span>
+</button>
+          <div class="collapse navbar-collapse" id="navbarCollapse">
+            <ul class="navbar-nav navbar-nav-scroll ms-auto">
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://github.com/AnswerDotAI/rustymath"> <i class="bi bi-github" role="img">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+</ul>
+          </div> <!-- /navcollapse -->
+            <div class="quarto-navbar-tools">
+</div>
+      </div> <!-- /container-fluid -->
+    </nav>
+  <nav class="quarto-secondary-nav">
+    <div class="container-fluid d-flex">
+      <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+        <i class="bi bi-layout-text-sidebar-reverse"></i>
+      </button>
+        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="./arrays.html">Arrays and indexing</a></li></ol></nav>
+        <a class="flex-grow-1" role="navigation" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
+        </a>
+    </div>
+  </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article page-navbar">
+<!-- sidebar -->
+  <nav id="quarto-sidebar" class="sidebar collapse collapse-horizontal quarto-sidebar-collapse-item sidebar-navigation floating overflow-auto">
+    <div class="sidebar-menu-container"> 
+    <ul class="list-unstyled mt-1">
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">rustymath</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./arrays.html" class="sidebar-item-text sidebar-link active">
+ <span class="menu-text">Arrays and indexing</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./math.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Maths and statistics</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./search.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Searching, sorting and selection</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./random.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Random numbers and distributions</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./linalg.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Linear algebra</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./optimize.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Optimization and iterative solves</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./exact.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Polynomials, exact arithmetic and number theory</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./accuracy.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Accuracy</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="./rust.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Using rustymath from Rust</span></a>
+  </div>
+</li>
+    </ul>
+    </div>
+</nav>
+<div id="quarto-sidebar-glass" class="quarto-sidebar-collapse-item" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item"></div>
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">On this page</h2>
+   
+  <ul>
+  <li><a href="#construction-and-dtypes" id="toc-construction-and-dtypes" class="nav-link active" data-scroll-target="#construction-and-dtypes">Construction and dtypes</a></li>
+  <li><a href="#broadcasting-and-conversion" id="toc-broadcasting-and-conversion" class="nav-link" data-scroll-target="#broadcasting-and-conversion">Broadcasting and conversion</a></li>
+  <li><a href="#selecting-and-reshaping" id="toc-selecting-and-reshaping" class="nav-link" data-scroll-target="#selecting-and-reshaping">Selecting and reshaping</a></li>
+  <li><a href="#names-and-keys" id="toc-names-and-keys" class="nav-link" data-scroll-target="#names-and-keys">Names and keys</a></li>
+  <li><a href="#interoperability-and-threads" id="toc-interoperability-and-threads" class="nav-link" data-scroll-target="#interoperability-and-threads">Interoperability and threads</a></li>
+  </ul>
+<div class="toc-actions"><ul><li><a href="https://github.com/AnswerDotAI/rustymath/issues/new" class="toc-action"><i class="bi bi-github"></i>Report an issue</a></li></ul></div><div class="quarto-alternate-formats"><h2>Other Formats</h2><ul><li><a href="arrays.html.md"><i class="bi bi-file-code"></i>Markdown</a></li></ul></div></nav>
+    </div>
+<!-- main -->
+<main class="content" id="quarto-document-content">
+
+<header id="title-block-header" class="quarto-title-block default">
+<div class="quarto-title">
+<h1 class="title">Arrays and indexing</h1>
+</div>
+
+<div>
+  <div class="description">
+    Arrays and views, leading-axis broadcasting, names, keys and Python interoperability.
+  </div>
+</div>
+
+
+<div class="quarto-title-meta">
+
+    
+  
+    
+  </div>
+  
+
+
+</header>
+
+
+<!-- WARNING: THIS FILE WAS AUTOGENERATED! DO NOT EDIT! -->
+<div id="05b7ef53" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb1"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> rustymath <span class="im">as</span> rm</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</div>
+<p>Python operations run eagerly. Basic slices, reversals and transposes share storage without writable aliases: assigning to an array never changes another array’s values. A small view keeps its whole base allocation alive. Use <code>a.compact()</code> to keep just its logical items, even for a contiguous slice of a larger base. Float display rounding depends on the dtype and does not change the values returned by <code>.tolist()</code>. For expression fusion and richer array notation, use <a href="https://answerdotai.github.io/basedpl/">BasedPL</a>.</p>
+<section id="construction-and-dtypes" class="level2">
+<h2 class="anchored" data-anchor-id="construction-and-dtypes">Construction and dtypes</h2>
+<p><code>array</code> copies Python values or a buffer exporter into an owned array. <code>dtype</code> selects its item type: <code>bool</code>, <code>uint8</code>, <code>int16</code>, <code>int32</code>, <code>int64</code>, <code>float16</code>, <code>float32</code>, <code>float64</code>, <code>complex64</code>, <code>complex128</code> or <code>character</code>. Fill constructors take a shape. Their <code>_like</code> forms retain another array’s shape, keys and names:</p>
+<div id="7e24a560" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb2"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a>temperatures <span class="op">=</span> rm.array([[<span class="fl">18.</span>, <span class="dv">20</span>, <span class="dv">22</span>], [<span class="dv">16</span>, <span class="dv">19</span>, <span class="dv">23</span>]], dtype<span class="op">=</span><span class="st">'float32'</span>)</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>temperatures, rm.zeros_like(temperatures), rm.full((<span class="dv">2</span>, <span class="dv">3</span>), <span class="dv">1</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>(Array([[18.0, 20.0, 22.0], [16.0, 19.0, 23.0]], dtype=float32),
+ Array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=float32),
+ Array([[1, 1, 1], [1, 1, 1]], dtype=int64))</code></pre>
+</div>
+</div>
+<p>A string becomes an array of individual Unicode characters, not variable-length strings. <code>.astype()</code> keeps keys and names. Float-to-integer casts truncate toward zero, out-of-range values raise <code>OverflowError</code>, and casts between characters and numbers are not supported.</p>
+<div id="f00ff1a1" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb4"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>rm.array(<span class="st">'東京∑'</span>), temperatures.astype(<span class="st">'int16'</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>(Array(['東', '京', '∑'], dtype=character),
+ Array([[18, 20, 22], [16, 19, 23]], dtype=int16))</code></pre>
+</div>
+</div>
+<p><code>arange</code> generates values before its stop. <code>linspace</code> includes both endpoints by default. <code>logspace</code> generates evenly spaced exponents in the chosen base:</p>
+<div id="1308c11b" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb6"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a>rm.arange(<span class="dv">0</span>, <span class="dv">6</span>, <span class="dv">2</span>), rm.linspace(<span class="dv">0</span>, <span class="dv">1</span>, <span class="dv">5</span>), rm.logspace(<span class="dv">0</span>, <span class="dv">3</span>, <span class="dv">4</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>(Array([0, 2, 4], dtype=int64),
+ Array([0.0, 0.25, 0.5, 0.75, 1.0], dtype=float64),
+ Array([1.0, 10.0, 100.0, 1000.0], dtype=float64))</code></pre>
+</div>
+</div>
+<p>Dtype helpers use the same supported item types as arrays. <code>finfo</code> reports float limits and spacing at 1; <code>iinfo</code> reports integer limits. <code>result_type</code> gives the shared promotion rule:</p>
+<div id="9c972576" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb8"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a>rm.finfo(<span class="st">'float32'</span>).eps, rm.iinfo(<span class="st">'int16'</span>).<span class="bu">max</span>, rm.result_type(<span class="st">'int16'</span>, <span class="st">'float16'</span>), rm.issubdtype(<span class="st">'float32'</span>, <span class="st">'floating'</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>(1.1920928955078125e-07, 32767, 'float16', True)</code></pre>
+</div>
+</div>
+</section>
+<section id="broadcasting-and-conversion" class="level2">
+<h2 class="anchored" data-anchor-id="broadcasting-and-conversion">Broadcasting and conversion</h2>
+<p>Each function takes numbers, nested lists, rustymath arrays or buffer exporters such as NumPy arrays. Buffers need a supported item format; foreign byte order is converted. A function returns a <code>rustymath.Array</code>, or a Python number when every argument is a Python number. Arguments broadcast by aligning their leading axes, where NumPy aligns trailing axes. An axis of length 1 stretches to match. <code>broadcast_to</code> returns a compact copy at the requested shape. Here a vector of two items adds one number to each row of a 2 by 3 matrix:</p>
+<div id="aa4572d6" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb10"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a>rm.add([[<span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">3</span>], [<span class="dv">4</span>, <span class="dv">5</span>, <span class="dv">6</span>]], [<span class="dv">10</span>, <span class="dv">20</span>])</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>Array([[11, 12, 13], [24, 25, 26]], dtype=int64)</code></pre>
+</div>
+</div>
+<p>Arrays of different dtypes promote to the higher kind, wide enough to hold both. An integer array beside a float or complex array takes that dtype, as in JAX. So an <code>int16</code> array beside a <code>float16</code> array gives <code>float16</code>, where NumPy gives <code>float32</code>. Characters don’t mix with numbers. An integer sum, difference, product, magnitude or power that doesn’t fit its dtype wraps, as in NumPy. A Python number or list follows NEP 50, as in NumPy: it takes the dtype of the array beside it, unless its kind is higher, so a float beside an integer array gives <code>float64</code>. A function that computes only on floats, such as <code>exp</code>, converts Booleans and integers to the narrowest float that holds them exactly, but at least <code>float32</code>, which computes faster than <code>float16</code>. So Booleans, <code>uint8</code> and <code>int16</code> give <code>float32</code>, and wider integers give <code>float64</code>:</p>
+<div id="242c3a63" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb12"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a>i16 <span class="op">=</span> rm.array([<span class="dv">1</span>, <span class="dv">2</span>]).astype(<span class="st">'int16'</span>)</span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a>rm.add(i16, <span class="dv">3</span>), rm.add(i16, <span class="fl">0.5</span>), rm.add(i16, rm.array([<span class="fl">0.5</span>, <span class="dv">1</span>]).astype(<span class="st">'float16'</span>)), rm.exp(i16), rm.exp([<span class="dv">1</span>, <span class="dv">2</span>])</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>(Array([4, 5], dtype=int16),
+ Array([1.5, 2.5], dtype=float64),
+ Array([1.5, 3.0], dtype=float16),
+ Array([2.71828, 7.38906], dtype=float32),
+ Array([2.7182818, 7.3890561], dtype=float64))</code></pre>
+</div>
+</div>
+<p>A <code>rustymath.Array</code> has arithmetic, bitwise and comparison operators, <code>@</code>, and the methods <code>.sum()</code>, <code>.prod()</code>, <code>.max()</code>, <code>.min()</code>, <code>.all()</code>, <code>.any()</code>, <code>.cumsum()</code>, <code>.cumprod()</code>, <code>.reshape()</code>, <code>.astype()</code> and <code>.tolist()</code>. With no <code>axis</code>, a reduction reduces the whole array to a number, and a scan runs over the flattened array:</p>
+<div id="5ceed6a0" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb14"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a>m <span class="op">=</span> rm.array([[<span class="dv">1</span>, <span class="dv">2</span>], [<span class="dv">3</span>, <span class="dv">4</span>]])</span>
+<span id="cb14-2"><a href="#cb14-2" aria-hidden="true" tabindex="-1"></a>(m <span class="op">*</span> <span class="dv">10</span>).<span class="bu">sum</span>(), m.<span class="bu">sum</span>(axis<span class="op">=</span><span class="dv">0</span>), m.cumsum()</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>(100, Array([4, 6], dtype=int64), Array([1, 3, 6, 10], dtype=int64))</code></pre>
+</div>
+</div>
+</section>
+<section id="selecting-and-reshaping" class="level2">
+<h2 class="anchored" data-anchor-id="selecting-and-reshaping">Selecting and reshaping</h2>
+<p>Brackets take one selector for each axis. Index arrays pair by broadcasting from the front, as function arguments do: <code>grid[[1, 0], [2, 0]]</code> reads two items. Length-1 axes expand, so index arrays shaped as an open grid read every combination, as <code>np.ix_</code>’s do. The paired axes take the first array’s place, where NumPy moves them to the front when a slice separates the arrays. Integers remove an axis; lists and one-dimensional Boolean masks keep it. Negative positions count from the end, and slices take Python’s start, stop and step syntax:</p>
+<div id="b90a36fc" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb16"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a>grid <span class="op">=</span> rm.array([[<span class="dv">10</span>, <span class="dv">20</span>, <span class="dv">30</span>], [<span class="dv">40</span>, <span class="dv">50</span>, <span class="dv">60</span>]])</span>
+<span id="cb16-2"><a href="#cb16-2" aria-hidden="true" tabindex="-1"></a>grid[[<span class="dv">1</span>, <span class="dv">0</span>], [<span class="dv">2</span>, <span class="dv">0</span>]], grid[[[<span class="dv">1</span>], [<span class="dv">0</span>]], [[<span class="dv">2</span>, <span class="dv">0</span>]]], grid[:, ::<span class="op">-</span><span class="dv">1</span>], grid[:, [<span class="va">True</span>, <span class="va">False</span>, <span class="va">True</span>]]</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>(Array([60, 10], dtype=int64),
+ Array([[60, 40], [30, 10]], dtype=int64),
+ Array([[30, 20, 10], [60, 50, 40]], dtype=int64),
+ Array([[10, 30], [40, 60]], dtype=int64))</code></pre>
+</div>
+</div>
+<p><code>len</code>, iteration and <code>in</code> use major cells: items of a vector or rows of a matrix. Membership compares the whole query with one cell matching floats within the process’s tolerance (<code>rm.set_tolerance</code>), exactly unless it’s set; the wrong rank or cell shape gives <code>False</code>. This differs from NumPy’s element search. Keys remain available through <code>.keys</code> and do not change value membership. Rank-0 arrays are not iterable.</p>
+<p>With exactly one item, <code>bool(a)</code> uses that item’s truth value. Other item counts raise <code>ValueError</code>.</p>
+<div id="82224c24" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb18"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="cf">assert</span> [<span class="dv">10</span>, <span class="dv">20</span>, <span class="dv">30</span>] <span class="kw">in</span> grid <span class="kw">and</span> <span class="dv">30</span> <span class="kw">not</span> <span class="kw">in</span> grid</span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a>letters <span class="op">=</span> rm.array(<span class="st">'abc'</span>)</span>
+<span id="cb18-3"><a href="#cb18-3" aria-hidden="true" tabindex="-1"></a><span class="cf">assert</span> <span class="st">'a'</span> <span class="kw">in</span> letters <span class="kw">and</span> <span class="st">'z'</span> <span class="kw">not</span> <span class="kw">in</span> letters <span class="kw">and</span> <span class="st">'ab'</span> <span class="kw">not</span> <span class="kw">in</span> letters <span class="kw">and</span> rm.array(<span class="st">'a'</span>) <span class="kw">not</span> <span class="kw">in</span> letters</span>
+<span id="cb18-4"><a href="#cb18-4" aria-hidden="true" tabindex="-1"></a><span class="dv">20</span> <span class="kw">in</span> grid[<span class="dv">0</span>], [<span class="dv">10</span>, <span class="dv">20</span>, <span class="dv">30</span>] <span class="kw">in</span> grid, <span class="dv">30</span> <span class="kw">in</span> grid</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>(True, True, False)</code></pre>
+</div>
+</div>
+<p><code>where</code> chooses between two arrays with a Boolean condition. All three arguments use leading-axis broadcasting. Here it caps readings above 20. <code>argwhere</code> gives the coordinates of those readings as rows. <code>nonzero</code> gives one index vector per axis, ready for bracket selection:</p>
+<div id="f84a1aaa" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb20"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a>hot <span class="op">=</span> temperatures <span class="op">&gt;</span> <span class="dv">20</span></span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a>rm.where(hot, <span class="dv">20</span>, temperatures), rm.argwhere(hot), temperatures[rm.nonzero(hot)]</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>(Array([[18.0, 20.0, 20.0], [16.0, 19.0, 20.0]], dtype=float32),
+ Array([[0, 2], [1, 2]], dtype=int64),
+ Array([22.0, 23.0], dtype=float32))</code></pre>
+</div>
+</div>
+<p><code>...</code> fills omitted axes. <code>None</code> inserts an unnamed, unkeyed axis of length one and consumes no input axis. Transpose and reshape of compact inputs share storage:</p>
+<div id="31ba8e9c" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb22"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a>grid[<span class="va">None</span>, ...].shape, grid[:, <span class="va">None</span>, :].shape, grid[..., <span class="va">None</span>].shape, grid.T</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>((1, 2, 3),
+ (2, 1, 3),
+ (2, 3, 1),
+ Array([[10, 40], [20, 50], [30, 60]], dtype=int64))</code></pre>
+</div>
+</div>
+<p>One <code>-1</code> in a reshape infers that dimension. <code>split</code> divides an axis into equal sections or at specified positions. <code>stack</code> inserts an axis, while <code>concatenate</code> joins along an existing one. Both joins create compact results:</p>
+<div id="daf656b8" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb24"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a>blocks <span class="op">=</span> rm.arange(<span class="dv">12</span>).reshape(<span class="dv">3</span>, <span class="op">-</span><span class="dv">1</span>)</span>
+<span id="cb24-2"><a href="#cb24-2" aria-hidden="true" tabindex="-1"></a>left, right <span class="op">=</span> rm.split(blocks, <span class="dv">2</span>, axis<span class="op">=</span><span class="dv">1</span>)</span>
+<span id="cb24-3"><a href="#cb24-3" aria-hidden="true" tabindex="-1"></a>rm.stack([left, right], axis<span class="op">=</span><span class="dv">1</span>), rm.concatenate([left, right], axis<span class="op">=</span><span class="dv">1</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>(Array([[[0, 1], [2, 3]], [[4, 5], [6, 7]], [[8, 9], [10, 11]]], dtype=int64),
+ Array([[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]], dtype=int64))</code></pre>
+</div>
+</div>
+<p><code>swapaxes(a, i, j)</code> exchanges two axes. <code>expand_dims(a, axis)</code> and <code>squeeze(a, axis)</code> insert and remove length-one axes, as <code>a[None, ...]</code> and integer indexing do. <code>ravel(a)</code> flattens, and <code>take(a, indices, axis)</code> selects positions along one axis. With <code>axis=None</code>, <code>take</code>, <code>split</code>, <code>repeat</code> and <code>roll</code> flatten their input first.</p>
+<p><code>repeat</code> accepts one count or a count per position. A zero count removes an item, and a negative count puts that many fill items in its place. Where the axis has one position, every count repeats it. <code>pad</code> adds dtype-fill items: zero, false or spaces. <code>roll</code> shifts circularly, moving the last items to the front for a positive shift:</p>
+<div id="2af41b94" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb26"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb26-1"><a href="#cb26-1" aria-hidden="true" tabindex="-1"></a>sequence <span class="op">=</span> rm.array([<span class="dv">10</span>, <span class="dv">20</span>, <span class="dv">30</span>])</span>
+<span id="cb26-2"><a href="#cb26-2" aria-hidden="true" tabindex="-1"></a>rm.repeat(sequence, [<span class="dv">2</span>, <span class="op">-</span><span class="dv">1</span>, <span class="dv">0</span>]), rm.pad(sequence, (<span class="dv">1</span>, <span class="dv">2</span>)), rm.roll(sequence, <span class="dv">1</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>(Array([10, 10, 0], dtype=int64),
+ Array([0, 10, 20, 30, 0, 0], dtype=int64),
+ Array([30, 10, 20], dtype=int64))</code></pre>
+</div>
+</div>
+<p><code>eye</code> constructs an identity or rectangular diagonal matrix. <code>diag</code> constructs a matrix from a vector, or extracts a matrix’s diagonal. <code>diagonal</code> works on any two axes, moving the diagonal to the last axis. Its axes default to the last two, the axes that matrix functions take, where NumPy defaults to the first two. Diagonal extraction can share storage with independent values. Constructing a diagonal matrix and masking triangles with <code>tril</code> or <code>triu</code> allocate compact results.</p>
+<div id="59f10b84" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb28"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a>rm.eye(<span class="dv">3</span>), rm.diagonal(grid), rm.tril(grid)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>(Array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], dtype=float64),
+ Array([10, 50], dtype=int64),
+ Array([[10, 0, 0], [40, 50, 0]], dtype=int64))</code></pre>
+</div>
+</div>
+<p>A selection returns a Python scalar when every axis is removed, and an independent array otherwise. Assignment uses the same selectors and leading-axis broadcasting. It preserves the array’s dtype and shape, and leaves earlier selections unchanged. For repeated unkeyed targets, the last assigned value wins:</p>
+<div id="9a821bd7" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb30"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb30-1"><a href="#cb30-1" aria-hidden="true" tabindex="-1"></a>selected <span class="op">=</span> grid[:, <span class="dv">1</span>]</span>
+<span id="cb30-2"><a href="#cb30-2" aria-hidden="true" tabindex="-1"></a>grid[<span class="va">None</span>, :, <span class="dv">1</span>] <span class="op">=</span> [[<span class="dv">200</span>, <span class="dv">500</span>]]</span>
+<span id="cb30-3"><a href="#cb30-3" aria-hidden="true" tabindex="-1"></a>selected, grid</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>(Array([20, 50], dtype=int64),
+ Array([[10, 200, 30], [40, 500, 60]], dtype=int64))</code></pre>
+</div>
+</div>
+<p><code>rm.at(rm.add, a, indices, b)</code> adds <code>b</code> at the selection, as NumPy’s <code>np.add.at</code> does, but returns a new array. A target selected more than once adds every item that selects it. Here row 0’s last item is selected twice:</p>
+<div id="7d7c9687" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb32"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb32-1"><a href="#cb32-1" aria-hidden="true" tabindex="-1"></a>rm.at(rm.add, grid, ([<span class="dv">0</span>, <span class="dv">0</span>, <span class="dv">1</span>], [<span class="dv">2</span>, <span class="dv">2</span>, <span class="dv">0</span>]), [<span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">3</span>])</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>Array([[10, 200, 33], [43, 500, 60]], dtype=int64)</code></pre>
+</div>
+</div>
+</section>
+<section id="names-and-keys" class="level2">
+<h2 class="anchored" data-anchor-id="names-and-keys">Names and keys</h2>
+<p>A dictionary becomes a vector whose axis has the dictionary’s keys. Functions align keyed axes by key:</p>
+<div id="56fd89fc" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb34"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb34-1"><a href="#cb34-1" aria-hidden="true" tabindex="-1"></a>rm.add({<span class="st">'a'</span>: <span class="fl">1.5</span>, <span class="st">'b'</span>: <span class="fl">2.5</span>}, {<span class="st">'b'</span>: <span class="fl">10.0</span>, <span class="st">'a'</span>: <span class="fl">20.0</span>})</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>Array([21.5, 12.5], dtype=float64, keys=(('a', 'b'),))</code></pre>
+</div>
+</div>
+<p><code>None</code> as an item reads as NaN:</p>
+<div id="5116adbe" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb36"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb36-1"><a href="#cb36-1" aria-hidden="true" tabindex="-1"></a>rm.array([<span class="dv">1</span>, <span class="va">None</span>, <span class="dv">3</span>])</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>Array([1.0, nan, 3.0], dtype=float64)</code></pre>
+</div>
+</div>
+<p>A pandas <code>DataFrame</code> reads as a matrix of rows by columns, at its columns’ common dtype. Its column labels key the columns as a dictionary’s keys do, an index of strings keys the rows, and the index’s and the columns’ names name the axes.</p>
+<div id="61937777" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb38"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb38-1"><a href="#cb38-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> pandas <span class="im">as</span> pd</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</div>
+<div id="e283c428" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb39"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb39-1"><a href="#cb39-1" aria-hidden="true" tabindex="-1"></a>df <span class="op">=</span> pd.DataFrame({<span class="st">'jan'</span>: [<span class="fl">1.</span>, <span class="fl">2.</span>], <span class="st">'feb'</span>: [<span class="fl">3.</span>, <span class="fl">4.</span>]}, index<span class="op">=</span>pd.Index([<span class="st">'north'</span>, <span class="st">'south'</span>], name<span class="op">=</span><span class="st">'city'</span>))</span>
+<span id="cb39-2"><a href="#cb39-2" aria-hidden="true" tabindex="-1"></a>df.columns.name <span class="op">=</span> <span class="st">'month'</span></span>
+<span id="cb39-3"><a href="#cb39-3" aria-hidden="true" tabindex="-1"></a>sales <span class="op">=</span> rm.array(df)</span>
+<span id="cb39-4"><a href="#cb39-4" aria-hidden="true" tabindex="-1"></a>sales.names, sales.keys</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>(('city', 'month'), (('north', 'south'), ('jan', 'feb')))</code></pre>
+</div>
+</div>
+<p>Different keys form a union in first-occurrence order. Missing positions use the dtype’s fill value, zero here:</p>
+<div id="650e1ee8" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb41"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb41-1"><a href="#cb41-1" aria-hidden="true" tabindex="-1"></a>rm.add({<span class="st">'a'</span>: <span class="fl">1.</span>, <span class="st">'b'</span>: <span class="fl">2.</span>}, {<span class="st">'b'</span>: <span class="fl">10.</span>, <span class="st">'c'</span>: <span class="fl">30.</span>})</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>Array([1.0, 12.0, 30.0], dtype=float64, keys=(('a', 'b', 'c'),))</code></pre>
+</div>
+</div>
+<p>Keys select positions too. A key slice includes its stop key, as in <code>keyed['a':'b']</code>. An axis holds each key at most once. Selecting a key twice raises an error that names the key, such as <code>duplicate key: a</code>. Reordering a keyed axis keeps its keys:</p>
+<div id="7b386cce" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb43"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb43-1"><a href="#cb43-1" aria-hidden="true" tabindex="-1"></a>keyed <span class="op">=</span> rm.array({<span class="st">'a'</span>: [<span class="dv">1</span>, <span class="dv">2</span>], <span class="st">'b'</span>: [<span class="dv">3</span>, <span class="dv">4</span>]})</span>
+<span id="cb43-2"><a href="#cb43-2" aria-hidden="true" tabindex="-1"></a>keyed[[<span class="st">'b'</span>, <span class="st">'a'</span>]]</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>Array([[3, 4], [1, 2]], dtype=int64, keys=(('b', 'a'), None))</code></pre>
+</div>
+</div>
+<p><code>keys=</code> labels a new array, and assigning <code>.keys</code> replaces labels without moving values. The tuple has one entry per axis: a tuple of keys, or <code>None</code> for an unkeyed axis. <code>None</code> within a keyed axis leaves that position unlabelled. Assign <code>None</code> to clear all keys.</p>
+<div id="0f92524b" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb45"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb45-1"><a href="#cb45-1" aria-hidden="true" tabindex="-1"></a>labelled <span class="op">=</span> rm.array(grid[:, ::<span class="op">-</span><span class="dv">1</span>], keys<span class="op">=</span>((<span class="st">'north'</span>, <span class="st">'south'</span>), (<span class="st">'late'</span>, <span class="va">None</span>, <span class="st">'early'</span>)))</span>
+<span id="cb45-2"><a href="#cb45-2" aria-hidden="true" tabindex="-1"></a>labelled.keys, labelled[<span class="st">'south'</span>, <span class="st">'early'</span>], labelled.tolist()</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>((('north', 'south'), ('late', None, 'early')),
+ 40,
+ [[30, 200, 10], [60, 500, 40]])</code></pre>
+</div>
+</div>
+<p>Replacing keys changes labels, not positions. Each labelled axis needs one entry per position. An outer <code>None</code> removes that axis’s keys:</p>
+<div id="b1cfaaa9" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb47"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb47-1"><a href="#cb47-1" aria-hidden="true" tabindex="-1"></a>labelled.keys <span class="op">=</span> ((<span class="st">'N'</span>, <span class="st">'S'</span>), <span class="va">None</span>)</span>
+<span id="cb47-2"><a href="#cb47-2" aria-hidden="true" tabindex="-1"></a>replacement <span class="op">=</span> labelled.keys</span>
+<span id="cb47-3"><a href="#cb47-3" aria-hidden="true" tabindex="-1"></a>labelled.keys <span class="op">=</span> <span class="va">None</span></span>
+<span id="cb47-4"><a href="#cb47-4" aria-hidden="true" tabindex="-1"></a>replacement, labelled.keys, labelled.tolist()</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>((('N', 'S'), None), (None, None), [[30, 200, 10], [60, 500, 40]])</code></pre>
+</div>
+</div>
+<p><code>names=</code> names a new array’s axes. Assign a tuple to <code>.names</code> to replace them, with one name or <code>None</code> per axis. <code>axis</code> takes a name wherever it takes a position:</p>
+<div id="d094ad72" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb49"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb49-1"><a href="#cb49-1" aria-hidden="true" tabindex="-1"></a>s <span class="op">=</span> rm.array([[<span class="dv">10</span>, <span class="dv">20</span>, <span class="dv">30</span>], [<span class="dv">40</span>, <span class="dv">50</span>, <span class="dv">60</span>]], names<span class="op">=</span>(<span class="st">'city'</span>, <span class="st">'month'</span>))</span>
+<span id="cb49-2"><a href="#cb49-2" aria-hidden="true" tabindex="-1"></a>s.<span class="bu">sum</span>(axis<span class="op">=</span><span class="st">'month'</span>)</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>Array([60, 150], dtype=int64, names=('city',))</code></pre>
+</div>
+</div>
+<p>Arithmetic matches axes by name, even when an axis is not first. A month-labelled vector adds to each city’s months. Disjoint names keep their axes separate:</p>
+<div id="27fbbd27" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb51"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb51-1"><a href="#cb51-1" aria-hidden="true" tabindex="-1"></a>monthly <span class="op">=</span> rm.array([<span class="dv">1</span>, <span class="dv">2</span>, <span class="dv">3</span>])</span>
+<span id="cb51-2"><a href="#cb51-2" aria-hidden="true" tabindex="-1"></a>monthly.names <span class="op">=</span> (<span class="st">'month'</span>,)</span>
+<span id="cb51-3"><a href="#cb51-3" aria-hidden="true" tabindex="-1"></a>s <span class="op">+</span> monthly</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>Array([[11, 22, 33], [41, 52, 63]], dtype=int64, names=('city', 'month'))</code></pre>
+</div>
+</div>
+<p>Index arrays with axis names follow arithmetic’s rule for names. Two with the same name read one position along both, and two with different names read every combination. A named index array selects along the axis with its name, wherever it stands in the brackets:</p>
+<div id="a7281d54" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb53"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb53-1"><a href="#cb53-1" aria-hidden="true" tabindex="-1"></a>m <span class="op">=</span> rm.array([[<span class="dv">0</span>, <span class="dv">1</span>, <span class="dv">2</span>], [<span class="dv">3</span>, <span class="dv">4</span>, <span class="dv">5</span>], [<span class="dv">6</span>, <span class="dv">7</span>, <span class="dv">8</span>]])</span>
+<span id="cb53-2"><a href="#cb53-2" aria-hidden="true" tabindex="-1"></a>i, j <span class="op">=</span> rm.arange(<span class="dv">3</span>), rm.arange(<span class="dv">3</span>)</span>
+<span id="cb53-3"><a href="#cb53-3" aria-hidden="true" tabindex="-1"></a>i.names, j.names <span class="op">=</span> (<span class="st">'i'</span>,), (<span class="st">'j'</span>,)</span>
+<span id="cb53-4"><a href="#cb53-4" aria-hidden="true" tabindex="-1"></a>month <span class="op">=</span> rm.array([<span class="dv">2</span>, <span class="dv">0</span>])</span>
+<span id="cb53-5"><a href="#cb53-5" aria-hidden="true" tabindex="-1"></a>month.names <span class="op">=</span> (<span class="st">'month'</span>,)</span>
+<span id="cb53-6"><a href="#cb53-6" aria-hidden="true" tabindex="-1"></a>m[i, i], m[i, j].shape, s[month]</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>(Array([0, 4, 8], dtype=int64, names=('i',)),
+ (3, 3),
+ Array([[30, 10], [60, 40]], dtype=int64, names=('city', 'month')))</code></pre>
+</div>
+</div>
+</section>
+<section id="interoperability-and-threads" class="level2">
+<h2 class="anchored" data-anchor-id="interoperability-and-threads">Interoperability and threads</h2>
+<p>Rustymath arrays export Python’s buffer protocol. NumPy can read them through <code>np.asarray</code> without copying. Rustymath accepts NumPy arrays and other buffer exporters too. Converting a BasedPL array with <code>rm.array(a)</code> also preserves its <code>.keys</code> and <code>.names</code>, without NumPy. The <a href="https://answerdotai.github.io/basedpl/python.html#rustymath-vs-basedpl">BasedPL Python guide</a> compares the two APIs and demonstrates a round trip.</p>
+<p>Python operators prefer BasedPL when either operand is a BPL value. Explicit Rustymath functions remain eager. Active BPL differentiation or batching values cannot convert to Rustymath. Other values outside Rustymath’s supported homogeneous dtypes require explicit conversion.</p>
+<p>Here <code>exp</code> keeps its argument’s 32-bit width:</p>
+<div id="be358817" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb55"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb55-1"><a href="#cb55-1" aria-hidden="true" tabindex="-1"></a><span class="im">import</span> numpy <span class="im">as</span> np</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+</div>
+<div id="83707ec1" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb56"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb56-1"><a href="#cb56-1" aria-hidden="true" tabindex="-1"></a>x <span class="op">=</span> np.linspace(<span class="dv">0</span>, <span class="dv">2</span>, <span class="dv">5</span>, dtype<span class="op">=</span>np.float32)</span>
+<span id="cb56-2"><a href="#cb56-2" aria-hidden="true" tabindex="-1"></a>result <span class="op">=</span> rm.exp(x)</span>
+<span id="cb56-3"><a href="#cb56-3" aria-hidden="true" tabindex="-1"></a>result</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>Array([1.0, 1.64872, 2.71828, 4.48169, 7.38906], dtype=float32)</code></pre>
+</div>
+</div>
+<p>Buffer exports are read-only snapshots. They retain their values after assignment to the Rustymath array. Transposes and slices export their actual strides without copying. Use ordinary Rustymath bracket assignment to change an array.</p>
+<div id="43aaf9a6" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb58"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb58-1"><a href="#cb58-1" aria-hidden="true" tabindex="-1"></a>snapshot <span class="op">=</span> np.asarray(result[::<span class="op">-</span><span class="dv">1</span>])</span>
+<span id="cb58-2"><a href="#cb58-2" aria-hidden="true" tabindex="-1"></a>result[<span class="dv">0</span>] <span class="op">=</span> <span class="dv">99</span></span>
+<span id="cb58-3"><a href="#cb58-3" aria-hidden="true" tabindex="-1"></a>snapshot, snapshot.flags.writeable, result</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>(array([7.389056 , 4.4816885, 2.718282 , 1.6487211, 1.       ],
+       dtype=float32),
+ False,
+ Array([99.0, 1.64872, 2.71828, 4.48169, 7.38906], dtype=float32))</code></pre>
+</div>
+</div>
+<p><code>rm.set_threads(n)</code> limits parallel calls across the whole process and returns its previous setting. Use 0 for the default or 1 for serial calls. <code>thread_setting()</code> reports that requested limit, while <code>threads()</code> reports the effective thread count. Restore the previous setting after a local change. Results need not agree in their last bits across thread counts.</p>
+<div id="46985d2d" class="cell">
+<div class="code-copy-outer-scaffold"><div class="sourceCode cell-code" id="cb60"><pre class="sourceCode python code-with-copy"><code class="sourceCode python"><span id="cb60-1"><a href="#cb60-1" aria-hidden="true" tabindex="-1"></a>previous <span class="op">=</span> rm.set_threads(<span class="dv">1</span>)</span>
+<span id="cb60-2"><a href="#cb60-2" aria-hidden="true" tabindex="-1"></a>setting <span class="op">=</span> rm.thread_setting(), rm.threads()</span>
+<span id="cb60-3"><a href="#cb60-3" aria-hidden="true" tabindex="-1"></a>rm.set_threads(previous)</span>
+<span id="cb60-4"><a href="#cb60-4" aria-hidden="true" tabindex="-1"></a>setting</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<div class="cell-output cell-output-display">
+<pre><code>(1, 1)</code></pre>
+</div>
+</div>
+
+
+</section>
+
+</main> <!-- /main -->
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp("https:\/\/answerdotai\.github\.io\/rustymath");
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+</div> <!-- /content -->
+
+
+
+
+<footer class="footer"><div class="nav-footer"><div class="nav-footer-center"><div class="toc-actions d-sm-block d-md-none"><ul><li><a href="https://github.com/AnswerDotAI/rustymath/issues/new" class="toc-action"><i class="bi bi-github"></i>Report an issue</a></li></ul></div></div></div></footer></body></html>
