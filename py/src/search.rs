@@ -270,15 +270,14 @@ macro_rules! matching_functions {
     ($($(#[doc = $doc:literal])* $name:ident($($arg:ident: $ty:ty),*) -> $result:ty;)+) => {
         mod ordinary { matching_functions!(@define false; $($(#[doc = $doc])* $name($($arg: $ty),*) -> $result;)+); }
         mod mathish { matching_functions!(@define true; $($(#[doc = $doc])* $name($($arg: $ty),*) -> $result;)+); }
-        pub fn add_mathish(m: &Bound<'_, PyModule>) -> PyResult<()> {
-            $(m.add_function(wrap_pyfunction!(mathish::$name, m)?)?;)+ Ok(())
-        }
+        pub use mathish::add as add_mathish;
     };
     (@define $mode:expr; $($(#[doc = $doc:literal])* $name:ident($($arg:ident: $ty:ty),*) -> $result:ty;)+) => {
         use super::*;
         $($(#[doc = $doc])*
         #[pyfunction]
         pub fn $name<'py>(py: Python<'py>, $($arg: $ty),*) -> PyResult<$result> { super::$name(py, $($arg,)* $mode) })+
+        pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> { $(m.add_function(wrap_pyfunction!(self::$name, m)?)?;)+ Ok(()) }
     };
 }
 matching_functions! {
@@ -299,12 +298,11 @@ matching_functions! {
 
 /// Adds this module's functions to `m`.
 pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    ordinary::add(m)?;
     for f in [
-        wrap_pyfunction!(ordinary::unique, m)?, wrap_pyfunction!(ordinary::index, m)?, wrap_pyfunction!(ordinary::isin, m)?, wrap_pyfunction!(ordinary::find, m)?,
-        wrap_pyfunction!(ordinary::counts, m)?, wrap_pyfunction!(ordinary::group_indices, m)?,
         wrap_pyfunction!(argsort, m)?, wrap_pyfunction!(sort, m)?, wrap_pyfunction!(partition, m)?, wrap_pyfunction!(argpartition, m)?,
         wrap_pyfunction!(argmin, m)?, wrap_pyfunction!(argmax, m)?, wrap_pyfunction!(median, m)?, wrap_pyfunction!(quantile, m)?,
-        wrap_pyfunction!(lexsort, m)?, wrap_pyfunction!(searchsorted, m)?, wrap_pyfunction!(bincount, m)?, wrap_pyfunction!(ordinary::_set, m)?,
+        wrap_pyfunction!(lexsort, m)?, wrap_pyfunction!(searchsorted, m)?, wrap_pyfunction!(bincount, m)?,
     ] { m.add_function(f)?; }
     Ok(())
 }
