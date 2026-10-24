@@ -32,11 +32,11 @@ from .linalg import matmul
 from .integer import encode, decode
 from .search import (Unique, unique, index, isin, argsort, lexsort, searchsorted, bins, bincount, counts, group_indices, sort, partition, argpartition,
     argmin, argmax, median, quantile, percentile, union1d, intersect1d, setdiff1d, find)
-from ._core import (__version__, CT, Array, absolute, add, all, angle, any, arccos, arccosh, arcsin, arcsinh, arctan, arctan2, arctanh, array, betainc,
+from ._core import (__version__, Array, absolute, add, all, angle, any, arccos, arccosh, arcsin, arcsinh, arctan, arctan2, arctanh, array, betainc,
     betaincinv, binom, binom_dk, binom_dn, cbrt, ceil, cis, cos, cosh, cumprod, cumsum, digamma, distribution, divide, equal, erf, erfc, erfcinv, erfinv, exp, expm1, factorial, floor,
     gamma, gammainc, gammaincc, gammaincinv, gammaln, gcd, greater, greater_equal, hypot, lambertw, lcm, less, less_equal, log, log10, log1p, log2, logb,
     loggamma, logical_and, logical_or, logical_scan, logical_xor, logical_xnor, max, maximum, min, minimum, minmax, multiply, not_equal, number_theory, power,
-    prod, remainder, root, set_threads, set_tolerance, sign, sin, sinh, sqrt, sqrt1mx2, sqrt1px2, sqrtx2m1, subtract, sum, tan, tanh, threads, thread_setting, timing, tolerance)
+    prod, remainder, root, set_threads, sign, sin, sinh, sqrt, sqrt1mx2, sqrt1px2, sqrtx2m1, subtract, sum, tan, tanh, threads, thread_setting, timing)
 from .create import arange, finfo, full, full_like, iinfo, issubdtype, linspace, logspace, ones, ones_like, result_type, zeros, zeros_like
 from ._core import clip, conj, imag, isfinite, isinf, isnan, real, rint, trunc
 from ._core import bitwise_and, bitwise_or, bitwise_xor, bitwise_not, left_shift, right_shift, floor_divide, round, degrees, radians
@@ -45,16 +45,16 @@ from ._core import (argwhere, concatenate, expand_dims, flatten, flip, nonzero, 
     transpose, where)
 from .structure import diag, diagonal, eye, identity, tril, triu, trace, diff, ptp, broadcast_to
 from .signal import correlate, convolve, overlap_add
-from ._naming import _binary_name
+from ._naming import _binary_function
 Generator, default_rng = random.Generator, random.default_rng
 
 def accumulate(f, x, axis=None, start=None):
     "Left-to-right running results of a native binary function, along the flattened input or one axis by position/name. A scalar start precedes each lane without adding an output item. Comparisons retain the input's computing dtype, reading each later result as 0 or 1; ordinary arithmetic promotion and overflow rules apply"
-    return _core._accumulate(_binary_name(f), x, axis, start)
+    return _core._accumulate(_binary_function(f), x, axis, start)
 
 def sliding(f, x, width, axis=-1):
     "Folds of each window of `width` neighbouring items along one axis, by position or name, by a native binary function with an associative reduction: `add`, `multiply`, `maximum`, `minimum` or a logical one. A lane of n items gives n - width + 1 folds, each keyed as the item that starts its window. A fold costs the same for each item whatever the width"
-    return _core._sliding(_binary_name(f), x, width, axis)
+    return _core._sliding(_binary_function(f), x, width, axis)
 
 def sliding_argmax(x, width, axis=-1):
     "The position along one axis, by position or name, of the first maximum of each window of `width` neighbouring items, as int64, keyed as `sliding` keys its folds. A window compares its items as `sliding(maximum, ...)` folds them, so it skips NaN, where `argmax` counts NaN as the largest"
@@ -66,6 +66,7 @@ def sliding_argmin(x, width, axis=-1):
 
 def at(f, a, indices, b):
     "A copy of `a` with `b`, broadcast over the selection that `indices` makes as brackets take it, combined into each selected item by the native binary function `f`. An item selected more than once combines every time, as NumPy's `ufunc.at` combines in place. `f` is `add`, `subtract`, `multiply`, `divide`, `maximum` or `minimum`."
-    return _core._at(_binary_name(f), a, indices, b)
+    return _core._at(_binary_function(f), a, indices, b)
 for _m in (distribution, number_theory): sys.modules[f'{__name__}.{_m.__name__}'] = _m
+from . import mathish
 

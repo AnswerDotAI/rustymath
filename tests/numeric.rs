@@ -210,6 +210,9 @@ mod integer {
             }
         }
         assert_eq!([power(0, 0), power(0, -1), power(-1, i64::MIN), power(-2, 63), power(2, 63)], [Some(1), None, Some(1), Some(i64::MIN), None]);
+        for (x, y, result) in [(2, -1, None), (200, 2, Some(-25536)), (-1, -3, Some(-1))] {
+            assert_eq!(Binary::<i16>::checked(&rustymath::WrappingPow, x, y), result);
+        }
     }
 
     #[test]

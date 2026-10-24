@@ -11,17 +11,16 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rustymath::agreement::Agreement;
 use rustymath::array::{Array as Core, ArrayView};
-use rustymath::buffer::{Buffer, ComplexWidth, DType, Element, FloatWidth, Ints, Items, View, Width};
+use rustymath::buffer::{Buffer, ComplexWidth, DType, Element, FloatWidth, Items, View};
 use rustymath::error::{Error, Kind};
 use rustymath::layout::{position, Lanes, Layout};
 use rustymath::operation::{AccumulationKernel, BinaryKernel, Kernels, TernaryKernel, UnaryKernel};
 use rustymath::linalg::Scalar;
 use rustymath::stats;
 use rustymath::structure::Plan;
-use rustymath::tolerant::{Ceil, Equal, Floor, FloorDivide, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue, Tolerance};
+use rustymath::tolerant::{Ceil, Equal, Floor, FloorDivide, MathishFloorDivide, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue, Tolerance};
 use rustymath::{Flipped, kernels, reduce, with_ints, Wrapped};
 use rustymath_buffer::py_err;
-use ::std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// The error for a function with no kernel for `dtype`.
 pub fn missing(function: &str, dtype: DType) -> PyErr { py_err(Error::new(Kind::Domain, format!("{function} doesn't take {}", dtype.name()))) }
@@ -39,31 +38,9 @@ fn fitted<F: Copy>(function: &str, kernels: &Kernels<F>, dtype: DType, out: DTyp
     Err(py_err(Error::new(Kind::Overflow, format!("an integer result of {function} doesn't fit {}", out.name()))))
 }
 
-/// Whether a pair of integers `x` and `y`, as `agreement` pairs them, has a negative exponent `y` beside a base `x` other than 1 or -1, so that its integer power isn't an integer.
-fn fractional_power(x: ArrayView<'_>, y: ArrayView<'_>, agreement: &Agreement) -> Result<bool, Error> {
-    if !matches!((x.dtype(), y.dtype()), (DType::Integer(_), DType::Integer(_))) { return Ok(false); }
-    let (xs, ys) = (x.cast(DType::Integer(Width::I64))?, y.cast(DType::Integer(Width::I64))?);
-    let (View::Integers(Ints::I64(xs)), View::Integers(Ints::I64(ys))) = (xs.view(), ys.view()) else { unreachable!("a cast to 64-bit integers") };
-    Ok((0..agreement.len).any(|i| matches!((agreement.left.get(i), agreement.right.get(i)), (Some(a), Some(b)) if ys[b] < 0 && !matches!(xs[a], 1 | -1))))
-}
-
-/// The process's tolerance, as `set_tolerance` sets it: the bits of an `f64` from 0, exact, up to below 1. It starts at 0.
-static TOLERANCE: AtomicU64 = AtomicU64::new(0);
-
-/// `t` as a tolerance, or a ValueError naming `name` outside 0 to below 1.
-fn checked_tolerance(t: f64, name: &str) -> PyResult<Tolerance> {
-    Tolerance::new(t).ok_or_else(|| PyValueError::new_err(format!("{name} must be at least 0 and below 1, not {t}")))
-}
-
-/// Sets the process's tolerance to `t`, returning its previous setting. A ValueError outside 0 to below 1.
-pub(crate) fn set_tolerance(t: f64) -> PyResult<f64> {
-    checked_tolerance(t, "the tolerance")?;
-    Ok(f64::from_bits(TOLERANCE.swap(t.to_bits(), Relaxed)))
-}
-
-/// The tolerance `ct`, or the process's tolerance (`set_tolerance`) for `None`. A ValueError outside 0 to below 1.
-pub(crate) fn tolerance(ct: Option<f64>) -> PyResult<Tolerance> {
-    checked_tolerance(ct.unwrap_or_else(|| f64::from_bits(TOLERANCE.load(Relaxed))), "ct")
+pub(crate) fn comparison(mathish: bool) -> Tolerance { if mathish { Tolerance::DEFAULT } else { Tolerance::EXACT } }
+pub(crate) fn mathish_at(dtype: Option<DType>) -> bool {
+    matches!(dtype, Some(DType::Float(FloatWidth::F64) | DType::Complex(ComplexWidth::F64)))
 }
 
 /// An axis, given as a position, negative from the end, or as an axis name.
@@ -113,12 +90,11 @@ fn axes_of(axis: Option<&Axes>, layout: &Layout) -> PyResult<Vec<usize>> {
 
 /// Running a function object's kernels on a call's Python arguments, for each arity.
 pub trait Apply<K> {
-    fn apply<'py>(&self, py: Python<'py>, function: &str, k: &K, args: &[&Bound<'py, PyAny>]) -> PyResult<Bound<'py, PyAny>>;
+    fn apply<'py>(&self, py: Python<'py>, function: &str, k: &K, call: Call) -> PyResult<Bound<'py, PyAny>>;
 }
 
 impl<K: Sync> Apply<K> for Kernels<UnaryKernel<K>> {
-    fn apply<'py>(&self, py: Python<'py>, function: &str, k: &K, args: &[&Bound<'py, PyAny>]) -> PyResult<Bound<'py, PyAny>> {
-        let call = convert(args)?;
+    fn apply<'py>(&self, py: Python<'py>, function: &str, k: &K, call: Call) -> PyResult<Bound<'py, PyAny>> {
         let x = call.args[0].view();
         let buffer = released(py, || checked(function, self, x.dtype(), self.unary(k, x)))?;
         give_items(py, x.layout().clone(), buffer, call.scalar())
@@ -126,9 +102,8 @@ impl<K: Sync> Apply<K> for Kernels<UnaryKernel<K>> {
 }
 
 /// `k` on two arguments. `domain` is the message of a Domain error for a failed integer result from a pair with a negative integer exponent and a base other than 1 or -1, as an integer power gives. Where `characters` gives the object's [`characters::binary`](rustymath::characters::binary), a call with a character argument runs it, and raises a Domain error where an offset isn't whole or a result isn't a Unicode scalar value.
-fn binary<'py, K: Sync>(kernels: &Kernels<BinaryKernel<K>>, py: Python<'py>, function: &str, k: &K, args: &[&Bound<'py, PyAny>], domain: Option<&str>, characters: Option<rustymath::characters::Kernel<K>>) -> PyResult<Bound<'py, PyAny>> {
-    let Some(characters) = characters else { return binary_call(kernels, py, function, k, convert(args)?, domain) };
-    let call = convert_kinds(args)?;
+fn binary<'py, K: Sync>(kernels: &Kernels<BinaryKernel<K>>, py: Python<'py>, function: &str, k: &K, call: Call, domain: Option<&str>, characters: Option<rustymath::characters::Kernel<K>>) -> PyResult<Bound<'py, PyAny>> {
+    let Some(characters) = characters else { return binary_call(kernels, py, function, k, call, domain) };
     let (x, y) = (call.args[0].view(), call.args[1].view());
     if x.dtype() != DType::Character && y.dtype() != DType::Character { return binary_call(kernels, py, function, k, call, domain); }
     let agreement = Agreement::new(x.layout(), y.layout()).map_err(py_err)?;
@@ -137,25 +112,33 @@ fn binary<'py, K: Sync>(kernels: &Kernels<BinaryKernel<K>>, py: Python<'py>, fun
     give_items(py, agreement.layout, buffer, call.scalar())
 }
 
+fn convert_binary<K>(_: &K, characters: Option<rustymath::characters::Kernel<K>>, args: &[&Bound<'_, PyAny>]) -> PyResult<Call> {
+    if characters.is_some() { convert_kinds(args) } else { convert(args) }
+}
+
 /// [`binary`] on a call that [`convert`] or [`convert_kinds`] gave.
 fn binary_call<'py, K: Sync>(kernels: &Kernels<BinaryKernel<K>>, py: Python<'py>, function: &str, k: &K, call: Call, domain: Option<&str>) -> PyResult<Bound<'py, PyAny>> {
     let (x, y) = (call.args[0].view(), call.args[1].view());
     let agreement = Agreement::new(x.layout(), y.layout()).map_err(py_err)?;
-    let buffer = released(py, || checked_binary(function, kernels, kernels.binary(k, x, y, &agreement), x, y, &agreement, domain))?;
+    let buffer = released(py, || checked_binary(function, kernels, kernels.binary(k, x, y, &agreement), x.dtype(), y, &agreement, domain))?;
     give_items(py, agreement.layout, buffer, call.scalar())
 }
 
-/// [`checked`] for two arguments, after raising `domain` where a failed integer result comes from a pair whose integer power isn't an integer, as [`binary`] describes.
-fn checked_binary<F: Copy>(function: &str, kernels: &Kernels<F>, result: Option<(Buffer, bool)>, x: ArrayView<'_>, y: ArrayView<'_>, agreement: &Agreement, domain: Option<&str>) -> PyResult<Buffer> {
-    if let (Some((_, false)), Some(message)) = (&result, domain) && fractional_power(x, y, agreement).map_err(py_err)? {
+fn negative_right(y: ArrayView<'_>, agreement: &Agreement) -> bool {
+    let View::Integers(ints) = y.storage() else { return false };
+    with_ints!(ints, |items| (0..agreement.len).any(|i| agreement.right.get(i).and_then(|j| y.mapping().get(j)).is_some_and(|j| i64::from(items[j]) < 0)))
+}
+
+/// [`checked`] after raising `domain` for a failed integer call with a negative right argument.
+fn checked_binary<F: Copy>(function: &str, kernels: &Kernels<F>, result: Option<(Buffer, bool)>, dtype: DType, right: ArrayView<'_>, agreement: &Agreement, domain: Option<&str>) -> PyResult<Buffer> {
+    if let (Some((buffer, false)), Some(message)) = (&result, domain) && matches!(buffer.dtype(), DType::Integer(_)) && negative_right(right, agreement) {
         return Err(py_err(Error::new(Kind::Domain, message.to_owned())));
     }
-    checked(function, kernels, x.dtype(), result)
+    checked(function, kernels, dtype, result)
 }
 
 impl<K: Sync> Apply<K> for Kernels<TernaryKernel<K>> {
-    fn apply<'py>(&self, py: Python<'py>, function: &str, k: &K, args: &[&Bound<'py, PyAny>]) -> PyResult<Bound<'py, PyAny>> {
-        let call = convert(args)?;
+    fn apply<'py>(&self, py: Python<'py>, function: &str, k: &K, call: Call) -> PyResult<Bound<'py, PyAny>> {
         let views = [0, 1, 2].map(|i| call.args[i].view());
         let first = Agreement::new(views[0].layout(), views[1].layout()).map_err(py_err)?;
         let second = Agreement::new(&first.layout, views[2].layout()).map_err(py_err)?;
@@ -217,10 +200,12 @@ fn scan<'py, R: Sync>(py: Python<'py>, function: &str, kernels: &Kernels<Accumul
 
 /// Bulk products, folds and scans at the same dtypes as their elementwise functions. A tolerant function compares within the tolerance that each call passes.
 pub(crate) struct NativeBinary {
-    pub apply: for<'a, 'b> fn(View<'a>, View<'b>, &Agreement, Tolerance) -> PyResult<Buffer>,
-    pub fold: for<'a, 'b> fn(View<'a>, [usize; 3], Option<View<'b>>, Tolerance) -> PyResult<Buffer>,
-    pub scan: for<'a, 'b> fn(View<'a>, [usize; 3], Option<View<'b>>, Tolerance) -> PyResult<Buffer>,
+    pub apply: for<'a, 'b> fn(View<'a>, View<'b>, &Agreement, bool) -> PyResult<Buffer>,
+    pub fold: for<'a, 'b> fn(View<'a>, [usize; 3], Option<View<'b>>, bool) -> PyResult<Buffer>,
+    pub scan: for<'a, 'b> fn(View<'a>, [usize; 3], Option<View<'b>>, bool) -> PyResult<Buffer>,
 }
+
+pub(crate) type NativeFunction<'a> = (&'a str, bool);
 
 pub(crate) fn native_binary(name: &str) -> PyResult<&'static NativeBinary> {
     NATIVE_BINARIES.iter().flatten().find(|(n, _)| *n == name).map(|(_, b)| b)
@@ -253,62 +238,103 @@ fn reduction_scan(name: &str, x: View<'_>, dims: [usize; 3], start: Option<View<
     rustymath::facts!(known_reduction, name, run)
 }
 
-/// Each function object as a Python function, in one entry: its name, its arguments, with `; ct` for a tolerance keyword, and the object, which `ct` can make. `only` limits its kernels to the dtypes it lists. With two arguments, `negative` gives the message that [`binary`] raises for a failed integer result beside a negative second argument, and an object with a [`Rule`](rustymath::characters::Rule) takes characters by it, as [`binary`] says. The same entries supply native inner-product callbacks.
+/// Each function object as a Python function and native callback. `; ct` binds the mode's comparison tolerance internally; an object after `=>` replaces the ordinary one in Mathish mode. `only` limits dtypes. `negative` gives a failed integer result's error beside a negative second argument. A character [`Rule`](rustymath::characters::Rule) supplies character arithmetic.
 macro_rules! functions {
-    ($($(#[doc = $doc:literal])+ $name:ident($($x:ident),+ $(; $ct:ident)?) = $k:expr $(, only $only:expr)? $(, negative $negative:literal)?;)+) => {
-        $(
-            $(#[doc = $doc])+
-            #[pyfunction]
-            #[pyo3(signature = ($($x),+ $(, $ct = None)?))]
-            pub(crate) fn $name<'py>(py: Python<'py>, $($x: &Bound<'py, PyAny>,)+ $($ct: Option<f64>)?) -> PyResult<Bound<'py, PyAny>> {
-                $(let $ct = tolerance($ct)?;)?
-                let k = $k;
-                let kernels = functions!(@kernels [$($x),+] k)$(.only($only))?;
-                functions!(@apply kernels, py, $name, k, [$($x),+] $(, $negative)?)
-            }
-        )+
+    ($($(#[doc = $doc:literal])+ $name:ident($($x:ident),+ $(; $ct:ident)?) = $k:expr $(=> $mathish:expr)? $(, only $only:expr)? $(, negative $negative:literal)?;)+) => {
+        $(functions!(@define false; $(#[doc = $doc])+ $name($($x),+ $(; $ct)?) = $k $(=> $mathish)? $(, only $only)? $(, negative $negative)?);)+
+        pub(crate) mod mathish {
+            use super::*;
+            $(functions!(@affected [$($ct)?], [$($mathish)?]; $(#[doc = $doc])+ $name($($x),+ $(; $ct)?) = $k $(=> $mathish)? $(, only $only)? $(, negative $negative)?);)+
+        }
         static NATIVE_BINARIES: &[Option<(&str, NativeBinary)>] = &[
-            $(functions!(@native $name, [$($x),+], [$($ct)?], $k $(, only $only)? $(, negative $negative)?)),+
+            $(functions!(@native $name, [$($x),+], [$($ct)?], [$($mathish)?], $k $(, only $only)? $(, negative $negative)?)),+
         ];
-        /// Adds the elementwise functions to `m`.
         fn add_elementwise(m: &Bound<'_, PyModule>) -> PyResult<()> {
             $(m.add_function(wrap_pyfunction!($name, m)?)?;)+
             m.add("_binary_names", NATIVE_BINARIES.iter().flatten().map(|(name, _)| *name).collect::<Vec<_>>())?;
             Ok(())
         }
+        pub(crate) fn add_mathish(m: &Bound<'_, PyModule>) -> PyResult<()> {
+            $(functions!(@add [$($ct)?], [$($mathish)?]; m, mathish::$name);)+
+            Ok(())
+        }
     };
-    (@native $name:ident, [$x:ident, $y:ident], [$($ct:ident)?], $k:expr $(, only $only:expr)? $(, negative $negative:literal)?) => {
+    (@affected [], []; $($rest:tt)*) => {};
+    (@affected $ct:tt, $mathish:tt; $($rest:tt)*) => { functions!(@define true; $($rest)*); };
+    (@add [], []; $m:ident, $f:path) => {};
+    (@add $ct:tt, $mathish:tt; $m:ident, $f:path) => { $m.add_function(wrap_pyfunction!($f, $m)?)?; };
+    (@define $on:expr; $(#[doc = $doc:literal])+ $name:ident($($x:ident),+ $(; $ct:ident)?) = $k:expr $(=> $mathish:expr)? $(, only $only:expr)? $(, negative $negative:literal)?) => {
+        $(#[doc = $doc])+
+        #[pyfunction]
+        #[pyo3(signature = ($($x),+))]
+        pub(crate) fn $name<'py>(py: Python<'py>, $($x: &Bound<'py, PyAny>,)+) -> PyResult<Bound<'py, PyAny>> {
+            $(let $ct = Tolerance::EXACT;)?
+            let ordinary = $k;
+            let call = functions!(@convert ordinary, [$($x),+])?;
+            let _mode = $on && {
+                let raw = functions!(@kernels [$($x),+] ordinary)$(.only($only))?;
+                mathish_at(raw.computes(call.args[0].view().dtype()))
+            };
+            functions!(@object [$($ct)?], [$($mathish)?], _mode, $k, |k| {
+                let kernels = functions!(@kernels [$($x),+] k)$(.only($only))?;
+                functions!(@apply kernels, py, $name, k, call, [$($x),+] $(, $negative)?)
+            })
+        }
+    };
+    (@native $name:ident, [$x:ident, $y:ident], [$($ct:ident)?], [$($mathish:expr)?], $k:expr $(, only $only:expr)? $(, negative $negative:literal)?) => {
         Some((stringify!($name), NativeBinary {
-            apply: |x, y, agreement, _t| {
-                $(let $ct = _t;)?
-                let k = $k;
-                let (xl, yl) = (Layout::from([x.len()]), Layout::from([y.len()]));
-                let kernels = kernels!(Binary of k)$(.only($only))?;
-                let (xv, yv) = (ArrayView::compact(&xl, x), ArrayView::compact(&yl, y));
-                checked_binary(stringify!($name), &kernels, kernels.binary(&k, xv, yv, agreement), xv, yv, agreement, None$(.or(Some($negative)))?)
+            apply: |x, y, agreement, on| {
+                let _mode = functions!(@mode [$($ct)?], on, $k, x.dtype());
+                functions!(@object [$($ct)?], [$($mathish)?], _mode, $k, |k| {
+                    let (xl, yl) = (Layout::from([x.len()]), Layout::from([y.len()]));
+                    let kernels = kernels!(Binary of k)$(.only($only))?;
+                    let (xv, yv) = (ArrayView::compact(&xl, x), ArrayView::compact(&yl, y));
+                    checked_binary(stringify!($name), &kernels, kernels.binary(&k, xv, yv, agreement), x.dtype(), yv, agreement, None$(.or(Some($negative)))?)
+                })
             },
-            fold: |x, dims, tail, _t| {
-                $(let $ct = _t;)?
-                let k = $k;
+            fold: |x, dims, tail, on| {
                 if let Some(result) = reduction_fold(stringify!($name), x, dims, tail) { return result; }
-                if dims[1] == 0 { return Err(PyValueError::new_err(format!("{} has no identity for an empty inner product", stringify!($name)))); }
-                let kernels = kernels!(RightFold of k)$(.only($only))?;
-                checked(stringify!($name), &kernels, x.dtype(), kernels.run(&k, x, dims, tail))
+                let _mode = functions!(@mode [$($ct)?], on, $k, x.dtype());
+                functions!(@object [$($ct)?], [$($mathish)?], _mode, $k, |k| {
+                    if dims[1] == 0 { return Err(PyValueError::new_err(format!("{} has no identity for an empty inner product", stringify!($name)))); }
+                    let kernels = kernels!(RightFold of k)$(.only($only))?;
+                    checked(stringify!($name), &kernels, x.dtype(), kernels.run(&k, x, dims, tail))
+                })
             },
-            scan: |x, dims, start, _t| {
-                $(let $ct = _t;)?
-                let k = $k;
+            scan: |x, dims, start, on| {
                 if let Some(result) = reduction_scan(stringify!($name), x, dims, start) { return result; }
-                let kernels = kernels!(LeftScan of k)$(.only($only))?;
-                checked(stringify!($name), &kernels, x.dtype(), kernels.run(&k, x, dims, start))
+                let _mode = functions!(@mode [$($ct)?], on, $k, x.dtype());
+                functions!(@object [$($ct)?], [$($mathish)?], _mode, $k, |k| {
+                    let kernels = kernels!(LeftScan of k)$(.only($only))?;
+                    checked(stringify!($name), &kernels, x.dtype(), kernels.run(&k, x, dims, start))
+                })
             },
         }))
     };
     (@native $name:ident, [$($x:ident),+], $($rest:tt)*) => { None };
-    (@apply $kernels:ident, $py:ident, $name:ident, $k:ident, [$x:ident, $y:ident] $(, $negative:literal)?) => {
-        binary(&$kernels, $py, stringify!($name), &$k, &[$x, $y], None$(.or(Some($negative)))?, rustymath::characters!(of $k))
+    (@mode [$($ct:ident)?], $on:expr, $ordinary:expr, $dtype:expr) => { $on && {
+        $(let $ct = Tolerance::EXACT;)?
+        let k = $ordinary;
+        mathish_at(kernels!(Binary of k).computes($dtype))
+    }};
+    (@object [$($ct:ident)?], [], $mode:expr, $ordinary:expr, |$k:ident| $body:block) => {{
+        $(let $ct = comparison($mode);)?
+        let $k = $ordinary;
+        $body
+    }};
+    (@object [$($ct:ident)?], [$mathish:expr], $mode:expr, $ordinary:expr, |$k:ident| $body:block) => {{
+        let mode = $mode;
+        $(let $ct = comparison(mode);)?
+        if mode { let $k = $mathish; $body } else { let $k = $ordinary; $body }
+    }};
+    (@convert $k:ident, [$x:ident, $y:ident]) => {
+        convert_binary(&$k, rustymath::characters!(of $k), &[$x, $y])
     };
-    (@apply $kernels:ident, $py:ident, $name:ident, $k:ident, $args:tt) => { $kernels.apply($py, stringify!($name), &$k, &$args) };
+    (@convert $k:ident, [$($x:ident),+]) => { convert(&[$($x),+]) };
+    (@apply $kernels:ident, $py:ident, $name:ident, $k:ident, $call:ident, [$x:ident, $y:ident] $(, $negative:literal)?) => {
+        binary(&$kernels, $py, stringify!($name), &$k, $call, None$(.or(Some($negative)))?, rustymath::characters!(of $k))
+    };
+    (@apply $kernels:ident, $py:ident, $name:ident, $k:ident, $call:ident, $args:tt) => { $kernels.apply($py, stringify!($name), &$k, $call) };
     (@kernels [$x:ident] $k:ident) => { kernels!(Unary of $k) };
     (@kernels [$x:ident, $y:ident] $k:ident) => { kernels!(Binary of $k) };
     (@kernels [$x:ident, $y:ident, $z:ident] $k:ident) => { kernels!(Ternary of $k) };
@@ -365,8 +391,8 @@ functions! {
     log2(x) = rustymath::Log2;
     /// The logarithm of x to base 10.
     log10(x) = rustymath::Log10;
-    /// The logarithm of x to the given base, with the base first.
-    logb(base, x) = rustymath::Logb;
+    /// The logarithm of x to the given base, with the base first. Mathish mode gives zero for base and argument one at float64 and complex128.
+    logb(base, x) = rustymath::Logb => rustymath::MathishLogb;
     /// The square root of x, the principal one for a complex x.
     sqrt(x) = rustymath::Sqrt;
     /// The cube root of x.
@@ -435,10 +461,10 @@ functions! {
     subtract(x, y) = Wrapped(rustymath::Subtract);
     /// x × y. An integer result that doesn't fit its dtype wraps, as NumPy's does.
     multiply(x, y) = Wrapped(rustymath::Multiply);
-    /// x / y. Integers compute as floats.
-    divide(x, y) = rustymath::Divide;
+    /// x / y. Integers compute as floats. Mathish mode defines zero divided by zero as zero for float64 and complex128.
+    divide(x, y) = rustymath::Divide => rustymath::MathishDivide;
     /// x^y. An integer power that doesn't fit its dtype wraps, as NumPy's does. A negative integer y beside an x other than 1 or -1 raises ValueError.
-    power(x, y) = rustymath::Pow, negative "an integer power with a negative exponent isn't an integer";
+    power(x, y) = rustymath::WrappingPow, negative "an integer power with a negative exponent isn't an integer";
     /// The real nth root of y, computed without rounding 1/n first.
     root(n, y) = rustymath::Root;
     /// √(x² + y²), with no overflow or underflow in between.
@@ -473,29 +499,29 @@ functions! {
     betainc(a, b, x) = rustymath::Betainc;
     /// The x with I_x(a, b) = p.
     betaincinv(a, b, p) = rustymath::Betaincinv;
-    /// Whether x equals y. Floats are equal when |x - y| is at most `ct` times the larger magnitude, as APL compares them. Integers compare exactly, and characters by code point. A number never equals a character.
+    /// Whether x equals y. Mathish mode compares floats within relative tolerance 1e-14. Integers compare exactly, and characters by code point. A number never equals a character.
     equal(x, y; ct) = Equal(ct);
-    /// Whether x doesn't equal y, within the tolerance `ct` for floats.
+    /// Whether x doesn't equal y, with floats compared under Mathish mode.
     not_equal(x, y; ct) = NotEqual(ct);
-    /// Whether x is below y and doesn't equal it, within the tolerance `ct` for floats. Characters compare by code point, and a number is below a character.
+    /// Whether x is below y and doesn't equal it, with floats compared under Mathish mode. Characters compare by code point, and a number is below a character.
     less(x, y; ct) = Less(ct);
-    /// Whether x is below y or equals it, within the tolerance `ct` for floats. Characters compare by code point, and a number is below a character.
+    /// Whether x is below y or equals it, with floats compared under Mathish mode. Characters compare by code point, and a number is below a character.
     less_equal(x, y; ct) = LessEqual(ct);
-    /// Whether x is above y and doesn't equal it, within the tolerance `ct` for floats. Characters compare by code point, and a number is below a character.
+    /// Whether x is above y and doesn't equal it, with floats compared under Mathish mode. Characters compare by code point, and a number is below a character.
     greater(x, y; ct) = Greater(ct);
-    /// Whether x is above y or equals it, within the tolerance `ct` for floats. Characters compare by code point, and a number is below a character.
+    /// Whether x is above y or equals it, with floats compared under Mathish mode. Characters compare by code point, and a number is below a character.
     greater_equal(x, y; ct) = GreaterEqual(ct);
-    /// The largest whole number at most x. An item within relative tolerance `ct` of the next whole number rounds to it. Integers and Booleans keep their values.
+    /// The largest whole number at most x. Mathish mode rounds a float within relative tolerance 1e-14 of the next whole number to it. Integers and Booleans keep their values.
     floor(x; ct) = Floor(ct);
-    /// The smallest whole number at least x. An item within relative tolerance `ct` of the whole number below rounds to it. Integers and Booleans keep their values.
+    /// The smallest whole number at least x. Mathish mode rounds a float within relative tolerance 1e-14 of the whole number below to it. Integers and Booleans keep their values.
     ceil(x; ct) = Ceil(ct);
-    /// The remainder of x divided by y. A zero y gives x, by APL's rule. Floats use `floor_divide`'s quotient and native fused multiply-add where available. At nonzero `ct`, a product equal to x within tolerance snaps the float remainder to 0.
+    /// The remainder of x divided by y. A zero y gives x, by APL's rule. Floats use the floored quotient and native fused multiply-add where available. Mathish mode snaps the remainder to zero when the product equals x within tolerance.
     remainder(x, y; ct) = Flipped(Residue(ct));
-    /// The floor of rounded x / y. For floats, a quotient within relative tolerance `ct` of a whole number gives that number. Integer division is exact, and fails on a zero divisor or an overflowing quotient.
-    floor_divide(x, y; ct) = FloorDivide(ct);
-    /// The greatest common divisor of x and y, never negative for integers and floats. Each remainder step of floats and complex numbers uses relative tolerance `ct`.
+    /// The floor of rounded x / y. Mathish mode uses tolerant flooring and defines zero divided by zero as zero for float64. Integer zero divisors and overflowing quotients fail.
+    floor_divide(x, y; ct) = FloorDivide(ct) => MathishFloorDivide(ct);
+    /// The greatest common divisor of x and y, never negative for integers and floats. Float and complex remainder steps compare under Mathish mode.
     gcd(x, y; ct) = Gcd(ct);
-    /// The least common multiple of x and y, with the sign of x y. Each remainder step of floats uses relative tolerance `ct`.
+    /// The least common multiple of x and y, with the sign of x y. Float remainder steps compare under Mathish mode.
     lcm(x, y; ct) = Lcm(ct);
 }
 
@@ -586,22 +612,24 @@ fn logical_scan<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, table: [[bool; 2]; 
 
 #[pyfunction]
 #[pyo3(signature = (function, x, axis=None, start=None))]
-fn _accumulate<'py>(py: Python<'py>, function: &str, x: &Bound<'py, PyAny>, axis: Option<Axis>, start: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+fn _accumulate<'py>(py: Python<'py>, function: NativeFunction<'_>, x: &Bound<'py, PyAny>, axis: Option<Axis>, start: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
     let call = convert(&[Some(x), start].into_iter().flatten().collect::<Vec<_>>())?;
     let x = &call.args[0];
     let start = call.args.get(1);
     if start.is_some_and(|s| !s.layout().shape().is_empty()) { return Err(PyValueError::new_err("start must be a scalar")); }
     let (dims, layout, _) = along_axis(x.layout(), x.view().len(), axis)?;
     let (items, start) = (x.row_major()?, start.map(|s| s.row_major()).transpose()?);
-    let (scan, t) = (native_binary(function)?.scan, tolerance(None)?);
-    let result = released(py, || scan(items.view(), dims, start.as_ref().map(|s| s.view()), t))?;
+    let (function, mode) = function;
+    let scan = native_binary(function)?.scan;
+    let result = released(py, || scan(items.view(), dims, start.as_ref().map(|s| s.view()), mode))?;
     give_items(py, layout, result, false)
 }
 
 /// The folds by the native binary `function` of each window of `width` neighbouring items of `x` along `axis`, by position or name. `function` must have an associative reduction. A lane of n items gives n - width + 1 folds, each keyed as the item that starts its window.
 #[pyfunction]
 #[pyo3(signature = (function, x, width, axis=Axis::Position(-1)))]
-fn _sliding<'py>(py: Python<'py>, function: &str, x: &Bound<'py, PyAny>, width: usize, axis: Axis) -> PyResult<Bound<'py, PyAny>> {
+fn _sliding<'py>(py: Python<'py>, function: NativeFunction<'_>, x: &Bound<'py, PyAny>, width: usize, axis: Axis) -> PyResult<Bound<'py, PyAny>> {
+    let (function, _) = function;
     let x = one(x)?;
     let items = x.row_major()?;
     let view = items.view();
@@ -627,7 +655,8 @@ fn _sliding_pick<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, width: usize, axis
 
 /// `a`, with `b` broadcast over the selection that `index` makes, as brackets take it, and combined by `function` into each item it selects, in turn. A target selected more than once combines every item that selects it. `function` is add, subtract, multiply, divide, maximum or minimum. A failed integer result follows [`fitted`]'s rule.
 #[pyfunction]
-fn _at<'py>(py: Python<'py>, function: &str, a: &Bound<'py, PyAny>, index: &Bound<'py, PyAny>, b: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+fn _at<'py>(py: Python<'py>, function: NativeFunction<'_>, a: &Bound<'py, PyAny>, index: &Bound<'py, PyAny>, b: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let (function, mode) = function;
     let mut args = convert(&[a, b])?.args.into_iter();
     let (a, b) = (args.next().expect("two arguments give two"), args.next().expect("two arguments give two"));
     // A maximum or minimum folds each place's values as its reduction folds them (`Combine`), so a NaN value never takes the place of the values before it.
@@ -647,7 +676,9 @@ fn _at<'py>(py: Python<'py>, function: &str, a: &Bound<'py, PyAny>, index: &Boun
     }}; }
     let out = match function {
         "add" => run!(Scatter, Wrapped(rustymath::Add)), "subtract" => run!(Scatter, Wrapped(rustymath::Subtract)), "multiply" => run!(Scatter, Wrapped(rustymath::Multiply)),
-        "divide" => run!(Scatter, rustymath::Divide), "maximum" => run!(Combine, reduce::Max), "minimum" => run!(Combine, reduce::Min),
+        "divide" if mode && mathish_at(kernels!(Scatter of rustymath::Divide).computes(a.view().dtype())) => run!(Scatter, rustymath::MathishDivide),
+        "divide" => run!(Scatter, rustymath::Divide),
+        "maximum" => run!(Combine, reduce::Max), "minimum" => run!(Combine, reduce::Min),
         _ => return Err(PyValueError::new_err(format!("at takes add, subtract, multiply, divide, maximum or minimum, not {function}"))),
     };
     give(py, out, false)
@@ -782,7 +813,7 @@ pub(crate) fn histogram<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, bins: Optio
 #[pyo3(signature = (x, decimals=0))]
 pub(crate) fn round<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, decimals: i32) -> PyResult<Bound<'py, PyAny>> {
     let k = rustymath::Round::new(decimals);
-    kernels!(Unary of k).apply(py, "round", &k, &[x])
+    kernels!(Unary of k).apply(py, "round", &k, convert(&[x])?)
 }
 
 /// Adds the elementwise functions, reductions and scans to `m`.

@@ -83,9 +83,7 @@ def test_bitwise_decimal_rounding_and_angles():
     x = rm.array([0.3, 1.])
     assert (x // .1).tolist() == [2., 10.]
     np.testing.assert_allclose((x % .1).tolist(), [0.3 % .1, 0.], atol=1e-15)
-    rm.set_tolerance(rm.CT)
-    try: assert (x // .1).tolist() == [3., 10.] and (x % .1).tolist() == [0., 0.]
-    finally: rm.set_tolerance(0)
+    assert rm.mathish.floor_divide(x, .1).tolist() == [3., 10.] and rm.mathish.remainder(x, .1).tolist() == [0., 0.]
     for dtype in ('float16', 'float32', 'float64'):
         x = rm.array([1.25, -1.25, 0., np.inf], dtype=dtype)
         assert np.allclose(rm.round(x, 1), [1.2, -1.2, 0., np.inf], atol=.001)

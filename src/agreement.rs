@@ -466,7 +466,7 @@ impl<'a, X> Side<'a, X> {
 impl<A: Element, X: Source<A>> Read<A> for Side<'_, X> {
     #[inline]
     fn read<'b>(&'b self, start: usize, n: usize, buf: &'b mut Vec<A>) -> Arg<'b, A> { read_mapped(self.mapping, self.data, start, n, buf) }
-    fn constant(&self) -> Option<A> { matches!(self.mapping, Mapping::Single).then(|| self.data[0].read()) }
+    fn constant(&self) -> Option<A> { if matches!(self.mapping, Mapping::Single) { self.data.first().map(|x| x.read()) } else { None } }
     fn reads(&self) -> (&Mapping, usize) { (self.mapping, size_of::<X>()) }
 }
 

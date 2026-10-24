@@ -15,6 +15,13 @@ pub struct Multiply;
 #[derive(Clone, Copy, Debug)]
 pub struct Divide;
 
+/// Division with zero divided by zero defined as zero.
+#[derive(Clone, Copy, Debug)]
+pub struct MathishDivide;
+
+#[inline]
+pub(crate) fn both_zero<T: num_traits::Zero>(x: T, y: T) -> bool { x.is_zero() & y.is_zero() }
+
 macro_rules! bitwise {
     ($($(#[doc = $doc:literal])* $name:ident [$($x:ident),+] $body:expr;)+) => {$(
         $(#[doc = $doc])*
@@ -52,6 +59,8 @@ forms!(#[inline] Subtract at Complex<f32>, Complex<f64>: |_, [x, y]| Total(x - y
 forms!(#[inline] Multiply at Complex<f32>, Complex<f64>: |_, [x, y]| Total(x * y));
 forms!(#[inline] Divide at real: |_, [x, y]| Total(x / y));
 forms!(#[inline] Divide at Complex<f32>, Complex<f64>: |_, [x, y]| Total(crate::divide(x, y)));
+forms!(#[inline] MathishDivide at real: |_, [x, y]| Total(if both_zero(x, y) { x } else { x / y }));
+forms!(#[inline] MathishDivide at Complex<f32>, Complex<f64>: |_, [x, y]| Total(if both_zero(x, y) { x } else { crate::divide(x, y) }));
 
 /// -x. A float or complex result never fails. An integer result fails where it doesn't fit its type, as the negation of a signed type's least value or of an unsigned byte other than 0 doesn't, and holds the result wrapped to the type.
 #[derive(Clone, Copy, Debug)]

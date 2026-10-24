@@ -16,11 +16,12 @@ pub fn element_count(shape: &[usize]) -> Result<usize, Error> {
     shape.iter().try_fold(1usize, |n, &d| n.checked_mul(d)).ok_or_else(|| Error::new(Kind::Limit, "an array of this shape has too many items to count"))
 }
 
-/// The number of items in an array of `shape` that a function makes. A Limit error past `MAX_GENERATED_ELEMENTS`.
+/// The number of items in an array of `shape` that a function makes. A Limit error past `MAX_GENERATED_ELEMENTS`, or where the array would take the process past its memory guard's limit ([`memory::admit`](crate::memory::admit)).
 #[inline]
 pub fn generated_len(shape: &[usize]) -> Result<usize, Error> {
     let len = element_count(shape)?;
     if len > MAX_GENERATED_ELEMENTS { return Err(Error::new(Kind::Limit, format!("an array has at most {MAX_GENERATED_ELEMENTS} items"))); }
+    crate::memory::admit(len)?;
     Ok(len)
 }
 

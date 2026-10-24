@@ -67,7 +67,7 @@ def test_integers():
     assert not rm.equal(10**15, 10**15 + 1) and rm.less(2**62, 2**62 + 1)
     # A Python float beside integers promotes them to float64, so a tolerant comparison applies to them.
     assert A(rm.add(np.arange(3, dtype=np.int16), 0.5)).dtype == np.float64
-    assert rm.equal(np.arange(3), 1 + 1e-15, ct=rm.CT).tolist() == [False, True, False]
+    assert rm.equal(np.arange(3), 1 + 1e-15).tolist() == [False, False, False]
     # Arrays of different dtypes promote to the higher kind, wide enough for both. An integer beside a float takes the float's dtype, as in JAX, where NumPy widens the float. NumPy's other integer widths have no rustymath dtype.
     for t, u, want in [(np.int16, np.int32, np.int32), (np.bool_, np.uint8, np.uint8), (np.uint8, np.float16, np.float16), (np.int16, np.float16, np.float16), (np.int32, np.float32, np.float32), (np.float64, np.complex64, np.complex128)]:
         x, y = np.arange(3).astype(t), np.arange(3).astype(u)
@@ -137,21 +137,30 @@ def test_reductions(threads):
     assert np.array_equal(A(rm.sum(rm.swapaxes(n, 0, 2), axis=1)), np.arange(60).reshape(3, 4, 5).swapaxes(0, 2).sum(1))
     assert np.array_equal(A(rm.any(rm.array(b).T, axis=0)), b.T.any(0))
 
-def test_tolerant():
-    # Comparisons start exact. `ct` sets one call's tolerance, and `set_tolerance` the process's.
-    assert rm.tolerance() == 0 and not rm.equal(0.1 + 0.2, 0.3) and rm.equal(0.1 + 0.2, 0.3, ct=rm.CT)
-    assert rm.set_tolerance(rm.CT) == 0
-    try:
-        assert rm.tolerance() == rm.CT and rm.equal(0.1 + 0.2, 0.3) and not rm.equal(0.1 + 0.2, 0.3, ct=0)
-        assert not rm.equal(1, 1 + 3e-14) and rm.equal([1, 2], 1 + 3e-14, ct=1e-13).tolist() == [True, False]
-        assert not rm.less(0.3, 0.1 + 0.2) and rm.less(0.3, 0.1 + 0.2, ct=0) and rm.greater_equal(0.3, 0.1 + 0.2) and not rm.not_equal(0.3, 0.1 + 0.2)
-        assert rm.floor(0.5 + 0.5 - 1e-16) == 1 and rm.ceil(1 + 1e-15) == 1 and rm.floor(1 - 1e-15, ct=0) == 0
-        assert rm.remainder([-5.0, 5.0], 3).tolist() == np.remainder([-5.0, 5.0], 3).tolist() and rm.remainder(0.3, 0.1) == 0
-        assert abs(rm.gcd(0.6, 0.4) - 0.2) < 1e-15 and abs(rm.lcm(-0.6, 0.4) + 1.2) < 1e-14
-        assert len(rm.unique([0.3, 0.1 + 0.2]).values) == 1 and 0.1 + 0.2 in rm.array([0.3])
-    finally: rm.set_tolerance(0)
-    with pytest.raises(ValueError): rm.equal(1, 1, ct=1)
-    with pytest.raises(ValueError): rm.set_tolerance(-1)
+def test_mathish():
+    from rustymath import mathish as mm
+    assert not rm.equal(0.1 + 0.2, 0.3)
+    assert np.isnan(rm.divide(0., 0.)) and np.isnan(rm.floor_divide(0., 0.)) and np.isnan(rm.logb(1., 1.))
+    assert mm.equal(0.1 + 0.2, 0.3) and not mm.equal(1, 1 + 3e-14)
+    assert mm.equal(np.arange(3), 1 + 1e-15).tolist() == [False, True, False]
+    assert not mm.less(0.3, 0.1 + 0.2) and mm.greater_equal(0.3, 0.1 + 0.2) and not mm.not_equal(0.3, 0.1 + 0.2)
+    assert mm.floor(0.5 + 0.5 - 1e-16) == 1 and mm.ceil(1 + 1e-15) == 1
+    assert mm.remainder([-5.0, 5.0], 3).tolist() == np.remainder([-5.0, 5.0], 3).tolist() and mm.remainder(0.3, 0.1) == 0
+    assert abs(mm.gcd(0.6, 0.4) - 0.2) < 1e-15 and abs(mm.lcm(-0.6, 0.4) + 1.2) < 1e-14
+    assert len(mm.unique([0.3, 0.1 + 0.2]).values) == 1 and 0.1 + 0.2 not in rm.array([0.3])
+    assert mm.divide([0., 1.], [0., 0.]).tolist() == [0., np.inf] and mm.floor_divide(0., 0.) == 0
+    assert mm.divide(0, 0) == 0 and mm.divide(np.zeros(1, np.complex128), 0).tolist() == [0j]
+    assert mm.logb(1., 1.) == 0 and mm.logb(np.ones(2), np.ones(2)).tolist() == [0., 0.]
+    assert mm.logb(1., np.ones(2)).tolist() == mm.logb(np.ones(2), 1.).tolist() == [0., 0.]
+    assert mm.logb(np.ones(1, np.complex128), 1).tolist() == [0j]
+    assert np.isnan(mm.logb(np.float32(1), np.float32(1)))
+    for dtype in (np.float16, np.float32, np.complex64): assert np.isnan(mm.divide(np.zeros(1, dtype), 0)).all()
+    for dtype in (np.float16, np.float32): assert np.isnan(mm.floor_divide(np.zeros(1, dtype), 0)).all()
+    with pytest.raises(OverflowError): mm.floor_divide(0, 0)
+    assert rm.linalg.inner(rm.add, mm.divide)([0., 2.], [0., 2.]) == 1
+    assert rm.linalg.inner(mm.divide, rm.add)([0., 0.], [0., 0.]) == 0
+    assert rm.accumulate(mm.divide, [0., 0.]).tolist() == [0., 0.] and rm.at(mm.divide, [0.], [0], 0.).tolist() == [0.]
+    assert np.isnan(mm.accumulate(rm.divide, [0., 0.])[-1]) and not rm.equal(0.1 + 0.2, 0.3)
 
 def test_special():
     from scipy import special

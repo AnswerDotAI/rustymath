@@ -3,7 +3,7 @@
 `solve` and `pinv` give a result for every matrix. A square matrix with no negligible LU pivot solves and inverts through LU, with no cutoff, as NumPy's `solve` and `inv` do. Any other matrix gets `lstsq`'s least-squares solution with the least norm, or the pseudoinverse with `lstsq`'s cutoff. A matrix that `cholesky` can't factor, or whose eigenvalues don't converge, gives NaN results, with no warning. R in a QR factorization has a real diagonal. `matmul` and `inner` multiply matrices, including through APL's inner products, such as the min-plus product of shortest paths."""
 from typing import NamedTuple
 from ._core import Array, linalg as _g
-from ._naming import _binary_name, _named
+from ._naming import _binary_function, _named
 
 class Svd(NamedTuple):
     "Thin SVD factors, reusable for least-norm solves and pseudoinverses"
@@ -67,13 +67,13 @@ def inner(
     f, # Native binary function that folds the products, from the right
     g, # Native binary function that forms the products
 ):
-    "The inner product `f.g`: apply `g` over the contracted axis and fold with `f` from the right. Recognized pairs use specialized kernels; others use bounded scratch. Comparisons use the product's `ct`, as the elementwise functions do"
-    names = tuple(map(_binary_name, (f, g)))
+    "The inner product `f.g`: apply `g` over the contracted axis and fold with `f` from the right. Recognized pairs use specialized kernels; others use bounded scratch. Each function keeps its Mathish choice"
+    functions = tuple(map(_binary_function, (f, g)))
+    names = tuple(f[0] for f in functions)
     name = '_'.join(names)
     def product(
         x1, x2, # Matrices, or vectors, which act as one row on the left and one column on the right
         /,
-        *, ct=None, # Tolerance for a comparing `f` or `g`; None for the process's tolerance (`set_tolerance`)
-    ): return _g.product(*names, x1, x2, name, ct=ct)
+    ): return _g.product(*functions, x1, x2, name)
     return _named(product, name, f"The matrix product whose item `[i, j]` is the `{names[0]}` over `k` of `{names[1]}(x1[i, k], x2[k, j])`")
 

@@ -511,6 +511,12 @@ tolerant!(Residue at Complex<f32>, Complex<f64>: |t, [x, y]| t.complex_residue(x
 pub struct FloorDivide(pub Tolerance);
 tolerant!(FloorDivide at real: |t, [x, y]| Total(t.floor_quotient(x, y)));
 
+/// [`FloorDivide`] with zero divided by zero defined as zero.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MathishFloorDivide(pub Tolerance);
+tolerant!(MathishFloorDivide at real: |t, [x, y]| Total(if crate::arith::both_zero(x, y) { x } else { t.floor_quotient(x, y) }));
+forms!(MathishFloorDivide at u8, i16, i32, i64: |k, [x, y]| if crate::arith::both_zero(x, y) { Some(x) } else { crate::Binary::checked(&FloorDivide(k.0), x, y) });
+
 /// [`Tolerant::gcd`], or [`TolerantComplex::complex_gcd`] for complex items, at the tolerance it holds, as a function object. A non-finite argument gives NaN, which marks the item failed. Its `i64` form is [`integer::gcd`](crate::integer::gcd).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Gcd(pub Tolerance);

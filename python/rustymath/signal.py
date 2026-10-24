@@ -1,11 +1,11 @@
 "Correlation and convolution along an array's leading axes, and overlap-add, which adds frames back where their windows were read."
 from . import _core
 from ._core import add, multiply, overlap_add
-from ._naming import _binary_name
+from ._naming import _binary_function
 
 def _slid(x, kernel, mode, slide, stride, f, g, flip):
     stride = [stride] if isinstance(stride, int) else list(stride)
-    return _core._correlate(_binary_name(f), _binary_name(g), x, kernel, mode, slide, stride, flip)
+    return _core._correlate(_binary_function(f), _binary_function(g), x, kernel, mode, slide, stride, flip)
 
 def correlate(
     x, # The array the kernel slides along

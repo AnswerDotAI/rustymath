@@ -12,7 +12,7 @@ use rustymath_buffer::py_err;
 
 use crate::array::{give, give_items};
 use crate::convert::{convert, one, released};
-use crate::functions::{missing, tolerance, Axis};
+use crate::functions::{missing, Axis, NativeFunction};
 
 /// `buffer`, computed at `compute`, as the dtype `store`.
 fn stored(buffer: Buffer, compute: DType, store: DType) -> PyResult<Buffer> {
@@ -22,7 +22,7 @@ fn stored(buffer: Buffer, compute: DType, store: DType) -> PyResult<Buffer> {
 /// The correlation of `x` with `kernel` by the native binary functions named `f` and `g`, along `x`'s first `slide` axes, or its convolution where `flip` is true. `stride` gives one stride for each sliding axis, or one for all of them. Float and complex sums of products read the windows a block at a time. Other pairs and dtypes build the windows as a matrix and take its inner product with the kernel, as `linalg.product` does.
 #[pyfunction]
 #[pyo3(signature = (f, g, x, kernel, mode, slide, stride, flip))]
-fn _correlate<'py>(py: Python<'py>, f: &str, g: &str, x: &Bound<'py, PyAny>, kernel: &Bound<'py, PyAny>, mode: &str, slide: Option<usize>, stride: Vec<usize>, flip: bool) -> PyResult<Bound<'py, PyAny>> {
+fn _correlate<'py>(py: Python<'py>, f: NativeFunction<'_>, g: NativeFunction<'_>, x: &Bound<'py, PyAny>, kernel: &Bound<'py, PyAny>, mode: &str, slide: Option<usize>, stride: Vec<usize>, flip: bool) -> PyResult<Bound<'py, PyAny>> {
     let name = if flip { "convolve" } else { "correlate" };
     let mode = match mode { "valid" => Mode::Valid, "full" => Mode::Full, "same" => Mode::Same, _ => return Err(PyValueError::new_err(format!("mode must be 'valid', 'full' or 'same', not {mode:?}"))) };
     let call = convert(&[x, kernel])?;
@@ -31,7 +31,7 @@ fn _correlate<'py>(py: Python<'py>, f: &str, g: &str, x: &Bound<'py, PyAny>, ker
     let stride = if let [s] = *stride.as_slice() { vec![s; slide] } else { stride };
     let c = signal::correlation(lx.shape(), lk.shape(), slide, mode, &stride, flip).map_err(py_err)?;
     let dtype = call.args[0].view().dtype();
-    if (f, g) == ("add", "multiply") && matches!(dtype, DType::Float(_) | DType::Complex(_)) {
+    if (f.0, g.0) == ("add", "multiply") && matches!(dtype, DType::Float(_) | DType::Complex(_)) {
         let (compute, store) = dtype.inexact(FloatWidth::F64).ok_or_else(|| missing(name, dtype))?;
         return rustymath::with_inexact!(compute, T => {
             let (xs, ks) = (call.args[0].items::<T>()?, call.args[1].items::<T>()?);
@@ -39,14 +39,14 @@ fn _correlate<'py>(py: Python<'py>, f: &str, g: &str, x: &Bound<'py, PyAny>, ker
             give_items(py, Layout::from(c.shape.clone()), buffer, false)
         });
     }
-    let (xi, ki, t) = (call.args[0].at(dtype)?, call.args[1].at(dtype)?, tolerance(None)?);
+    let (xi, ki) = (call.args[0].at(dtype)?, call.args[1].at(dtype)?);
     let product = released(py, || -> PyResult<Core> {
         let padded = c.padding.as_ref().map(|p| Core::gathered(xi.view(), p)).transpose().map_err(py_err)?;
         let source = match &padded { Some(p) => p.view().contiguous().expect("a gathered array is contiguous"), None => xi.view() };
         let matrix = |view, plan: &Plan, rows, cols| Core::gathered(view, &Plan { layout: Layout::from(vec![rows, cols]), steps: plan.steps.clone() }).map_err(py_err);
         let [positions, cells, outputs] = c.size;
         let (windows, kernel) = (matrix(source, &c.windows, positions, cells)?, matrix(ki.view(), &c.kernel, cells, outputs)?);
-        crate::linalg::inner(f, g, [windows.view(), kernel.view()], name, t)
+        crate::linalg::inner(f, g, [windows.view(), kernel.view()], name)
     })?;
     give(py, product.reshape(Layout::from(c.shape.clone())).map_err(py_err)?, false)
 }

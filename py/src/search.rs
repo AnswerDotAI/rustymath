@@ -1,7 +1,7 @@
-//! rustymath's searches, sorts and classifications, on arguments that `convert` reads. Booleans, integers and characters match exactly. Floats match within the tolerance `ct`, or the process's tolerance (`set_tolerance`) where `ct` is `None`, which is 0, exact, unless set. Tolerant classification and item matching check for Ctrl-C, stopping with `KeyboardInterrupt`. Sorts and insertion searches compare exactly: signed zeros compare equal, and every NaN comes after positive infinity. Complex numbers raise. Positions come back as `i64` arrays.
+//! rustymath's searches, sorts and classifications, on arguments that `convert` reads. Ordinary functions match exactly; the Mathish namespace compares f64/complex128 tolerantly. Tolerant classification and item matching check for Ctrl-C, stopping with `KeyboardInterrupt`. Sorts and insertion searches compare exactly: signed zeros compare equal, and every NaN comes after positive infinity. Complex sorting raises. Positions come back as `i64` arrays.
 use crate::array::{core, give, give_items};
 use crate::convert::{Arg, Call, convert, one, released};
-use crate::functions::{Axis, along_axis, missing, tolerance};
+use crate::functions::{Axis, along_axis, comparison, mathish_at, missing};
 use pyo3::prelude::*;
 use rustymath::array::Array as Core;
 use rustymath::buffer::{Buffer, Element, View};
@@ -25,13 +25,11 @@ fn vector(positions: impl IntoIterator<Item = usize>) -> PyResult<Core> {
     core(items, &[n])
 }
 
-/// The classes of flattened `ar` in order of first position: their values, each one's first position, each item's class number, and each class's size.
-#[pyfunction]
-#[pyo3(signature = (ar, *, ct=None))]
-pub fn unique<'py>(py: Python<'py>, ar: &Bound<'py, PyAny>, ct: Option<f64>) -> PyResult<[Bound<'py, PyAny>; 4]> {
+fn unique<'py>(py: Python<'py>, ar: &Bound<'py, PyAny>, mode: bool) -> PyResult<[Bound<'py, PyAny>; 4]> {
     let x = one(ar)?;
     let items = x.row_major()?;
-    let (view, t) = (items.view(), tolerance(ct)?);
+    let view = items.view();
+    let t = comparison(mode && mathish_at(Some(view.dtype())));
     let classes = released(py, || search::view_classes(view, t)).ok_or_else(|| missing("unique", view.dtype()))?.map_err(py_err)?;
     let numbered = search::numbered(&classes);
     let counts = numbered.counts();
@@ -42,30 +40,25 @@ pub fn unique<'py>(py: Python<'py>, ar: &Bound<'py, PyAny>, ct: Option<f64>) -> 
     Ok([give(py, values, false)?, give(py, core(firsts, &[n])?, false)?, give(py, vector(numbers.into_iter().map(|k| k as usize))?, false)?, give(py, vector(counts)?, false)?])
 }
 
-/// `x` and `y` converted, and for each item of `y`, the first position in flattened `x` of an item that matches it within the tolerance `ct`, or the size of `x` where none does.
-fn first_matches<'py>(py: Python<'py>, function: &str, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>, ct: Option<f64>) -> PyResult<(Call, Vec<u32>)> {
+/// `x` and `y` converted, with each item of `y`'s first matching position in flattened `x` under Mathish mode, or the size of `x` where none matches.
+fn first_matches<'py>(py: Python<'py>, function: &str, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>, mode: bool) -> PyResult<(Call, Vec<u32>)> {
     let call = convert(&[x, y])?;
     let found = {
-        let (xs, ys, t) = (call.args[0].at(call.args[0].view().dtype())?, call.args[1].at(call.args[1].view().dtype())?, tolerance(ct)?);
+        let (xs, ys) = (call.args[0].at(call.args[0].view().dtype())?, call.args[1].at(call.args[1].view().dtype())?);
+        let t = comparison(mode && mathish_at(Some(xs.view().dtype())));
         released(py, || search::view_index_of(xs.view(), ys.view(), t)).ok_or_else(|| missing(function, xs.view().dtype()))?.map_err(py_err)?
     };
     Ok((call, found))
 }
 
-/// Where in flattened `x` each item of `y` first matches, or the size of `x` where none does, shaped like `y`.
-#[pyfunction]
-#[pyo3(signature = (x, y, *, ct=None))]
-pub fn index<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>, ct: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
-    let (call, found) = first_matches(py, "index", x, y, ct)?;
+fn index<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>, mode: bool) -> PyResult<Bound<'py, PyAny>> {
+    let (call, found) = first_matches(py, "index", x, y, mode)?;
     let ys = &call.args[1];
     give(py, positions(ys.layout(), found.into_iter().map(|p| p as usize))?, ys.scalar)
 }
 
-/// Whether each item of `element` matches an item of flattened `test_elements`, shaped like `element`.
-#[pyfunction]
-#[pyo3(signature = (element, test_elements, *, ct=None))]
-pub fn isin<'py>(py: Python<'py>, element: &Bound<'py, PyAny>, test_elements: &Bound<'py, PyAny>, ct: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
-    let (call, found) = first_matches(py, "isin", test_elements, element, ct)?;
+fn isin<'py>(py: Python<'py>, element: &Bound<'py, PyAny>, test_elements: &Bound<'py, PyAny>, mode: bool) -> PyResult<Bound<'py, PyAny>> {
+    let (call, found) = first_matches(py, "isin", test_elements, element, mode)?;
     let (n, ys) = (call.args[0].view().len(), &call.args[1]);
     give_items(py, ys.layout(), bool::buffer(found.into_iter().map(|p| (p as usize) < n).collect()), ys.scalar)
 }
@@ -74,55 +67,46 @@ pub fn contains(py: Python<'_>, a: &Bound<'_, PyAny>, query: &Bound<'_, PyAny>) 
     let (x, y) = (one(a)?, one(query)?);
     let wanted = if query.is_instance_of::<pyo3::types::PyString>() && query.len()? == 1 { Layout::EMPTY } else { y.layout() };
     let (xs, ys) = (x.row_major()?, y.row_major()?);
-    let (lx, t) = (x.layout(), tolerance(None)?);
+    let (lx, t) = (x.layout(), comparison(false));
     released(py, || search::view_member(&lx, xs.view(), &wanted, ys.view(), t))
         .map_err(|e| if e.kind == Kind::Rank { pyo3::exceptions::PyTypeError::new_err(e.message.to_string()) } else { py_err(e) })
 }
 
-/// A Boolean mask shaped like `target`, marking starts where `pattern` fits and matches. A lower-rank pattern has leading singleton axes; a higher-rank pattern never matches. Floats use `ct`.
-#[pyfunction]
-#[pyo3(signature = (pattern, target, *, ct=None))]
-pub fn find<'py>(py: Python<'py>, pattern: &Bound<'py, PyAny>, target: &Bound<'py, PyAny>, ct: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+fn find<'py>(py: Python<'py>, pattern: &Bound<'py, PyAny>, target: &Bound<'py, PyAny>, mode: bool) -> PyResult<Bound<'py, PyAny>> {
     let call = convert(&[pattern, target])?;
     let (pattern, target) = (&call.args[0], &call.args[1]);
     let (xs, ys) = (pattern.row_major()?, target.row_major()?);
-    let (lp, lt, t) = (pattern.layout(), target.layout(), tolerance(ct)?);
+    let (lp, lt, t) = (pattern.layout(), target.layout(), comparison(mode && mathish_at(Some(xs.view().dtype()))));
     let found = released(py, || search::view_find(xs.view(), lp.shape(), ys.view(), lt.shape(), t)).ok_or_else(|| missing("find", xs.view().dtype()))?;
     give_items(py, lt, bool::buffer(found), target.scalar)
 }
 
-#[pyfunction]
-#[pyo3(signature = (x, y, how, ct=None))]
-fn _set<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>, how: &str, ct: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+fn _set<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>, how: &str, mode: bool) -> PyResult<Bound<'py, PyAny>> {
     let how = match how { "union" => search::Set::Union, "intersection" => search::Set::Intersection, "difference" => search::Set::Difference,
         _ => return Err(py_err(Error::new(Kind::Domain, "unknown set operation"))), };
     let call = convert(&[x, y])?;
     let (xs, ys) = (call.args[0].at(call.args[0].view().dtype())?, call.args[1].at(call.args[1].view().dtype())?);
-    let (x, y, t) = (xs.view(), ys.view(), tolerance(ct)?);
+    let (x, y, t) = (xs.view(), ys.view(), comparison(mode && mathish_at(Some(xs.view().dtype()))));
     generated_len(&[x.len().saturating_add(y.len())]).map_err(py_err)?;
     let values = released(py, || search::view_set(x, y, how, t)).ok_or_else(|| missing("set operation", x.dtype()))?.map_err(py_err)?;
     let n = values.len();
     give_items(py, [n].into(), values, false)
 }
 
-/// The size of each class of flattened `x`, in order of first position.
-#[pyfunction]
-#[pyo3(signature = (x, *, ct=None))]
-pub fn counts<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, ct: Option<f64>) -> PyResult<Bound<'py, PyAny>> {
+fn counts<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, mode: bool) -> PyResult<Bound<'py, PyAny>> {
     let x = one(x)?;
     let items = x.row_major()?;
-    let (view, t) = (items.view(), tolerance(ct)?);
+    let view = items.view();
+    let t = comparison(mode && mathish_at(Some(view.dtype())));
     let counts = released(py, || search::view_class_counts(view, t)).ok_or_else(|| missing("counts", view.dtype()))?.map_err(py_err)?;
     give(py, vector(counts)?, false)
 }
 
-/// The flat positions of each class of `x`, one vector for each class in order of first position, each in ascending order.
-#[pyfunction]
-#[pyo3(signature = (x, *, ct=None))]
-pub fn group_indices<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, ct: Option<f64>) -> PyResult<Vec<Bound<'py, PyAny>>> {
+fn group_indices<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, mode: bool) -> PyResult<Vec<Bound<'py, PyAny>>> {
     let x = one(x)?;
     let items = x.row_major()?;
-    let (view, t) = (items.view(), tolerance(ct)?);
+    let view = items.view();
+    let t = comparison(mode && mathish_at(Some(view.dtype())));
     let grouped = released(py, || search::view_grouped(view, t)).ok_or_else(|| missing("group_indices", view.dtype()))?.map_err(py_err)?;
     grouped.groups.each().map(|these| give(py, vector(these.iter().map(|&p| p as usize))?, false)).collect()
 }
@@ -282,14 +266,45 @@ pub fn bincount<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, minlength: i64) -> 
     give(py, vector(counts)?, false)
 }
 
+macro_rules! matching_functions {
+    ($($(#[doc = $doc:literal])* $name:ident($($arg:ident: $ty:ty),*) -> $result:ty;)+) => {
+        mod ordinary { matching_functions!(@define false; $($(#[doc = $doc])* $name($($arg: $ty),*) -> $result;)+); }
+        mod mathish { matching_functions!(@define true; $($(#[doc = $doc])* $name($($arg: $ty),*) -> $result;)+); }
+        pub fn add_mathish(m: &Bound<'_, PyModule>) -> PyResult<()> {
+            $(m.add_function(wrap_pyfunction!(mathish::$name, m)?)?;)+ Ok(())
+        }
+    };
+    (@define $mode:expr; $($(#[doc = $doc:literal])* $name:ident($($arg:ident: $ty:ty),*) -> $result:ty;)+) => {
+        use super::*;
+        $($(#[doc = $doc])*
+        #[pyfunction]
+        pub fn $name<'py>(py: Python<'py>, $($arg: $ty),*) -> PyResult<$result> { super::$name(py, $($arg,)* $mode) })+
+    };
+}
+matching_functions! {
+    /// The classes of flattened `ar` in order of first position: their values, each one's first position, each item's class number, and each class's size.
+    unique(ar: &Bound<'py, PyAny>) -> [Bound<'py, PyAny>; 4];
+    /// Where in flattened `x` each item of `y` first matches, or the size of `x` where none does, shaped like `y`.
+    index(x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>) -> Bound<'py, PyAny>;
+    /// Whether each item of `element` matches an item of flattened `test_elements`, shaped like `element`.
+    isin(element: &Bound<'py, PyAny>, test_elements: &Bound<'py, PyAny>) -> Bound<'py, PyAny>;
+    /// A Boolean mask shaped like `target`, marking starts where `pattern` fits and matches. A lower-rank pattern has leading singleton axes; a higher-rank pattern never matches.
+    find(pattern: &Bound<'py, PyAny>, target: &Bound<'py, PyAny>) -> Bound<'py, PyAny>;
+    _set(x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>, how: &str) -> Bound<'py, PyAny>;
+    /// The size of each class of flattened `x`, in order of first position.
+    counts(x: &Bound<'py, PyAny>) -> Bound<'py, PyAny>;
+    /// The flat positions of each class of `x`, one vector for each class in order of first position, each in ascending order.
+    group_indices(x: &Bound<'py, PyAny>) -> Vec<Bound<'py, PyAny>>;
+}
+
 /// Adds this module's functions to `m`.
 pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
     for f in [
-        wrap_pyfunction!(unique, m)?, wrap_pyfunction!(index, m)?, wrap_pyfunction!(isin, m)?, wrap_pyfunction!(find, m)?,
-        wrap_pyfunction!(counts, m)?, wrap_pyfunction!(group_indices, m)?,
+        wrap_pyfunction!(ordinary::unique, m)?, wrap_pyfunction!(ordinary::index, m)?, wrap_pyfunction!(ordinary::isin, m)?, wrap_pyfunction!(ordinary::find, m)?,
+        wrap_pyfunction!(ordinary::counts, m)?, wrap_pyfunction!(ordinary::group_indices, m)?,
         wrap_pyfunction!(argsort, m)?, wrap_pyfunction!(sort, m)?, wrap_pyfunction!(partition, m)?, wrap_pyfunction!(argpartition, m)?,
         wrap_pyfunction!(argmin, m)?, wrap_pyfunction!(argmax, m)?, wrap_pyfunction!(median, m)?, wrap_pyfunction!(quantile, m)?,
-        wrap_pyfunction!(lexsort, m)?, wrap_pyfunction!(searchsorted, m)?, wrap_pyfunction!(bincount, m)?, wrap_pyfunction!(_set, m)?,
+        wrap_pyfunction!(lexsort, m)?, wrap_pyfunction!(searchsorted, m)?, wrap_pyfunction!(bincount, m)?, wrap_pyfunction!(ordinary::_set, m)?,
     ] { m.add_function(f)?; }
     Ok(())
 }

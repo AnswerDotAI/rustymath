@@ -197,10 +197,10 @@ array_methods! { folds [sum, prod, max, min, all, any, mean] scans [cumsum, cump
     }
     fn __matmul__<'py>(slf: &Bound<'py, Self>, y: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(y, || crate::linalg::matmul(slf.py(), slf, y)) }
     fn __rmatmul__<'py>(slf: &Bound<'py, Self>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(x, || crate::linalg::matmul(slf.py(), x, slf)) }
-    fn __mod__<'py>(slf: &Bound<'py, Self>, y: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(y, || functions::remainder(slf.py(), slf, y, None)) }
-    fn __rmod__<'py>(slf: &Bound<'py, Self>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(x, || functions::remainder(slf.py(), x, slf, None)) }
-    fn __floordiv__<'py>(slf: &Bound<'py, Self>, y: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(y, || functions::floor_divide(slf.py(), slf, y, None)) }
-    fn __rfloordiv__<'py>(slf: &Bound<'py, Self>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(x, || functions::floor_divide(slf.py(), x, slf, None)) }
+    fn __mod__<'py>(slf: &Bound<'py, Self>, y: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(y, || functions::remainder(slf.py(), slf, y)) }
+    fn __rmod__<'py>(slf: &Bound<'py, Self>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(x, || functions::remainder(slf.py(), x, slf)) }
+    fn __floordiv__<'py>(slf: &Bound<'py, Self>, y: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(y, || functions::floor_divide(slf.py(), slf, y)) }
+    fn __rfloordiv__<'py>(slf: &Bound<'py, Self>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { operand(x, || functions::floor_divide(slf.py(), x, slf)) }
     fn __pow__<'py>(slf: &Bound<'py, Self>, y: &Bound<'py, PyAny>, modulo: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         if !modulo.is_none() { return Ok(not_implemented(slf.py())) }
         operand(y, || functions::power(slf.py(), slf, y))
@@ -214,7 +214,7 @@ array_methods! { folds [sum, prod, max, min, all, any, mean] scans [cumsum, cump
     fn __abs__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> { functions::absolute(slf.py(), slf) }
     fn __richcmp__<'py>(slf: &Bound<'py, Self>, y: &Bound<'py, PyAny>, op: CompareOp) -> PyResult<Bound<'py, PyAny>> {
         let compare = match op { CompareOp::Eq => functions::equal, CompareOp::Ne => functions::not_equal, CompareOp::Lt => functions::less, CompareOp::Le => functions::less_equal, CompareOp::Gt => functions::greater, CompareOp::Ge => functions::greater_equal };
-        operand(y, || compare(slf.py(), slf, y, None))
+        operand(y, || compare(slf.py(), slf, y))
     }
     #[getter]
     #[pyo3(name = "T")]

@@ -4,7 +4,7 @@
 //!
 //! `exp` and the powers that compute through it give an exact direction at the float nearest a whole number of quarter turns. e^(iπ/2) is then exactly i, where the exponential of that float has a real part of about 6e-17. These results lie outside the error bound.
 use crate::{
-    Abs, Acos, Acosh, Angle, Arg, Asin, Asinh, Atan, Atan2, Atanh, Binary, Binom, Cos, Cosh, Exp, Factorial, Gamma, Hypot, Lgamma, Ln, Log1p, Logb, Pow, Sign,
+    Abs, Acos, Acosh, Angle, Arg, Asin, Asinh, Atan, Atan2, Atanh, Binary, Binom, Cos, Cosh, Exp, Factorial, Gamma, Hypot, Lgamma, Ln, Log1p, Logb, MathishLogb, Pow, Sign,
     Sin, Sinh, Sqrt, Sqrt1mx2, Sqrt1px2, Sqrtx2m1, Tan, Tanh, Unary,
 };
 use crate::{Native, arc, exp as e, float::ln2, hyperbolic, ln as l, pow as p, special, trig};
@@ -709,6 +709,10 @@ forms!(Pow at Complex<f32>, Complex<f64>: |_, [z, w]| pow::<_, { crate::FUSED }>
         unit | zero | real | tiny(z) | !finite(r)
     }, |[z, w]| pow::<_, { crate::FUSED }>(z, w)));
 forms!(Logb at Complex<f32>, Complex<f64>: |_, [b, z]| divide(ln::<_, { crate::FUSED }>(z), ln::<_, { crate::FUSED }>(b)));
+forms!(#[inline] MathishLogb at Complex<f32>, Complex<f64>: |_, [b, z]| {
+    let y = Logb.one(b, z);
+    if b == c(1.0, 0.0) && z == c(1.0, 0.0) { c(0.0, 0.0) } else { y }
+});
 forms!(Binom at Complex<f32>, Complex<f64>: |_, [n, k]| binom::<_, { crate::FUSED }>(n, k));
 forms!(Abs at Complex<f32> => f32, Complex<f64> => f64: |_, [z]| crate::slice::Total(p::hypot::<_, { crate::FUSED }>(z.re, z.im)));
 forms!(Angle at Complex<f32> => f32, Complex<f64> => f64: |_, [z]| crate::slice::Total(arc::atan2::<_, { crate::FUSED }>(z.im, z.re)));

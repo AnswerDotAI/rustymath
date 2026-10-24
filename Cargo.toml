@@ -54,8 +54,8 @@ rayon = ">=1.12.0, <2"
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 web-time = ">=1.1.0, <2"
 
-[target.'cfg(target_vendor = "apple")'.dependencies]
-# The timing lock's QoS call, which asks macOS to favour the performance cores for a timing.
+[target.'cfg(unix)'.dependencies]
+# The memory guard reads physical memory through `libc`. On macOS, the timing lock also makes its QoS call through it, to favour the performance cores for a timing.
 libc = ">=0.2.190, <1"
 
 [profile.test]

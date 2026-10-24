@@ -4,7 +4,7 @@
 
 Rustymath drops precision that numerical code doesn't need, for speed and a smaller implementation. Rustymath doesn't aim for last-bit agreement with other libraries, or for reproducible results. The last bits of a result can differ between thread counts, platforms, builds and runs. Only spend speed, memory or code to make them agree if there's a real common practical use case that needs it. Tests never compare results across thread counts.
 
-Keep the accuracy contracts that callers use. Check a change that alters arithmetic against those contracts, not against bit-identical results. Don't add sign canonicalization or compensated arithmetic without an agreed need. Each shortcut that drops precision is a hypothesis that real uses don't need that precision. When a real use needs digits that a shortcut loses, return that operation to the conservative method, or create an optional parameter.
+Keep the accuracy contracts that callers use. Check a change that alters arithmetic against those contracts, not against bit-identical results. Don't add sign canonicalization, compensated arithmetic or defensive passes without an agreed need. Each shortcut that drops precision is a hypothesis that real uses don't need that precision. When a real use needs digits that a shortcut loses, return that operation to the conservative method, or create an optional parameter.
 
 Rustymath and basedpl have no outside users yet, so treat neither as published. Changing rustymath to give both projects shared machinery is encouraged. Separate machinery in the two for the same task is an error, unless Jeremy has asked for them to differ there.
 

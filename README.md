@@ -35,13 +35,13 @@ rm.add([[1, 2, 3], [4, 5, 6]], [10, 20])
 
 ## Maths and statistics
 
-Real and complex functions operate on whole arrays. Float comparisons are exact unless you set a relative tolerance, for one call with `ct` or for the whole process with `set_tolerance`:
+Real and complex functions operate on whole arrays. The `rustymath.mathish` namespace provides J-inspired [Mathish conventions](https://answerdotai.github.io/rustymath/math.html#mathish-mode). Ordinary comparisons are exact:
 
 ``` python
-rm.exp([0., 1, 2]), rm.equal(0.1 + 0.2, 0.3), rm.equal(0.1 + 0.2, 0.3, ct=rm.CT)
+rm.exp([0., 1, 2]), rm.equal(0.1 + 0.2, 0.3)
 ```
 
-    (Array([1.0, 2.7182818, 7.3890561], dtype=float64), False, True)
+    (Array([1.0, 2.7182818, 7.3890561], dtype=float64), False)
 
 [Maths and statistics](https://answerdotai.github.io/rustymath/math.html) covers elementary and special functions, reductions, scans, statistics and tolerant comparison.
 

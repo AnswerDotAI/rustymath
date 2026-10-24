@@ -1,6 +1,6 @@
 //! rustymath's `distribution` module. Each constructor checks its parameters and gives a `Distribution`, whose methods take a number or an array of any shape.
 use crate::array::{core, give};
-use crate::convert::released;
+use crate::convert::{convert, released};
 use crate::functions::Apply;
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyFloat};
 use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -24,13 +24,13 @@ pub(crate) fn sampled<'py>(py: Python<'py>, distribution: dist::Distribution, rn
 #[pymethods]
 impl Distribution {
     /// The density at each item of `x`, or for a discrete distribution the probability of each.
-    fn pdf<'py>(&self, py: Python<'py>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { let k = dist::Pdf(self.0); kernels!(Unary of k).apply(py, "pdf", &k, &[x]) }
+    fn pdf<'py>(&self, py: Python<'py>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { let k = dist::Pdf(self.0); kernels!(Unary of k).apply(py, "pdf", &k, convert(&[x])?) }
 
     /// The probability of a value at most each item of `x`.
-    fn cdf<'py>(&self, py: Python<'py>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { let k = dist::Cdf(self.0); kernels!(Unary of k).apply(py, "cdf", &k, &[x]) }
+    fn cdf<'py>(&self, py: Python<'py>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { let k = dist::Cdf(self.0); kernels!(Unary of k).apply(py, "cdf", &k, convert(&[x])?) }
 
     /// The least value whose `cdf` is at least each item of `p`. A `p` outside 0 to 1 gives NaN.
-    fn quantile<'py>(&self, py: Python<'py>, p: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { let k = dist::Quantile(self.0); kernels!(Unary of k).apply(py, "quantile", &k, &[p]) }
+    fn quantile<'py>(&self, py: Python<'py>, p: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { let k = dist::Quantile(self.0); kernels!(Unary of k).apply(py, "quantile", &k, convert(&[p])?) }
 
     /// Values drawn from the distribution: one float with no `size`, or else an array of shape `size`. The same `seed` gives the same values.
     #[pyo3(signature = (size=None, seed=None))]

@@ -106,31 +106,50 @@ fn for_base<R: Native, const FUSED: bool>(b: R) -> (((R, R), R), R) {
 #[inline(always)]
 pub(crate) fn logb<R: Native, const FUSED: bool>(b: R, x: R) -> R { let (to, d) = for_base::<R, FUSED>(b); log::<R, FUSED>(x, to) / d }
 
+#[inline(always)]
+fn logb_mode<R: Native, const MATHISH: bool>(b: R, x: R) -> R {
+    let y = logb::<_, { crate::FUSED }>(b, x);
+    if MATHISH && b == R::one() && x == R::one() { R::zero() } else { y }
+}
+
 /// [`logb`](crate::logb) as a function object. Its slice form computes the logarithm of a constant argument once, before its loop.
 #[derive(Clone, Copy, Debug)]
 pub struct Logb;
-forms!(Logb at real: |_, [b, x]| logb::<_, { crate::FUSED }>(b, x),
-many |_, [b, x], n, out| match (b, x) {
-    (Arg::One(c), _) => {
-        // Bases 2 and 10 divide by 1, which their loop skips, and take the logarithms' fast form for usual items. Any other base divides by ln b, which can be 0 or NaN, so its loop judges every result.
-        let (to, d) = for_base::<_, { crate::FUSED }>(c);
-        if d == 1.0 {
-            crate::slice::each_usual(x, n, out, (usual, #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), to)), crate::slice::none(),
-                #[inline(always)] |x| log::<_, { crate::FUSED }>(x, to))
-        } else {
-            each!([b, x], n, out, |[_, x]| log::<_, { crate::FUSED }>(x, to) / d)
+forms!(Logb at real: |_, [b, x]| logb::<_, { crate::FUSED }>(b, x), many |_, [b, x], n, out| logb_many::<_, false>([b, x], n, out));
+
+/// [`Logb`] with log base one of one defined as zero.
+#[derive(Clone, Copy, Debug)]
+pub struct MathishLogb;
+forms!(MathishLogb at real: |_, [b, x]| logb_mode::<_, true>(b, x), many |_, [b, x], n, out| logb_many::<_, true>([b, x], n, out));
+
+#[inline]
+fn logb_many<R: Native, const MATHISH: bool>([b, x]: [Arg<'_, R>; 2], n: usize, out: &mut [std::mem::MaybeUninit<R>]) -> bool {
+    match (b, x) {
+        (Arg::One(c), _) => {
+            // Bases 2 and 10 divide by 1, which their loop skips, and take the logarithms' fast form for usual items. Any other base divides by ln b, which can be 0 or NaN, so its loop judges every result.
+            let (to, d) = for_base::<_, { crate::FUSED }>(c);
+            if MATHISH && c == R::one() {
+                each!([b, x], n, out, |[_, x]| if x == R::one() { R::zero() } else { log::<_, { crate::FUSED }>(x, to) / d })
+            } else if d == R::one() {
+                crate::slice::each_usual(x, n, out, (usual, #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), to)), crate::slice::none(),
+                    #[inline(always)] |x| log::<_, { crate::FUSED }>(x, to))
+            } else {
+                each!([b, x], n, out, |[_, x]| log::<_, { crate::FUSED }>(x, to) / d)
+            }
         }
+        (Arg::Many(bs), Arg::One(c)) => {
+            // A base of exactly 2 or 10 takes `log2` or `log10` of c. A second pass writes those items, because a select in the main loop stops it vectorizing. At those bases either result is NaN only where c is negative or NaN. The main loop's outcome holds.
+            let l = ln::<_, { crate::FUSED }>(c);
+            let ok = if MATHISH && c == R::one() {
+                each!([b, x], n, out, |[b, _]| if b == R::one() { R::zero() } else { l / ln::<_, { crate::FUSED }>(b) })
+            } else { each!([b, x], n, out, |[b, _]| l / ln::<_, { crate::FUSED }>(b)) };
+            let exact = [log2::<_, { crate::FUSED }>(c), log10::<_, { crate::FUSED }>(c)];
+            for (r, &b) in crate::slice::written(out).iter_mut().zip(bs) { *r = by_base(b, [exact[0], exact[1], *r]) }
+            ok
+        }
+        _ => each!([b, x], n, out, |[b, x]| logb_mode::<_, MATHISH>(b, x)),
     }
-    (Arg::Many(bs), Arg::One(c)) => {
-        // A base of exactly 2 or 10 takes `log2` or `log10` of c. A second pass writes those items, because a select in the main loop stops it vectorizing. At those bases either result is NaN only where c is negative or NaN. The main loop's outcome holds.
-        let l = ln::<_, { crate::FUSED }>(c);
-        let ok = each!([b, x], n, out, |[b, _]| l / ln::<_, { crate::FUSED }>(b));
-        let exact = [log2::<_, { crate::FUSED }>(c), log10::<_, { crate::FUSED }>(c)];
-        for (r, &b) in crate::slice::written(out).iter_mut().zip(bs) { *r = by_base(b, [exact[0], exact[1], *r]) }
-        ok
-    }
-    _ => each!([b, x], n, out, |[b, x]| logb::<_, { crate::FUSED }>(b, x)),
-});
+}
 
 /// The part of `log1p` that computes ln(1 + x) from u = 1 + x, split as `(m, e)`, with none of its special values.
 #[inline(always)]

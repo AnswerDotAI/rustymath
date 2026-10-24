@@ -1,4 +1,4 @@
-"""Numeric and character search, stable sorting and grouping. Sorts and insertion searches compare exactly: signed zeros compare equal, and every NaN comes after positive infinity. Matching and classification compare floats within the tolerance `ct`, or within the process's tolerance (`set_tolerance`, exact unless set) where `ct` is None, and Booleans, integers and characters exactly. Sorts use the last axis by default. Explicit `axis=None` flattens the input."""
+"""Numeric and character search, stable sorting and grouping. Sorts and insertion searches compare exactly: signed zeros compare equal, and every NaN comes after positive infinity. Matching and classification compare exactly; the Mathish namespace compares f64/complex128 tolerantly. Sorts use the last axis by default. Explicit `axis=None` flattens the input."""
 from typing import NamedTuple
 from . import _core
 from ._core import Array, index, isin, sort, argsort, partition, argpartition, argmin, argmax, median, quantile
@@ -11,7 +11,7 @@ class Unique(NamedTuple):
     numbers: Array
     counts: Array
 
-unique = _named(lambda ar, *, ct=None: Unique(*_core.unique(ar, ct=ct)), 'unique', _core.unique.__doc__)
+unique = _named(lambda ar: Unique(*_core.unique(ar)), 'unique', _core.unique.__doc__)
 
 def bins(boundaries, values):
     "The number of ascending `boundaries` at or below each value, as `searchsorted(..., side='right')` gives it"
@@ -21,14 +21,14 @@ def percentile(x, q, axis=None):
     "Quantiles with probabilities in percent rather than fractions"
     return quantile(x, _core.divide(q, 100), axis)
 
-def union1d(x, y, *, ct=None):
+def union1d(x, y):
     "Unique flattened values in x then y, in first-occurrence order"
-    return _core._set(x, y, 'union', ct)
+    return _core._set(x, y, 'union')
 
-def intersect1d(x, y, *, ct=None):
+def intersect1d(x, y):
     "Unique flattened values of x that match y, in first-occurrence order"
-    return _core._set(x, y, 'intersection', ct)
+    return _core._set(x, y, 'intersection')
 
-def setdiff1d(x, y, *, ct=None):
+def setdiff1d(x, y):
     "Unique flattened values of x absent from y, in first-occurrence order"
-    return _core._set(x, y, 'difference', ct)
+    return _core._set(x, y, 'difference')

@@ -167,10 +167,11 @@ def test_linalg(kind):
     assert np.array_equal(la.inner(rm.add, rm.equal)(n / 2, p / 2), equal)
     # A pair with no kernel at a dtype computes through the native functions, as counts of complex numbers do.
     assert la.inner(rm.add, rm.equal)(np.array([[1+1j, 2]]), np.array([[1+1j], [3]])) == 1
-    # Counts compare exactly unless a tolerance is given, for floats and complex numbers alike.
+    # Mathish comparisons also apply through generic product callbacks.
     count = la.inner(rm.add, rm.equal)
-    assert count([0.3, 1.0], [0.1 + 0.2, 1.0]) == 1 and count([0.3, 1.0], [0.1 + 0.2, 1.0], ct=rm.CT) == 2
-    assert count([[0.3 + 1j]], [[0.1 + 0.2 + 1j]]) == 0 and count([[0.3 + 1j]], [[0.1 + 0.2 + 1j]], ct=rm.CT) == 1
+    assert count([0.3, 1.0], [0.1 + 0.2, 1.0]) == 1 and count([[0.3 + 1j]], [[0.1 + 0.2 + 1j]]) == 0
+    count = la.inner(rm.add, rm.mathish.equal)
+    assert count([0.3, 1.0], [0.1 + 0.2, 1.0]) == 2 and count([[0.3 + 1j]], [[0.1 + 0.2 + 1j]]) == 1
     # NumPy's ufuncs aren't rustymath's functions.
     with pytest.raises(ValueError): la.inner(np.add, np.multiply)
     # An integer product that doesn't fit int64 raises: 2^62 times 4 is 2^64.

@@ -30,6 +30,7 @@ mod lambert;
 pub mod layout;
 pub mod linalg;
 mod ln;
+pub mod memory;
 pub mod number_theory;
 pub mod operation;
 pub mod optimize;
@@ -52,15 +53,15 @@ mod trig;
 #[cfg(accelerate)]
 mod vforce;
 
-pub use arith::{Add, Divide, Multiply, Subtract, BitAnd, BitOr, BitXor, BitNot, LeftShift, RightShift, Negate, Reciprocal, PiTimes, WholeDivide, Bitwise, Not, Nand, Nor, bitwise};
+pub use arith::{Add, Divide, MathishDivide, Multiply, Subtract, BitAnd, BitOr, BitXor, BitNot, LeftShift, RightShift, Negate, Reciprocal, PiTimes, WholeDivide, Bitwise, Not, Nand, Nor, bitwise};
 /// The crates whose types compact buffers hold, which the exported width macros name.
 pub use {half, num_complex};
 pub use complex::{Cis, divide};
 pub use float::{FUSED, Float, Native};
 pub use exp::{Exp, Expm1};
-pub use ln::{Ln, Log1p, Log2, Log10, Logb};
+pub use ln::{Ln, Log1p, Log2, Log10, Logb, MathishLogb};
 pub use parts::{Abs, Angle, Sign, Isnan, Isfinite, Isinf, Real, Imag, Conj, Trunc, Rint, Clip, Choose, Scale, Round};
-pub use pow::{Pow, Root, WholePow};
+pub use pow::{Pow, Root, WholePow, WrappingPow};
 pub use slice::{Arg, Binary, CHUNK, Flipped, Results, Ternary, Unary, Wrapped, choose, pairs};
 pub use special::{Erfc, Erfcinv, Erfinv};
 pub use sqrts::Sqrt;
