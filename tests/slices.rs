@@ -495,11 +495,11 @@ mod reductions {
         assert!(!left_scan(&Add, &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i64::MAX, 1], [8, 2, 1], None, &mut Vec::new()));
     }
 
-    /// Each window's fold matches the same reduction of that window's items alone, for windows folded directly and by van Herk-Gil-Werman, a last block cut short, a window as wide as its lane, and windows down rows. A float maximum skips each NaN item, as `Max::step` does. Each window's pick is its first row that gives its maximum or minimum, and so is each whole lane's pick and each running pick. A sum that wraps reports it.
+    /// Each window's fold matches the same reduction of that window's items alone, for windows folded directly, across the blocks of a long lane and by van Herk-Gil-Werman, a last block cut short, a window as wide as its lane, and windows down rows. A float maximum skips each NaN item, as `Max::step` does. Each window's pick is its first row that gives its maximum or minimum, and so is each whole lane's pick and each running pick. A sum that wraps reports it.
     #[test]
     fn windows_fold_as_their_items_do() {
         let same = |a: f64, b: f64| a == b || a.is_nan() && b.is_nan();
-        for shape in [[1usize, 100, 1], [3, 37, 2], [2, 25, 1], [1, 9, 4], [2, 0, 3]] {
+        for shape in [[1usize, 100, 1], [3, 37, 2], [2, 25, 1], [1, 9, 4], [2, 0, 3], [1, 2500, 1], [2, 600, 3]] {
             let [outer, len, inner] = shape;
             let x: Vec<i64> = (0..outer * len * inner).map(|i| (i * 37 % 101) as i64 - 50).collect();
             let f: Vec<f64> = x.iter().map(|&v| if v == 7 { f64::NAN } else { v as f64 / 7.0 }).collect();
@@ -540,6 +540,28 @@ mod reductions {
         }
         assert!(!sliding::<i64, Sum>(&[i64::MAX, 1, 0], [1, 3, 1], 2).1);
         assert!(!sliding::<i64, Sum>(&[i64::MAX; 20], [1, 20, 1], 10).1);
+    }
+
+    /// Each window along two axes folds as its items do, for windows that slide or tile along either axis, a window of one row along one of them, and a float maximum beside NaN. A window wider than the direct folds take gives `None`.
+    #[test]
+    fn windows_along_two_axes_fold_as_their_items_do() {
+        for (dims, widths, every) in [([2, 7, 3, 9, 2], [3, 2], [1, 1]), ([1, 8, 1, 6, 4], [2, 2], [2, 2]), ([3, 6, 2, 5, 1], [2, 3], [2, 1]), ([1, 4, 1, 4, 3], [4, 1], [1, 1])] {
+            let [outer, len1, mid, len2, inner] = dims;
+            let x: Vec<i64> = (0..dims.iter().product::<usize>()).map(|i| (i * 37 % 101) as i64 - 50).collect();
+            let f: Vec<f64> = x.iter().map(|&v| if v == 7 { f64::NAN } else { v as f64 / 7.0 }).collect();
+            let at = |o: usize, r: usize, m: usize, s: usize, c: usize| (((o * len1 + r) * mid + m) * len2 + s) * inner + c;
+            let (c1, c2) = ((len1 - widths[0]) / every[0] + 1, (len2 - widths[1]) / every[1] + 1);
+            let (mut sums, mut maxima) = (Vec::new(), Vec::new());
+            for o in 0..outer { for i in 0..c1 { for m in 0..mid { for j in 0..c2 { for c in 0..inner {
+                let items: Vec<usize> = (0..widths[0]).flat_map(|a| (0..widths[1]).map(move |b| (a, b))).map(|(a, b)| at(o, every[0] * i + a, m, every[1] * j + b, c)).collect();
+                sums.push(items.iter().map(|&p| x[p]).sum::<i64>());
+                maxima.push(items.iter().map(|&p| f[p]).fold(<Max as Reduction<f64>>::unit(), <Max as Reduction<f64>>::step));
+            }}}}}
+            assert_eq!(sliding_2d::<i64, Sum>(&x, dims, widths, every), Some((sums, true)), "{dims:?} {widths:?} {every:?}");
+            let (got, ok) = sliding_2d::<f64, Max>(&f, dims, widths, every).expect("windows of at most 8 rows fold directly");
+            assert!(ok && got.len() == maxima.len() && got.iter().zip(&maxima).all(|(&g, &m)| g == m || g.is_nan() && m.is_nan()), "{dims:?} {widths:?} {every:?}");
+        }
+        assert_eq!(sliding_2d::<i64, Sum>(&[0; 80], [1, 4, 1, 20, 1], [2, 9], [1, 1]), None);
     }
 
     /// Folds that run in pieces, of long lanes and of single matrices down their columns, and folds of many short lanes or groups, which split across threads, match the sums taken lane by lane, on one thread and on four.

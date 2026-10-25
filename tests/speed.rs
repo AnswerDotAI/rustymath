@@ -406,9 +406,9 @@ fn decompositions(units: &Units<f64, f32>, complex_units: &Units<num_complex::Co
     ]
 }
 
-/// This machine's budget of each function at each item type, keyed by `(type, name)`. Each section of `text` (`timing::sections`) is an item type, and each line under it holds a name and its two native budgets. `timing::NATIVE_COLUMN` picks the budget this machine checks.
-fn budgets(text: &str) -> HashMap<(&str, &str), f64> {
-    let budget = |line: &str| line.split('\t').nth(1 + timing::NATIVE_COLUMN).expect("a budget line holds a name and two budgets, separated by tabs").parse::<f64>().expect("a budget is a number");
+/// This machine's budget of each function at each item type, keyed by `(type, name)`. Each section of `text` (`timing::sections`) is an item type, and each line under it holds a name and its two native budgets. `timing::NATIVE_COLUMN` picks the budget this machine checks, and a machine with no column has `None` for each.
+fn budgets(text: &str) -> HashMap<(&str, &str), Option<f64>> {
+    let budget = |line: &str| timing::NATIVE_COLUMN.map(|column| line.split('\t').nth(1 + column).expect("a budget line holds a name and two budgets, separated by tabs").parse::<f64>().expect("a budget is a number"));
     timing::sections(text).expect("speed.txt starts with a section").into_iter().flat_map(|(width, _, lines)| lines.into_iter().map(move |line| ((width, timing::code_of(line)), budget(line)))).collect()
 }
 
@@ -483,9 +483,9 @@ fn speed() {
     }
     let budgets = budgets(include_str!("speed.txt"));
     let line = |&(width, name, (cost, ns)): &(&str, &str, Timed)| match budgets.get(&(width, name)) {
-        Some(budget) => timing::line(width, name, cost, &budget.to_string(), ns * 1e-9), None => format!("{width} {name}: {cost:.2}, with no budget in speed.txt")
+        Some(budget) => timing::line(width, name, cost, &budget.map_or("-".into(), |b| b.to_string()), ns * 1e-9), None => format!("{width} {name}: {cost:.2}, with no budget in speed.txt")
     };
-    let over = |&(width, name, (cost, _)): &(&str, &str, Timed)| budgets.get(&(width, name)).is_some_and(|&budget| cost > budget);
+    let over = |&(width, name, (cost, _)): &(&str, &str, Timed)| budgets.get(&(width, name)).copied().flatten().is_some_and(|budget| cost > budget);
     let mut failures = Vec::new();
     for row in &costed {
         if print_all { writeln!(stderr, "{}", line(row)).unwrap(); }

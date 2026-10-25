@@ -165,8 +165,9 @@ pub fn code_of(line: &str) -> &str { line.split('\t').next().unwrap_or_default()
 /// The pauses, in seconds, before each retry in `retried`. All of a case's runs together take a fraction of a millisecond, and one disturbance on a shared machine can last that long.
 pub const RETRY_PAUSES: [f64; 2] = [0.1, 1.0];
 
-/// Which of a budget file's two native budgets this machine's speed tests check: 0, for macOS on Apple silicon, where matrix products run on Accelerate, or 1, for Linux on CI's x86 runner and every other system.
-pub const NATIVE_COLUMN: usize = if cfg!(target_os = "macos") { 0 } else { 1 };
+/// Which of a budget file's two native budgets this machine's speed tests check: 0, for macOS on Apple silicon, where matrix products run on Accelerate, or 1, for Linux on x86-64, as CI's runner is. Other machines, such as Linux on Arm, have no budgets: their speed tests report costs without checking them.
+pub const NATIVE_COLUMN: Option<usize> =
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) { Some(0) } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) { Some(1) } else { None };
 
 /// The failures of a timing test that still fail after every retry. After each pause in `RETRY_PAUSES`, `retime` gets the failures and the pause, times them again, prints the retry and gives those that still fail. A speed test calls it after timing every case.
 pub fn retried<T>(mut failures: Vec<T>, mut retime: impl FnMut(Vec<T>, f64) -> Vec<T>) -> Vec<T> {

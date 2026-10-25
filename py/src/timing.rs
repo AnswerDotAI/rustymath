@@ -1,7 +1,7 @@
 //! The machine's timing lock, copy times and cost lines for Python, as `rustymath::timing` describes.
 use pyo3::prelude::*;
 
-/// A hold on the machine's timing lock, taken exclusively when a `with` block starts and released when it ends, as `rustymath::timing::exclusive` takes it. While the block runs, the calling thread runs rustymath's calls on one thread, and on macOS it asks for user-interactive QoS. `pauses` gives the pauses, in seconds, before each retry of a case over its budget, and `column` which of a budget file's two native budgets this machine checks, as `rustymath::timing::NATIVE_COLUMN` gives it.
+/// A hold on the machine's timing lock, taken exclusively when a `with` block starts and released when it ends, as `rustymath::timing::exclusive` takes it. While the block runs, the calling thread runs rustymath's calls on one thread, and on macOS it asks for user-interactive QoS. `pauses` gives the pauses, in seconds, before each retry of a case over its budget, and `column` which of a budget file's two native budgets this machine checks, or `None` on a machine with no budgets, as `rustymath::timing::NATIVE_COLUMN` gives it.
 #[pyclass(module = "rustymath")]
 struct Timing(Option<rustymath::timing::Hold>);
 
@@ -10,7 +10,7 @@ impl Timing {
     #[classattr]
     fn pauses() -> Vec<f64> { rustymath::timing::RETRY_PAUSES.to_vec() }
     #[classattr]
-    fn column() -> usize { rustymath::timing::NATIVE_COLUMN }
+    fn column() -> Option<usize> { rustymath::timing::NATIVE_COLUMN }
     /// One copy's time for each of `items` items of `bytes` bytes, in seconds, and the line that the speed tests print for it, as `rustymath::timing::copy_time` and `copy_line` give them.
     #[staticmethod]
     fn copy(bytes: usize, items: usize) -> PyResult<(f64, String)> {

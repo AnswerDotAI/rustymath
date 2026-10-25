@@ -749,8 +749,10 @@ pub fn along_mapped<T: Element, R: Reduction<T>>(data: &[T], mapping: &Mapping, 
     (totals, fits, None)
 }
 
-/// The widest window that [`sliding`] folds directly, one pass for each of its rows. Wider windows take van Herk-Gil-Werman.
+/// The widest window that [`sliding`] folds directly, with one pass over each block of a lane for each of the window's rows. Wider windows take van Herk-Gil-Werman.
 const DIRECT: usize = 8;
+/// The items in each block of a lane that [`sliding`]'s direct folds finish before moving on, so that a block and the rows its windows read stay in cache.
+const SLIDE_BLOCK: usize = 1024;
 
 /// The fold of the one item `x`, clearing `ok` where it doesn't fit.
 #[inline(always)]
@@ -761,6 +763,21 @@ fn one_of<T, R: Reduction<T>>(x: T, ok: &mut bool) -> R::Total { let (t, fits) =
 fn steps_of<T: Copy, R: Reduction<T>>(totals: &mut [R::Total], x: &[T]) -> bool {
     let (n, mut fits) = (totals.len().min(x.len()), true);
     for k in 0..n { let (t, f) = R::checked(totals[k], x[k]); (totals[k], fits) = (t, fits & f) }
+    fits
+}
+
+/// Appends to `out` the fold of each column of the first one, two or three of `rows`, as far as the shorter goes, and gives whether every fold fits. One pass reads those rows, where a pass for each row would also read and write `out` again.
+#[inline(always)]
+fn started<T: Copy, R: Reduction<T>>(out: &mut Vec<R::Total>, rows: &[&[T]]) -> bool {
+    #[inline(always)]
+    fn step<T, R: Reduction<T>>((t, f): (R::Total, bool), x: T) -> (R::Total, bool) { let (u, g) = R::checked(t, x); (u, f & g) }
+    let mut fits = true;
+    match *rows {
+        [] => {}
+        [a] => out.extend(a.iter().map(|&x| { let (t, f) = R::one(x); fits &= f; t })),
+        [a, b] => out.extend(a.iter().zip(b).map(|(&x, &y)| { let (t, f) = step::<T, R>(R::one(x), y); fits &= f; t })),
+        [a, b, c, ..] => out.extend(a.iter().zip(b).zip(c).map(|((&x, &y), &z)| { let (t, f) = step::<T, R>(step::<T, R>(R::one(x), y), z); fits &= f; t })),
+    }
     fits
 }
 
@@ -825,12 +842,16 @@ pub fn sliding<T: Copy + Sync, R: Reduction<T>>(data: &[T], [outer, len, inner]:
     if width == len && inner == 1 { return along::<T, R>(data, [outer, len, inner]); }
     let mut ok = true;
     if width <= DIRECT {
-        // Each lane's folds start from its first row, which fills the buffer as it's read.
+        // Each block of a lane's folds starts with one pass that folds up to three of each window's rows. The window's other rows step the block while it's still in cache, so the lane is read from memory once.
+        let block = (SLIDE_BLOCK / inner).max(1);
         let mut out = Vec::with_capacity(outer * count * inner);
         for lane in data.chunks_exact(len * inner) {
-            let at = out.len();
-            out.extend(lane[..count * inner].iter().map(|&x| one_of::<T, R>(x, &mut ok)));
-            for i in 1..width { ok &= steps_of::<T, R>(&mut out[at..], &lane[i * inner..]); }
+            for r in (0..count).step_by(block) {
+                let (at, rows) = (out.len(), block.min(count - r));
+                let row = |i: usize| &lane[(r + i) * inner..(r + i + rows) * inner];
+                ok &= match width { 1 => started::<T, R>(&mut out, &[row(0)]), 2 => started::<T, R>(&mut out, &[row(0), row(1)]), _ => started::<T, R>(&mut out, &[row(0), row(1), row(2)]) };
+                for i in 3..width { ok &= steps_of::<T, R>(&mut out[at..], row(i)); }
+            }
         }
         return (out, ok);
     }
@@ -842,6 +863,38 @@ pub fn sliding<T: Copy + Sync, R: Reduction<T>>(data: &[T], [outer, len, inner]:
         else { hgw::<T, R, false>(lane, folds, &mut suffix, &mut row, width, inner, &mut ok) }
     }
     (out, ok)
+}
+
+/// The folds by `R` of each window of `w1` rows along axis 1 and `w2` rows along axis 3 of `data`, an array of shape `[outer, len1, mid, len2, inner]` held row by row. Windows start every `e1` positions along axis 1 and every `e2` along axis 3: every position for windows that slide, or every window's width for windows that tile the axis, as pooling's do. The result has shape `[outer, c1, mid, c2, inner]`, where `c1` and `c2` count the windows along each axis, with whether every fold fits. Each band of `w1` rows folds into a buffer that stays in cache, and the windows along axis 3 fold from that buffer, so `data` is read once. A window's items fold along axis 1 and then along axis 3, which suits reductions that fold in any order. `None` for a window wider than [`DIRECT`] rows.
+pub fn sliding_2d<T: Copy + Sync, R: Reduction<T>>(data: &[T], [outer, len1, mid, len2, inner]: [usize; 5], [w1, w2]: [usize; 2], [e1, e2]: [usize; 2]) -> Option<(Vec<R::Total>, bool)> {
+    assert_eq!(data.len(), outer * len1 * mid * len2 * inner, "the data must fill its dimensions");
+    assert!(w1 > 0 && w2 > 0 && e1 > 0 && e2 > 0, "windows hold items and start in order");
+    if w1 > DIRECT || w2 > DIRECT { return None; }
+    let (c1, c2) = ((len1 + e1).saturating_sub(w1) / e1, (len2 + e2).saturating_sub(w2) / e2);
+    if outer * c1 * mid * c2 * inner == 0 { return Some((Vec::new(), true)); }
+    let (row, plane) = (len2 * inner, mid * len2 * inner);
+    let mut out = Vec::with_capacity(outer * c1 * mid * c2 * inner);
+    let (mut band, mut ok) = (Vec::with_capacity(plane), true);
+    for lane in data.chunks_exact(len1 * plane) {
+        for i in 0..c1 {
+            band.clear();
+            let rows = |a: usize| &lane[(e1 * i + a) * plane..(e1 * i + a + 1) * plane];
+            ok &= match w1 { 1 => started::<T, R>(&mut band, &[rows(0)]), 2 => started::<T, R>(&mut band, &[rows(0), rows(1)]), _ => started::<T, R>(&mut band, &[rows(0), rows(1), rows(2)]) };
+            for a in 3..w1 { ok &= steps_of::<T, R>(&mut band, rows(a)); }
+            for m in band.chunks_exact(row) {
+                let at = out.len();
+                // Windows that slide fold as `sliding`'s direct folds do, one pass over the band's row for each of the window's rows. Windows that tile fold one window at a time.
+                if e2 == 1 {
+                    out.extend_from_slice(&m[..c2 * inner]);
+                    for b in 1..w2 { ok &= merges_of::<T, R>(&mut out[at..], &m[b * inner..]); }
+                } else {
+                    for j in 0..c2 { out.extend_from_slice(&m[e2 * j * inner..(e2 * j + 1) * inner]); }
+                    for b in 1..w2 { for j in 0..c2 { ok &= merges_of::<T, R>(&mut out[at + j * inner..at + (j + 1) * inner], &m[(e2 * j + b) * inner..]); } }
+                }
+            }
+        }
+    }
+    Some((out, ok))
 }
 
 /// A reduction that picks one of its items, as [`Max`] and [`Min`] do, over pairs of an item and its row. Each fold keeps the row of the first item that gives it.

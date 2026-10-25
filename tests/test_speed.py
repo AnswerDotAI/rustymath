@@ -16,14 +16,14 @@ def arrays():
         r=rm.array(rng.integers(0, 256, N)), c=rm.array(rng.integers(0, 256, N)), mask=rm.array(u(N) > 0))
 
 def budgets():
-    "Each case in `speed_python.txt` as `(section, code, budget)`, with the native budget that `rm.timing().column` picks for this machine, as written."
+    "Each case in `speed_python.txt` as `(section, code, budget)`, with the native budget that `rm.timing().column` picks for this machine, as written, or `None` on a machine with no budgets."
     section, cases, column = None, [], rm.timing().column
     for line in Path(__file__).with_name('speed_python.txt').read_text().splitlines():
         if not line or line.startswith('#'): continue
         if line.startswith('['): section = line.strip('[]')
         else:
             code, *native = line.split('\t')
-            cases.append((section, code, native[column]))
+            cases.append((section, code, None if column is None else native[column]))
     return cases
 
 def fastest(run):
@@ -58,7 +58,7 @@ def over_budget(cases, namespace, timing, show):
     def attempt(case):
         section, code, budget = case
         copies, seconds = cost(code, namespace, units[section][0])
-        return timing.line(section, code, copies, budget, seconds), copies > float(budget)
+        return timing.line(section, code, copies, budget or '-', seconds), budget is not None and copies > float(budget)
     over = []
     for case in cases:
         line, failed = attempt(case)
