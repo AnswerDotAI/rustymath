@@ -761,16 +761,32 @@ pub fn along_with_tail<T: Copy + Sync, R: Reduction<T>>(data: &[T], dims: [usize
     (totals, ok)
 }
 
-/// Items of an array that [`along_mapped`] reads through a mapping at a time. A fold along an earlier axis steps strips of columns down each block's rows. A block of 4096 items holds too few rows of a 1024-column matrix for that to pay. Larger blocks also cost a strided read's walk less for each item.
+/// Items of an array that [`along_mapped`] copies through a mapping at a time. A fold along an earlier axis steps strips of columns down each block's rows. A block of 4096 items holds too few rows of a 1024-column matrix for that to pay. Larger blocks also cost a strided read's walk less for each item.
 const MAPPED: usize = 1 << 16;
 
-/// [`along`] of the array of `shape` that `mapping` lays `data` over, folding axis `axis`, without building that array: its totals, whether they all fit, and the tables that read the totals in the order of the array's other axes, where they come in another order. A reduction combines each lane's items in any order. Where the array reads a contiguous block of `data` with its axes in another order, as [`Mapping::block`] finds, the block folds in its own order, as [`Block::fold`] plans it, and its totals keep the block's order. A caller can then copy them through the tables, or read them through the tables as another view. Otherwise the array is read [`MAPPED`] items at a time through [`expanded_items`], and folds as [`fold_pieces`] folds it.
+/// The shortest run of consecutive items that [`along_mapped`] folds where it lies. Each run costs its own call into the fold, so shorter runs fold faster copied a piece at a time. On one thread, folding runs of 128 floats in place took 9% less time than copying them, and runs of 64 took 15% more.
+pub const RUN: usize = 128;
+
+/// The runs of at least [`RUN`] consecutive items that `mapping` reads over `positions` positions: their length, and the offset of each run's first item. `None` where the mapping reads shorter runs, gives a fill, or reads its runs through a padded or rotated axis, as [`Mapping::runs`] says.
+fn long_runs(mapping: &Mapping, positions: usize) -> Option<(usize, Vec<usize>)> {
+    if !mapping.regular().is_some_and(|(len, stride)| stride == 1 && len >= RUN) { return None; }
+    mapping.runs(positions).map(|(len, _, starts)| (len, starts))
+}
+
+/// Whether [`along_mapped`] reads the array of `shape` that `mapping` lays over storage where it lies, with no copy: a block of storage, as [`Mapping::block`] finds, or runs of at least [`RUN`] items. Elsewhere each read copies the array's items a piece at a time, at about a gather's cost, so a caller that will read the array again keeps a compact copy instead, as basedpl does for a pending copy that a name holds and the Python API does for a view that keeps what it gathers.
+pub fn rereads_cheaply(mapping: &Mapping, shape: &[usize]) -> bool {
+    mapping.block(shape).is_some() || long_runs(mapping, crate::layout::count(shape)).is_some()
+}
+
+/// [`along`] of the array of `shape` that `mapping` lays `data` over, folding axis `axis`, without building that array: its totals, whether they all fit, and the tables that read the totals in the order of the array's other axes, where they come in another order. A reduction combines each lane's items in any order. Where the array reads a contiguous block of `data` with its axes in another order, as [`Mapping::block`] finds, the block folds in its own order, as [`Block::fold`] plans it, and its totals keep the block's order. A caller can then copy them through the tables, or read them through the tables as another view. Otherwise each run of at least [`RUN`] items folds where it lies, shorter runs are copied [`MAPPED`] items at a time through [`expanded_items`], and the array folds as [`fold_pieces`] folds it.
 pub fn along_mapped<T: Element, R: Reduction<T>>(data: &[T], mapping: &Mapping, shape: &[usize], axis: usize) -> (Vec<R::Total>, bool, Option<Vec<Steps>>) {
+    let positions = crate::layout::count(shape);
     let finished = |(totals, fits, order)| {
-        if fits { crate::events::taken(crate::events::Route::MappedFold, crate::layout::count(shape)); }
+        if fits { crate::events::taken(crate::events::Route::MappedFold, positions); }
         (totals, fits, order)
     };
     if let Some(block) = mapping.block(shape) {
+        crate::events::taken(crate::events::Route::InPlace, positions);
         let (dims, order) = block.fold(Some(axis));
         let (totals, fits) = along::<T, R>(&data[block.range.clone()], dims);
         return finished((totals, fits, order));
@@ -778,9 +794,21 @@ pub fn along_mapped<T: Element, R: Reduction<T>>(data: &[T], mapping: &Mapping, 
     let dims = Lanes::new(shape, axis).expect("the folded axis is within the shape").dims();
     let mut totals = vec![R::unit(); dims[0] * dims[2]];
     if dims[1] == 0 || totals.is_empty() { return finished((totals, true, None)); }
-    let fits = fold_pieces::<T, R>(&mut totals, dims, &|range, fold| {
-        let mut buf = Vec::new();
-        for at in range.clone().step_by(MAPPED) { fold(at, Part::Items(expanded_items(mapping, data, at, MAPPED.min(range.end - at), &mut buf))); }
+    let runs = long_runs(mapping, positions);
+    if runs.is_some() { crate::events::taken(crate::events::Route::InPlace, positions); }
+    let fits = fold_pieces::<T, R>(&mut totals, dims, &|range, fold| match &runs {
+        Some((len, starts)) => {
+            let (len, mut at) = (*len, range.start);
+            while at < range.end {
+                let (start, n) = (starts[at / len] + at % len, (len - at % len).min(range.end - at));
+                fold(at, Part::Items(&data[start..start + n]));
+                at += n;
+            }
+        }
+        None => {
+            let mut buf = Vec::new();
+            for at in range.clone().step_by(MAPPED) { fold(at, Part::Items(expanded_items(mapping, data, at, MAPPED.min(range.end - at), &mut buf))); }
+        }
     });
     finished((totals, fits, None))
 }

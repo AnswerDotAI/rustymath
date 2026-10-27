@@ -41,7 +41,7 @@ impl<'a, T: Copy> Arg<'a, T> {
     pub(crate) fn part(self, start: usize, n: usize) -> Self { match self { Arg::One(v) => Arg::One(v), Arg::Many(s) => Arg::Many(&s[start..start + n]) } }
 }
 
-/// A function object's input or output item.
+/// A type that function objects take or give: a float, a complex number, an integer, a Boolean, a character or an ordering. Pieces on several threads read and write items.
 pub trait KernelItem: Copy + Send + Sync {
     /// Whether the type has NaN, as floats and complex numbers do.
     const NAN: bool;
@@ -49,7 +49,7 @@ pub trait KernelItem: Copy + Send + Sync {
     fn has_nan(self) -> bool;
 }
 
-/// The scalar and slice forms of an `N`-argument function object. [`Unary`], [`Binary`] and [`Ternary`] call these forms through blanket implementations.
+/// A function object of `N` arguments at item type `E`: its scalar and slice forms, which [`Unary`], [`Binary`] and [`Ternary`] call through blanket implementations. rustymath's own impls, which `forms!` writes, compile inside rustymath and never inline into a caller. A call can split its slice across threads.
 ///
 /// # Safety
 /// `slice` must initialize every slot in `out[..n]` before returning, even when it returns `false`.

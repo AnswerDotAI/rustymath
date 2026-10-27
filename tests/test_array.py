@@ -30,6 +30,19 @@ def test_numpy_views_share_items():
     view[0, 0] = 88
     assert a[3, 0] == 18 and view[3, 0] == 0 and snapshot[0, 0] == 18 and base[0, 0] == 0
 
+def test_views_that_strides_cant_describe_keep_what_they_gather():
+    image = rm.arange(256.).reshape(16, 16)
+    rows = rm.windows(image, (3, 3)).reshape(-1, 9)
+    declines = lambda report: [(r.route, r.reason, r.calls) for r in report.records if r.kind == 'declined']
+    with rm.explain() as report: row = rows[2]
+    assert row.tolist() == [2, 3, 4, 18, 19, 20, 34, 35, 36] and declines(report) == []
+    with rm.explain() as report: totals = {rows.sum(), rows.sum(), np.asarray(rows).sum(), sum(map(sum, rows.tolist()))}
+    assert len(totals) == 1 and declines(report) == [('in place', 'a view that gathers', 1)]
+    with rm.explain() as report: repeated = rm.repeat(image[:, ::2], 2, axis=1)
+    assert repeated.tolist() == np.repeat(np.asarray(image)[:, ::2], 2, axis=1).tolist() and declines(report) == []
+    padded = rm.pad(rm.arange(4.), 1, fill=9.)
+    assert padded.tolist() == np.asarray(padded).tolist() == [9, 0, 1, 2, 3, 9] and repr(padded).startswith('Array([9.0, 0.0')
+
 def test_array_copies_and_reads_any_layout():
     x = np.arange(12.).reshape(3, 4)
     a = rm.array(x)

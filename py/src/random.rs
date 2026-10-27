@@ -61,7 +61,7 @@ impl Generator {
         let selector = Selector::Indices { layout: shape.into(), positions: rustymath::gather::Table::new(positions.into_iter().map(|i| i as usize).collect()) };
         if replace { layout = layout.without_keys(0); }
         let plan = structure::select(&layout, vec![selector], false).map_err(py_err)?;
-        give(py, x.selected(py, plan)?, size.is_none())
+        give(py, x.selected(py, plan, None)?, size.is_none())
     }
     /// A copy with the leading-axis cells in random order, or a permutation of integers below `x` when it is one integer.
     fn permutation(&mut self, py: Python<'_>, x: &Bound<'_, PyAny>) -> PyResult<Array> {
@@ -71,7 +71,7 @@ impl Generator {
         let Some(x) = x else { return Ok(Array::new(core(positions.into_iter().map(|i| i as i64).collect(), &[n])?)) };
         let layout = x.layout();
         let selector = Selector::Indices { layout: [n].into(), positions: rustymath::gather::Table::new(positions.into_iter().map(|i| i as usize).collect()) };
-        Ok(Array::new(x.selected(py, structure::select(&layout, vec![selector], false).map_err(py_err)?)?))
+        Ok(Array::new(x.selected(py, structure::select(&layout, vec![selector], false).map_err(py_err)?, None)?))
     }
 }
 

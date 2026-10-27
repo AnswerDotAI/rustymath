@@ -547,7 +547,7 @@ mod operation {
         assert_eq!(table(vec![3]).affine(&[1]), Some((5, vec![0])));
         assert_eq!(table(vec![3, Steps::FILL]).affine(&[0]), Some((0, vec![0])));
         assert!(table(vec![3, Steps::FILL]).affine(&[2]).is_none() && table(vec![Steps::FILL]).affine(&[1]).is_none());
-        // A weighted mean reads the mapping’s fill where no stored item is selected.
+        // A weighted mean reads the fill that a mapping chose where it reaches no item: one stored 2 reads as 0 2 0, and as 4 2 4 with a chosen fill of 4.
         let padded = Mapping::Steps { base: 0, steps: vec![Steps::clipped(-1, 3, 1, 1)].into() };
         assert_eq!(rustymath::stats::average(&[2.], &[1.], &rustymath::stats::Axes::new(&row, &[0]).unwrap(), [&padded, &Mapping::Single]), [2. / 3.]);
         let fill = |x| std::sync::Arc::new(rustymath::buffer::Fill::new(f64::view(&[x]), f64::DTYPE).unwrap());
@@ -566,12 +566,12 @@ mod operation {
     fn owned_views_share_detach_and_release_their_base() {
         use rustymath::{array::Array, buffer::Element, structure::{self, Selector}};
         let mut base = Array::new([2, 3].into(), i64::buffer((0..6).collect())).unwrap();
-        let transposed = base.selected(structure::transpose(base.layout(), &[1, 0]).unwrap()).unwrap();
+        let transposed = base.selected(structure::transpose(base.layout(), &[1, 0]).unwrap(), None).unwrap();
         assert_eq!(base.view().storage().as_ptr(), transposed.view().storage().as_ptr());
         assert_eq!(transposed.view().items::<i64>().unwrap().as_ref(), &[0, 3, 1, 4, 2, 5]);
         let reshaped = base.reshape([6].into()).unwrap();
         assert_eq!(base.view().storage().as_ptr(), reshaped.view().storage().as_ptr());
-        let mut tail = reshaped.selected(structure::select_axis(reshaped.layout(), 0, Selector::Range { start: 2, len: 3, step: 1 }).unwrap()).unwrap();
+        let mut tail = reshaped.selected(structure::select_axis(reshaped.layout(), 0, Selector::Range { start: 2, len: 3, step: 1 }).unwrap(), None).unwrap();
         assert_eq!(tail.view().storage().len(), 6);
         let compact = tail.compact();
         assert_eq!(compact.view().storage().len(), 3);

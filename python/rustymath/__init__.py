@@ -42,7 +42,7 @@ from ._core import clip, conj, imag, isfinite, isinf, isnan, real, rint, trunc
 from ._core import bitwise_and, bitwise_or, bitwise_xor, bitwise_not, left_shift, right_shift, floor_divide, round, degrees, radians
 from ._core import average, corrcoef, cov, histogram, mean, norm, std, var
 from ._core import (argwhere, concatenate, expand_dims, flatten, flip, nonzero, pad, ravel, repeat, reshape, roll, split, squeeze, stack, swapaxes, take,
-    transpose, where)
+    transpose, where, windows)
 from .structure import diag, diagonal, eye, identity, tril, triu, trace, diff, ptp, broadcast_to
 from .signal import correlate, convolve, overlap_add
 from ._naming import _binary_function

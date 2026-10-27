@@ -48,9 +48,10 @@ def test_integers():
     assert (A(rm.gcd(a, b)) == np.gcd(a, b)).all() and (A(rm.lcm(a, b)) == np.sign(a * b) * np.lcm(a, b)).all() and rm.gcd(a, b).dtype == 'int64'
     assert (A(rm.remainder(a, b + 100)) == np.remainder(a, b + 100)).all()
     assert (A(rm.power(a, 3)) == a**3).all() and rm.power(a, 3).dtype == 'int64'
-    # An integer power that doesn't fit wraps, as NumPy's does. A negative exponent has no integer power beside a base other than 1 or -1, whatever other pairs give.
+    # An integer power that doesn't fit wraps, as NumPy's does. A negative exponent has no integer power beside a base other than 1 or -1, whatever other pairs give, and a padded view's fill counts as an exponent.
     assert rm.power(np.array([10, 3]), 30).tolist() == np.power(np.array([10, 3]), 30).tolist() and rm.power(np.array([3], np.uint8), 6).tolist() == [729 % 256]
     with pytest.raises(ValueError, match='negative'): rm.power(np.array([2, 3]), np.array([1, -1]))
+    with pytest.raises(ValueError, match='negative'): rm.power(2, rm.pad(rm.array([1, 2]), 1, fill=-1))
     assert rm.power(np.array([1, 2]), np.array([-1, 63])).tolist() == [1, -2**63]
     # Each integer width keeps its type.
     for t in [np.uint8, np.int16, np.int32, np.int64]:
@@ -311,6 +312,24 @@ def test_explain():
         assert {'vector kernel', 'mapped kernel'} <= set(report.routes)
         record = next(r for r in report.records if r.route == 'mapped kernel')
         assert (record.kind, record.calls, record.items) == ('taken', calls, 6 * calls)
+
+def test_view_folds(threads):
+    # A view that isn't a block of its storage folds through its mapping, without being built. Runs of at least 128 items fold where they lie, and shorter runs are copied a piece at a time.
+    m = np.random.default_rng(0).random((1024, 1024))
+    r = rm.array(m)
+    for cols, in_place in [(slice(None, 512), True), (slice(None, None, 2), False)]:
+        with rm.explain() as report:
+            assert np.isclose(rm.sum(r[:, cols]), m[:, cols].sum())
+            assert all(np.allclose(rm.sum(r[:, cols], axis=a), m[:, cols].sum(a)) for a in [0, 1])
+        assert 'mapped fold' in report.routes and ('in place' in report.routes) == in_place
+
+def test_window_folds(threads):
+    # A fold along an axis of a view of windows slides over the view's storage, with no windows built.
+    x = np.random.default_rng(0).random((300, 400))
+    with rm.explain() as report:
+        assert np.allclose(rm.sum(rm.windows(x[0], 3), axis=1), windows(x[0], 3).sum(1))
+        assert np.allclose(rm.max(rm.windows(x, (5, 5)), axis=3), windows(x, (5, 5)).max(3))
+    assert 'sliding fold' in report.routes
 
 def test_elementwise_layouts(threads):
     x = np.linspace(0.1, 1, 262_147)

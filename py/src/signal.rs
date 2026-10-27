@@ -41,9 +41,9 @@ fn _correlate<'py>(py: Python<'py>, f: NativeFunction<'_>, g: NativeFunction<'_>
     }
     let (xi, ki) = (call.args[0].at(dtype)?, call.args[1].at(dtype)?);
     let product = released(py, || -> PyResult<Core> {
-        let padded = c.padding.as_ref().map(|p| Core::gathered(xi.view(), p)).transpose().map_err(py_err)?;
+        let padded = c.padding.as_ref().map(|p| Core::gathered(xi.view(), p, None)).transpose().map_err(py_err)?;
         let source = match &padded { Some(p) => p.view().contiguous().expect("a gathered array is contiguous"), None => xi.view() };
-        let matrix = |view, plan: &Plan, rows, cols| Core::gathered(view, &Plan { layout: Layout::from(vec![rows, cols]), steps: plan.steps.clone() }).map_err(py_err);
+        let matrix = |view, plan: &Plan, rows, cols| Core::gathered(view, &Plan { layout: Layout::from(vec![rows, cols]), steps: plan.steps.clone() }, None).map_err(py_err);
         let [positions, cells, outputs] = c.size;
         let (windows, kernel) = (matrix(source, &c.windows, positions, cells)?, matrix(ki.view(), &c.kernel, cells, outputs)?);
         crate::linalg::inner(f, g, [windows.view(), kernel.view()], name)

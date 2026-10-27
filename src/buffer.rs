@@ -484,11 +484,12 @@ impl Buffer {
     }
 }
 
-/// One native item, checked at the dtype that reads it, for a mapping's missing positions.
+/// A fill that a call chooses: the item that a read gives at each position that reaches no item, as one native item, checked at the dtype that reads it. A read with no chosen fill gives its dtype's [`Element::FILL`]. A frontend's own storage, such as basedpl's nested arrays, keeps its fills in the frontend.
 #[derive(Clone, Debug)]
 pub struct Fill(Buffer);
 
 impl Fill {
+    /// The one item of `value` at `dtype`, where the conversion keeps its value, as [`Buffer::kept`] converts it. A Length error where `value` doesn't hold one item, and a Domain error where the item doesn't keep its value.
     pub fn new(value: View<'_>, dtype: DType) -> Result<Self, Error> {
         if value.len() != 1 { return Err(Error::new(Kind::Length, "a fill must contain one item")); }
         Buffer::kept(value, dtype).map(Self)
@@ -496,6 +497,7 @@ impl Fill {
     pub fn view(&self) -> View<'_> { self.0.view() }
     /// Convert with the source's items, including its rounding and truncation.
     pub fn cast(&self, dtype: DType) -> Result<Self, Error> { Buffer::cast(self.view(), dtype).map(Self) }
+    /// The item that a read of items of type `A` gives at a position that reaches no item: the chosen `fill`, made for items of type `A`, or `A`'s own fill where there's none.
     #[inline]
     pub fn item<A: Element>(fill: Option<&std::sync::Arc<Self>>) -> A { fill.map_or(A::FILL, |f| A::of(f.view()).expect("a fill has its source's dtype")[0]) }
 }
@@ -647,7 +649,7 @@ where bool: Source<A>, u8: Source<A>, i16: Source<A>, i32: Source<A>, i64: Sourc
 }
 
 /// Gathers source items in blocks, then converts each block contiguously.
-fn read_as<A: Element, S: Source<A>>(items: &[S], mapping: &crate::agreement::Mapping, n: usize) -> Vec<A> {
+pub(crate) fn read_as<A: Element, S: Source<A>>(items: &[S], mapping: &crate::agreement::Mapping, n: usize) -> Vec<A> {
     if matches!(mapping, crate::agreement::Mapping::Linear(1)) { return read_all(&items[..n]); }
     let mut out = Vec::with_capacity(n);
     crate::agreement::block(items, mapping, n, &mut out, |x, n, slots| slots.pairs(x, crate::Arg::One(()), n, |x, ()| (x.read(), true)));
@@ -743,7 +745,7 @@ impl Buffer {
     }
     /// Shared conversion dispatch for compact and mapped logical items. Unselected storage never participates in checked conversion.
     pub(crate) fn cast_mapped(view: View<'_>, mapping: &crate::agreement::Mapping, n: usize, dtype: DType) -> Result<Self, Error> {
-        // Checked conversion must read chosen fills at the source dtype before converting them.
+        // The checked conversions below read 0 at a fill, so a chosen fill is read at the items' own dtype first.
         if mapping.chosen().is_some() { return Self::cast(with_dtype!(view.dtype(), T => T::buffer(read_as::<T, T>(T::of(view).expect("matching dtype"), mapping, n))).view(), dtype); }
         if view.dtype() == dtype {
             if matches!(mapping, crate::agreement::Mapping::Linear(1)) { return Ok(Self::copied(view, 0..n)); }

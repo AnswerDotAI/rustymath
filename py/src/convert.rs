@@ -6,13 +6,13 @@ use pyo3::exceptions::{PySystemError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyComplex, PyFloat, PyInt, PyList, PyString};
 use rustymath::array::{Array as Core, ArrayView};
-use rustymath::buffer::{Buffer, ComplexWidth, DType, Element, FloatWidth, Items, Width};
+use rustymath::buffer::{Buffer, ComplexWidth, DType, Element, Fill, FloatWidth, Items, Width};
 use rustymath::error::{Error, Kind};
 use rustymath::layout::Layout;
 use rustymath::structure::transpose;
 use rustymath::with_dtype;
 use rustymath_buffer::{Read, frame::{Frame, frame}, py_err, read, read_array, walk::{Collect, walked}};
-use std::{borrow::Cow, cell::Cell};
+use std::{borrow::Cow, cell::Cell, sync::Arc};
 
 /// The shared compact dtype named `name`, or a Python argument error.
 pub fn dtype(name: &str) -> PyResult<DType> {
@@ -74,11 +74,11 @@ impl Arg {
             Source::Owned(c) => Ok(c),
         }
     }
-    /// Selects before taking ownership, with the GIL released: foreign items gather directly, while Rustymath arrays can share affine views.
-    pub fn selected(&self, py: Python<'_>, plan: rustymath::structure::Plan) -> PyResult<Core> {
+    /// Selects by `plan` before taking ownership, with the GIL released, reading `fill`, or the item type's fill, where the plan reaches no item: foreign items gather directly, and rustymath arrays select as [`Core::selected`] does.
+    pub fn selected(&self, py: Python<'_>, plan: rustymath::structure::Plan, fill: Option<Arc<Fill>>) -> PyResult<Core> {
         match &self.source {
-            Source::Read { read, .. } => { let items = read.view(); released(py, || Core::gathered(items, &plan)) }
-            Source::Owned(c) => released(py, || c.selected(plan)),
+            Source::Read { read, .. } => { let items = read.view(); released(py, || Core::gathered(items, &plan, fill)) }
+            Source::Owned(c) => released(py, || c.selected(plan, fill)),
         }.map_err(py_err)
     }
     /// The items at `dtype`, borrowed where the argument already has it, and otherwise widened. An empty argument converts to any dtype. It raises where the argument's dtype doesn't widen to `dtype`, as [`DType::widens_to`] decides.
@@ -284,7 +284,7 @@ fn framed(py: Python<'_>, frame: Frame<'_>, strong: &mut Option<DType>) -> PyRes
         return Err(py_err(Error::new(Kind::Domain, format!("column {label} holds text, which a rustymath array can't hold"))));
     }
     let columns = one(&PyList::new(py, &frame.columns)?.into_any())?.into_core()?;
-    let mut core = if frame.columns.is_empty() { columns.reshape(Layout::from([frame.rows, 0])) } else { columns.selected(transpose(columns.layout(), &[1, 0]).map_err(py_err)?) }.map_err(py_err)?;
+    let mut core = if frame.columns.is_empty() { columns.reshape(Layout::from([frame.rows, 0])) } else { columns.selected(transpose(columns.layout(), &[1, 0]).map_err(py_err)?, None) }.map_err(py_err)?;
     core.set_keys(frame.keys.to_vec()).map_err(py_err)?;
     core.set_names(frame.names.to_vec()).map_err(py_err)?;
     join(strong, core.dtype())?;

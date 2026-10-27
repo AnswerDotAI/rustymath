@@ -81,7 +81,7 @@ impl From<Writes<'_>> for Mapping {
     }
 }
 
-/// The entries of a [`Mapping::Steps`], one for each result axis, with their chosen native fill and the walk that `Steps::simplify` plans for them. The plan is made on the first walk and kept, so a mapping that is read a block at a time plans its walk once.
+/// The entries of a [`Mapping::Steps`], one for each result axis, with the walk that `Steps::simplify` plans for them and the native fill that a call chose for the positions that reach no item. The plan is made on the first walk and kept, so a mapping that is read a block at a time plans its walk once.
 #[derive(Clone, Debug, Default)]
 pub struct Route { steps: Vec<Steps>, plan: OnceLock<(usize, Vec<Cow<'static, Steps>>)>, fill: Option<Arc<Fill>> }
 
@@ -122,7 +122,7 @@ impl Mapping {
         }).collect::<Option<_>>()?;
         Some((base, steps))
     }
-    /// Reads through `outer`, whose missing positions use the default fill, then this mapping. Chosen inner fills cannot combine with outer missing positions.
+    /// Reads of a logical array of `shape` through `outer`, then through this mapping to its storage. A position where `outer` gives a fill reads its item type's own fill. `None` where this mapping chose a fill and `outer` gives fills.
     pub fn through(&self, outer: &[Steps], shape: &[usize]) -> Option<Self> {
         if outer.iter().any(|s| s.len() == 0) { return Some(Self::Linear(1)); }
         if self.chosen().is_some() && outer.iter().any(Steps::fills) { return None; }
@@ -130,9 +130,9 @@ impl Mapping {
         let (base, steps) = Steps::through(outer, shape, base, &inner)?;
         Some(self.with_steps(base, steps))
     }
-    /// This mapping split into entries for `shape`, preserving its fill.
+    /// This mapping over a result of `shape` as one entry for each axis of `shape`, keeping its fill, or as it is where its offsets don't split by axis ([`Mapping::entries`]).
     pub fn split(&self, shape: &[usize]) -> Self { self.entries(shape).map_or_else(|| self.clone(), |(base, steps)| self.with_steps(base, steps)) }
-    /// Base, axis entries and chosen native fill of the walk over `shape`. Geometry-only users may ignore the fill.
+    /// The base and the tables of a walk that reads what this mapping reads over `shape`, with the native fill that the walk reads where it reaches no item. A [`Mapping::Steps`] lends its own steps. Code that needs only positions can ignore the fill.
     #[inline]
     pub fn to_walk(&self, shape: &[usize]) -> (usize, Cow<'_, [Steps]>, Option<&Arc<Fill>>) {
         if let Self::Steps { base, steps } = self { return (*base, Cow::Borrowed(steps), steps.fill.as_ref()); }
@@ -142,20 +142,20 @@ impl Mapping {
         };
         (base, Cow::Owned(steps), None)
     }
-    /// Positions only, including the base as a leading entry, for geometric operations such as [`Walk::new`](crate::structure::Walk::new).
+    /// The tables of [`Mapping::to_walk`]'s walk, with its base as a leading table of one item, for code that walks or classifies tables, such as [`Walk::new`](crate::structure::Walk::new). They hold positions only, without the walk's fill.
     pub fn tables(&self, shape: &[usize]) -> Vec<Steps> { let (base, steps, _) = self.to_walk(shape); Steps::with_base(base, steps.into_owned()) }
     /// The bytes that this mapping's entries take: each entry, and a table's listed offsets.
     pub fn footprint(&self) -> usize { if let Self::Steps { steps, .. } = self { steps.iter().map(Steps::footprint).sum() } else { 0 } }
-    /// `outer` maps `frame` to an array of `shape`; this maps that array to storage. Different fills or unsupported walks give `None`.
+    /// `outer` maps `frame` to a logical array of `shape`; this maps that array to storage. `None` for an unsupported composition, and where both read fills and chose different ones.
     pub fn compose(&self, outer: &Self, shape: &[usize], frame: &[usize]) -> Option<Self> {
         if frame.contains(&0) { return Some(Self::Linear(1)); }
         if matches!(self, Self::Linear(1)) { return Some(outer.clone()); }
         if matches!(outer, Self::Linear(1)) { return Some(self.clone()); }
         let fill = self.joined_fill(outer)?;
-        let (base, steps) = outer.entries(frame)?;
+        let (base, steps) = match outer { Self::Steps { base, steps } => (*base, steps.to_vec()), _ => outer.entries(frame)? };
         Some(self.through(&Steps::with_base(base, steps), shape)?.filled(fill))
     }
-    /// `compose`, or where `table` allows it, the composed offsets. Different fills cannot collapse into one mapping.
+    /// [`Mapping::compose`], or else, where `table` allows it, the composed offsets as one table over `frame`'s positions, with a fill wherever either mapping reads one. `None` where both read fills and chose different ones.
     pub fn composed(&self, outer: &Self, shape: &[usize], frame: &[usize], table: bool) -> Option<Self> {
         if let Some(mapping) = self.compose(outer, shape, frame) { return Some(mapping); }
         let fill = self.joined_fill(outer)?;
@@ -313,23 +313,31 @@ impl Mapping {
     }
     /// Whether some position reads a fill, as a padded read's does.
     pub fn fills(&self) -> bool { matches!(self, Self::Steps { steps, .. } if steps.iter().any(Steps::fills)) }
-    /// Set the native fill only where this mapping reaches missing positions.
+    /// This mapping, reading the native `fill` at each position that reaches no item, or each item type's own fill for `None`. A mapping whose positions all reach items keeps no fill. `None` on a mapping that chose no fill changes nothing, and costs nothing once inlined.
     #[inline]
-    pub fn filled(mut self, fill: Option<Arc<Fill>>) -> Self {
+    pub fn filled(self, fill: Option<Arc<Fill>>) -> Self {
         if fill.is_none() && self.chosen().is_none() { return self; }
+        self.refilled(fill)
+    }
+    /// What `filled` does where a fill is given or chosen. It has no `#[inline]`, so callers in other crates inline only `filled`'s check.
+    fn refilled(mut self, fill: Option<Arc<Fill>>) -> Self {
         if let Self::Steps { steps, .. } = &mut self { steps.fill = fill.filter(|_| steps.iter().any(Steps::fills)); }
         self
     }
+    /// The native fill that a call chose for the positions that reach no item, if any.
     #[inline]
     pub fn chosen(&self) -> Option<&Arc<Fill>> { match self { Self::Steps { steps, .. } => steps.fill.as_ref(), _ => None } }
-    /// Retype a chosen fill with its converted source; borrow maps whose fill already has that dtype.
-    pub fn cast_fill(&self, dtype: crate::buffer::DType) -> Result<Cow<'_, Self>, Error> {
-        let Some(fill) = self.chosen().filter(|fill| fill.view().dtype() != dtype) else { return Ok(Cow::Borrowed(self)); };
-        Ok(Cow::Owned(self.clone().filled(Some(Arc::new(fill.cast(dtype)?)))))
+    /// This mapping with its chosen fill converted to `dtype`, as its source's items convert. `None` where it chose no fill, or its fill already has that dtype.
+    pub fn cast_fill(&self, dtype: crate::buffer::DType) -> Result<Option<Self>, Error> {
+        let Some(fill) = self.chosen().filter(|fill| fill.view().dtype() != dtype) else { return Ok(None) };
+        Ok(Some(self.clone().filled(Some(Arc::new(fill.cast(dtype)?)))))
     }
-    /// Replace this mapping's geometry, retaining its native fill.
+    /// A [`Mapping::Steps`] of `base` and `steps`, with the native fill that this mapping chose.
+    #[inline]
     pub fn with_steps(&self, base: usize, steps: Vec<Steps>) -> Self { Self::Steps { base, steps: steps.into() }.filled(self.chosen().cloned()) }
+    /// The fill that a composition of this mapping with `outer` reads, which either of them chose, if any. `None` where both read fills and chose different ones.
     fn joined_fill(&self, outer: &Self) -> Option<Option<Arc<Fill>>> {
+        // The chosen fills are compared first, so that mappings that chose none scan no tables, which `Table::fills` reads in full.
         if self.chosen() != outer.chosen() && self.fills() && outer.fills() { return None; }
         Some(outer.chosen().or(self.chosen()).cloned())
     }
@@ -339,6 +347,11 @@ impl Mapping {
         steps.iter().rev().find(|s| s.len() > 1)
     }
 }
+
+/// The share of an array's items, 1 in `LISTED`, at or below which a read is small. A small read lists its items' offsets through a mapping that it doesn't compose with, as [`Mapping::composed`]'s table does. Listing one item's offset costs about 50 times what a copy spends on each item. A larger read gathers the whole array first.
+pub const LISTED: usize = 128;
+/// Whether a read of `read` items from an array of `len` items is small (`LISTED`).
+pub fn small_read(read: usize, len: usize) -> bool { read.saturating_mul(LISTED) <= len }
 
 /// Two arguments paired by broadcasting: the result's layout, its number of items, and how each argument lays out over it. A caller that adds its own data to layouts can carry its own layout type, through `map_layout`.
 pub struct Agreement<L = Layout> { pub layout: L, pub len: usize, pub left: Mapping, pub right: Mapping }
@@ -606,7 +619,7 @@ pub struct Side<'a, X: Clone> { data: Cow<'a, [X]>, mapping: Cow<'a, Mapping> }
 
 impl<'a, X: Element> Side<'a, X> {
     pub fn new(data: &'a [X], mapping: &'a Mapping) -> Self {
-        let mapping = mapping.cast_fill(X::DTYPE).expect("a fill converts with its source");
+        let mapping = mapping.cast_fill(X::DTYPE).expect("a fill converts with its source").map_or(Cow::Borrowed(mapping), Cow::Owned);
         let mut items = Vec::new();
         match gather_cycle(data, &mapping, &mut items) {
             Some(tiled) => Self { data: Cow::Owned(items), mapping: Cow::Owned(tiled) },

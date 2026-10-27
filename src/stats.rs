@@ -40,7 +40,7 @@ impl Axes {
         Cow::Owned(out)
     }
 
-    /// The walk that reads what `mapping` reads, in the order the reduction reads its items ([`Mapping::to_walk`]).
+    /// The walk that reads what `mapping` reads, in the order the reduction reads its items ([`Mapping::to_walk`]), and the item that the walk reads where it reaches none: the fill that `mapping` chose, or else the item type's own.
     fn plan<T: Element>(&self, mapping: &Mapping) -> (usize, Vec<Steps>, T) {
         let frame: Vec<usize> = self.steps.as_ref().map_or_else(|| self.shape.clone(), |steps| steps.iter().map(Steps::len).collect());
         let ordered = match &self.steps {

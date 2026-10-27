@@ -509,8 +509,8 @@ fn replicated(layout: &Layout, axis: usize, counts: &[i64], inverse: bool) -> Re
     Ok(Plan { layout: result, steps: vec![rows, Steps::table(table), Steps::along(lanes.inner, 1)] })
 }
 
-/// Pads every axis by `(before, after)` positions, filled with the item type's fill. Existing axis keys remain on their positions. An axis that pads by nothing keeps a plain walk.
-pub fn pad(layout: &Layout, widths: &[(usize, usize)]) -> Result<Plan, Error> {
+/// Pads every axis by `(before, after)` positions. Each position past an end reads by `edge`: the item type's fill, or a position on the axis. Existing axis keys remain on their positions. Padding a keyed axis by another mode than `Edge::Fill` repeats keyed positions, which is an error. An axis that pads by nothing keeps a plain walk.
+pub fn pad(layout: &Layout, widths: &[(usize, usize)], edge: Edge) -> Result<Plan, Error> {
     if widths.len() != layout.shape().len() { return Err(Error::new(Kind::Rank, "padding needs one pair for each axis")); }
     let stride = strides(layout.shape());
     let mut result = layout.clone();
@@ -518,9 +518,9 @@ pub fn pad(layout: &Layout, widths: &[(usize, usize)]) -> Result<Plan, Error> {
     for (axis, (&size, &(before, after))) in layout.shape().iter().zip(widths).enumerate() {
         if before == 0 && after == 0 { steps.push(Steps::along(size, stride[axis])); continue; }
         let len = size.checked_add(before).and_then(|n| n.checked_add(after)).ok_or_else(|| Error::new(Kind::Limit, "padding length overflow"))?;
-        let positions = Steps::clipped(-(before as i128), len, size, 1);
+        let positions = Steps::padded(-(before as i128), len, size, 1, edge);
         result = result.select(axis, positions.offsets())?;
-        steps.push(Steps::clipped(-(before as i128), len, size, stride[axis]));
+        steps.push(Steps::padded(-(before as i128), len, size, stride[axis], edge));
     }
     generated_len(result.shape())?;
     Ok(Plan { layout: result, steps })
@@ -720,6 +720,92 @@ impl Walk {
             }
         }).collect()
     }
+}
+
+/// A fold along one or two axes of a copy whose axes walk windows of its source, run as sliding folds over the source's rows without building the windows ([`crate::reduce::sliding`] and [`crate::reduce::sliding_2d`]). [`Walk`] classifies the copy. Each folded axis is a window's axis that moves one position at a time along its source axis. The copy's other axes along that source axis move by 1, where the windows slide, or by whole windows, where they tile it, as pooling's do. basedpl folds its pending copies of windows this way, and the Python API its views of windows.
+#[derive(Clone, Debug)]
+pub struct Slide {
+    /// How the copy walks its source.
+    pub walk: Walk,
+    /// The offsets of the source items that the folds read: for one fold, the rows that it reads along its source axis, or the whole source where a source axis before the fold's holds more than one item, and for two folds the whole source.
+    pub region: std::ops::Range<usize>,
+    /// The region as rows, with each fold along a middle axis: `[outer, len, inner]` for one folded axis, where windows that tile fold one tile to a row, and `[outer, len1, mid, len2, inner]` for two, in the order of their source axes.
+    pub dims: Vec<usize>,
+    /// Each fold's window width, in the order of `dims`.
+    pub widths: Vec<usize>,
+    /// The positions between the starts of each fold's windows, in the order of `dims`: 1 where they slide, and the width where they tile.
+    pub every: Vec<usize>,
+    /// The shape of the folds' results: the source's shape, with each folded source axis holding one item for each start of its windows.
+    pub folded: Vec<usize>,
+    /// The tables through which the copy without its folded axes reads the folds' results.
+    pub tables: Vec<Steps>,
+}
+
+impl Slide {
+    /// The sliding folds along `axes`, one axis or two, of the copy of `shape` that `tables` read from a source of shape `source`. Two folds need windows along two source axes, each covering its whole axis, and a last source axis after both of at least two items, as [`crate::reduce::sliding_2d`] takes them. `None` for any other copy: one that reads fills, one with an axis of more than one item that walks no source axis, one that reads a source axis that none of its axes walks at a position other than 0, one whose folded axis doesn't move by 1 along its source axis or is the only axis along it, and one whose other axes along a folded axis's source axis neither move by 1 nor tile it. `None` also for a window narrower than two items.
+    pub fn new(tables: &[Steps], shape: &[usize], source: &[usize], axes: &[usize]) -> Option<Self> {
+        let walk = Walk::new(tables, shape, source)?;
+        // An axis of the copy that walks no source axis holds one item.
+        if walk.base != 0 || walk.steps.iter().zip(&walk.along).any(|(s, a)| a.is_none() && s.len() != 1) { return None; }
+        let reads = (0..source.len()).map(|a| walk.read(a, source[a])).collect::<Option<Vec<_>>>()?;
+        let moves: Vec<usize> = walk.steps.iter().zip(&walk.along).map(|(s, a)| match (s, a) {
+            (Steps::Stride { step, .. }, Some(a)) => *step as usize / walk.strides[*a],
+            _ => 0,
+        }).collect();
+        // Each fold's source axis, the first row and number of rows that it reads along that axis, the positions between its windows' starts, and its width. A source axis before the fold's means the fold reads every row of its axis.
+        let mut lanes = axes.iter().map(|&k| {
+            let (q, width) = (walk.along[k]?, shape[k]);
+            if width < 2 || moves[k] != 1 || walk.walking(q).count() < 2 { return None; }
+            let others: Vec<usize> = walk.walking(q).filter(|&r| r != k).map(|r| moves[r]).collect();
+            let every = if others.iter().all(|&m| m == 1) { 1 } else if others.iter().all(|&m| m % width == 0) { width } else { return None };
+            let (first, read) = &reads[q];
+            let len = 1 + read.iter().map(|&[n, m]| (n - 1) * m).sum::<usize>();
+            let (lo, len) = if crate::layout::count(&source[..q]) == 1 { (*first, len) } else { (0, source[q]) };
+            ((first - lo) % every == 0 && len % every == 0).then_some([q, lo, len, every, width])
+        }).collect::<Option<Vec<_>>>()?;
+        lanes.sort_unstable();
+        let count = |range: std::ops::Range<usize>| crate::layout::count(&source[range]);
+        let (region, dims) = match lanes[..] {
+            [[q, lo, len, every, width]] => {
+                let (outer, inner) = (count(0..q), walk.strides[q]);
+                let region = if outer == 1 { lo * inner..(lo + len) * inner } else { 0..count(0..source.len()) };
+                (region, if every == 1 { vec![outer, len, inner] } else { vec![outer * len / width, width, inner] })
+            }
+            [[q1, lo1, len1, ..], [q2, lo2, len2, ..]] => {
+                let whole = lo1 == 0 && lo2 == 0 && len1 == source[q1] && len2 == source[q2];
+                let dims = vec![count(0..q1), source[q1], count(q1 + 1..q2), source[q2], count(q2 + 1..source.len())];
+                if q1 == q2 || !whole || dims[4] < 2 { return None; }
+                (0..count(0..source.len()), dims)
+            }
+            _ => return None,
+        };
+        let mut folded = source.to_vec();
+        for &[q, _, len, every, width] in &lanes { folded[q] = (len - width) / every + 1; }
+        let folded_strides = strides(&folded);
+        let mut started = vec![false; folded.len()];
+        // Each table moves by its axis's moves, in starts along a folded axis, and the first of them along each source axis starts where the copy does.
+        let tables = (0..shape.len()).filter(|r| !axes.contains(r)).map(|r| match walk.along[r] {
+            Some(a) => {
+                let (every, lo) = lanes.iter().find(|l| l[0] == a).map_or((1, 0), |l| (l[3], l[1]));
+                let start = if std::mem::replace(&mut started[a], true) { 0 } else { (reads[a].0 - lo) / every };
+                Steps::Stride { start: start * folded_strides[a], len: shape[r], step: (moves[r] / every * folded_strides[a]) as isize }
+            }
+            None => Steps::Stride { start: 0, len: shape[r], step: 0 },
+        }).collect();
+        Some(Self { region, dims, widths: lanes.iter().map(|l| l[4]).collect(), every: lanes.iter().map(|l| l[3]).collect(), folded, tables, walk })
+    }
+}
+
+/// The row-major shape of a source of `len` items whose axes the entries of `tables` step along, for a copy of `shape`, for a caller that holds a source's storage without its shape, as a Python view does. It has one axis for each distinct stride, and each axis holds as many items as the next larger stride spans. `None` where a stride doesn't divide the next, or `len` isn't a whole number of the largest.
+pub fn walked_source(tables: &[Steps], shape: &[usize], len: usize) -> Option<Vec<usize>> {
+    let (_, steps) = Steps::per_axis(tables, shape)?;
+    let mut units: Vec<usize> = steps.iter().filter_map(|s| match *s { Steps::Stride { len, step, .. } if len > 1 && step != 0 => Some(step.unsigned_abs()), _ => None }).collect();
+    units.push(1);
+    units.sort_unstable();
+    units.dedup();
+    let largest = *units.last()?;
+    if len % largest != 0 || units.windows(2).any(|w| w[1] % w[0] != 0) { return None; }
+    Some(std::iter::once(len / largest).chain(units.windows(2).rev().map(|w| w[1] / w[0])).collect())
 }
 
 /// Sends axis `i` of `layout` to result axis `axes[i]`. Axes sent to the same result axis select their diagonal, at the shortest of their lengths. Every result axis from 0 to the largest destination needs a source. A result axis keeps the keys and name its source axes agree on.

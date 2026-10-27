@@ -9,15 +9,16 @@ use crate::array::{give, give_items};
 use crate::convert::{convert, convert_kinds, one, released, Call};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use rustymath::agreement::Agreement;
+use rustymath::agreement::{Agreement, Mapping};
 use rustymath::array::{Array as Core, ArrayView};
-use rustymath::buffer::{Buffer, ComplexWidth, DType, Element, FloatWidth, Items, View};
+use rustymath::buffer::{Buffer, ComplexWidth, DType, Element, Fill, FloatWidth, Items, View};
 use rustymath::error::{Error, Kind};
+use rustymath::gather::Steps;
 use rustymath::layout::{position, Lanes, Layout};
-use rustymath::operation::{AccumulationKernel, BinaryKernel, Kernels, TernaryKernel, UnaryKernel};
+use rustymath::operation::{AccumulationKernel, BinaryKernel, Kernels, MappedFoldKernel, SlidingKernel, TernaryKernel, UnaryKernel};
 use rustymath::linalg::Scalar;
 use rustymath::stats;
-use rustymath::structure::Plan;
+use rustymath::structure::{walked_source, Plan, Slide};
 use rustymath::tolerant::{Ceil, Equal, Floor, FloorDivide, MathishFloorDivide, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue, Tolerance};
 use rustymath::{Flipped, kernels, reduce, with_ints, Wrapped};
 use rustymath_buffer::py_err;
@@ -124,9 +125,14 @@ fn binary_call<'py, K: Sync>(kernels: &Kernels<BinaryKernel<K>>, py: Python<'py>
     give_items(py, agreement.layout, buffer, call.scalar())
 }
 
+/// Whether an integer that `y` gives at some position of `agreement` is negative, a fill included: the agreement's fill where it pairs no item of `y`, and `y`'s own where its mapping reaches no stored item.
 fn negative_right(y: ArrayView<'_>, agreement: &Agreement) -> bool {
     let View::Integers(ints) = y.storage() else { return false };
-    with_ints!(ints, |items| (0..agreement.len).any(|i| agreement.right.get(i).and_then(|j| y.mapping().get(j)).is_some_and(|j| i64::from(items[j]) < 0)))
+    let (outer, inner) = (&agreement.right, y.mapping());
+    with_ints!(ints, |items| (0..agreement.len).any(|i| {
+        let x = match outer.get(i) { None => Fill::item(outer.chosen()), Some(j) => inner.get(j).map_or_else(|| Fill::item(inner.chosen()), |o| items[o]) };
+        i64::from(x) < 0
+    }))
 }
 
 /// [`checked`] after raising `domain` for a failed integer call with a negative right argument.
@@ -147,17 +153,25 @@ impl<K: Sync> Apply<K> for Kernels<TernaryKernel<K>> {
     }
 }
 
+/// The kernel tables that fold by one reduction: folds of lanes ([`ArrayView::fold_items`]), folds through a view's mapping ([`reduce::along_mapped`]) and sliding folds of windows ([`slid`]). `folds!` builds them.
+struct Folds<R> { lanes: Kernels<AccumulationKernel<R>>, mapped: Kernels<MappedFoldKernel<R>>, sliding: Kernels<SlidingKernel<R>> }
+
+/// The [`Folds`] of the reduction `r`, limited to the dtypes that `only` names where it's given.
+macro_rules! folds {
+    ($r:expr $(, $only:expr)?) => { Folds { lanes: kernels!(Fold of $r)$(.only($only))?, mapped: kernels!(MappedFold of $r)$(.only($only))?, sliding: kernels!(Sliding of $r)$(.only($only))? } };
+}
+
 /// `r`'s totals of `x` over the axes that `axis` names: every axis for `None`, or one axis or a tuple of them. A total over every axis is a Python number.
-fn fold<'py, R: Sync>(py: Python<'py>, function: &str, kernels: &Kernels<AccumulationKernel<R>>, r: &R, x: &Bound<'py, PyAny>, axis: Option<Axes>) -> PyResult<Bound<'py, PyAny>> {
+fn fold<'py, R: Sync>(py: Python<'py>, function: &str, folds: &Folds<R>, r: &R, x: &Bound<'py, PyAny>, axis: Option<Axes>) -> PyResult<Bound<'py, PyAny>> {
     let x = one(x)?;
     let view = x.view();
-    let core = match released(py, || totals(function, kernels, r, view, axis.as_ref()))? { Some(core) => core, None => x.into_core()? };
+    let core = match released(py, || totals(function, folds, r, view, axis.as_ref()))? { Some(core) => core, None => x.into_core()? };
     let scalar = core.layout().shape().is_empty();
     give(py, core, scalar)
 }
 
-/// `r`'s totals of `x` over the axes that `axis` names, as [`fold`] takes them. `None` where `axis` is an empty tuple, which leaves the argument as it is. Each fold reads the items that [`ArrayView::fold_items`] gives, in place where `x` reads a block of its storage, and the totals keep `x`'s order.
-fn totals<R>(function: &str, kernels: &Kernels<AccumulationKernel<R>>, r: &R, x: ArrayView<'_>, axis: Option<&Axes>) -> PyResult<Option<Core>> {
+/// `r`'s totals of `x` over the axes that `axis` names, as [`fold`] takes them. `None` where `axis` is an empty tuple, which leaves the argument as it is. A fold along one axis of a view of windows slides over the view's storage without building the windows ([`slid`]). A view that reads a block of its storage folds the block in place, and a view that keeps what it gathers ([`ArrayView::keeps`]) gathers once where it reads runs that [`reduce::rereads_cheaply`] rejects, both through [`ArrayView::fold_items`]. Any other view folds through its mapping without building it ([`reduce::along_mapped`]). The totals keep `x`'s order.
+fn totals<R>(function: &str, folds: &Folds<R>, r: &R, x: ArrayView<'_>, axis: Option<&Axes>) -> PyResult<Option<Core>> {
     let mut steps: Vec<Option<usize>> = match axis {
         None => vec![None],
         Some(axes) => axes.positions(x.layout())?.into_iter().map(Some).collect(),
@@ -169,15 +183,35 @@ fn totals<R>(function: &str, kernels: &Kernels<AccumulationKernel<R>>, r: &R, x:
         let view = out.as_ref().map_or(x, Core::view);
         let layout = view.layout();
         let next = match step { None => Layout::EMPTY, Some(a) => layout.axes((0..layout.shape().len()).filter(|&i| i != a)) };
-        let (items, dims, order) = view.fold_items(step).map_err(py_err)?;
-        let buffer = checked(function, kernels, items.view().dtype(), kernels.run(r, items.view(), dims, None))?;
+        let (shape, axis) = match step { None => (vec![view.len()], 0), Some(a) => (layout.shape().to_vec(), a) };
+        let through = view.mapping().block(layout.shape()).is_none() && !(view.keeps() && !reduce::rereads_cheaply(view.mapping(), layout.shape()));
+        let (buffer, order) = if let Some(k) = step && let Some(slid) = slid(function, &folds.sliding, r, view, k)? {
+            slid
+        } else if through && let Some((buffer, fits, order)) = folds.mapped.mapped_fold(r, view.storage(), view.mapping(), &shape, axis) {
+            (checked(function, &folds.mapped, view.dtype(), Some((buffer, fits)))?, order)
+        } else {
+            let (items, dims, order) = view.fold_items(step).map_err(py_err)?;
+            (checked(function, &folds.lanes, items.view().dtype(), folds.lanes.run(r, items.view(), dims, None))?, order)
+        };
         let totals = match order {
             None => Core::new(next, buffer),
-            Some(steps) => Core::new(Layout::from([buffer.len()].as_slice()), buffer).and_then(|t| t.selected(Plan { layout: next, steps })),
+            Some(steps) => Core::new(Layout::from([buffer.len()].as_slice()), buffer).and_then(|t| t.selected(Plan { layout: next, steps }, None)),
         };
         out = Some(totals.map_err(py_err)?);
     }
     Ok(out)
+}
+
+/// `r`'s folds along axis `k` of a view of windows, slid over the view's storage without building the windows, as rustymath's [`Slide`] classifies the view, with the tables that read them in the order of the view's other axes where they come in another order. `None` for a view that `Slide` doesn't classify.
+fn slid<R>(function: &str, sliding: &Kernels<SlidingKernel<R>>, r: &R, view: ArrayView<'_>, k: usize) -> PyResult<Option<(Buffer, Option<Vec<Steps>>)>> {
+    let Mapping::Steps { base, steps } = view.mapping() else { return Ok(None) };
+    let shape = view.layout().shape();
+    let tables = Steps::with_base(*base, steps.to_vec());
+    let Some(s) = walked_source(&tables, shape, view.storage().len()).and_then(|source| Slide::new(&tables, shape, &source, &[k])) else { return Ok(None) };
+    let &[outer, len, inner] = &s.dims[..] else { return Ok(None) };
+    let storage = view.storage().slice(s.region.clone());
+    let buffer = checked(function, sliding, storage.dtype(), sliding.sliding(r, storage, [outer, len, inner], s.widths[0]))?;
+    Ok(Some((buffer, (!Steps::in_order(&s.tables)).then_some(s.tables))))
 }
 
 /// The lanes along `axis` of an argument with `layout` and `len` items, as rustymath's axis functions take them, and the result's layout: `layout` itself, or the flattened argument for `None`. Last comes the position of `axis` in `layout`, or `None` for no axis.
@@ -534,7 +568,7 @@ macro_rules! reductions {
             #[pyo3(signature = (x, axis=None))]
             pub(crate) fn $name<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, axis: Option<reductions!(@axis $how)>) -> PyResult<Bound<'py, PyAny>> {
                 let r = $r;
-                reductions!(@$how py, stringify!($name), &kernels!($how of r)$(.only($only))?, &r, x, axis)
+                reductions!(@$how py, stringify!($name), x, axis, r $(, $only)?)
             }
         )+
         /// Adds the reductions and scans to `m`.
@@ -543,8 +577,8 @@ macro_rules! reductions {
             Ok(())
         }
     };
-    (@Fold $($args:tt)*) => { fold($($args)*) };
-    (@Scan $($args:tt)*) => { scan($($args)*) };
+    (@Fold $py:ident, $name:expr, $x:ident, $axis:ident, $r:ident $(, $only:expr)?) => { fold($py, $name, &folds!($r $(, $only)?), &$r, $x, $axis) };
+    (@Scan $py:ident, $name:expr, $x:ident, $axis:ident, $r:ident $(, $only:expr)?) => { scan($py, $name, &kernels!(Scan of $r)$(.only($only))?, &$r, $x, $axis) };
     (@axis Fold) => { Axes };
     (@axis Scan) => { Axis };
 }
@@ -578,8 +612,8 @@ fn minmax<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, axis: Option<Axes>) -> Py
         if axis.is_none() && let Some(ends) = extremes(view.fold_items(None).map_err(py_err)?.0.view()) {
             return Ok(Some(ends.map(|b| Core::new(Layout::EMPTY, b).expect("one item has a rank-0 layout"))));
         }
-        let lo = totals("minmax", &kernels!(Fold reduce::Min), &reduce::Min, view, axis.as_ref())?;
-        let hi = totals("minmax", &kernels!(Fold reduce::Max), &reduce::Max, view, axis.as_ref())?;
+        let lo = totals("minmax", &folds!(reduce::Min), &reduce::Min, view, axis.as_ref())?;
+        let hi = totals("minmax", &folds!(reduce::Max), &reduce::Max, view, axis.as_ref())?;
         Ok(lo.zip(hi).map(Into::into))
     })?;
     let [lo, hi] = match computed { Some(ends) => ends, None => { let core = x.into_core()?; [core.clone(), core] } };

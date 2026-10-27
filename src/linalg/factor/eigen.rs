@@ -100,10 +100,10 @@ fn symmetric_row<T: Scalar>(y: &mut [T], v: &[T], row: &[T], i: usize) {
 /// The fewest rows in each piece of a reduction's pass. At 64, values-only SVD and eigen at 1024 ran 1.65 to 2 times faster on 18 threads than as one piece.
 const ROW_PIECE: usize = 64;
 
-/// Runs `row(i, items, sums)` on each of rows `0..count` of a reduction's pass, where row `i`'s items are `rows[i * stride..(i + 1) * stride]`, and adds the sums each row gives into `sums`, in pieces of at least `ROW_PIECE` rows that sum into parts of `parts` ([`crate::parallel::summed`]).
+/// Runs `row(i, items, sums)` on each of rows `0..count` of a reduction's pass, where row `i`'s items are `rows[i * stride..(i + 1) * stride]`, and adds the sums each row gives into `sums`, in pieces of at least `ROW_PIECE` rows that sum into parts of `parts` ([`crate::parallel::summed_of`]).
 pub(super) fn summed_rows<T: Tiled, F: Fn(usize, &mut [T], &mut [T]) + Sync>(
     rows: &mut [T], stride: usize, count: usize, sums: &mut [T], parts: &mut Vec<T>, row: F) {
-    crate::parallel::summed(&mut rows[..count * stride], stride, ROW_PIECE, sums, parts, &|first, rows, sums| {
+    crate::parallel::summed_of(&mut rows[..count * stride], stride, ROW_PIECE, sums, parts, &|first, rows, sums| {
         for (j, items) in rows.chunks_mut(stride).enumerate() { row(first + j, items, sums) }
     });
 }

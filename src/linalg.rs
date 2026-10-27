@@ -789,16 +789,30 @@ fn gemm<T: Tiled>(c: &mut [T], ldc: usize, a: Matrix<'_, T>, b: Matrix<'_, T>, [
     dispatch!(accelerate::product(c, ldc, a, b, [m, k, n], alpha, beta, part), native_gemm(c, ldc, a, b, [m, k, n], alpha, beta, part))
 }
 
-/// How many items [`blocked`] reads at a time from an operand that isn't held in order, rounded to whole stored rows. A block this size stays in cache while its product runs.
+/// The fewest items that [`blocked`] reads at a time from an operand that isn't held in order, rounded to whole stored rows. A block this size stays in cache while its product runs.
 const BLOCK_ITEMS: usize = 1 << 18;
+/// The most items of `b` for which [`blocked`] gives each thread its own piece of the result's rows, multiplied a block at a time. Each thread's product packs its own copy of `b`, and larger copies crowd the cache that the threads share. On one thread, no other copy of `b` shares the cache. A product there takes pieces whatever the size of `b`. With threads on an M5 Max, for a strided 4096×2048 view times a 2048×n matrix (28 October 2026), pieces took 3% to 14% less time than one copy and one product at 64 columns, 2^17 items, and up to 37% more from 128 columns on rustymath's own kernels.
+const PIECE_MATRIX: usize = 1 << 17;
+/// The most items of an operand that isn't held in order that [`blocked`] reads whole, where `b` is too large for [`PIECE_MATRIX`]. A larger operand is read in blocks of this many items, rounded up to whole rows, each multiplied in one threaded call. With threads on an M5 Max (28 October 2026), products of 2048 and 4096 rows of 2048 items took within 1% as long for each row at 512 columns, and 1024 rows took 4% longer on Accelerate and 8% longer on rustymath's own kernels.
+const WHOLE_ITEMS: usize = 1 << 24;
 
-/// Calls `f` on each block of an operand's stored rows, `[rows, cols]` as stored, with the block's first row, its number of rows and its items. A block holds about [`BLOCK_ITEMS`] items, in whole rows.
-fn blocks<T: Element>(op: Mapped<'_, T>, [rows, cols]: [usize; 2], mut f: impl FnMut(usize, usize, &[T])) {
-    let (step, mut block) = ((BLOCK_ITEMS / cols).max(1), Vec::new());
-    for first in (0..rows).step_by(step) {
-        let len = step.min(rows - first);
+/// The stored rows of `cols` items in each block that [`blocks`] reads: at least `least` items and at least [`BLOCK_ITEMS`], in whole rows.
+fn block_rows(cols: usize, least: usize) -> usize { least.max(BLOCK_ITEMS).div_ceil(cols) }
+
+/// Calls `f` on each block of an operand's stored rows `rows`, each row of `cols` items, with the block's first row, its number of rows and its items. Each block holds [`block_rows`] rows, apart from the last.
+fn blocks<T: Element>(op: Mapped<'_, T>, rows: std::ops::Range<usize>, cols: usize, least: usize, mut f: impl FnMut(usize, usize, &[T])) {
+    let (step, mut block) = (block_rows(cols, least), Vec::new());
+    for first in rows.clone().step_by(step) {
+        let len = step.min(rows.end - first);
         f(first, len, op.read(first * cols, len * cols, &mut block));
     }
+}
+
+/// Sets the result `c` to the sum of the products of each block of an operand's stored rows, `[rows, cols]` as stored, where those rows run along the contraction. `f(first, len, block, c, beta)` sets `c` to the product of the block of `len` rows from `first` plus `beta` times `c`. The block at row 0 replaces what `c` held, with `beta` 0. Every other block adds, with `beta` 1. A result of at most [`BLOCK_ITEMS`] items splits the rows into one piece of at least one block for each thread ([`parallel::summed`]). Each thread reads its rows in blocks of [`BLOCK_ITEMS`] items into its own copy of the result, and the copies then add into `c`. A larger result takes blocks of at least as many items as it holds, in turn.
+fn contracted<T: Tiled + Element>(op: Mapped<'_, T>, [rows, cols]: [usize; 2], c: &mut [T], f: &(dyn Fn(usize, usize, &[T], &mut [T], T) + Sync)) {
+    let beta = |first: usize| if first == 0 { T::zero() } else { T::one() };
+    if c.len() > BLOCK_ITEMS { return blocks(op, 0..rows, cols, c.len(), |first, len, block| f(first, len, block, c, beta(first))); }
+    parallel::summed(rows, block_rows(cols, 0), c, &mut Vec::new(), &|range, sums| blocks(op, range, cols, 0, |first, len, block| f(first, len, block, sums, beta(first))));
 }
 
 /// The most rows of the result in one piece of [`by_columns`]'s split across threads.
@@ -874,28 +888,36 @@ fn dots<T: Tiled>(out: &mut [T], data: &[T], ld: usize, first: usize, x: &[T]) {
     for (i, y) in tail.iter_mut().enumerate() { *y = factor::dot(&data[(first + i) * ld..][..k], x) }
 }
 
-/// `+.×` of mapped operands on the tiled kernels, for [`Inner::inner_mapped`]. An operand whose mapping reads it at positive strides, one of them 1, is used where it lies, row by row or as a transpose. Any other operand is read a block of its stored rows at a time. Each block's product goes straight into the result. A block whose rows are the result's rows or columns writes them. A block whose rows run along the contraction adds to the whole result. Where neither operand can be used where it lies, `b` is read whole. A vector `b` beside an `a` whose rows are adjacent in storage goes to [`by_columns`], which reads `a` where it lies.
+/// `+.×` of mapped operands on the tiled kernels, for [`Inner::inner_mapped`]. An operand whose mapping reads it at positive strides, one of them 1, is used where it lies, row by row or as a transpose. Any other operand is read a block of its stored rows at a time, and each block's product goes straight into the result. Where `a`'s stored rows are the result's rows, and the product runs on one thread or `b` has at most [`PIECE_MATRIX`] items, the result's rows split into one piece for each thread. Each thread multiplies its piece's rows itself, reading them in blocks that hold at least [`BLOCK_ITEMS`] items and at least as many as `b`. Otherwise an operand of up to [`WHOLE_ITEMS`] items is read whole, and a larger one in blocks of at least that many. Each block is gathered across threads and multiplied in one threaded call. Rows along the contraction add into the whole result, as [`contracted`] reads them. Blocks of the result's columns hold at least as many items as the result. Where neither operand can be used where it lies, `b` is read whole. A vector `b` beside an `a` whose rows are adjacent in storage goes to [`by_columns`], which reads `a` where it lies. Reading an operand larger than the result through its map, by blocks or by columns, records the route `mapped product`.
 fn blocked<T: Tiled + Element>(a: Mapped<'_, T>, b: Mapped<'_, T>, [oa, ob]: [Orientation; 2], [m, k, n]: [usize; 3]) -> Vec<T> {
     let (ma, mb) = (a.matrix(oa, [m, k]), b.matrix(ob, [k, n]));
     if let (Some(a), Some(b)) = (ma, mb) { return T::multiply(a, b, [m, k, n]); }
-    if ma.is_none() && n == 1 && let Some(c) = by_columns(a, b, oa, [m, k]) { return c; }
+    if ma.is_none() && n == 1 && let Some(c) = by_columns(a, b, oa, [m, k]) { crate::events::taken(crate::events::Route::MappedProduct, m * k); return c; }
     let mut c = filled(m * n, T::zero());
     if m == 0 || k == 0 || n == 0 { return c; }
+    let read = if ma.is_none() { m * k } else { k * n };
+    if read > m * n { crate::events::taken(crate::events::Route::MappedProduct, read); }
     let (one, zero) = (T::one(), T::zero());
-    let added = |first: usize| if first == 0 { zero } else { one };
     let mut whole = Vec::new();
     match ma {
         None => {
             let b = match mb { Some(b) => b, None => Matrix::oriented(b.read(0, k * n, &mut whole), ob, [k, n]) };
-            blocks(a, if oa == Orientation::Normal { [m, k] } else { [k, m] }, |first, len, part| match oa {
-                Orientation::Normal => T::gemm(&mut c[first * n..], n, Matrix::rows(part, k), b, [len, k, n], one, zero),
-                Orientation::Transpose => T::gemm(&mut c, n, Matrix::oriented(part, oa, [m, len]), b.offset(first, 0), [m, len, n], one, added(first)),
-            });
+            match oa {
+                Orientation::Normal => {
+                    let (rows, least) = if parallel::threads() == 1 || k * n <= PIECE_MATRIX { (m.div_ceil(parallel::threads()), k * n) } else { (m, WHOLE_ITEMS) };
+                    parallel::pieces_of(&mut c, rows * n, usize::MAX, &|start, part| {
+                        let from = start / n;
+                        blocks(a, from..from + part.len() / n, k, least, |first, len, block| T::gemm(&mut part[(first - from) * n..], n, Matrix::rows(block, k), b, [len, k, n], one, zero));
+                        true
+                    });
+                }
+                Orientation::Transpose => contracted(a, [k, m], &mut c, &|first, len, part, c, beta| T::gemm(c, n, Matrix::oriented(part, oa, [m, len]), b.offset(first, 0), [m, len, n], one, beta)),
+            }
         }
-        Some(a) => blocks(b, if ob == Orientation::Normal { [k, n] } else { [n, k] }, |first, len, part| match ob {
-            Orientation::Normal => T::gemm(&mut c, n, a.offset(0, first), Matrix::rows(part, n), [m, len, n], one, added(first)),
-            Orientation::Transpose => T::gemm(&mut c[first..], n, a, Matrix::oriented(part, ob, [k, len]), [m, k, len], one, zero),
-        }),
+        Some(a) => match ob {
+            Orientation::Normal => contracted(b, [k, n], &mut c, &|first, len, part, c, beta| T::gemm(c, n, a.offset(0, first), Matrix::rows(part, n), [m, len, n], one, beta)),
+            Orientation::Transpose => blocks(b, 0..n, k, m * n, |first, len, block| T::gemm(&mut c[first..], n, a, Matrix::oriented(block, ob, [k, len]), [m, k, len], one, zero)),
+        },
     }
     c
 }
@@ -939,11 +961,11 @@ fn by_vector<T: Tiled>(c: &mut [T], ldc: usize, a: Matrix<'_, T>, alpha: T, b: M
     let mut y = filled(rows, T::zero());
     if matrix.op.transposed() {
         // Stored row `p` holds the matrix's column `p`, so the matrix's row `i` starts at `data[i]`. A strip of results takes the stored rows a block at a time, reading the block's rows side by side in storage order.
-        let mut columns: Vec<(T, usize)> = x.iter().enumerate().map(|(p, &w)| (w, p * ld)).collect();
+        let columns: Vec<(T, usize)> = x.iter().enumerate().map(|(p, &w)| (w, p * ld)).collect();
         if rows <= VECTOR_STRIP {
             // Results that fit one strip leave each thread a narrow part of every stored row, so the stored rows split instead. Each piece reads its rows whole into results of its own, which add into `y` ([`parallel::summed`]).
-            parallel::summed(&mut columns, 1, (VECTOR_PIECE / rows).max(1), &mut y, &mut Vec::new(), &|_, columns, part| {
-                for block in columns.chunks(VECTOR_ROWS) { scaled_runs(part, data, 0, block) }
+            parallel::summed(columns.len(), (VECTOR_PIECE / rows).max(1), &mut y, &mut Vec::new(), &|range, part| {
+                for block in columns[range].chunks(VECTOR_ROWS) { scaled_runs(part, data, 0, block) }
             });
         } else {
             parallel::split(&mut y, unit, &|first, part| {

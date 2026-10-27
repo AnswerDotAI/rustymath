@@ -110,6 +110,23 @@ def test_join_split_repeat_and_padding(a):
     assert rm.take(a, [1, 0], axis=0).tolist() == [[3, 4], [1, 2]] and rm.take(a, [-1]).tolist() == [4]
     assert rm.roll(a, 1, axis=1).tolist() == [[2, 1], [4, 3]] and rm.flip(a).tolist() == [[4, 3], [2, 1]]
 
+def test_edge_modes_pad_take_and_windows():
+    x = np.arange(5.)
+    for mode, numpy_mode in (('clamp', 'edge'), ('wrap', 'wrap'), ('reflect', 'reflect'), ('symmetric', 'symmetric')):
+        assert rm.pad(x, (2, 7), mode=mode).tolist() == np.pad(x, (2, 7), mode=numpy_mode).tolist()
+    assert rm.pad(x, 1, fill=-1).tolist() == [-1, 0, 1, 2, 3, 4, -1] and rm.pad([], 1, mode='wrap').tolist() == [0, 0]
+    assert rm.take(x, [-2, 0, 6], mode='clamp').tolist() == [0, 0, 4] and rm.array(x).take([-2, 6], mode='wrap').tolist() == [3, 1]
+    assert rm.take(x, [6, np.nan], mode='fill', fill=7).tolist() == [7, 7]
+    with pytest.raises(ValueError): rm.pad({'a': 1., 'b': 2.}, 1, mode='wrap')
+    with pytest.raises(ValueError): rm.pad(np.arange(3), 1, fill=0.5)
+    with pytest.raises(ValueError): rm.take(x, [0], mode='mirror')
+    assert rm.windows(range(6), 3).tolist() == [[0, 1, 2], [1, 2, 3], [2, 3, 4], [3, 4, 5]]
+    assert rm.windows(range(4), 3, mode='wrap').tolist() == [[3, 0, 1], [0, 1, 2], [1, 2, 3], [2, 3, 0]]
+    assert rm.windows(range(6), 3, step=2, mode='reflect').tolist() == [[1, 0, 1], [1, 2, 3], [3, 4, 5]]
+    assert rm.windows(range(4), 3, mode='fill', fill=-1).tolist() == [[-1, 0, 1], [0, 1, 2], [1, 2, 3], [2, 3, -1]]
+    image = rm.arange(16).reshape(4, 4)
+    assert rm.windows(image, (3, 3)).shape == (2, 2, 3, 3) and np.shares_memory(np.asarray(rm.windows(image, 2)), np.asarray(image))
+
 def test_nonzero_and_where_use_shared_broadcasting():
     a = rm.array([[0, 2, 0], [3, 0, 4]])
     assert [x.tolist() for x in rm.nonzero(a)] == [[0, 1, 1], [1, 0, 2]]

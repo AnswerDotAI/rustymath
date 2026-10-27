@@ -20,6 +20,8 @@ pub type TernaryKernel<K> = for<'a> fn(&K, [View<'a>; 3], &Agreement, &Agreement
 pub type AccumulationKernel<K> = for<'a> fn(&K, View<'a>, [usize; 3], Option<View<'a>>) -> (Buffer, bool);
 /// A reduction's folds of each window of a number of neighbouring rows along the middle of `[outer, len, inner]`, with that number.
 pub type SlidingKernel<K> = for<'a> fn(&K, View<'a>, [usize; 3], usize) -> (Buffer, bool);
+/// A reduction's fold along one axis of an array that a mapping lays over storage, read through the mapping without building the array, given the array's shape and the axis: its totals, whether they all fit, and the tables that read the totals in the order of the other axes, where they come in another order.
+pub type MappedFoldKernel<K> = for<'a> fn(&K, View<'a>, &Mapping, &[usize], usize) -> (Buffer, bool, Option<Vec<crate::gather::Steps>>);
 /// A matrix product's kernel at one dtype: the product of each pair of cells that the frames pair, each of sizes `[n, k, m]`, and whether every product fit. It checks for an interrupt between rounds of cells, and an interrupt's error stops the products.
 pub type ProductKernel<P> = for<'a> fn(&P, [View<'a>; 2], &Frames, [usize; 3]) -> Result<(Buffer, bool), Error>;
 /// An object's kernel at one dtype for combining items into an array in place, as [`Kernels::scatter`] describes.
@@ -99,7 +101,7 @@ impl<K> Kernels<TernaryKernel<K>> {
         let (y, right) = y.mapped(&first.right, first.layout.shape(), at);
         // A Boolean third argument keeps its dtype: `ternary_at` turns it into items of `at` a chunk at a time, through `Element::truth`.
         let (z, last) = z.mapped(&second.right, second.layout.shape(), if z.dtype() == DType::Boolean { DType::Boolean } else { at });
-        let middle = match second.left.cast_fill(at).ok()? { std::borrow::Cow::Borrowed(_) => None, std::borrow::Cow::Owned(map) => Some(map) };
+        let middle = second.left.cast_fill(at).ok()?;
         let (one, two) = (remapped(first, left, right), remapped(second, middle, last));
         Some(kernel(k, [x.view(), y.view(), z.view()], one.as_ref().unwrap_or(first), two.as_ref().unwrap_or(second)))
     }
@@ -118,6 +120,14 @@ impl<K> Kernels<SlidingKernel<K>> {
     pub fn sliding(&self, k: &K, x: View<'_>, dims: [usize; 3], width: usize) -> Option<(Buffer, bool)> {
         let (kernel, at) = self.chosen(x.dtype())?;
         Some(kernel(k, cast(x, at, &mut None), dims, width))
+    }
+}
+
+impl<K> Kernels<MappedFoldKernel<K>> {
+    /// The folds along `axis` of the array of `shape` that `mapping` lays `x` over, as [`reduce::along_mapped`](crate::reduce::along_mapped) gives them. `None` where there is no kernel at `x`'s own dtype: this kernel reads `x` where it lies, and never casts it.
+    pub fn mapped_fold(&self, k: &K, x: View<'_>, mapping: &Mapping, shape: &[usize], axis: usize) -> Option<(Buffer, bool, Option<Vec<crate::gather::Steps>>)> {
+        let (kernel, at) = self.chosen(x.dtype())?;
+        (at == x.dtype()).then(|| kernel(k, x, mapping, shape, axis))
     }
 }
 
@@ -171,7 +181,7 @@ impl<'a, T: Element> Third<'a, T> {
     fn of(z: View<'a>) -> Self { match bool::of(z) { Some(mask) if T::DTYPE != DType::Boolean => Third::Mask(mask), _ => Third::Items(items::<T>(z)) } }
 }
 
-/// Contiguous or constant arguments go to the slice form directly, and a mask through [`masked`](crate::slice::masked). Otherwise each argument reads through its two mappings composed into one, as [`read_runs`] reads it. Where the two don't compose structurally, they compose into a table of offsets.
+/// Contiguous or constant arguments go to the slice form directly, and a mask through [`masked`](crate::slice::masked). Otherwise each argument reads through its two mappings composed into one, as [`read_runs`] reads it. Where the two don't compose structurally, they compose into a table of offsets. Where they can't compose at all, as two different chosen fills can't, the argument's items are first read through its own mapping (`read_as`).
 fn ternary_at<K: Ternary<T, Out: Element> + Sync, T: Element>(k: &K, [x, y, z]: [View<'_>; 3], first: &Agreement, second: &Agreement) -> (Buffer, bool) {
     let (x, y, z) = (items::<T>(x), items::<T>(y), Third::<T>::of(z));
     let mut out = Vec::with_capacity(second.len);
@@ -181,12 +191,9 @@ fn ternary_at<K: Ternary<T, Out: Element> + Sync, T: Element>(k: &K, [x, y, z]: 
         Third::Mask(m) => direct(m, &second.right, &Mapping::Linear(1)).map(|ma| crate::slice::masked(k, xa, ya, ma, second.len, &mut out)),
     });
     let ok = done.unwrap_or_else(|| {
-        let [(x, xm), (y, ym)] = [(x, &first.left), (y, &first.right)].map(|(data, map)| {
-            if let Some(m) = map.composed(&second.left, first.layout.shape(), second.layout.shape(), true) { return (std::borrow::Cow::Borrowed(data), m); }
-            let (base, steps, fill) = map.to_walk(first.layout.shape());
-            let mut items = Vec::with_capacity(first.len);
-            crate::gather::walk(&mut items, data, base, &steps, crate::buffer::Fill::item(fill), crate::gather::Same);
-            (std::borrow::Cow::Owned(items), second.left.clone())
+        let [(x, xm), (y, ym)] = [(x, &first.left), (y, &first.right)].map(|(data, map)| match map.composed(&second.left, first.layout.shape(), second.layout.shape(), true) {
+            Some(m) => (std::borrow::Cow::Borrowed(data), m),
+            None => (std::borrow::Cow::Owned(crate::buffer::read_as(data, map, first.len)), second.left.clone()),
         });
         let (xs, ys) = (Side::new(x.as_ref(), &xm), Side::new(y.as_ref(), &ym));
         let leaf = |[a, b, c]: [Arg<'_, T>; 3], n: usize, slots: &mut Slots<'_, _>| k.many_into(a, b, c, n, slots);
@@ -228,6 +235,11 @@ fn scan_at<R: Reduction<T>, T: Element>(_: &R, x: View<'_>, dims: [usize; 3], st
 fn sliding_at<R: Reduction<T>, T: Element>(_: &R, x: View<'_>, dims: [usize; 3], width: usize) -> (Buffer, bool) where R::Total: Element {
     let (totals, ok) = crate::reduce::sliding::<T, R>(items::<T>(x), dims, width);
     (R::Total::buffer(totals), ok)
+}
+
+fn mapped_fold_at<R: Reduction<T>, T: Element>(_: &R, x: View<'_>, mapping: &Mapping, shape: &[usize], axis: usize) -> (Buffer, bool, Option<Vec<crate::gather::Steps>>) where R::Total: Element {
+    let (totals, ok, order) = crate::reduce::along_mapped::<T, R>(items::<T>(x), mapping, shape, axis);
+    (R::Total::buffer(totals), ok, order)
 }
 
 fn right_fold_at<K: Binary<T, Out: Element + Source<T>>, T: Element>(k: &K, x: View<'_>, dims: [usize; 3], tail: Option<View<'_>>) -> (Buffer, bool) {
@@ -287,6 +299,7 @@ pub mod probe {
     pub enum RightFold {}
     pub enum LeftScan {}
     pub enum Sliding {}
+    pub enum MappedFold {}
     pub enum Product {}
     pub enum Scatter {}
     /// A reduction's [`ScatterKernel`], which folds each place's item with the values written to it, as the reduction folds.
@@ -329,6 +342,10 @@ pub mod probe {
         #[inline(always)]
         fn kernel(&self) -> Option<(SlidingKernel<R>, bool)> { Some((sliding_at::<R, T>, true)) }
     }
+    impl<R: Reduction<T>, T: Element> Found<MappedFoldKernel<R>> for Probe<R, T, MappedFold> where R::Total: Element {
+        #[inline(always)]
+        fn kernel(&self) -> Option<(MappedFoldKernel<R>, bool)> { Some((mapped_fold_at::<R, T>, true)) }
+    }
     impl<K: crate::Binary<T, Out: Element + Source<T>>, T: Element> Found<AccumulationKernel<K>> for Probe<K, T, RightFold> {
         #[inline(always)]
         fn kernel(&self) -> Option<(AccumulationKernel<K>, bool)> { Some((right_fold_at::<K, T>, K::WRAPS)) }
@@ -355,7 +372,7 @@ pub mod probe {
     }
 }
 
-/// The [`Kernels`](crate::operation::Kernels) of a function object or reduction: `Unary`, `Binary` or `Ternary` for that arity, `RightFold` or `LeftScan` for ordered accumulation by a binary function, `Scatter` for combining a binary function's results into an array in place, `Fold`, `Scan` or `Sliding` for a [`Reduction`](crate::reduce::Reduction), and `Product` for a matrix product's [`Inner`](crate::linalg::Inner) pair. Name the object by its type, or by a value after `of`. Each kernel's test resolves where the macro expands, so the type must be concrete there. In generic code the tests see only the type parameter's bounds, not the impls of the type it later stands for, so a kernel that the bounds don't promise comes out as `None`, with no error.
+/// The [`Kernels`](crate::operation::Kernels) of a function object or reduction: `Unary`, `Binary` or `Ternary` for that arity, `RightFold` or `LeftScan` for ordered accumulation by a binary function, `Scatter` for combining a binary function's results into an array in place, `Fold`, `Scan`, `Sliding` or `MappedFold` for a [`Reduction`](crate::reduce::Reduction), and `Product` for a matrix product's [`Inner`](crate::linalg::Inner) pair. Name the object by its type, or by a value after `of`. Each kernel's test resolves where the macro expands, so the type must be concrete there. In generic code the tests see only the type parameter's bounds, not the impls of the type it later stands for, so a kernel that the bounds don't promise comes out as `None`, with no error.
 #[macro_export]
 macro_rules! kernels {
     ($arity:ident of $k:expr) => {{

@@ -1,18 +1,37 @@
 //! Python syntax for the shared structural plans and independent-value views.
 use crate::{array::{Array, core, give}, convert::{self, Arg, released}, functions::{Axis, Axes}};
 use pyo3::{exceptions::{PyIndexError, PyTypeError, PyValueError}, prelude::*, types::PyTuple};
-use rustymath::{array::{Array as Core, ArrayView}, buffer::{Buffer, DType}, error::Error, layout::{Layout, element_count, generated_len, position}, structure::{self, Plan, Selector}};
+use rustymath::{array::{Array as Core, ArrayView}, buffer::{Buffer, DType, Element, Fill}, error::Error, layout::{Layout, element_count, generated_len, position}, structure::{self, Edge, Edged, Plan, Selector}};
 use rustymath_buffer::py_err;
+use std::sync::Arc;
 
 fn at(n: i64, size: usize) -> PyResult<usize> {
     position(n, size).ok_or_else(|| PyIndexError::new_err(format!("position {n} is outside an axis of length {size}")))
 }
 fn array_selector(layout: &Layout, axis: usize, obj: &Bound<'_, PyAny>) -> PyResult<(Selector, bool)> {
-    let indices = convert::one(obj)?.into_core()?.compact();
-    rustymath_buffer::selection::array_selector(layout, axis, indices.layout().clone(), std::sync::Arc::new(indices))
+    indexed(layout, axis, convert::one(obj)?.into_core()?.compact())
+}
+/// The selector that the compact index values `indices` make on `axis` of `layout`.
+fn indexed(layout: &Layout, axis: usize, indices: Core) -> PyResult<(Selector, bool)> {
+    rustymath_buffer::selection::array_selector(layout, axis, indices.layout().clone(), Arc::new(indices))
 }
 fn selector(layout: &Layout, axis: usize, obj: &Bound<'_, PyAny>) -> PyResult<Selector> {
     rustymath_buffer::selection::selector(layout, axis, obj, || array_selector(layout, axis, obj)).map(|(s, _)| s)
+}
+/// The edge mode named `name`, one of the names in `structure::Edge::MODES`.
+fn mode_named(name: &str) -> PyResult<Edge> {
+    Edge::named(name).ok_or_else(|| PyValueError::new_err(format!("unknown mode {name:?}, which must be one of {}", Edge::MODES.map(|(n, _)| format!("{n:?}")).join(", "))))
+}
+/// `fill`, a Python value, as a fill of `x`'s dtype. It must be one item that keeps its value at that dtype (`Fill::new`).
+fn fill_of(x: &Arg, fill: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Arc<Fill>>> {
+    fill.map(|f| Fill::new(convert::one(f)?.row_major()?.view(), x.view().dtype()).map(Arc::new).map_err(py_err)).transpose()
+}
+/// The selector that `indices` make on `axis` of `layout` under `edge`: each index reads the position that `edge` gives it on the axis, or the fill where it gives none (`Edge::positions`).
+fn edged(layout: &Layout, axis: usize, indices: &Bound<'_, PyAny>, edge: Edge) -> PyResult<Selector> {
+    let indices = convert::one(indices)?.into_core()?.compact();
+    let positions = edge.positions(indices.view().contiguous().expect("compact index values"), layout.shape()[axis]).map_err(py_err)?;
+    let buffer = match positions { Edged::Positions(p) => i64::buffer(p.into_iter().map(|p| p as i64).collect()), Edged::Floats(f) => f64::buffer(f) };
+    Ok(indexed(layout, axis, Core::new(indices.layout().clone(), buffer).map_err(py_err)?)?.0)
 }
 pub fn selection(layout: &Layout, index: &Bound<'_, PyAny>) -> PyResult<Plan> {
     rustymath_buffer::selection::selection(layout, index,
@@ -26,7 +45,7 @@ pub fn selection(layout: &Layout, index: &Bound<'_, PyAny>) -> PyResult<Plan> {
 
 fn planned(py: Python<'_>, arg: Arg, build: impl FnOnce(&Layout) -> Result<Plan, Error>) -> PyResult<Array> {
     let plan = build(arg.view().layout()).map_err(py_err)?;
-    Ok(Array::new(arg.selected(py, plan)?))
+    Ok(Array::new(arg.selected(py, plan, None)?))
 }
 /// The layout that `axis` refers to, and the axis's position: `x`'s own layout, or the flattened layout and its one axis when `axis` is `None`.
 fn along(x: &Arg, axis: Option<Axis>) -> PyResult<(Layout, usize)> {
@@ -101,14 +120,15 @@ pub fn squeeze(py: Python<'_>, x: &Bound<'_, PyAny>, axis: Option<Axes>) -> PyRe
     planned(py, x, |layout| structure::select(layout, selectors, false))
 }
 
-/// Gathers independent positions on one axis, or on the flattened input without `axis`.
+/// Gathers independent positions on one axis, or on the flattened input without `axis`. With `mode="raise"`, the default, a position outside the axis raises, and a negative one counts back from the end. Under `"clamp"`, `"wrap"`, `"reflect"` and `"symmetric"`, a position outside the axis, a negative one included, reads a position on the axis, as `structure::Edge` defines them. Under `"fill"`, it reads the fill, and under any mode so does every position of an empty axis. A NaN position reads the fill in every mode. The fill is `fill`, or else the dtype's fill.
 #[pyfunction]
-#[pyo3(signature = (x, indices, axis=None))]
-pub fn take(py: Python<'_>, x: &Bound<'_, PyAny>, indices: &Bound<'_, PyAny>, axis: Option<Axis>) -> PyResult<Array> {
+#[pyo3(signature = (x, indices, axis=None, mode="raise", fill=None))]
+pub fn take(py: Python<'_>, x: &Bound<'_, PyAny>, indices: &Bound<'_, PyAny>, axis: Option<Axis>, mode: &str, fill: Option<&Bound<'_, PyAny>>) -> PyResult<Array> {
     let x = convert::one(x)?;
     let (layout, axis) = along(&x, axis)?;
-    let selector = selector(&layout, axis, indices)?;
-    planned(py, x, |_| structure::select_axis(&layout, axis, selector))
+    let selector = if mode == "raise" { selector(&layout, axis, indices)? } else { edged(&layout, axis, indices, mode_named(mode)?)? };
+    let plan = structure::select_axis(&layout, axis, selector).map_err(py_err)?;
+    Ok(Array::new(x.selected(py, plan, fill_of(&x, fill)?)?))
 }
 
 #[pyfunction]
@@ -182,7 +202,7 @@ pub fn split(py: Python<'_>, x: &Bound<'_, PyAny>, sections: &Bound<'_, PyAny>, 
     points.into_iter().chain([size]).map(|end| {
         let plan = structure::select_axis(&layout, a, Selector::Range { start, len: end.saturating_sub(start), step: 1 }).map_err(py_err)?;
         start = end;
-        Ok(Array::new(x.selected(py, plan)?))
+        Ok(Array::new(x.selected(py, plan, None)?))
     }).collect()
 }
 
@@ -198,15 +218,46 @@ pub fn repeat(py: Python<'_>, x: &Bound<'_, PyAny>, repeats: &Bound<'_, PyAny>, 
     planned(py, x, |_| structure::repeat(&layout, a, &counts))
 }
 
-/// Constant padding with the dtype's fill: zero, false or a space.
+/// `x` padded by `pad_width` on each axis: one width for both ends of every axis, one `(before, after)` pair for every axis, or a pair for each axis. Each position past an end reads by `mode`. `"fill"`, the default, reads `fill`, or else the dtype's fill: zero, false or a space. `"clamp"`, `"wrap"`, `"reflect"` and `"symmetric"` read a position on the axis, as `structure::Edge` defines them. An empty axis reads the fill in every mode. Only `"fill"` pads an axis that has keys.
 #[pyfunction]
-pub fn pad(py: Python<'_>, x: &Bound<'_, PyAny>, pad_width: &Bound<'_, PyAny>) -> PyResult<Array> {
+#[pyo3(signature = (x, pad_width, mode="fill", fill=None))]
+pub fn pad(py: Python<'_>, x: &Bound<'_, PyAny>, pad_width: &Bound<'_, PyAny>, mode: &str, fill: Option<&Bound<'_, PyAny>>) -> PyResult<Array> {
     let x = convert::one(x)?;
     let rank = x.view().layout().shape().len();
     let widths = if let Ok(n) = pad_width.extract::<usize>() { vec![(n, n); rank] }
     else if let Ok(pair) = pad_width.extract::<(usize, usize)>() { vec![pair; rank] }
     else { pad_width.extract::<Vec<(usize, usize)>>()? };
-    planned(py, x, |layout| structure::pad(layout, &widths))
+    let plan = structure::pad(&x.layout(), &widths, mode_named(mode)?).map_err(py_err)?;
+    Ok(Array::new(x.selected(py, plan, fill_of(&x, fill)?)?))
+}
+
+/// One count, or one count for each axis, as `windows` takes its sizes and steps.
+#[derive(FromPyObject)]
+pub enum Counts { One(i64), Many(Vec<i64>) }
+
+impl Counts {
+    /// The counts for `axes` axes: one count repeated, or the counts as given.
+    fn counts(self, axes: usize) -> Vec<i64> { match self { Self::One(n) => vec![n; axes], Self::Many(v) => v } }
+}
+
+/// The windows of `size` positions on the leading axes of `x`: one size for the first axis, or one for each windowed axis. A window starts every `step` positions, 1 by default: one step for every windowed axis, or one for each. The result's axes count the windows along each windowed axis, then give each window's positions, then `x`'s other axes. With `mode=None`, the result has only the windows that lie inside `x`. With a mode, a window centres on every `step`-th position, and positions past an end read by the mode, as `pad` reads them, `"fill"` reading `fill` or else the dtype's fill. Windows of a rustymath array share its storage, and padded windows share one padded copy of it.
+#[pyfunction]
+#[pyo3(signature = (x, size, step=Counts::One(1), mode=None, fill=None), text_signature = "(x, size, step=1, mode=None, fill=None)")]
+pub fn windows(py: Python<'_>, x: &Bound<'_, PyAny>, size: Counts, step: Counts, mode: Option<&str>, fill: Option<&Bound<'_, PyAny>>) -> PyResult<Array> {
+    let sizes = size.counts(1);
+    if sizes.iter().any(|&n| n < 0) { return Err(PyValueError::new_err("window sizes must be nonnegative")); }
+    let mode = mode.map(mode_named).transpose()?;
+    let x = convert::one(x)?;
+    let fill = fill_of(&x, fill)?;
+    let source = x.into_core()?;
+    let windows = structure::Windows::new(&sizes, &step.counts(sizes.len()), |_| mode, source.layout().shape()).map_err(py_err)?;
+    released(py, || match windows.padding() {
+        None => source.selected(windows.plan(source.layout(), source.layout().shape())?, None),
+        Some(padding) => {
+            let plan = windows.plan(source.layout(), padding.layout.shape())?;
+            source.selected(padding, fill)?.compact().selected(plan, None)
+        }
+    }).map(Array::new).map_err(py_err)
 }
 
 /// The coordinates of `x`'s nonzero items, one row of axis positions for each item, and the number of rows.
@@ -306,7 +357,7 @@ fn _difference(py: Python<'_>, x: &Bound<'_, PyAny>, axis: Axis) -> PyResult<Arr
 pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
     for f in [wrap_pyfunction!(reshape, m)?, wrap_pyfunction!(ravel, m)?, wrap_pyfunction!(transpose, m)?, wrap_pyfunction!(swapaxes, m)?,
         wrap_pyfunction!(expand_dims, m)?, wrap_pyfunction!(squeeze, m)?, wrap_pyfunction!(take, m)?, wrap_pyfunction!(roll, m)?, wrap_pyfunction!(flip, m)?,
-        wrap_pyfunction!(concatenate, m)?, wrap_pyfunction!(stack, m)?, wrap_pyfunction!(split, m)?, wrap_pyfunction!(repeat, m)?, wrap_pyfunction!(pad, m)?,
+        wrap_pyfunction!(concatenate, m)?, wrap_pyfunction!(stack, m)?, wrap_pyfunction!(split, m)?, wrap_pyfunction!(repeat, m)?, wrap_pyfunction!(pad, m)?, wrap_pyfunction!(windows, m)?,
         wrap_pyfunction!(nonzero, m)?, wrap_pyfunction!(argwhere, m)?, wrap_pyfunction!(where_, m)?, wrap_pyfunction!(diagonal, m)?,
         wrap_pyfunction!(_diag, m)?, wrap_pyfunction!(_triangle, m)?, wrap_pyfunction!(broadcast_to, m)?, wrap_pyfunction!(_difference, m)?] { m.add_function(f)?; }
     m.add("flatten", m.getattr("ravel")?)

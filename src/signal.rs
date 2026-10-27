@@ -53,7 +53,7 @@ pub fn correlation(input: &[usize], kernel: &[usize], slide: usize, mode: Mode, 
         (Some(&w), Mode::Same) => (w / 2, (w - 1) / 2),
     }).collect();
     let layout = Layout::from(input.to_vec());
-    let padding = widths.iter().any(|&w| w != (0, 0)).then(|| structure::pad(&layout, &widths)).transpose()?;
+    let padding = widths.iter().any(|&w| w != (0, 0)).then(|| structure::pad(&layout, &widths, structure::Edge::Fill)).transpose()?;
     let padded = padding.as_ref().map_or(&layout, |p| &p.layout);
     let signed = |n: &[usize]| n.iter().map(|&n| i64::try_from(n).unwrap_or(i64::MAX)).collect::<Vec<_>>();
     let slid = Windows::new(&signed(window), &signed(stride), |_| None, padded.shape())?;

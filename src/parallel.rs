@@ -75,21 +75,26 @@ pub fn split<B: Send>(out: &mut [B], unit: usize, write: &(dyn Fn(usize, &mut [B
     ranges(n, unit, &|range| write(range.start, unsafe { shared.part(range) }))
 }
 
-/// Adds the sums of every piece of `items` into `sums`, where `items` holds whole units of `unit` items and `piece(first, items, sums)` adds the sums of the piece whose first unit is `first` into the `sums` it's given. The units split into one piece of at least `least` units for each of this thread's [`threads`]. With too few units for two pieces, `items` runs as one piece on this thread. Otherwise the first piece adds into `sums`, each later one into its own part of `parts`, and the parts then add into `sums` on this thread.
-pub fn summed<B: Send, T: Copy + Send + num_traits::Zero>(items: &mut [B], unit: usize, least: usize, sums: &mut [T], parts: &mut Vec<T>, piece: &(dyn Fn(usize, &mut [B], &mut [T]) + Sync)) {
-    let count = items.len() / unit;
-    let pieces = (count / least).min(threads());
-    if pieces <= 1 { return piece(0, items, sums); }
-    let per = count.div_ceil(pieces);
+/// Adds the sums of every piece of `0..n` into `sums`, where `piece(range, sums)` adds the sums of the piece `range` into the `sums` it's given. `0..n` splits into one piece of at least `least` items for each of this thread's [`threads`]. With too few items for two pieces, `0..n` runs as one piece on this thread. Otherwise the first piece adds into `sums`, each later one into its own part of `parts`, and the parts then add into `sums` on this thread.
+pub fn summed<T: Copy + Send + num_traits::Zero>(n: usize, least: usize, sums: &mut [T], parts: &mut Vec<T>, piece: &(dyn Fn(Range<usize>, &mut [T]) + Sync)) {
+    let pieces = (n / least).min(threads());
+    if pieces <= 1 { return piece(0..n, sums); }
+    let per = n.div_ceil(pieces);
     let (len, width) = (sums.len(), sums.len().max(1));
     parts.clear();
-    parts.resize((count.div_ceil(per) - 1) * width, T::zero());
+    parts.resize((n.div_ceil(per) - 1) * width, T::zero());
     {
-        let (first, rest) = items.split_at_mut(per * unit);
-        let mut work: Vec<(&mut [B], &mut [T])> = std::iter::once((first, &mut *sums)).chain(rest.chunks_mut(per * unit).zip(parts.chunks_mut(width).map(|part| &mut part[..len]))).collect();
-        pieces_of(&mut work, 1, usize::MAX, &|p, work| { let (items, part) = &mut work[0]; piece(p * per, items, part); true });
+        let mut work: Vec<&mut [T]> = std::iter::once(&mut *sums).chain(parts.chunks_mut(width).map(|part| &mut part[..len])).collect();
+        pieces_of(&mut work, 1, usize::MAX, &|p, work| { piece(p * per..n.min((p + 1) * per), &mut work[0]); true });
     }
     for part in parts.chunks(width) { for (s, &x) in sums.iter_mut().zip(part) { *s = *s + x } }
+}
+
+/// [`summed`] over the units of `items`, each of `unit` items, where `piece(first, items, sums)` gets the items of the piece whose first unit is `first`.
+pub fn summed_of<B: Send, T: Copy + Send + num_traits::Zero>(items: &mut [B], unit: usize, least: usize, sums: &mut [T], parts: &mut Vec<T>, piece: &(dyn Fn(usize, &mut [B], &mut [T]) + Sync)) {
+    let shared = Shared(items.as_mut_ptr());
+    // SAFETY: `summed` gives each call its own range of units, within `items`.
+    summed(items.len() / unit, least, sums, parts, &|units, sums| piece(units.start, unsafe { shared.part(units.start * unit..units.end * unit) }, sums))
 }
 
 /// The most cells that [`each_cell`] runs alone at its start, to time a cell.

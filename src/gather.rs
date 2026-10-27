@@ -1222,7 +1222,7 @@ impl<T: Copy> Convert<T, T> for Same {
 ///
 /// # Safety
 /// `Self` has no padding, so every byte of every value is initialized, and [`Item::Unit`] has the same size and alignment as `Self`. `units` reads items as units on these promises, and `units!` checks size and alignment at compile time.
-pub unsafe trait Item: Copy {
+pub unsafe trait Item: Copy + Send + Sync {
     /// The unit that holds an item's bytes.
     type Unit: Unit;
     /// Writes `items` into `out`, each converted by `conv`: one cell at each start along a stride of `step` from `at`, with its items at the offsets that `rest` reaches. Gives whether a fixed-width loop that converts from `S` wrote them. Only `f64` has such loops, for the sources whose [`Item::cells_into_f64`] has one. Otherwise [`scatter_walk`] converts a block at a time.
@@ -1324,7 +1324,7 @@ fn converted_cells<S: Copy, D, C: Convert<S, D>>(out: &mut [D], items: &[S], con
     true
 }
 
-/// Appends the items of `s` that `steps` reach from `base`, each converted by `conv`: one `Steps` for each axis, with the last varying fastest. A `None` offset gives `fill`, converted. `conv` is any `Fn(S) -> D`, or [`Same`] for a source and result of one type. The walk's fixed-width loops move items as [`Unit`]s, so they compile once for each size of item. With [`Same`], the walk appends straight onto `out`. Any other conversion walks `CHUNK` items at a time into a buffer of source items, which it converts onto `out` while they're still in cache.
+/// Appends the items of `s` that `steps` reach from `base`, each converted by `conv`: one `Steps` for each axis, with the last varying fastest. A `None` offset gives `fill`, converted. `conv` is any `Fn(S) -> D`, or [`Same`] for a source and result of one type. The walk's fixed-width loops move items as [`Unit`]s, so they compile once for each size of item. With [`Same`], the walk appends straight onto `out`, splitting across threads from [`SPLIT`] items. Any other conversion walks `CHUNK` items at a time into a buffer of source items, which it converts onto `out` while they're still in cache.
 #[inline]
 pub fn walk<S: Item, D>(out: &mut Vec<D>, s: &[S], base: usize, steps: &[Steps], fill: S, conv: impl Convert<S, D>) {
     let n = Steps::count(steps);
@@ -1341,10 +1341,22 @@ pub(crate) fn walk_plan<S: Item, D>(out: &mut Vec<D>, s: &[S], base: usize, plan
     })
 }
 
-/// Runs `walk` over items `0..n`, giving it a range of them and a buffer of source items to append them to. Where `conv` keeps items as they are, the one range is all `n` items and the buffer is `out`. Otherwise each range holds `CHUNK` items, which `conv` converts onto `out` while they're still in cache.
-fn walked<S: Item, D, C: Convert<S, D>>(out: &mut Vec<D>, conv: &C, n: usize, walk: impl Fn(&mut Vec<S>, usize, usize)) {
+/// The fewest items from which a walk with [`Same`] splits across threads, unless this thread's calls run serially. A shorter walk runs on its calling thread.
+const SPLIT: usize = 1 << 16;
+
+/// Runs `walk` over items `0..n`, giving it a range of them and a buffer of source items to append them to. Where `conv` keeps items as they are, the one range is all `n` items and the buffer is `out`. From [`SPLIT`] items, those ranges split across threads instead, in whole `CHUNK`s, as [`parallel::extended`](crate::parallel::extended) splits its calls. Each thread walks its ranges a `CHUNK` at a time into a buffer of its own, which it copies into its part of `out`. Otherwise each range holds `CHUNK` items, which `conv` converts onto `out` while they're still in cache.
+fn walked<S: Item, D, C: Convert<S, D>>(out: &mut Vec<D>, conv: &C, n: usize, walk: impl Fn(&mut Vec<S>, usize, usize) + Sync) {
     use crate::slice::CHUNK;
     match conv.same(out) {
+        Some(out) if n >= SPLIT && !crate::parallel::serial() => { crate::parallel::extended(out, n, CHUNK, &|range, slots| {
+            let mut block = Vec::with_capacity(CHUNK);
+            for from in range.clone().step_by(CHUNK) {
+                block.clear();
+                walk(&mut block, from, CHUNK.min(range.end - from));
+                slots.copy(&block);
+            }
+            true
+        }); }
         Some(out) => walk(out, 0, n),
         None => {
             let mut block = Vec::with_capacity(n.min(CHUNK));
