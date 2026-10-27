@@ -174,8 +174,8 @@ fn put<T: Copy, I: IndexValue>(out: &mut [T], items: &[T], indices: &[I]) {
     }
 }
 
-/// A short cell's items (`short_cells`) as runs of adjacent items: `runs` runs of `len` items each, whose lowest offsets, as [`Steps::combined`] reaches them from the cell's start, are `starts[..runs]`. A `rev` cell takes each run's items from its highest offset down, as a reversed last axis gives.
-struct Cell { starts: [usize; CELL], runs: usize, len: usize, rev: bool }
+/// A short cell's items (`short_cells`) as runs of adjacent items: `runs` runs of `len` items each, whose lowest offsets, as [`Steps::combined`] reaches them from the cell's start, are `starts[..runs]`. A `rev` cell takes each run's items from its highest offset down, as a reversed last axis gives. Bit `j` of `fills` marks run `j` as one that reads fills. Such a run starts where another run does. A walk reads it like any other run, then [`Cell::filled`] writes the fill over it.
+struct Cell { starts: [usize; CELL], runs: usize, len: usize, rev: bool, fills: u64 }
 impl Cell {
     #[inline]
     fn starts(&self) -> &[usize] { &self.starts[..self.runs] }
@@ -186,6 +186,18 @@ impl Cell {
     /// One past the highest offset that the cell reaches from its start.
     #[inline]
     fn reach(&self) -> usize { self.starts().iter().max().expect("a short cell holds a run") + self.len }
+    /// Writes `fill` over each run that reads fills, in each of the cells that lie end to end in `out`.
+    fn filled<T: Copy>(&self, out: &mut [T], fill: T) {
+        if self.fills == 0 { return }
+        for cell in out.chunks_exact_mut(self.width()) {
+            let mut runs = self.fills;
+            while runs != 0 {
+                let j = runs.trailing_zeros() as usize;
+                cell[j * self.len..][..self.len].fill(fill);
+                runs &= runs - 1;
+            }
+        }
+    }
     /// Checks that every run of `m` cells, which start `step` apart from `at`, lies below `n`, so that a loop over them can skip each bounds check.
     #[inline]
     fn check(&self, at: usize, step: isize, m: usize, n: usize) {
@@ -210,7 +222,8 @@ impl Cell {
     fn each_way<const L: usize>(&self, o: usize, step: isize, m: usize, mut each: impl FnMut(usize, usize, bool)) {
         debug_assert!(L <= self.len, "`runs!` gives an L no longer than the run");
         let last = self.len - L;
-        let mut blocks = |item: usize, at: usize, rev: bool| {
+        // Inlined into each direction's loop, so that `rev` is a constant there. Out of line, `rev` is a runtime test, and LLVM moves a block of bytes one byte at a time.
+        let mut blocks = std::convert::identity(#[inline(always)] |item: usize, at: usize, rev: bool| {
             if L < RUN || last == 0 { return each(item, at, rev); }
             let mut d = 0;
             loop {
@@ -219,7 +232,7 @@ impl Cell {
                 if b == last { break }
                 d += L;
             }
-        };
+        });
         if self.rev { self.each_run(o, step, m, |item, at| blocks(item, at, true)) } else { self.each_run(o, step, m, |item, at| blocks(item, at, false)) }
     }
     /// Moves each block of `L` units of run `j` of each of `m` cells, as [`each_way`](Self::each_way) reaches them, between the places that `places(item, at)` gives, reversed in a `rev` cell.
@@ -331,10 +344,10 @@ pub fn scatter_walk<S: Item, D: Item>(out: &mut [D], items: &[S], base: usize, s
     if let [x] = *items { return scatter_into(out, &[conv.one(x)], base, &steps, &mut 0); }
     let Some((axis, rest)) = steps.split_first() else { return scatter_into(out, &conv.all(items), base, &steps, &mut 0) };
     // Short cells along a stride, as joins of short lanes and writes of a few columns give, convert as they write where `D` has a fixed-width loop for `S` (`Item::cells_from`).
-    if let (&Steps::Stride { start, step, .. }, Some(_)) = (&**axis, short_cells(rest)) {
+    if let (&Steps::Stride { start, step, .. }, Some(_)) = (&**axis, short_cells(rest, false)) {
         if D::cells_from(out, items, &conv, base + start, step, rest) { return; }
     }
-    let width: usize = rest.iter().map(|s| s.len()).product();
+    let width = Steps::count(rest);
     let rows = (crate::slice::CHUNK / width.max(1)).max(1);
     let mut block = Vec::with_capacity(rows * width);
     for j in (0..axis.len()).step_by(rows) {
@@ -423,7 +436,7 @@ fn scatter_axis<T: Item>(out: &mut [T], items: &[T], base: usize, axis: &Steps, 
         }
     }
     // Each position along `axis` starts a cell of the same few items, where `rest` reaches from it, which `walk_into` reads in the same way (`short_cells`). Along a stride, `windows_into` moves each run of a cell's adjacent items as one block, so the loop over cells makes no call.
-    if let Some(cell) = short_cells(rest) {
+    if let Some(cell) = short_cells(rest, false) {
         let width = cell.width();
         if let Steps::Stride { start: a, len: m, step } = *axis {
             // SAFETY: `windows_into` writes only units read from `items`, which hold items of `out`'s type.
@@ -441,7 +454,7 @@ fn scatter_axis<T: Item>(out: &mut [T], items: &[T], base: usize, axis: &Steps, 
         *k += axis.len() * width;
         return;
     }
-    let width: usize = rest.iter().map(|s| s.len()).product();
+    let width = Steps::count(rest);
     axis.for_each(|_, o| match o { Some(o) => scatter_into(out, items, base + o, rest, k), None => *k += width });
 }
 /// Writes the slice `out` from the items of `items` at `k` on, or from its only item when it holds one.
@@ -456,11 +469,13 @@ fn row<T: Copy>(out: &mut [T], items: &[T], k: usize) {
 #[derive(Clone, Copy)]
 pub enum Writes<'a> { Offsets(&'a [usize]), Walk { base: usize, steps: &'a [Steps] } }
 
-impl Writes<'_> {
+impl<'a> Writes<'a> {
     /// The number of writes, fills included.
-    pub fn len(&self) -> usize { match *self { Self::Offsets(offsets) => offsets.len(), Self::Walk { steps, .. } => steps.iter().map(Steps::len).product() } }
+    pub fn len(&self) -> usize { match *self { Self::Offsets(offsets) => offsets.len(), Self::Walk { steps, .. } => Steps::count(steps) } }
     /// Whether there are no writes.
     pub fn is_empty(&self) -> bool { self.len() == 0 }
+    /// The writes' flat offsets, listing a walk's positions (`Steps::combined`).
+    pub fn listed(&self) -> Cow<'a, [usize]> { match *self { Self::Offsets(offsets) => Cow::Borrowed(offsets), Self::Walk { base, steps } => Cow::Owned(Steps::combined(base, steps)) } }
     /// Calls `each(k, run)` with runs of the writes' flat offsets, in order, where `k` is the place among the writes of the run's first, until `each` gives `false`, and gives whether it went through every run. A fill gives [`Steps::FILL`]. Listed offsets are one run. A table of index values converts its own runs, as [`Table::chunks`] gives them. Other walks gather whole innermost axes into runs of about `TABLE_CHUNK` offsets (`Steps::reached`), so no walk is listed whole. `each` is a trait object, so the walk compiles once, and each caller's loop over a run once.
     pub fn runs_while(&self, each: &mut dyn FnMut(usize, &[usize]) -> bool) -> bool {
         match *self {
@@ -683,6 +698,80 @@ impl Table {
         let Positions::Indices { scale, even: Some((first, step)), .. } = self.all else { return None };
         Some(Steps::Stride { start: first.wrapping_add_signed(step * self.start as isize) * scale, len: self.len, step: step * scale as isize })
     }
+    /// Pushes this table onto `into` as one `Stride` for each axis of `lens`, outermost first, and gives `true`, where every offset is the first plus, for each axis, its step times the position along that axis, and none is a fill. Gives `false`, and pushes nothing, for any other table and for an empty one. Index values that [`structure::index_table`](crate::structure::index_table) found evenly spaced answer at once, and so do index values along one axis that it found uneven. Others take [`stepping`]'s passes over the values in their own type. [`Steps::settle`] sets the strides' starts.
+    pub(crate) fn affine(&self, lens: &[usize], into: &mut Vec<Steps>) -> bool {
+        if lens.is_empty() || self.len == 0 { return false; }
+        let at = into.len();
+        into.extend(lens.iter().map(|&len| Steps::Stride { start: 0, len, step: 0 }));
+        let (strides, range) = (&mut into[at..], self.start..self.start + self.len);
+        let first = match &self.all {
+            // Evenly spaced positions in row-major order step along each axis by their step times the axis's width.
+            Positions::Indices { even: Some(_), .. } => self.stride().map(|flat| {
+                let Steps::Stride { start, step: mut width, .. } = flat else { unreachable!("`stride` gives a stride") };
+                for s in strides.iter_mut().rev() { if let Steps::Stride { len, step, .. } = s { *step = width; width *= *len as isize; } }
+                start
+            }),
+            Positions::Indices { .. } if lens.len() == 1 => None,
+            Positions::Indices { values, size, scale, .. } => with_index_values!(values.view(), |x| stepping(&x[range.clone()], strides, |v| v.position())).and_then(|first| {
+                // Values of one sign give positions that step as the values do. Steps that cross 0 would wrap.
+                let (mut lo, mut hi) = (first, first);
+                for s in strides.iter_mut() {
+                    let Steps::Stride { len, step, .. } = s else { unreachable!("`affine` pushes strides") };
+                    let reach = *step as i64 * (*len as i64 - 1);
+                    if reach < 0 { lo += reach } else { hi += reach }
+                    *step *= *scale as isize;
+                }
+                (lo >= 0 || hi < 0).then(|| crate::structure::counted_back(first, *size) * scale)
+            }),
+            Positions::Listed(o) if !o[range.clone()].contains(&Steps::FILL) => stepping(&o[range], strides, |o| o as i64).map(|first| first as usize),
+            Positions::Listed(_) => None,
+        };
+        match first {
+            Some(first) => { Steps::settle(&mut into[at..], first); true }
+            None => { into.truncate(at); false }
+        }
+    }
+    /// This table as one `Padded` or `Rotated` entry (`Steps::padded`), where its offsets are positions one apart along an axis of `size` items with `stride`, read past the axis's ends by one edge mode. Positions that count back from the end read as the wrap mode does. `None` for any other table. In every mode, each position differs from the one before it by 1, 0, -1 or `1 - size`. A check of two such pairs rejects most other tables. Positions inside the axis step up by one in every mode. The first two offsets one position apart therefore give the first position. One pass checks the stretch inside the axis. The offsets past its ends choose the mode.
+    pub(crate) fn edged(&self, size: usize, stride: usize) -> Option<Steps> {
+        if self.len < 2 || size < 2 || stride == 0 { return None; }
+        let (n, step) = (self.len, stride as i128);
+        let follows = |j: usize| match (self.get(j - 1), self.get(j)) {
+            (Some(a), Some(b)) => [step, 0, -step, (1 - size as i128) * step].contains(&(b as i128 - a as i128)),
+            _ => true,
+        };
+        if !follows(n - 1) || !follows(n / 2) { return None; }
+        let (mut previous, mut start) = (Steps::FILL, None);
+        self.runs_while(&mut |j0, run| {
+            for (r, &o) in run.iter().enumerate() {
+                if o != Steps::FILL && previous != Steps::FILL && o == previous + stride { start = Some((previous / stride) as i128 + 1 - (j0 + r) as i128); return false; }
+                previous = o;
+            }
+            true
+        });
+        let start = start?;
+        let (before, lo, middle) = padded_parts(start, n, size);
+        if !self.slice(before, middle).runs_while(&mut |j0, run| run.first().is_none_or(|&o| o == (lo + j0) * stride) && run.iter().zip(run.get(1..).unwrap_or_default()).fold(true, |all, (&a, &b)| all & (b.wrapping_sub(a) == stride))) { return None; }
+        let edge = Edge::MODES.iter().map(|&(_, e)| e).find(|&e| (0..before).chain(before + middle..n).all(|j| self.get(j) == edged(e, start + j as i128, size).map(|p| p * stride)))?;
+        Some(Steps::padded(start, n, size, stride, edge))
+    }
+}
+
+/// The position of the first of `values`, which lie along the axes of `strides` in row-major order, where each value's position, less that of the value one position before it along an axis, is that axis's step, which this sets in `strides`. `None` where some value breaks that pattern. Each axis takes one pass that compares each value with the one a position before it, which vectorises in the values' own type, after a check of the last of them, which most values in no order fail.
+fn stepping<T: Copy>(values: &[T], strides: &mut [Steps], position: impl Fn(T) -> i64) -> Option<i64> {
+    let first = position(values[0]);
+    let mut block = values.len();
+    for s in strides.iter_mut() {
+        let Steps::Stride { len, step, .. } = s else { unreachable!("`Table::affine` passes strides") };
+        let width = block / *len;
+        if *len > 1 {
+            let d = position(values[width]) - first;
+            *step = d as isize;
+            let steps = |(&a, &b): (&T, &T)| position(a) - position(b) == d;
+            if !steps((&values[block - 1], &values[block - 1 - width])) || !values[width..block].iter().zip(&values[..block - width]).fold(true, |all, pair| all & steps(pair)) { return None; }
+        }
+        block = width;
+    }
+    Some(first)
 }
 
 impl PartialEq for Table { fn eq(&self, other: &Self) -> bool { self.len == other.len && (0..self.len).all(|j| self.get(j) == other.get(j)) } }
@@ -727,8 +816,9 @@ impl Steps {
             Self::Table(table) => Self::Table(table.scaled(k)),
         }
     }
-    /// `len` positions from `start` along an axis of `size` items with `stride`, read past the axis's ends by `edge`: a `Padded` entry where a position falls outside the axis, and otherwise the `Stride` that reads the same offsets.
+    /// `len` positions from `start` along an axis of `size` items with `stride`, read past the axis's ends by `edge`: a `Padded` entry where a position falls outside the axis, the `Rotated` entry for a wrapped stretch as long as the axis, and otherwise the `Stride` that reads the same offsets.
     pub fn padded(start: i128, len: usize, size: usize, stride: usize, edge: Edge) -> Self {
+        if edge == Edge::Wrap && len == size && size != 0 { return Self::rotated(start.rem_euclid(size as i128) as usize, len, stride); }
         if start >= 0 && start + len as i128 <= size as i128 { Self::Stride { start: start as usize * stride, len, step: stride as isize } } else { Self::Padded { start, len, size, stride, edge } }
     }
     /// `padded` with a fill past the axis's ends.
@@ -762,8 +852,18 @@ impl Steps {
     pub fn for_each(&self, mut each: impl FnMut(usize, Option<usize>)) {
         match *self {
             Self::Stride { start, len, step } => for r in 0..len { each(r, Some(start.wrapping_add_signed(step * r as isize))) },
+            Self::Padded { start, len, size, stride, edge } => {
+                let (before, lo, middle) = padded_parts(start, len, size);
+                let border = |r: usize| edged(edge, start + r as i128, size).map(|p| p * stride);
+                for r in 0..before { each(r, border(r)) }
+                for r in 0..middle { each(before + r, Some((lo + r) * stride)) }
+                for r in before + middle..len { each(r, border(r)) }
+            }
+            Self::Rotated { shift, len, stride } => {
+                for r in 0..len - shift { each(r, Some((shift + r) * stride)) }
+                for r in len - shift..len { each(r, Some((r + shift - len) * stride)) }
+            }
             Self::Table(ref t) => t.chunks(|j0, run| for (r, &o) in run.iter().enumerate() { each(j0 + r, (o != Self::FILL).then_some(o)) }),
-            _ => for (r, o) in self.offsets().enumerate() { each(r, o) },
         }
     }
     /// Offsets `start..start + len`, as at most two entries. A table's piece holding every offset is the table itself, borrowed.
@@ -783,9 +883,11 @@ impl Steps {
         };
         pieces.into_iter().flatten()
     }
+    /// How many positions `steps` reach: the product of their lengths.
+    pub fn count(steps: &[impl std::borrow::Borrow<Self>]) -> usize { steps.iter().map(|s| s.borrow().len()).product() }
     /// The offset of every position that `steps` reach from `base`, in the order that `walk` visits them, with [`Steps::FILL`] where a fill goes. [`Steps::reach`] gives one of them.
     pub fn combined(base: usize, steps: &[impl std::borrow::Borrow<Self>]) -> Vec<usize> {
-        let mut out = Vec::with_capacity(steps.iter().map(|s| s.borrow().len()).product());
+        let mut out = Vec::with_capacity(Self::count(steps));
         Self::reached(&mut out, base, steps, &mut |_| true);
         out
     }
@@ -815,8 +917,8 @@ impl Steps {
         }
         flush(out)
     }
-    /// `steps` without axes of one position, whose offset moves into `base`, and with neighbouring runs merged into one longer run. A table whose offsets step evenly merges as the stride it is (`Steps::even`), and becomes that stride where it's the innermost axis, which `walk_into` and `scatter_into` then reach without the table. An outer table that merges with nothing stays a table, for their routes that take a table of starts.
-    fn simplify<B: std::borrow::Borrow<Self>>(mut base: usize, steps: &[B]) -> (usize, Vec<Cow<'_, Self>>) {
+    /// `steps` without axes of one position, whose offset moves into `base`, and with neighbouring axes merged into one where they step as one axis (`merged`). A table whose offsets step evenly merges as the stride it is (`Steps::even`), and becomes that stride where it's the innermost axis, which `walk_into` and `scatter_into` then reach without the table. An outer table that merges with nothing stays a table, for their routes that take a table of starts.
+    pub(crate) fn simplify<B: std::borrow::Borrow<Self>>(mut base: usize, steps: &[B]) -> (usize, Vec<Cow<'_, Self>>) {
         let mut kept: Vec<Cow<Self>> = Vec::with_capacity(steps.len());
         for s in steps {
             let s = s.borrow();
@@ -832,10 +934,17 @@ impl Steps {
         if let (Some(stride), Some(last)) = (innermost, kept.last_mut()) { *last = Cow::Owned(stride); }
         (base, kept)
     }
-    /// `outer` and `inner` as one run, where `inner` reads adjacent items and each step of `outer` moves past one run of `inner`, as `simplify` merges neighbours. `None` where they don't form one run.
+    /// `outer` and `inner` as one axis, where each step of `outer` moves past one run of `inner`: `outer`'s step is `inner`'s step times `inner`'s length. Adjacent items, runs one stride apart and a broadcast along both qualify. `None` where they don't form one axis.
     fn merged(outer: &Self, inner: &Self) -> Option<Self> {
-        let (Some(Self::Stride { start: a, len: m, step }), Some(Self::Stride { start: b, len: n, step: 1 })) = (outer.even(), inner.even()) else { return None };
-        (step == n as isize).then_some(Self::Stride { start: a + b, len: m * n, step: 1 })
+        let (Self::Stride { start: a, len: m, step: so }, Self::Stride { start: b, len: n, step: si }) = (outer.even()?, inner.even()?) else { return None };
+        (so == si * n as isize).then_some(Self::Stride { start: a + b, len: m * n, step: si })
+    }
+    /// `outer` and `inner` as a transpose, which the tiled `transposed` copy reads: `outer` reads adjacent items and `inner` steps by more than 1. Their combined start, `outer`'s length, `inner`'s length and `inner`'s stride.
+    pub(crate) fn transposing(outer: &Self, inner: &Self) -> Option<(usize, usize, usize, usize)> {
+        match (outer, inner) {
+            (&Self::Stride { start: a, len: m, step: 1 }, &Self::Stride { start: b, len: n, step }) if step > 1 => Some((a + b, m, n, step as usize)),
+            _ => None,
+        }
     }
     /// The box whose first axis is `piece`, a run of positions along an axis, and whose other axes are `rest`, already simplified, as `simplify` would give it: its base, first axis and other axes. A piece of one position moves its offset into the base, a piece that steps over whole runs of `rest`'s first axis merges with it, and an evenly stepping table with no axes after it becomes a stride. It allocates nothing, so a range's walk cuts its boxes cheaply.
     fn boxed<'a>(base: usize, piece: Cow<'a, Self>, rest: &'a [Cow<'a, Self>]) -> (usize, Cow<'a, Self>, &'a [Cow<'a, Self>]) {
@@ -849,8 +958,16 @@ impl Steps {
             None => (base, piece, rest),
         }
     }
+    /// Sets the starts of `strides`, one `Stride` for each axis of a walk whose first offset is `first`, so that each stride's own offsets stay at or above 0, as every entry's must: an axis after the first that steps down starts at its far end, and the first axis takes the rest of `first`.
+    pub(crate) fn settle(strides: &mut [Self], first: usize) {
+        let mut rest = first;
+        for s in strides.iter_mut().skip(1) {
+            if let Self::Stride { start, len, step } = s { *start = if *step < 0 { step.unsigned_abs() * (*len - 1) } else { 0 }; rest -= *start; }
+        }
+        if let Some(Self::Stride { start, .. }) = strides.first_mut() { *start = rest; }
+    }
     /// This axis as one stride: itself where it is a stride, and a table of at least two offsets where none is a fill and each lies the same distance on from the one before. `None` for any other axis.
-    fn even(&self) -> Option<Self> {
+    pub(crate) fn even(&self) -> Option<Self> {
         match *self {
             Self::Stride { start, len, step } => Some(Self::Stride { start, len, step }),
             Self::Table(ref t) => {
@@ -876,10 +993,11 @@ impl Steps {
     }
     /// The first source offset and stride of items `start..start + n`, where they form one regular run. Singleton axes disappear and neighbouring strides can form one run. Padded and rotated reads must stay within their valid, unwrapped part.
     #[inline]
-    pub fn run(base: usize, steps: &[Self], start: usize, n: usize) -> Option<(usize, isize)> {
+    pub fn run(base: usize, steps: &[impl std::borrow::Borrow<Self>], start: usize, n: usize) -> Option<(usize, isize)> {
         if n == 0 { return None; }
         let (mut width, mut stride) = (1usize, None);
         for axis in steps.iter().rev() {
+            let axis = axis.borrow();
             let len = axis.len();
             if len == 0 { return None; }
             if len == 1 { axis.get(0)?; continue; }
@@ -897,21 +1015,24 @@ impl Steps {
         }
         (n == 1).then(|| (Self::reach(base, steps, start).expect("singleton run has no fill"), 1))
     }
-    /// How many consecutive items of the frame read adjacent offsets: the product of the lengths of the innermost axes, outward, while each axis steps on from the ones inside it. Clip and wrap edges don't count, because only the runs that cross them copy. A run of `n` items reads in place through `run` only where it lies inside one such stretch, so a frame whose stretches are shorter than its blocks copies every block.
-    pub fn contiguous(steps: &[Self]) -> usize {
-        let mut width = 1;
+    /// The innermost stretch of the frame whose items read at one regular stride, as its length and that stride: the product of the lengths of the innermost axes, outward, while each axis steps on from the ones inside it. Edges of padded and rotated axes don't count, because only the runs that cross them copy. A run reads through `run` only where it lies inside one such stretch.
+    pub fn regular(steps: &[Self]) -> (usize, isize) {
+        let (mut width, mut stride) = (1, None);
         for axis in steps.iter().rev() {
             if axis.len() == 1 { continue; }
             let step = match *axis {
                 Self::Stride { step, .. } => step,
-                Self::Padded { stride, edge: Edge::Fill, .. } | Self::Rotated { stride, .. } => stride as isize,
-                Self::Padded { .. } | Self::Table(_) => return width,
+                Self::Padded { stride, .. } | Self::Rotated { stride, .. } => stride as isize,
+                Self::Table(_) => break,
             };
-            if step != width as isize { return width; }
+            if stride.is_some_and(|s: isize| step != s * width as isize) { break; }
+            stride.get_or_insert(step);
             width *= axis.len();
         }
-        width
+        (width, stride.unwrap_or(1))
     }
+    /// How many consecutive items of the frame read adjacent offsets: the stretch that `regular` gives where its stride is 1. A run reads in place only inside one such stretch, so a frame whose stretches are shorter than its blocks copies every block.
+    pub fn contiguous(steps: &[Self]) -> usize { match Self::regular(steps) { (width, 1) => width, _ => 1 } }
     /// Whether this entry reads items that aren't adjacent: a step or stride of more than 1, as a transpose's innermost axis has.
     pub fn skips(&self) -> bool {
         match *self { Self::Stride { step, .. } => step.unsigned_abs() > 1, Self::Padded { stride, .. } | Self::Rotated { stride, .. } => stride > 1, Self::Table(_) => false }
@@ -942,27 +1063,26 @@ impl Steps {
             _ => { let mut seen = crate::hashing::HashSet::default(); !self.offsets().all(|o| o.is_some_and(|o| seen.insert(o))) }
         }
     }
-    /// `tables`, a walk's entries for a result of `shape`, as one entry for each axis of `shape`, with the offset of each entry of one item moved into the base. An entry over several axes splits into one `Stride` for each. `None` where an entry that isn't a `Stride` covers several axes.
+    /// `tables`, a walk's entries for a result of `shape`, as one entry for each axis of `shape`, with the offset of each entry of one item moved into the base. Neighbouring entries that step as one axis merge first (`simplify`), so that one axis of `shape` can read several of them, as a view that merges axes does. An entry over several axes splits into one `Stride` for each. `None` where an entry that isn't a `Stride` covers several axes, or where one axis of `shape` reads entries that don't merge.
     pub fn per_axis(tables: &[Self], shape: &[usize]) -> Option<(usize, Vec<Self>)> {
-        let (mut base, mut steps, mut a) = (0, Vec::with_capacity(shape.len()), 0);
+        let (mut base, tables) = Self::simplify(0, tables);
+        let (mut steps, mut a) = (Vec::with_capacity(shape.len()), 0);
         let ones = |steps: &mut Vec<Self>, a: &mut usize| while *a < shape.len() && shape[*a] == 1 {
             steps.push(Self::Stride { start: 0, len: 1, step: 0 });
             *a += 1;
         };
-        for t in tables {
+        for t in &tables {
             if t.len() == 1 { base += t.get(0)?; continue; }
             ones(&mut steps, &mut a);
             let (first, mut n) = (a, 1);
             while a < shape.len() && n < t.len() { n *= shape[a]; a += 1; }
             if n != t.len() { return None; }
-            match (&shape[first..a], t) {
-                ([_], _) => steps.push(t.clone()),
+            match (&shape[first..a], &**t) {
+                ([_], _) => steps.push(t.clone().into_owned()),
                 (group, &Self::Stride { start, step, .. }) => {
-                    let mut width = n;
-                    for (i, &len) in group.iter().enumerate() {
-                        width /= len;
-                        steps.push(Self::Stride { start: if i == 0 { start } else { 0 }, len, step: step * width as isize });
-                    }
+                    let (at, mut width) = (steps.len(), n);
+                    for &len in group { width /= len; steps.push(Self::Stride { start: 0, len, step: step * width as isize }); }
+                    Self::settle(&mut steps[at..], start);
                 }
                 _ => return None,
             }
@@ -981,12 +1101,23 @@ impl Steps {
         for &a in axes.iter().flatten() { walks[a] += 1; }
         // Checked before any `read_through`, so that a composition that fails builds no table.
         if walks.iter().zip(inner).any(|(&w, r)| w > 1 && !matches!(r, Self::Stride { .. })) { return None; }
-        let mut first = vec![true; shape.len()];
+        // The share of a `Stride`'s offset at position 0 that each entry along its axis takes. The first entry takes all of it. Along an axis that `inner` reads backwards, each later entry starts at its own far end instead, so that its own offsets stay at or above 0, and the first gives that up.
+        let (mut first, mut taken) = (vec![None; shape.len()], vec![0; outer.len()]);
+        for (k, &axis) in axes.iter().enumerate() {
+            let Some(a) = axis else { continue };
+            let f = *first[a].get_or_insert(k);
+            let Self::Stride { start: r0, step: s, .. } = inner[a] else { continue };
+            if f == k { taken[k] = r0; }
+            else if let (true, &Self::Stride { start, len, step }) = (s < 0, &outer[k]) {
+                taken[k] = s.unsigned_abs() * ((start + len.saturating_sub(1) * step.max(0) as usize) / strides[a]);
+                taken[f] = taken[f].checked_sub(taken[k])?;
+            }
+        }
         let mut steps = Vec::with_capacity(outer.len());
-        for (e, &axis) in outer.iter().zip(&axes) {
+        for (k, (e, &axis)) in outer.iter().zip(&axes).enumerate() {
             steps.push(match axis {
-                None => Self::Stride { start: 0, len: e.len(), step: 0 },
-                Some(a) => e.read_through(strides[a], &inner[a], std::mem::replace(&mut first[a], false), &mut base)?,
+                None => if e.fills() { e.clone() } else { Self::Stride { start: 0, len: e.len(), step: 0 } },
+                Some(a) => e.read_through(strides[a], &inner[a], first[a] == Some(k), taken[k], &mut base)?,
             });
         }
         for (a, p) in crate::layout::coordinates(at, shape) { if walks[a] == 0 { base += inner[a].get(p)?; } }
@@ -1050,11 +1181,12 @@ impl Steps {
         if !unique { return None; }
         Some(Self::table(back))
     }
-    /// This entry's positions along an axis whose stride is `unit`, read through `r`. The first entry along an axis takes `r`'s offset at position 0, in its own start or in `base`. `None` where neither this entry nor `r` is a table and the two don't combine into one regular entry.
-    fn read_through(&self, unit: usize, r: &Self, first: bool, base: &mut usize) -> Option<Self> {
-        if first && matches!(*self, Self::Stride { start: 0, len, step } if step == unit as isize && len == r.len()) { return Some(r.clone()); }
-        if let Self::Stride { start: r0, step: s, .. } = *r {
-            let r0 = if first { r0 } else { 0 };
+    /// This entry's positions along an axis whose stride is `unit`, read through `r`, taking `r0` of the offset that `r` gives position 0 (`through`), in its own start or in `base`. `None` where neither this entry nor `r` is a table and the two don't combine into one regular entry.
+    fn read_through(&self, unit: usize, r: &Self, first: bool, r0: usize, base: &mut usize) -> Option<Self> {
+        if first && matches!(*self, Self::Stride { start: 0, len, step } if step == unit as isize && len == r.len()) {
+            return Some(match *r { Self::Stride { len, step, .. } => Self::Stride { start: r0, len, step }, _ => r.clone() });
+        }
+        if let Self::Stride { step: s, .. } = *r {
             match *self {
                 Self::Stride { start, len, step } => {
                     let start = usize::try_from(r0 as isize + (start / unit) as isize * s).ok()?;
@@ -1065,14 +1197,19 @@ impl Steps {
                 _ => {}
             }
         }
+        // Consecutive positions read through a `Padded` entry are a `Padded` stretch of the same axis, `start / unit` positions further on.
+        if first && let (&Self::Stride { start, len, step }, &Self::Padded { start: p, size, stride, edge, .. }) = (self, r) && step == unit as isize {
+            return Some(Self::padded(p + (start / unit) as i128, len, size, stride, edge));
+        }
         // A rotation that carries only fill across the axis's end reads what a shift reads: the source's items stay in one stretch, which starts at position `a`.
         if first && let (&Self::Rotated { shift, len, stride }, &Self::Padded { start, len: m, size, stride: s, edge: Edge::Fill }) = (self, r) && stride == unit && len == m {
             let a = (-start - shift as i128).rem_euclid(len as i128);
             if a + size as i128 <= len as i128 { return Some(Self::padded(-a, len, size, s, Edge::Fill)); }
         }
         (first && (matches!(self, Self::Table(_)) || matches!(r, Self::Table(_)))).then(|| {
+            let read = |p: usize| match *r { Self::Stride { step, .. } => Some(r0.wrapping_add_signed(step * p as isize)), _ => r.get(p) };
             let mut table = Vec::with_capacity(self.len());
-            self.for_each(|_, o| table.push(o.and_then(|o| r.get(o / unit)).unwrap_or(Self::FILL)));
+            self.for_each(|_, o| table.push(o.and_then(|o| read(o / unit)).unwrap_or(Self::FILL)));
             Self::table(table)
         })
     }
@@ -1234,7 +1371,7 @@ fn converted_cells<S: Copy, D, C: Convert<S, D>>(out: &mut [D], items: &[S], con
             for i in 0..L { out[i] = conv.one(run[i]) }
         });
     }
-    let Some(cell) = short_cells(rest) else { return false };
+    let Some(cell) = short_cells(rest, false) else { return false };
     runs!(cell.len, L => cells::<L, S, D, C>(out, items, conv, at, step, &cell));
     true
 }
@@ -1242,18 +1379,17 @@ fn converted_cells<S: Copy, D, C: Convert<S, D>>(out: &mut [D], items: &[S], con
 /// Appends the items of `s` that `steps` reach from `base`, each converted by `conv`: one `Steps` for each axis, with the last varying fastest. A `None` offset gives `fill`, converted. `conv` is any `Fn(S) -> D`, or [`Same`] for a source and result of one type. The walk's fixed-width loops move items as [`Unit`]s, so they compile once for each size of item. With [`Same`], the walk appends straight onto `out`. Any other conversion walks `CHUNK` items at a time into a buffer of source items, which it converts onto `out` while they're still in cache.
 #[inline]
 pub fn walk<S: Item, D>(out: &mut Vec<D>, s: &[S], base: usize, steps: &[Steps], fill: S, conv: impl Convert<S, D>) {
-    let n = steps.iter().map(Steps::len).product();
+    let n = Steps::count(steps);
     let (base, steps) = Steps::simplify(base, steps);
     walked(out, &conv, n, |d, from, m| if m == n { walk_into(d, s, fill, base, &steps) } else { range_into(d, s, fill, base, &steps, from, m) })
 }
 
-/// Items `from..from + n` of what [`walk`] gives for the same arguments, appended to `out`. It simplifies the plan once, and cuts the range's boxes from it without allocating, so a chunked reader's ranges cost about what one whole walk costs.
+/// Items `from..from + n` of what [`walk`] gives for the same arguments, appended to `out`, read through a plan that `Steps::simplify` has already made, as a mapping keeps one for every block it reads (`Route::plan`).
 #[inline]
-pub fn walk_range<S: Item, D>(out: &mut Vec<D>, s: &[S], base: usize, steps: &[Steps], fill: S, from: usize, n: usize, conv: impl Convert<S, D>) {
-    let (plan_base, plan) = Steps::simplify(base, steps);
-    walked(out, &conv, n, |d, at, m| match Steps::run(base, steps, from + at, m) {
+pub(crate) fn walk_plan<S: Item, D>(out: &mut Vec<D>, s: &[S], base: usize, plan: &[Cow<Steps>], fill: S, from: usize, n: usize, conv: impl Convert<S, D>) {
+    walked(out, &conv, n, |d, at, m| match Steps::run(base, plan, from + at, m) {
         Some((start, step)) => walk_axis(d, s, fill, 0, &Steps::Stride { start, len: m, step }, &[]),
-        None => range_into(d, s, fill, plan_base, &plan, from + at, m),
+        None => range_into(d, s, fill, base, plan, from + at, m),
     })
 }
 
@@ -1273,11 +1409,11 @@ fn walked<S: Item, D, C: Convert<S, D>>(out: &mut Vec<D>, conv: &C, n: usize, wa
     }
 }
 
-/// `walk_range` over `steps` after `Steps::simplify`: a partial row at each end recurses into the next axis, and the whole rows between them walk as one box, which `Steps::boxed` cuts without allocating. A range therefore costs about its share of one whole walk.
+/// `walk_plan`'s walk of items `from..from + n` over `steps` after `Steps::simplify`: a partial row at each end recurses into the next axis, and the whole rows between them walk as one box, which `Steps::boxed` cuts without allocating. A range therefore costs about its share of one whole walk.
 fn range_into<T: Item>(d: &mut Vec<T>, s: &[T], fill: T, base: usize, steps: &[Cow<Steps>], from: usize, n: usize) {
     if n == 0 { return; }
     let Some((axis, rest)) = steps.split_first() else { return d.push(s[base]) };
-    let width: usize = rest.iter().map(|s| s.len()).product();
+    let width = Steps::count(rest);
     let row = |d: &mut Vec<T>, j: usize, at: usize, m: usize| match axis.get(j) {
         Some(o) => range_into(d, s, fill, base + o, rest, at, m),
         None => d.extend(std::iter::repeat_n(fill, m)),
@@ -1301,15 +1437,23 @@ const RUN: usize = 8;
 /// The most items below one axis that `walk_into` reaches through a table of their offsets.
 const CELL: usize = 64;
 
-/// The cell below an axis, where `walk_into` and `scatter_into` reach every cell's items through one table of offsets: `rest` holds at least one axis and no fill, reaches at most `CELL` items, and ends in a run of adjacent items, forwards or backwards.
-fn short_cells(rest: &[Cow<Steps>]) -> Option<Cell> {
-    let width: usize = rest.iter().map(|s| s.len()).product();
+/// The cell below an axis, where `walk_into` and `scatter_into` reach every cell's items through one table of offsets: `rest` holds at least one axis, reaches at most `CELL` items, and ends in a run of adjacent items, forwards or backwards. With `fills`, a cell qualifies where some of its runs read fills, as long as one run reads items (`Cell::fills`). Without `fills`, as a scatter needs, a run that reads fills rules the cell out.
+fn short_cells(rest: &[Cow<Steps>], fills: bool) -> Option<Cell> {
+    let width = Steps::count(rest);
     let (len, rev) = match rest.last().map(|t| &**t) { Some(&Steps::Stride { len, step: 1, .. }) => (len, false), Some(&Steps::Stride { len, step: -1, .. }) => (len, true), _ => (1, false) };
-    if rest.is_empty() || !(1..=CELL).contains(&width) || rest.iter().any(|t| t.fills()) { return None; }
-    let (mut starts, runs) = ([0; CELL], width / len);
+    if rest.is_empty() || !(1..=CELL).contains(&width) { return None; }
+    let (mut starts, runs, mut gaps) = ([0; CELL], width / len, 0u64);
     // A reversed run reaches its highest offset first, and the table holds its lowest.
-    for (i, start) in starts[..runs].iter_mut().enumerate() { *start = Steps::reach(0, rest, i * len).expect("a short cell holds no fill") - if rev { len - 1 } else { 0 } }
-    Some(Cell { starts, runs, len, rev })
+    for (i, start) in starts[..runs].iter_mut().enumerate() {
+        match Steps::reach(0, rest, i * len) { Some(o) => *start = o - if rev { len - 1 } else { 0 }, None => gaps |= 1 << i }
+    }
+    if gaps != 0 {
+        // A run that reads fills starts where the first run that reads items does.
+        let first = (!gaps).trailing_zeros() as usize;
+        if !fills || first >= runs { return None; }
+        for j in (0..runs).filter(|j| gaps >> j & 1 == 1) { starts[j] = starts[first] }
+    }
+    Some(Cell { starts, runs, len, rev, fills: gaps })
 }
 
 /// `walk`'s walk after `Steps::simplify`. Its fixed-width loops move [`Unit`]s, through `windows`.
@@ -1320,9 +1464,7 @@ fn walk_into<T: Item>(d: &mut Vec<T>, s: &[T], fill: T, base: usize, steps: &[Co
 /// [`walk_into`] for a box whose first axis, `axis`, comes apart from the others, `rest`, so that a piece of an axis walks with the axes after it without a slice of its own.
 fn walk_axis<T: Item>(d: &mut Vec<T>, s: &[T], fill: T, base: usize, axis: &Steps, rest: &[Cow<Steps>]) {
     if let [inner] = rest {
-        if let (&Steps::Stride { start: a, len: m, step: 1 }, &Steps::Stride { start: b, len: n, step }) = (axis, &**inner) {
-            if step > 1 { return transposed(d, &s[base + a + b..], m, n, step as usize); }
-        }
+        if let Some((start, m, n, stride)) = Steps::transposing(axis, inner) { return transposed(d, &s[base + start..], m, n, stride); }
         // Cells picked from a matrix, as columns are: a table of starts, each reaching items a stride apart.
         if let (Steps::Table(t), &Steps::Stride { start: b, len: n, step }) = (axis, &**inner) {
             if step > 1 { t.chunks(|_, run| picked(&mut *d, s, base + b, fill, run, n, step as usize)); return; }
@@ -1336,28 +1478,30 @@ fn walk_axis<T: Item>(d: &mut Vec<T>, s: &[T], fill: T, base: usize, axis: &Step
             }
         }
     }
-    // Each offset along `axis` starts a copy of the same few items, where `rest` reaches from it, as windows give (`short_cells`). Each run of a cell's adjacent items moves as one block: along a stride through `windows`, straight into spare capacity, so the loop over starts makes no call, and along other axes through `cells_at`. Where an axis has fills, the fills go in first, which a missing start keeps.
-    if let Some(cell) = short_cells(rest) {
-        let width = cell.width();
+    // Each offset along `axis` starts a copy of the same few items, where `rest` reaches from it, as windows give (`short_cells`). Each run of a cell's adjacent items moves as one block: along a stride through `windows`, straight into spare capacity, so the loop over starts makes no call, and along other axes through `cells_at`. Where an axis has fills, the fills go in first, which a missing start keeps. A cell's runs that read fills take their fill last (`Cell::filled`).
+    if let Some(cell) = short_cells(rest, true) {
+        let (width, start) = (cell.width(), d.len());
         if let Steps::Stride { start: a, len: m, step } = *axis {
             // SAFETY: `windows` writes only units read from `s`, which hold items of `d`'s type.
-            return runs!(cell.len, L => crate::slice::appended(d, m * width, |slots| windows::<L, T::Unit>(unsafe { written_as(slots) }, units(s), base + a, step, &cell)));
+            runs!(cell.len, L => crate::slice::appended(d, m * width, |slots| windows::<L, T::Unit>(unsafe { written_as(slots) }, units(s), base + a, step, &cell)));
+        } else if !axis.fills() {
+            // SAFETY, here and below: `cells_at` writes only units read from `s`, which hold items of `d`'s type.
+            runs!(cell.len, L => crate::slice::appended(d, axis.len() * width, |slots| cells_at::<L, T::Unit>(unsafe { written_as(slots) }, units(s), base, axis, &cell)));
+        } else {
+            d.resize(start + axis.len() * width, fill);
+            runs!(cell.len, L => cells_at::<L, T::Unit>(unsafe { written_as(&mut d[start..]) }, units(s), base, axis, &cell));
         }
-        // SAFETY, for both calls: `cells_at` writes only units read from `s`, which hold items of `d`'s type.
-        if !axis.fills() { return runs!(cell.len, L => crate::slice::appended(d, axis.len() * width, |slots| cells_at::<L, T::Unit>(unsafe { written_as(slots) }, units(s), base, axis, &cell))); }
-        let start = d.len();
-        d.resize(start + axis.len() * width, fill);
-        runs!(cell.len, L => cells_at::<L, T::Unit>(unsafe { written_as(&mut d[start..]) }, units(s), base, axis, &cell));
+        cell.filled(&mut d[start..], fill);
         return;
     }
     if !rest.is_empty() {
-        let width: usize = rest.iter().map(|s| s.len()).product();
+        let width = Steps::count(rest);
         axis.for_each(|_, o| match o { Some(o) => walk_into(d, s, fill, base + o, rest), None => d.extend(std::iter::repeat_n(fill, width)) });
         return;
     }
     if axis.len() == 0 { return; }
-    // Each loop gets the source from `base` onwards by value, so that the compiler keeps its bounds in registers.
-    let s = &s[base..];
+    // Each loop gets the source from `base` onwards by value, so that the compiler keeps its bounds in registers. A padded axis whose positions all lie outside an empty source reads nothing from it, whatever its base.
+    let s = s.get(base..).unwrap_or_default();
     match *axis {
         Steps::Stride { start, len, step: 1 } => copied(d, &s[start..start + len]),
         Steps::Stride { start, len, step: -1 } => d.extend(s[start + 1 - len..=start].iter().rev().copied()),

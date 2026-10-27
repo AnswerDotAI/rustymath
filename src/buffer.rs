@@ -20,6 +20,12 @@ macro_rules! buffers {
             pub fn capacity(&self) -> usize { match self { $(Self::$variant(v) => v.capacity()),+ } }
             #[inline]
             pub fn as_mut_ptr(&mut self) -> *mut u8 { match self { $(Self::$variant(v) => v.as_mut_ptr().cast()),+ } }
+            /// Sets the length to `n` after a writer outside Rust, such as compiled code, filled the first `n` items through `as_mut_ptr`.
+            ///
+            /// # Safety
+            /// `n` is at most the capacity, and the first `n` items are initialized.
+            #[inline]
+            pub unsafe fn set_len(&mut self, n: usize) { match self { $(Self::$variant(v) => unsafe { v.set_len(n) }),+ } }
             /// Copies `range` of `source` when it has this buffer's element type, and gives whether it could.
             pub fn extend_from(&mut self, source: $view<'_>, range: std::ops::Range<usize>) -> bool {
                 match (self, source) {
@@ -66,6 +72,8 @@ macro_rules! buffers {
             #[inline]
             fn vec(buffer: Buffer) -> Option<Vec<Self>> { match buffer { Buffer::$outer($owned::$variant(v)) => Some(v), _ => None } }
             #[inline]
+            fn vec_mut(buffer: &mut Buffer) -> Option<&mut Vec<Self>> { match buffer { Buffer::$outer($owned::$variant(v)) => Some(v), _ => None } }
+            #[inline]
             fn truth(b: bool) -> Self { Source::<Self>::read(b) }
         })+
     };
@@ -91,6 +99,8 @@ macro_rules! single {
             fn buffer(data: Vec<Self>) -> Buffer { Buffer::$variant(data) }
             #[inline]
             fn vec(buffer: Buffer) -> Option<Vec<Self>> { match buffer { Buffer::$variant(v) => Some(v), _ => None } }
+            #[inline]
+            fn vec_mut(buffer: &mut Buffer) -> Option<&mut Vec<Self>> { match buffer { Buffer::$variant(v) => Some(v), _ => None } }
             #[inline]
             fn truth(b: bool) -> Self { ($truth)(b) }
         }
@@ -178,6 +188,7 @@ macro_rules! with_int_pair {
 
 impl Width {
     /// The bytes that one integer of this width takes.
+    #[inline]
     fn bytes(self) -> usize { with_width!(self, T => std::mem::size_of::<T>()) }
     #[inline]
     fn holds(self, n: i64) -> bool { with_width!(self, T => T::try_from(n).is_ok()) }
@@ -257,6 +268,7 @@ pub enum DType { Boolean, Integer(Width), Float(FloatWidth), Complex(ComplexWidt
 
 impl DType {
     /// Whether items of this dtype are whole numbers: Booleans and integers.
+    #[inline]
     pub fn is_integral(self) -> bool { matches!(self, Self::Boolean | Self::Integer(_)) }
     /// This dtype's kind, in the order that NEP 50 promotes kinds: 0 for Booleans, 1 for integers, 2 for floats, 3 for complex numbers and 4 for characters, which don't mix with numbers.
     pub fn kind(self) -> u8 { match self { Self::Boolean => 0, Self::Integer(_) => 1, Self::Float(_) => 2, Self::Complex(_) => 3, Self::Character => 4 } }
@@ -455,6 +467,21 @@ impl Buffer {
         }
         true
     }
+    /// Sets the length to `n` after a writer outside Rust, such as compiled code, filled the first `n` items through `as_mut_ptr`.
+    ///
+    /// # Safety
+    /// `n` is at most the capacity, and the first `n` items are initialized.
+    pub unsafe fn set_len(&mut self, n: usize) {
+        match self {
+            Self::Booleans(v) => unsafe { v.set_len(n) }, Self::Integers(v) => unsafe { v.set_len(n) }, Self::Floats(v) => unsafe { v.set_len(n) },
+            Self::Complexes(v) => unsafe { v.set_len(n) }, Self::Characters(v) => unsafe { v.set_len(n) }
+        }
+    }
+    /// Removes the items, keeping the allocation.
+    pub fn clear(&mut self) {
+        // SAFETY: no items remain, and items have no destructors.
+        unsafe { self.set_len(0) }
+    }
 }
 // Buffers are equal when they hold the same items. Numbers of one kind compare by value across widths. Buffers of different kinds are never equal.
 impl PartialEq for Buffer { fn eq(&self, other: &Self) -> bool { self.view() == other.view() } }
@@ -482,6 +509,12 @@ impl<'a> View<'a> {
             Self::Complexes(v) => DType::Complex(v.tag()), Self::Characters(_) => DType::Character
         }
     }
+    /// Whether the views hold the same items of one dtype, bit for bit. `-0.0` differs from `0.0`, and a NaN is identical to a NaN with the same bits. `==` instead compares values across widths.
+    pub fn identical(self, other: View<'_>) -> bool {
+        // SAFETY: every element type is plain data with no padding, so a view's items read as initialized bytes.
+        let bytes = |v: View<'_>| unsafe { std::slice::from_raw_parts(v.as_ptr(), v.len() * v.dtype().bytes()) };
+        self.dtype() == other.dtype() && bytes(self) == bytes(other)
+    }
 }
 impl PartialEq for View<'_> {
     fn eq(&self, other: &Self) -> bool {
@@ -508,6 +541,8 @@ pub trait Element: Copy + Send + Sync + 'static + crate::gather::Item {
     fn buffer(data: Vec<Self>) -> Buffer;
     /// The items of `buffer`, moved out, when they have this type.
     fn vec(buffer: Buffer) -> Option<Vec<Self>>;
+    /// The items of `buffer` as their vector, when they have this type, for a writer that appends or clears them.
+    fn vec_mut(buffer: &mut Buffer) -> Option<&mut Vec<Self>>;
     /// `b` as an item of this type: 1 or 0 for a number, the Boolean itself, or the characters U+0001 and U+0000. A Boolean mask becomes lanes of the items that a kernel such as [`Choose`](crate::Choose) chooses between. A number converts through an integer, which suits stored Booleans. A comparison's lane mask turns into 1 or 0 faster by a choice between the two, so `Indicator` writes its own (`tolerant::indicated`).
     fn truth(b: bool) -> Self;
 }
@@ -640,11 +675,19 @@ impl Buffer {
     pub fn nonzero(view: View<'_>) -> Vec<usize> {
         with_dtype!(view.dtype(), T => T::of(view).expect("matching dtype").iter().enumerate().filter_map(|(i, &x)| (x != T::FILL).then_some(i)).collect())
     }
-    /// Copies the first `n` items of a structural walk from `base`, using the type's fill for missing positions and whole-slice copies for contiguous runs.
+    /// Whether every item has the first item's bits, as an array of one repeated value does: `0` and `¯0` differ, and a NaN matches only a NaN with its bits. An empty view gives true.
+    pub fn same(view: View<'_>) -> bool {
+        let size = view.dtype().bytes();
+        // SAFETY: a view holds `len` initialised items of `size` bytes each at `as_ptr`, and no element type has padding.
+        let bytes = unsafe { std::slice::from_raw_parts(view.as_ptr(), view.len() * size) };
+        bytes.chunks_exact(size).all(|item| item == &bytes[..size])
+    }
+    /// Copies the first `n` items of a structural walk from `base`, using the type's fill for missing positions and whole-slice copies for contiguous runs. `n` can be shorter than the walk, as it is for a view whose mapping reaches past its own items.
     pub fn walked(view: View<'_>, base: usize, steps: &[crate::gather::Steps], n: usize) -> Self {
         with_dtype!(view.dtype(), T => {
             let mut out = Vec::with_capacity(n);
-            crate::gather::walk_range(&mut out, T::of(view).expect("matching dtype"), base, steps, T::FILL, 0, n, crate::gather::Same);
+            let (base, plan) = crate::gather::Steps::simplify(base, steps);
+            crate::gather::walk_plan(&mut out, T::of(view).expect("matching dtype"), base, &plan, T::FILL, 0, n, crate::gather::Same);
             T::buffer(out)
         })
     }
@@ -673,8 +716,17 @@ impl Buffer {
     pub fn cast(view: View<'_>, dtype: DType) -> Result<Self, Error> {
         Self::cast_mapped(view, &crate::agreement::Mapping::Linear(1), view.len(), dtype)
     }
+    /// The items of `view` at `dtype`, where every item keeps its value. Items convert as [`Buffer::cast`] converts them, and a float that becomes a Boolean or an integer must be whole. A float rounds to a float of another width. A Domain error where an item doesn't keep its value.
+    pub fn kept(view: View<'_>, dtype: DType) -> Result<Self, Error> {
+        let whole = match view { View::Floats(v) => (0..v.len()).all(|i| v.get(i).fract() == 0.0), View::Complexes(v) => (0..v.len()).all(|i| v.get(i).re.fract() == 0.0), _ => true };
+        let lost = || Error::new(Kind::Domain, format!("a {} item doesn't keep its value as {}", view.dtype().name(), dtype.name()));
+        if dtype.is_integral() && !whole { return Err(lost()); }
+        Self::cast(view, dtype).map_err(|_| lost())
+    }
     /// Shared conversion dispatch for compact and mapped logical items. Unselected storage never participates in checked conversion.
     pub(crate) fn cast_mapped(view: View<'_>, mapping: &crate::agreement::Mapping, n: usize, dtype: DType) -> Result<Self, Error> {
+        // The checked conversions below read 0 at a fill, so a chosen fill is read at the items' own dtype first.
+        if mapping.chosen().is_some() { return Self::cast(with_dtype!(view.dtype(), T => T::buffer(read_as::<T, T>(T::of(view).expect("matching dtype"), mapping, n))).view(), dtype); }
         if view.dtype() == dtype {
             if matches!(mapping, crate::agreement::Mapping::Linear(1)) { return Ok(Self::copied(view, 0..n)); }
             if let crate::agreement::Mapping::Steps { base, steps } = mapping { return Ok(Self::walked(view, *base, steps, n)); }
@@ -696,3 +748,29 @@ impl Buffer {
         })
     }
 }
+
+/// A fill that a call chooses: the item that a read gives at each position that reaches no item. Compact data takes one item of its own dtype (`Item`). A frontend's own storage, such as basedpl's nested arrays, takes a value of the frontend's (`Other`), which only the frontend reads. A read with no chosen fill gives its dtype's [`Element::FILL`].
+#[derive(Clone)]
+pub enum Fill { Item(Buffer), Other(std::sync::Arc<dyn std::any::Any + Send + Sync>) }
+
+impl Fill {
+    /// The one item of `value` at `dtype`, where the conversion keeps its value, as [`Buffer::kept`] converts it. A Domain error where the item doesn't keep its value.
+    pub fn new(value: View<'_>, dtype: DType) -> Result<Self, Error> {
+        Buffer::kept(value, dtype).map(Self::Item).map_err(|_| Error::new(Kind::Domain, format!("a {} fill doesn't keep its value as {}", value.dtype().name(), dtype.name())))
+    }
+    /// The item that a read of items of type `A` gives at a position that reaches no item: the chosen `fill`, made for compact data of type `A`, or `A`'s own fill where there's none.
+    pub fn item<A: Element>(fill: Option<&std::sync::Arc<Self>>) -> A {
+        match fill.map(|f| &**f) { None => A::FILL, Some(Self::Item(b)) => A::of(b.view()).expect("a fill has its data's dtype")[0], Some(Self::Other(_)) => panic!("a read of compact data has a compact fill") }
+    }
+}
+
+impl std::fmt::Debug for Fill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { match self { Self::Item(b) => write!(f, "Fill({b:?})"), Self::Other(_) => f.write_str("Fill(frontend value)") } }
+}
+
+impl PartialEq for Fill {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) { (Self::Item(a), Self::Item(b)) => a.view().identical(b.view()), (Self::Other(a), Self::Other(b)) => std::sync::Arc::ptr_eq(a, b), _ => false }
+    }
+}
+impl Eq for Fill {}

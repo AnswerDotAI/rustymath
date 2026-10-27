@@ -29,7 +29,7 @@ pub fn inner_with<E>(a: View<'_>, b: View<'_>, [m, k, n]: [usize; 3],
                 let right_items = b.slice(start * n + column..(end - 1) * n + column + width);
                 let right = if width == n || rows == 1 { Mapping::Linear(1) } else { Mapping::Steps { base: 0, steps: vec![
                     Steps::Stride { start: 0, len: rows, step: n as isize }, Steps::Stride { start: 0, len: width, step: 1 },
-                ] } };
+                ].into() } };
                 let agreement = Agreement {
                     layout: Layout::from([rows, width]), len: rows * width, left: Mapping::Linear(width), right,
                 };

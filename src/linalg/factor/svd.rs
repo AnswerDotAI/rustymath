@@ -415,8 +415,7 @@ fn arrow<R: Native + Tiled<Real = R>>(d: &mut [R], z: &[R], outer: &[usize]) -> 
             order.swap(i - 1, i);
         }
     }
-    let mut rank = vec![0; actual];
-    for (i, &k) in order.iter().enumerate() { rank[k] = i }
+    let rank: Vec<usize> = crate::search::inverse_permutation(order.iter().copied());
     let mut from = vec![0; n];
     for k in 0..n { from[if k < actual { actual - rank[k] - 1 } else { k }] = k }
     let (mut ut, mut vt) = (vec![zero; (n + 1) * (n + 1)], vec![zero; n * n]);

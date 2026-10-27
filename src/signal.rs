@@ -3,7 +3,7 @@ use crate::agreement::{Mapping, LINE};
 use crate::buffer::Element;
 use crate::error::{Error, Kind};
 use crate::gather::{self, Steps};
-use crate::layout::{strides, Layout};
+use crate::layout::{count, strides, Layout};
 use crate::linalg::{Inner, Mapped, Orientation, Scalar};
 use crate::structure::{self, Plan, Windows};
 use std::borrow::Cow;
@@ -64,7 +64,6 @@ pub fn correlation(input: &[usize], kernel: &[usize], slide: usize, mode: Mode, 
         false => Steps::along(kernel[a], at[a]),
     }).collect();
     let outputs = &kernel[rank..];
-    let count = |n: &[usize]| n.iter().product::<usize>();
     let size = [count(slid.frame()), count(slid.cell()), count(outputs)];
     Ok(Correlation { padding, windows, kernel: Plan { layout: Layout::from(kernel.to_vec()), steps }, size, shape: [slid.frame(), outputs].concat() })
 }
@@ -74,12 +73,12 @@ pub fn correlate<T: Element, P: Inner<T>>(pair: &P, x: &[T], kernel: &[T], c: &C
     let padded = match &c.padding {
         None => Cow::Borrowed(x),
         Some(p) => {
-            let mut out = Vec::with_capacity(p.layout.shape().iter().product());
+            let mut out = Vec::with_capacity(p.layout.count());
             gather::walk(&mut out, x, 0, &p.steps, T::FILL, gather::Same);
             Cow::Owned(out)
         }
     };
-    let read = |plan: &Plan| Mapping::Steps { base: 0, steps: plan.steps.clone() };
+    let read = |plan: &Plan| Mapping::Steps { base: 0, steps: plan.steps.clone().into() };
     let (windows, reversed) = (read(&c.windows), read(&c.kernel));
     pair.inner_mapped(Mapped { data: &padded, mapping: &windows }, Mapped { data: kernel, mapping: &reversed }, [Orientation::Normal; 2], c.size)
 }

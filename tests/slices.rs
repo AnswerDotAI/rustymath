@@ -355,7 +355,7 @@ mod reductions {
         ] {
             let mut built = Vec::new();
             walk(&mut built, &x, 0, &steps, 0, Same);
-            let mapping = Mapping::Steps { base: 0, steps };
+            let mapping = Mapping::Steps { base: 0, steps: steps.into() };
             for axis in 0..shape.len() {
                 let dims = Lanes::new(&shape, axis).unwrap().dims();
                 let (mut totals, fits, order) = along_mapped::<i64, Sum>(&x, &mapping, &shape, axis);
@@ -363,7 +363,7 @@ mod reductions {
                 assert_eq!((totals, fits), along::<i64, Sum>(&built, dims), "{shape:?} {axis}");
             }
         }
-        let pool = Mapping::Steps { base: 0, steps: vec![s(0, 2, 12), s(0, 3, 2), s(0, 2, 6), s(0, 2, 1)] };
+        let pool = Mapping::Steps { base: 0, steps: vec![s(0, 2, 12), s(0, 3, 2), s(0, 2, 6), s(0, 2, 1)].into() };
         let block = Block { range: 0..24, dims: vec![2, 2, 3, 2], axes: vec![Some((0, false)), Some((2, false)), Some((1, false)), Some((3, false))] };
         assert_eq!(pool.block(&[2, 3, 2, 2]), Some(block));
     }
@@ -564,11 +564,11 @@ mod reductions {
         assert_eq!(sliding_2d::<i64, Sum>(&[0; 80], [1, 4, 1, 20, 1], [2, 9], [1, 1]), None);
     }
 
-    /// Folds that run in pieces, of long lanes and of single matrices down their columns, and folds of many short lanes or groups, which split across threads, match the sums taken lane by lane, on one thread and on four.
+    /// Folds that run in pieces, of long lanes and of single matrices down their columns, folds of many short lanes or groups, and folds of a few wide rows by columns, which split across threads, match the sums taken lane by lane, on one thread and on four.
     #[test]
     fn long_and_many_lanes() {
         let _threads = crate::support::threads_lock();
-        for shape in [[1, (3 << 18) + 5, 1], [2, (1 << 18) + 7, 3], [5000, 200, 1], [300, 50, 70], [1, 2000, 300], [1, 600, 2000]] {
+        for shape in [[1, (3 << 18) + 5, 1], [2, (1 << 18) + 7, 3], [5000, 200, 1], [300, 50, 70], [1, 2000, 300], [1, 600, 2000], [1, 8, 100000], [3, 5, 60000]] {
             let x: Vec<i64> = (0..shape.iter().product::<usize>()).map(|i| (i * 37 % 101) as i64 - 50).collect();
             let lanes = lanes_of(&x, shape);
             let sums: Vec<i64> = lanes.iter().map(|l| l.iter().sum()).collect();
@@ -635,6 +635,35 @@ mod search {
         assert!(quantiles(&mut x, &[1.5]).is_err() && quantiles(&mut x, &[f64::NAN]).is_err());
         let part = view_partition(View::Floats(rustymath::buffer::Floats::F64(&[f64::NAN, -0., 0., 3.])), 1).unwrap();
         assert_eq!(f64::of(part.view()).unwrap()[1], 0.);
+    }
+
+    #[test]
+    fn float_sorts_follow_total_keys() {
+        use rustymath::{buffer::Element, Float};
+        fn check<F: Float + Element>(x: &[F], dims @ [outer, n, inner]: [usize; 3], bits: impl Fn(F) -> u64) {
+            for down in [false, true] {
+                let got = F::vec(view_sort_along(F::view(x), dims, down).unwrap().unwrap()).unwrap();
+                for (o, i) in (0..outer).flat_map(|o| (0..inner).map(move |i| (o, i))) {
+                    let at = |k: usize| (o * n + k) * inner + i;
+                    let mut keys: Vec<_> = (0..n).map(|k| x[at(k)].total_key()).collect();
+                    keys.sort();
+                    if down { keys.reverse() }
+                    let want: Vec<u64> = keys.into_iter().map(|k| bits(F::from_order_key(k))).collect();
+                    assert_eq!((0..n).map(|k| bits(got[at(k)])).collect::<Vec<_>>(), want, "{dims:?} {down}");
+                }
+            }
+        }
+        // Every 11th item is special: NaNs of both signs and a signalling one, both zeros, both infinities, a subnormal. The rest are whole numbers with many repeats.
+        let specials = [f64::NAN, -f64::NAN, f64::from_bits(0x7ff0_0000_0000_0001), -0.0, 0.0, f64::INFINITY, -f64::INFINITY, 5e-324, -1.5, 1.5];
+        // Lengths below, inside and above the range that the network sorts, and around its powers of two.
+        for n in [0, 1, 7, 31, 32, 33, 63, 64, 65, 100, 255, 256, 257, 1000, 1024, 8191, 8192, 8193, 16384, 16385] {
+            for dims in [[1, n, 1], [3, n, 2]] {
+                let x: Vec<f64> = (0..dims.iter().product()).map(|i| if i % 11 == 0 { specials[i / 11 % specials.len()] }
+                    else { (i as f64 * 0.618034 % 1.0 * 64.0).round() - 32.0 }).collect();
+                check(&x, dims, f64::to_bits);
+                check(&x.iter().map(|&v| v as f32).collect::<Vec<_>>(), dims, |v: f32| v.to_bits().into());
+            }
+        }
     }
 
     #[test]
@@ -709,7 +738,7 @@ mod search {
                 expected.sort_by_key(|&i| { let k = (rows[i as usize * 3] as u16 ^ 1 << 15, second[i as usize].order_key()); if down { (!k.0, !k.1) } else { k } });
                 let order = view_lexgrade(n, [(i16::view(&rows), 0, 3), (f32::view(&second), 0, 1)].into_iter(), down).unwrap();
                 assert_eq!(order, expected);
-                let ranks = inverse_permutation(order.iter().map(|&i| i as usize));
+                let ranks = inverse_permutation::<u32>(order.iter().map(|&i| i as usize));
                 for (rank, &position) in order.iter().enumerate() { assert_eq!(ranks[position as usize], rank as u32); }
             }
         }
@@ -1017,7 +1046,7 @@ mod tolerant {
 }
 
 mod gather {
-    use rustymath::{gather::{scatter, scatter_walk, walk, walk_range, Same, Steps}, structure::Walk};
+    use rustymath::{agreement::{expanded_items, Mapping}, buffer::Element, gather::{scatter, scatter_walk, walk, Same, Steps}, structure::Walk};
     /// The items of `s` that `steps` reach from `base`, with -1 for a fill.
     fn read(s: &[i64], base: usize, steps: &[Steps]) -> Vec<i64> {
         let mut out = vec![];
@@ -1028,6 +1057,7 @@ mod gather {
     #[test]
     fn walks_reach_and_run_agree() {
         assert_eq!(read(&[], 1, &[Steps::table(vec![Steps::FILL; 2]), along(2, 3)]), [-1; 4]);
+        assert!(read(&[], 0, &[Steps::padded(0, 0, 0, 1, rustymath::structure::Edge::Wrap)]).is_empty());
         // Each item of `s` is its own offset, so a walk shows the offsets it read.
         let s: Vec<i64> = (0..600).collect();
         let cases = [
@@ -1057,10 +1087,12 @@ mod gather {
             walk(&mut mapped, &s, *base, steps, -1, |x: i64| x);
             assert_eq!(whole, mapped);
             for (i, &x) in whole.iter().enumerate() { assert_eq!(Steps::reach(*base, steps, i).map_or(-1, |o| o as i64), x) }
+            // A mapping reads parts of the walk through the plan that it keeps, with the type's fill.
+            let mapping = Mapping::Steps { base: *base, steps: steps.clone().into() };
+            let filled: Vec<i64> = whole.iter().map(|&x| if x == -1 { i64::FILL } else { x }).collect();
             for (from, n) in [(1, 7), (5, whole.len() - 5), (0, whole.len())] {
-                let mut part = vec![];
-                walk_range(&mut part, &s, *base, steps, -1, from, n, Same);
-                assert_eq!(part, whole[from..from + n]);
+                let mut buf = vec![];
+                assert_eq!(expanded_items(&mapping, &s, from, n, &mut buf), &filled[from..from + n]);
             }
             // `scatter_walk` writes where the walk reads, in the same order, so it agrees with `scatter` at the listed offsets, for many items and for one.
             let offsets = Steps::combined(*base, steps);
@@ -1096,6 +1128,59 @@ mod gather {
         let one = [ix(vec![1, 0]), Selector::At(2)];
         assert_eq!(read(&s, 0, &select(&layout, one.to_vec(), true).unwrap().steps), read(&s, 0, &select(&layout, one.to_vec(), false).unwrap().steps));
     }
+    /// Index arrays read as strides wherever their positions step evenly along each of their axes, alone or paired. Paired arrays that share no axis keep their own positions, as `⌷` keeps them, so a data-dependent array beside an evenly spaced one reads as a table and a stride. Arrays that share axes sum their positions, and an array that lacks one of those axes repeats along it.
+    #[test]
+    fn index_arrays_read_as_strides() {
+        use rustymath::{gather::{Steps, Table}, layout::Layout, structure::{select, Selector}};
+        let ix = |names: &[&str], shape: &[usize], positions: Vec<usize>| {
+            let layout = Layout::from(shape.to_vec()).with_names(names.iter().map(|&n| Some(n.into())).collect()).unwrap();
+            Selector::Indices { layout, positions: Table::new(positions) }
+        };
+        let s: Vec<i64> = (0..24).collect();
+        let m = Layout::from([4, 6]);
+        let whole = select(&m, vec![ix(&["r"], &[4], (0..4).collect()), ix(&["c"], &[6], (0..6).collect())], true).unwrap();
+        assert!(Steps::in_order(&whole.steps));
+        let diagonal = select(&Layout::from([4, 4]), vec![ix(&["i"], &[4], (0..4).collect()), ix(&["i"], &[4], (0..4).collect())], true).unwrap();
+        assert_eq!(diagonal.steps, [Steps::Stride { start: 0, len: 4, step: 5 }]);
+        let windows = select(&m, vec![Selector::all(4), ix(&["p", "q"], &[2, 3], vec![0, 1, 2, 2, 3, 4])], true).unwrap();
+        assert!(windows.steps.iter().all(|s| matches!(s, Steps::Stride { .. })));
+        assert_eq!(read(&s, 0, &windows.steps)[..6], [0, 1, 2, 2, 3, 4]);
+        let rows = select(&m, vec![ix(&["r"], &[4], vec![2, 0, 3, 1]), ix(&["c"], &[6], (0..6).collect())], true).unwrap();
+        assert!(matches!(rows.steps[..], [Steps::Table(_), Steps::Stride { .. }]));
+        assert_eq!(read(&s, 0, &rows.steps), [12..18, 0..6, 18..24, 6..12].into_iter().flatten().collect::<Vec<i64>>());
+        let sum = select(&m, vec![ix(&["i", "j"], &[2, 3], vec![0, 1, 2, 1, 2, 3]), ix(&["j"], &[3], vec![0, 1, 2])], true).unwrap();
+        assert_eq!(sum.steps, [Steps::Stride { start: 0, len: 2, step: 6 }, Steps::Stride { start: 0, len: 3, step: 7 }]);
+        let spread = select(&m, vec![ix(&["i", "j"], &[2, 3], vec![3, 0, 2, 1, 1, 0]), ix(&["j"], &[3], vec![5, 0, 4])], true).unwrap();
+        assert_eq!(read(&s, 0, &spread.steps), [23, 0, 16, 11, 6, 4]);
+        // An inner axis that steps down starts at its far end, so that each stride's own offsets stay at or above 0.
+        let back = select(&m, vec![ix(&["p", "q"], &[2, 2], vec![1, 0, 1, 0])], true).unwrap();
+        assert_eq!(back.steps[..2], [Steps::Stride { start: 0, len: 2, step: 0 }, Steps::Stride { start: 6, len: 2, step: -6 }]);
+        assert_eq!(read(&s, 0, &back.steps), [6..12, 0..6, 6..12, 0..6].into_iter().flatten().collect::<Vec<i64>>());
+    }
+    /// An index array whose positions read a stretch of one axis past its ends, as `•edge`'s modes and positions that count back from the end give them, reads as one `Padded` entry, or as a `Rotated` one where it wraps once round the whole axis. Each reads what its table reads. Positions in any other order stay a table.
+    #[test]
+    fn index_arrays_read_past_edges() {
+        use rustymath::{gather::{Steps, Table}, layout::Layout, structure::{select, Edge, Selector}};
+        const F: usize = Steps::FILL;
+        let s: Vec<i64> = (0..24).collect();
+        // The rows of a 4 by 6 array at `positions`, checked against a table of them.
+        let rows = |positions: &[usize]| {
+            let layout = Layout::from([positions.len()]).with_names(vec![Some("r".into())]).unwrap();
+            let plan = select(&Layout::from([4, 6]), vec![Selector::Indices { layout, positions: Table::new(positions.to_vec()) }, Selector::all(6)], true).unwrap();
+            let table = Steps::table(positions.iter().map(|&p| if p == F { F } else { 6 * p }).collect());
+            assert_eq!(read(&s, 0, &plan.steps), read(&s, 0, &[table, along(6, 1)]));
+            plan.steps[0].clone()
+        };
+        let padded = |start, len, edge| Steps::Padded { start, len, size: 4, stride: 6, edge };
+        assert_eq!(rows(&[3, 0, 1, 2]), Steps::Rotated { shift: 3, len: 4, stride: 6 });
+        assert_eq!(rows(&[3, 0, 1]), padded(-1, 3, Edge::Wrap));
+        assert_eq!(rows(&[F, 0, 1, 2, 3, F]), padded(-1, 6, Edge::Fill));
+        assert_eq!(rows(&[1, 2, 3, F]), padded(1, 4, Edge::Fill));
+        assert_eq!(rows(&[0, 0, 0, 1]), padded(-2, 4, Edge::Clamp));
+        assert_eq!(rows(&[2, 1, 0, 1]), padded(-2, 4, Edge::Reflect));
+        assert_eq!(rows(&[1, 0, 0, 1]), padded(-2, 4, Edge::Symmetric));
+        assert!(matches!(rows(&[2, 0, 3, 1]), Steps::Table(_)));
+    }
     /// A padded axis reads its edge mode's positions past its ends. Centred windows of 3 over 4 items read one position before the axis and one after it. A padded size of 0 is an error.
     #[test]
     fn window_padding() {
@@ -1114,7 +1199,7 @@ mod gather {
     #[test]
     fn walks_compose() {
         let s: Vec<i64> = (0..600).collect();
-        // An array of shape 6 by 10 stored from offset 5 with strides 30 and 2, read through reversed rows, a take, a rotation and a clipped read.
+        // An array of shape 6 by 10 stored from offset 5 with strides 30 and 2, read through reversed rows, a take, a rotation, a clipped read, and one row with fill around it, whose entry walks no axis.
         let (shape, inner) = ([6, 10], [along(6, 30), along(10, 2)]);
         let array = read(&s, 5, &inner);
         for outer in [
@@ -1122,6 +1207,7 @@ mod gather {
             vec![Steps::Stride { start: 10, len: 4, step: 10 }, Steps::Stride { start: 2, len: 5, step: 1 }],
             vec![along(6, 10), Steps::Rotated { shift: 3, len: 10, stride: 1 }],
             vec![along(6, 10), Steps::clipped(-2, 12, 10, 1)],
+            vec![Steps::clipped(-2, 6, 1, 0), along(10, 1)],
         ] {
             let (base, steps) = Steps::through(&outer, &shape, 5, &inner).expect("these reads compose");
             assert_eq!(read(&s, base, &steps), read(&array, 0, &outer));

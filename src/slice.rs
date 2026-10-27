@@ -8,7 +8,7 @@ use std::mem::MaybeUninit;
 pub const CHUNK: usize = 4096;
 
 /// How many independent running values a loop keeps, each of `size` bytes: a fold's partial results, or a block of items under Horner's rule. 32 measured faster on the Mac than 8 or 16 for items of up to 8 bytes. A 16-byte item, such as a `Complex<f64>`, keeps 16, because 32 fill every vector register, and a complex sum then took 1.7 times as long. In wasm, LLVM leaves 32 values of 8 bytes, or 16 of 16 bytes, in linear memory, where each step loads and stores them. It keeps half as many in locals.
-pub(crate) const fn running(size: usize) -> usize {
+pub const fn running(size: usize) -> usize {
     let wasm = cfg!(target_arch = "wasm32");
     if size >= 16 { if wasm { 8 } else { 16 } } else if wasm && size == 8 { 16 } else { 32 }
 }
@@ -25,12 +25,12 @@ impl<'a, T: Copy> Arg<'a, T> {
     pub fn nth(self, i: usize) -> T { match self { Arg::One(v) => v, Arg::Many(s) => s[i] } }
     /// Items `start..start + n` of this argument, each converted by `f`. A `Many` argument converts into `buf`.
     #[inline]
-    pub fn converted<'b, A: Send>(self, start: usize, n: usize, buf: &'b mut Vec<A>, f: impl Fn(T) -> A + Sync) -> Arg<'b, A> where T: Sync {
+    pub fn converted<'b, A>(self, start: usize, n: usize, buf: &'b mut Vec<A>, f: impl Fn(T) -> A) -> Arg<'b, A> {
         match self.part(start, n) {
             Arg::One(v) => Arg::One(f(v)),
-            many => {
+            Arg::Many(items) => {
                 buf.clear();
-                pairs(many, Arg::One(()), n, buf, |v, ()| (f(v), true));
+                buf.extend(items.iter().map(|&v| f(v)));
                 Arg::Many(buf)
             }
         }
@@ -137,6 +137,23 @@ impl<E: Item, K: Forms<E, 2>> Forms<E, 2> for Flipped<K> {
     fn judged_scalar(&self, [x, y]: [E; 2]) -> (K::Out, bool) { self.0.judged_scalar([y, x]) }
     #[inline]
     fn slice(&self, [x, y]: [Arg<'_, E>; 2], n: usize, out: &mut [MaybeUninit<K::Out>]) -> bool { self.0.slice([y, x], n, out) }
+}
+
+/// `K` as a two-argument object that ignores its left argument, as a [`Binary`] at each item type where `K` is a [`Unary`]: `Right(k).one(x, y)` is `k.one(y)`. A caller uses one where a constant left argument names the function, as basedpl's `2√y` runs [`Sqrt`](crate::Sqrt).
+#[derive(Clone, Copy, Debug)]
+pub struct Right<K>(pub K);
+
+impl<E: Item, K: Forms<E, 1>> Forms<E, 2> for Right<K> {
+    type Out = K::Out;
+    const TOTAL: bool = K::TOTAL;
+    const WRAPS: bool = K::WRAPS;
+    const INLINE: bool = K::INLINE;
+    #[inline]
+    fn scalar(&self, [_, y]: [E; 2]) -> K::Out { self.0.scalar([y]) }
+    #[inline]
+    fn judged_scalar(&self, [_, y]: [E; 2]) -> (K::Out, bool) { self.0.judged_scalar([y]) }
+    #[inline]
+    fn slice(&self, [_, y]: [Arg<'_, E>; 2], n: usize, out: &mut [MaybeUninit<K::Out>]) -> bool { self.0.slice([y], n, out) }
 }
 
 /// `K` with no result failing. Each result is `K`'s, wrapped to its type, as static kinds and NumPy keep integer results. LLVM removes `K`'s test of whether a result fits, because the loop never reads it. The adapter suits an object whose scalar form is its whole computation, as integer arithmetic's is.
@@ -454,13 +471,13 @@ pub fn pairs<X: Copy + Sync, Y: Copy + Sync, B: Send>(x: Arg<'_, X>, y: Arg<'_, 
 }
 
 /// [`pairs`], writing into the `n` slots of `out` in place of appending to a vector. It runs [`triples_into`]'s loops with a unit first argument, which go straight to [`each_pair!`]'s.
-#[inline]
+#[inline(always)]
 pub(crate) fn pairs_into<X: Copy, Y: Copy, B>(x: Arg<'_, X>, y: Arg<'_, Y>, n: usize, out: &mut [MaybeUninit<B>], f: impl Fn(X, Y) -> (B, bool)) -> bool {
     triples_into(Arg::One(()), x, y, n, out, #[inline(always)] |(), a, b| f(a, b))
 }
 
 /// [`pairs_into`] for three arguments, which `mapped` runs for a function object of three arguments.
-#[inline]
+#[inline(always)]
 fn triples_into<X: Copy, Y: Copy, Z: Copy, B>(x: Arg<'_, X>, y: Arg<'_, Y>, z: Arg<'_, Z>, n: usize, out: &mut [MaybeUninit<B>], f: impl Fn(X, Y, Z) -> (B, bool)) -> bool {
     let (out, mut ok) = (&mut out[..n], true);
     each_triple!(x, y, z, n, |i, a, b, c| {

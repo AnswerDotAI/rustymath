@@ -1,17 +1,17 @@
 //! Plans for structural operations: take and drop, rotate and reverse, windows, transpose and catenate. A plan gives the result's layout, and `Steps` that read the result's items from the argument's items in order. `gather::walk` copies a compact array by a plan, and basedpl copies its other arrays by the same plan. Each plan checks its arguments.
 use crate::error::{Error, Kind};
-use crate::gather::{IndexSource, IndexValue, Steps, Table};
+use crate::gather::{IndexSource, IndexValue, Steps, Table, Writes};
 use crate::{buffer::View, float::Float, tolerant::{Tolerance, Tolerant}};
 use crate::agreement::{Agreement, Mapping};
-use crate::layout::{agreed, generated_len, names_conflict, strides, Keys, Lanes, Layout};
-use std::sync::Arc;
+use crate::layout::{agreed, generated_len, names_conflict, shown, strides, Keys, Lanes, Layout};
+use std::{borrow::Cow, sync::Arc};
 
 /// A structural result's layout, and the steps that read its items from the argument. The steps' lengths multiply to the result's item count, outermost first. One entry can cover several result axes.
 #[derive(Clone, Debug)]
 pub struct Plan { pub layout: Layout, pub steps: Vec<Steps> }
 
 /// Written index parts, before the selected axes and their lengths are known.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum IndexPart<T> { Axis(T), All, NewAxis, Rest }
 impl<T> IndexPart<T> {
     /// The part with its axis payload borrowed.
@@ -109,21 +109,20 @@ impl Selector {
     pub fn all(len: usize) -> Self { Selector::Range { start: 0, len, step: 1 } }
 }
 
-/// Selects with one selector for each leading axis of `layout`, in order, keeping the axes that no selector mentions. A single position removes its axis, and a range keeps it in place. An index array's axes replace its axis. An unnamed vector keeps the axis's name and the keys at the positions it selects, as a named vector without keys of its own keeps those keys, and an unnamed index array of another rank has plain axes. Index arrays pair, as arguments pair in arithmetic: all of them with `broadcast`, as `.[]` reads them, and otherwise those that share an axis name, as `⌷` reads them. Paired index arrays put their axes where the first of them was. A range pairs with an index array that has its axis's name.
+/// Selects with one selector for each leading axis of `layout`, in order, keeping the axes that no selector mentions. A single position removes its axis, and a range keeps it in place. An index array's axes replace its axis. An unnamed vector keeps the axis's name and the keys at the positions it selects, as a named vector without keys of its own keeps those keys, and an unnamed index array of another rank has plain axes. Index arrays pair, as arguments pair in arithmetic: all of them with `broadcast`, as `.[]` reads them, and otherwise those that share an axis name, as `⌷` reads them. Paired index arrays put their axes where the first of them was. A range pairs with an index array that has its axis's name. Positions that step evenly along each axis read as strides (`strided`), whether one index array gives them or paired arrays sum to them. One index array whose positions read a stretch of its axis past the ends, as edge modes and positions that count back from the end give them, reads as one padded or rotated entry.
 pub fn select(layout: &Layout, selectors: Vec<Selector>, broadcast: bool) -> Result<Plan, Error> {
     let (shape, stride) = (layout.shape(), strides(layout.shape()));
     let mut parts = Vec::with_capacity(shape.len());
     let mut axis = 0;
     for selector in selectors {
-        if matches!(selector, Selector::NewAxis) { parts.push(Part::new(Steps::along(1, 0), Layout::from([1]), 0)); continue; }
+        if matches!(selector, Selector::NewAxis) { parts.push(Part::new(Steps::along(1, 0), Layout::from([1]), 0, 1)); continue; }
         if axis == shape.len() { return Err(Error::new(Kind::Index, "too many axis selectors")); }
         parts.push(Part::of(selector, layout, axis, stride[axis])?);
         axis += 1;
     }
-    parts.extend((axis..shape.len()).map(|a| Part::new(Steps::along(shape[a], 1), layout.axes(a..a + 1), stride[a])));
+    parts.extend((axis..shape.len()).map(|a| Part::new(Steps::along(shape[a], 1), layout.axes(a..a + 1), stride[a], shape[a])));
     let names: Vec<Arc<str>> = parts.iter().filter(|p| p.array).flat_map(|p| p.axes.names().iter().flatten().cloned()).collect();
     for part in parts.iter_mut().filter(|p| !p.array && p.axes.name(0).is_some_and(|n| names.contains(n))) {
-        part.steps = Steps::table(part.steps.offsets().map(|o| o.expect("a range has no fills")).collect());
         part.array = true;
     }
     // The index arrays that pair, each group in order.
@@ -138,38 +137,41 @@ pub fn select(layout: &Layout, selectors: Vec<Selector>, broadcast: bool) -> Res
     }
     let mut group_of = vec![usize::MAX; parts.len()];
     for (g, members) in groups.iter().enumerate() { for &p in members { group_of[p] = g; } }
-    let mut joined = groups.iter().map(|g| if g.len() > 1 { joined(&parts, g, broadcast).map(Some) } else { Ok(None) }).collect::<Result<Vec<_>, _>>()?;
-    let (mut result, mut steps) = (Layout::EMPTY, Vec::with_capacity(parts.len()));
-    for (p, part) in parts.into_iter().enumerate() {
-        if group_of[p] != usize::MAX && groups[group_of[p]].len() > 1 {
-            if let Some((axes, table)) = joined[group_of[p]].take() { result = result.concat(&axes); steps.push(table); }
+    // At most one entry for each axis that a part reads along, or one for a part with none.
+    let (mut result, mut steps) = (Layout::EMPTY, Vec::with_capacity(parts.iter().map(|p| p.axes.shape().len().max(1)).sum()));
+    for p in 0..parts.len() {
+        // Paired index arrays read where the first of them was.
+        if let Some(group) = groups.get(group_of[p]).filter(|g| g.len() > 1) {
+            if group[0] == p { result = result.concat(&joined(&parts, group, broadcast, &mut steps)?); }
             continue;
         }
+        let part = &mut parts[p];
         result = result.concat(part.alone.as_ref().unwrap_or(&part.axes));
-        steps.push(part.steps.scaled(part.stride));
+        let entry = std::mem::replace(&mut part.steps, Steps::along(0, 0)).scaled(part.stride);
+        if part.array { strided(entry, part.axes.shape(), Some((part.size, part.stride)), &mut steps); } else { steps.push(entry); }
     }
     generated_len(result.shape())?;
     Ok(Plan { layout: result, steps })
 }
 
-/// One selector's share of a plan: positions along its axis, before scaling by the axis's `stride`, and the result axes they run along. An index array that pairs with nothing takes `alone` as its axes, where it has them.
-struct Part { steps: Steps, axes: Layout, stride: usize, array: bool, alone: Option<Layout> }
+/// One selector's share of a plan: positions along its axis, before scaling by the axis's `stride`, the axis's `size`, and the result axes they run along. An index array that pairs with nothing takes `alone` as its axes, where it has them.
+struct Part { steps: Steps, axes: Layout, stride: usize, size: usize, array: bool, alone: Option<Layout> }
 
 impl Part {
-    fn new(steps: Steps, axes: Layout, stride: usize) -> Self { Part { steps, axes, stride, array: false, alone: None } }
+    fn new(steps: Steps, axes: Layout, stride: usize, size: usize) -> Self { Part { steps, axes, stride, size, array: false, alone: None } }
 
     /// The part that `selector` reads along `axis` of `layout`, whose items lie `stride` apart.
     fn of(selector: Selector, layout: &Layout, axis: usize, stride: usize) -> Result<Self, Error> {
         let size = layout.shape()[axis];
         let outside = || Error::new(Kind::Index, "axis selector is outside its axis");
         match selector {
-            Selector::At(i) if i < size => Ok(Part::new(Steps::Stride { start: i, len: 1, step: 0 }, Layout::EMPTY, stride)),
+            Selector::At(i) if i < size => Ok(Part::new(Steps::Stride { start: i, len: 1, step: 0 }, Layout::EMPTY, stride, size)),
             Selector::At(_) => Err(outside()),
             Selector::Range { start, len, step } => {
                 if len > 0 && !(start < size && start.checked_add_signed(step.saturating_mul((len - 1) as isize)).is_some_and(|i| i < size)) { return Err(outside()); }
                 let steps = Steps::Stride { start, len, step };
                 let axes = layout.select(axis, steps.offsets())?.axes(axis..axis + 1);
-                Ok(Part::new(steps, axes, stride))
+                Ok(Part::new(steps, axes, stride, size))
             }
             Selector::Indices { layout: within, positions } => {
                 if generated_len(within.shape())? != positions.len() { return Err(Error::new(Kind::Length, "index array shape doesn't fit its positions")); }
@@ -182,15 +184,15 @@ impl Part {
                     _ if !within.has_names() => Some(Layout::from(within.shape().to_vec())),
                     _ => None,
                 };
-                Ok(Part { steps, axes: within, stride, array: true, alone })
+                Ok(Part { steps, axes: within, stride, size, array: true, alone })
             }
             Selector::NewAxis => unreachable!("a new axis reads no positions"),
         }
     }
 }
 
-/// The axes that paired index arrays agree on, and the offset at each of their items: the sum of each array's scaled position there. A fill in any array makes a fill.
-fn joined(parts: &[Part], group: &[usize], broadcast: bool) -> Result<(Layout, Steps), Error> {
+/// The axes that paired index arrays agree on, with the entries that read them pushed onto `steps`, one for each run of those axes: the fewest consecutive axes that hold all the axes of each array in the run. An array alone in its run reads through its own positions, as an array that pairs with nothing does. Where every array in a run steps evenly through its positions (`Steps::even`), and the run's axes have no keys, the run reads as one `Stride` for each of its axes, whose step is the sum of each array's step along that axis times the array's stride, and no table is built. Otherwise the arrays add their scaled positions into one table, where a fill in any of them makes a fill. An array that lies along the whole run adds its positions in chunks, and one that broadcasts along it adds them in the runs that a walk through its mapping reaches. The table reads as strides where its offsets are affine (`strided`).
+fn joined(parts: &[Part], group: &[usize], broadcast: bool, steps: &mut Vec<Steps>) -> Result<Layout, Error> {
     let mut frame = parts[group[0]].axes.clone();
     let mut pairs = vec![(0..frame.shape().len()).collect::<Vec<_>>()];
     for &p in &group[1..] {
@@ -198,17 +200,69 @@ fn joined(parts: &[Part], group: &[usize], broadcast: bool) -> Result<(Layout, S
         frame = Agreement::paired(&frame, &parts[p].axes, &axes)?.layout;
         pairs.push(axes);
     }
-    let len = generated_len(frame.shape())?;
-    let mut table = vec![0; len];
-    for (&p, axes) in group.iter().zip(&pairs) {
-        let Part { steps, axes: own, stride, .. } = &parts[p];
-        let add = |t: &mut usize, o: Option<usize>| *t = match o { Some(o) if *t != Steps::FILL => *t + o * stride, _ => Steps::FILL };
-        match (Mapping::new(own, axes, &frame, len), steps) {
-            (Mapping::Linear(1), Steps::Table(positions)) => positions.chunks(|j0, run| for (t, &o) in table[j0..].iter_mut().zip(run) { add(t, Some(o).filter(|&o| o != Steps::FILL)) }),
-            (map, _) => for (b, t) in table.iter_mut().enumerate() { add(t, map.get(b).and_then(|j| steps.get(j))) },
+    let rank = frame.shape().len();
+    // A run ends after axis `a` unless some array has axes on both sides of it. An array with no axes reads in the first run.
+    let crosses = |a: usize| pairs.iter().any(|axes| axes.iter().any(|&b| b <= a) && axes.iter().any(|&b| b > a));
+    let mut start = 0;
+    for end in (1..=rank).filter(|&end| end == rank || !crosses(end - 1)).chain((rank == 0).then_some(0)) {
+        let run = start..end;
+        start = end;
+        let lens = &frame.shape()[run.clone()];
+        let members = || (0..group.len()).filter(|&m| pairs[m].first().map_or(run.start == 0, |a| run.contains(a)));
+        let mut lone = members();
+        if let (Some(m), None) = (lone.next(), lone.next()) && pairs[m].iter().copied().eq(run.clone()) {
+            let Part { steps: own, stride, size, .. } = &parts[group[m]];
+            strided(own.clone().scaled(*stride), lens, Some((*size, *stride)), steps);
+            continue;
         }
+        let at = steps.len();
+        steps.extend(lens.iter().map(|&len| Steps::Stride { start: 0, len, step: 0 }));
+        let mut first = 0;
+        let summed = !lens.is_empty() && run.clone().all(|a| frame.keys(a).is_none()) && members().all(|m| {
+            let Part { steps: own, axes, stride, .. } = &parts[group[m]];
+            let Some(Steps::Stride { start, step, .. }) = own.even() else { return false };
+            first += start * stride;
+            // The positions step through the array's own axes in row-major order, so each axis steps by the array's step times the axis's width.
+            let mut width = step * *stride as isize;
+            for (&a, &len) in pairs[m].iter().zip(axes.shape()).rev() {
+                if len > 1 && let Steps::Stride { step, .. } = &mut steps[at + a - run.start] { *step += width; }
+                width *= len as isize;
+            }
+            true
+        });
+        if summed { Steps::settle(&mut steps[at..], first); continue; }
+        steps.truncate(at);
+        let within = if run.len() == rank { Cow::Borrowed(&frame) } else { Cow::Owned(frame.axes(run.clone())) };
+        let len = generated_len(lens)?;
+        let mut table = vec![0; len];
+        for m in members() {
+            let Part { steps: own, axes, stride, .. } = &parts[group[m]];
+            let add = |t: &mut usize, o: Option<usize>| *t = match o { Some(o) if *t != Steps::FILL => *t + o * stride, _ => Steps::FILL };
+            let shifted: Vec<usize>;
+            let along = if run.start == 0 { &pairs[m] } else { shifted = pairs[m].iter().map(|&a| a - run.start).collect(); &shifted };
+            match (Mapping::new(axes, along, &within, len), own) {
+                (Mapping::Linear(1), Steps::Table(positions)) => positions.chunks(|j0, offsets| for (t, &o) in table[j0..].iter_mut().zip(offsets) { add(t, Some(o).filter(|&o| o != Steps::FILL)) }),
+                (map, _) => {
+                    let (base, tables) = map.to_walk(lens);
+                    Writes::Walk { base, steps: &tables }.runs_while(&mut |k, reads| {
+                        for (t, &j) in table[k..].iter_mut().zip(reads) { add(t, (j != Steps::FILL).then(|| own.get(j)).flatten()) }
+                        true
+                    });
+                }
+            }
+        }
+        strided(Steps::table(table), lens, None, steps);
     }
-    Ok((frame, Steps::table(table)))
+    Ok(frame)
+}
+
+/// Pushes `entry`, which reads the axes of `lens`, onto `into`: as one `Stride` for each of those axes where its offsets are affine (`Table::affine`), as one `Padded` or `Rotated` entry where `lens` is one axis read past the ends of the source axis whose size and stride `axis` gives (`Table::edged`), or else as it is. A copy reads strides in place, and the transpose of a copy through strides reads back where a table would scatter.
+fn strided(entry: Steps, lens: &[usize], axis: Option<(usize, usize)>, into: &mut Vec<Steps>) {
+    if let Steps::Table(table) = &entry {
+        if table.affine(lens, into) { return; }
+        if let ([_], Some((size, stride))) = (lens, axis) && let Some(edged) = table.edged(size, stride) { return into.push(edged); }
+    }
+    into.push(entry);
 }
 
 /// The name of the one named axis of `layout`, where it has exactly one.
@@ -225,7 +279,7 @@ pub fn addressed(layout: &Layout, selectors: &[(Option<&str>, usize)]) -> Result
     let names: Vec<_> = selectors.iter().map(|&(n, _)| n.filter(|_| selectors.iter().filter(|s| s.0 == n).count() == 1)).collect();
     for (k, &(_, width)) in selectors.iter().enumerate() {
         let Some((n, a)) = names[k].and_then(|n| Some((n, layout.axis_named(n)?))) else { continue };
-        if span(a, width).any(|b| !free[b]) { return Err(Error::new(Kind::Index, format!("two selectors address axis {n}"))); }
+        if span(a, width).any(|b| !free[b]) { return Err(Error::new(Kind::Index, format!("two selectors address axis {}", shown(n)))); }
         free[span(a, width)].fill(false);
         axes[k] = a;
     }
@@ -233,7 +287,7 @@ pub fn addressed(layout: &Layout, selectors: &[(Option<&str>, usize)]) -> Result
         if axes[k] != rank { continue; }
         let name = names[k];
         let fits = |a: usize| a < rank && span(a, width).all(|b| free[b] && !names_conflict(name, layout.name(b).map(|n| &**n)));
-        let missing = || Error::new(Kind::Index, name.map_or_else(|| "too many axis selectors".into(), |n| format!("no axis for a selector named {n}")));
+        let missing = || Error::new(Kind::Index, name.map_or_else(|| "too many axis selectors".into(), |n| format!("no axis for a selector named {}", shown(n))));
         let a = (0..rank).find(|&a| fits(a)).ok_or_else(missing)?;
         free[span(a, width)].fill(false);
         axes[k] = a;
@@ -298,7 +352,7 @@ pub fn positions(view: View<'_>, size: usize) -> Result<Vec<usize>, Error> {
 }
 
 /// The message of the Domain error for an index value that isn't a whole number.
-pub const NOT_WHOLE: &str = "index must be an integer";
+pub const NOT_WHOLE: &str = "index must be a whole number";
 
 /// The Domain error for an index value that isn't a whole number.
 fn not_whole() -> Error { Error::new(Kind::Domain, NOT_WHOLE) }
@@ -364,6 +418,10 @@ pub fn counted_positions(values: &[Option<i64>], size: usize) -> Result<Vec<usiz
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Edge { Fill, Clamp, Wrap, Reflect, Symmetric }
 
+/// The positions that [`Edge::positions`] gives: each item's position on the axis, or floats where some item reads the fill, with NaN there.
+#[derive(Debug, PartialEq)]
+pub enum Edged { Positions(Vec<usize>), Floats(Vec<f64>) }
+
 impl Edge {
     /// Each mode with its name.
     pub const MODES: [(&'static str, Edge); 5] =
@@ -372,8 +430,10 @@ impl Edge {
     pub fn named(name: &str) -> Option<Edge> { Self::MODES.iter().find(|(n, _)| *n == name).map(|&(_, e)| e) }
     /// This mode's name.
     pub fn name(self) -> &'static str { Self::MODES.iter().find(|&&(_, e)| e == self).expect("every mode has a name").0 }
-    /// The position on an axis of `n` items that position `p` reads, or `None` for the fill. A negative `p` is outside the axis here. `Reflect` leaves out the edge item, as NumPy's `reflect` does, so `-1` reads 1. `Symmetric` repeats it, as NumPy's `symmetric` does, so `-1` reads 0. An empty axis gives `None` in every mode.
+    /// The position on an axis of `n` items that position `p` reads, or `None` for the fill. A position inside the axis stays as it is in every mode. A negative `p` is outside the axis here. `Reflect` leaves out the edge item, as NumPy's `reflect` does, so `-1` reads 1. `Symmetric` repeats it, as NumPy's `symmetric` does, so `-1` reads 0. An empty axis gives `None` in every mode.
+    #[inline]
     pub fn position(self, p: i64, n: usize) -> Option<usize> {
+        if (p as u64) < n as u64 { return Some(p as usize); }
         let n = i64::try_from(n).ok().filter(|&n| n > 0)?;
         let q = match self {
             Edge::Fill => p,
@@ -384,6 +444,21 @@ impl Edge {
             Edge::Symmetric => { let r = p.rem_euclid(2 * n); r.min(2 * n - 1 - r) }
         };
         usize::try_from(q).ok().filter(|&q| q < n as usize)
+    }
+    /// The position on an axis of `n` items that each index value in `view` reads (`position`), in one pass: integers as they are, and floats as `float_position` reads them, where NaN reads the fill. A value that isn't a whole number is a Domain error.
+    pub fn positions(self, view: View<'_>, n: usize) -> Result<Edged, Error> {
+        index_view!(view, |ix| Ok(self.mapped(n, false, ix.iter().map(|&i| Some(i.into())))), |x| {
+            // One branch-free pass finds the NaNs and any value that isn't exactly whole, which `float_position` then reads within tolerance.
+            let (whole, nan) = x.iter().fold((true, false), |(w, f), &y| { let y = y.wide(); (w & (y.is_nan() | (y as i64 as f64 == y)), f | y.is_nan()) });
+            if whole { return Ok(self.mapped(n, nan, x.iter().map(|&y| { let y = y.wide(); (!y.is_nan()).then_some(y as i64) }))); }
+            let signed = x.iter().map(|&y| float_position(y)).collect::<Result<Vec<_>, _>>()?;
+            Ok(self.mapped(n, nan, signed.into_iter()))
+        })
+    }
+    /// What [`Edge::positions`] gives for `signed` positions, each `None` for a NaN, where `nan` says whether any is. Where `Fill` or an empty axis reads the fill for some position, or a position is NaN, the result is floats.
+    pub fn mapped(self, n: usize, nan: bool, signed: impl ExactSizeIterator<Item = Option<i64>>) -> Edged {
+        if self == Edge::Fill || nan || (n == 0 && signed.len() > 0) { return Edged::Floats(signed.map(|q| q.and_then(|p| self.position(p, n)).map_or(f64::NAN, |p| p as f64)).collect()); }
+        Edged::Positions(signed.map(|q| q.and_then(|p| self.position(p, n)).expect("a mode other than fill reads a position on an axis with items")).collect())
     }
 }
 
@@ -600,7 +675,7 @@ impl Walk {
     pub fn new(tables: &[Steps], shape: &[usize], source: &[usize]) -> Option<Self> {
         let (base, mut steps) = Steps::per_axis(tables, shape)?;
         let strides = strides(source);
-        if base >= source.iter().product::<usize>() { return None; }
+        if base >= crate::layout::count(source) { return None; }
         let along: Vec<Option<usize>> = steps.iter().map(|e| e.axis_of(source, &strides)).collect::<Option<_>>()?;
         let mut rest = 0;
         for (a, p) in crate::layout::coordinates(base, source).filter(|&(_, p)| p > 0) {

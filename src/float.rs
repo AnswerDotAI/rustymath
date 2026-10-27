@@ -114,7 +114,7 @@ pub(crate) mod sealed {
         /// The lesser of `self` and `y`, as `maximum` gives the greater.
         fn minimum(self, y: Self) -> Self;
     }
-    /// The folds and scans of floats by maximum and minimum, and their running sums. Every route that folds by a maximum or minimum keeps one rule: no running result is ever NaN. Each fold or scan starts at `-∞` or `∞`. An item joins a running result only through `Core::maximum` or `step_max`, which take the running result as `y` and keep it beside a NaN item. Merges combine running results alone. The rule makes every route give the maximum of the items that aren't NaN, whatever its grouping, piece sizes, vector width or target. A scan reads each item through a step from its start, which turns a NaN item into that start, so the groups that `grouped` starts at an item keep the rule. The defaults' fold loops vectorize. The default running sum is `grouped`'s. `reduce.rs` overrides them where a target has instructions that do better.
+    /// The folds and scans of floats by maximum and minimum, and their running sums. Every route that folds by a maximum or minimum keeps one rule: no running result is ever NaN. Each fold or scan starts at `-∞` or `∞`. An item joins a running result only through `Core::maximum` or `step_max`, which take the running result as `y` and keep it beside a NaN item. Merges combine running results alone. The rule makes every route give the maximum of the items that aren't NaN, whatever its grouping, piece sizes, vector width or target. The one exception is an AArch64 scan with no start, which reads its first item as it is: a NaN first item is its first running result, and the next `fmaxnm` drops it. Where a step keeps a NaN running result, a scan turns each NaN item into its start as it reads it, so the groups that `grouped` starts at an item keep the rule. The defaults' fold loops vectorize. The default running sum is `grouped`'s. `reduce.rs` overrides them where a target has instructions that do better.
     pub trait Folds: Core + num_traits::Float {
         /// One step of a fold or scan by maximum: `Core::maximum` of the item `v` and the running result `t`, which gives `t` beside a NaN item. Chains, where each step waits for the one before, take it through `Reduction::chain`. AArch64 overrides it with `fmaxnm`, one instruction to the select's two. LLVM can't vectorize that override, so loops that vectorize call `Core::maximum` instead.
         #[inline(always)]
@@ -131,6 +131,11 @@ pub(crate) mod sealed {
             crate::reduce::records(x, start, out, |v| Self::step_min(Self::infinity(), v), Self::step_min, crate::reduce::above)
         }
         fn scan_sum(x: &[Self], start: Option<Self>, out: &mut Vec<Self>) { crate::reduce::grouped(x, start, out, |v| v, |a, b| a + b, |t| t, false) }
+        /// The rows `a` and `c` lane by lane, the lesser first, for items that aren't NaN. Equal items keep their places. The default takes one comparison and two selects, as `Core::minimum` and `Core::maximum` do, which x86-64 makes `minpd` and `maxpd`. `reduce.rs` overrides it where a row fills one vector, because LLVM leaves some of those selects scalar there.
+        #[inline(always)]
+        fn ordered_lanes<const W: usize>(a: [Self; W], c: [Self; W]) -> ([Self; W], [Self; W]) {
+            (std::array::from_fn(|j| c[j].minimum(a[j])), std::array::from_fn(|j| a[j].maximum(c[j])))
+        }
     }
 }
 

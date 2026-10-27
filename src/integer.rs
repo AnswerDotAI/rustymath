@@ -1,7 +1,7 @@
-//! Functions of `i64`s: greatest common divisor, least common multiple, binomial coefficients, powers, square roots and residues. Each gives `None` where its result isn't an `i64`. Their function objects are the ones that floats and complex numbers use: [`Gcd`], [`Lcm`], [`Residue`] and [`FloorDivide`] from [`tolerant`](crate::tolerant), whose integer forms ignore the tolerance they hold, and [`Binom`] and [`Pow`]. A slice form appends results to a vector and reports whether every item fitted. [`Divisor`] divides many integers by one, with multiplications in place of division instructions. `Residue`'s slice form uses one where every item has the same divisor. For types of 16 bits or fewer it multiplies 32-bit integers instead, which vectorizes.
+//! Functions of `i64`s: greatest common divisor, least common multiple, binomial coefficients, powers, square roots and residues. Each gives `None` where its result isn't an `i64`. Their function objects are the ones that floats and complex numbers use: [`Gcd`], [`Lcm`], [`Residue`] and [`FloorDivide`] from [`tolerant`](crate::tolerant), whose integer forms ignore the tolerance they hold, and [`Binom`] and [`Pow`]. A slice form appends results to a vector and reports whether every item fitted. [`Divisor`] divides many integers by one, with multiplications in place of division instructions. Where every item has the same divisor, `Residue`'s slice form divides through `FloatDivisor`, which multiplies by the divisor's reciprocal in `f64` and vectorizes, for divisors and dividends below 2⁵¹ in magnitude. At types of 16 bits or fewer it multiplies 32-bit integers instead, and it takes `Divisor` for 64-bit dividends of 2⁵¹ or more.
 //!
 //! `Gcd`, `Lcm`, `Binom`, `Pow` and `Residue` also take the narrower integer types of compact buffers, `u8`, `i16` and `i32`, which they compute through these functions. A result that doesn't fit its type fails. `FloorDivide` divides each integer type exactly, and fails on a zero divisor or an overflowing quotient. The tolerant comparisons, [`Floor`] and [`Ceil`] take each of these integer types exactly, ignoring the tolerance. [`Abs`] and [`Sign`] take them through the integer arithmetic of the `arith` module, and `Abs` of a signed type's least value fails. `Floor`, `Ceil` and `Abs` keep Booleans as they are.
-use crate::{Abs, Arg, Binom, Pow, WrappingPow, tolerant::{Ceil, Equal, Floor, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue, FloorDivide}};
+use crate::{Abs, Arg, Binom, Pow, WrappingPow, convert::{self, WIDE_LIMIT}, float::sealed::Core, tolerant::{Ceil, Equal, Floor, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue, FloorDivide}};
 use strength_reduce::StrengthReducedU64;
 
 /// Bounds for every prefix sum of up to `len` items in `[lo, hi]`, from `start` or 0. With `subtract`, bounds every running difference instead: `start` less up to `len` items, or without `start`, the first item less up to `len - 1` more. `None` where the bounds leave `i64`.
@@ -144,6 +144,31 @@ impl Short {
     }
 }
 
+/// A fixed nonzero divisor whose magnitude is below 2⁵¹, for dividends whose magnitude is below 2⁵¹. Each division multiplies by the divisor's reciprocal in `f64` and corrects the quotient once, which vectorizes at every integer width, where [`Divisor`]'s 64-bit high product doesn't. For such y and x, y·(1/x) rounds to within less than ½ of y/x, so its nearest whole number q is ⌊y/x⌋ or one more. The remainder y - q·x, which `f64` holds exactly, has the divisor's sign or is 0 only for ⌊y/x⌋. [`convert::unshifted`] and [`convert::shifted`] convert integers to and from `f64` in a form that vectorizes too.
+#[derive(Clone, Copy)]
+struct FloatDivisor { x: f64, reciprocal: f64 }
+
+impl FloatDivisor {
+    /// The divisor `x`, or `None` for 0 and for a magnitude of 2⁵¹ or more.
+    #[inline]
+    fn new(x: i64) -> Option<Self> { (x != 0 && x.unsigned_abs() <= WIDE_LIMIT as u64).then(|| Self { x: x as f64, reciprocal: 1.0 / x as f64 }) }
+
+    /// The residue of y modulo x, as [`residue`] gives it, for y below 2⁵¹ in magnitude.
+    #[inline(always)]
+    fn residue(self, y: i64) -> i64 {
+        let y = convert::unshifted(y);
+        let q = (y * self.reciprocal + f64::SHIFT) - f64::SHIFT;
+        let r = y - q * self.x;
+        convert::shifted(if r * self.x < 0.0 { r + self.x } else { r })
+    }
+}
+
+/// Whether each of the first `n` dividends in `y` is below 2⁵¹ in magnitude, as [`FloatDivisor`] needs. One pass finds their least and greatest.
+fn fit(y: Arg<'_, i64>, n: usize) -> bool {
+    let fits = |v: i64| v.unsigned_abs() <= WIDE_LIMIT as u64;
+    match y { Arg::One(v) => fits(v), Arg::Many(v) => v[..n].is_empty() || { let (lo, hi) = crate::reduce::extremes(&v[..n]); fits(lo) && fits(hi) } }
+}
+
 /// The digits of each of `values` in the mixed radix of `bases`, as APL's `⊤` gives them: each value's digits together, the most significant first. A base of 0 takes all of what remains as its digit. `None` where a quotient isn't an `i64`.
 pub fn encode(bases: &[i64], values: &[i64]) -> Option<Vec<i64>> {
     let divisors: Vec<_> = bases.iter().map(|&b| Divisor::new(b)).collect();
@@ -151,8 +176,16 @@ pub fn encode(bases: &[i64], values: &[i64]) -> Option<Vec<i64>> {
 }
 
 /// The value of each cell of `bases.len()` digits in `digits`, in the mixed radix of `bases`, as APL's `⊥` gives it. The first base is never used. `None` where a step isn't an `i64`.
-pub fn decode(bases: &[i64], digits: &[i64]) -> Option<Vec<i64>> {
-    digits.chunks(bases.len()).map(|d| (1..d.len()).try_fold(d[0], |v, k| v.checked_mul(bases[k])?.checked_add(d[k]))).collect()
+pub fn decode(bases: &[i64], digits: &[i64]) -> Option<Vec<i64>> { decoded(bases, digits, |v, b, d| v.checked_mul(b)?.checked_add(d)) }
+
+/// [`decode`] with each step wrapped to 64 bits, as integers that wrap compute it. Wrapping a value to a narrower width then gives what wrapping each step at that width gives.
+pub fn decode_wrapped(bases: &[i64], digits: &[i64]) -> Vec<i64> {
+    decoded(bases, digits, |v, b, d| Some(v.wrapping_mul(b).wrapping_add(d))).expect("a wrapped step always fits")
+}
+
+/// Each cell's value by Horner's rule, through `step(value, base, digit)`, or `None` where a step gives none.
+fn decoded(bases: &[i64], digits: &[i64], step: impl Fn(i64, i64, i64) -> Option<i64>) -> Option<Vec<i64>> {
+    digits.chunks(bases.len()).map(|d| (1..d.len()).try_fold(d[0], |v, k| step(v, bases[k], d[k]))).collect()
 }
 
 forms!(#[inline] Gcd at i64: |_, [x, y]| gcd(x, y));
@@ -165,7 +198,9 @@ forms!(#[inline] Pow at i64: |_, [x, y]| wrapped_power(x, y));
 fn wrapping_power(x: i64, y: i64) -> Option<i64> { let (p, exact) = wrapped_power(x, y); (exact | (y >= 0)).then_some(p) }
 forms!(#[inline] WrappingPow at i64: |_, [x, y]| wrapping_power(x, y));
 forms!(
-    #[inline] Residue at i64: |_, [x, y]| residue(x, y), many |_, [x, y], n, out| if let Arg::One(d) = x && let Some(d) = Divisor::new(d) {
+    #[inline] Residue at i64: |_, [x, y]| residue(x, y), many |_, [x, y], n, out| if let Arg::One(d) = x && let Some(r) = FloatDivisor::new(d) && fit(y, n) {
+        each!([y], n, out, |[y]| r.residue(y))
+    } else if let Arg::One(d) = x && let Some(d) = Divisor::new(d) {
         each!([y], n, out, |[y]| d.residue(y))
     } else {
         each!([x, y], n, out, |[x, y]| residue(x, y))
@@ -184,8 +219,8 @@ macro_rules! narrower {
             #[inline] Residue at $t: |_, [x, y]| residue(x.into(), y.into()) as $t,
             many |_, [x, y], n, out| if let Arg::One(d) = x && <$t>::BITS <= 16 && let Some(s) = Short::new(d.into()) {
                 each!([y], n, out, |[y]| s.residue(y.into()) as $t)
-            } else if let Arg::One(d) = x && let Some(d) = Divisor::new(d.into()) {
-                each!([y], n, out, |[y]| d.residue(y.into()) as $t)
+            } else if let Arg::One(d) = x && let Some(r) = FloatDivisor::new(d.into()) {
+                each!([y], n, out, |[y]| r.residue(y.into()) as $t)
             } else {
                 each!([x, y], n, out, |[x, y]| residue(x.into(), y.into()) as $t)
             }
@@ -193,8 +228,14 @@ macro_rules! narrower {
     )+};
 }
 narrower!(u8, i16, i32);
-forms!(FloorDivide at u8: |_, [x, y]| x.checked_div(y));
-forms!(FloorDivide at i16, i32, i64: |_, [x, y]| floor_quotient(x.into(), y.into()).and_then(|q| q.try_into().ok()));
+/// Floor division at the narrower types, through a float type in which every quotient's floor is exact, as `floor_quotient`'s doc explains. A zero divisor and a quotient that doesn't fit the type fail without a branch. The loop then vectorizes.
+macro_rules! floor_divides {
+    ($($t:ty => $f:ty),+) => {$(
+        forms!(FloorDivide at $t: |_, [x, y]| { let q = (<$f>::from(x) / <$f>::from(y)).floor(); (y != 0 && q <= <$t>::MAX as $f).then_some(q as $t) });
+    )+};
+}
+floor_divides!(u8 => f32, i16 => f32, i32 => f64);
+forms!(FloorDivide at i64: |_, [x, y]| floor_quotient(x, y));
 
 /// Each comparison's exact forms, which give Booleans: at each integer type of compact buffers, and at Booleans, where `false` orders before `true`. Characters compare as their code points, through these forms at `i32` ([`characters`](crate::characters)).
 macro_rules! exactly {

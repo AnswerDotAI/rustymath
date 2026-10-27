@@ -73,6 +73,10 @@ fn halves(i: i64) -> f64 {
 #[inline(always)]
 pub(crate) fn shifted(x: f64) -> i64 { (x + f64::SHIFT).to_bits().wrapping_sub(f64::SHIFT.to_bits()) as i64 }
 
+/// The whole number `i`, of magnitude up to `WIDE_LIMIT`, as an `f64`, through the bits of `f64::SHIFT` + i. It undoes [`shifted`].
+#[inline(always)]
+pub(crate) fn unshifted(i: i64) -> f64 { f64::from_bits(f64::SHIFT.to_bits().wrapping_add(i as u64)) - f64::SHIFT }
+
 /// Writes each integer type's conversions. `narrow` types fit an `i32`, and every target converts a float to an `i32` in vector form. `wide` types convert from a float through the bits of `f64::SHIFT` + x, unless the target has `NATIVE_64`. The two expressions convert `i` to `f32` and `f64`.
 macro_rules! ints {
     ($($t:ty: $kind:ident, |$i:ident| $f32:expr, $f64:expr;)+) => {$(

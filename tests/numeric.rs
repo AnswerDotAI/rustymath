@@ -58,18 +58,17 @@ mod convert {
 
 mod distribution {
     use crate::support::seeded;
-    use rand::RngExt;
     use rustymath::distribution::*;
     use rustymath::{Arg, Unary};
 
-    /// One of each distribution, with each sampling method's case: binomials that draw by inversion, by BTRD and reflected, and Poisson distributions that draw by multiplying and by PTRS.
+    /// One of each distribution, with each sampling method's case: binomials that draw by inversion, by BTRD and reflected, and Poisson distributions that draw by multiplying and by PTRS. A second Weibull distribution has an odd whole shape, whose root of a negative number is finite, and a density whose power overflows in its upper tail.
     fn cases() -> Vec<Distribution> {
         let d = Distribution::binomial;
         [
             Distribution::normal(1.0, 2.0), Distribution::uniform(-1.0, 3.0), Distribution::beta(0.5, 2.0), Distribution::beta(3.0, 4.0),
             Distribution::cauchy(0.0, 1.0), Distribution::chi_squared(3.0), Distribution::exponential(2.0), Distribution::fisher(4.0, 7.0),
             Distribution::gamma(0.5, 2.0), Distribution::gamma(5.0, 1.0), Distribution::inverse_gamma(3.0, 2.0), Distribution::laplace(1.0, 2.0),
-            Distribution::logistic(0.0, 1.0), Distribution::log_normal(0.0, 0.5), Distribution::student_t(3.0), Distribution::weibull(1.5, 2.0), d(10, 0.3),
+            Distribution::logistic(0.0, 1.0), Distribution::log_normal(0.0, 0.5), Distribution::student_t(3.0), Distribution::weibull(1.5, 2.0), Distribution::weibull(199.0, 1.0), d(10, 0.3),
             d(1000, 0.4), d(100, 0.9), Distribution::poisson(3.0), Distribution::poisson(50.0),
         ].into_iter().map(Result::unwrap).collect()
     }
@@ -116,34 +115,42 @@ mod distribution {
         assert_eq!(one[0], 0.0);
     }
 
-    /// `f`'s slice form against `scalar` for each item of `xs` at f64, and against `f`'s own scalar form at f32, which needn't compute in f64. Gives whether the slice form reported every item as succeeding.
-    fn matches_scalar(f: impl Unary<f64, Out = f64> + Unary<f32, Out = f32>, scalar: impl Fn(f64) -> f64, xs: &[f64]) -> bool {
-        let same = |a: f64, b: f64| a == b || (a.is_nan() && b.is_nan());
-        let (mut out, mut out32) = (Vec::new(), Vec::new());
-        let ok = f.many(Arg::Many(xs), xs.len(), &mut out);
-        let xs32: Vec<f32> = xs.iter().map(|&x| x as f32).collect();
-        assert_eq!(f.many(Arg::Many(&xs32), xs32.len(), &mut out32), ok);
-        assert!(out.iter().zip(xs).all(|(&r, &x)| same(r, scalar(x))), "{out:?}");
-        assert!(out32.iter().zip(&xs32).all(|(&r, &x)| same(r.into(), Unary::<f32>::one(&f, x).into())), "{out32:?}");
-        ok
+    /// Each distribution's density and cdf succeed at every x, and its quantile at every p from 0 to 1. A quantile fails at a p outside 0 to 1, where it gives NaN.
+    #[test]
+    fn domains() {
+        fn many(f: impl Unary<f64, Out = f64>, items: &[f64]) -> (bool, Vec<f64>) { let mut out = Vec::new(); (f.many(Arg::Many(items), items.len(), &mut out), out) }
+        let (xs, ps) = ([-1.0, 0.0, 0.25, 0.5, 1.0, 3.0, 100.0, f64::NAN], [0.001, 0.25, 0.5, 0.999, f64::NAN]);
+        for d in cases() {
+            assert!(many(Pdf(d), &xs).0 && many(Cdf(d), &xs).0 && many(Quantile(d), &ps).0, "{d:?}");
+            let (ok, out) = many(Quantile(d), &xs);
+            assert!(!ok && [0, 5, 6].iter().all(|&i| out[i].is_nan()), "{d:?}");
+        }
     }
 
-    /// Each distribution's function objects give their scalar functions' results. A quantile fails where p lies outside 0 to 1.
+    /// The worst relative error of `f`'s f32 slice form against `wide`, the same law at f64, over `xs`. The error is relative where the f64 result rounds to a normal f32 number. Elsewhere the f32 result must be a NaN beside a NaN, the same infinity, or at most f32's least normal number in magnitude where the f64 result rounds to zero or a subnormal. A result outside its class, or a success verdict other than the one the f64 results imply, counts as an infinite error.
+    fn worst_at_f32(f: impl Unary<f32, Out = f32>, wide: impl Fn(f64) -> f64, xs: &[f32]) -> f64 {
+        let (mut out, wants): (Vec<f32>, Vec<f64>) = (Vec::new(), xs.iter().map(|&x| wide(x.into())).collect());
+        if f.many(Arg::Many(xs), xs.len(), &mut out) != xs.iter().zip(&wants).all(|(x, w)| !w.is_nan() || x.is_nan()) { return f64::INFINITY; }
+        wants.iter().zip(&out).map(|(&want, &r)| {
+            let (near, r) = (want as f32, f64::from(r));
+            let same = r == f64::from(near) || (r.is_nan() && near.is_nan()) || (near.abs() < f32::MIN_POSITIVE && r.abs() <= f64::from(f32::MIN_POSITIVE));
+            if near.is_normal() && !r.is_nan() { ((r - want) / want).abs() } else if same { 0.0 } else { f64::INFINITY }
+        }).fold(0.0, f64::max)
+    }
+
+    /// The closed-form laws compute in f32 at f32. Their densities, cdfs and quantiles stay within a relative error of 1e-4 of the same laws at f64, in the tails as well as near the centre. The worst cases are quantiles near 0, where `location + scale·l` cancels, and the Weibull density near f32's underflow. At shape 50 the Weibull density's power overflows in f32 where the density is 0, and at shape 0.5 the density at 0 is infinite.
     #[test]
-    fn objects_match_scalars() {
-        let (xs, ps) = ([-1.0, 0.0, 0.25, 0.5, 1.0, 3.0, f64::NAN], [0.001, 0.25, 0.5, 0.999, f64::NAN]);
-        for d in cases() {
-            assert!(matches_scalar(Pdf(d), |x| d.pdf(x), &xs) && matches_scalar(Cdf(d), |x| d.cdf(x), &xs), "{d:?}");
-            assert!(matches_scalar(Quantile(d), |p| d.quantile(p), &ps), "{d:?}");
-            assert!(!matches_scalar(Quantile(d), |p| d.quantile(p), &xs), "{d:?}");
-        }
-        // Several blocks of uniform p reach every region of the inverse error function, in random order.
-        let mut rng = seeded(1);
-        let uniform: Vec<f64> = (0..5000).map(|_| rng.random()).collect();
-        for d in [Distribution::normal(1.0, 2.0).unwrap(), Distribution::log_normal(0.0, 0.5).unwrap()] {
-            assert!(matches_scalar(Quantile(d), |p| d.quantile(p), &uniform), "{d:?}");
+    fn closed_forms_at_f32() {
+        let laws = [Distribution::uniform(-1.0, 3.0), Distribution::exponential(2.0), Distribution::cauchy(1.0, 2.0), Distribution::laplace(1.0, 2.0),
+            Distribution::logistic(1.0, 2.0), Distribution::weibull(1.5, 2.0), Distribution::weibull(50.0, 1.0), Distribution::weibull(0.5, 1.0)].map(Result::unwrap);
+        let xs: Vec<f32> = (-960..=960).map(|i| i as f32 / 16.0).chain((0..=24).flat_map(|k| { let t = 2f32.powi(k); [t, -t] })).collect();
+        let ps: Vec<f32> = (1..1000).map(|i| i as f32 / 1000.0).chain((1..24).flat_map(|k| { let t = 0.5f32.powi(k); [t, 1.0 - t] })).collect();
+        for d in laws {
+            let errors = [worst_at_f32(Pdf(d), |x| d.pdf(x), &xs), worst_at_f32(Cdf(d), |x| d.cdf(x), &xs), worst_at_f32(Quantile(d), |p| d.quantile(p), &ps)];
+            assert!(errors.iter().all(|&e| e <= 1e-4), "{d:?}: relative errors {errors:?} in the density, cdf and quantile");
         }
     }
+
 }
 
 mod exact {
@@ -170,7 +177,7 @@ mod integer {
     use num_bigint::BigInt;
     use rustymath::integer::*;
     use rustymath::{
-        Abs, Arg, Binary, Binom, Pow, Sign, Unary, tolerant::{Ceil, Equal, Floor, Gcd, Greater, GreaterEqual, Lcm, LessEqual, NotEqual, Residue}
+        Abs, Arg, Binary, Binom, Pow, Sign, Unary, tolerant::{Ceil, Equal, Floor, Gcd, Greater, GreaterEqual, Lcm, LessEqual, NotEqual, Residue, FloorDivide}
     };
 
     /// Integers that exercise overflow and sign: the extremes, small numbers, powers of two and random bits.
@@ -279,6 +286,24 @@ mod integer {
             assert!(Residue(t).many(Arg::One(d), Arg::Many(&ys16), ys16.len(), &mut out));
             assert_eq!(out, ys16.iter().map(|&y| residue(d.into(), y.into()) as i16).collect::<Vec<_>>());
         }
+        // Below 2⁵¹ in magnitude, 64-bit dividends take the residue by one divisor through its reciprocal, and every `i32` dividend does. Dividends beside multiples of each divisor, and beside 2⁵¹, test the step that corrects the quotient.
+        let limit = (1i64 << 51) - 1;
+        for d in [3, -3, 7, -12, 1, -1, 1 << 20, (1 << 50) + 1, -limit] {
+            let mut ys: Vec<i64> = samples().into_iter().map(|v| v % limit).chain([limit, -limit, limit - 1, 1 - limit]).collect();
+            for k in [1, 2, 3, 1 << 10, 1 << 30, limit / d.abs()] {
+                if let Some(m) = k.checked_mul(d) { ys.extend([-1, 0, 1].into_iter().flat_map(|e| [m + e, e - m])); }
+            }
+            ys.retain(|y| y.abs() <= limit);
+            let mut out = Vec::new();
+            assert!(Residue(t).many(Arg::One(d), Arg::Many(&ys), ys.len(), &mut out));
+            assert_eq!(out, ys.iter().map(|&y| residue(d, y)).collect::<Vec<_>>(), "divisor {d}");
+        }
+        let ys32: Vec<i32> = samples().into_iter().map(|v| v as i32).chain([i32::MIN, i32::MIN + 1, i32::MAX]).collect();
+        for d in [3i32, -3, 7, -12, 1, -1, i32::MAX, i32::MIN] {
+            let mut out = Vec::new();
+            assert!(Residue(t).many(Arg::One(d), Arg::Many(&ys32), ys32.len(), &mut out));
+            assert_eq!(out, ys32.iter().map(|&y| residue(d.into(), y.into()) as i32).collect::<Vec<_>>(), "divisor {d}");
+        }
         let mut out = vec![5];
         let ok = Gcd(t).many(Arg::Many(&xs), Arg::Many(&ys), xs.len(), &mut out);
         assert_eq!(ok, xs.iter().zip(&ys).all(|(&x, &y)| gcd(x, y).is_some()));
@@ -301,6 +326,30 @@ mod integer {
                 assert_eq!(Binary::<u8>::checked(&Lcm(t), x, y), fit(lcm(a, b)), "lcm({x}, {y})");
                 assert_eq!(Binary::<u8>::checked(&Pow, x, y), fit(power(a, b)), "power({x}, {y})");
                 assert_eq!(i64::from(Residue(t).one(x, y)), residue(a, b), "residue({x}, {y})");
+                assert_eq!(Binary::<u8>::checked(&FloorDivide(t), x, y), fit(floor_quotient(a, b)), "floor quotient({x}, {y})");
+            }
+        }
+        // `i16` and `i32` floor division divides in `f32` and `f64`, where the quotients have exact floors. It agrees with `floor_quotient` on every `i16` dividend and on `i32` samples beside the type's ends. A zero divisor, or a quotient past the type, fails the whole call.
+        let xs16: Vec<i16> = (i16::MIN..=i16::MAX).collect();
+        let floor16 = |x: i16, y: i16| floor_quotient(x.into(), y.into()).and_then(|q| i16::try_from(q).ok());
+        let ds16: Vec<i16> = xs16.iter().map(|&x| x.rotate_left(5) | 1).collect();
+        let want: Option<Vec<i16>> = xs16.iter().zip(&ds16).map(|(&x, &d)| floor16(x, d)).collect();
+        let mut out = Vec::new();
+        assert_eq!(FloorDivide(t).many(Arg::Many(&xs16), Arg::Many(&ds16), xs16.len(), &mut out).then_some(out), want);
+        for d in [7i16, -12, 1, -1, 3, -3, i16::MAX, i16::MIN, 0] {
+            for xs in [&xs16[..], &xs16[1..]] {
+                let want: Option<Vec<i16>> = xs.iter().map(|&x| floor16(x, d)).collect();
+                let mut out = Vec::new();
+                assert_eq!(FloorDivide(t).many(Arg::Many(xs), Arg::One(d), xs.len(), &mut out).then_some(out), want, "divisor {d}");
+            }
+        }
+        let xs32: Vec<i32> = samples().into_iter().map(|v| v as i32).chain([i32::MIN, i32::MIN + 1, i32::MAX, i32::MAX - 1]).collect();
+        let floor32 = |x: i32, y: i32| floor_quotient(x.into(), y.into()).and_then(|q| i32::try_from(q).ok());
+        for d in [3i32, -3, 7, -12, 1, -1, i32::MAX, i32::MIN, 1 << 16, -(1 << 16) - 1, 0] {
+            for xs in [&xs32[..], &xs32[..xs32.len() - 4]] {
+                let want: Option<Vec<i32>> = xs.iter().map(|&x| floor32(x, d)).collect();
+                let mut out = Vec::new();
+                assert_eq!(FloorDivide(t).many(Arg::Many(xs), Arg::One(d), xs.len(), &mut out).then_some(out), want, "divisor {d}");
             }
         }
         // Integers compare exactly, however close they are within the tolerance.
@@ -459,12 +508,12 @@ mod operation {
     fn logical_views_compose_prepare_and_run() {
         use rustymath::{agreement::Mapping, buffer::Element, gather::Steps};
         let (shape, data) = (Layout::from([3, 2]), [0., 1., 2., 3., 4., 5.]);
-        let transpose = Mapping::Steps { base: 0, steps: vec![Steps::along(3, 1), Steps::along(2, 3)] };
+        let transpose = Mapping::Steps { base: 0, steps: vec![Steps::along(3, 1), Steps::along(2, 3)].into() };
         let x = ArrayView::new(&shape, f64::view(&data), &transpose);
         assert!(x.contiguous().is_none());
         assert_eq!(x.items::<f64>().unwrap().as_ref(), &[0., 3., 1., 4., 2., 5.]);
         assert_eq!(transpose.affine(shape.shape()), Some((0, vec![1, 3])));
-        let reversed = Mapping::Steps { base: 0, steps: vec![Steps::Stride { start: 4, len: 3, step: -2 }, Steps::along(2, 1)] };
+        let reversed = Mapping::Steps { base: 0, steps: vec![Steps::Stride { start: 4, len: 3, step: -2 }, Steps::along(2, 1)].into() };
         let composed = transpose.compose(&reversed, shape.shape(), shape.shape()).unwrap();
         assert_eq!(ArrayView::new(&shape, f64::view(&data), &composed).items::<f64>().unwrap().as_ref(), &[2., 5., 1., 4., 0., 3.]);
         let compact = ArrayView::compact(&shape, f64::view(&data));
@@ -476,16 +525,16 @@ mod operation {
         assert!(ok); assert_eq!(f64::of(clipped.view()).unwrap(), &[1., 3., 1., 4., 2., 4.]);
         // A table of positions reads through its offsets before broadcasting.
         let row = Layout::from([3]);
-        let positions = Mapping::Steps { base: 0, steps: vec![Steps::table(vec![5, 0, 3])] };
+        let positions = Mapping::Steps { base: 0, steps: vec![Steps::table(vec![5, 0, 3])].into() };
         let row_view = ArrayView::new(&row, f64::view(&data), &positions);
         let (sum, _) = kernels!(Binary rustymath::Add).binary(&rustymath::Add, row_view, compact, &Agreement::new(&row, &shape).unwrap()).unwrap();
         assert_eq!(f64::of(sum.view()).unwrap(), &[5., 6., 2., 3., 7., 8.]);
         // Checked casts inspect only selected items; a compact subrange borrows its exact storage.
-        let sub = Mapping::Steps { base: 1, steps: vec![Steps::along(3, 1)] };
+        let sub = Mapping::Steps { base: 1, steps: vec![Steps::along(3, 1)].into() };
         let selected = ArrayView::new(&row, f64::view(&[f64::NAN, 1., 2., 3., f64::INFINITY]), &sub);
         assert_eq!(selected.items::<i16>().unwrap().as_ref(), &[1, 2, 3]);
         assert_eq!(selected.contiguous().unwrap().as_ptr(), selected.storage().as_ptr().wrapping_add(8));
-        let strided = Mapping::Steps { base: 0, steps: vec![Steps::Stride { start: 4, len: 3, step: -2 }] };
+        let strided = Mapping::Steps { base: 0, steps: vec![Steps::Stride { start: 4, len: 3, step: -2 }].into() };
         assert_eq!(ArrayView::new(&row, f64::view(&[1., f64::NAN, 2., f64::INFINITY, 3.]), &strided).items::<i16>().unwrap().as_ref(), &[3, 2, 1]);
         let prefix = Layout::from([2]);
         let prefix = ArrayView::new(&prefix, f64::view(&[1., f64::NAN, 2., f64::INFINITY, 3.]), &strided);
@@ -494,10 +543,13 @@ mod operation {
         let empty = Layout::from([0, 3]);
         assert!(ArrayView::new(&empty, f64::view(&data), &transpose).items::<f64>().unwrap().is_empty());
         assert!(Mapping::Linear(2).affine(&[3]).is_none());
-        let table = |items| Mapping::Steps { base: 2, steps: vec![Steps::table(items)] };
+        let table = |items| Mapping::Steps { base: 2, steps: vec![Steps::table(items)].into() };
         assert_eq!(table(vec![3]).affine(&[1]), Some((5, vec![0])));
         assert_eq!(table(vec![3, Steps::FILL]).affine(&[0]), Some((0, vec![0])));
         assert!(table(vec![3, Steps::FILL]).affine(&[2]).is_none() && table(vec![Steps::FILL]).affine(&[1]).is_none());
+        // A weighted mean reads the fill that a mapping chose where it reaches no item: one stored 2 read as 10 2 10.
+        let padded = Mapping::Steps { base: 0, steps: vec![Steps::clipped(-1, 3, 1, 1)].into() }.filled(Some(std::sync::Arc::new(rustymath::buffer::Fill::Item(f64::buffer(vec![10.])))));
+        assert_eq!(rustymath::stats::average(&[2.], &[1.], &rustymath::stats::Axes::new(&row, &[0]).unwrap(), [&padded, &Mapping::Single]), [22. / 3.]);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use pyo3::prelude::*;
 use rustymath::array::Array as Core;
 use rustymath::buffer::{Buffer, DType, Element, FloatWidth};
 use rustymath::error::{Error, Kind};
-use rustymath::layout::Layout;
+use rustymath::layout::{count, Layout};
 use rustymath::linalg::PlusTimes;
 use rustymath::signal::{self, Mode};
 use rustymath::structure::Plan;
@@ -61,7 +61,7 @@ fn overlap_add<'py>(py: Python<'py>, frames: &Bound<'py, PyAny>, step: usize, ax
     let (a, shape) = (axis.of(&layout)?, layout.shape());
     if a + 1 >= shape.len() { return Err(py_err(Error::new(Kind::Rank, "overlap_add needs each frame's items along the axis after the frames"))); }
     let (n, w) = (shape[a], shape[a + 1]);
-    let dims = [shape[..a].iter().product(), n, 1, w, shape[a + 2..].iter().product()];
+    let dims = [count(&shape[..a]), n, 1, w, count(&shape[a + 2..])];
     let len = if n == 0 { 0 } else { (n - 1) * step + w };
     let result: Vec<usize> = shape[..a].iter().copied().chain([len]).chain(shape[a + 2..].iter().copied()).collect();
     let dtype = x.view().dtype();

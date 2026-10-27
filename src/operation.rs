@@ -155,7 +155,7 @@ pub(crate) fn binary_at<K: Binary<T, Out: Element> + Sync, T: Element, L>(k: &K,
 #[inline]
 fn direct<'a, T: Element>(data: &'a [T], mapping: &Mapping, parent: &Mapping) -> Option<Arg<'a, T>> {
     match (parent, mapping) {
-        (Mapping::Single, _) => Some(Arg::One(mapping.get(0).map_or(T::FILL, |i| data[i]))),
+        (Mapping::Single, _) => Some(Arg::One(mapping.get(0).map_or_else(|| crate::buffer::Fill::item(mapping.chosen()), |i| data[i]))),
         (Mapping::Linear(1), Mapping::Single) => Some(Arg::One(data[0])),
         (Mapping::Linear(1), Mapping::Linear(1)) => Some(Arg::Many(data)),
         _ => None,
@@ -214,7 +214,7 @@ fn fold_at<R: Reduction<T>, T: Element>(_: &R, x: View<'_>, dims: [usize; 3], ta
 fn scan_at<R: Reduction<T>, T: Element>(_: &R, x: View<'_>, dims: [usize; 3], start: Option<View<'_>>) -> (Buffer, bool) where R::Total: Element {
     let mut sc = None;
     let start = start.map(|s| items::<R::Total>(cast(s, R::Total::DTYPE, &mut sc))[0]);
-    let mut out = Vec::with_capacity(dims.iter().product());
+    let mut out = Vec::with_capacity(crate::layout::count(&dims));
     let ok = scan_along::<T, R>(items::<T>(x), dims, start, &mut out);
     (R::Total::buffer(out), ok)
 }

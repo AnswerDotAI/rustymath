@@ -75,6 +75,23 @@ pub fn split<B: Send>(out: &mut [B], unit: usize, write: &(dyn Fn(usize, &mut [B
     ranges(n, unit, &|range| write(range.start, unsafe { shared.part(range) }))
 }
 
+/// Adds the sums of every piece of `items` into `sums`, where `items` holds whole units of `unit` items and `piece(first, items, sums)` adds the sums of the piece whose first unit is `first` into the `sums` it's given. The units split into one piece of at least `least` units for each of this thread's [`threads`]. With too few units for two pieces, `items` runs as one piece on this thread. Otherwise the first piece adds into `sums`, each later one into its own part of `parts`, and the parts then add into `sums` on this thread.
+pub fn summed<B: Send, T: Copy + Send + num_traits::Zero>(items: &mut [B], unit: usize, least: usize, sums: &mut [T], parts: &mut Vec<T>, piece: &(dyn Fn(usize, &mut [B], &mut [T]) + Sync)) {
+    let count = items.len() / unit;
+    let pieces = (count / least).min(threads());
+    if pieces <= 1 { return piece(0, items, sums); }
+    let per = count.div_ceil(pieces);
+    let (len, width) = (sums.len(), sums.len().max(1));
+    parts.clear();
+    parts.resize((count.div_ceil(per) - 1) * width, T::zero());
+    {
+        let (first, rest) = items.split_at_mut(per * unit);
+        let mut work: Vec<(&mut [B], &mut [T])> = std::iter::once((first, &mut *sums)).chain(rest.chunks_mut(per * unit).zip(parts.chunks_mut(width).map(|part| &mut part[..len]))).collect();
+        pieces_of(&mut work, 1, usize::MAX, &|p, work| { let (items, part) = &mut work[0]; piece(p * per, items, part); true });
+    }
+    for part in parts.chunks(width) { for (s, &x) in sums.iter_mut().zip(part) { *s = *s + x } }
+}
+
 /// The most cells that [`each_cell`] runs alone at its start, to time a cell.
 const CELLS: usize = 8;
 
@@ -203,7 +220,7 @@ impl<B> Slots<'_, B> {
         });
     }
     /// `write`'s result for the next `n` slots, which it must fill. They then count as written. Panics where they don't fit.
-    pub(crate) fn fill(&mut self, n: usize, write: impl FnOnce(&mut [MaybeUninit<B>]) -> bool) -> bool {
+    pub fn fill(&mut self, n: usize, write: impl FnOnce(&mut [MaybeUninit<B>]) -> bool) -> bool {
         let ok = write(&mut self.slots[self.written..self.written + n]);
         self.written += n;
         ok

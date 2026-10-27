@@ -1,19 +1,23 @@
 //! Array shapes, axis keys and names, and their limits.
 use crate::error::{Error, Kind};
 use crate::hashing::{HashMap, HashMapExt, HashSet, HashSetExt};
-use std::{fmt, sync::Arc};
+use std::{borrow::Cow, fmt, sync::Arc};
 
 /// The most axes an array can have.
 pub const MAX_RANK: usize = 128;
 /// The most items in an array that a function makes.
 pub const MAX_GENERATED_ELEMENTS: usize = 1_000_000_000;
 
+/// The number of items in an array of `shape` that already exists. Unlike `element_count`, it checks neither the rank nor overflow. Ranks 0 to 2 compute it inline.
+#[inline]
+pub fn count(shape: &[usize]) -> usize { match *shape { [] => 1, [n] => n, [m, n] => m * n, _ => shape.iter().product() } }
+
 /// The number of items in an array of `shape`. A Limit error when `shape` has more than `MAX_RANK` axes, or more items than a `usize` counts.
 #[inline]
 pub fn element_count(shape: &[usize]) -> Result<usize, Error> {
     if shape.len() > MAX_RANK { return Err(Error::new(Kind::Limit, format!("an array has at most {MAX_RANK} axes"))); }
-    if shape.contains(&0) { return Ok(0); }
-    shape.iter().try_fold(1usize, |n, &d| n.checked_mul(d)).ok_or_else(|| Error::new(Kind::Limit, "an array of this shape has too many items to count"))
+    shape.iter().try_fold(1usize, |n, &d| n.checked_mul(d)).or_else(|| shape.contains(&0).then_some(0))
+        .ok_or_else(|| Error::new(Kind::Limit, "an array of this shape has too many items to count"))
 }
 
 /// The number of items in an array of `shape` that a function makes. A Limit error past `MAX_GENERATED_ELEMENTS`, or where the array would take the process past its memory guard's limit ([`memory::admit`](crate::memory::admit)).
@@ -89,6 +93,17 @@ pub fn repeated_name(names: &[Option<Arc<str>>]) -> Option<&Arc<str>> {
 #[inline]
 pub fn hidden(name: &str) -> bool { name.starts_with('_') }
 
+/// The character between a fresh name's stem and its random part. [`shown`] cuts a hidden name after it.
+pub const FRESH: char = '·';
+
+/// `name` as messages and display show it: a hidden name that holds [`FRESH`] cut after the last one, as in `_b·…`. Any other name stays as it is.
+pub fn shown(name: &str) -> Cow<'_, str> {
+    match name.rfind(FRESH) {
+        Some(i) if hidden(name) => format!("{}…", &name[..i + FRESH.len_utf8()]).into(),
+        _ => name.into(),
+    }
+}
+
 /// Whether two axis names conflict: both are names, they differ, and they're in the same namespace. A name meets a name from the other namespace as if that axis were unnamed.
 #[inline]
 pub fn names_conflict(a: Option<&str>, b: Option<&str>) -> bool { matches!((a, b), (Some(a), Some(b)) if a != b && hidden(a) == hidden(b)) }
@@ -159,6 +174,17 @@ pub struct Keys { names: Vec<Option<Arc<str>>>, index: HashMap<Arc<str>, usize> 
 impl PartialEq for Keys { fn eq(&self, other: &Self) -> bool { self.names == other.names } }
 impl Eq for Keys {}
 
+/// How the positions of one axis's keys lie along those of a result axis, as [`Keys::aligned`] and [`Keys::union`] give it.
+#[derive(Clone, Debug)]
+pub enum Alignment {
+    /// The same positions, in the same order.
+    Same,
+    /// The positions in order, at the result's first positions. The result's other positions read a fill.
+    Leading,
+    /// The position of each of the result's positions, or `None` where it reads a fill.
+    Table(Vec<Option<usize>>),
+}
+
 impl Keys {
     /// Keys from `names`, where `None` marks a position with no name. A Domain error when a name appears twice.
     pub fn partial(names: Vec<Option<Arc<str>>>) -> Result<Arc<Self>, Error> {
@@ -203,7 +229,7 @@ impl Keys {
         let kind = if subset { Kind::Index } else { Kind::Length };
         if !subset && self.len() != wanted.len() { return Err(Error::new(kind, format!("keyed axes of lengths {} and {} don't pair", self.len(), wanted.len()))); }
         self.align(wanted).into_iter().zip(&wanted.names).map(|(p, name)| p.ok_or_else(|| match name {
-            Some(name) => Error::new(kind, format!("missing key: {name}")),
+            Some(name) => Error::new(kind, format!("missing key: {}", shown(name))),
             None => Error::new(kind, "too few positions without keys"),
         })).collect()
     }
@@ -211,19 +237,29 @@ impl Keys {
     pub fn select(&self, positions: impl IntoIterator<Item = Option<usize>>) -> Result<Arc<Self>, Error> {
         Self::partial(positions.into_iter().map(|i| i.and_then(|i| self.names[i].clone())).collect())
     }
-    /// These positions, then the named positions of `other` that these lack. Unnamed positions pair in order. Both sides need the same number of them.
-    pub fn union(self: &Arc<Self>, other: &Arc<Self>) -> Result<Arc<Self>, Error> {
-        if self == other { return Ok(self.clone()); }
+    /// How these positions lie along those of `wanted`: as the same positions, at its first positions, or as [`Keys::align`] finds them.
+    pub fn aligned(self: &Arc<Self>, wanted: &Arc<Self>) -> Alignment {
+        if self == wanted { Alignment::Same } else if wanted.names.starts_with(&self.names) { Alignment::Leading } else { Alignment::Table(self.align(wanted)) }
+    }
+    /// These positions, then the named positions of `other` that these lack, with how these positions and `other`'s lie along them. Unnamed positions pair in order. Both sides need the same number of them.
+    pub fn union(self: &Arc<Self>, other: &Arc<Self>) -> Result<(Arc<Self>, [Alignment; 2]), Error> {
+        if self == other { return Ok((self.clone(), [Alignment::Same, Alignment::Same])); }
         let (a, b) = (self.len() - self.index.len(), other.len() - other.index.len());
         if a != b { return Err(Error::new(Kind::Length, format!("axes with {a} and {b} positions without keys don't align"))); }
-        let mut extra = other.names.iter().filter(|k| k.as_ref().is_some_and(|k| self.position(k).is_none())).peekable();
-        if extra.peek().is_none() { return Ok(self.clone()); }
-        Self::partial(self.names.iter().chain(extra).cloned().collect())
+        if other.names.starts_with(&self.names) { return Ok((other.clone(), [Alignment::Leading, Alignment::Same])); }
+        if self.names.starts_with(&other.names) { return Ok((self.clone(), [Alignment::Same, Alignment::Leading])); }
+        let places = self.align(other);
+        // `places` holds the position here of each of `other`'s positions. `other`'s table is its inverse, with each key that these lack appended after these.
+        let mut table = vec![None; self.len()];
+        for (j, &p) in places.iter().enumerate() { match p { Some(p) => table[p] = Some(j), None => table.push(Some(j)) } }
+        if table.len() == self.len() { return Ok((self.clone(), [Alignment::Same, Alignment::Table(table)])); }
+        let keys = Self::partial(self.names.iter().chain(other.names.iter().zip(&places).filter(|(_, p)| p.is_none()).map(|(k, _)| k)).cloned().collect())?;
+        Ok((keys, [Alignment::Leading, Alignment::Table(table)]))
     }
 }
 
 /// The Domain error for a key that appears twice on one axis.
-fn duplicate(key: &str) -> Error { Error::new(Kind::Domain, format!("duplicate key: {key}")) }
+fn duplicate(key: &str) -> Error { Error::new(Kind::Domain, format!("duplicate key: {}", shown(key))) }
 
 /// An array's shape, with optional keys and a name for each axis. A layout with no keys or names holds no `Meta`.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -242,6 +278,9 @@ impl Layout {
     pub const EMPTY: Self = Self { shape: Shape::EMPTY, meta: None };
     #[inline]
     pub fn shape(&self) -> &[usize] { &self.shape }
+    /// The number of items in an array of this layout (`count`).
+    #[inline]
+    pub fn count(&self) -> usize { count(&self.shape) }
     /// The name of each axis, with `None` for an axis without one. Empty when no axis has a name (`has_names`).
     #[inline]
     pub fn names(&self) -> &[Option<Arc<str>>] { self.meta.as_ref().map_or(&[], |l| &l.names) }
@@ -262,7 +301,7 @@ impl Layout {
     /// The layout with `names` on its axes. A Rank error when the count differs from the rank, and a Domain error when a name repeats.
     pub fn with_names(self, names: Vec<Option<Arc<str>>>) -> Result<Self, Error> {
         if !names.is_empty() && names.len() != self.shape.len() { return Err(Error::new(Kind::Rank, format!("{} names for {} axes", names.len(), self.shape.len()))); }
-        if let Some(name) = repeated_name(&names) { return Err(Error::new(Kind::Domain, format!("the result would have two axes named {name}"))); }
+        if let Some(name) = repeated_name(&names) { return Err(Error::new(Kind::Domain, format!("the result would have two axes named {}", shown(name)))); }
         Ok(self.inherit_names(names))
     }
     /// The layout with `names`, which the caller has checked: one for each axis, or none.

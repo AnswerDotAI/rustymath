@@ -1,9 +1,9 @@
 //! Statistics through the shared reductions and matrix products. Means and norms use the ordinary parallel folds. Variance makes two passes, without an array-sized buffer of deviations. No compensated sums or reproducibility rules are imposed.
 use crate::agreement::Mapping;
-use crate::buffer::Element;
+use crate::buffer::{Element, Fill};
 use crate::error::{Error, Kind};
 use crate::gather::{self, Steps};
-use crate::layout::Layout;
+use crate::layout::{count, Layout};
 use crate::linalg::{Inner, Orientation, PlusTimes, Scalar};
 use crate::reduce::{self, Reduction, Sum};
 use crate::{Float, Native};
@@ -25,7 +25,7 @@ impl Axes {
         let result = layout.axes(remaining.iter().copied());
         let (first, end) = axes.first().zip(axes.last()).map_or((0, 0), |(&a, &b)| (a, b + 1));
         if end - first == axes.len() {
-            return Ok(Self { dims: [shape[..first].iter().product(), shape[first..end].iter().product(), shape[end..].iter().product()], layout: result, shape: shape.to_vec(), steps: None });
+            return Ok(Self { dims: [count(&shape[..first]), count(&shape[first..end]), count(&shape[end..])], layout: result, shape: shape.to_vec(), steps: None });
         }
         let mut destinations = vec![0; shape.len()];
         for (to, &from) in remaining.iter().chain(&axes).enumerate() { destinations[from] = to; }
@@ -40,14 +40,15 @@ impl Axes {
         Cow::Owned(out)
     }
 
-    /// The offsets that `mapping` reads, in the order the reduction reads its items: one entry per axis where the mapping and the axes compose, otherwise a table.
-    fn plan(&self, mapping: &Mapping) -> (usize, Vec<Steps>) {
+    /// The walk that reads what `mapping` reads, in the order the reduction reads its items ([`Mapping::to_walk`]), and the item that the walk reads where it reaches none: the fill that `mapping` chose, or else the item type's own.
+    fn plan<T: Element>(&self, mapping: &Mapping) -> (usize, Vec<Steps>, T) {
         let frame: Vec<usize> = self.steps.as_ref().map_or_else(|| self.shape.clone(), |steps| steps.iter().map(Steps::len).collect());
         let ordered = match &self.steps {
-            Some(steps) => mapping.composed(&Mapping::Steps { base: 0, steps: steps.clone() }, &self.shape, &frame, true).expect("a table always composes"),
+            Some(steps) => mapping.composed(&Mapping::Steps { base: 0, steps: steps.clone().into() }, &self.shape, &frame, true).expect("a table always composes"),
             None => mapping.clone(),
         };
-        ordered.entries(&frame).unwrap_or_else(|| (0, vec![Steps::table((0..frame.iter().product()).map(|j| ordered.get(j).unwrap_or(Steps::FILL)).collect())]))
+        let (base, steps) = ordered.to_walk(&frame);
+        (base, steps.into_owned(), Fill::item(ordered.chosen()))
     }
 }
 
@@ -70,7 +71,7 @@ fn mapped<F: Copy, R: Reduction<F>>(dims: [usize; 3], f: impl Fn(Range<usize>, &
             let end = range.end.min(start + crate::CHUNK);
             work.clear();
             f(start..end, &mut work);
-            fold(start, &work);
+            fold(start, reduce::Part::Items(&work));
         }
     });
     totals
@@ -130,15 +131,16 @@ pub fn norm<T: Scalar>(data: &[T], dims: [usize; 3], p: f64) -> Vec<T::Real> {
 
 /// Weighted means. The two mappings broadcast `data` and `weights` into an array of `dims`. Weights may be real or complex; a zero total weight gives the ordinary floating-point quotient.
 pub fn average<T: Scalar + Element>(data: &[T], weights: &[T], axes: &Axes, mappings: [&Mapping; 2]) -> Vec<T> where Sum: Reduction<T, Total = T> {
-    let [(xbase, xsteps), (wbase, wsteps)] = mappings.map(|mapping| axes.plan(mapping));
-    let read = |x: &[T], base, steps: &[Steps], range: Range<usize>, out: &mut Vec<T>| gather::walk_range(out, x, base, steps, T::zero(), range.start, range.len(), gather::Same);
+    let [(xbase, xsteps, xfill), (wbase, wsteps, wfill)] = mappings.map(|mapping| axes.plan::<T>(mapping));
+    let [(xbase, xplan), (wbase, wplan)] = [Steps::simplify(xbase, &xsteps), Steps::simplify(wbase, &wsteps)];
+    let read = |x: &[T], base, plan: &[Cow<Steps>], fill, range: Range<usize>, out: &mut Vec<T>| gather::walk_plan(out, x, base, plan, fill, range.start, range.len(), gather::Same);
     let mut sums = mapped::<_, Sum>(axes.dims, |range, out| {
-        read(data, xbase, &xsteps, range.clone(), out);
+        read(data, xbase, &xplan, xfill, range.clone(), out);
         let mut w = Vec::with_capacity(range.len());
-        read(weights, wbase, &wsteps, range, &mut w);
+        read(weights, wbase, &wplan, wfill, range, &mut w);
         for (x, w) in out.iter_mut().zip(w) { *x = *x * w; }
     });
-    let totals = mapped::<_, Sum>(axes.dims, |range, out| read(weights, wbase, &wsteps, range, out));
+    let totals = mapped::<_, Sum>(axes.dims, |range, out| read(weights, wbase, &wplan, wfill, range, out));
     for (sum, weight) in sums.iter_mut().zip(totals) { *sum = sum.quotient(weight); }
     sums
 }

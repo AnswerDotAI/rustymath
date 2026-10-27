@@ -71,14 +71,14 @@ mod products {
 
     #[test]
     fn transposed_operands_read_as_their_transposes() {
-        // Float `PlusTimes` reads a transposed operand in place, and `MaxPlus` takes the default, which copies it. `inner_mapped` uses an operand where its map reads it: through a transposing map, through padded rows, or in a transposed orientation. A map that reads backwards is read in blocks. Small whole numbers keep every sum exact.
+        // Float `PlusTimes` reads a transposed operand in place, and `MaxPlus` takes the default, which copies it. `inner_mapped` uses an operand where its map reads it: through a transposing map, through padded rows, or in a transposed orientation. A map that reads backwards is read in blocks. On rustymath's own kernels, a product with a vector takes both of `by_vector`'s routes: rows dotted four at a time with a remainder, and stored rows added a block at a time into a whole strip of results and a tail. Small whole numbers keep every sum exact.
         fn check<P: Inner<f64, Out = f64>>(p: P, a: &[f64], b: &[f64], [m, k, n]: [usize; 3]) {
             use rustymath::{agreement::Mapping, gather::Steps};
             let (at, bt, expected) = (transpose(a, m, k), transpose(b, k, n), p.inner(a, b, [m, k, n]));
             assert_eq!(p.inner_ops(&at, b, [Orientation::Transpose, Orientation::Normal], [m, k, n]), expected);
             assert_eq!(p.inner_ops(a, &bt, [Orientation::Normal, Orientation::Transpose], [m, k, n]), expected);
             assert_eq!(p.inner_ops(&at, &bt, [Orientation::Transpose, Orientation::Transpose], [m, k, n]), expected);
-            let read = |[(s0, l0, d0), (s1, l1, d1)]: [(usize, usize, isize); 2]| Mapping::Steps { base: 0, steps: vec![Steps::Stride { start: s0, len: l0, step: d0 }, Steps::Stride { start: s1, len: l1, step: d1 }] };
+            let read = |[(s0, l0, d0), (s1, l1, d1)]: [(usize, usize, isize); 2]| Mapping::Steps { base: 0, steps: vec![Steps::Stride { start: s0, len: l0, step: d0 }, Steps::Stride { start: s1, len: l1, step: d1 }].into() };
             let (held, (mi, ki, ni)) = (Mapping::Linear(1), (m as isize, k as isize, n as isize));
             let padded: Vec<f64> = b.chunks(n).flat_map(|row| row.iter().copied().chain([0.0; 2])).collect();
             let reversed: Vec<f64> = a.iter().rev().copied().collect();
@@ -89,7 +89,7 @@ mod products {
             assert_eq!(p.inner_mapped(Mapped { data: &reversed, mapping: &backwards }, Mapped { data: b, mapping: &held }, normal, [m, k, n]), expected);
             assert_eq!(p.inner_mapped(Mapped { data: a, mapping: &stored_t }, Mapped { data: &bt, mapping: &held }, [Orientation::Transpose; 2], [m, k, n]), expected);
         }
-        for [m, k, n] in [[5, 7, 9], [1, 7, 9], [5, 7, 1]] {
+        for [m, k, n] in [[5, 7, 9], [1, 11, 37], [37, 11, 1]] {
             let a: Vec<f64> = (0..m * k).map(|i| (i * 7 % 17) as f64 - 8.0).collect();
             let b: Vec<f64> = (0..k * n).map(|i| (i * 5 % 13) as f64 - 6.0).collect();
             check(PlusTimes, &a, &b, [m, k, n]);
@@ -102,7 +102,7 @@ mod products {
         use rustymath::{agreement::{Mapping, expanded_items}, gather::Steps};
         let along = |start, len, step| Steps::Stride { start, len, step };
         let check = |data: &[f64], steps: Vec<Steps>, o: Orientation, [m, k]: [usize; 2]| {
-            let mapping = Mapping::Steps { base: 0, steps };
+            let mapping = Mapping::Steps { base: 0, steps: steps.into() };
             let mut buf = Vec::new();
             let stored = expanded_items(&mapping, data, 0, m * k, &mut buf).to_vec();
             let a = if o == Orientation::Normal { stored } else { transpose(&stored, k, m) };
@@ -118,7 +118,7 @@ mod products {
     #[test]
     fn products_match_folds_in_order() {
         // The sizes leave partial tiles, give no steps or a single one, and cross each block size. Small whole numbers keep every float sum exact, in any order.
-        let sizes = [[0, 3, 4], [3, 0, 4], [3, 4, 0], [1, 1, 1], [5, 7, 9], [MC + 3, KC + 5, 37], [17, 3, NC + 5]];
+        let sizes = [[0, 3, 4], [3, 0, 4], [3, 4, 0], [1, 1, 1], [5, 7, 9], [MC + 3, KC + 5, 37], [MC + 3, KC + 5, 1], [17, 3, NC + 5]];
         for size @ [m, k, n] in sizes {
             let a64: Vec<f64> = (0..m * k).map(|i| (i * 7 % 17) as f64 - 8.0).collect();
             let b64: Vec<f64> = (0..k * n).map(|i| (i * 5 % 13) as f64 - 6.0).collect();
@@ -189,6 +189,37 @@ mod products {
         }
         let ([a, b], size) = ([1i64 << 40, -(1 << 40)], [1, 2, 1]);
         assert_eq!(checked(&PlusTimes, &[a, b], &[1 << 30, 1 << 30], size), Some(vec![0]), "products beyond i64 whose sum fits");
+    }
+
+    #[test]
+    fn wrapped_and_half_products_match_folds() {
+        // `Wrapped(PlusTimes)` folds with wrapping `i32` steps whatever its items' type, whether they compute as exact floats or on the `i32` kernel: `u8`, `i16` and `i32` items give the folds of their `i32` values, and the large `i16` and `i32` items overflow 32 bits. Small and moderate `i32` items take the exact float route, and the moderate ones still wrap at 32 bits. f16 `+.×` gives the f32 folds of the same values, which small whole numbers keep exact.
+        use rustymath::Wrapped;
+        fn widened<T: Copy + Into<i32>>(x: &[T]) -> Vec<i32> { x.iter().map(|&v| v.into()).collect() }
+        for size @ [m, k, n] in [[0, 3, 4], [3, 0, 4], [3, 4, 0], [5, 7, 9], [MC + 3, KC + 5, 37]] {
+            let wrapped = |a: &[i32], b: &[i32]| folded(a, b, size, 0i32, |s, x, y| s.wrapping_add(x.wrapping_mul(y)));
+            let a8: Vec<u8> = (0..m * k).map(|i| (i * 37 % 256) as u8).collect();
+            let b8: Vec<u8> = (0..k * n).map(|i| (i * 91 % 256) as u8).collect();
+            let a16: Vec<i16> = (0..m * k).map(|i| (i * 4099 % 65536) as u16 as i16).collect();
+            let b16: Vec<i16> = (0..k * n).map(|i| (i * 8191 % 65536) as u16 as i16).collect();
+            let a32: Vec<i32> = (0..m * k).map(|i| (i as i32).wrapping_mul(-1_640_531_527)).collect();
+            let b32: Vec<i32> = (0..k * n).map(|i| (i as i32).wrapping_mul(1_013_904_223)).collect();
+            assert_eq!(Wrapped(PlusTimes).inner(&a8, &b8, size), wrapped(&widened(&a8), &widened(&b8)));
+            assert_eq!(Wrapped(PlusTimes).inner(&a16, &b16, size), wrapped(&widened(&a16), &widened(&b16)));
+            assert_eq!(Wrapped(PlusTimes).inner(&a32, &b32, size), wrapped(&a32, &b32));
+            let small = |len: usize| (0..len).map(|i| (i * 37 % 127) as i32 - 63).collect::<Vec<i32>>();
+            let moderate = |len: usize| (0..len).map(|i| (i * 7919 % 2_000_001) as i32 - 1_000_000).collect::<Vec<i32>>();
+            assert_eq!(Wrapped(PlusTimes).inner(&small(m * k), &small(k * n), size), wrapped(&small(m * k), &small(k * n)));
+            assert_eq!(Wrapped(PlusTimes).inner(&moderate(m * k), &moderate(k * n), size), wrapped(&moderate(m * k), &moderate(k * n)));
+            let ah: Vec<half::f16> = (0..m * k).map(|i| half::f16::from_f32((i * 7 % 17) as f32 - 8.0)).collect();
+            let bh: Vec<half::f16> = (0..k * n).map(|i| half::f16::from_f32((i * 5 % 13) as f32 - 6.0)).collect();
+            let single = |x: &[half::f16]| x.iter().map(|&v| f32::from(v)).collect::<Vec<f32>>();
+            assert_eq!(PlusTimes.inner(&ah, &bh, size), folded(&single(&ah), &single(&bh), size, 0.0, |s, x, y| s + x * y));
+        }
+        // A sum of more than 2^21 `i16` products can pass the 53 bits that `f64` holds exactly, so it runs on the `i32` kernel.
+        let size = [1, (1 << 21) + 1, 1];
+        let a: Vec<i16> = (0..size[1]).map(|i| (i * 4099 % 65536) as u16 as i16).collect();
+        assert_eq!(Wrapped(PlusTimes).inner(&a, &a, size), folded(&widened(&a), &widened(&a), size, 0i32, |s, x, y| s.wrapping_add(x.wrapping_mul(y))));
     }
 
     #[test]

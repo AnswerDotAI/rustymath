@@ -5,7 +5,7 @@
 //! A product large enough splits its rows across the threads that [`crate::parallel::set_threads`] sets. On macOS, Accelerate computes real and complex plus-times products instead. `Tiled` also sends the decompositions' triangular solves, SVDs and Hermitian eigen decompositions to it, and the general eigen decompositions of real matrices from `accelerate::GEEV_FROM` rows. macOS builds with the `native` feature also compile rustymath's own kernels, and `RUSTYMATH_NATIVE=1` selects them for the whole process.
 //!
 //! The private module `factor` holds decompositions of real and complex matrices, whose blocked updates run on these loops. This module re-exports its public items, and [`Scalar`], the trait of the item types they take. [`transpose_into`] transposes a matrix through 8×8 tiles.
-use crate::{Float, agreement::{Frames, Mapping, expanded_items}, buffer::{Buffer, DType, Element, FloatWidth, View, Width}, convert, error::Error, float::{FUSED, sealed::Core}, parallel, slice};
+use crate::{Float, agreement::{Frames, Mapping, expanded_items}, buffer::{Buffer, DType, Element, FloatWidth, Source, View, Width, read_all}, convert, error::Error, float::{FUSED, sealed::Core}, parallel, slice};
 use num_complex::Complex;
 use num_traits::{One, Zero};
 use std::{mem::MaybeUninit, sync::LazyLock};
@@ -179,6 +179,15 @@ impl Product {
             Self::PlusNotEqual => crate::kernels!(Product PlusNotEqual).only(&COUNTS).product(&PlusNotEqual, xy.map(crate::characters::as_codes), frames, size),
         }
     }
+    /// The products of [`run`](Self::run) with wrapping steps: `+.×` on `u8`, `i16` or `i32` items gives each result's exact sum of products wrapped to 32 bits, at `i32`, as static kinds and fixed widths keep integer results (`Wrapped<PlusTimes>`). `None` for any other pair or dtype, which `run` then takes.
+    pub fn run_wrapped(self, xy: [View<'_>; 2], frames: &Frames, size: [usize; 3]) -> Option<Result<(Buffer, bool), Error>> {
+        match self {
+            Self::PlusTimes => crate::kernels!(Product crate::Wrapped<PlusTimes>).product(&crate::Wrapped(PlusTimes), xy, frames, size),
+            _ => None,
+        }
+    }
+    /// Whether the pair's kernel compares items exactly, as the counts `+.=` and `+.≠` do. A frontend sends approximate items that compare within a tolerance to another route.
+    pub fn compares_exactly(self) -> bool { matches!(self, Self::PlusEqual | Self::PlusNotEqual) }
 }
 
 /// The scalar operations of a pair at item type `T`.
@@ -262,7 +271,7 @@ impl Inner<bool> for OrAnd {
     type Out = bool;
     #[inline]
     fn inner_into(&self, a: &[bool], b: &[bool], size: [usize; 3], out: &mut [bool]) {
-        if size[0] * size[1] * size[2] <= DIRECT_WORK { direct::<bool, OrAnd>(a, b, size, out) } else { packed::<false>(a, b, size, out) }
+        if size[0] * size[1] * size[2] <= DIRECT_WORK { direct::<bool, bool, OrAnd>(a, b, size, out) } else { packed::<false>(a, b, size, out) }
     }
 }
 
@@ -270,7 +279,7 @@ impl Inner<bool> for AndOr {
     type Out = bool;
     #[inline]
     fn inner_into(&self, a: &[bool], b: &[bool], size: [usize; 3], out: &mut [bool]) {
-        if size[0] * size[1] * size[2] <= DIRECT_WORK { direct::<bool, AndOr>(a, b, size, out) } else { packed::<true>(a, b, size, out) }
+        if size[0] * size[1] * size[2] <= DIRECT_WORK { direct::<bool, bool, AndOr>(a, b, size, out) } else { packed::<true>(a, b, size, out) }
     }
 }
 
@@ -297,15 +306,20 @@ fn packed<const NOT: bool>(a: &[bool], b: &[bool], [m, k, n]: [usize; 3], c: &mu
         }
     }
 }
-/// The pairs at `i64`, which `tiered` runs only where every value that a product forms fits `i64`, so their wrapping operations never wrap.
-impl Pair<i64> for PlusTimes {
-    type Out = i64;
-    const UNIT: i64 = 0;
-    #[inline(always)]
-    fn g(a: i64, b: i64) -> i64 { a.wrapping_mul(b) }
-    #[inline(always)]
-    fn f(x: i64, y: i64) -> i64 { x.wrapping_add(y) }
+/// The pairs at `i64` and `+.×`'s pair at `i32`. `tiered` runs the pairs at `i64` only where every value that a product forms fits `i64`. Their wrapping operations then never wrap. The pair at `i32` wraps, as the products of [`Wrapped<PlusTimes>`] do.
+macro_rules! wrapping_times {
+    ($($t:ty),+) => {$(
+        impl Pair<$t> for PlusTimes {
+            type Out = $t;
+            const UNIT: $t = 0;
+            #[inline(always)]
+            fn g(a: $t, b: $t) -> $t { a.wrapping_mul(b) }
+            #[inline(always)]
+            fn f(x: $t, y: $t) -> $t { x.wrapping_add(y) }
+        }
+    )+};
 }
+wrapping_times!(i64, i32);
 impl Pair<i64> for MaxPlus {
     type Out = i64;
     const UNIT: i64 = i64::MIN;
@@ -365,13 +379,12 @@ pub const MC: usize = 128;
 #[doc(hidden)]
 pub const NC: usize = 2048;
 
-/// The tile shapes, `[MR, NR]`, and the bytes in a vector. A tile holds the rows and columns of the result that a micro-kernel keeps in registers. AArch64 has 32 vector registers of 16 bytes, and AVX2 has 16 registers of 32 bytes. wasm has 16-byte vectors, and V8 gives it 16 registers on x86-64. The extremes and the counts compare at each step, and on AVX2 they need registers for those comparisons, so their tiles have fewer rows. A plain kernel's tile holds at most 32 items. On the Mac, plain tiles of 48 or more floats compiled to scalar code and ran 4 to 5 times slower.
+/// The tile shapes, `[MR, NR]`, and the bytes in a vector. A tile holds the rows and columns of the result that a micro-kernel keeps in registers. AArch64 has 32 vector registers of 16 bytes, and AVX2 has 16 registers of 32 bytes. wasm has 16-byte vectors, and V8 gives it 16 registers on x86-64. The extremes and the counts compare at each step, and on AVX2 they need registers for those comparisons, so their tiles have fewer rows. `TIMES32` serves both `f32` and `i32` products, whose items take 4 bytes. A plain kernel's tile holds at most 32 items. On the Mac, plain tiles of 48 or more floats compiled to scalar code and ran 4 to 5 times slower.
 #[cfg(target_arch = "aarch64")]
 mod tiles {
     pub(super) const BYTES: usize = 16;
     #[cfg(native)]
     pub(super) const TIMES64: [usize; 2] = [8, 4];
-    #[cfg(native)]
     pub(super) const TIMES32: [usize; 2] = [8, 8];
     pub(super) const COMPARES64: [usize; 2] = [6, 8];
     pub(super) const COMPARES32: [usize; 2] = [6, 16];
@@ -382,7 +395,6 @@ mod tiles {
     pub(super) const BYTES: usize = 32;
     #[cfg(native)]
     pub(super) const TIMES64: [usize; 2] = [6, 8];
-    #[cfg(native)]
     pub(super) const TIMES32: [usize; 2] = [6, 16];
     pub(super) const COMPARES64: [usize; 2] = [4, 8];
     pub(super) const COMPARES32: [usize; 2] = [4, 16];
@@ -408,7 +420,7 @@ macro_rules! inner {
             fn inner_into(&self, a: &[$t], b: &[$t], size: [usize; 3], out: &mut [Self::Out]) {
                 const MR: usize = $tile[0];
                 const NR: usize = $tile[1];
-                tiled_into::<$t, $object, MR, NR>(a, b, size, out, $kernel::<MR, NR, { NR * size_of::<$t>() / tiles::BYTES }>)
+                tiled_into::<$t, $t, $object, MR, NR>(a, b, size, out, $kernel::<MR, NR, { NR * size_of::<$t>() / tiles::BYTES }>)
             }
         }
     )+};
@@ -419,24 +431,26 @@ fn filled<T: Clone>(n: usize, x: T) -> Vec<T> {
     v.resize(n, x);
     v
 }
-/// `P`'s inner product of `a` and `b`, as `Inner::inner_into` gives it, written into `c`, which holds `m`×`n` items, through `kernel` on tiles of `MR`×`NR`.
+/// `P`'s inner product of `a` and `b`, as `Inner::inner_into` gives it, written into `c`, which holds `m`×`n` items, through `kernel` on tiles of `MR`×`NR`. Each item reads as the kernel's type `T` through [`Source`] as it's packed, so an operand of narrower items is never copied whole.
 #[inline(always)]
-fn tiled_into<T: Copy + Default + Send + Sync, P: Pair<T>, const MR: usize, const NR: usize>(
-    a: &[T], b: &[T], [m, k, n]: [usize; 3], c: &mut [P::Out], kernel: impl Fn(&[T], &[T], &mut [[P::Out; NR]; MR], bool) + Sync) {
+fn tiled_into<S: Source<T> + Copy + Sync, T: Copy + Default + Send + Sync, P: Pair<T>, const MR: usize, const NR: usize>(
+    a: &[S], b: &[S], [m, k, n]: [usize; 3], c: &mut [P::Out], kernel: impl Fn(&[T], &[T], &mut [[P::Out; NR]; MR], bool) + Sync) {
     assert!(a.len() == m * k && b.len() == k * n && c.len() == m * n, "`a` must hold `m`×`k` items, `b` `k`×`n` and `c` `m`×`n`");
-    if m * k * n <= DIRECT_WORK { return direct::<T, P>(a, b, [m, k, n], c) }
+    if m * k * n <= DIRECT_WORK { return direct::<S, T, P>(a, b, [m, k, n], c) }
+    let f = <S as Source<T>>::read;
     product::<T, P, MR, NR>(
-        c, n, |rows, p0, out| strip(a, k, false, rows, p0, out, |x| x), |columns, p0, out| strip(b, n, true, columns, p0, out, |x| x), [m, k, n], true,
+        c, n, |rows, p0, out| strip(a, k, false, rows, p0, out, f), |columns, p0, out| strip(b, n, true, columns, p0, out, f), [m, k, n], true,
         Part::Whole, kernel);
 }
 
 /// The most steps, `m`×`k`×`n`, of a product that [`direct`] computes, where packing the operands for the tiled kernels, or calling Accelerate, costs more than the steps. Measured on 22 October 2026 on an M5 Max, a stack of 4,096 products of 4×4 matrices cost 9.3 copies this way, against 25 on Accelerate and 38 on the packed kernels. A stack of 1,024 products of 8×8 matrices cost 10.1 copies this way, against 10.3 on Accelerate and 9.7 on the packed kernels, so the threshold stays below them.
 const DIRECT_WORK: usize = 64;
 
-/// `P`'s inner product of `a` and `b`, written into `c`, which holds `m`×`n` items, by a plain loop. Each result folds its row of `a` with its column of `b` in order, in a register, as the tiled kernels do on every target, NaN included. Four results of a row fold side by side, which vectorises, and the row's last columns fold one at a time. Nothing is packed or allocated.
+/// `P`'s inner product of `a` and `b`, written into `c`, which holds `m`×`n` items, by a plain loop. Each item reads as `T` through [`Source`]. Each result folds its row of `a` with its column of `b` in order, in a register, as the tiled kernels do on every target, NaN included. Four results of a row fold side by side, which vectorises, and the row's last columns fold one at a time. Nothing is packed or allocated.
 // A stack of tiny products calls this once for each cell. Once the loop vectorizer ran before thin LTO's import step, this body grew too large to import into `product_at`, and the call cost a stack of 64 2×2 Boolean products about 600 instructions.
 #[inline]
-fn direct<T: Copy, P: Pair<T>>(a: &[T], b: &[T], [m, k, n]: [usize; 3], c: &mut [P::Out]) {
+fn direct<S: Source<T> + Copy, T: Copy, P: Pair<T>>(a: &[S], b: &[S], [m, k, n]: [usize; 3], c: &mut [P::Out]) {
+    let f = <S as Source<T>>::read;
     const SIDE: usize = 4;
     assert!(a.len() >= m * k && b.len() >= k * n && c.len() >= m * n, "`a` must hold `m`×`k` items, `b` `k`×`n` and `c` `m`×`n`");
     // SAFETY: every index below is `i * k + p`, `p * n + j` or `i * n + j` with `i < m`, `p < k` and `j < n`, which the assert bounds. Checking each one cost about half of `direct`'s instructions on a 4×4 product.
@@ -445,15 +459,15 @@ fn direct<T: Copy, P: Pair<T>>(a: &[T], b: &[T], [m, k, n]: [usize; 3], c: &mut 
         while j + SIDE <= n {
             let mut acc = [P::UNIT; SIDE];
             for p in 0..k {
-                let x = unsafe { *a.get_unchecked(i * k + p) };
-                for s in 0..SIDE { acc[s] = P::step(acc[s], x, unsafe { *b.get_unchecked(p * n + j + s) }) }
+                let x = f(unsafe { *a.get_unchecked(i * k + p) });
+                for s in 0..SIDE { acc[s] = P::step(acc[s], x, f(unsafe { *b.get_unchecked(p * n + j + s) })) }
             }
             for s in 0..SIDE { unsafe { *c.get_unchecked_mut(i * n + j + s) = acc[s] } }
             j += SIDE;
         }
         for j in j..n {
             let mut acc = P::UNIT;
-            for p in 0..k { acc = P::step(acc, unsafe { *a.get_unchecked(i * k + p) }, unsafe { *b.get_unchecked(p * n + j) }) }
+            for p in 0..k { acc = P::step(acc, f(unsafe { *a.get_unchecked(i * k + p) }), f(unsafe { *b.get_unchecked(p * n + j) })) }
             unsafe { *c.get_unchecked_mut(i * n + j) = acc }
         }
     }
@@ -478,7 +492,7 @@ impl Inner<i64> for PlusEqual {
         if let (Some(a), Some(b)) = (narrow(a), narrow(b)) { return out.iter_mut().zip(&self.inner(&a, &b, size)).for_each(|(o, &x)| *o = i64::from(x)); }
         const MR: usize = tiles::COMPARES64[0];
         const NR: usize = tiles::COMPARES64[1];
-        tiled_into::<i64, PlusEqual, MR, NR>(a, b, size, out, equal_i64::<MR, NR, { NR * size_of::<i64>() / tiles::BYTES }>)
+        tiled_into::<i64, i64, PlusEqual, MR, NR>(a, b, size, out, equal_i64::<MR, NR, { NR * size_of::<i64>() / tiles::BYTES }>)
     }
 }
 
@@ -508,7 +522,7 @@ macro_rules! differences {
 differences!(i64 => i64, i32 => i32, i16 => i16, f64 => i64, f32 => i32);
 
 /// The largest magnitude among the items of `x`.
-fn magnitude(x: &[i64]) -> u128 { u128::from(x.iter().fold(0, |m, v| m.max(v.unsigned_abs()))) }
+fn magnitude<T: Copy>(x: &[T]) -> u128 where i64: From<T> { u128::from(x.iter().fold(0, |m, &v| m.max(i64::from(v).unsigned_abs()))) }
 
 /// The integer inner products of the float pairs. Each computes at the narrowest item type that holds every value the product forms exactly: `f32` where none exceeds 2^24 in magnitude, `f64` where all lie below 2^51, `i64` where all fit it, and otherwise 128 bits through `wide`. `$bound` gives the largest magnitude that a product can form, from the largest magnitudes in `a` and `b` and from `k`. `checked_into` gives `false` where a result doesn't fit `i64`, and `inner` and `inner_into` panic there.
 macro_rules! integers {
@@ -546,15 +560,68 @@ fn tiered<P>(pair: &P, a: &[i64], b: &[i64], [m, k, n]: [usize; 3], bound: u128,
     P: Inner<f32, Out = f32> + Inner<f64, Out = f64> + Pair<i64, Out = i64> {
     assert!(a.len() == m * k && b.len() == k * n, "`a` must hold `m`×`k` items and `b` `k`×`n`");
     if k == 0 { return out.fill(<P as Pair<i64>>::UNIT); }
-    if bound <= 1 << 24 { return exactly::<f32, P>(pair, a, b, [m, k, n], out); }
-    if bound <= convert::WIDE_LIMIT as u128 { return exactly::<f64, P>(pair, a, b, [m, k, n], out); }
-    tiled_into::<i64, P, { PLAIN[0] }, { PLAIN[1] }>(a, b, [m, k, n], out, micro::<i64, P, { PLAIN[0] }, { PLAIN[1] }>)
+    if exactly(pair, a, b, [m, k, n], bound, true, out, |x| x) { return; }
+    tiled_into::<i64, i64, P, { PLAIN[0] }, { PLAIN[1] }>(a, b, [m, k, n], out, micro::<i64, P, { PLAIN[0] }, { PLAIN[1] }>)
 }
 
-/// `pair`'s inner product of `a` and `b` at the float type `F`, which holds every value it forms exactly, written into `out`. The conversions go through `convert`, because `as` between `f64` and `i64` converts one item at a time on AVX2 and in wasm.
-fn exactly<F: Float, P: Inner<F, Out = F>>(pair: &P, a: &[i64], b: &[i64], size: [usize; 3], out: &mut [i64]) {
-    let floats = |x: &[i64]| x.iter().map(|&v| convert::float::<F, i64>(v)).collect::<Vec<F>>();
-    for (o, x) in out.iter_mut().zip(pair.inner(&floats(a), &floats(b), size)) { *o = convert::shifted(x.wide()) }
+/// `pair`'s inner product of `a` and `b`, whose values never exceed `bound` in magnitude, in a float that holds each of them exactly: `f32` up to 2^24, and `f64` up to `WIDE_LIMIT` where `wide` holds. Each item reads through [`Source`], and each result, a whole number, converts from `i64` to the type of `out` through `whole`. `false`, with `out` untouched, where neither float holds every value.
+fn exactly<P, S, O>(pair: &P, a: &[S], b: &[S], size: [usize; 3], bound: u128, wide: bool, out: &mut [O], whole: impl Fn(i64) -> O) -> bool where
+    P: Inner<f32, Out = f32> + Inner<f64, Out = f64>, S: Source<f32> + Source<f64> {
+    fn at<F: Float + Element, P: Inner<F, Out = F>, S: Source<F>, O>(pair: &P, a: &[S], b: &[S], size: [usize; 3], out: &mut [O], whole: impl Fn(i64) -> O) -> bool {
+        for (o, x) in out.iter_mut().zip(pair.inner(&read_all(a), &read_all(b), size)) { *o = whole(convert::shifted(x.wide())) }
+        true
+    }
+    if bound <= 1 << 24 { at::<f32, P, S, O>(pair, a, b, size, out, whole) } else { wide && bound <= convert::WIDE_LIMIT as u128 && at::<f64, P, S, O>(pair, a, b, size, out, whole) }
+}
+
+/// `+.×` of `a` and `b` with wrapping `i32` steps, written into `out`, on the `i32` kernel. The kernel converts each item to `i32` through [`Source`] as it packs it.
+fn times_i32_into<S: Source<i32>>(a: &[S], b: &[S], size: [usize; 3], out: &mut [i32]) {
+    const MR: usize = tiles::TIMES32[0];
+    const NR: usize = tiles::TIMES32[1];
+    tiled_into::<S, i32, PlusTimes, MR, NR>(a, b, size, out, times_i32::<MR, NR, { NR * size_of::<i32>() / tiles::BYTES }>)
+}
+
+/// [`Wrapped<PlusTimes>`] on `u8`, `i16` and `i32` items. Each result is its exact sum of products wrapped to 32 bits, as static kinds and fixed widths keep integer results. Nothing fails. [`Product::run_wrapped`] runs these products. `$largest` gives the largest magnitude that a product of two items can form: from the item type for `u8` and `i16`, and from the items' largest magnitudes for `i32`. Where `k` such products sum exactly in `f32`, the product computes in `f32` and wraps each whole result, as `integers!`'s products do. Where Accelerate serves the product, a sum that `f64` holds exactly computes in `f64` the same way. Every other product runs on the `i32` kernel, whose wrapping steps are exact to 32 bits whatever the items. On an M5 Max on 25 October 2026, against the `i32` kernel's time, a product of two 512×512 `u8` matrices took a fifth through Accelerate's `f64` product and 1.6 times as long through rustymath's own. A 512×256 by 256×512 product took 0.85 of the `i32` kernel's time through rustymath's own `f32` product.
+macro_rules! wrapped_narrow {
+    ($($t:ty: $largest:expr;)+) => {$(
+        impl Inner<$t> for crate::Wrapped<PlusTimes> {
+            type Out = i32;
+            fn inner_into(&self, a: &[$t], b: &[$t], size @ [m, k, n]: [usize; 3], out: &mut [i32]) {
+                assert!(a.len() == m * k && b.len() == k * n && out.len() == m * n, "`a` must hold `m`×`k` items, `b` `k`×`n` and `out` `m`×`n`");
+                if m * k * n > DIRECT_WORK && exactly(&PlusTimes, a, b, size, $largest(a, b) * k as u128, accelerated(), out, |x| x as i32) { return }
+                times_i32_into(a, b, size, out)
+            }
+        }
+    )+};
+}
+wrapped_narrow! {
+    u8: |_, _| 255 * 255;
+    i16: |_, _| 1 << 30;
+    i32: |a, b| magnitude(a) * magnitude(b);
+}
+
+/// `+.×` of f16 matrices, summed and returned at f32. rustymath's own kernels convert each item to f32 as they pack it, so neither operand is copied whole. Accelerate has no f16 product, so where it serves the process, both operands convert to f32 copies for its f32 product.
+impl Inner<half::f16> for PlusTimes {
+    type Out = f32;
+    fn inner_into(&self, a: &[half::f16], b: &[half::f16], size @ [m, k, n]: [usize; 3], c: &mut [f32]) {
+        assert!(a.len() == m * k && b.len() == k * n && c.len() == m * n, "`a` must hold `m`×`k` items, `b` `k`×`n` and `c` `m`×`n`");
+        if m * k * n <= DIRECT_WORK { return direct::<half::f16, f32, PlusTimes>(a, b, size, c) }
+        dispatch!(half_products_accelerated(a, b, size, c), half_products_native(a, b, size, c))
+    }
+}
+
+/// [`PlusTimes`] at f16 on Accelerate's f32 product, through f32 copies of both operands.
+#[cfg(accelerate)]
+fn half_products_accelerated(a: &[half::f16], b: &[half::f16], size @ [_, k, n]: [usize; 3], c: &mut [f32]) {
+    f32::gemm(c, n, Matrix::rows(&read_all(a), k), Matrix::rows(&read_all(b), n), size, 1.0, 0.0)
+}
+
+/// [`PlusTimes`] at f16 on rustymath's own f32 kernels, which convert each item as they pack it.
+#[cfg(native)]
+fn half_products_native(a: &[half::f16], b: &[half::f16], size: [usize; 3], c: &mut [f32]) {
+    const MR: usize = tiles::TIMES32[0];
+    const NR: usize = tiles::TIMES32[1];
+    tiled_into::<half::f16, f32, PlusTimes, MR, NR>(a, b, size, c, times32::<MR, NR, { NR * size_of::<f32>() / tiles::BYTES }>)
 }
 
 /// A strided matrix borrowed in its stored, transposed, conjugated or adjoint orientation.
@@ -736,15 +803,15 @@ fn blocks<T: Element>(op: Mapped<'_, T>, [rows, cols]: [usize; 2], mut f: impl F
 
 /// The most rows of the result in one piece of [`by_columns`]'s split across threads.
 const COLUMN_ROWS: usize = 4096;
-/// The rows of the result that [`by_columns`] keeps in registers while every column of `a` adds into them.
-const COLUMN_STRIP: usize = 8;
+/// The results that [`scaled_runs`] keeps in registers while every column adds into them.
+const COLUMN_STRIP: usize = 32;
 /// The fewest adjacent rows of `a` that [`by_columns`] reads at once. Shorter runs cost more in loop overhead than gathering saves.
 const COLUMN_RUN: usize = 64;
 
-/// `+.×` of `a` and a vector `b`, where each row of `a` starts one item after the row before it in storage, as the windows of a vector or a single-channel image do. Each column of `a` is then a run of storage. The result is computed a strip of [`COLUMN_STRIP`] rows at a time, which stays in registers while every column of `a`, read where it lies and scaled by its item of `b`, adds into it. `a` is never gathered. `None` where `a`'s mapping doesn't split into entries for its rows and entries for its columns, or where its rows aren't adjacent in runs of at least [`COLUMN_RUN`].
+/// `+.×` of `a` and a vector `b`, where each row of `a` starts one item after the row before it in storage, as the windows of a vector or a single-channel image do. Each column of `a` is then a run of storage, which [`scaled_runs`] reads where it lies and scales by its item of `b`. `a` is never gathered. `None` where `a`'s mapping chose a fill, where it doesn't split into entries for its rows and entries for its columns, or where its rows aren't adjacent in runs of at least [`COLUMN_RUN`]. The loop reads a fill as 0, the item type's own fill.
 fn by_columns<T: Tiled + Element>(a: Mapped<'_, T>, b: Mapped<'_, T>, oa: Orientation, [m, k]: [usize; 2]) -> Option<Vec<T>> {
     use crate::gather::Steps;
-    let Mapping::Steps { base, steps } = a.mapping else { return None };
+    let (Mapping::Steps { base, steps }, None) = (a.mapping, a.mapping.chosen()) else { return None };
     if m * k == 0 { return None; }
     // The entries of the stored matrix's leading axis come first, and give its first `lead` items.
     let lead = if oa == Orientation::Normal { m } else { k };
@@ -764,24 +831,47 @@ fn by_columns<T: Tiled + Element>(a: Mapped<'_, T>, b: Mapped<'_, T>, oa: Orient
         while r < first + part.len() {
             let len = (width - r % width).min(COLUMN_ROWS).min(first + part.len() - r);
             // A row whose outer entries give a fill reads only fills, and its result stays 0.
-            if let Some(at) = Steps::reach(*base, rows, r) {
-                let (strips, tail) = part[r - first..r - first + len].as_chunks_mut::<COLUMN_STRIP>();
-                for (s, strip) in strips.iter_mut().enumerate() {
-                    let (at, mut acc) = (at + s * COLUMN_STRIP, [T::zero(); COLUMN_STRIP]);
-                    for &(w, o) in &columns {
-                        let x = &a.data[at + o..][..COLUMN_STRIP];
-                        for t in 0..COLUMN_STRIP { acc[t] = w.mul_acc(x[t], acc[t]) }
-                    }
-                    *strip = acc;
-                }
-                let at = at + strips.len() * COLUMN_STRIP;
-                for (t, y) in tail.iter_mut().enumerate() { *y = columns.iter().fold(T::zero(), |acc, &(w, o)| w.mul_acc(a.data[at + o + t], acc)) }
-            }
+            if let Some(at) = Steps::reach(*base, rows, r) { scaled_runs(&mut part[r - first..r - first + len], a.data, at, &columns) }
             r += len;
         }
         true
     });
     Some(c)
+}
+
+/// Adds into `out`'s results, for adjacent rows of a matrix whose first row starts at `data[at]` and each next row one item later, the item at each row's start plus each column's offset, times the column's weight, for each of `columns`. A strip of [`COLUMN_STRIP`] results stays in registers while every column adds into it.
+fn scaled_runs<T: Tiled>(out: &mut [T], data: &[T], at: usize, columns: &[(T, usize)]) {
+    let (strips, tail) = out.as_chunks_mut::<COLUMN_STRIP>();
+    for (s, strip) in strips.iter_mut().enumerate() {
+        let (at, mut acc) = (at + s * COLUMN_STRIP, *strip);
+        for &(w, o) in columns {
+            let x = &data[at + o..][..COLUMN_STRIP];
+            for t in 0..COLUMN_STRIP { acc[t] = w.mul_acc(x[t], acc[t]) }
+        }
+        *strip = acc;
+    }
+    let at = at + strips.len() * COLUMN_STRIP;
+    for (t, y) in tail.iter_mut().enumerate() { *y = columns.iter().fold(*y, |acc, &(w, o)| w.mul_acc(data[at + o + t], acc)) }
+}
+
+/// Writes `out`'s results for stored rows `first..` of a matrix whose rows start `ld` items apart in `data`: each the sum of products of its row with `x`. Four rows at a time share each read of `x`, each row in eight running sums, which vectorize and then add pairwise.
+#[cfg(native)]
+fn dots<T: Tiled>(out: &mut [T], data: &[T], ld: usize, first: usize, x: &[T]) {
+    let k = x.len();
+    let (quads, tail) = out.as_chunks_mut::<4>();
+    let (xc, xr) = x.as_chunks::<8>();
+    let sum = |s: &[T; 8]| ((s[0] + s[4]) + (s[2] + s[6])) + ((s[1] + s[5]) + (s[3] + s[7]));
+    for (q, quad) in quads.iter_mut().enumerate() {
+        let rows: [&[T]; 4] = std::array::from_fn(|r| &data[(first + 4 * q + r) * ld..][..k]);
+        let mut s = [[T::zero(); 8]; 4];
+        for (c, xs) in xc.iter().enumerate() {
+            for r in 0..4 { let a = &rows[r][c * 8..][..8]; for l in 0..8 { s[r][l] = a[l].mul_acc(xs[l], s[r][l]) } }
+        }
+        let at = xc.len() * 8;
+        for r in 0..4 { quad[r] = xr.iter().enumerate().fold(sum(&s[r]), |t, (p, &b)| rows[r][at + p].mul_acc(b, t)) }
+    }
+    let first = first + 4 * quads.len();
+    for (i, y) in tail.iter_mut().enumerate() { *y = factor::dot(&data[(first + i) * ld..][..k], x) }
 }
 
 /// `+.×` of mapped operands on the tiled kernels, for [`Inner::inner_mapped`]. An operand whose mapping reads it at positive strides, one of them 1, is used where it lies, row by row or as a transpose. Any other operand is read a block of its stored rows at a time. Each block's product goes straight into the result. A block whose rows are the result's rows or columns writes them. A block whose rows run along the contraction adds to the whole result. Where neither operand can be used where it lies, `b` is read whole. A vector `b` beside an `a` whose rows are adjacent in storage goes to [`by_columns`], which reads `a` where it lies.
@@ -821,12 +911,67 @@ fn scale<T: Tiled>(c: &mut [T], ldc: usize, [m, n]: [usize; 2], beta: T, part: P
     }
 }
 
-/// `gemm` on rustymath's own packed kernels, for a nonzero `k` and `alpha`.
+/// The multiply-adds in each unit of [`by_vector`]'s split across threads. `parallel::split` times the first unit to choose the pieces.
+#[cfg(native)]
+const VECTOR_WORK: usize = 1 << 15;
+/// The results that [`by_vector`] keeps in the first-level cache while the stored rows of a transposed matrix add into them.
+#[cfg(native)]
+const VECTOR_STRIP: usize = 2048;
+/// The stored rows of a transposed matrix that [`by_vector`] adds into its results together, read side by side in storage order.
+#[cfg(native)]
+const VECTOR_ROWS: usize = 8;
+/// The fewest multiply-adds in each piece of [`by_vector`]'s split of stored rows across threads: twice what waking one more thread costs ([`THREAD_WORK`]), so that every split gains. At 4 threads on an M5 Max, a split cost about 10 to 12 µs whether it made two pieces or four, and pieces of 2^15 to 2^17 made a vector times a matrix of 1024 columns up to 76% slower than one piece where their work came to less than that. With pieces of 2^18, 128 and 256 rows ran as one piece, and 512 and 1024 rows ran 20 and 28% faster than before in two and four pieces.
+#[cfg(native)]
+const VECTOR_PIECE: usize = 2 * THREAD_WORK;
+
+/// `alpha a b`, where `m` or `n` is 1, replacing `c` with `start` and added to it otherwise, as [`Tiled::native_product`] gives it. The packed kernels would pack the whole matrix and pad the vector to a tile. As a matrix times a vector, `a b` or the transpose of `bᵀ aᵀ`, each result is the sum of products of a stored row with the vector ([`dots`]) where the matrix's stored rows run along the contraction. Otherwise the stored rows, scaled by the vector's items, add into a strip of [`VECTOR_STRIP`] results [`VECTOR_ROWS`] rows at a time ([`scaled_runs`]), which reads each block of rows in storage order. The results split across threads, or, where they fit one strip of a transposed matrix, the stored rows do, each piece adding into results of its own. `false` for any other size, and for `Part::Lower`.
+#[cfg(native)]
+fn by_vector<T: Tiled>(c: &mut [T], ldc: usize, a: Matrix<'_, T>, alpha: T, b: Matrix<'_, T>, [m, k, n]: [usize; 3], start: bool, part: Part) -> bool {
+    let (matrix, vector, rows, step) = match (m, n, part) {
+        (_, 1, Part::Whole) => (a, b.transpose(), m, ldc),
+        (1, _, Part::Whole) => (b.transpose(), a, n, 1),
+        _ => return false,
+    };
+    // A conjugated matrix's results are the conjugates of its stored items' results with the conjugated vector.
+    let conj = matches!(matrix.op, Op::Adjoint | Op::Conjugate);
+    let x: Vec<T> = (0..k).map(|p| if conj { vector.at(0, p).conj() } else { vector.at(0, p) }).collect();
+    let (data, ld, unit) = (matrix.data, matrix.ld, (VECTOR_WORK / k).max(1).next_multiple_of(4));
+    let mut y = filled(rows, T::zero());
+    if matrix.op.transposed() {
+        // Stored row `p` holds the matrix's column `p`, so the matrix's row `i` starts at `data[i]`. A strip of results takes the stored rows a block at a time, reading the block's rows side by side in storage order.
+        let mut columns: Vec<(T, usize)> = x.iter().enumerate().map(|(p, &w)| (w, p * ld)).collect();
+        if rows <= VECTOR_STRIP {
+            // Results that fit one strip leave each thread a narrow part of every stored row, so the stored rows split instead. Each piece reads its rows whole into results of its own, which add into `y` ([`parallel::summed`]).
+            parallel::summed(&mut columns, 1, (VECTOR_PIECE / rows).max(1), &mut y, &mut Vec::new(), &|_, columns, part| {
+                for block in columns.chunks(VECTOR_ROWS) { scaled_runs(part, data, 0, block) }
+            });
+        } else {
+            parallel::split(&mut y, unit, &|first, part| {
+                for (s, strip) in part.chunks_mut(VECTOR_STRIP).enumerate() {
+                    for block in columns.chunks(VECTOR_ROWS) { scaled_runs(strip, data, first + s * VECTOR_STRIP, block) }
+                }
+                true
+            });
+        }
+    } else {
+        parallel::split(&mut y, unit, &|first, part| { dots(part, data, ld, first, &x); true });
+    }
+    // As the packed kernels do, `alpha` scales only where it isn't 1, which keeps a complex result's infinite part from making NaN.
+    let one = alpha == T::one();
+    for (i, y) in y.into_iter().enumerate() {
+        let y = if conj { y.conj() } else { y };
+        let (y, z) = (if one { y } else { alpha * y }, &mut c[i * step]);
+        *z = if start { y } else { *z + y };
+    }
+    true
+}
+
+/// `gemm` on rustymath's own kernels, for a nonzero `k` and `alpha`: [`by_vector`] for a product with a vector, and the packed kernels otherwise.
 #[cfg(native)]
 fn native_gemm<T: Tiled>(c: &mut [T], ldc: usize, a: Matrix<'_, T>, b: Matrix<'_, T>, [m, k, n]: [usize; 3], alpha: T, beta: T, part: Part) {
     let start = beta == T::zero();
     if !start { scale(c, ldc, [m, n], beta, part) }
-    T::native_product(c, ldc, a, alpha, b, [m, k, n], start, part)
+    if !by_vector(c, ldc, a, alpha, b, [m, k, n], start, part) { T::native_product(c, ldc, a, alpha, b, [m, k, n], start, part) }
 }
 /// The items of a product's result that it must fold: all of them, or those on and below its diagonal.
 #[derive(Clone, Copy)]
@@ -874,7 +1019,7 @@ macro_rules! tiled {
             #[inline]
             fn inner_into(&self, a: &[$t], b: &[$t], [m, k, n]: [usize; 3], c: &mut [$t]) {
                 assert!(a.len() == m * k && b.len() == k * n && c.len() == m * n, "`a` must hold `m`×`k` items, `b` `k`×`n` and `c` `m`×`n`");
-                if m * k * n <= DIRECT_WORK { return direct::<$t, PlusTimes>(a, b, [m, k, n], c) }
+                if m * k * n <= DIRECT_WORK { return direct::<$t, $t, PlusTimes>(a, b, [m, k, n], c) }
                 <$t>::gemm(c, n, Matrix::rows(a, k), Matrix::rows(b, n), [m, k, n], <$t>::one(), <$t>::zero())
             }
             fn inner_mapped(&self, a: Mapped<'_, $t>, b: Mapped<'_, $t>, orientations: [Orientation; 2], size: [usize; 3]) -> Vec<$t> { blocked(a, b, orientations, size) }
@@ -940,6 +1085,7 @@ mod plain {
     plain! {
         times64: f64, PlusTimes;
         times32: f32, PlusTimes;
+        times_i32: i32, PlusTimes;
         max_plus64: f64, MaxPlus;
         max_plus32: f32, MaxPlus;
         min_plus64: f64, MinPlus;
@@ -1006,6 +1152,8 @@ mod lanes {
     }
     #[cfg(target_arch = "aarch64")]
     lanes! {
+        // Integer plus-times products have no Accelerate form, so every target compiles them.
+        times_i32: i32, PlusTimes, 4, vdupq_n_s32, vld1q_s32, vst1q_s32, |a, b, c| vmlaq_s32(c, a, b);
         max_plus64: f64, MaxPlus, 2, vdupq_n_f64, vld1q_f64, vst1q_f64, |a, b, c| vmaxnmq_f64(c, vaddq_f64(a, b));
         max_plus32: f32, MaxPlus, 4, vdupq_n_f32, vld1q_f32, vst1q_f32, |a, b, c| vmaxnmq_f32(c, vaddq_f32(a, b));
         min_plus64: f64, MinPlus, 2, vdupq_n_f64, vld1q_f64, vst1q_f64, |a, b, c| vminnmq_f64(c, vaddq_f64(a, b));
@@ -1016,6 +1164,7 @@ mod lanes {
     lanes! {
         times64: f64, PlusTimes, 2, f64x2_splat, v128_load, v128_store, |a, b, c| f64x2_add(c, f64x2_mul(a, b));
         times32: f32, PlusTimes, 4, f32x4_splat, v128_load, v128_store, |a, b, c| f32x4_add(c, f32x4_mul(a, b));
+        times_i32: i32, PlusTimes, 4, i32x4_splat, v128_load, v128_store, |a, b, c| i32x4_add(c, i32x4_mul(a, b));
         max_plus64: f64, MaxPlus, 2, f64x2_splat, v128_load, v128_store, |a, b, c| f64x2_pmax(c, f64x2_add(a, b));
         max_plus32: f32, MaxPlus, 4, f32x4_splat, v128_load, v128_store, |a, b, c| f32x4_pmax(c, f32x4_add(a, b));
         min_plus64: f64, MinPlus, 2, f64x2_splat, v128_load, v128_store, |a, b, c| f64x2_pmin(c, f64x2_add(a, b));
@@ -1027,9 +1176,11 @@ mod lanes {
         times64: f64, PlusTimes, 4, _mm256_set1_pd, _mm256_loadu_pd, _mm256_storeu_pd, |a, b, c| _mm256_fmadd_pd(a, b, c);
         times32: f32, PlusTimes, 8, _mm256_set1_ps, _mm256_loadu_ps, _mm256_storeu_ps, |a, b, c| _mm256_fmadd_ps(a, b, c);
     }
-    // AVX2's `maxpd` and `minpd` give their second argument beside NaN: the running value `c`.
     #[cfg(target_arch = "x86_64")]
     lanes! {
+        // Integer plus-times products have no Accelerate form, so every target compiles them. AVX2 has no multiply-add on 32-bit integers.
+        times_i32: i32, PlusTimes, 8, _mm256_set1_epi32, _mm256_loadu_si256, _mm256_storeu_si256, |a, b, c| _mm256_add_epi32(c, _mm256_mullo_epi32(a, b));
+        // AVX2's `maxpd` and `minpd` give their second argument beside NaN: the running value `c`.
         max_plus64: f64, MaxPlus, 4, _mm256_set1_pd, _mm256_loadu_pd, _mm256_storeu_pd, |a, b, c| _mm256_max_pd(_mm256_add_pd(a, b), c);
         max_plus32: f32, MaxPlus, 8, _mm256_set1_ps, _mm256_loadu_ps, _mm256_storeu_ps, |a, b, c| _mm256_max_ps(_mm256_add_ps(a, b), c);
         min_plus64: f64, MinPlus, 4, _mm256_set1_pd, _mm256_loadu_pd, _mm256_storeu_pd, |a, b, c| _mm256_min_pd(_mm256_add_pd(a, b), c);

@@ -34,8 +34,11 @@ impl Tolerance {
 pub trait Tolerant: Copy + Send + Sync {
     /// The tolerance: 0 for `Exactly`.
     fn value(self) -> f64;
-    /// Whether `x` equals `y`. NaN equals nothing, as in IEEE, and an infinity equals only itself.
-    fn equal<F: Float>(self, x: F, y: F) -> bool;
+    /// Whether `x` and `y` lie within the tolerance of each other: `|x-y|` is less than the tolerance times the larger of `|x|` and `|y|`. NaN and the infinities are close to nothing. `less` and `less_equal` read it without `equal`'s `x == y`, because `x < y` already implies `x != y`, and `x <= y` already holds where `x == y`.
+    fn close<F: Float>(self, x: F, y: F) -> bool;
+    /// Whether `x` equals `y`: it is `y`, or `close` to it. NaN equals nothing, as in IEEE, and an infinity equals only itself.
+    #[inline]
+    fn equal<F: Float>(self, x: F, y: F) -> bool { (x == y) | self.close(x, y) }
     /// The floor of `y`: the whole number nearest to `y`, unless it lies above `y` and doesn't equal it. Then the whole number below. A floor or ceiling that is zero is `0`, never `-0`, as BPL's numbers give it.
     fn floor<F: Float>(self, y: F) -> F;
     /// The ceiling of `y`: the whole number nearest to `y`, unless it lies below `y` and doesn't equal it. Then the whole number above.
@@ -46,10 +49,10 @@ pub trait Tolerant: Copy + Send + Sync {
     fn matches<F: Float>(self, x: F, y: F) -> bool { self.equal(x, y) | (x.is_nan() & y.is_nan()) }
     /// Whether `x` is below `y` and doesn't equal it. Comparisons with NaN are false.
     #[inline]
-    fn less<F: Float>(self, x: F, y: F) -> bool { (x < y) & !self.equal(x, y) }
+    fn less<F: Float>(self, x: F, y: F) -> bool { (x < y) & !self.close(x, y) }
     /// Whether `x` is below `y` or equals it. Comparisons with NaN are false.
     #[inline]
-    fn less_equal<F: Float>(self, x: F, y: F) -> bool { (x <= y) | self.equal(x, y) }
+    fn less_equal<F: Float>(self, x: F, y: F) -> bool { (x <= y) | self.close(x, y) }
     /// Whether `x` is above `y` and doesn't equal it. Comparisons with NaN are false.
     #[inline]
     fn greater<F: Float>(self, x: F, y: F) -> bool { self.less(y, x) }
@@ -169,7 +172,7 @@ impl Tolerant for Exactly {
     #[inline]
     fn value(self) -> f64 { 0.0 }
     #[inline]
-    fn equal<F: Float>(self, x: F, y: F) -> bool { x == y }
+    fn close<F: Float>(self, _: F, _: F) -> bool { false }
     #[inline]
     // Adding 0 turns IEEE's `-0` into `0`.
     fn floor<F: Float>(self, y: F) -> F { y.floor() + F::narrow(0.0) }
@@ -178,9 +181,9 @@ impl Tolerant for Exactly {
 impl Tolerant for Tolerance {
     #[inline]
     fn value(self) -> f64 { Tolerance::value(self) }
-    // A loop of comparisons vectorizes only when the test has no branch. The test therefore uses `&` and `|`, not `&&` and `||`. With a strict `<`, an infinity is unequal to every finite number without a finiteness test, because `inf < inf` is false. NaN fails every comparison.
+    // A loop of comparisons vectorizes only when the test has no branch, so `close` and `Tolerant`'s methods use `&` and `|`, not `&&` and `||`. With a strict `<`, an infinity is close to no number without a finiteness test, because `inf < inf` is false. NaN fails every comparison.
     #[inline]
-    fn equal<F: Float>(self, x: F, y: F) -> bool { let t = F::narrow(self.0); (x == y) | ((x - y).abs() < t * larger(x.abs(), y.abs())) }
+    fn close<F: Float>(self, x: F, y: F) -> bool { (x - y).abs() < F::narrow(self.0) * larger(x.abs(), y.abs()) }
     #[inline]
     fn floor<F: Float>(self, y: F) -> F {
         // `y` equals the whole number above it when raising `y` by `t·|y|` reaches that number. Capping the raise just below a half keeps a whole number from reaching the next one where `t·|y|` exceeds a half. Where floats are 1 or more apart, the sum rounds back to `y`.
@@ -500,11 +503,34 @@ pub struct Ceil(pub Tolerance);
 tolerant!(#[inline] Ceil at real: |t, [y]| Total(t.ceil(y)));
 tolerant!(Ceil at Complex<f32>, Complex<f64>: |t, [y]| Total(t.complex_ceil(y)));
 
-/// [`Tolerant::residue`], or [`TolerantComplex::complex_residue`] for complex items, at the tolerance it holds, as a function object: `y` modulo `x`, for arguments `x` and `y` in that order. Its `i64` form is [`integer::residue`](crate::integer::residue), which needs no tolerance.
+/// [`Tolerant::residue`], or [`TolerantComplex::complex_residue`] for complex items, at the tolerance it holds, as a function object: `y` modulo `x`, for arguments `x` and `y` in that order. At no tolerance, where `y/x` passes the float's precision ([`far`]), the rounded quotient has lost its low digits, and [`exact_residue`] gives the residue. The slice form recomputes those items in a second pass. Its `i64` form is [`integer::residue`](crate::integer::residue), which needs no tolerance.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Residue(pub Tolerance);
-tolerant!(#[inline] Residue at real: |t, [x, y]| Total(t.residue(x, y)));
+forms!(#[inline] Residue at real: |k, [x, y]| Total(if k.0.is_exact() && far(x, y) { exact_residue(x, y) } else { k.0.residue(x, y) }),
+    many |k, [x, y], n, out| with_tolerance!(k.0, |t| {
+        if t.value() != 0.0 { return each!([x, y], n, out, |[x, y]| Total(t.residue(x, y))); }
+        if !each!([x, y], n, out, |[x, y]| (t.residue(x, y), !far(x, y))) { replace_far(x, y, n, out); }
+        true
+    }));
 tolerant!(Residue at Complex<f32>, Complex<f64>: |t, [x, y]| t.complex_residue(x, y));
+
+/// Replaces the residue in `out` of each item that [`far`] picks with [`exact_residue`]. The slice form's loop judges each item by `far` as it computes it, and runs this only where one is picked.
+fn replace_far<F: Float>(x: Arg<'_, F>, y: Arg<'_, F>, n: usize, out: &mut [std::mem::MaybeUninit<F>]) {
+    for (i, r) in crate::slice::written(&mut out[..n]).iter_mut().enumerate() {
+        let (x, y) = (x.nth(i), y.nth(i));
+        if far(x, y) { *r = exact_residue(x, y); }
+    }
+}
+
+/// Whether `y/x` passes the float's precision, 2^p, for a nonzero `x`. Below it, a rounded quotient is at most one away from the whole number below `y/x`, and the residue at most one `x` away from its range. Past it, the quotient has lost its low digits, and so has the residue. Without fused multiply-add, rounding the product of `x` and the quotient loses the residue past the same bound.
+#[inline(always)]
+fn far<F: Float>(x: F, y: F) -> bool { (x != F::zero()) & (y.abs() >= F::narrow(2.0) / F::epsilon() * x.abs()) }
+
+/// `y` modulo `x` from Rust's float remainder, which is exact. The remainder keeps `y`'s sign, so one whose sign differs from `x`'s moves up by `x`. A zero remainder is +0, as [`Tolerant::residue`] gives.
+fn exact_residue<F: Float>(x: F, y: F) -> F {
+    let r = y % x;
+    if r == F::zero() { F::zero() } else if (r < F::zero()) != (x < F::zero()) { r + x } else { r }
+}
 
 /// The tolerant floor of rounded `x ÷ y`, through [`Tolerant::floor_quotient`], as a function object. Float forms never fail. Its integer forms, from the `integer` module, divide exactly and fail on a zero divisor or an overflowing quotient.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -644,6 +670,15 @@ pub(crate) fn order_keys<F: Float>(x: &[F]) -> Vec<F::OrderKey> { x.iter().map(|
 
 /// The magnitude below which each whole number equals no other whole number within tolerance `t`, nor do floats equal to different whole numbers equal each other: 1/(4t), or 2^53 for a tolerance of 0. It is never above 2^53, below which an `f64` holds every whole number.
 pub fn whole_limit(t: impl Tolerant) -> f64 { (0.25 / t.value()).min(9_007_199_254_740_992.0) }
+
+/// The magnitude below which a whole number compares with integers as it does exactly, where each integer converts to a float of `F`'s width and compares within tolerance `t`: `whole_limit(t)`, and at most 2^p, below which floats of the width hold every whole number. A residue of one integer by another, where their magnitudes add up to less than it, is exact at the width, with or without a fused multiply-add.
+pub fn integer_limit<F: Float>(t: impl Tolerant) -> f64 { whole_limit(t).min(2.0 / F::epsilon().wide()) }
+
+/// `v` as an integer, where it is exactly whole and below `integer_limit::<F>(t)` in magnitude, so that integers compare with it as with that integer.
+pub fn integer_of<F: Float>(t: impl Tolerant, v: F) -> Option<i64> {
+    let v = v.wide();
+    (v.fract() == 0.0 && v.abs() < integer_limit::<F>(t)).then_some(v as i64)
+}
 
 /// Each item of `x` as the whole number it equals within tolerance `t`, when every item equals one below `limit` in magnitude, and whether every item is exactly its whole number. A search can then index these integers in place of the floats, with `whole_limit(t)` as the limit. A `limit` of at most 2^63 keeps every whole number within `i64`. Each block of `WHOLES` items is rounded to its nearest whole numbers in one loop that vectorizes. A block with an item that isn't exactly whole then tests each item against the tolerance in a second loop. The first block that fails ends the conversion.
 pub fn wholes<F: Float>(t: impl Tolerant, x: &[F], limit: f64) -> Option<(Vec<i64>, bool)> {

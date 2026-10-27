@@ -336,7 +336,7 @@ impl Cells {
         Some(Self { base, frame, matrix })
     }
     /// The mapping of the matrix at position `i` of the frame. `None` where the frame reads a fill there.
-    fn at(&self, i: usize) -> Option<Mapping> { Some(Mapping::Steps { base: Steps::reach(self.base, &self.frame, i)?, steps: self.matrix.clone() }) }
+    fn at(&self, i: usize) -> Option<Mapping> { Some(Mapping::Steps { base: Steps::reach(self.base, &self.frame, i)?, steps: self.matrix.clone().into() }) }
 }
 
 /// `x +.× y` of 32- or 64-bit floats or complex numbers, where a view holds an operand out of order but gemm can read both operands where they lie, as strided or transposed matrices. `Inner::inner_mapped` multiplies them without copying either. `None` where both operands are contiguous, for other dtypes, and where an operand would need a copy, as reversed rows do. A copy and one gemm cost less than gemm over blocks read in turn.
@@ -366,11 +366,20 @@ pub fn product<'py>(py: Python<'py>, f: NativeFunction<'_>, g: NativeFunction<'_
     result(py, released(py, || inner(f, g, views, name.unwrap_or("inner")))?)
 }
 
+/// The product kernel for the native functions named `$names`, from rustymath's table of facts ([`facts!`](rustymath::facts)): a `boolean_products` row first where `$booleans` holds, then a `products` row.
+macro_rules! known_product {
+    (($names:expr, $booleans:expr) folds $folds:tt booleans $truths:tt comparisons $comparisons:tt characters $characters:tt
+        products { $($kernel:ident: [$($p:tt)*] [$(($pf:literal, $pg:literal)),*];)* } boolean_products { $($truth:ident: [$($tp:tt)*] [$(($tf:literal, $tg:literal)),*];)* }) => {
+        match $names { $($(($tf, $tg) if $booleans => Some(linalg::Product::$truth),)*)* $($(($pf, $pg) => Some(linalg::Product::$kernel),)*)* _ => None }
+    };
+}
+
 /// [`product`] of two arrays that share one dtype, as a core array. It runs without the GIL, checking for Ctrl-C.
 pub fn inner(f: NativeFunction<'_>, g: NativeFunction<'_>, [x1, x2]: [ArrayView<'_>; 2], name: &str) -> PyResult<Core> {
     let dtype = x1.dtype();
     // Counts compare exactly through their kernels. Floats and complex numbers within a tolerance compare through the generic route's `equal`.
     let exact = !g.1 || !mathish_at(Some(dtype));
+    let named = rustymath::facts!(known_product, (f.0, g.0), (dtype == DType::Boolean)).filter(|pair| exact || !pair.compares_exactly());
     let (l1, l2) = (x1.layout().clone(), x2.layout().clone());
     let side = |l: &Layout| match l.shape().len() {
         0 => Err(py_err(Error::new(Kind::Rank, format!("{name} needs matrices or vectors, with at least one axis")))),
@@ -385,22 +394,11 @@ pub fn inner(f: NativeFunction<'_>, g: NativeFunction<'_>, [x1, x2]: [ArrayView<
     let frames = Frames::new(&[(&l1, c1), (&l2, c2)]).map_err(py_err)?;
     let cell = l1.axes(r1 - c1..r1).contracted(&l2.axes(r2 - c2..r2));
     let keyless = l1.keys(r1 - 1).is_none() && l2.keys(r2 - c2).is_none();
-    if (f.0, g.0) == ("add", "multiply") && keyless && let Some(r) = mapped([x1, x2], [c1, c2], &frames, [n, k, m], &cell)? { return Ok(r); }
+    if named == Some(linalg::Product::PlusTimes) && keyless && let Some(r) = mapped([x1, x2], [c1, c2], &frames, [n, k, m], &cell)? { return Ok(r); }
     let x = x1.cast(dtype).map_err(py_err)?;
     let y = linalg::paired(x2.cast(dtype).map_err(py_err)?, &l2, r2 - c2, &l1, r1 - 1, name).map_err(py_err)?;
     let p = Operands { args: [x.view(), y.view()], frames: &frames, size: [n, k, m], cell: &cell, name };
-    use linalg::Product as P;
-    let pair = match (f.0, g.0) {
-        ("add", "multiply") if dtype == DType::Boolean => P::OrAnd,
-        ("add", "multiply") => P::PlusTimes,
-        ("maximum", "add") => P::MaxPlus,
-        ("minimum", "add") => P::MinPlus,
-        ("logical_or", "logical_and") => P::OrAnd,
-        ("logical_and", "logical_or") => P::AndOr,
-        ("add", "equal") if exact => P::PlusEqual,
-        ("add", "not_equal") if exact => P::PlusNotEqual,
-        _ => return p.generic(f, g),
-    };
+    let Some(pair) = named else { return p.generic(f, g) };
     match p.run(pair)? { Some(r) => Ok(r), None => p.generic(f, g) }
 }
 

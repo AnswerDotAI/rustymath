@@ -2,9 +2,9 @@
 //!
 //! Axes with the same name pair first. The remaining axes pair from the front unless their names conflict, so a vector pairs with the rows of a matrix. Two names conflict when they differ and are both hidden or both visible. A hidden name, which starts with `_`, meets a visible one as if that axis were unnamed, and the result keeps the visible name. An axis of length 1 repeats along its partner. Where both arguments key an axis, the result's keys are their union, and an item that one argument lacks reads as its type's fill.
 use crate::{
-    buffer::{Element, Source}, error::{Error, Kind}, gather::{cycled, walk_range, Same, Steps}, layout::{generated_len, hidden, names_conflict, strides, Layout}, parallel::{extended, Slots}, Arg, Binary, Unary, CHUNK
+    buffer::{Element, Fill, Source}, error::{Error, Kind}, gather::{cycled, walk_plan, Same, Steps, Writes}, layout::{count, generated_len, hidden, names_conflict, strides, Alignment, Layout}, parallel::{extended, Slots}, Arg, Binary, Unary, CHUNK
 };
-use std::ops::Range;
+use std::{borrow::Cow, ops::Range, sync::{Arc, OnceLock}};
 
 /// How one argument's items lay out over a result: the argument's offset for each result position.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -16,7 +16,23 @@ pub enum Mapping {
     /// The input fills the trailing result axes and repeats as one block.
     Tiled(usize),
     /// The offsets that one entry for each result axis, outermost first, reach from `base`. An axis the input broadcasts along has step 0, and a `None` offset gives a fill.
-    Steps { base: usize, steps: Vec<Steps> },
+    Steps { base: usize, steps: Route },
+}
+
+/// How a mapping's positions read the same items again (`Mapping::period`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Period<'a> {
+    /// Each item repeats over this many consecutive positions.
+    Repeats(usize),
+    /// Every this many positions read the source's first items again, in order, as `Tiled` reads them.
+    Cycles(usize),
+    /// Every `len` positions read the same items again, through entries: those that `steps` reach from `base`. Reading a cycle in place walks its entries, so a reader gathers one cycle first (`gather_cycle`).
+    Walks { len: usize, base: usize, steps: &'a [Steps] },
+}
+
+impl Period<'_> {
+    /// The period, where each period's items can be read in place: `None` for a mapping that walks entries (`Walks`).
+    pub fn in_place(&self) -> Option<usize> { match *self { Self::Repeats(n) | Self::Cycles(n) => Some(n), Self::Walks { .. } => None } }
 }
 
 /// A contiguous block of storage that a view reads, each item once, with the block's axes in another order and some of them backwards. [`Mapping::block`] finds one.
@@ -37,7 +53,7 @@ impl Block {
         let folded = self.axes[axis].map(|(b, _)| b);
         let dims = &self.dims;
         let around = match folded {
-            Some(f) => [dims[..f].iter().product(), dims[f], dims[f + 1..].iter().product()],
+            Some(f) => [count(&dims[..f]), dims[f], count(&dims[f + 1..])],
             None => [self.range.len(), 1, 1],
         };
         // Each other axis of the view reads the totals along its block axis.
@@ -55,7 +71,40 @@ impl Block {
     }
 }
 
+/// The mapping that walking `tables` reads, with the tables as they are.
+impl From<Vec<Steps>> for Mapping { #[inline] fn from(tables: Vec<Steps>) -> Self { Self::Steps { base: 0, steps: tables.into() } } }
+
+/// The mapping that reads the places that `writes` writes, in order: a list of offsets as one table, and a walk as its own steps.
+impl From<Writes<'_>> for Mapping {
+    fn from(writes: Writes<'_>) -> Self {
+        match writes { Writes::Offsets(offsets) => Self::from(vec![Steps::table(offsets.to_vec())]), Writes::Walk { base, steps } => Self::Steps { base, steps: steps.to_vec().into() } }
+    }
+}
+
+/// The entries of a [`Mapping::Steps`], one for each result axis, with the walk that `Steps::simplify` plans for them and the fill that a call chose for the positions that reach no item. The plan is made on the first walk and kept, so a mapping that is read a block at a time plans its walk once.
+#[derive(Clone, Debug, Default)]
+pub struct Route { steps: Vec<Steps>, plan: OnceLock<(usize, Vec<Cow<'static, Steps>>)>, fill: Option<Arc<Fill>> }
+
+impl std::ops::Deref for Route { type Target = [Steps]; #[inline] fn deref(&self) -> &[Steps] { &self.steps } }
+impl From<Vec<Steps>> for Route { #[inline] fn from(steps: Vec<Steps>) -> Self { Self { steps, plan: OnceLock::new(), fill: None } } }
+impl From<Route> for Vec<Steps> { #[inline] fn from(route: Route) -> Self { route.steps } }
+impl PartialEq for Route { fn eq(&self, other: &Self) -> bool { self.steps == other.steps && self.fill == other.fill } }
+impl Eq for Route {}
+
+impl Route {
+    /// The offset that the walk adds to its mapping's base, and the entries it walks.
+    #[inline]
+    pub(crate) fn plan(&self) -> (usize, &[Cow<'static, Steps>]) {
+        let (offset, plan) = self.plan.get_or_init(|| { let (offset, plan) = Steps::simplify(0, &self.steps); (offset, plan.into_iter().map(|s| Cow::Owned(s.into_owned())).collect()) });
+        (*offset, plan)
+    }
+}
+
 impl Mapping {
+    /// Whether an axis of this mapping reads through a table of positions, as a selection by data does, rather than by strides.
+    pub fn tabled(&self) -> bool { matches!(self, Self::Steps { steps, .. } if steps.iter().any(|s| matches!(s, Steps::Table(_)))) }
+    /// The writes at the places that a [`Mapping::Steps`] reads, in order, as `From<Writes>` makes one. `None` for any other mapping.
+    pub fn as_writes(&self) -> Option<Writes<'_>> { if let Self::Steps { base, steps } = self { Some(Writes::Walk { base: *base, steps }) } else { None } }
     /// This mapping as one entry per axis of `shape`, or `None` where offsets aren't axis-separable.
     pub fn entries(&self, shape: &[usize]) -> Option<(usize, Vec<Steps>)> {
         if shape.contains(&0) { return Some((0, shape.iter().map(|&n| Steps::along(n, 0)).collect())); }
@@ -64,7 +113,7 @@ impl Mapping {
             return Some((base + offset, steps));
         }
         if let Self::Linear(period) | Self::Tiled(period) = *self {
-            let n: usize = shape.iter().product();
+            let n = count(shape);
             if period < n && period != 1 && !shape.iter().rev().scan(1, |p, &n| { *p *= n; Some(*p) }).any(|p| p == period) { return None; }
         }
         let base = self.get(0)?;
@@ -73,27 +122,44 @@ impl Mapping {
         }).collect::<Option<_>>()?;
         Some((base, steps))
     }
-    /// Reads of a logical array of `shape` through `outer`, then through this mapping to its storage.
+    /// Reads of a logical array of `shape` through `outer`, then through this mapping to its storage. A position where `outer` gives a fill reads its item type's own fill. `None` where this mapping chose a fill and `outer` gives fills.
     pub fn through(&self, outer: &[Steps], shape: &[usize]) -> Option<Self> {
         if outer.iter().any(|s| s.len() == 0) { return Some(Self::Linear(1)); }
+        if self.chosen().is_some() && outer.iter().any(Steps::fills) { return None; }
         let (base, inner) = self.entries(shape)?;
         let (base, steps) = Steps::through(outer, shape, base, &inner)?;
-        Some(Self::Steps { base, steps })
+        Some(self.with_steps(base, steps))
     }
-    /// `outer` maps `frame` to a logical array of `shape`; this maps that array to storage. Unsupported compositions return `None`.
+    /// This mapping over a result of `shape` as one entry for each axis of `shape`, or as it is where its offsets don't split by axis ([`Mapping::entries`]).
+    pub fn split(&self, shape: &[usize]) -> Self { self.entries(shape).map_or_else(|| self.clone(), |(base, steps)| self.with_steps(base, steps)) }
+    /// The base and the tables of a walk that reads what this mapping reads over `shape`. A [`Mapping::Steps`] lends its own steps.
+    #[inline]
+    pub fn to_walk(&self, shape: &[usize]) -> (usize, Cow<'_, [Steps]>) {
+        if let Self::Steps { base, steps } = self { return (*base, Cow::Borrowed(steps)); }
+        match self.entries(shape) {
+            Some((base, steps)) => (base, Cow::Owned(steps)),
+            None => (0, Cow::Owned(vec![Steps::table((0..count(shape)).map(|i| self.get(i).unwrap_or(Steps::FILL)).collect())])),
+        }
+    }
+    /// The tables of [`Mapping::to_walk`]'s walk, with its base as a leading table of one item, for code that walks or classifies tables, such as [`Walk::new`](crate::structure::Walk::new).
+    pub fn tables(&self, shape: &[usize]) -> Vec<Steps> { let (base, steps) = self.to_walk(shape); Steps::with_base(base, steps.into_owned()) }
+    /// The bytes that this mapping's entries take: each entry, and a table's listed offsets.
+    pub fn footprint(&self) -> usize { if let Self::Steps { steps, .. } = self { steps.iter().map(Steps::footprint).sum() } else { 0 } }
+    /// `outer` maps `frame` to a logical array of `shape`; this maps that array to storage. Unsupported compositions return `None`, as do two mappings that both read fills where either chose one.
     pub fn compose(&self, outer: &Self, shape: &[usize], frame: &[usize]) -> Option<Self> {
         if frame.contains(&0) { return Some(Self::Linear(1)); }
         if matches!(self, Self::Linear(1)) { return Some(outer.clone()); }
         if matches!(outer, Self::Linear(1)) { return Some(self.clone()); }
+        let fill = self.joined_fill(outer)?;
         let (base, steps) = outer.entries(frame)?;
-        if base != 0 { return None; }
-        self.through(&steps, shape)
+        Some(self.through(&Steps::with_base(base, steps), shape)?.filled(fill))
     }
-    /// [`Mapping::compose`], or else, where `table` allows it, the composed offsets as one table over `frame`'s positions, with a fill wherever either mapping reads one.
+    /// [`Mapping::compose`], or else, where `table` allows it, the composed offsets as one table over `frame`'s positions, with a fill wherever either mapping reads one. `None` where both read fills and chose different ones.
     pub fn composed(&self, outer: &Self, shape: &[usize], frame: &[usize], table: bool) -> Option<Self> {
         if let Some(mapping) = self.compose(outer, shape, frame) { return Some(mapping); }
-        let n: usize = frame.iter().product();
-        table.then(|| Self::Steps { base: 0, steps: vec![Steps::table((0..n).map(|k| outer.get(k).and_then(|j| self.get(j)).unwrap_or(Steps::FILL)).collect())] })
+        let fill = self.joined_fill(outer)?;
+        let n = count(frame);
+        table.then(|| Self::Steps { base: 0, steps: vec![Steps::table((0..n).map(|k| outer.get(k).and_then(|j| self.get(j)).unwrap_or(Steps::FILL)).collect())].into() }.filled(fill))
     }
     /// First item offset and signed item strides, where the mapping is affine over `shape`: each axis reads one regular run with no fill, as [`Steps::affine`] decides.
     pub fn affine(&self, shape: &[usize]) -> Option<(usize, Vec<isize>)> {
@@ -148,17 +214,21 @@ impl Mapping {
     /// For a contraction such as a matrix product: a one-axis mapping from each key on `left`'s axis `laxis` to its position on `right`'s axis `raxis`, as a table. Where the keys match, or either axis has none, positions pair in order.
     pub fn contract(left: &Layout, laxis: usize, right: &Layout, raxis: usize) -> Result<Self, Error> {
         match (left.keys(laxis), right.keys(raxis)) {
-            (Some(x), Some(y)) if x != y => Ok(Self::Steps { base: 0, steps: vec![Steps::table(y.positions(x, false)?)] }),
+            (Some(x), Some(y)) if x != y => Ok(Self::Steps { base: 0, steps: vec![Steps::table(y.positions(x, false)?)].into() }),
             _ => Ok(Self::Linear(1)),
         }
     }
     /// How `input` lays out over `result`, which has `count` items. Axis `a` of `input` is axis `axes[a]` of `result`.
     pub fn new(input: &Layout, axes: &[usize], result: &Layout, count: usize) -> Self {
+        let alignments = axes.iter().enumerate().map(|(a, &b)| match (input.keys(a), result.keys(b)) { (Some(src), Some(dst)) => src.aligned(dst), _ => Alignment::Same }).collect();
+        Self::aligned(input, axes, result, count, alignments)
+    }
+    /// [`Mapping::new`], where `alignments` gives how each axis of `input` lies along its axis of `result`: by its keys, or by position where an axis has none.
+    fn aligned(input: &Layout, axes: &[usize], result: &Layout, count: usize, alignments: Vec<Alignment>) -> Self {
         if count == 0 { return Self::Single; }
         let (shape, output) = (input.shape(), result.shape());
-        let keyed = axes.iter().enumerate().any(|(a, &b)| input.keys(a).is_some() && input.keys(a) != result.keys(b));
-        if !keyed {
-            let size: usize = shape.iter().product();
+        if alignments.iter().all(|a| matches!(a, Alignment::Same)) {
+            let size = input.count();
             if size == 1 { return Self::Single; }
             let strides = strides(output);
             let (mut source, mut linear, mut tiled, repeat) = (1, true, true, count / size);
@@ -174,14 +244,16 @@ impl Mapping {
         }
         let mut steps: Vec<Steps> = output.iter().map(|&len| Steps::Stride { start: 0, len, step: 0 }).collect();
         let mut source = 1;
-        for (a, (&len, &b)) in shape.iter().zip(axes).enumerate().rev() {
-            steps[b] = match (input.keys(a), result.keys(b)) {
-                (Some(src), Some(dst)) if src != dst => Steps::table(src.align(dst).into_iter().map(|p| p.map_or(Steps::FILL, |p| p * source)).collect()),
-                _ => Steps::Stride { start: 0, len: output[b], step: if len == 1 { 0 } else { source as isize } },
+        for ((&len, &b), alignment) in shape.iter().zip(axes).zip(alignments).rev() {
+            steps[b] = match alignment {
+                Alignment::Same => Steps::Stride { start: 0, len: output[b], step: if len == 1 { 0 } else { source as isize } },
+                Alignment::Leading => Steps::clipped(0, output[b], len, source),
+                // A table whose offsets step evenly, as reversed keys give, becomes the stride it is.
+                Alignment::Table(t) => { let table = Steps::table(t.into_iter().map(|p| p.map_or(Steps::FILL, |p| p * source)).collect()); table.even().unwrap_or(table) }
             };
             source *= len;
         }
-        Self::Steps { base: 0, steps }
+        Self::Steps { base: 0, steps: steps.into() }
     }
     /// The fewest items in a block of a read through this mapping, where its innermost axis skips items, as a transpose's does: as many whole rows as a cache line holds items of `size` bytes, up to `LINE_BLOCK` items. The rows of such a block then share each fetch of a line. 0 where the innermost axis reads adjacent items or one item.
     pub fn line_block(&self, size: usize) -> usize {
@@ -190,8 +262,18 @@ impl Mapping {
             _ => 0,
         }
     }
-    /// The number of positions over which this mapping repeats each item, or after which it cycles. `None` for one item, adjacent items and steps.
-    pub fn period(&self) -> Option<usize> { match *self { Self::Linear(r) if r > 1 => Some(r), Self::Tiled(m) => Some(m), _ => None } }
+    /// What this mapping's positions read again, and over how many positions (`Period`): each item repeated (`repeats`), `Tiled`'s cycle, or the cycle of a `Steps` mapping whose outer axes step by 0, as a broadcast along outer axes reads. `None` for one item, adjacent items, a mapping that fills, and other steps.
+    pub fn period(&self) -> Option<Period<'_>> {
+        if let Self::Tiled(m) = *self { return Some(Period::Cycles(m)); }
+        if let Some(r) = self.repeats() { return Some(Period::Repeats(r)); }
+        let Self::Steps { base, steps } = self else { return None };
+        let k = steps.iter().position(|s| !matches!(*s, Steps::Stride { step: 0, .. }))?;
+        let (outer, inner) = steps.split_at(k);
+        let p = inner.iter().map(Steps::len).product::<usize>();
+        if p < 2 || outer.iter().all(|s| s.len() < 2) || self.fills() { return None; }
+        let base = base + outer.iter().map(|s| if let Steps::Stride { start, .. } = *s { start } else { 0 }).sum::<usize>();
+        Some(if base == 0 && Steps::in_order(inner) { Period::Cycles(p) } else { Period::Walks { len: p, base, steps: inner } })
+    }
     /// Whether `expanded` copies most blocks of `block` items read through this mapping, rather than reading them where they lie: steps whose runs of adjacent offsets (`Steps::contiguous`) are shorter than a block, as a transpose's, a reversal's, windows' and a column slice's are. Repeats and cycles don't count: a run that stays inside one repeat or cycle reads in place, and the caller decides where runs end.
     pub fn copies(&self, block: usize) -> bool {
         match self {
@@ -199,8 +281,57 @@ impl Mapping {
             _ => false,
         }
     }
+    /// Whether a walk of blocks of `block` items through this mapping reads each item from its own cache line, where a walk of the whole copy reads them through the tiled transpose (`Steps::transposing`): after `simplify`, the last two axes form a transpose whose inner axis holds a block or more, so that each block walks one strided run. A copy made whole then costs much less than reads through it a block at a time.
+    pub fn tiles_whole(&self, block: usize) -> bool {
+        let Self::Steps { steps, .. } = self else { return false };
+        let (_, steps) = Steps::simplify(0, steps);
+        let [.., outer, inner] = &steps[..] else { return false };
+        Steps::transposing(outer, inner).is_some_and(|(_, _, n, _)| n >= block)
+    }
+    /// The innermost stretch of positions that read at one regular stride, as its length and that stride: `(r, 0)` for `Linear(r)`, each of whose stretches reads one item, and `Steps::regular` for steps.
+    pub fn regular(&self) -> Option<(usize, isize)> { match self { Self::Linear(r) => Some((*r, 0)), Self::Steps { steps, .. } => Some(Steps::regular(steps)), _ => None } }
+    /// The number of positions over which this mapping repeats each item: the length of its innermost regular stretch (`regular`) where that steps by 0, as `Linear(r)` does and a broadcast along inner axes does. `None` for one item, adjacent items, cycles and other steps.
+    pub fn repeats(&self) -> Option<usize> {
+        self.regular().and_then(|(len, step)| (step == 0 && len > 1).then_some(len))
+    }
+    /// The runs of this mapping's innermost regular stretch (`regular`) over `positions` positions, where every run reads its items in place: the stretch's length and stride, and the offset of each run's first item, in the order of the runs. A `Linear(r)` mapping's runs read its items in order. `None` where the mapping isn't linear or steps, gives a fill, or reads its stretch through a padded or rotated axis.
+    pub fn runs(&self, positions: usize) -> Option<(usize, isize, Vec<usize>)> {
+        let (base, steps) = match self { Self::Linear(r) => return Some((*r, 0, (0..positions.div_ceil(*r)).collect())), Self::Steps { base, steps } => (base, steps), _ => return None };
+        if self.fills() { return None; }
+        let (len, stride) = Steps::regular(steps);
+        // Each axis of the stretch keeps only its first position, so that each position left starts one run.
+        let (mut width, mut outer) = (1, steps.to_vec());
+        for axis in outer.iter_mut().rev() {
+            if width == len { break; }
+            if axis.len() == 1 { continue; }
+            let Steps::Stride { start, len: n, step } = *axis else { return None };
+            *axis = Steps::Stride { start, len: 1, step };
+            width *= n;
+        }
+        Some((len, stride, Steps::combined(*base, &outer)))
+    }
     /// Whether some position reads a fill, as a padded read's does.
     pub fn fills(&self) -> bool { matches!(self, Self::Steps { steps, .. } if steps.iter().any(Steps::fills)) }
+    /// This mapping, reading `fill` at each position that reaches no item, or each item type's own fill for `None`. A mapping whose positions all reach items keeps no fill. `None` on a mapping that chose no fill changes nothing, and costs nothing once inlined.
+    #[inline]
+    pub fn filled(self, fill: Option<Arc<Fill>>) -> Self { if fill.is_none() && self.chosen().is_none() { self } else { self.refilled(fill) } }
+    /// `filled` where the fill can change.
+    fn refilled(mut self, fill: Option<Arc<Fill>>) -> Self {
+        if let Self::Steps { steps, .. } = &mut self { steps.fill = fill.filter(|_| steps.iter().any(Steps::fills)); }
+        self
+    }
+    /// The fill that a call chose for the positions that reach no item, if any.
+    #[inline]
+    pub fn chosen(&self) -> Option<&Arc<Fill>> { match self { Self::Steps { steps, .. } => steps.fill.as_ref(), _ => None } }
+    /// A [`Mapping::Steps`] of `base` and `steps`, with the fill that this mapping chose.
+    #[inline]
+    pub fn with_steps(&self, base: usize, steps: Vec<Steps>) -> Self { Self::Steps { base, steps: steps.into() }.filled(self.chosen().cloned()) }
+    /// The fill that a composition of this mapping with `outer` reads, which either of them chose, if any. `None` where both read fills and chose different ones.
+    fn joined_fill(&self, outer: &Self) -> Option<Option<Arc<Fill>>> {
+        // The chosen fills are compared first, so that mappings that chose none scan no tables, which `Table::fills` reads in full.
+        if self.chosen() != outer.chosen() && self.fills() && outer.fills() { return None; }
+        Some(outer.chosen().or(self.chosen()).cloned())
+    }
     /// The innermost axis of a `Steps` mapping that reaches more than one offset.
     fn inner(&self) -> Option<&Steps> {
         let Self::Steps { steps, .. } = self else { return None };
@@ -256,14 +387,15 @@ impl Agreement {
         let mut shape = vec![1; xa.iter().chain(ya).max().map_or(0, |a| a + 1)];
         let mut keys = vec![None; shape.len()];
         let mut names = vec![None; shape.len()];
+        let (mut lt, mut rt) = (vec![Alignment::Same; left.shape().len()], vec![Alignment::Same; right.shape().len()]);
         for axis in 0..shape.len() {
             let (x, y) = (xa.iter().position(|&a| a == axis), ya.iter().position(|&a| a == axis));
             let (nx, ny) = (x.map_or(1, |a| left.shape()[a]), y.map_or(1, |a| right.shape()[a]));
             let (kx, ky) = (x.and_then(|a| left.keys(a)), y.and_then(|a| right.keys(a)));
             let (lx, ly) = (x.and_then(|a| left.name(a)), y.and_then(|a| right.name(a)));
             names[axis] = match (lx, ly) { (Some(l), Some(r)) if hidden(l) && !hidden(r) => Some(r), _ => lx.or(ly) }.cloned();
-            if let (Some(x), Some(y)) = (kx, ky) {
-                let key = if left_keys { x.clone() } else { x.union(y)? };
+            if let (Some(kx), Some(ky), Some(a), Some(b)) = (kx, ky, x, y) {
+                let key = if left_keys { rt[b] = ky.aligned(kx); kx.clone() } else { let (key, [l, r]) = kx.union(ky)?; (lt[a], rt[b]) = (l, r); key };
                 shape[axis] = key.len();
                 keys[axis] = Some(key);
             } else {
@@ -274,8 +406,7 @@ impl Agreement {
         }
         let len = generated_len(&shape)?;
         let layout = Layout::from(shape).with_keys(keys)?.inherit_names(names);
-        let x = Mapping::new(left, xa, &layout, len);
-        let y = Mapping::new(right, ya, &layout, len);
+        let (x, y) = (Mapping::aligned(left, xa, &layout, len, lt), Mapping::aligned(right, ya, &layout, len, rt));
         Ok(Self { layout, len, left: x, right: y })
     }
 }
@@ -341,6 +472,8 @@ const LINE_BLOCK: usize = 1 << 16;
 #[inline]
 pub fn block<Y: Element, B: Copy + Send>(
     y: &[Y], mapping: &Mapping, len: usize, out: &mut Vec<B>, leaf: impl Fn(Arg<'_, Y>, usize, &mut Slots<'_, B>) -> bool + Sync) -> bool {
+    let side = Side::new(y, mapping);
+    let (y, mapping) = (&*side.data, &*side.mapping);
     extended(out, len, CHUNK, &|range, slots| {
         use {Arg::*, Mapping::*};
         if range.is_empty() { return true; }
@@ -362,7 +495,8 @@ pub fn block<Y: Element, B: Copy + Send>(
 #[inline]
 pub fn blocks<X: Element, Y: Element, B: Copy + Send, L>(
     x: &[X], y: &[Y], agreement: &Agreement<L>, out: &mut Vec<B>, leaf: impl Fn(Arg<'_, X>, Arg<'_, Y>, usize, &mut Slots<'_, B>) -> bool + Sync) -> bool {
-    let (left, right) = (&agreement.left, &agreement.right);
+    let (xs, ys) = (Side::new(x, &agreement.left), Side::new(y, &agreement.right));
+    let ((x, left), (y, right)) = ((&*xs.data, &*xs.mapping), (&*ys.data, &*ys.mapping));
     extended(out, agreement.len, CHUNK, &|range, slots| paired(x, y, left, right, range, slots, &leaf))
 }
 
@@ -399,7 +533,7 @@ enum Within { Same, Repeated, Cycled(usize) }
 impl Within {
     /// How `mapping` lays its items within its periods. `None` for a mapping that neither reads in order, repeats nor cycles.
     fn of(mapping: &Mapping) -> Option<Self> {
-        match *mapping { Mapping::Linear(1) => Some(Self::Same), Mapping::Linear(_) => Some(Self::Repeated), Mapping::Tiled(m) => Some(Self::Cycled(m)), _ => None }
+        match *mapping { Mapping::Linear(1) => Some(Self::Same), Mapping::Linear(_) => Some(Self::Repeated), _ => match mapping.period()? { Period::Cycles(m) => Some(Self::Cycled(m)), _ => None } }
     }
 
     /// The items of `x` over positions `part` of period `k`.
@@ -411,10 +545,10 @@ impl Within {
 
 /// The period at which `mappings` run as one call for each period, with how each lays its items within it. Every mapping must read in order, repeat or cycle, those that repeat or cycle must share the period, and the period must be long enough that a call for each period beats expanding it: `SHORT_REPEATED` where a mapping repeats, and `SHORT_CYCLED` otherwise.
 fn by_periods<const N: usize>(mappings: [&Mapping; N]) -> Option<(usize, [Within; N])> {
-    let mut ps = mappings.iter().filter_map(|m| m.period());
+    let mut ps = mappings.iter().filter_map(|m| m.period()?.in_place());
     let p = ps.next()?;
     if ps.any(|q| q != p) { return None; }
-    let short = if mappings.iter().any(|m| matches!(**m, Mapping::Linear(r) if r > 1)) { SHORT_REPEATED } else { SHORT_CYCLED };
+    let short = if mappings.iter().any(|m| m.repeats().is_some()) { SHORT_REPEATED } else { SHORT_CYCLED };
     let within = mappings.map(Within::of);
     (p >= short && within.iter().all(Option::is_some)).then(|| (p, within.map(|w| w.unwrap_or(Within::Same))))
 }
@@ -424,7 +558,7 @@ fn by_periods<const N: usize>(mappings: [&Mapping; N]) -> Option<(usize, [Within
 pub(crate) fn chunks(range: Range<usize>, reads: &[(&Mapping, usize)], f: &mut dyn FnMut(usize, usize) -> bool) -> bool {
     let len = reads.iter().fold(CHUNK, |n, &(mapping, size)| n.max(mapping.line_block(size)));
     let mut runs = |part: Range<usize>| part.clone().step_by(len).fold(true, |ok, at| f(at, len.min(part.end - at)) & ok);
-    match reads.iter().filter_map(|&(mapping, _)| mapping.period()).filter(|&p| p >= LONG_PERIOD).min() {
+    match reads.iter().filter_map(|&(mapping, _)| mapping.period()?.in_place()).filter(|&p| p >= LONG_PERIOD).min() {
         Some(p) => periods(range, p, |_, part| runs(part)),
         None => runs(range),
     }
@@ -456,18 +590,24 @@ pub trait Read<A>: Sync {
     fn reads(&self) -> (&Mapping, usize);
 }
 
-/// An argument's items and the mapping that lays them over the frame. It reads them as any type they convert to through [`Source`].
-pub struct Side<'a, X> { data: &'a [X], mapping: &'a Mapping }
+/// An argument's items and the mapping that lays them over the frame. It reads them as any type they convert to through [`Source`]. Where the mapping's positions walk entries (`Period::Walks`), it holds one cycle's items, gathered once, which `Tiled` reads in place: walking the entries for each run would read every cycle's items again.
+pub struct Side<'a, X: Clone> { data: Cow<'a, [X]>, mapping: Cow<'a, Mapping> }
 
-impl<'a, X> Side<'a, X> {
-    pub fn new(data: &'a [X], mapping: &'a Mapping) -> Self { Self { data, mapping } }
+impl<'a, X: Element> Side<'a, X> {
+    pub fn new(data: &'a [X], mapping: &'a Mapping) -> Self {
+        let mut items = Vec::new();
+        match gather_cycle(data, mapping, &mut items) {
+            Some(tiled) => Self { data: Cow::Owned(items), mapping: Cow::Owned(tiled) },
+            None => Self { data: Cow::Borrowed(data), mapping: Cow::Borrowed(mapping) },
+        }
+    }
 }
 
 impl<A: Element, X: Source<A>> Read<A> for Side<'_, X> {
     #[inline]
-    fn read<'b>(&'b self, start: usize, n: usize, buf: &'b mut Vec<A>) -> Arg<'b, A> { read_mapped(self.mapping, self.data, start, n, buf) }
-    fn constant(&self) -> Option<A> { if matches!(self.mapping, Mapping::Single) { self.data.first().map(|x| x.read()) } else { None } }
-    fn reads(&self) -> (&Mapping, usize) { (self.mapping, size_of::<X>()) }
+    fn read<'b>(&'b self, start: usize, n: usize, buf: &'b mut Vec<A>) -> Arg<'b, A> { read_mapped(&self.mapping, &self.data, start, n, buf) }
+    fn constant(&self) -> Option<A> { if matches!(*self.mapping, Mapping::Single) { self.data.first().map(|x| x.read()) } else { None } }
+    fn reads(&self) -> (&Mapping, usize) { (&self.mapping, size_of::<X>()) }
 }
 
 /// `leaf` on the frame of `len` positions, a run at a time, with the items that each of `readers` reads for the run. It appends the results to `out` in order, and gives whether every call succeeded. Ranges of the frame run in parallel, each with its own buffers. Runs take the sizes that `chunks` gives them, and every run is written even after a failure. The readers and `leaf` are `dyn`, so the loop compiles once for each item type `A`, result type `B` and number of readers, whatever the arguments' types and the kernel. A call through them costs little next to a run's items.
@@ -491,7 +631,7 @@ fn read_mapped<'a, A: Element, X: Source<A>>(mapping: &Mapping, data: &'a [X], s
 
 /// The one item that every position in `start..start + n` reads, where `mapping` repeats a single item over all of them. `None` where the positions read more than one item.
 fn single<A: Copy>(mapping: &Mapping, data: &[A], start: usize, n: usize) -> Option<A> {
-    match *mapping { Mapping::Single => Some(data[0]), Mapping::Linear(r) if r != 1 && n <= r - start % r => Some(data[start / r]), _ => None }
+    match *mapping { Mapping::Single => Some(data[0]), Mapping::Linear(r) if r != 1 && n <= r - start % r => Some(data[start / r]), Mapping::Steps { .. } => mapping.run(start, n).and_then(|(o, step)| (step == 0).then(|| data[o])), _ => None }
 }
 
 /// Items `start..start + n` of an argument that `mapping` lays out, read as `expanded` reads them but always as a slice of all `n` items. A repeated item fills `buf`.
@@ -511,10 +651,17 @@ pub fn in_place<'a, A: Copy>(mapping: &Mapping, data: &'a [A], start: usize, n: 
     }
 }
 
-/// Items `start..start + n` of an argument that `mapping` lays out over the frame, read `in_place` where they can be. Others copy into `buf`. A repeated item fills each of its periods. A cycled argument copies through `gather::cycled`, and a `Steps` mapping through `walk_range`.
+/// Items `start..start + n` of an argument that `mapping` lays out over the frame, read `in_place` where they can be. Others copy into `buf`. A repeated item fills each of its periods. A cycled argument copies through `gather::cycled`, and a `Steps` mapping through `walk_plan`, over the plan that the mapping keeps (`Route::plan`).
 pub fn expanded<'a, A: Element>(mapping: &Mapping, data: &'a [A], start: usize, n: usize, buf: &'a mut Vec<A>) -> Arg<'a, A> {
     if let Some(arg) = in_place(mapping, data, start, n) { return arg; }
     Arg::Many(copied(mapping, data, start, n, buf))
+}
+
+/// One cycle's items of `data`, copied into `buf` once, where `mapping`'s positions walk entries (`Period::Walks`), with the `Tiled` mapping that then reads them in place. `None` for any other mapping, leaving `buf` alone. Walking the entries for every cycle would read the same items again each time.
+pub fn gather_cycle<A: Element>(data: &[A], mapping: &Mapping, buf: &mut Vec<A>) -> Option<Mapping> {
+    let Some(Period::Walks { len, base, steps }) = mapping.period() else { return None };
+    copied(&Mapping::Steps { base, steps: steps.to_vec().into() }, data, 0, len, buf);
+    Some(Mapping::Tiled(len))
 }
 
 /// Items `start..start + n` that `expanded` copies into `buf`, cleared first. It's out of line, so it compiles once for each item type rather than in each caller.
@@ -525,7 +672,7 @@ fn copied<'a, A: Element>(mapping: &Mapping, data: &[A], start: usize, n: usize,
         Mapping::Single => { buf.resize(n, data[0]); "a repeated item" }
         Mapping::Linear(r) => { periods(start..start + n, r, |k, p| { buf.resize(buf.len() + p.len(), data[k]); true }); "repeats of each item" }
         Mapping::Tiled(m) => { cycled(buf, &data[..m], start, n); "a cycle that wraps" }
-        Mapping::Steps { base, ref steps } => { walk_range(buf, data, base, steps, A::FILL, start, n, Same); "steps other than a forward run" }
+        Mapping::Steps { base, ref steps } => { let (offset, plan) = steps.plan(); walk_plan(buf, data, base + offset, plan, Fill::item(mapping.chosen()), start, n, Same); "steps other than a forward run" }
     };
     crate::events::declined("in place", reason, n);
     &buf[..n]

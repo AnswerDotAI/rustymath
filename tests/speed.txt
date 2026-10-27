@@ -1,5 +1,5 @@
 # The budgets that `tests/speed.rs` checks. Each section starts with an item type in brackets. Each line under it holds a function's name and its two native budgets at that type, separated by tabs: first for macOS on Apple silicon, where matrix products and decompositions run on Accelerate, then for Linux on CI's x86 runner, where they run on rustymath's own kernels. `rustymath::timing::NATIVE_COLUMN` picks the budget a machine checks. A budget counts copies of as many items as the function's inputs hold, or its output for broadcasting.
-# An initial budget is twice what a first-principles analysis says the function should cost, and at least 0.5. A later budget comes from a fuller understanding of the function than that analysis gives, such as a platform difference or a cost the analysis missed. A comment above each function, or above its group, gives the expected cost and its reason, as in "1 copy: one read and one write per item", and records each later change with its reason. `basedpl.bpltests.set_budgets` writes budgets from expected costs.
+# A budget is the function's expected cost times the multiplier that `basedpl.bpltests.set_budgets` applies, as basedpl's DEV.md gives, and at least 0.5. The expected cost starts from a first-principles analysis of what the function should cost. A later expected cost comes from a fuller understanding of the function than that analysis gives, such as a platform difference or a cost the analysis missed. A comment above each function, or above its group, gives the expected cost and its reason, as in "1 copy: one read and one write per item", and records each later change with its reason.
 # One expected cost serves both platforms at first. A platform's budget differs only where a specific difference on that platform is found, such as Accelerate's matrix products on macOS.
 # A function that costs more than its budget needs study, which finds either a speed bug to fix or something the analysis missed. Avoid raising a budget to match a run without understanding why the function costs what it does.
 # CI's x86 runner is an AMD Ryzen 9 7950X3D 16-Core Processor.
@@ -117,6 +117,10 @@ complex Sqrt1mx2	53	62
 complex Pow	110	130
 # 64 copies, for 256 FMAs per result item, a quarter copy each, on rustymath's own kernels. On macOS, 8.8 copies, for the same 512 flops at Accelerate's rate for a 1024×1024 product.
 linalg::PlusTimes	18	130
+# 0.5 copies: one read of the matrix, about half a copy, on rustymath's own kernels, where its one FMA per item, a quarter copy, runs alongside. On macOS, 0.29 copies, for 2 flops per item at Accelerate's matrix-vector rate.
+linalg::PlusTimes by a vector	0.6	1
+# 0.5 copies, as `linalg::PlusTimes by a vector`.
+linalg::PlusTimes of a vector	0.6	1
 # 128 copies, for 256 steps of a max and an add per result item, a quarter copy per op.
 linalg::MaxPlus	260	260
 # 128 copies, for 256 steps of a min and an add per result item, a quarter copy per op.
@@ -127,11 +131,11 @@ linalg::PlusEqual	260	260
 linalg::PlusTimes at i64	26	140
 # 128 copies, for 256 steps of an integer comparison and an add per result item.
 linalg::PlusEqual at i64	260	260
-# 40 copies, for an unstable comparison sort of each 256-item row's keys, computed once: about 8 compare-and-swap levels per item at about 5 copies a level, the standard library sort's cost on random keys, which its cost at 32,768 items agrees with, plus a pass that computes the keys and one that writes the floats back. A sorting network on explicit vectors would cost about 12 to 20 by instruction counts, unmeasured, as "A vectorized sort kernel, not built" in basedpl's `meta/rustymath.md` records. It costs about 41 copies on macOS, down from about 80 when each comparison computed two keys.
-search::view_sort_along	80	80
-# 60 copies, for an unstable comparison sort of each 32,768-item lane's keys: about 15 levels per item at about 4 copies a level. A radix sort of the keys costs about 71, at about 9 copies for each of its 8 passes. A sorting network would gain here only as the base case of a long sort, as "A vectorized sort kernel, not built" in basedpl's `meta/rustymath.md` records. It costs about 60 copies on macOS, down from about 105 when each comparison computed two keys.
+# 16 copies, for a bitonic network on two-lane vectors (`search::networked`): 36 steps, each a minimum and a maximum for every two rows, about 8 copies, plus 15 passes that load and store every row, about 6, and about 2 for the shuffles of the steps across lanes, the write by columns and the NaN count. A block of 16 rows stays in registers for the steps within it. It costs about 17 copies on macOS. An unstable comparison sort of each row's keys cost about 41.
+search::view_sort_along	32	32
+# 60 copies, for an unstable comparison sort of each 32,768-item lane's keys: about 15 levels per item at about 4 copies a level. A radix sort of the keys costs about 71, at about 9 copies for each of its 8 passes. A sorting network would gain here only as the base case of a long sort, as "A vectorized sort kernel" in basedpl's `meta/rustymath.md` records. It costs about 60 copies on macOS, down from about 105 when each comparison computed two keys.
 search::view_sort_along long lanes	120	120
-# 15 copies, for a quickselect of each row's keys: about 3 comparisons per item at about 5 copies each, as the sorts measure comparisons, plus a pass that computes the keys and one that writes the floats back. A vectorized kernel that partitions would cost less, as "A vectorized sort kernel, not built" in basedpl's `meta/rustymath.md` records. It costs about 15 copies on macOS, down from about 17 when each comparison computed two keys. CI measured 12.4 on 22 October 2026, so its Linux budget follows the same expected cost.
+# 15 copies, for a quickselect of each row's keys: about 3 comparisons per item at about 5 copies each, as the sorts measure comparisons, plus a pass that computes the keys and one that writes the floats back. A vectorized kernel that partitions would cost less, as "A vectorized sort kernel" in basedpl's `meta/rustymath.md` records. It costs about 15 copies on macOS, down from about 17 when each comparison computed two keys. CI measured 12.4 on 22 October 2026, so its Linux budget follows the same expected cost.
 search::view_partition_along	30	30
 # 15 copies, for selecting the two middle keys of each row, which costs about what one partition does. It costs about 15 copies on macOS, down from about 33 when each comparison computed two keys. CI measured 12.6 on 22 October 2026, so its Linux budget follows the same expected cost.
 search::view_quantiles_along	30	30
@@ -280,6 +284,10 @@ complex Sqrt1mx2	59	92
 complex Pow	110	130
 # 64 copies, for 256 FMAs per result item, a quarter copy each, on rustymath's own kernels. On macOS, 4.4 copies, for the same 512 flops at Accelerate's rate for a 1024×1024 product.
 linalg::PlusTimes	8.8	130
+# 0.5 copies: one read of the matrix, about half a copy, on rustymath's own kernels, where its one FMA per item, a quarter copy, runs alongside. On macOS, 0.4 copies, for 2 flops per item at Accelerate's matrix-vector rate.
+linalg::PlusTimes by a vector	0.8	1
+# 0.5 copies, as `linalg::PlusTimes by a vector`.
+linalg::PlusTimes of a vector	0.8	1
 # 128 copies, for 256 steps of a max and an add per result item, a quarter copy per op.
 linalg::MaxPlus	260	260
 # 128 copies, for 256 steps of a min and an add per result item, a quarter copy per op.
@@ -290,11 +298,11 @@ linalg::PlusEqual	260	260
 linalg::PlusTimes at i64	12	70
 # 128 copies, for 256 steps of an integer comparison and an add per result item.
 linalg::PlusEqual at i64	260	260
-# 80 copies, for a radix sort of each 256-item row's keys alone, which costs about what an unstable comparison sort of them does: about 8 levels per item at about 10 copies a level of half-width items, as the f64 sorts measure them. A sorting network on explicit vectors would cost about 10 to 15 by instruction counts, unmeasured, as "A vectorized sort kernel, not built" in basedpl's `meta/rustymath.md` records. It costs about 83 copies on macOS, down from about 96 when the sort carried each float beside its key.
-search::view_sort_along	160	160
-# 52 copies, for a radix sort of each 32,768-item lane's keys alone: 4 byte passes, each scattering the keys to 256 places at about 13 copies, as measured on this hardware. A sorting network would gain here only as the base case of a long sort, as "A vectorized sort kernel, not built" in basedpl's `meta/rustymath.md` records. It costs about 52 copies on macOS, down from about 72 when the sort carried each float beside its key.
+# 16 copies of 32-bit items, for the same network on four-lane vectors. Its minimums, maximums and passes over rows cost about as many copies as at f64, about 12, because a row holds twice the items and a copy takes half the time. Its passes over each item, the lane stages' shuffles, the write by columns and the NaN count, take the same time as at f64, about 4 copies of 32-bit items. It costs about 22 copies on macOS, more than this analysis gives, and the difference hasn't been studied. A radix sort of each row's keys cost about 77.
+search::view_sort_along	32	32
+# 52 copies, for a radix sort of each 32,768-item lane's keys alone: 4 byte passes, each scattering the keys to 256 places at about 13 copies, as measured on this hardware. A sorting network would gain here only as the base case of a long sort, as "A vectorized sort kernel" in basedpl's `meta/rustymath.md` records. It costs about 52 copies on macOS, down from about 72 when the sort carried each float beside its key.
 search::view_sort_along long lanes	110	110
-# 30 copies, for a quickselect of each row's keys: about 3 comparisons per item at about 10 copies each, as the sorts measure comparisons of half-width items, plus a pass that computes the keys and one that writes the floats back. A vectorized kernel that partitions would cost less, as "A vectorized sort kernel, not built" in basedpl's `meta/rustymath.md` records. It costs about 25 copies on macOS, down from about 33 when each comparison computed two keys. CI measured 22 on 22 October 2026, so its Linux budget follows the same expected cost.
+# 30 copies, for a quickselect of each row's keys: about 3 comparisons per item at about 10 copies each, as the sorts measure comparisons of half-width items, plus a pass that computes the keys and one that writes the floats back. A vectorized kernel that partitions would cost less, as "A vectorized sort kernel" in basedpl's `meta/rustymath.md` records. It costs about 25 copies on macOS, down from about 33 when each comparison computed two keys. CI measured 22 on 22 October 2026, so its Linux budget follows the same expected cost.
 search::view_partition_along	60	60
 # 30 copies, for selecting the two middle keys of each row, which costs about what one partition does. It costs about 27 copies on macOS, down from about 66 when each comparison computed two keys. CI measured 23.6 on 22 October 2026, so its Linux budget follows the same expected cost.
 search::view_quantiles_along	60	60

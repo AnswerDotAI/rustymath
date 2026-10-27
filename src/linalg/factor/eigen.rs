@@ -100,26 +100,12 @@ fn symmetric_row<T: Scalar>(y: &mut [T], v: &[T], row: &[T], i: usize) {
 /// The fewest rows in each piece of a reduction's pass. At 64, values-only SVD and eigen at 1024 ran 1.65 to 2 times faster on 18 threads than as one piece.
 const ROW_PIECE: usize = 64;
 
-/// Runs `row(i, items, sums)` on each of rows `0..count` of a reduction's pass, where row `i`'s items are `rows[i * stride..(i + 1) * stride]`, and adds the sums each row gives into `sums`. The rows split into one piece of at least `ROW_PIECE` rows for each of this thread's [`crate::parallel::threads`]. On one thread they run as one loop. The first piece adds into `sums` and each later one into its own part of `parts`, which then add into `sums`.
+/// Runs `row(i, items, sums)` on each of rows `0..count` of a reduction's pass, where row `i`'s items are `rows[i * stride..(i + 1) * stride]`, and adds the sums each row gives into `sums`, in pieces of at least `ROW_PIECE` rows that sum into parts of `parts` ([`crate::parallel::summed`]).
 pub(super) fn summed_rows<T: Tiled, F: Fn(usize, &mut [T], &mut [T]) + Sync>(
     rows: &mut [T], stride: usize, count: usize, sums: &mut [T], parts: &mut Vec<T>, row: F) {
-    let pieces = (count / ROW_PIECE).min(crate::parallel::threads());
-    if pieces <= 1 { for (i, items) in rows.chunks_mut(stride).take(count).enumerate() { row(i, items, sums) } return; }
-    let per = count.div_ceil(pieces);
-    let (len, width) = (sums.len(), sums.len().max(1));
-    parts.clear();
-    parts.resize((count.div_ceil(per) - 1) * width, T::zero());
-    {
-        let (first, rest) = rows[..count * stride].split_at_mut(per * stride);
-        let mut pieces: Vec<(&mut [T], &mut [T])> =
-            std::iter::once((first, &mut *sums)).chain(rest.chunks_mut(per * stride).zip(parts.chunks_mut(width).map(|part| &mut part[..len]))).collect();
-        crate::parallel::pieces_of(&mut pieces, 1, usize::MAX, &|p, piece| {
-            let (rows, part) = &mut piece[0];
-            for (j, items) in rows.chunks_mut(stride).enumerate() { row(p * per + j, items, part) }
-            true
-        });
-    }
-    for part in parts.chunks(width) { for (s, &x) in sums.iter_mut().zip(part) { *s = *s + x } }
+    crate::parallel::summed(&mut rows[..count * stride], stride, ROW_PIECE, sums, parts, &|first, rows, sums| {
+        for (j, items) in rows.chunks_mut(stride).enumerate() { row(first + j, items, sums) }
+    });
 }
 
 /// Diagonalises the real symmetric tridiagonal matrix with diagonal `d` and subdiagonal `e` by implicit QL iterations, as EISPACK's `tql2` does. Each rotation also rotates two adjacent rows of `vt`, which starts as Qᵀ and ends as Vᵀ, unless `vt` is empty. `d` ends as the eigenvalues, in no particular order. `None` where an eigenvalue takes more than 30 iterations.

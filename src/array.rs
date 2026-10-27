@@ -20,7 +20,7 @@ impl<'a> ArrayView<'a> {
     pub fn storage(self) -> View<'a> { self.storage }
     pub fn mapping(self) -> &'a Mapping { self.mapping }
     pub fn dtype(self) -> DType { self.storage.dtype() }
-    pub fn len(self) -> usize { self.layout.shape().iter().product() }
+    pub fn len(self) -> usize { self.layout.count() }
     pub fn is_empty(self) -> bool { self.len() == 0 }
     /// The logical sequence as one borrowed slice, including a contiguous subrange of larger storage.
     pub fn contiguous(self) -> Option<View<'a>> {
@@ -102,7 +102,7 @@ impl Array {
     /// Shares an affine structural selection, or gathers through its composed mapping. Unsupported compositions compact first.
     pub fn selected(&self, plan: crate::structure::Plan) -> Result<Self, Error> {
         let mapping = match self.mapping {
-            Mapping::Linear(1) => Mapping::Steps { base: 0, steps: plan.steps },
+            Mapping::Linear(1) => Mapping::Steps { base: 0, steps: plan.steps.into() },
             _ => match self.mapping.through(&plan.steps, self.layout.shape()) {
                 Some(mapping) => mapping,
                 None => return Self::gathered(self.view().cast(self.dtype())?.view(), &plan),
@@ -117,7 +117,7 @@ impl Array {
         if element_count(layout.shape())? != self.len() { return Err(Error::new(Kind::Length, "reshape must retain the number of items")); }
         let mut out = if self.view().contiguous().is_some() { self.clone() } else { self.compact() };
         let base = if out.is_empty() { 0 } else { out.mapping.get(0).expect("compact items") };
-        out.mapping = if base == 0 { Mapping::Linear(1) } else { Mapping::Steps { base, steps: vec![crate::gather::Steps::along(out.len(), 1)] } };
+        out.mapping = if base == 0 { Mapping::Linear(1) } else { Mapping::Steps { base, steps: vec![crate::gather::Steps::along(out.len(), 1)].into() } };
         out.layout = layout;
         Ok(out)
     }
@@ -189,7 +189,7 @@ impl Array {
         let select = |start| structure::select_axis(layout, axis, Selector::Range { start, len: n, step: 1 });
         let (next, previous) = (select(usize::from(size > 0))?, select(0)?);
         let len = crate::layout::element_count(next.layout.shape())?;
-        let agreement = Agreement { layout: next.layout, len, left: Mapping::Steps { base: 0, steps: next.steps }, right: Mapping::Steps { base: 0, steps: previous.steps } };
+        let agreement = Agreement { layout: next.layout, len, left: Mapping::Steps { base: 0, steps: next.steps.into() }, right: Mapping::Steps { base: 0, steps: previous.steps.into() } };
         let result = if source.dtype() == DType::Boolean { let k = crate::reduce::Xor; crate::kernels!(Binary of k).binary(&k, source, source, &agreement) }
             else { let k = crate::Subtract; crate::kernels!(Binary of k).binary(&k, source, source, &agreement) };
         let (buffer, _) = result.ok_or_else(|| Error::new(Kind::Domain, "differences need numerical items"))?;

@@ -510,7 +510,7 @@ pub fn paired<'a>(items: Items<'a>, layout: &Layout, axis: usize, with: &Layout,
     let contracted = Mapping::contract(with, along, layout, axis).map_err(|_| Error::new(Kind::Length, format!("{function} needs the same keys on the axes it pairs")))?;
     let Mapping::Steps { steps, .. } = contracted else { return Ok(items) };
     let [outer, len, inner] = Lanes::new(layout.shape(), axis)?.dims();
-    let table = steps.into_iter().next().expect("a contraction maps one axis").scaled(inner);
+    let table = Vec::from(steps).into_iter().next().expect("a contraction maps one axis").scaled(inner);
     let plan = [Steps::along(outer, len * inner), table, Steps::along(inner, 1)];
     Ok(Items::Owned(Buffer::walked(items.view(), 0, &plan, outer * plan[1].len() * inner)))
 }

@@ -1,7 +1,7 @@
 //! Search and sort over slices of keys. A key is an item read as a whole number (`Key`), or an unsigned word whose order is the order you want (`RadixKey`). `Float::order_key` gives each float such a word, as wide as the float. Positions take 32 bits inside these functions, so a slice holds at most `u32::MAX` items. `tolerant` builds its searches over floats on these functions.
 //!
-//! `index_of`, `classes` and `firsts` index the first position of each key. `index_of` passes over `x` once for each item of `y` when `y` has at most `SCANNED` items. The index is a table when the keys span at most twice the slice's length, or 1024, and a hash map otherwise. `numbered` numbers the classes in order of first position, with each one's size. `grouped_keys` numbers them the same way from a table of keys, with each one's positions, `numbered_keys` with each item's number, and `class_counts` gives only their sizes. `counts` counts the items with each key in such a table. `sort_rows` sorts keys that span such a table by counting them. It sorts other keys with an LSD radix sort that skips any byte that is the same in every key. `view_sort_along`, `view_partition_along` and `view_quantiles_along` work on each item's `SortKey`, which reads back to the item exactly. A sort counts, or sorts the keys by comparison or by the same radix sort. With several threads, the radix sort splits each pass of more than `RADIX_PIECE` keys across them, and `index_of` splits its lookups.
-use crate::{Float, agreement::Mapping, array::ArrayView, layout::Layout, buffer::{Buffer, DType, Element, Floats, View}, error::{Error, Kind}, interrupt::check, tolerant::{self, Tolerance}};
+//! `index_of`, `classes` and `firsts` index the first position of each key. `index_of` passes over `x` once for each item of `y` when `y` has at most `SCANNED` items. The index is a table when the keys span at most twice the slice's length, or 1024, and a hash map otherwise. `numbered` numbers the classes in order of first position, with each one's size. `grouped_keys` numbers them the same way from a table of keys, with each one's positions, `numbered_keys` with each item's number, and `class_counts` gives only their sizes. `counts` counts the items with each key in such a table. `sort_rows` sorts keys that span such a table by counting them. It sorts other keys with an LSD radix sort that skips any byte that is the same in every key. `view_sort_along`, `view_partition_along` and `view_quantiles_along` work on each item's `SortKey`, which reads back to the item exactly. A sort counts, sorts a float lane through a bitonic network on vectors, or sorts the keys by comparison or by the same radix sort. With several threads, the radix sort splits each pass of more than `RADIX_PIECE` keys across them, and `index_of` splits its lookups.
+use crate::{Float, Native, agreement::Mapping, array::ArrayView, layout::{count, Layout}, buffer::{Buffer, DType, Element, Floats, View}, error::{Error, Kind}, interrupt::check, tolerant::{self, Tolerance}};
 use crate::hashing::{HashMap, HashMapExt};
 use hashbrown::hash_map::Entry;
 use std::{convert::Infallible, hash::Hash, mem::MaybeUninit, ops::Not};
@@ -78,8 +78,8 @@ pub(crate) trait SortKey: Element + Default {
     type Key: RadixKey;
     fn sort_key(self) -> Self::Key;
     fn from_sort_key(k: Self::Key) -> Self;
-    /// Writes `x` sorted into `out` by counting, where its items span a small table (`spread_into`), and gives whether it did.
-    fn counted(_x: &[Self], _out: &mut [Self], _down: bool) -> bool { false }
+    /// Writes `x` sorted into `out` by the type's own route, and gives whether it did: by counting where an integer lane spans a small table (`spread_into`), and through `networked` for a float lane. `scratch` is that route's working space.
+    fn sorted_into(_x: &[Self], _out: &mut [Self], _down: bool, _scratch: &mut Vec<Self>) -> bool { false }
     /// Replaces `keys` with the key of each item of `x`, complemented for descending order.
     fn keys_into(x: &[Self], keys: &mut Vec<Self::Key>, down: bool) {
         keys.clear();
@@ -90,12 +90,13 @@ pub(crate) trait SortKey: Element + Default {
         for (o, &k) in out.iter_mut().zip(keys) { *o = Self::from_sort_key(if down { !k } else { k }); }
     }
 }
-impl<F: Float + Element + Default> SortKey for F {
+impl<F: Float + Element + Default + Network> SortKey for F {
     type Key = F::OrderKey;
     #[inline]
     fn sort_key(self) -> F::OrderKey { self.total_key() }
     #[inline]
     fn from_sort_key(k: F::OrderKey) -> Self { F::from_order_key(k) }
+    fn sorted_into(x: &[Self], out: &mut [Self], down: bool, scratch: &mut Vec<Self>) -> bool { F::networked(x, out, down, scratch) }
 }
 macro_rules! sort_keys {
     ($($t:ty => $key:ty, $to:expr, $back:expr);+) => {$(
@@ -105,7 +106,7 @@ macro_rules! sort_keys {
             fn sort_key(self) -> $key { ($to)(self) }
             #[inline]
             fn from_sort_key(k: $key) -> Self { ($back)(k) }
-            fn counted(x: &[Self], out: &mut [Self], down: bool) -> bool { spread_into(x, out, down) }
+            fn sorted_into(x: &[Self], out: &mut [Self], down: bool, _: &mut Vec<Self>) -> bool { spread_into(x, out, down) }
         }
     )+};
 }
@@ -264,22 +265,22 @@ pub fn occurrences(offsets: &[usize], size: usize) -> Option<(Vec<u32>, usize)> 
     (rounds > 1).then_some((counts, rounds as usize))
 }
 
-/// Inverts a permutation: each input position's rank in `order`. Every position must occur exactly once.
-pub fn inverse_permutation(order: impl ExactSizeIterator<Item = usize>) -> Vec<u32> {
-    let mut ranks = vec![0; order.len()];
-    for (rank, position) in order.enumerate() { ranks[position] = rank as u32; }
+/// Inverts a permutation: each position's rank in `order`, as a `T` such as a grade's `u32` or an axis order's `usize`. Every position must occur exactly once.
+pub fn inverse_permutation<T: Copy + Default + 'static>(order: impl ExactSizeIterator<Item = usize>) -> Vec<T> where usize: num_traits::AsPrimitive<T> {
+    let mut ranks = vec![T::default(); order.len()];
+    for (rank, position) in order.enumerate() { ranks[position] = num_traits::AsPrimitive::as_(rank); }
     ranks
 }
 
 /// Marks where `pattern_shape` fits within `shape` and every pattern item matches. Shapes describe compact row-major buffers; `same` compares their flat positions. A lower-rank pattern has leading axes of length one.
 #[inline]
 pub fn find_with<E>(pattern_shape: &[usize], shape: &[usize], mut same: impl FnMut(usize, usize) -> Result<bool, E>) -> Result<Vec<bool>, E> {
-    let mut out = vec![false; shape.iter().product()];
+    let mut out = vec![false; count(shape)];
     if pattern_shape.len() > shape.len() { return Ok(out); }
     let mut pattern = vec![1; shape.len() - pattern_shape.len()];
     pattern.extend_from_slice(pattern_shape);
     let strides = crate::layout::strides(shape);
-    let offsets: Vec<usize> = (0..pattern.iter().product()).map(|i| crate::layout::coordinates(i, &pattern).map(|(a, c)| c * strides[a]).sum()).collect();
+    let offsets: Vec<usize> = (0..count(&pattern)).map(|i| crate::layout::coordinates(i, &pattern).map(|(a, c)| c * strides[a]).sum()).collect();
     for (flat, matched) in out.iter_mut().enumerate() {
         if crate::layout::coordinates(flat, shape).any(|(a, c)| pattern[a] > shape[a] - c) { continue; }
         *matched = true;
@@ -850,7 +851,7 @@ pub fn view_numbered(x: View<'_>, t: Tolerance) -> Option<Result<Numbered, Error
     Some(view_classes(x, t)?.map(|classes| numbered(&classes)))
 }
 
-/// For each item of `y`, the first position in `x` of an item that matches it, or the length of `x` where none does: exactly for Booleans, integers or characters of one kind, with integers of different widths read as `i64`, and within `t` for floats of one width, checking for an interrupt as it goes. An integer haystack also takes `f64` needles when every needle is exactly whole and below [`tolerant::whole_limit`]. `None` for other pairs.
+/// For each item of `y`, the first position in `x` of an item that matches it, or the length of `x` where none does: exactly for Booleans, integers or characters of one kind, with integers of different widths read as `i64`, and within `t` for floats of one width, checking for an interrupt as it goes. An integer haystack also takes `f64` needles when every needle is an integer that [`tolerant::integer_of`] accepts. `None` for other pairs.
 pub fn view_index_of(x: View<'_>, y: View<'_>, t: Tolerance) -> Option<Result<Vec<u32>, Error>> {
     if let (DType::Float(w), true) = (x.dtype(), x.dtype() == y.dtype()) {
         return with_float_width!(w, F => Some(crate::with_tolerance!(t, |t| tolerant::index_of(t, F::of(x)?, F::of(y)?))));
@@ -912,10 +913,9 @@ pub fn view_member(x: &Layout, xs: View<'_>, query: &Layout, ys: View<'_>, t: To
     view_contains(haystack.view(), needle.view(), x.shape()[0], t).ok_or_else(|| Error::new(Kind::Domain, "membership can't compare these kinds"))?
 }
 
-/// Exact whole float needles small enough that tolerance cannot equate them with another integer. Other needles decline this integer fast path.
+/// For each float needle, the first position in `x` of the integer that it stands for, where `tolerant::integer_of` reads an integer from every needle. Other needles decline this integer fast path.
 fn whole_needles<K: Key>(x: &[K], y: &[f64], t: Tolerance) -> Option<Vec<u32>> {
-    let limit = tolerant::whole_limit(t);
-    let whole: Vec<i64> = y.iter().map(|&v| (v.fract() == 0.0 && v.abs() < limit).then_some(v as i64)).collect::<Option<_>>()?;
+    let whole: Vec<i64> = y.iter().map(|&v| tolerant::integer_of(t, v)).collect::<Option<_>>()?;
     let mut found = index_of(x, &whole.iter().filter_map(|&n| K::from_key(n)).collect::<Vec<_>>()).into_iter();
     Some(whole.iter().map(|&n| K::from_key(n).and_then(|_| found.next()).unwrap_or(x.len() as u32)).collect())
 }
@@ -1051,14 +1051,158 @@ fn spread_into<T: Element + Key>(x: &[T], out: &mut [T], down: bool) -> bool {
     true
 }
 
+/// Whether this target's vectors make `networked` faster than a comparison sort, as AArch64's, AVX2's and wasm's are.
+const VECTORS: bool = cfg!(any(target_arch = "aarch64", target_feature = "avx2", target_feature = "simd128"));
+/// The bytes in one vector register: 32 with AVX2, and 16 on AArch64 and in wasm.
+const VECTOR_BYTES: usize = if cfg!(target_feature = "avx2") { 32 } else { 16 };
+/// The rows that `network` keeps in registers at once: 16 of AArch64's 32 vector registers, and 8 of the 16 that x86-64 has.
+const HELD_ROWS: usize = if cfg!(target_arch = "aarch64") { 16 } else { 8 };
+/// The most bytes in the lane that `network` sorts, padded to the next power of two of its length. Past this, the network's log² steps cost more than a comparison sort or a radix sort.
+const NETWORK_BYTES: usize = 32 << 10;
+/// The most bytes in a padded lane that `networked` sorts whatever the lane's length. A longer padded lane must be at least three quarters full. The network's cost follows the padded length, and its gain over the comparison sort and the radix sort falls as lanes grow. On AArch64, at `f32` and `f64`, every lane that these bounds admit sorts at least a tenth faster through the network.
+const ANY_FILL_BYTES: usize = 4 << 10;
+
+/// A float type whose lanes `networked` sorts, in rows of as many lanes as a vector holds: `f32` and `f64`. `f16` sorts its keys.
+pub(crate) trait Network: Sized {
+    fn networked(_x: &[Self], _out: &mut [Self], _down: bool, _scratch: &mut Vec<Self>) -> bool { false }
+}
+impl Network for half::f16 {}
+impl Network for f32 {
+    fn networked(x: &[f32], out: &mut [f32], down: bool, scratch: &mut Vec<f32>) -> bool { networked::<_, { VECTOR_BYTES / 4 }>(x, out, down, scratch) }
+}
+impl Network for f64 {
+    fn networked(x: &[f64], out: &mut [f64], down: bool, scratch: &mut Vec<f64>) -> bool { networked::<_, { VECTOR_BYTES / 8 }>(x, out, down, scratch) }
+}
+
+/// Writes `x` sorted into `out` through `network`, and gives whether it did: on a target with `VECTORS`, for a lane of at least one block of `HELD_ROWS` rows whose padded length `NETWORK_BYTES` and `ANY_FILL_BYTES` admit. NaNs move aside first and sort among themselves by `total_key`, which clears their signs as the comparison sort does. The network's comparisons can leave `¯0` and `0` in either order, so a pass then puts the run's negative zeros first.
+fn networked<F: Native, const W: usize>(x: &[F], out: &mut [F], down: bool, scratch: &mut Vec<F>) -> bool {
+    let padded = x.len().next_power_of_two() * size_of::<F>();
+    if !VECTORS || x.len() < W * HELD_ROWS || padded > NETWORK_BYTES || padded > ANY_FILL_BYTES && 4 * size_of_val(x) < 3 * padded { return false; }
+    scratch.clear();
+    let real = x.len() - x.iter().filter(|v| v.is_nan()).count();
+    if real == x.len() { scratch.extend_from_slice(x) } else { scratch.extend(x.iter().copied().filter(|v| !v.is_nan())) }
+    scratch.resize(real.next_power_of_two().max(W * HELD_ROWS), F::infinity());
+    let rows = scratch.as_chunks_mut::<W>().0;
+    network(rows);
+    for (j, lane) in out[..real].chunks_mut(rows.len()).enumerate() {
+        for (o, row) in lane.iter_mut().zip(&*rows) { *o = row[j]; }
+    }
+    if real < x.len() {
+        let mut nans: Vec<F::OrderKey> = x.iter().filter(|v| v.is_nan()).map(|v| v.total_key()).collect();
+        nans.sort_unstable();
+        for (o, &k) in out[real..].iter_mut().zip(&nans) { *o = F::from_order_key(k); }
+    }
+    let sorted = &mut out[..real];
+    let (zeros, positive) = (sorted.partition_point(|&v| v < F::zero()), sorted.partition_point(|&v| v <= F::zero()));
+    let negative = zeros + sorted[zeros..positive].iter().filter(|v| v.is_sign_negative()).count();
+    sorted[zeros..negative].fill(-F::zero());
+    sorted[negative..positive].fill(F::zero());
+    if down { out.reverse(); }
+    true
+}
+
+/// Batcher's bitonic network on `rows`, a power of two of them and at least `HELD_ROWS`, in its flipped form, where every comparison puts the lesser item first. It sorts the items as read column by column: lane 0 of every row, then lane 1, and so on. So every step compares whole rows, apart from those of the last stages, which `lanes_stage` makes across lanes. The steps within `HELD_ROWS` rows run on those rows in registers.
+fn network<F: Native, const W: usize>(rows: &mut [[F; W]]) {
+    for block in rows.as_chunks_mut::<HELD_ROWS>().0 { sorted_block(block) }
+    let mut b = 2 * HELD_ROWS;
+    while b <= rows.len() {
+        for part in rows.chunks_exact_mut(b) { flip(part) }
+        cleaned(rows, b / 4);
+        b *= 2;
+    }
+    lanes_stage::<F, W, 1>(rows);
+    if W >= 4 { lanes_stage::<F, W, 2>(rows) }
+    if W >= 8 { lanes_stage::<F, W, 3>(rows) }
+}
+
+/// The stages of 2 to `HELD_ROWS` rows, on one block of rows in registers.
+#[inline(always)]
+fn sorted_block<F: Native, const W: usize>(block: &mut [[F; W]; HELD_ROWS]) {
+    let mut v = *block;
+    held_step::<F, W, 2, true>(&mut v);
+    held_step::<F, W, 4, true>(&mut v);
+    half_cleans(&mut v, 2);
+    held_step::<F, W, 8, true>(&mut v);
+    half_cleans(&mut v, 4);
+    if HELD_ROWS == 16 {
+        held_step::<F, W, 16, true>(&mut v);
+        half_cleans(&mut v, 8);
+    }
+    *block = v;
+}
+
+/// The steps of a stage after its flip, at row distances `d`, `d/2` and on down to 1: through memory while the distance is at least `HELD_ROWS`, then on each block of rows in registers.
+fn cleaned<F: Native, const W: usize>(rows: &mut [[F; W]], mut d: usize) {
+    while d >= HELD_ROWS { for part in rows.chunks_exact_mut(2 * d) { half_clean(part) } d /= 2 }
+    for block in rows.as_chunks_mut::<HELD_ROWS>().0 {
+        let mut v = *block;
+        half_cleans(&mut v, HELD_ROWS);
+        *block = v;
+    }
+}
+
+/// The half-cleans of a block in registers, within spans of `span` rows, then of half as many, and on down to spans of 2.
+#[inline(always)]
+fn half_cleans<F: Native, const W: usize>(v: &mut [[F; W]; HELD_ROWS], span: usize) {
+    if span >= 16 { held_step::<F, W, 16, false>(v) }
+    if span >= 8 { held_step::<F, W, 8, false>(v) }
+    if span >= 4 { held_step::<F, W, 4, false>(v) }
+    held_step::<F, W, 2, false>(v);
+}
+
+/// One step on a block of rows in registers, within each span of `SPAN` rows: each row of the span's first half against its mirror in the second half, where `FLIP`, and otherwise against the row at the same place in the second half. A constant span lets the compiler unroll the step, which keeps the block in registers.
+#[inline(always)]
+fn held_step<F: Native, const W: usize, const SPAN: usize, const FLIP: bool>(v: &mut [[F; W]; HELD_ROWS]) {
+    for base in (0..HELD_ROWS).step_by(SPAN) {
+        for r in 0..SPAN / 2 {
+            let (i, k) = (base + r, if FLIP { base + SPAN - 1 - r } else { base + SPAN / 2 + r });
+            (v[i], v[k]) = F::ordered_lanes(v[i], v[k]);
+        }
+    }
+}
+
+/// Stage `T` of the stages that compare lanes, for groups of `2^T` lanes. Row `r` and row `n-1-r` compare lane `j` with lane `j ^ (2^T - 1)`, and the lesser goes to the lane with the lower number. Then each row compares the lanes `2^u` apart within each group, for each `u` from `T - 2` down to 0. Then the rows clean as any stage's do.
+fn lanes_stage<F: Native, const W: usize, const T: u32>(rows: &mut [[F; W]]) {
+    let (m, h) = ((1 << T) - 1, 1 << (T - 1));
+    let half = rows.len() / 2;
+    let (lo, hi) = rows.split_at_mut(half);
+    for (a, c) in lo.iter_mut().zip(hi.iter_mut().rev()) {
+        let (s, l) = F::ordered_lanes(*a, std::array::from_fn(|j| c[j ^ m]));
+        *a = std::array::from_fn(|j| if j & h == 0 { s[j] } else { l[j] });
+        *c = std::array::from_fn(|j| if j & h == 0 { s[j ^ m] } else { l[j ^ m] });
+    }
+    for u in (0..T - 1).rev() {
+        let g = 1 << u;
+        for v in rows.iter_mut() {
+            let (s, l) = F::ordered_lanes::<W>(std::array::from_fn(|j| v[j & !g]), std::array::from_fn(|j| v[j | g]));
+            *v = std::array::from_fn(|j| if j & g == 0 { s[j] } else { l[j] });
+        }
+    }
+    cleaned(rows, half);
+}
+
+/// The first step of a stage: each row of `part`'s first half against its mirror in the second half.
+#[inline(always)]
+fn flip<F: Native, const W: usize>(part: &mut [[F; W]]) {
+    let (lo, hi) = part.split_at_mut(part.len() / 2);
+    for (a, c) in lo.iter_mut().zip(hi.iter_mut().rev()) { (*a, *c) = F::ordered_lanes(*a, *c) }
+}
+
+/// A later step of a stage: each row of `part`'s first half against the row at the same place in the second half.
+#[inline(always)]
+fn half_clean<F: Native, const W: usize>(part: &mut [[F; W]]) {
+    let (lo, hi) = part.split_at_mut(part.len() / 2);
+    for (a, c) in lo.iter_mut().zip(hi) { (*a, *c) = F::ordered_lanes(*a, *c) }
+}
+
 /// A sorted vector: one lane of `view_sort_along`.
 pub fn view_sort(x: View<'_>, down: bool) -> Result<Option<Buffer>, Error> { view_sort_along(x, [1, x.len(), 1], down) }
 
-/// Sorts each lane into its own output. A lane of 256 items or more whose values span a small table sorts by counting. Other lanes sort their items' `SortKey`s, computed once, by an unstable comparison sort below `value_radix_from` and by the radix sort from there, then write the items back from the keys. Equal keys come from equal items, so the result doesn't depend on how the sort orders them, and `¯0` comes before `0`. Lanes run through the shared stack scheduler, which reuses each thread's buffers. A single lane runs on the calling thread, where the radix sort can split its passes across threads. `None` for complex numbers. An interrupt stops a run of several lanes with the interrupt hook's error.
+/// Sorts each lane into its own output. A lane of 256 items or more whose values span a small table sorts by counting, and a float lane through `networked` where it takes the lane's length. Other lanes sort their items' `SortKey`s, computed once, by an unstable comparison sort below `value_radix_from` and by the radix sort from there, then write the items back from the keys. Equal keys come from equal items, so the result doesn't depend on how the sort orders them, and `¯0` comes before `0`. Lanes run through the shared stack scheduler, which reuses each thread's buffers. A single lane runs on the calling thread, where the radix sort can split its passes across threads. `None` for complex numbers. An interrupt stops a run of several lanes with the interrupt hook's error.
 pub fn view_sort_along(x: View<'_>, dims: [usize; 3], down: bool) -> Result<Option<Buffer>, Error> {
     fn run<T: SortKey>(x: &[T], dims @ [outer, len, inner]: [usize; 3], down: bool) -> Result<Buffer, Error> {
-        let sort = |lane: &[T], out: &mut [T], (keys, spare): &mut (Vec<T::Key>, Vec<T::Key>)| {
-            if T::counted(lane, out, down) { return; }
+        let sort = |lane: &[T], out: &mut [T], (keys, spare, scratch): &mut (Vec<T::Key>, Vec<T::Key>, Vec<T>)| {
+            if T::sorted_into(lane, out, down, scratch) { return; }
             T::keys_into(lane, keys, down);
             let n = keys.len();
             if n < value_radix_from(<T::Key as RadixKey>::BYTES) { keys.sort_unstable(); } else {
@@ -1071,7 +1215,7 @@ pub fn view_sort_along(x: View<'_>, dims: [usize; 3], down: bool) -> Result<Opti
             let mut out = vec![T::FILL; len];
             sort(x, &mut out, &mut Default::default());
             out
-        } else { map_lanes::<_, _, (Vec<T::Key>, Vec<T::Key>)>(x, dims, len, |lane, out, work| sort(lane, out, work))? }))
+        } else { map_lanes::<_, _, (Vec<T::Key>, Vec<T::Key>, Vec<T>)>(x, dims, len, |lane, out, work| sort(lane, out, work))? }))
     }
     ordered_view!(x, |x| run(x, dims, down)).transpose()
 }
@@ -1257,7 +1401,7 @@ pub fn view_quantiles_along(x: View<'_>, dims @ [outer, _, inner]: [usize; 3], p
             plan.apply(keys, out, |a, b| a.cmp(b), |k| read(T::from_sort_key(k)));
         })
     }
-    fn floats<F: Element + Float + Default>(x: &[F], dims: [usize; 3], plan: &Quantiles) -> Result<Buffer, Error> {
+    fn floats<F: Element + Float + Default + Network>(x: &[F], dims: [usize; 3], plan: &Quantiles) -> Result<Buffer, Error> {
         Ok(F::buffer(run::<_, F>(x, dims, plan, Float::working)?))
     }
     let plan = Quantiles::new(dims[1], probabilities)?;

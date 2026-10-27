@@ -278,8 +278,8 @@ fn complex(units: &Units<num_complex::Complex<f64>, num_complex::Complex<f32>>) 
     ]
 }
 
-/// Inner products of 256×256 matrices, whose results hold `N` items. In the integer rows, the 64-bit column times items large enough to need the 64-bit kernels, and the 32-bit column items small enough for the 32-bit kernels. Both count copies of 64-bit items.
-fn inner_products(units: &Units<f64, f32>) -> [Costed; 6] {
+/// Inner products of 256×256 matrices, whose results hold `N` items, and `+.×` of such a matrix with a vector on either side, which reads the matrix once. In the integer rows, the 64-bit column times items large enough to need the 64-bit kernels, and the 32-bit column items small enough for the 32-bit kernels. Both count copies of 64-bit items.
+fn inner_products(units: &Units<f64, f32>) -> [Costed; 8] {
     use linalg::*;
     let size = [256; 3];
     let first = |(x, y): (Vec<f64>, Vec<f32>)| (set(&x, 0).to_vec(), set(&y, 0).to_vec());
@@ -298,10 +298,14 @@ fn inner_products(units: &Units<f64, f32>) -> [Costed; 6] {
             [$large, $small].map(|[a, b]: &[Vec<i64>; 2]| units.0.cost(|| run(&|| $k.inner(black_box(a.as_slice()), black_box(b.as_slice()), size).len())))
         };
     }
+    // A 256×256 matrix times a vector on either side, with `[a, b]` items of each operand.
+    let by_vector = |size: [usize; 3], [a, b]: [usize; 2]| units.costs(
+        || run(&|| PlusTimes.inner(black_box(&a64[..a]), black_box(&b64[..b]), size).len()), || run(&|| PlusTimes.inner(black_box(&a32[..a]), black_box(&b32[..b]), size).len()));
     [
         ("linalg::PlusTimes", copies!(PlusTimes)), ("linalg::MaxPlus", copies!(MaxPlus)), ("linalg::MinPlus", copies!(MinPlus)),
         ("linalg::PlusEqual", copies!(PlusEqual)), ("linalg::PlusTimes at i64", integer_copies!(PlusTimes, &large, &small)),
         ("linalg::PlusEqual at i64", integer_copies!(PlusEqual, &wide, &small)),
+        ("linalg::PlusTimes by a vector", by_vector([256, 256, 1], [N, 256])), ("linalg::PlusTimes of a vector", by_vector([1, 256, 256], [256, N])),
     ]
 }
 

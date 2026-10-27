@@ -1,5 +1,5 @@
 //! Special functions: gamma, its logarithm and its logarithmic derivative digamma, binomial coefficients, the error function and its inverses, and the regularized incomplete gamma and beta functions with their inverses. f64 computes in f64. Narrower types round an f64 result, from a cheaper f64 algorithm where one has the precision they need. `gamma`, `lgamma` and `erf` have no branch on their usual path, and loops that call them vectorize. The others choose a method by range, or iterate until they converge.
-use crate::{Arg, Native, dd::Double, exp::{exp, exp_narrow, exp_plus}, float::{horner, sealed::Core}, ln::{ln, ln_double, ln_narrow, ln_split, log1p}};
+use crate::{Arg, Native, dd::Double, exp::{exp, exp_narrow, exp_plus}, float::{horner, sealed::Core}, ln::{ln, ln_double, ln_narrow, ln_split, log1p}, slice::written};
 use std::{f64::consts::PI, mem::MaybeUninit};
 
 /// Each function at every type: it computes in f64, and narrower types round the result.
@@ -589,7 +589,7 @@ many |_, [x], n, out| match x {
 /// `erfc` on each item of `x`, written into `out`, through `slice::blocks` of 512 items. A block whose magnitudes all lie below `ERFC_SPLIT` computes only `erfc_near`, and one whose magnitudes all reach it computes only `erfc_far`. Where `branches` holds, a mixed block's items are partitioned: `placed` puts the positions of those below `ERFC_SPLIT` at the front and the others' at the back, and each formula runs on its own items, gathered into one buffer, as `regions` does, because a branch on each item was mispredicted on mixed arguments. Elsewhere a mixed block runs `erfc`, which computes both formulas in every lane. Partitioning every block added about 12 instructions an item, more than computing in place where a block lies in one region. Blocks of 64, the size `each_usual` uses, cost the normal CDF about 7% more instructions on shuffled and on sorted items than blocks of 512.
 fn erfc_blocks<R: Native, const FUSED: bool>(x: &[R], out: &mut [MaybeUninit<R>]) -> bool {
     const BLOCK: usize = 512;
-    let (mut place, mut t) = ([0u16; BLOCK], [R::zero(); BLOCK]);
+    let (mut place, mut t) = ([const { MaybeUninit::uninit() }; BLOCK], [const { MaybeUninit::uninit() }; BLOCK]);
     let split = R::narrow(ERFC_SPLIT);
     #[inline(always)]
     fn near<R: Native, const FUSED: bool>(v: R) -> R { erfc_ends(v, erfc_near::<R, FUSED>(v)) }
@@ -602,7 +602,7 @@ fn erfc_blocks<R: Native, const FUSED: bool>(x: &[R], out: &mut [MaybeUninit<R>]
         #[inline(always)] |xs, os| {
             if branches::<R>() {
                 let n = placed(0..xs.len() as u16, &mut place, |i| xs[usize::from(i)].abs() < split);
-                let (nears, fars) = place[..xs.len()].split_at(n);
+                let (nears, fars) = written(&mut place[..xs.len()]).split_at(n);
                 gathered(nears, &mut t, os, |i| xs[i], #[inline(always)] |t| { for v in t { *v = near::<R, FUSED>(*v) } }, |_, v| v);
                 gathered(fars, &mut t, os, |i| xs[i], #[inline(always)] |t| { for v in t { *v = far::<R, FUSED>(*v) } }, |_, v| v);
             } else { for (o, &v) in os.iter_mut().zip(xs) { o.write(erfc::<R, FUSED>(v)); } }
@@ -629,21 +629,22 @@ fn inverses<R: Native>(x: Arg<'_, R>, n: usize, out: &mut [MaybeUninit<R>], f: i
 /// `maddock` on each item of `x`, written into `out`, with no branch on an item's region. In each block of `BLOCK` items, one pass computes each item's `parts` once into three buffers and `placed` puts the central items' positions at the front and the others' at the back, and a second `placed` splits the others by whether q is at least 1/4. Each region's formula then runs on its items' arguments, gathered into one buffer. On uniform arguments, `maddock`'s branches were mispredicted about three times in four, which took half its time. Items outside the domain, and NaN, take `f`, in a last pass that runs only in a block that holds one. Gives `false` where an output is NaN and its item isn't.
 fn regions<R: Native, const FUSED: bool>(x: &[R], out: &mut [MaybeUninit<R>], f: impl Fn(R) -> R, parts: impl Fn(f64) -> (f64, f64, f64)) -> bool {
     const BLOCK: usize = 512;
-    let (mut place, mut split) = ([0u16; BLOCK], [0u16; BLOCK]);
-    let (mut ps, mut qs, mut signs, mut t) = ([0.0; BLOCK], [0.0; BLOCK], [0.0; BLOCK], [0.0; BLOCK]);
+    let (mut place, mut split) = ([const { MaybeUninit::uninit() }; BLOCK], [const { MaybeUninit::uninit() }; BLOCK]);
+    let (mut ps, mut qs, mut signs, mut t) = ([const { MaybeUninit::uninit() }; BLOCK], [const { MaybeUninit::uninit() }; BLOCK], [const { MaybeUninit::uninit() }; BLOCK], [const { MaybeUninit::uninit() }; BLOCK]);
     let mut ok = true;
     for (xs, os) in x.chunks(BLOCK).zip(out.chunks_mut(BLOCK)) {
         let mut outside = false;
         let central = placed(0..xs.len() as u16, &mut place, |i| {
             let i = usize::from(i);
             let (p, q, sign) = parts(xs[i].wide());
-            (ps[i], qs[i], signs[i]) = (p, q, sign);
+            (ps[i], qs[i], signs[i]) = (MaybeUninit::new(p), MaybeUninit::new(q), MaybeUninit::new(sign));
             outside |= !(p < 1.0);
             p <= 0.5
         });
-        let (central, others) = place[..xs.len()].split_at(central);
+        let (ps, qs, signs): (&[f64], &[f64], &[f64]) = (written(&mut ps[..xs.len()]), written(&mut qs[..xs.len()]), written(&mut signs[..xs.len()]));
+        let (central, others) = written(&mut place[..xs.len()]).split_at(central);
         let upper = placed(others.iter().copied(), &mut split, |i| qs[usize::from(i)] >= 0.25);
-        let (upper, below) = split[..others.len()].split_at(upper);
+        let (upper, below) = written(&mut split[..others.len()]).split_at(upper);
         let signed = |i: usize, v: f64| R::narrow(v.copysign(signs[i]));
         gathered(central, &mut t, os, |i| ps[i], #[inline(always)] |t| { for v in t { *v = maddock_central::<FUSED>(*v) } }, signed);
         gathered(upper, &mut t, os, |i| qs[i], #[inline(always)] |t| { for v in t { *v = maddock_upper::<FUSED>(*v) } }, signed);
@@ -666,20 +667,22 @@ fn regions<R: Native, const FUSED: bool>(x: &[R], out: &mut [MaybeUninit<R>], f:
 
 /// `formula` on the values that `arg` gives at `positions`, gathered into `t`. Each result goes to its item's place in `os`, through `result`, which also gets the item's position.
 #[inline(always)]
-fn gathered<T: Copy, R>(positions: &[u16], t: &mut [T], os: &mut [MaybeUninit<R>], arg: impl Fn(usize) -> T, formula: impl Fn(&mut [T]), result: impl Fn(usize, T) -> R) {
+fn gathered<T: Copy, R>(positions: &[u16], t: &mut [MaybeUninit<T>], os: &mut [MaybeUninit<R>], arg: impl Fn(usize) -> T, formula: impl Fn(&mut [T]), result: impl Fn(usize, T) -> R) {
     let t = &mut t[..positions.len()];
-    for (v, &i) in t.iter_mut().zip(positions) { *v = arg(usize::from(i)) }
+    for (v, &i) in t.iter_mut().zip(positions) { v.write(arg(usize::from(i))); }
+    let t = written(t);
     formula(t);
     for (&v, &i) in t.iter().zip(positions) { let i = usize::from(i); os[i].write(result(i, v)); }
 }
 
 /// Places each of `positions` for which `first` holds at the front of `place`, in order, and each other one at the back, with no branch, and gives how many went to the front.
 #[inline(always)]
-fn placed(positions: impl ExactSizeIterator<Item = u16>, place: &mut [u16], mut first: impl FnMut(u16) -> bool) -> usize {
+fn placed(positions: impl ExactSizeIterator<Item = u16>, place: &mut [MaybeUninit<u16>], mut first: impl FnMut(u16) -> bool) -> usize {
     let (mut lo, mut hi) = (0, positions.len());
     for i in positions {
         let front = first(i);
-        (place[lo], place[hi - 1]) = (i, i);
+        place[lo].write(i);
+        place[hi - 1].write(i);
         lo += usize::from(front);
         hi -= usize::from(!front);
     }
