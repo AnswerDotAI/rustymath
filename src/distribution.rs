@@ -1,7 +1,7 @@
 //! Probability distributions. Each has a density, a cumulative distribution, a quantile function and a sampler. The first three are also function objects, `Pdf`, `Cdf` and `Quantile`, which hold the distribution. Their slice forms choose the distribution's formulas once, outside the loop, so the loops of the closed-form distributions vectorize. Their one-item forms run the slice forms on one item. An item of a slice form fails where its result is NaN and its argument isn't, as for a quantile of p outside 0 to 1. A discrete distribution's density is its mass at a whole x, and its quantile function and sampler give whole numbers.
 use crate::{
     Arg, Atan, Erfc, Erfcinv, Float, Ln, Log1p, Pow, Root, Tan, Unary, betainc, betaincinv, cos, erfcinv, exp, expm1, gammainc, gammaincc, gammaincinv, lgamma, ln, log1p, pow, sin,
-    float::sealed::Forms, slice::{CHUNK, written},
+    slice::{Forms, CHUNK, written},
 };
 use rand::{Rng, distr::{Distribution as _, Open01, StandardUniform}};
 use std::{f64::consts::{FRAC_1_SQRT_2, PI, SQRT_2, TAU}, mem::MaybeUninit};

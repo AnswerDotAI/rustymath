@@ -766,19 +766,23 @@ const MAPPED: usize = 1 << 16;
 
 /// [`along`] of the array of `shape` that `mapping` lays `data` over, folding axis `axis`, without building that array: its totals, whether they all fit, and the tables that read the totals in the order of the array's other axes, where they come in another order. A reduction combines each lane's items in any order. Where the array reads a contiguous block of `data` with its axes in another order, as [`Mapping::block`] finds, the block folds in its own order, as [`Block::fold`] plans it, and its totals keep the block's order. A caller can then copy them through the tables, or read them through the tables as another view. Otherwise the array is read [`MAPPED`] items at a time through [`expanded_items`], and folds as [`fold_pieces`] folds it.
 pub fn along_mapped<T: Element, R: Reduction<T>>(data: &[T], mapping: &Mapping, shape: &[usize], axis: usize) -> (Vec<R::Total>, bool, Option<Vec<Steps>>) {
+    let finished = |(totals, fits, order)| {
+        if fits { crate::events::taken(crate::events::Route::MappedFold, crate::layout::count(shape)); }
+        (totals, fits, order)
+    };
     if let Some(block) = mapping.block(shape) {
         let (dims, order) = block.fold(Some(axis));
         let (totals, fits) = along::<T, R>(&data[block.range.clone()], dims);
-        return (totals, fits, order);
+        return finished((totals, fits, order));
     }
     let dims = Lanes::new(shape, axis).expect("the folded axis is within the shape").dims();
     let mut totals = vec![R::unit(); dims[0] * dims[2]];
-    if dims[1] == 0 || totals.is_empty() { return (totals, true, None); }
+    if dims[1] == 0 || totals.is_empty() { return finished((totals, true, None)); }
     let fits = fold_pieces::<T, R>(&mut totals, dims, &|range, fold| {
         let mut buf = Vec::new();
         for at in range.clone().step_by(MAPPED) { fold(at, Part::Items(expanded_items(mapping, data, at, MAPPED.min(range.end - at), &mut buf))); }
     });
-    (totals, fits, None)
+    finished((totals, fits, None))
 }
 
 /// The widest window that [`sliding`] folds directly, with one pass over each block of a lane for each of the window's rows. Wider windows take van Herk-Gil-Werman.
@@ -877,10 +881,14 @@ fn hgw<T: Copy, R: Reduction<T>, const ONE: bool>(lane: &[T], folds: &mut [R::To
 pub fn sliding<T: Copy + Sync, R: Reduction<T>>(data: &[T], [outer, len, inner]: [usize; 3], width: usize) -> (Vec<R::Total>, bool) {
     assert_eq!(data.len(), outer * len * inner, "the data must fill its dimensions");
     assert!((1..=len.max(1)).contains(&width), "a window lies within its lane");
+    let finished = |(totals, fits)| {
+        if fits { crate::events::taken(crate::events::Route::SlidingFold, data.len()); }
+        (totals, fits)
+    };
     let count = (len + 1).saturating_sub(width);
-    if outer * count * inner == 0 { return (Vec::new(), true); }
+    if outer * count * inner == 0 { return finished((Vec::new(), true)); }
     // A window as long as a lane of single items is that lane's fold, which `along` runs side by side with its neighbours'. Wider lanes fold directly, starting from their first row.
-    if width == len && inner == 1 { return along::<T, R>(data, [outer, len, inner]); }
+    if width == len && inner == 1 { return finished(along::<T, R>(data, [outer, len, inner])); }
     let mut ok = true;
     if width <= DIRECT {
         // Each block of a lane's windows folds while its rows are in cache (`rows_folded`), which reads the lane from memory once.
@@ -892,7 +900,7 @@ pub fn sliding<T: Copy + Sync, R: Reduction<T>>(data: &[T], [outer, len, inner]:
                 ok &= rows_folded::<T, R>(&mut out, width, |i| &lane[(r + i) * inner..(r + i + rows) * inner]);
             }
         }
-        return (out, ok);
+        return finished((out, ok));
     }
     let mut out = vec![R::unit(); outer * count * inner];
     let lanes = data.chunks_exact(len * inner).zip(out.chunks_exact_mut(count * inner));
@@ -901,7 +909,7 @@ pub fn sliding<T: Copy + Sync, R: Reduction<T>>(data: &[T], [outer, len, inner]:
         if inner == 1 { hgw::<T, R, true>(lane, folds, &mut suffix, &mut row, width, inner, &mut ok) }
         else { hgw::<T, R, false>(lane, folds, &mut suffix, &mut row, width, inner, &mut ok) }
     }
-    (out, ok)
+    finished((out, ok))
 }
 
 /// The folds by `R` of each window of `w1` rows along axis 1 and `w2` rows along axis 3 of `data`, an array of shape `[outer, len1, mid, len2, inner]` held row by row. Windows start every `e1` positions along axis 1 and every `e2` along axis 3: every position for windows that slide, or every window's width for windows that tile the axis, as pooling's do. The result has shape `[outer, c1, mid, c2, inner]`, where `c1` and `c2` count the windows along each axis, with whether every fold fits. Each band of `w1` rows folds into a buffer that stays in cache, and the windows along axis 3 fold from that buffer, so `data` is read once. A window's items fold along axis 1 and then along axis 3, which suits reductions that fold in any order. `None` for a window wider than [`DIRECT`] rows.
@@ -931,6 +939,7 @@ pub fn sliding_2d<T: Copy + Sync, R: Reduction<T>>(data: &[T], [outer, len1, mid
             }
         }
     }
+    if ok { crate::events::taken(crate::events::Route::SlidingFold, data.len()); }
     Some((out, ok))
 }
 

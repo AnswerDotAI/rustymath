@@ -7,6 +7,7 @@ mod convert;
 mod create;
 mod distribution;
 mod exact;
+mod explain;
 mod functions;
 mod integer;
 mod linalg;
@@ -48,6 +49,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_submodule(&mathish)?;
     signal::add(m)?;
     timing::add(m)?;
+    explain::add(m)?;
     for (name, add) in [
         ("number_theory", number_theory::add as fn(&Bound<'_, PyModule>) -> PyResult<()>), ("distribution", distribution::add), ("linalg", linalg::add),
         ("exact", exact::add), ("integer", integer::add), ("optimize", optimize::add), ("random", random::add),

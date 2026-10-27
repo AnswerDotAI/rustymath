@@ -99,7 +99,8 @@ impl<K> Kernels<TernaryKernel<K>> {
         let (y, right) = y.mapped(&first.right, first.layout.shape(), at);
         // A Boolean third argument keeps its dtype: `ternary_at` turns it into items of `at` a chunk at a time, through `Element::truth`.
         let (z, last) = z.mapped(&second.right, second.layout.shape(), if z.dtype() == DType::Boolean { DType::Boolean } else { at });
-        let (one, two) = (remapped(first, left, right), remapped(second, None, last));
+        let middle = match second.left.cast_fill(at).ok()? { std::borrow::Cow::Borrowed(_) => None, std::borrow::Cow::Owned(map) => Some(map) };
+        let (one, two) = (remapped(first, left, right), remapped(second, middle, last));
         Some(kernel(k, [x.view(), y.view(), z.view()], one.as_ref().unwrap_or(first), two.as_ref().unwrap_or(second)))
     }
 }
@@ -180,9 +181,14 @@ fn ternary_at<K: Ternary<T, Out: Element> + Sync, T: Element>(k: &K, [x, y, z]: 
         Third::Mask(m) => direct(m, &second.right, &Mapping::Linear(1)).map(|ma| crate::slice::masked(k, xa, ya, ma, second.len, &mut out)),
     });
     let ok = done.unwrap_or_else(|| {
-        let through = |m: &Mapping| m.composed(&second.left, first.layout.shape(), second.layout.shape(), true).expect("a table always composes");
-        let (xm, ym) = (through(&first.left), through(&first.right));
-        let (xs, ys) = (Side::new(x, &xm), Side::new(y, &ym));
+        let [(x, xm), (y, ym)] = [(x, &first.left), (y, &first.right)].map(|(data, map)| {
+            if let Some(m) = map.composed(&second.left, first.layout.shape(), second.layout.shape(), true) { return (std::borrow::Cow::Borrowed(data), m); }
+            let (base, steps, fill) = map.to_walk(first.layout.shape());
+            let mut items = Vec::with_capacity(first.len);
+            crate::gather::walk(&mut items, data, base, &steps, crate::buffer::Fill::item(fill), crate::gather::Same);
+            (std::borrow::Cow::Owned(items), second.left.clone())
+        });
+        let (xs, ys) = (Side::new(x.as_ref(), &xm), Side::new(y.as_ref(), &ym));
         let leaf = |[a, b, c]: [Arg<'_, T>; 3], n: usize, slots: &mut Slots<'_, _>| k.many_into(a, b, c, n, slots);
         match z {
             Third::Items(z) => read_runs([&xs, &ys, &Side::new(z, &second.right)], second.len, &mut out, &leaf),

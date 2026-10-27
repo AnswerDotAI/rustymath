@@ -1129,58 +1129,6 @@ impl Steps {
         let mut walked = vec![false; shape.len()];
         walk.along.iter().flatten().any(|&a| std::mem::replace(&mut walked[a], true))
     }
-    /// For a copy of `shape` that `tables` read from a source of shape `source`: an order to move the copy's axes into, and the reads of the moved copy whose sum sends each item back to the source position it was read from. Each read gives the source's shape, through one table for each source axis after a table of length 1 for any offset, with a fill where it reads nothing. A copy that reads each item at most once needs one read, and keeps its order. Overlapping windows that move by 1 along an axis need one read for each position in a window, each of which reads the frames back: a correlation. The order moves each window's axis first, so that each read walks the moved copy's last axis forwards. `None` for any other copy, such as a spread, a selection that repeats items or windows that move further, and where the copy or its source is empty.
-    pub fn transposed(tables: &[Self], shape: &[usize], source: &[usize]) -> Option<(Vec<usize>, Vec<Vec<Self>>)> {
-        if shape.contains(&0) || source.contains(&0) { return None; }
-        let walk = Walk::new(tables, shape, source)?;
-        let (base, steps, from) = (walk.base, &walk.steps, &walk.strides);
-        if walk.along.iter().zip(steps).any(|(a, s)| a.is_none() && s.len() > 1) { return None; }
-        // The axes of the copy that walk each source axis.
-        let walks: Vec<Vec<usize>> = (0..source.len()).map(|a| walk.walking(a).collect()).collect();
-        // Of each pair of axes that walk one source axis, the shorter plays the window, which gives fewer reads. Moving the windows' axes first lets each read walk the copy's last axis forwards.
-        let cells: Vec<usize> = walks.iter().filter_map(|w| match *w.as_slice() { [f, c] => Some(if steps[f].len() >= steps[c].len() { c } else { f }), _ => None }).collect();
-        let order: Vec<usize> = cells.iter().copied().chain((0..shape.len()).filter(|r| !cells.contains(r))).collect();
-        let moved = crate::layout::strides(&order.iter().map(|&r| shape[r]).collect::<Vec<_>>());
-        let mut to = vec![0; shape.len()];
-        for (&r, &stride) in order.iter().zip(&moved) { to[r] = stride; }
-        // Each source axis gives its entries, each with an offset into the moved copy. A source axis that no axis of the copy walks gives the copy one position, which `base` holds.
-        let axes = walks.iter().enumerate().map(|(a, w)| match *w.as_slice() {
-            [] => Some(vec![(0, Self::clipped(-((base / from[a] % source[a]) as i128), source[a], 1, 0))]),
-            [r] => Some(vec![(0, steps[r].inverted(from[a], source[a], to[r])?)]),
-            [f, c] => {
-                let (f, c) = if cells.contains(&c) { (f, c) } else { (c, f) };
-                Some(steps[f].correlated(&steps[c], walk.range(a, source[a])?.start, source[a], to[f], to[c]))
-            }
-            _ => None,
-        }).collect::<Option<Vec<_>>>()?;
-        let terms = axes.iter().fold(vec![(0, vec![])], |terms, entries| {
-            terms.iter().flat_map(|(offset, t)| entries.iter().map(move |(o, e)| (offset + o, [t.as_slice(), std::slice::from_ref(e)].concat()))).collect()
-        });
-        Some((order, terms.into_iter().map(|(offset, t)| Self::with_base(offset, t)).collect()))
-    }
-    /// The entries that read back the windows that this entry's frames and `cell`'s positions read along an axis of `n` items, where the windows start at position `first`: one for each position in a window, each with that position's offset in the copy. `frames` and `cells` are the copy's strides along the two entries. Each entry reads the frames at a negated offset from `first`.
-    fn correlated(&self, cell: &Self, first: usize, n: usize, frames: usize, cells: usize) -> Vec<(usize, Self)> {
-        (0..cell.len()).map(|c| (c * cells, Self::clipped(-((first + c) as i128), n, self.len(), frames))).collect()
-    }
-    /// The entry that reads this entry's items back, for an entry along an axis of `n` items whose stride is `unit`, from a copy whose stride along this entry's own axis is `stride`. `None` where the entry reads a position twice.
-    fn inverted(&self, unit: usize, n: usize, stride: usize) -> Option<Self> {
-        let (m, forwards) = (self.len(), unit as isize);
-        match *self {
-            Self::Stride { start: 0, step, .. } if step == forwards && m == n => return Some(Self::along(n, stride)),
-            Self::Stride { start, step, .. } if step == -forwards && start == (n - 1) * unit && m == n => {
-                return Some(Self::Stride { start: (n - 1) * stride, len: n, step: -(stride as isize) });
-            }
-            Self::Stride { start, step, .. } if step == forwards => return Some(Self::clipped(-((start / unit) as i128), n, m, stride)),
-            Self::Padded { start, size, edge: Edge::Fill, .. } if size == n => return Some(Self::clipped(-start, n, m, stride)),
-            Self::Rotated { shift, len, .. } if len == n => return Some(Self::rotated(n - shift % n, n, stride)),
-            _ => {}
-        }
-        let mut back = vec![Self::FILL; n];
-        let mut unique = true;
-        self.for_each(|j, o| if unique && let Some(o) = o { unique = std::mem::replace(&mut back[o / unit], j * stride) == Self::FILL });
-        if !unique { return None; }
-        Some(Self::table(back))
-    }
     /// This entry's positions along an axis whose stride is `unit`, read through `r`, taking `r0` of the offset that `r` gives position 0 (`through`), in its own start or in `base`. `None` where neither this entry nor `r` is a table and the two don't combine into one regular entry.
     fn read_through(&self, unit: usize, r: &Self, first: bool, r0: usize, base: &mut usize) -> Option<Self> {
         if first && matches!(*self, Self::Stride { start: 0, len, step } if step == unit as isize && len == r.len()) {

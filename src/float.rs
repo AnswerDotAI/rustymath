@@ -6,7 +6,7 @@ use crate::{parallel::Slots, slice::{Arg, Ternary}};
 pub const FUSED: bool = cfg!(any(target_arch = "aarch64", target_feature = "fma"));
 
 /// A float type that rustymath's functions take: `half::f16`, `f32` or `f64`.
-pub trait Float: num_traits::Float + sealed::Sealed + sealed::Item {
+pub trait Float: num_traits::Float + sealed::Sealed + crate::slice::KernelItem {
     /// The type this float computes in, its working precision: `f32` for `f16`, and the type itself otherwise. A function of an `f16` computes in `f32` and rounds once. Sums keep their running totals in this type.
     type Working: Native;
     /// This float in its working type, which holds it exactly.
@@ -41,39 +41,10 @@ pub trait Native: Float<Working = Self> + sealed::Core + sealed::Folds {
     fn algebraic_mul(self, other: Self) -> Self;
 }
 
-/// Traits that only rustymath implements. `Core` holds the bit-level operations that the algorithms build on. `Item` and `Forms` describe function objects.
+/// Traits that only rustymath implements. `Core` holds the bit-level operations that the algorithms build on.
 pub(crate) mod sealed {
-    use crate::slice::Arg;
     use num_complex::Complex;
     pub trait Sealed {}
-    /// A type that function objects take or give: a float, a complex number, an integer or a Boolean. Pieces on several threads read and write items.
-    pub trait Item: Copy + Send + Sync {
-        /// Whether the type has NaN, as floats and complex numbers do.
-        const NAN: bool;
-        /// Whether this item is NaN, or for a complex number has a NaN part. An integer or Boolean never is.
-        fn has_nan(self) -> bool;
-    }
-    /// A function object of `N` arguments at item type `E`, compiled inside rustymath and never inlined into a caller. `forms!` writes the impls, and [`Unary`](crate::Unary), [`Binary`](crate::Binary) and [`Ternary`](crate::Ternary) call them. A call can split its slice across threads.
-    pub trait Forms<E: Item, const N: usize>: Sync {
-        type Out: Item;
-        fn scalar(&self, x: [E; N]) -> Self::Out;
-        /// The scalar form's result and whether it succeeded, as `slice` judges each item: a failed result is what `slice` writes in its slot.
-        fn judged_scalar(&self, x: [E; N]) -> (Self::Out, bool);
-        /// `judged_scalar`'s result where it succeeded.
-        #[inline]
-        fn checked_scalar(&self, x: [E; N]) -> Option<Self::Out> { let (r, ok) = self.judged_scalar(x); ok.then_some(r) }
-        /// Whether no item fails: `checked_scalar` always gives `Some`, and `slice` always gives true.
-        const TOTAL: bool;
-        /// Whether a failed item's slot holds its result wrapped to the output type, as integer arithmetic's does.
-        const WRAPS: bool;
-        /// Whether `slice` runs `judged_scalar` in a loop, and the scalar forms inline into a caller in another crate.
-        const INLINE: bool;
-        fn slice(&self, x: [Arg<'_, E>; N], n: usize, out: &mut [std::mem::MaybeUninit<Self::Out>]) -> bool;
-    }
-    macro_rules! nan_items { ($($t:ty),+) => {$( impl Item for $t { const NAN: bool = true; #[inline(always)] fn has_nan(self) -> bool { self.is_nan() } } )+} }
-    nan_items!(f32, f64, half::f16, Complex<f32>, Complex<f64>);
-    macro_rules! exact_items { ($($t:ty),+) => {$( impl Item for $t { const NAN: bool = false; #[inline(always)] fn has_nan(self) -> bool { false } } )+} }
-    exact_items!(u8, i16, i32, i64, bool, char, std::cmp::Ordering);
     macro_rules! sealed { ($($t:ty),+) => {$( impl Sealed for $t {} )+} }
     sealed!(i8, i16, i32, i64, u8, u16, u32);
     impl<T: super::Native> Sealed for Complex<T> {}

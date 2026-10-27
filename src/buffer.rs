@@ -483,6 +483,24 @@ impl Buffer {
         unsafe { self.set_len(0) }
     }
 }
+
+/// One native item, checked at the dtype that reads it, for a mapping's missing positions.
+#[derive(Clone, Debug)]
+pub struct Fill(Buffer);
+
+impl Fill {
+    pub fn new(value: View<'_>, dtype: DType) -> Result<Self, Error> {
+        if value.len() != 1 { return Err(Error::new(Kind::Length, "a fill must contain one item")); }
+        Buffer::kept(value, dtype).map(Self)
+    }
+    pub fn view(&self) -> View<'_> { self.0.view() }
+    /// Convert with the source's items, including its rounding and truncation.
+    pub fn cast(&self, dtype: DType) -> Result<Self, Error> { Buffer::cast(self.view(), dtype).map(Self) }
+    #[inline]
+    pub fn item<A: Element>(fill: Option<&std::sync::Arc<Self>>) -> A { fill.map_or(A::FILL, |f| A::of(f.view()).expect("a fill has its source's dtype")[0]) }
+}
+impl PartialEq for Fill { fn eq(&self, other: &Self) -> bool { self.view().identical(other.view()) } }
+impl Eq for Fill {}
 // Buffers are equal when they hold the same items. Numbers of one kind compare by value across widths. Buffers of different kinds are never equal.
 impl PartialEq for Buffer { fn eq(&self, other: &Self) -> bool { self.view() == other.view() } }
 
@@ -725,7 +743,7 @@ impl Buffer {
     }
     /// Shared conversion dispatch for compact and mapped logical items. Unselected storage never participates in checked conversion.
     pub(crate) fn cast_mapped(view: View<'_>, mapping: &crate::agreement::Mapping, n: usize, dtype: DType) -> Result<Self, Error> {
-        // The checked conversions below read 0 at a fill, so a chosen fill is read at the items' own dtype first.
+        // Checked conversion must read chosen fills at the source dtype before converting them.
         if mapping.chosen().is_some() { return Self::cast(with_dtype!(view.dtype(), T => T::buffer(read_as::<T, T>(T::of(view).expect("matching dtype"), mapping, n))).view(), dtype); }
         if view.dtype() == dtype {
             if matches!(mapping, crate::agreement::Mapping::Linear(1)) { return Ok(Self::copied(view, 0..n)); }
@@ -748,29 +766,3 @@ impl Buffer {
         })
     }
 }
-
-/// A fill that a call chooses: the item that a read gives at each position that reaches no item. Compact data takes one item of its own dtype (`Item`). A frontend's own storage, such as basedpl's nested arrays, takes a value of the frontend's (`Other`), which only the frontend reads. A read with no chosen fill gives its dtype's [`Element::FILL`].
-#[derive(Clone)]
-pub enum Fill { Item(Buffer), Other(std::sync::Arc<dyn std::any::Any + Send + Sync>) }
-
-impl Fill {
-    /// The one item of `value` at `dtype`, where the conversion keeps its value, as [`Buffer::kept`] converts it. A Domain error where the item doesn't keep its value.
-    pub fn new(value: View<'_>, dtype: DType) -> Result<Self, Error> {
-        Buffer::kept(value, dtype).map(Self::Item).map_err(|_| Error::new(Kind::Domain, format!("a {} fill doesn't keep its value as {}", value.dtype().name(), dtype.name())))
-    }
-    /// The item that a read of items of type `A` gives at a position that reaches no item: the chosen `fill`, made for compact data of type `A`, or `A`'s own fill where there's none.
-    pub fn item<A: Element>(fill: Option<&std::sync::Arc<Self>>) -> A {
-        match fill.map(|f| &**f) { None => A::FILL, Some(Self::Item(b)) => A::of(b.view()).expect("a fill has its data's dtype")[0], Some(Self::Other(_)) => panic!("a read of compact data has a compact fill") }
-    }
-}
-
-impl std::fmt::Debug for Fill {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { match self { Self::Item(b) => write!(f, "Fill({b:?})"), Self::Other(_) => f.write_str("Fill(frontend value)") } }
-}
-
-impl PartialEq for Fill {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) { (Self::Item(a), Self::Item(b)) => a.view().identical(b.view()), (Self::Other(a), Self::Other(b)) => std::sync::Arc::ptr_eq(a, b), _ => false }
-    }
-}
-impl Eq for Fill {}

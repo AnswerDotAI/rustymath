@@ -169,8 +169,8 @@ forms!(Pow at real: |_, [x, y]| pow_one::<_, { crate::FUSED }>(x, y), many |_, [
 /// [`Pow`] with wrapping integer results. Fractional negative integer powers fail.
 #[derive(Clone, Copy, Debug)]
 pub struct WrappingPow;
-forms!(WrappingPow at real: |_, [x, y]| crate::Binary::one(&Pow, x, y), many |_, [x, y], n, out| crate::float::sealed::Forms::slice(&Pow, [x, y], n, out));
-forms!(WrappingPow at Complex<f32>, Complex<f64>: |_, [x, y]| crate::Binary::one(&Pow, x, y), many |_, [x, y], n, out| crate::float::sealed::Forms::slice(&Pow, [x, y], n, out));
+forms!(WrappingPow at real: |_, [x, y]| crate::Binary::one(&Pow, x, y), many |_, [x, y], n, out| crate::slice::Forms::slice(&Pow, [x, y], n, out));
+forms!(WrappingPow at Complex<f32>, Complex<f64>: |_, [x, y]| crate::Binary::one(&Pow, x, y), many |_, [x, y], n, out| crate::slice::Forms::slice(&Pow, [x, y], n, out));
 
 /// [`Pow`] for a whole exponent, where every real base has a real power and no result fails. Its forms are `Pow`'s. A caller passes it whole exponents only.
 #[derive(Clone, Copy, Debug)]

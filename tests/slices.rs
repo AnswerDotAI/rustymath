@@ -1230,48 +1230,8 @@ mod gather {
         assert!(along(3, 0).spreads() && Steps::table(vec![1, 1]).spreads() && !Steps::Rotated { shift: 1, len: 4, stride: 1 }.spreads());
         assert!(Steps::rereads(&[along(8, 1), along(3, 1)], &[10]) && !Steps::rereads(&[along(10, 1)], &[10]));
     }
-    /// The strides of an array of `shape`.
-    fn strides(shape: &[usize]) -> Vec<usize> { (0..shape.len()).map(|i| shape[i + 1..].iter().product()).collect() }
-    /// The items of `s` that `steps` reach, with 0 for a fill.
-    fn read0(s: &[i64], steps: &[Steps]) -> Vec<i64> {
-        let mut out = vec![];
-        walk(&mut out, s, 0, steps, 0, Same);
-        out
-    }
-    /// Each source position's sum of the items of a copy of shape `shape` through `tables` that came from it, as the reads that `Steps::transposed` give find it. `items` are the copy's items.
-    fn sent_back(items: &[i64], tables: &[Steps], shape: &[usize], source: &[usize]) -> Vec<i64> {
-        let (order, terms) = Steps::transposed(tables, shape, source).expect("the copy reads each item at most once, or reads windows that move by 1");
-        let strides = strides(shape);
-        let moved = read0(items, &order.iter().map(|&r| along(shape[r], strides[r] as isize)).collect::<Vec<_>>());
-        terms.iter().fold(vec![0; source.iter().product()], |sum, t| sum.iter().zip(read0(&moved, t)).map(|(a, b)| a + b).collect())
-    }
-    /// Each source position's sum of the items of a copy through `tables` that came from it, as adding each item there finds it.
-    fn added_back(items: &[i64], tables: &[Steps], source: &[usize]) -> Vec<i64> {
-        let n = source.iter().product();
-        let mut sums = vec![0; n];
-        for (&x, &item) in read(&(0..n as i64).collect::<Vec<_>>(), 0, tables).iter().zip(items) { if x >= 0 { sums[x as usize] += item; } }
-        sums
-    }
     #[test]
-    fn copies_transpose() {
-        // A copy of a 4 by 6 source: reversed rows, a rotation, a drop with an overtake, a transpose, a selection and one row. Then windows of 3, and of 5, along 6 items, windows of 3 over positions 2 to 7 of 8 items, and windows of 2 by 3 over 4 by 6.
-        for (tables, shape, source) in [
-            (vec![Steps::Stride { start: 18, len: 4, step: -6 }, along(6, 1)], vec![4, 6], vec![4, 6]),
-            (vec![along(4, 6), Steps::Rotated { shift: 2, len: 6, stride: 1 }], vec![4, 6], vec![4, 6]),
-            (vec![Steps::Stride { start: 6, len: 2, step: 6 }, Steps::clipped(-1, 8, 6, 1)], vec![2, 8], vec![4, 6]),
-            (vec![along(6, 1), along(4, 6)], vec![6, 4], vec![4, 6]),
-            (vec![along(4, 6), Steps::table(vec![5, 0, 3])], vec![4, 3], vec![4, 6]),
-            (vec![Steps::Stride { start: 12, len: 1, step: 0 }, along(6, 1)], vec![1, 6], vec![4, 6]),
-            (vec![along(4, 1), along(3, 1)], vec![4, 3], vec![6]),
-            (vec![along(2, 1), along(5, 1)], vec![2, 5], vec![6]),
-            (vec![Steps::Stride { start: 2, len: 4, step: 1 }, along(3, 1)], vec![4, 3], vec![8]),
-            (vec![along(3, 6), along(4, 1), along(2, 6), along(3, 1)], vec![3, 4, 2, 3], vec![4, 6]),
-        ] {
-            let items: Vec<i64> = (1..=shape.iter().product::<usize>() as i64).collect();
-            assert_eq!(sent_back(&items, &tables, &shape, &source), added_back(&items, &tables, &source));
-        }
-        // Windows that move by 2 and a spread repeat items, which needs a scatter.
-        assert!(Steps::transposed(&[along(3, 2), along(3, 1)], &[3, 3], &[7]).is_none() && Steps::transposed(&[along(3, 0)], &[3], &[2]).is_none());
+    fn windows_are_recognised() {
         // `Walk::windows` gives each window axis's frames, window size and move, and refuses windows that don't start at 0.
         let windows = |t: &[Steps], shape: &[usize], source: &[usize]| Walk::new(t, shape, source).and_then(|w| w.windows(source));
         assert_eq!(windows(&[along(3, 6), along(4, 1), along(2, 6), along(3, 1)], &[3, 4, 2, 3], &[4, 6]), Some(vec![[3, 2, 1], [4, 3, 1]]));

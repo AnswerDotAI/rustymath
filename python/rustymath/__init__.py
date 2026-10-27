@@ -36,7 +36,7 @@ from ._core import (__version__, Array, absolute, add, all, angle, any, arccos, 
     betaincinv, binom, binom_dk, binom_dn, cbrt, ceil, cis, cos, cosh, cumprod, cumsum, digamma, distribution, divide, equal, erf, erfc, erfcinv, erfinv, exp, expm1, factorial, floor,
     gamma, gammainc, gammaincc, gammaincinv, gammaln, gcd, greater, greater_equal, hypot, lambertw, lcm, less, less_equal, log, log10, log1p, log2, logb,
     loggamma, logical_and, logical_or, logical_scan, logical_xor, logical_xnor, max, maximum, min, minimum, minmax, multiply, not_equal, number_theory, power,
-    prod, remainder, root, set_threads, sign, sin, sinh, sqrt, sqrt1mx2, sqrt1px2, sqrtx2m1, subtract, sum, tan, tanh, threads, thread_setting, timing)
+    prod, remainder, root, set_threads, sign, sin, sinh, sqrt, sqrt1mx2, sqrt1px2, sqrtx2m1, subtract, sum, tan, tanh, threads, thread_setting, timing, explain)
 from .create import arange, finfo, full, full_like, iinfo, issubdtype, linspace, logspace, ones, ones_like, result_type, zeros, zeros_like
 from ._core import clip, conj, imag, isfinite, isinf, isnan, real, rint, trunc
 from ._core import bitwise_and, bitwise_or, bitwise_xor, bitwise_not, left_shift, right_shift, floor_divide, round, degrees, radians

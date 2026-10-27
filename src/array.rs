@@ -58,7 +58,7 @@ impl<'a> ArrayView<'a> {
             if let Some(view) = self.contiguous() { return (Items::Borrowed(view), None); }
             if let Some(mapping) = self.mapping.compose(outer, self.layout.shape(), frame) { return (Items::Borrowed(self.storage), Some(mapping)); }
         }
-        (self.cast(dtype).expect("computing dtype"), None)
+        (self.cast(dtype).expect("computing dtype"), match outer.cast_fill(dtype).expect("computing fill dtype") { Cow::Borrowed(_) => None, Cow::Owned(map) => Some(map) })
     }
 }
 

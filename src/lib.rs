@@ -62,7 +62,7 @@ pub use exp::{Exp, Expm1};
 pub use ln::{Ln, Log1p, Log2, Log10, Logb, MathishLogb};
 pub use parts::{Abs, Angle, Sign, Isnan, Isfinite, Isinf, Real, Imag, Conj, Trunc, Rint, Clip, Choose, Scale, Round};
 pub use pow::{Pow, Root, WholePow, WrappingPow};
-pub use slice::{Arg, Binary, CHUNK, Flipped, Results, Right, Ternary, Unary, Wrapped, choose, pairs};
+pub use slice::{Arg, Binary, CHUNK, Flipped, Forms, KernelItem, Results, Ternary, Unary, Wrapped, choose, pairs};
 pub use special::{Erfc, Erfcinv, Erfinv};
 pub use sqrts::Sqrt;
 pub use trig::{Cos, Sin, Tan};

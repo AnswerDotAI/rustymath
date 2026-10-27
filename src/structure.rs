@@ -243,7 +243,7 @@ fn joined(parts: &[Part], group: &[usize], broadcast: bool, steps: &mut Vec<Step
             match (Mapping::new(axes, along, &within, len), own) {
                 (Mapping::Linear(1), Steps::Table(positions)) => positions.chunks(|j0, offsets| for (t, &o) in table[j0..].iter_mut().zip(offsets) { add(t, Some(o).filter(|&o| o != Steps::FILL)) }),
                 (map, _) => {
-                    let (base, tables) = map.to_walk(lens);
+                    let (base, tables, _) = map.to_walk(lens);
                     Writes::Walk { base, steps: &tables }.runs_while(&mut |k, reads| {
                         for (t, &j) in table[k..].iter_mut().zip(reads) { add(t, (j != Steps::FILL).then(|| own.get(j)).flatten()) }
                         true

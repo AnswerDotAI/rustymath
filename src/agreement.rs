@@ -81,7 +81,7 @@ impl From<Writes<'_>> for Mapping {
     }
 }
 
-/// The entries of a [`Mapping::Steps`], one for each result axis, with the walk that `Steps::simplify` plans for them and the fill that a call chose for the positions that reach no item. The plan is made on the first walk and kept, so a mapping that is read a block at a time plans its walk once.
+/// The entries of a [`Mapping::Steps`], one for each result axis, with their chosen native fill and the walk that `Steps::simplify` plans for them. The plan is made on the first walk and kept, so a mapping that is read a block at a time plans its walk once.
 #[derive(Clone, Debug, Default)]
 pub struct Route { steps: Vec<Steps>, plan: OnceLock<(usize, Vec<Cow<'static, Steps>>)>, fill: Option<Arc<Fill>> }
 
@@ -122,7 +122,7 @@ impl Mapping {
         }).collect::<Option<_>>()?;
         Some((base, steps))
     }
-    /// Reads of a logical array of `shape` through `outer`, then through this mapping to its storage. A position where `outer` gives a fill reads its item type's own fill. `None` where this mapping chose a fill and `outer` gives fills.
+    /// Reads through `outer`, whose missing positions use the default fill, then this mapping. Chosen inner fills cannot combine with outer missing positions.
     pub fn through(&self, outer: &[Steps], shape: &[usize]) -> Option<Self> {
         if outer.iter().any(|s| s.len() == 0) { return Some(Self::Linear(1)); }
         if self.chosen().is_some() && outer.iter().any(Steps::fills) { return None; }
@@ -130,22 +130,23 @@ impl Mapping {
         let (base, steps) = Steps::through(outer, shape, base, &inner)?;
         Some(self.with_steps(base, steps))
     }
-    /// This mapping over a result of `shape` as one entry for each axis of `shape`, or as it is where its offsets don't split by axis ([`Mapping::entries`]).
+    /// This mapping split into entries for `shape`, preserving its fill.
     pub fn split(&self, shape: &[usize]) -> Self { self.entries(shape).map_or_else(|| self.clone(), |(base, steps)| self.with_steps(base, steps)) }
-    /// The base and the tables of a walk that reads what this mapping reads over `shape`. A [`Mapping::Steps`] lends its own steps.
+    /// Base, axis entries and chosen native fill of the walk over `shape`. Geometry-only users may ignore the fill.
     #[inline]
-    pub fn to_walk(&self, shape: &[usize]) -> (usize, Cow<'_, [Steps]>) {
-        if let Self::Steps { base, steps } = self { return (*base, Cow::Borrowed(steps)); }
-        match self.entries(shape) {
-            Some((base, steps)) => (base, Cow::Owned(steps)),
-            None => (0, Cow::Owned(vec![Steps::table((0..count(shape)).map(|i| self.get(i).unwrap_or(Steps::FILL)).collect())])),
-        }
+    pub fn to_walk(&self, shape: &[usize]) -> (usize, Cow<'_, [Steps]>, Option<&Arc<Fill>>) {
+        if let Self::Steps { base, steps } = self { return (*base, Cow::Borrowed(steps), steps.fill.as_ref()); }
+        let (base, steps) = match self.entries(shape) {
+            Some((base, steps)) => (base, steps),
+            None => (0, vec![Steps::table((0..count(shape)).map(|i| self.get(i).unwrap_or(Steps::FILL)).collect())]),
+        };
+        (base, Cow::Owned(steps), None)
     }
-    /// The tables of [`Mapping::to_walk`]'s walk, with its base as a leading table of one item, for code that walks or classifies tables, such as [`Walk::new`](crate::structure::Walk::new).
-    pub fn tables(&self, shape: &[usize]) -> Vec<Steps> { let (base, steps) = self.to_walk(shape); Steps::with_base(base, steps.into_owned()) }
+    /// Positions only, including the base as a leading entry, for geometric operations such as [`Walk::new`](crate::structure::Walk::new).
+    pub fn tables(&self, shape: &[usize]) -> Vec<Steps> { let (base, steps, _) = self.to_walk(shape); Steps::with_base(base, steps.into_owned()) }
     /// The bytes that this mapping's entries take: each entry, and a table's listed offsets.
     pub fn footprint(&self) -> usize { if let Self::Steps { steps, .. } = self { steps.iter().map(Steps::footprint).sum() } else { 0 } }
-    /// `outer` maps `frame` to a logical array of `shape`; this maps that array to storage. Unsupported compositions return `None`, as do two mappings that both read fills where either chose one.
+    /// `outer` maps `frame` to an array of `shape`; this maps that array to storage. Different fills or unsupported walks give `None`.
     pub fn compose(&self, outer: &Self, shape: &[usize], frame: &[usize]) -> Option<Self> {
         if frame.contains(&0) { return Some(Self::Linear(1)); }
         if matches!(self, Self::Linear(1)) { return Some(outer.clone()); }
@@ -154,7 +155,7 @@ impl Mapping {
         let (base, steps) = outer.entries(frame)?;
         Some(self.through(&Steps::with_base(base, steps), shape)?.filled(fill))
     }
-    /// [`Mapping::compose`], or else, where `table` allows it, the composed offsets as one table over `frame`'s positions, with a fill wherever either mapping reads one. `None` where both read fills and chose different ones.
+    /// `compose`, or where `table` allows it, the composed offsets. Different fills cannot collapse into one mapping.
     pub fn composed(&self, outer: &Self, shape: &[usize], frame: &[usize], table: bool) -> Option<Self> {
         if let Some(mapping) = self.compose(outer, shape, frame) { return Some(mapping); }
         let fill = self.joined_fill(outer)?;
@@ -312,23 +313,23 @@ impl Mapping {
     }
     /// Whether some position reads a fill, as a padded read's does.
     pub fn fills(&self) -> bool { matches!(self, Self::Steps { steps, .. } if steps.iter().any(Steps::fills)) }
-    /// This mapping, reading `fill` at each position that reaches no item, or each item type's own fill for `None`. A mapping whose positions all reach items keeps no fill. `None` on a mapping that chose no fill changes nothing, and costs nothing once inlined.
+    /// Set the native fill only where this mapping reaches missing positions.
     #[inline]
-    pub fn filled(self, fill: Option<Arc<Fill>>) -> Self { if fill.is_none() && self.chosen().is_none() { self } else { self.refilled(fill) } }
-    /// `filled` where the fill can change.
-    fn refilled(mut self, fill: Option<Arc<Fill>>) -> Self {
+    pub fn filled(mut self, fill: Option<Arc<Fill>>) -> Self {
+        if fill.is_none() && self.chosen().is_none() { return self; }
         if let Self::Steps { steps, .. } = &mut self { steps.fill = fill.filter(|_| steps.iter().any(Steps::fills)); }
         self
     }
-    /// The fill that a call chose for the positions that reach no item, if any.
     #[inline]
     pub fn chosen(&self) -> Option<&Arc<Fill>> { match self { Self::Steps { steps, .. } => steps.fill.as_ref(), _ => None } }
-    /// A [`Mapping::Steps`] of `base` and `steps`, with the fill that this mapping chose.
-    #[inline]
+    /// Retype a chosen fill with its converted source; borrow maps whose fill already has that dtype.
+    pub fn cast_fill(&self, dtype: crate::buffer::DType) -> Result<Cow<'_, Self>, Error> {
+        let Some(fill) = self.chosen().filter(|fill| fill.view().dtype() != dtype) else { return Ok(Cow::Borrowed(self)); };
+        Ok(Cow::Owned(self.clone().filled(Some(Arc::new(fill.cast(dtype)?)))))
+    }
+    /// Replace this mapping's geometry, retaining its native fill.
     pub fn with_steps(&self, base: usize, steps: Vec<Steps>) -> Self { Self::Steps { base, steps: steps.into() }.filled(self.chosen().cloned()) }
-    /// The fill that a composition of this mapping with `outer` reads, which either of them chose, if any. `None` where both read fills and chose different ones.
     fn joined_fill(&self, outer: &Self) -> Option<Option<Arc<Fill>>> {
-        // The chosen fills are compared first, so that mappings that chose none scan no tables, which `Table::fills` reads in full.
         if self.chosen() != outer.chosen() && self.fills() && outer.fills() { return None; }
         Some(outer.chosen().or(self.chosen()).cloned())
     }
@@ -567,17 +568,27 @@ pub(crate) fn chunks(range: Range<usize>, reads: &[(&Mapping, usize)], f: &mut d
 /// `f` on the frame of `len` items that one argument lays out through `mapping`, with the argument's items read as `A`, appended to `out`. Gives whether every result succeeded. Ranges of the frame run in parallel. An [`INLINE`](crate::Results::INLINE) object runs item by item in [`block`]'s loop, through `judged`, and converts each item as it reads it, so a short broadcast block costs no call. For any other object, items that already have type `A` go to `f` as `block` passes them, and items of another type convert a run at a time, through [`read_runs`].
 #[inline]
 pub fn map1<A: Element, Y: Source<A>, B: Copy + Send, K: Unary<A, Out = B> + Sync>(y: &[Y], mapping: &Mapping, len: usize, f: &K, out: &mut Vec<B>) -> bool {
-    if K::INLINE { return block(y, mapping, len, out, |y, n, o| o.pairs(y, Arg::One(()), n, |b, ()| f.judged(b.read()))); }
-    if let Some(y) = Y::borrowed(y) { return block(y, mapping, len, out, |y, n, o| f.many_into(y, n, o)); }
-    read_runs([&Side::new(y, mapping)], len, out, &|[y], n, o| f.many_into(y, n, o))
+    let succeeded = if K::INLINE { block(y, mapping, len, out, |y, n, o| o.pairs(y, Arg::One(()), n, |b, ()| f.judged(b.read()))) }
+        else if let Some(y) = Y::borrowed(y) { block(y, mapping, len, out, |y, n, o| f.many_into(y, n, o)) }
+        else { read_runs([&Side::new(y, mapping)], len, out, &|[y], n, o| f.many_into(y, n, o)) };
+    if succeeded {
+        crate::events::taken(crate::events::Route::VectorKernel, len);
+        if !matches!(mapping, Mapping::Linear(1)) { crate::events::taken(crate::events::Route::MappedKernel, len); }
+    }
+    succeeded
 }
 
 /// `f` on the frame of `agreement`, with both arguments' items read as `A`, appended to `out`. Gives whether every result succeeded. Ranges of the frame run in parallel. An [`INLINE`](crate::Results::INLINE) object runs item by item in [`blocks`]' loop, as [`map1`] runs one. For any other object, where both arguments' items already have type `A`, `f` takes them as `blocks` passes them. Otherwise `f` takes a run of pairs at a time, through [`read_runs`].
 #[inline]
 pub fn map2<A: Element, X: Source<A>, Y: Source<A>, B: Copy + Send, L, K: Binary<A, Out = B> + Sync>(x: &[X], y: &[Y], agreement: &Agreement<L>, f: &K, out: &mut Vec<B>) -> bool {
-    if K::INLINE { return blocks(x, y, agreement, out, |x, y, n, o| o.pairs(x, y, n, |a, b| f.judged(a.read(), b.read()))); }
-    if let (Some(x), Some(y)) = (X::borrowed(x), Y::borrowed(y)) { return blocks(x, y, agreement, out, |x, y, n, o| f.many_into(x, y, n, o)); }
-    read_runs([&Side::new(x, &agreement.left), &Side::new(y, &agreement.right)], agreement.len, out, &|[x, y], n, o| f.many_into(x, y, n, o))
+    let succeeded = if K::INLINE { blocks(x, y, agreement, out, |x, y, n, o| o.pairs(x, y, n, |a, b| f.judged(a.read(), b.read()))) }
+        else if let (Some(x), Some(y)) = (X::borrowed(x), Y::borrowed(y)) { blocks(x, y, agreement, out, |x, y, n, o| f.many_into(x, y, n, o)) }
+        else { read_runs([&Side::new(x, &agreement.left), &Side::new(y, &agreement.right)], agreement.len, out, &|[x, y], n, o| f.many_into(x, y, n, o)) };
+    if succeeded {
+        crate::events::taken(crate::events::Route::VectorKernel, agreement.len);
+        if !matches!((&agreement.left, &agreement.right), (Mapping::Linear(1), Mapping::Linear(1))) { crate::events::taken(crate::events::Route::MappedKernel, agreement.len); }
+    }
+    succeeded
 }
 
 /// One argument of a call, read a run of the frame's positions at a time as items of type `A`. A reader holds no buffers, so one reader serves every range of a parallel loop. A loop that takes readers as `dyn Read<A>` compiles once for `A`, whatever types the arguments' items have.
@@ -595,10 +606,11 @@ pub struct Side<'a, X: Clone> { data: Cow<'a, [X]>, mapping: Cow<'a, Mapping> }
 
 impl<'a, X: Element> Side<'a, X> {
     pub fn new(data: &'a [X], mapping: &'a Mapping) -> Self {
+        let mapping = mapping.cast_fill(X::DTYPE).expect("a fill converts with its source");
         let mut items = Vec::new();
-        match gather_cycle(data, mapping, &mut items) {
+        match gather_cycle(data, &mapping, &mut items) {
             Some(tiled) => Self { data: Cow::Owned(items), mapping: Cow::Owned(tiled) },
-            None => Self { data: Cow::Borrowed(data), mapping: Cow::Borrowed(mapping) },
+            None => Self { data: Cow::Borrowed(data), mapping },
         }
     }
 }
@@ -674,7 +686,7 @@ fn copied<'a, A: Element>(mapping: &Mapping, data: &[A], start: usize, n: usize,
         Mapping::Tiled(m) => { cycled(buf, &data[..m], start, n); "a cycle that wraps" }
         Mapping::Steps { base, ref steps } => { let (offset, plan) = steps.plan(); walk_plan(buf, data, base + offset, plan, Fill::item(mapping.chosen()), start, n, Same); "steps other than a forward run" }
     };
-    crate::events::declined("in place", reason, n);
+    crate::events::declined(crate::events::Route::InPlace, reason, n);
     &buf[..n]
 }
 

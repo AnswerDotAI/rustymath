@@ -547,9 +547,19 @@ mod operation {
         assert_eq!(table(vec![3]).affine(&[1]), Some((5, vec![0])));
         assert_eq!(table(vec![3, Steps::FILL]).affine(&[0]), Some((0, vec![0])));
         assert!(table(vec![3, Steps::FILL]).affine(&[2]).is_none() && table(vec![Steps::FILL]).affine(&[1]).is_none());
-        // A weighted mean reads the fill that a mapping chose where it reaches no item: one stored 2 read as 10 2 10.
-        let padded = Mapping::Steps { base: 0, steps: vec![Steps::clipped(-1, 3, 1, 1)].into() }.filled(Some(std::sync::Arc::new(rustymath::buffer::Fill::Item(f64::buffer(vec![10.])))));
-        assert_eq!(rustymath::stats::average(&[2.], &[1.], &rustymath::stats::Axes::new(&row, &[0]).unwrap(), [&padded, &Mapping::Single]), [22. / 3.]);
+        // A weighted mean reads the mapping’s fill where no stored item is selected.
+        let padded = Mapping::Steps { base: 0, steps: vec![Steps::clipped(-1, 3, 1, 1)].into() };
+        assert_eq!(rustymath::stats::average(&[2.], &[1.], &rustymath::stats::Axes::new(&row, &[0]).unwrap(), [&padded, &Mapping::Single]), [2. / 3.]);
+        let fill = |x| std::sync::Arc::new(rustymath::buffer::Fill::new(f64::view(&[x]), f64::DTYPE).unwrap());
+        let chosen = padded.filled(Some(fill(4.)));
+        assert_eq!(rustymath::stats::average(&[2.], &[1.], &rustymath::stats::Axes::new(&row, &[0]).unwrap(), [&chosen, &Mapping::Single]), [10. / 3.]);
+        // Two distinct fills cannot be flattened into one mapping.
+        let first = Agreement { layout: row, len: 3, left: chosen, right: Mapping::Single };
+        let outer = Mapping::Steps { base: 0, steps: vec![Steps::clipped(-1, 5, 3, 1)].into() }.filled(Some(fill(8.)));
+        let second = Agreement { layout: Layout::from([5]), len: 5, left: outer, right: Mapping::Single };
+        let data = [2., 1., 10.]; let args = data.each_ref().map(|x| ArrayView::compact(&Layout::EMPTY, f64::view(std::slice::from_ref(x))));
+        let (clipped, ok) = kernels!(Ternary rustymath::Clip).ternary(&rustymath::Clip, args, &first, &second).unwrap();
+        assert!(ok); assert_eq!(f64::of(clipped.view()).unwrap(), &[8., 4., 2., 4., 8.]);
     }
 
     #[test]

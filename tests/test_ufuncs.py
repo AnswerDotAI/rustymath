@@ -301,6 +301,17 @@ def test_native_accumulation():
         with pytest.raises(ValueError, match='window'): rm.sliding(rm.add, x, width)
     with pytest.raises(ValueError): rm.sliding(rm.subtract, x, 3)
 
+def test_explain():
+    x = rm.array([[1., 2., 3.], [4., 5., 6.]])
+    with rm.explain() as outer:
+        rm.add(x.T, 1.)
+        with rm.explain() as inner: rm.add(x.T, 2.)
+        rm.add(x.T, 3.)
+    for report, calls in [(outer, 3), (inner, 1)]:
+        assert {'vector kernel', 'mapped kernel'} <= set(report.routes)
+        record = next(r for r in report.records if r.route == 'mapped kernel')
+        assert (record.kind, record.calls, record.items) == ('taken', calls, 6 * calls)
+
 def test_elementwise_layouts(threads):
     x = np.linspace(0.1, 1, 262_147)
     for view in [x, x[::2], x[::-1], np.broadcast_to(0.5, x.shape)]:

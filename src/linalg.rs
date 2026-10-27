@@ -808,7 +808,7 @@ const COLUMN_STRIP: usize = 32;
 /// The fewest adjacent rows of `a` that [`by_columns`] reads at once. Shorter runs cost more in loop overhead than gathering saves.
 const COLUMN_RUN: usize = 64;
 
-/// `+.×` of `a` and a vector `b`, where each row of `a` starts one item after the row before it in storage, as the windows of a vector or a single-channel image do. Each column of `a` is then a run of storage, which [`scaled_runs`] reads where it lies and scales by its item of `b`. `a` is never gathered. `None` where `a`'s mapping chose a fill, where it doesn't split into entries for its rows and entries for its columns, or where its rows aren't adjacent in runs of at least [`COLUMN_RUN`]. The loop reads a fill as 0, the item type's own fill.
+/// `+.×` of `a` and a vector `b`, where each row of `a` starts one item after the row before it in storage, as the windows of a vector or a single-channel image do. Each column of `a` is then a run of storage, which [`scaled_runs`] reads where it lies and scales by its item of `b`. `a` is never gathered. `None` for a chosen fill, or where it doesn't split into entries for its rows and entries for its columns, or where its rows aren't adjacent in runs of at least [`COLUMN_RUN`]. The loop reads a fill as 0, the item type's own fill.
 fn by_columns<T: Tiled + Element>(a: Mapped<'_, T>, b: Mapped<'_, T>, oa: Orientation, [m, k]: [usize; 2]) -> Option<Vec<T>> {
     use crate::gather::Steps;
     let (Mapping::Steps { base, steps }, None) = (a.mapping, a.mapping.chosen()) else { return None };
