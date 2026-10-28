@@ -91,7 +91,8 @@ pub fn summed<T: Copy + Send + num_traits::Zero>(n: usize, least: usize, sums: &
 }
 
 /// [`summed`] over the units of `items`, each of `unit` items, where `piece(first, items, sums)` gets the items of the piece whose first unit is `first`.
-pub fn summed_of<B: Send, T: Copy + Send + num_traits::Zero>(items: &mut [B], unit: usize, least: usize, sums: &mut [T], parts: &mut Vec<T>, piece: &(dyn Fn(usize, &mut [B], &mut [T]) + Sync)) {
+pub fn summed_of<B: Send, T: Copy + Send + num_traits::Zero>(
+    items: &mut [B], unit: usize, least: usize, sums: &mut [T], parts: &mut Vec<T>, piece: &(dyn Fn(usize, &mut [B], &mut [T]) + Sync)) {
     let shared = Shared(items.as_mut_ptr());
     // SAFETY: `summed` gives each call its own range of units, within `items`.
     summed(items.len() / unit, least, sums, parts, &|units, sums| piece(units.start, unsafe { shared.part(units.start * unit..units.end * unit) }, sums))
@@ -141,7 +142,9 @@ pub trait Outputs: Sized {
     /// The items that each cell writes in each output.
     type Per: Copy + Sync;
     /// One cell's part of each output.
-    type Cell<'a> where Self: 'a;
+    type Cell<'a>
+    where
+        Self: 'a;
     /// The outputs' items, shared with the threads that write their cells.
     type Shared: Sync;
     /// The outputs of `count` cells, each item at its default. `vec!` asks the allocator for zeroed memory where that default is zero bits, as for real numbers and integers, so no pass writes a large output before its cells do.
@@ -149,7 +152,9 @@ pub trait Outputs: Sized {
     /// Pointers to the outputs' items.
     fn shared(&mut self) -> Self::Shared;
     /// Cell `i`'s part of each output. SAFETY: `i` must be below the outputs' number of cells, and no other caller may hold cell `i`'s part at the same time.
-    unsafe fn cell<'a>(shared: &'a Self::Shared, per: Self::Per, i: usize) -> Self::Cell<'a> where Self: 'a;
+    unsafe fn cell<'a>(shared: &'a Self::Shared, per: Self::Per, i: usize) -> Self::Cell<'a>
+    where
+        Self: 'a;
 }
 
 macro_rules! outputs {
@@ -172,7 +177,8 @@ outputs!(2: A 0, B 1);
 outputs!(3: A 0, B 1, C 2);
 
 /// Runs `write(i, parts, scratch)` on each cell `i` of a stack of `count` cells, as [`each_cell`] runs them, and gives the outputs with whether every call said `true`. `parts` is cell `i`'s part of each output `k`: `per[k]` items from `i * per[k]`.
-pub fn stack<O: Outputs + 'static, S: Default>(count: usize, per: O::Per, write: &(dyn Fn(usize, O::Cell<'_>, &mut S) -> bool + Sync)) -> Result<(O, bool), Error> {
+pub fn stack<O: Outputs + 'static, S: Default>(
+    count: usize, per: O::Per, write: &(dyn Fn(usize, O::Cell<'_>, &mut S) -> bool + Sync)) -> Result<(O, bool), Error> {
     let mut out = O::new(count, per);
     let shared = out.shared();
     // SAFETY: `each_cell` gives each cell below `count` to one call.
@@ -185,16 +191,22 @@ pub fn each<R: Send, S: Default>(count: usize, f: impl Fn(usize, &mut S) -> R + 
     let mut out: Vec<Option<R>> = (0..count).map(|_| None).collect();
     let shared = Shared(out.as_mut_ptr());
     // SAFETY: `each_cell` gives each cell below `count` to one call.
-    each_cell(count, |i, scratch| { let cell = unsafe { shared.part(i..i + 1) }; cell[0] = Some(f(i, scratch)); true })?;
+    each_cell(count, |i, scratch| {
+        let cell = unsafe { shared.part(i..i + 1) };
+        cell[0] = Some(f(i, scratch));
+        true
+    })?;
     Ok(out.into_iter().map(|c| c.expect("`each_cell` runs every cell")).collect())
 }
 
 /// Appends `n` items to `out`, and gives whether every call of `write` said `true`. `write(range, slots)` fills `slots` with the items in `range`, in order. The calls split across threads as [`split`] splits a call, in units of `unit` items. A call that leaves any of its slots unfilled panics, and `out` keeps its length.
 pub fn extended<B: Copy + Send>(out: &mut Vec<B>, n: usize, unit: usize, write: &(dyn Fn(Range<usize>, &mut Slots<'_, B>) -> bool + Sync)) -> bool {
-    crate::slice::appended(out, n, |slots| split(slots, unit, &|start, slots| {
-        let end = start + slots.len();
-        filled(slots, |slots| write(start..end, slots))
-    }))
+    crate::slice::appended(out, n, |slots| {
+        split(slots, unit, &|start, slots| {
+            let end = start + slots.len();
+            filled(slots, |slots| write(start..end, slots))
+        })
+    })
 }
 
 /// `write`'s result for `slots`, which it fills in order through one [`Slots`]. Panics where it leaves any unfilled.
@@ -219,10 +231,7 @@ impl<B> Slots<'_, B> {
     }
     /// Writes `items` after the items already written, on this thread. Panics where they don't fit.
     pub fn copy(&mut self, items: &[B]) where B: Copy {
-        self.fill(items.len(), |slots| {
-            for (slot, &item) in slots.iter_mut().zip(items) { slot.write(item); }
-            true
-        });
+        self.fill(items.len(), |slots| { for (slot, &item) in slots.iter_mut().zip(items) { slot.write(item); } true });
     }
     /// `write`'s result for the next `n` slots, which it must fill. They then count as written. Panics where they don't fit.
     pub fn fill(&mut self, n: usize, write: impl FnOnce(&mut [MaybeUninit<B>]) -> bool) -> bool {

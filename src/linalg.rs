@@ -5,7 +5,10 @@
 //! A product large enough splits its rows across the threads that [`crate::parallel::set_threads`] sets. On macOS, Accelerate computes real and complex plus-times products instead. `Tiled` also sends the decompositions' triangular solves, SVDs and Hermitian eigen decompositions to it, and the general eigen decompositions of real matrices from `accelerate::GEEV_FROM` rows. macOS builds with the `native` feature also compile rustymath's own kernels, and `RUSTYMATH_NATIVE=1` selects them for the whole process.
 //!
 //! The private module `factor` holds decompositions of real and complex matrices, whose blocked updates run on these loops. This module re-exports its public items, and [`Scalar`], the trait of the item types they take. [`transpose_into`] transposes a matrix through 8×8 tiles.
-use crate::{Float, agreement::{Frames, Mapping, expanded_items}, buffer::{Buffer, DType, Element, FloatWidth, Source, View, Width, read_all}, convert, error::Error, float::{FUSED, sealed::Core}, parallel, slice};
+use crate::{
+    Float, agreement::{Frames, Mapping, expanded_items}, buffer::{Buffer, DType, Element, FloatWidth, Source, View, Width, read_all}, convert, error::Error,
+    float::{FUSED, sealed::Core}, parallel, slice
+};
 use num_complex::Complex;
 use num_traits::{One, Zero};
 use std::{mem::MaybeUninit, sync::LazyLock};
@@ -49,7 +52,9 @@ macro_rules! dispatch {
 macro_rules! from_order {
     ($n:expr, $from:expr, $vendor:expr, $native:expr) => {{
         #[cfg(accelerate)]
-        if $n >= $from && accelerated() { return $vendor }
+        if $n >= $from && accelerated() {
+            return $vendor;
+        }
         $native
     }};
 }
@@ -57,7 +62,7 @@ pub mod exact;
 pub use factor::*;
 pub use inner::inner_with;
 pub use scalar::Scalar;
-pub use stacked::{cells, paired, stored, Stacked};
+pub use stacked::{Stacked, cells, paired, stored};
 
 /// The `n`×`n` identity matrix.
 pub(crate) fn identity<T: num_traits::Zero + num_traits::One>(n: usize) -> Vec<T> {
@@ -81,10 +86,8 @@ pub fn transpose_into<S: Copy, D>(src: &[S], ls: usize, dst: &mut [D], ld: usize
     let (whole_rows, whole_cols) = (rows / 8 * 8, cols / 8 * 8);
     // Each write moves 16 bytes where the items allow, which is at most 8 items, as the registers that the compiler shuffles hold.
     match 16 / size_of::<S>().max(1) {
-        8.. => tiles::<8, S, D>(src, ls, dst, ld, [whole_rows, whole_cols], &f),
-        4.. => tiles::<4, S, D>(src, ls, dst, ld, [whole_rows, whole_cols], &f),
-        2.. => tiles::<2, S, D>(src, ls, dst, ld, [whole_rows, whole_cols], &f),
-        _ => tiles::<1, S, D>(src, ls, dst, ld, [whole_rows, whole_cols], &f),
+        8.. => tiles::<8, S, D>(src, ls, dst, ld, [whole_rows, whole_cols], &f), 4.. => tiles::<4, S, D>(src, ls, dst, ld, [whole_rows, whole_cols], &f),
+        2.. => tiles::<2, S, D>(src, ls, dst, ld, [whole_rows, whole_cols], &f), _ => tiles::<1, S, D>(src, ls, dst, ld, [whole_rows, whole_cols], &f)
     }
     if whole_cols < cols { for r in 0..whole_rows { for c in whole_cols..cols { dst[c * ld + r] = f(src[r * ls + c]) } } }
     for r in whole_rows..rows { for c in 0..cols { dst[c * ld + r] = f(src[r * ls + c]) } }
@@ -101,10 +104,7 @@ fn tiles<const P: usize, S: Copy, D>(src: &[S], ls: usize, dst: &mut [D], ld: us
                 let read = |k: usize| unsafe { from.add((r0 + i + k) * ls + c0).cast::<[S; 8]>().read() };
                 let mut runs = [read(0); P];
                 for k in 1..P { runs[k] = read(k) }
-                for j in 0..8 {
-                    let out = unsafe { &mut *to.add((c0 + j) * ld + r0 + i).cast::<[D; P]>() };
-                    for k in 0..P { out[k] = f(runs[k][j]) }
-                }
+                for j in 0..8 { let out = unsafe { &mut *to.add((c0 + j) * ld + r0 + i).cast::<[D; P]>() }; for k in 0..P { out[k] = f(runs[k][j]) } }
             }
         }
     }
@@ -128,12 +128,16 @@ pub trait Inner<T> {
     /// `inner` of the matrices that `a` and `b` give in the orientations given, with `size` `[m, k, n]` for those matrices. A transposed `a` holds a `k`×`m` matrix, row-major, and gives its `m`×`k` transpose. This default copies a transposed operand into its orientation. Float and complex `PlusTimes` read it in place.
     fn inner_ops(&self, a: &[T], b: &[T], [oa, ob]: [Orientation; 2], [m, k, n]: [usize; 3]) -> Vec<Self::Out> where T: Copy {
         fn oriented<T: Copy>(x: &[T], o: Orientation, [rows, cols]: [usize; 2]) -> std::borrow::Cow<'_, [T]> {
-            match o { Orientation::Normal => std::borrow::Cow::Borrowed(x), Orientation::Transpose => (0..rows * cols).map(|ij| x[ij % cols * rows + ij / cols]).collect() }
+            match o {
+                Orientation::Normal => std::borrow::Cow::Borrowed(x),
+                Orientation::Transpose => (0..rows * cols).map(|ij| x[ij % cols * rows + ij / cols]).collect(),
+            }
         }
         self.inner(&oriented(a, oa, [m, k]), &oriented(b, ob, [k, n]), [m, k, n])
     }
     /// `inner_ops` of operands whose items come through mappings, as [`Mapped`] describes. This default reads each operand whole, then calls `inner_ops`. Float and complex `PlusTimes` read an operand that isn't held in order one block of its stored rows at a time and multiply each block as it's read. Only one block of that operand then exists at once.
-    fn inner_mapped(&self, a: Mapped<'_, T>, b: Mapped<'_, T>, orientations: [Orientation; 2], size @ [m, k, n]: [usize; 3]) -> Vec<Self::Out> where T: Element {
+    fn inner_mapped(&self, a: Mapped<'_, T>, b: Mapped<'_, T>, orientations: [Orientation; 2], size @ [m, k, n]: [usize; 3]) -> Vec<Self::Out> where T: Element
+    {
         let (mut ab, mut bb) = (Vec::new(), Vec::new());
         self.inner_ops(a.read(0, m * k, &mut ab), b.read(0, k * n, &mut bb), orientations, size)
     }
@@ -181,10 +185,7 @@ impl Product {
     }
     /// The products of [`run`](Self::run) with wrapping steps: `+.×` on `u8`, `i16` or `i32` items gives each result's exact sum of products wrapped to 32 bits, at `i32`, as static kinds and fixed widths keep integer results (`Wrapped<PlusTimes>`). `None` for any other pair or dtype, which `run` then takes.
     pub fn run_wrapped(self, xy: [View<'_>; 2], frames: &Frames, size: [usize; 3]) -> Option<Result<(Buffer, bool), Error>> {
-        match self {
-            Self::PlusTimes => crate::kernels!(Product crate::Wrapped<PlusTimes>).product(&crate::Wrapped(PlusTimes), xy, frames, size),
-            _ => None,
-        }
+        match self { Self::PlusTimes => crate::kernels!(Product crate::Wrapped<PlusTimes>).product(&crate::Wrapped(PlusTimes), xy, frames, size), _ => None }
     }
     /// Whether the pair's kernel compares items exactly, as the counts `+.=` and `+.≠` do. A frontend sends approximate items that compare within a tolerance to another route.
     pub fn compares_exactly(self) -> bool { matches!(self, Self::PlusEqual | Self::PlusNotEqual) }
@@ -436,11 +437,11 @@ fn filled<T: Clone>(n: usize, x: T) -> Vec<T> {
 fn tiled_into<S: Source<T> + Copy + Sync, T: Copy + Default + Send + Sync, P: Pair<T>, const MR: usize, const NR: usize>(
     a: &[S], b: &[S], [m, k, n]: [usize; 3], c: &mut [P::Out], kernel: impl Fn(&[T], &[T], &mut [[P::Out; NR]; MR], bool) + Sync) {
     assert!(a.len() == m * k && b.len() == k * n && c.len() == m * n, "`a` must hold `m`×`k` items, `b` `k`×`n` and `c` `m`×`n`");
-    if m * k * n <= DIRECT_WORK { return direct::<S, T, P>(a, b, [m, k, n], c) }
+    if m * k * n <= DIRECT_WORK { return direct::<S, T, P>(a, b, [m, k, n], c); }
     let f = <S as Source<T>>::read;
     product::<T, P, MR, NR>(
-        c, n, |rows, p0, out| strip(a, k, false, rows, p0, out, f), |columns, p0, out| strip(b, n, true, columns, p0, out, f), [m, k, n], true,
-        Part::Whole, kernel);
+        c, n, |rows, p0, out| strip(a, k, false, rows, p0, out, f), |columns, p0, out| strip(b, n, true, columns, p0, out, f), [m, k, n], true, Part::Whole,
+        kernel);
 }
 
 /// The most steps, `m`×`k`×`n`, of a product that [`direct`] computes, where packing the operands for the tiled kernels, or calling Accelerate, costs more than the steps. Measured on 22 October 2026 on an M5 Max, a stack of 4,096 products of 4×4 matrices cost 9.3 copies this way, against 25 on Accelerate and 38 on the packed kernels. A stack of 1,024 products of 8×8 matrices cost 10.1 copies this way, against 10.3 on Accelerate and 9.7 on the packed kernels, so the threshold stays below them.
@@ -567,11 +568,13 @@ fn tiered<P>(pair: &P, a: &[i64], b: &[i64], [m, k, n]: [usize; 3], bound: u128,
 /// `pair`'s inner product of `a` and `b`, whose values never exceed `bound` in magnitude, in a float that holds each of them exactly: `f32` up to 2^24, and `f64` up to `WIDE_LIMIT` where `wide` holds. Each item reads through [`Source`], and each result, a whole number, converts from `i64` to the type of `out` through `whole`. `false`, with `out` untouched, where neither float holds every value.
 fn exactly<P, S, O>(pair: &P, a: &[S], b: &[S], size: [usize; 3], bound: u128, wide: bool, out: &mut [O], whole: impl Fn(i64) -> O) -> bool where
     P: Inner<f32, Out = f32> + Inner<f64, Out = f64>, S: Source<f32> + Source<f64> {
-    fn at<F: Float + Element, P: Inner<F, Out = F>, S: Source<F>, O>(pair: &P, a: &[S], b: &[S], size: [usize; 3], out: &mut [O], whole: impl Fn(i64) -> O) -> bool {
+    fn at<F: Float + Element, P: Inner<F, Out = F>, S: Source<F>, O>(
+        pair: &P, a: &[S], b: &[S], size: [usize; 3], out: &mut [O], whole: impl Fn(i64) -> O) -> bool {
         for (o, x) in out.iter_mut().zip(pair.inner(&read_all(a), &read_all(b), size)) { *o = whole(convert::shifted(x.wide())) }
         true
     }
-    if bound <= 1 << 24 { at::<f32, P, S, O>(pair, a, b, size, out, whole) } else { wide && bound <= convert::WIDE_LIMIT as u128 && at::<f64, P, S, O>(pair, a, b, size, out, whole) }
+    if bound <= 1 << 24 { at::<f32, P, S, O>(pair, a, b, size, out, whole) }
+    else { wide && bound <= convert::WIDE_LIMIT as u128 && at::<f64, P, S, O>(pair, a, b, size, out, whole) }
 }
 
 /// `+.×` of `a` and `b` with wrapping `i32` steps, written into `out`, on the `i32` kernel. The kernel converts each item to `i32` through [`Source`] as it packs it.
@@ -605,7 +608,7 @@ impl Inner<half::f16> for PlusTimes {
     type Out = f32;
     fn inner_into(&self, a: &[half::f16], b: &[half::f16], size @ [m, k, n]: [usize; 3], c: &mut [f32]) {
         assert!(a.len() == m * k && b.len() == k * n && c.len() == m * n, "`a` must hold `m`×`k` items, `b` `k`×`n` and `c` `m`×`n`");
-        if m * k * n <= DIRECT_WORK { return direct::<half::f16, f32, PlusTimes>(a, b, size, c) }
+        if m * k * n <= DIRECT_WORK { return direct::<half::f16, f32, PlusTimes>(a, b, size, c); }
         dispatch!(half_products_accelerated(a, b, size, c), half_products_native(a, b, size, c))
     }
 }
@@ -646,9 +649,8 @@ impl<'a, T: Element> Mapped<'a, T> {
         let sr = if r > 1 { strides[0] } else if sc == 1 { c as isize } else { 1 };
         let data = self.data.get(first..)?;
         let stored = match (sr, sc) {
-            (s, 1) if s >= c as isize => Matrix::rows(data, s as usize),
-            (1, s) if s >= r as isize => Matrix { data, ld: s as usize, op: Op::Transpose },
-            _ => return None,
+            (s, 1) if s >= c as isize => Matrix::rows(data, s as usize), (1, s) if s >= r as isize => Matrix { data, ld: s as usize, op: Op::Transpose },
+            _ => return None
         };
         Some(if o == Orientation::Normal { stored } else { stored.transpose() })
     }
@@ -812,7 +814,9 @@ fn blocks<T: Element>(op: Mapped<'_, T>, rows: std::ops::Range<usize>, cols: usi
 fn contracted<T: Tiled + Element>(op: Mapped<'_, T>, [rows, cols]: [usize; 2], c: &mut [T], f: &(dyn Fn(usize, usize, &[T], &mut [T], T) + Sync)) {
     let beta = |first: usize| if first == 0 { T::zero() } else { T::one() };
     if c.len() > BLOCK_ITEMS { return blocks(op, 0..rows, cols, c.len(), |first, len, block| f(first, len, block, c, beta(first))); }
-    parallel::summed(rows, block_rows(cols, 0), c, &mut Vec::new(), &|range, sums| blocks(op, range, cols, 0, |first, len, block| f(first, len, block, sums, beta(first))));
+    parallel::summed(rows, block_rows(cols, 0), c, &mut Vec::new(), &|range, sums| {
+        blocks(op, range, cols, 0, |first, len, block| f(first, len, block, sums, beta(first)))
+    });
 }
 
 /// The most rows of the result in one piece of [`by_columns`]'s split across threads.
@@ -832,7 +836,10 @@ fn by_columns<T: Tiled + Element>(a: Mapped<'_, T>, b: Mapped<'_, T>, oa: Orient
     // The entries of the stored matrix's leading axis come first, and give its first `lead` items.
     let lead = if oa == Orientation::Normal { m } else { k };
     let (mut split, mut size) = (0, 1);
-    while size < lead && split < steps.len() { size *= steps[split].len(); split += 1; }
+    while size < lead && split < steps.len() {
+        size *= steps[split].len();
+        split += 1;
+    }
     if size != lead { return None; }
     let (outer, inner) = steps.split_at(split);
     let (rows, cols) = if oa == Orientation::Normal { (outer, inner) } else { (inner, outer) };
@@ -860,7 +867,9 @@ fn scaled_runs<T: Tiled>(out: &mut [T], data: &[T], at: usize, columns: &[(T, us
     let wide = scaled_strips::<T, COLUMN_STRIP>(out, data, at, columns, start);
     let done = wide + scaled_strips::<T, TAIL_STRIP>(&mut out[wide..], data, at + wide, columns, start);
     let at = at + done;
-    for (t, y) in out[done..].iter_mut().enumerate() { *y = columns.iter().fold(if start { T::zero() } else { *y }, |acc, &(w, o)| w.mul_acc(data[at + o + t], acc)) }
+    for (t, y) in out[done..].iter_mut().enumerate() {
+        *y = columns.iter().fold(if start { T::zero() } else { *y }, |acc, &(w, o)| w.mul_acc(data[at + o + t], acc))
+    }
 }
 
 /// [`scaled_runs`] for the whole strips of `N` results at the start of `out`, each kept in registers while every column adds into it. Gives how many results the strips hold.
@@ -868,10 +877,7 @@ fn scaled_strips<T: Tiled, const N: usize>(out: &mut [T], data: &[T], at: usize,
     let (strips, _) = out.as_chunks_mut::<N>();
     for (s, strip) in strips.iter_mut().enumerate() {
         let (at, mut acc) = (at + s * N, if start { [T::zero(); N] } else { *strip });
-        for &(w, o) in columns {
-            let x = &data[at + o..][..N];
-            for t in 0..N { acc[t] = w.mul_acc(x[t], acc[t]) }
-        }
+        for &(w, o) in columns { let x = &data[at + o..][..N]; for t in 0..N { acc[t] = w.mul_acc(x[t], acc[t]) } }
         *strip = acc;
     }
     strips.len() * N
@@ -887,9 +893,7 @@ fn dots<T: Tiled>(out: &mut [T], data: &[T], ld: usize, first: usize, x: &[T]) {
     for (q, quad) in quads.iter_mut().enumerate() {
         let rows: [&[T]; 4] = std::array::from_fn(|r| &data[(first + 4 * q + r) * ld..][..k]);
         let mut s = [[T::zero(); 8]; 4];
-        for (c, xs) in xc.iter().enumerate() {
-            for r in 0..4 { let a = &rows[r][c * 8..][..8]; for l in 0..8 { s[r][l] = a[l].mul_acc(xs[l], s[r][l]) } }
-        }
+        for (c, xs) in xc.iter().enumerate() { for r in 0..4 { let a = &rows[r][c * 8..][..8]; for l in 0..8 { s[r][l] = a[l].mul_acc(xs[l], s[r][l]) } } }
         let at = xc.len() * 8;
         for r in 0..4 { quad[r] = xr.iter().enumerate().fold(sum(&s[r]), |t, (p, &b)| rows[r][at + p].mul_acc(b, t)) }
     }
@@ -913,19 +917,28 @@ fn blocked<T: Tiled + Element>(a: Mapped<'_, T>, b: Mapped<'_, T>, [oa, ob]: [Or
             let b = match mb { Some(b) => b, None => Matrix::oriented(b.read(0, k * n, &mut whole), ob, [k, n]) };
             match oa {
                 Orientation::Normal => {
-                    let (rows, least) = if parallel::threads() == 1 || k * n <= PIECE_MATRIX { (m.div_ceil(parallel::threads()), k * n) } else { (m, WHOLE_ITEMS) };
+                    let (rows, least) =
+                        if parallel::threads() == 1 || k * n <= PIECE_MATRIX { (m.div_ceil(parallel::threads()), k * n) } else { (m, WHOLE_ITEMS) };
                     parallel::pieces_of(&mut c, rows * n, usize::MAX, &|start, part| {
                         let from = start / n;
-                        blocks(a, from..from + part.len() / n, k, least, |first, len, block| T::gemm(&mut part[(first - from) * n..], n, Matrix::rows(block, k), b, [len, k, n], one, zero));
+                        blocks(a, from..from + part.len() / n, k, least, |first, len, block| {
+                            T::gemm(&mut part[(first - from) * n..], n, Matrix::rows(block, k), b, [len, k, n], one, zero)
+                        });
                         true
                     });
                 }
-                Orientation::Transpose => contracted(a, [k, m], &mut c, &|first, len, part, c, beta| T::gemm(c, n, Matrix::oriented(part, oa, [m, len]), b.offset(first, 0), [m, len, n], one, beta)),
+                Orientation::Transpose => contracted(a, [k, m], &mut c, &|first, len, part, c, beta| {
+                    T::gemm(c, n, Matrix::oriented(part, oa, [m, len]), b.offset(first, 0), [m, len, n], one, beta)
+                }),
             }
         }
         Some(a) => match ob {
-            Orientation::Normal => contracted(b, [k, n], &mut c, &|first, len, part, c, beta| T::gemm(c, n, a.offset(0, first), Matrix::rows(part, n), [m, len, n], one, beta)),
-            Orientation::Transpose => blocks(b, 0..n, k, m * n, |first, len, block| T::gemm(&mut c[first..], n, a, Matrix::oriented(block, ob, [k, len]), [m, k, len], one, zero)),
+            Orientation::Normal => {
+                contracted(b, [k, n], &mut c, &|first, len, part, c, beta| T::gemm(c, n, a.offset(0, first), Matrix::rows(part, n), [m, len, n], one, beta))
+            }
+            Orientation::Transpose => {
+                blocks(b, 0..n, k, m * n, |first, len, block| T::gemm(&mut c[first..], n, a, Matrix::oriented(block, ob, [k, len]), [m, k, len], one, zero))
+            }
         },
     }
     c
@@ -959,9 +972,7 @@ const VECTOR_PIECE: usize = 2 * THREAD_WORK;
 #[cfg(native)]
 fn by_vector<T: Tiled>(c: &mut [T], ldc: usize, a: Matrix<'_, T>, alpha: T, b: Matrix<'_, T>, [m, k, n]: [usize; 3], start: bool, part: Part) -> bool {
     let (matrix, vector, rows, step) = match (m, n, part) {
-        (_, 1, Part::Whole) => (a, b.transpose(), m, ldc),
-        (1, _, Part::Whole) => (b.transpose(), a, n, 1),
-        _ => return false,
+        (_, 1, Part::Whole) => (a, b.transpose(), m, ldc), (1, _, Part::Whole) => (b.transpose(), a, n, 1), _ => return false
     };
     // A conjugated matrix's results are the conjugates of its stored items' results with the conjugated vector.
     let conj = matches!(matrix.op, Op::Adjoint | Op::Conjugate);
@@ -984,9 +995,7 @@ fn by_vector<T: Tiled>(c: &mut [T], ldc: usize, a: Matrix<'_, T>, alpha: T, b: M
                 true
             });
         }
-    } else {
-        parallel::split(&mut y, unit, &|first, part| { dots(part, data, ld, first, &x); true });
-    }
+    } else { parallel::split(&mut y, unit, &|first, part| { dots(part, data, ld, first, &x); true }); }
     // As the packed kernels do, `alpha` scales only where it isn't 1, which keeps a complex result's infinite part from making NaN.
     let one = alpha == T::one();
     for (i, y) in y.into_iter().enumerate() {

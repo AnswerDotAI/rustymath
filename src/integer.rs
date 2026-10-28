@@ -1,7 +1,10 @@
 //! Functions of `i64`s: greatest common divisor, least common multiple, binomial coefficients, powers, square roots and residues. Each gives `None` where its result isn't an `i64`. Their function objects are the ones that floats and complex numbers use: [`Gcd`], [`Lcm`], [`Residue`] and [`FloorDivide`] from [`tolerant`](crate::tolerant), whose integer forms ignore the tolerance they hold, and [`Binom`] and [`Pow`]. A slice form appends results to a vector and reports whether every item fitted. [`Divisor`] divides many integers by one, with multiplications in place of division instructions. Where every item has the same divisor, `Residue`'s slice form divides through `FloatDivisor`, which multiplies by the divisor's reciprocal in `f64` and vectorizes, for divisors and dividends below 2⁵¹ in magnitude. At types of 16 bits or fewer it multiplies 32-bit integers instead, and it takes `Divisor` for 64-bit dividends of 2⁵¹ or more.
 //!
 //! `Gcd`, `Lcm`, `Binom`, `Pow` and `Residue` also take the narrower integer types of compact buffers, `u8`, `i16` and `i32`, which they compute through these functions. A result that doesn't fit its type fails. `FloorDivide` divides each integer type exactly, and fails on a zero divisor or an overflowing quotient. The tolerant comparisons, [`Floor`] and [`Ceil`] take each of these integer types exactly, ignoring the tolerance. [`Abs`] and [`Sign`] take them through the integer arithmetic of the `arith` module, and `Abs` of a signed type's least value fails. `Floor`, `Ceil` and `Abs` keep Booleans as they are.
-use crate::{Abs, Arg, Binom, Pow, WrappingPow, convert::{self, WIDE_LIMIT}, float::sealed::Core, tolerant::{Ceil, Equal, Floor, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue, FloorDivide}};
+use crate::{
+    Abs, Arg, Binom, Pow, WrappingPow, convert::{self, WIDE_LIMIT}, float::sealed::Core,
+    tolerant::{Ceil, Equal, Floor, FloorDivide, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue}
+};
 use strength_reduce::StrengthReducedU64;
 
 /// Bounds for every prefix sum of up to `len` items in `[lo, hi]`, from `start` or 0. With `subtract`, bounds every running difference instead: `start` less up to `len` items, or without `start`, the first item less up to `len - 1` more. `None` where the bounds leave `i64`.
@@ -75,9 +78,12 @@ pub(crate) fn wrapped_power(x: i64, y: i64) -> (i64, bool) {
             // A square that overflows makes the power inexact only where a later bit of y multiplies it in.
             let (mut base, mut e, mut p, mut exact, mut base_exact) = (x, y as u64, 1i64, true, true);
             loop {
-                if e & 1 == 1 { let (q, over) = p.overflowing_mul(base); (p, exact) = (q, exact & base_exact & !over); }
+                if e & 1 == 1 {
+                    let (q, over) = p.overflowing_mul(base);
+                    (p, exact) = (q, exact & base_exact & !over);
+                }
                 e >>= 1;
-                if e == 0 { break (p, exact) }
+                if e == 0 { break (p, exact); }
                 let (b, over) = base.overflowing_mul(base);
                 (base, base_exact) = (b, base_exact & !over);
             }
@@ -124,23 +130,27 @@ impl Divisor {
     }
 }
 
-/// A fixed divisor whose magnitude is from 2 to 2¹⁶ - 1, for dividends whose magnitude is below 2¹⁶. Each division multiplies two 32-bit integers to 64 bits and shifts, which vectorizes, where [`Divisor`]'s 64-bit high product doesn't. With m = ⌈2³²/d⌉, ⌊a·m/2³²⌋ is ⌊a/d⌋ for each such dividend a: a·m/2³² exceeds a/d by less than 2⁻¹⁶, and the fraction of a/d is at most 1 - 1/d.
+/// A fixed divisor whose magnitude d is from 2 to 2¹⁵, for dividends whose magnitude a is at most 2¹⁵, as every `u8` and `i16` has. Each division takes the high 16 bits of a product of 16-bit integers and shifts them, which vectorizes in 16-bit lanes. [`Divisor`]'s 64-bit high product doesn't vectorize. With l = ⌈log₂ d⌉ and m = ⌈2^(15+l)/d⌉, ⌊a·m/2^(15+l)⌋ is ⌊a/d⌋. The fraction of a/d is at most 1 - 1/d. Because m exceeds 2^(15+l)/d by less than 1 and a·d is at most 2^(15+l), a·m/2^(15+l) exceeds a/d by less than 1/d, which leaves its floor unchanged. m is 2¹⁵ where d is 2^l. Any other d is at least 2^(l-1) + 1, which keeps 2^(15+l)/d below 2¹⁶ - 1. m therefore fits 16 bits and a·m fits 32. Shifting a·m's high 16 bits right by l - 1 gives ⌊a·m/2^(15+l)⌋.
 #[derive(Clone, Copy)]
-struct Short { x: i32, magnitude: u32, multiplier: u32 }
+struct Short { x: i16, magnitude: u16, multiplier: u16, shift: u32 }
 
 impl Short {
-    /// The divisor `x`, or `None` where its magnitude is outside 2 to 2¹⁶ - 1. The multiplier is ⌈2³²/d⌉ computed in 32 bits, as `u32::MAX / d + 1`. As a 64-bit quotient, its zero extension disappears once `new` inlines, and the residue loop then multiplies 64-bit lanes, which NEON has no instruction for.
-    fn new(x: i64) -> Option<Self> {
-        let magnitude = u32::try_from(x.unsigned_abs()).ok().filter(|m| (2..1 << 16).contains(m))?;
-        Some(Self { x: x as i32, magnitude, multiplier: u32::MAX / magnitude + 1 })
+    /// The divisor `x`, or `None` where its magnitude is below 2.
+    fn new(x: i16) -> Option<Self> {
+        let d = x.unsigned_abs();
+        (d >= 2).then(|| {
+            let l = u16::BITS - (d - 1).leading_zeros();
+            Self { x, magnitude: d, multiplier: (((1 << (15 + l)) - 1) / u32::from(d) + 1) as u16, shift: l - 1 }
+        })
     }
 
-    /// The residue of `y`, whose magnitude is below 2¹⁶, modulo the divisor, as [`residue`] gives it.
+    /// The residue of `y` modulo the divisor, as [`residue`] gives it.
     #[inline]
-    fn residue(self, y: i64) -> i64 {
-        let a = (y as i32).unsigned_abs();
-        let r = (a - ((u64::from(a) * u64::from(self.multiplier)) >> 32) as u32 * self.magnitude) as i32;
-        i64::from(floored(if y < 0 { -r } else { r }, self.x))
+    fn residue(self, y: i16) -> i16 {
+        let a = y.unsigned_abs();
+        let q = ((u32::from(a) * u32::from(self.multiplier)) >> 16) as u16 >> self.shift;
+        let r = (a - q * self.magnitude) as i16;
+        floored(if y < 0 { -r } else { r }, self.x)
     }
 }
 
@@ -166,7 +176,7 @@ impl FloatDivisor {
 /// Whether each of the first `n` dividends in `y` is below 2⁵¹ in magnitude, as [`FloatDivisor`] needs. One pass finds their least and greatest.
 fn fit(y: Arg<'_, i64>, n: usize) -> bool {
     let fits = |v: i64| v.unsigned_abs() <= WIDE_LIMIT as u64;
-    match y { Arg::One(v) => fits(v), Arg::Many(v) => v[..n].is_empty() || { let (lo, hi) = crate::reduce::extremes(&v[..n]); fits(lo) && fits(hi) } }
+    match y { Arg::One(v) => fits(v), Arg::Many(v) => { v[..n].is_empty() || { let (lo, hi) = crate::reduce::extremes(&v[..n]); fits(lo) && fits(hi) } } }
 }
 
 /// The digits of each of `values` in the mixed radix of `bases`, as APL's `⊤` gives them: each value's digits together, the most significant first. A base of 0 takes all of what remains as its digit. `None` where a quotient isn't an `i64`.
@@ -217,8 +227,8 @@ macro_rules! narrower {
         forms!(#[inline] WrappingPow at $t: |_, [x, y]| wrapping_power(x.into(), y.into()).map(|p| p as $t));
         forms!(
             #[inline] Residue at $t: |_, [x, y]| residue(x.into(), y.into()) as $t,
-            many |_, [x, y], n, out| if let Arg::One(d) = x && <$t>::BITS <= 16 && let Some(s) = Short::new(d.into()) {
-                each!([y], n, out, |[y]| s.residue(y.into()) as $t)
+            many |_, [x, y], n, out| if let Arg::One(d) = x && <$t>::BITS <= 16 && let Some(s) = Short::new(d as i16) {
+                each!([y], n, out, |[y]| s.residue(y as i16) as $t)
             } else if let Arg::One(d) = x && let Some(r) = FloatDivisor::new(d.into()) {
                 each!([y], n, out, |[y]| r.residue(y.into()) as $t)
             } else {

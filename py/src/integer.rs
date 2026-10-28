@@ -24,7 +24,8 @@ pub(crate) fn radix(bases: &[usize], digits: &[usize]) -> PyResult<()> {
 fn encode<'py>(py: Python<'py>, bases: &Bound<'py, PyAny>, values: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let ((b, bases), (mut shape, values)) = (integers(bases)?, integers(values)?);
     if b.len() != 1 { return Err(py_err(Error::new(Kind::Rank, "bases must be a vector"))); }
-    let digits = released(py, || rustymath::integer::encode(&bases, &values)).ok_or_else(|| py_err(Error::new(Kind::Overflow, "an encoding quotient doesn't fit int64")))?;
+    let digits = released(py, || rustymath::integer::encode(&bases, &values))
+        .ok_or_else(|| py_err(Error::new(Kind::Overflow, "an encoding quotient doesn't fit int64")))?;
     shape.push(bases.len());
     give(py, core(digits, &shape)?, false)
 }
@@ -34,11 +35,11 @@ fn encode<'py>(py: Python<'py>, bases: &Bound<'py, PyAny>, values: &Bound<'py, P
 fn decode<'py>(py: Python<'py>, bases: &Bound<'py, PyAny>, digits: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let ((b, bases), (mut shape, digits)) = (integers(bases)?, integers(digits)?);
     radix(&b, &shape)?;
-    let values = released(py, || rustymath::integer::decode(&bases, &digits)).ok_or_else(|| py_err(Error::new(Kind::Overflow, "a decoded value doesn't fit int64")))?;
+    let values =
+        released(py, || rustymath::integer::decode(&bases, &digits)).ok_or_else(|| py_err(Error::new(Kind::Overflow, "a decoded value doesn't fit int64")))?;
     shape.pop();
     give(py, core(values, &shape)?, true)
 }
 
 /// Adds this module's functions to `m`.
 pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> { for f in [wrap_pyfunction!(encode, m)?, wrap_pyfunction!(decode, m)?] { m.add_function(f)?; } Ok(()) }
-

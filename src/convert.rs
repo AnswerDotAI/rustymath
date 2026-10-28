@@ -33,10 +33,12 @@ pub fn count<F: Float>(out: &mut Vec<F>, start: i64, down: bool, n: usize) {
     let end = if down { start - n as i64 } else { start + n as i64 };
     if !<F::Working as Core>::WIDE && i32::try_from(start).is_ok() && i32::try_from(end).is_ok() {
         let start = start as i32;
-        return if down { out.extend((0..n as i32).map(move |i| float::<F, i32>(start - i))) } else { out.extend((0..n as i32).map(move |i| float::<F, i32>(start + i))) };
+        return if down { out.extend((0..n as i32).map(move |i| float::<F, i32>(start - i))) }
+        else { out.extend((0..n as i32).map(move |i| float::<F, i32>(start + i))) };
     }
     if NATIVE_64 {
-        return if down { out.extend((0..n).map(move |i| F::narrow(wide_float(start - i as i64)))) } else { out.extend((0..n).map(move |i| F::narrow(wide_float(start + i as i64)))) };
+        return if down { out.extend((0..n).map(move |i| F::narrow(wide_float(start - i as i64)))) }
+        else { out.extend((0..n).map(move |i| F::narrow(wide_float(start + i as i64)))) };
     }
     let step = if down { -1 } else { 1 };
     let offsets: [f64; 8] = std::array::from_fn(|k| wide_float(step * k as i64));

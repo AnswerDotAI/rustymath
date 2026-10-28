@@ -1,12 +1,12 @@
-//! What speed tests share: the machine's timing lock, the timing loop, the copy that costs count in with the copy times stored for each machine that runs them, the format of cost lines, the format of budget files, and the retries. rustymath's and basedpl's speed tests use all of it, and basedpl's browser build uses all but the lock.
+//! What speed tests share: the machine's timing lock, the timing loop, the copy that costs count in with the copy times stored for each machine that runs them, the format of cost lines, the format of budget files, the CPU that budgets were set for, and the retries. rustymath's and basedpl's speed tests use all of it, and basedpl's browser build uses all but the lock.
 //!
 //! The lock keeps timings apart from builds and test runs on one machine. A timing takes it exclusively. A build or a test run takes it shared. It is an `flock` on the file `LOCK`. `fastws.cargo.timing_lock` takes the same lock from Python. The browser build has no timing lock.
 #[cfg(not(target_arch = "wasm32"))]
-pub use lock::{exclusive, shared, Hold, LOCK};
-use std::{ops::Neg, time::Duration};
+pub use lock::{Hold, LOCK, exclusive, shared};
 /// The clock that timings and `parallel`'s rounds read: the browser's in a browser build, where `std::time::Instant` panics.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) use std::time::Instant;
+use std::{ops::Neg, time::Duration};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub(crate) use web_time::Instant;
 
@@ -35,22 +35,28 @@ const CACHED_BYTES: usize = 64 << 20;
 /// Whether a copy of `items` items of `bytes` bytes each, with its destination, fits in `CACHED_BYTES`.
 fn cached(items: usize, bytes: usize) -> bool { 2 * items * bytes <= CACHED_BYTES }
 
+/// The CPU of CI's Ubicloud runner, on which the Linux budgets and basedpl's wasm budgets were set.
+const CI_CPU: &str = "AMD Ryzen 9 7950X3D 16-Core Processor";
+
+/// The CPU of the development Mac, on which the macOS budgets were set.
+const DEV_CPU: &str = "Apple M5 Max";
+
 /// The copy times of the machines that run the speed tests in native builds, for copies whose source and destination fit in `CACHED_BYTES`: the CPU's name as [`cpu`] reads it, an item's size in bytes, the number of items, and the time for each item in seconds. Each is at the slower end of what that machine's copy normally takes, which is the copy that the expected costs in the budget files assume. On CI's runner, a copy measured beside each case varied more than 3 times between cases, while every function's own time varied at most 1.18 times. A stored time keeps that noise out of every cost.
 #[cfg(not(target_arch = "wasm32"))]
 pub const COPIES: &[(&str, usize, usize, f64)] = &[
     // CI's Ubicloud runner, from 630 copies timed beside cases in 21 runs of rustymath's speed test, 15 to 21 October 2026: 0.13 to 0.16 ns for 8-byte items, and 0.33 to 0.45 ns when the copy read its source from the L3 cache that other machines share.
-    ("AMD Ryzen 9 7950X3D 16-Core Processor", 8, 65_536, 0.16e-9),
-    ("AMD Ryzen 9 7950X3D 16-Core Processor", 4, 65_536, 0.08e-9),
+    (CI_CPU, 8, 65_536, 0.16e-9),
+    (CI_CPU, 4, 65_536, 0.08e-9),
     // 16-byte items, complex f64: 0.285 ns, measured once on 22 October 2026. Each complex f64 function's time per item that day, divided by its cost in the earlier runs whose 8-byte copies came from cache, gives 0.24 to 0.29 ns.
-    ("AMD Ryzen 9 7950X3D 16-Core Processor", 16, 65_536, 0.29e-9),
+    (CI_CPU, 16, 65_536, 0.29e-9),
     // 1,048,576 8-byte items: 0.157 ns, measured once by basedpl's speed test on 22 October 2026. The browser build's copy at this size on the same runner varied 1.27 times across seven runs, so the entry allows for that.
-    ("AMD Ryzen 9 7950X3D 16-Core Processor", 8, 1_048_576, 0.18e-9),
+    (CI_CPU, 8, 1_048_576, 0.18e-9),
     // The development Mac, 22 October 2026, through basedpl's `time_cases` and rustymath's speed test: 0.115 to 0.13 ns for 8-byte items at each size, and 0.056 to 0.066 ns for 4-byte items.
-    ("Apple M5 Max", 8, 65_536, 0.12e-9),
-    ("Apple M5 Max", 8, 1_048_576, 0.125e-9),
-    ("Apple M5 Max", 4, 65_536, 0.065e-9),
+    (DEV_CPU, 8, 65_536, 0.12e-9),
+    (DEV_CPU, 8, 1_048_576, 0.125e-9),
+    (DEV_CPU, 4, 65_536, 0.065e-9),
     // 16-byte items, complex f64, measured at 0.240 ns by rustymath's speed test on 22 October 2026.
-    ("Apple M5 Max", 16, 65_536, 0.25e-9),
+    (DEV_CPU, 16, 65_536, 0.25e-9),
     // GitHub's runners in basedpl's `Release` workflow, from the copies that `bpl --costs` measured in its three runs of 22 October 2026: the slowest copy at each size that the cases' own times in that run bore out. The macOS runner's 1,048,576-item copy also measured 0.369 ns once, when its cases' times rose 1.28 times and its copy 1.78 times. The Linux ARM runner is the Neoverse-N2 that `lscpu` names.
     ("Apple M1 (Virtual)", 8, 65_536, 0.18e-9),
     ("Apple M1 (Virtual)", 8, 1_048_576, 0.25e-9),
@@ -69,8 +75,8 @@ pub const COPIES: &[(&str, usize, usize, f64)] = &[
 #[cfg(target_arch = "wasm32")]
 pub const COPIES: &[(&str, usize, usize, f64)] = &[
     // CI's Ubicloud runner under Node's V8, from the copies that `tests/wasm-speed.mjs` measured in seven runs of 22 October 2026: 0.172 to 0.218 ns at 65,536 items, and 0.196 to 0.249 ns at 1,048,576.
-    ("AMD Ryzen 9 7950X3D 16-Core Processor", 8, 65_536, 0.22e-9),
-    ("AMD Ryzen 9 7950X3D 16-Core Processor", 8, 1_048_576, 0.25e-9),
+    (CI_CPU, 8, 65_536, 0.22e-9),
+    (CI_CPU, 8, 1_048_576, 0.25e-9),
 ];
 
 /// This machine's CPU, as its operating system names it: `machdep.cpu.brand_string` on macOS. On Linux, it's the first `model name` in `/proc/cpuinfo`, or else the `CPU implementer` and `CPU part` codes that ARM machines give there in place of a model name, as `CPU implementer 0x41, part 0xd49`. In the browser build, it's the name passed to [`name_cpu`]. `None` without a name.
@@ -104,9 +110,10 @@ fn read_cpu() -> Option<String> { None }
 /// One copy's time for each of `items` items of type `T`. A copy whose source and destination fit in `CACHED_BYTES` takes this machine's entry in [`COPIES`]. Any other copy, or one with no entry, is measured once, the first time its size is asked for. [`copy_line`] says when a measured copy belongs in [`COPIES`].
 pub fn copy_time<T: Copy + Default + Neg<Output = T>>(items: usize) -> CopyTime {
     let bytes = size_of::<T>();
-    if cached(items, bytes) && let Some(name) = cpu() && let Some(&(_, _, _, seconds)) = COPIES.iter().find(|&&(c, b, n, _)| c == name && b == bytes && n == items) {
-        return CopyTime { seconds, items, bytes, stored: true };
-    }
+    if cached(items, bytes) && let Some(name) = cpu()
+        && let Some(&(_, _, _, seconds)) = COPIES.iter().find(|&&(c, b, n, _)| c == name && b == bytes && n == items) {
+            return CopyTime { seconds, items, bytes, stored: true };
+        }
     static MEASURED: std::sync::Mutex<Vec<CopyTime>> = std::sync::Mutex::new(Vec::new());
     let mut measured = MEASURED.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&t) = measured.iter().find(|t| (t.bytes, t.items) == (bytes, items)) { return t; }
@@ -120,7 +127,10 @@ fn measured_copy<T: Copy + Default + Neg<Output = T>>(items: usize) -> f64 {
     let (mut data, mut out) = (vec![T::default(); items], vec![T::default(); items]);
     copy(&data, &mut out);
     copy(&out, &mut data);
-    fastest(|_| { copy(std::hint::black_box(&data), &mut out); std::hint::black_box(&mut out); }) / items.max(1) as f64
+    fastest(|_| {
+        copy(std::hint::black_box(&data), &mut out);
+        std::hint::black_box(&mut out);
+    }) / items.max(1) as f64
 }
 
 /// A line saying what a copy of `t`'s items costs for each item, and whether that time was stored for this machine or measured, as the speed tests print it before their costs. A measured copy that fits in `CACHED_BYTES` adds that it belongs in [`COPIES`]: the line reaches the log where the speed tests' own lines do.
@@ -128,8 +138,7 @@ pub fn copy_line(t: &CopyTime) -> String {
     let source = match (t.stored, cpu()) {
         (true, Some(c)) => format!("stored for {c}"),
         (false, Some(c)) if cached(t.items, t.bytes) => format!("measured on {c}: add it to rustymath::timing::COPIES"),
-        (false, Some(c)) => format!("measured on {c}"),
-        (_, None) => "measured on a CPU with no name".into(),
+        (false, Some(c)) => format!("measured on {c}"), (_, None) => "measured on a CPU with no name".into()
     };
     format!("copy of {} {}-byte items: {:.3} ns an item, {source}", t.items, t.bytes, t.seconds * 1e9)
 }
@@ -156,7 +165,8 @@ pub fn sections(text: &str) -> Result<Vec<Section<'_>>, String> {
 
 /// The name and the rest of a budget file's header line: `[name]` or `[name] rest`.
 pub fn header(line: &str) -> Option<(&str, &str)> {
-    line.strip_prefix('[').and_then(|l| l.split_once(']')).filter(|(name, rest)| !name.contains(' ') && (rest.is_empty() || rest.starts_with(' '))).map(|(name, rest)| (name, rest.trim()))
+    line.strip_prefix('[').and_then(|l| l.split_once(']')).filter(|(name, rest)| !name.contains(' ') && (rest.is_empty() || rest.starts_with(' ')))
+        .map(|(name, rest)| (name, rest.trim()))
 }
 
 /// A case line's code: the text before its first tab.
@@ -165,9 +175,19 @@ pub fn code_of(line: &str) -> &str { line.split('\t').next().unwrap_or_default()
 /// The pauses, in seconds, before each retry in `retried`. All of a case's runs together take a fraction of a millisecond, and one disturbance on a shared machine can last that long.
 pub const RETRY_PAUSES: [f64; 2] = [0.1, 1.0];
 
-/// Which of a budget file's two native budgets this machine's speed tests check: 0, for macOS on Apple silicon, where matrix products run on Accelerate, or 1, for Linux on x86-64, as CI's runner is. Other machines, such as Linux on Arm, have no budgets: their speed tests report costs without checking them.
-pub const NATIVE_COLUMN: Option<usize> =
-    if cfg!(all(target_os = "macos", target_arch = "aarch64")) { Some(0) } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) { Some(1) } else { None };
+/// Which of a budget file's two native budgets this machine's speed tests compare costs with: 0, for macOS on Apple silicon, where matrix products run on Accelerate, or 1, for Linux on x86-64, as CI's runner is. Other machines, such as Linux on Arm, have no budgets: their speed tests report costs without comparing them. [`checks_budgets`] says whether a cost over its budget fails.
+pub const NATIVE_COLUMN: Option<usize> = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+    Some(0)
+} else if cfg!(all(target_os = "linux", target_arch = "x86_64")) { Some(1) }
+else { None };
+
+/// The CPU that this build's budgets were set for, as [`cpu`] names it: the development Mac's for macOS on Apple silicon, and CI's runner's for Linux on x86-64 and for the browser build. `None` for a build with no budgets, such as Linux on Arm.
+pub const BUDGET_CPU: Option<&str> = match NATIVE_COLUMN {
+    Some(0) => Some(DEV_CPU), Some(_) => Some(CI_CPU), None if cfg!(target_arch = "wasm32") => Some(CI_CPU), None => None
+};
+
+/// Whether this machine's speed tests fail on a case still over its budget after the retries: only where [`cpu`] is [`BUDGET_CPU`]. On any other CPU they print every cost, then each case still over its budget, marked `over`, and fail on none.
+pub fn checks_budgets() -> bool { BUDGET_CPU.is_some_and(|c| cpu() == Some(c)) }
 
 /// The failures of a timing test that still fail after every retry. After each pause in `RETRY_PAUSES`, `retime` gets the failures and the pause, times them again, prints the retry and gives those that still fail. A speed test calls it after timing every case.
 pub fn retried<T>(mut failures: Vec<T>, mut retime: impl FnMut(Vec<T>, f64) -> Vec<T>) -> Vec<T> {
@@ -214,9 +234,7 @@ mod lock {
         let (start, mut waiting, mut reported) = (Instant::now(), false, false);
         loop {
             match if shared { file.try_lock_shared() } else { file.try_lock() } {
-                Ok(()) => return held(file),
-                Err(TryLockError::WouldBlock) => {}
-                Err(TryLockError::Error(e)) => return Err(failed(e)),
+                Ok(()) => return held(file), Err(TryLockError::WouldBlock) => {} Err(TryLockError::Error(e)) => return Err(failed(e))
             }
             if start.elapsed() > Duration::from_secs(300) {
                 if !shared { return Err(io::Error::new(io::ErrorKind::TimedOut, format!("{others} has held {LOCK} for 5 minutes"))); }

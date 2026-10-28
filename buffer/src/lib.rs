@@ -13,7 +13,8 @@ pub mod walk;
 
 /// Decodes the Python per-axis key representation; shared layout methods validate its shape.
 pub fn axis_keys(keys: Vec<Option<Vec<Option<String>>>>) -> PyResult<Vec<Option<Arc<rustymath::layout::Keys>>>> {
-    keys.into_iter().map(|k| k.map(|v| rustymath::layout::Keys::partial(v.into_iter().map(|s| s.map(Arc::from)).collect())).transpose()).collect::<Result<Vec<_>, _>>().map_err(py_err)
+    keys.into_iter().map(|k| k.map(|v| rustymath::layout::Keys::partial(v.into_iter().map(|s| s.map(Arc::from)).collect())).transpose())
+        .collect::<Result<Vec<_>, _>>().map_err(py_err)
 }
 
 /// Keys from a Python dict's keys or a frame's column labels: a `str` is a key, and an `int` equal to its position leaves that position unkeyed. A `TypeError` for any other label.
@@ -40,18 +41,16 @@ pub fn py_err(e: Error) -> PyErr {
     let text = e.to_string();
     match e.kind {
         Kind::Interrupt => RAISED.lock().expect("no panic while holding the raised exception").take().unwrap_or_else(|| PyKeyboardInterrupt::new_err(text)),
-        Kind::Timeout => PyTimeoutError::new_err(text), Kind::Overflow => PyOverflowError::new_err(text), Kind::Index => PyIndexError::new_err(text), _ => PyValueError::new_err(text)
+        Kind::Timeout => PyTimeoutError::new_err(text), Kind::Overflow => PyOverflowError::new_err(text), Kind::Index => PyIndexError::new_err(text),
+        _ => PyValueError::new_err(text)
     }
 }
 
 /// Item `i` of `view` as a Python `bool`, `int`, `float`, `complex` or one-character `str`.
 pub fn item<'py>(py: Python<'py>, view: View<'_>, i: usize) -> PyResult<Bound<'py, PyAny>> {
     match view {
-        View::Booleans(v) => v[i].into_bound_py_any(py),
-        View::Integers(v) => v.get(i).into_bound_py_any(py),
-        View::Floats(v) => v.get(i).into_bound_py_any(py),
-        View::Complexes(v) => { let z = v.get(i); Ok(PyComplex::from_doubles(py, z.re, z.im).into_any()) }
-        View::Characters(v) => v[i].into_bound_py_any(py),
+        View::Booleans(v) => v[i].into_bound_py_any(py), View::Integers(v) => v.get(i).into_bound_py_any(py), View::Floats(v) => v.get(i).into_bound_py_any(py),
+        View::Complexes(v) => { let z = v.get(i); Ok(PyComplex::from_doubles(py, z.re, z.im).into_any()) } View::Characters(v) => v[i].into_bound_py_any(py)
     }
 }
 
@@ -59,7 +58,9 @@ pub fn item<'py>(py: Python<'py>, view: View<'_>, i: usize) -> PyResult<Bound<'p
 pub fn tolist<'py>(py: Python<'py>, view: View<'_>, shape: &[usize]) -> PyResult<Bound<'py, PyAny>> { nested(py, shape, &|i| item(py, view, i)) }
 
 /// The items that `item` gives for each position in row-major order, nested in lists by `shape`, or the item at position 0 when `shape` is empty.
-pub fn nested<'py>(py: Python<'py>, shape: &[usize], item: &dyn Fn(usize) -> PyResult<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> { nest(py, shape, 0, item) }
+pub fn nested<'py>(py: Python<'py>, shape: &[usize], item: &dyn Fn(usize) -> PyResult<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+    nest(py, shape, 0, item)
+}
 
 fn nest<'py>(py: Python<'py>, shape: &[usize], start: usize, item: &dyn Fn(usize) -> PyResult<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
     let [n, rest @ ..] = shape else { return item(start) };
@@ -100,9 +101,9 @@ impl Widen {
             Ok(match self {
                 Widen::I8 => i16::buffer(copied::<i8>(view, n, swapped, py)?.into_iter().map(i16::from).collect()),
                 Widen::U16 => i64::buffer(copied::<u16>(view, n, swapped, py)?.into_iter().map(i64::from).collect()),
-                Widen::U32 => i64::buffer(copied::<u32>(view, n, swapped, py)?.into_iter().map(i64::from).collect()),
-                Widen::U64 => i64::buffer(copied::<u64>(view, n, swapped, py)?.into_iter().map(i64::try_from).collect::<Result<Vec<_>, _>>()
-                    .map_err(|_| PyOverflowError::new_err("an unsigned integer exceeds int64; convert explicitly"))?),
+                Widen::U32 => i64::buffer(copied::<u32>(view, n, swapped, py)?.into_iter().map(i64::from).collect()), Widen::U64 => i64::buffer(
+                    copied::<u64>(view, n, swapped, py)?.into_iter().map(i64::try_from).collect::<Result<Vec<_>, _>>()
+                        .map_err(|_| PyOverflowError::new_err("an unsigned integer exceeds int64; convert explicitly"))?)
             })
         }
     }
@@ -122,11 +123,15 @@ struct Source {
 fn source(format: &CStr, item_size: usize) -> Result<Source, Error> {
     let unsupported = || Error::new(Kind::Domain, format!("unsupported buffer format `{}`", format.to_string_lossy()));
     let (code, swap) = match format.to_bytes() {
-        [order @ (b'@' | b'=' | b'<' | b'>' | b'!'), code @ ..] => (code, match order { b'<' => cfg!(target_endian = "big"), b'>' | b'!' => cfg!(target_endian = "little"), _ => false }),
+        [order @ (b'@' | b'=' | b'<' | b'>' | b'!'), code @ ..] => (code, match order {
+            b'<' => cfg!(target_endian = "big"), b'>' | b'!' => cfg!(target_endian = "little"), _ => false
+        }),
         code => (code, false),
     };
     let swapped = swap.then_some(if code.starts_with(b"Z") { item_size / 2 } else { item_size });
-    if let Some(&(_, _, widen)) = WIDENED.iter().find(|e| e.0 == code && e.1 == item_size) { return Ok(Source { dtype: widen.dtype(), swapped, widen: Some(widen) }); }
+    if let Some(&(_, _, widen)) = WIDENED.iter().find(|e| e.0 == code && e.1 == item_size) {
+        return Ok(Source { dtype: widen.dtype(), swapped, widen: Some(widen) });
+    }
     let dtype = match code {
         b"l" => DType::Integer(if item_size == 4 { Width::I32 } else { Width::I64 }),
         code => DTYPES.iter().map(|e| (e.1.to_bytes(), e.0)).chain(ALSO).find(|e| e.0 == code).ok_or_else(unsupported)?.1,
@@ -138,9 +143,7 @@ fn source(format: &CStr, item_size: usize) -> Result<Source, Error> {
 /// A buffer that an exporter lends, released when this drops.
 struct Held(Box<ffi::Py_buffer>);
 
-impl Drop for Held {
-    fn drop(&mut self) { Python::attach(|_| unsafe { ffi::PyBuffer_Release(&mut *self.0) }) }
-}
+impl Drop for Held { fn drop(&mut self) { Python::attach(|_| unsafe { ffi::PyBuffer_Release(&mut *self.0) }) } }
 
 /// The items of an object that exports a buffer: the exporter's own, or a copy in C order.
 pub struct Read { shape: Vec<usize>, len: usize, dtype: DType, items: Items }
@@ -160,10 +163,7 @@ impl Read {
         }
     }
     /// The items as an owned buffer. Only lent items are copied.
-    pub fn into_buffer(self) -> Buffer {
-        if let Items::Owned(b) = self.items { return b; }
-        Buffer::copied(self.view(), 0..self.len)
-    }
+    pub fn into_buffer(self) -> Buffer { if let Items::Owned(b) = self.items { return b; } Buffer::copied(self.view(), 0..self.len) }
 }
 
 /// The `n` items of type `T` at `p`, borrowed.
@@ -186,8 +186,7 @@ unsafe fn copied<T>(view: &ffi::Py_buffer, n: usize, swapped: Option<usize>, py:
 /// A Domain error for a code in `codes` that isn't a Unicode scalar value.
 fn characters(codes: &[u32]) -> PyResult<()> {
     match codes.iter().find(|&&c| char::from_u32(c).is_none()) {
-        Some(c) => Err(py_err(Error::new(Kind::Domain, format!("{c:#x} isn't a Unicode character")))),
-        None => Ok(()),
+        Some(c) => Err(py_err(Error::new(Kind::Domain, format!("{c:#x} isn't a Unicode character")))), None => Ok(())
     }
 }
 
@@ -221,16 +220,15 @@ pub fn read(obj: &Bound<'_, PyAny>) -> PyResult<Option<Read>> {
     let src = source(format, v.itemsize as usize).map_err(py_err)?;
     let dtype = src.dtype;
     let shape: Vec<usize> = match v.ndim {
-        0 => vec![],
-        _ if v.shape.is_null() => vec![v.len as usize / v.itemsize as usize],
-        ndim => unsafe { items::<ffi::Py_ssize_t>(v.shape.cast(), ndim as usize) }.iter().map(|&n| n as usize).collect(),
+        0 => vec![], _ if v.shape.is_null() => vec![v.len as usize / v.itemsize as usize],
+        ndim => unsafe { items::<ffi::Py_ssize_t>(v.shape.cast(), ndim as usize) }.iter().map(|&n| n as usize).collect()
     };
     let n = element_count(&shape).map_err(py_err)?;
-    let lend = src.swapped.is_none() && src.widen.is_none() && unsafe { ffi::PyBuffer_IsContiguous(v, b'C' as c_char) } == 1 && v.buf as usize % layout(dtype).1 == 0 && match dtype {
-        DType::Boolean => unsafe { items::<u8>(v.buf, n) }.iter().all(|&b| b <= 1),
-        DType::Character => characters(unsafe { items::<u32>(v.buf, n) }).map(|_| true)?,
-        _ => true,
-    };
+    let lend = src.swapped.is_none() && src.widen.is_none() && unsafe { ffi::PyBuffer_IsContiguous(v, b'C' as c_char) } == 1
+        && v.buf as usize % layout(dtype).1 == 0 && match dtype {
+            DType::Boolean => unsafe { items::<u8>(v.buf, n) }.iter().all(|&b| b <= 1),
+            DType::Character => characters(unsafe { items::<u32>(v.buf, n) }).map(|_| true)?, _ => true
+        };
     let items = if lend { Items::Lent(held) } else { Items::Owned(unsafe { owned(&src, &held.0, n, py) }?) };
     Ok(Some(Read { shape, len: n, dtype, items }))
 }
@@ -240,10 +238,12 @@ pub fn read_array(obj: &Bound<'_, PyAny>) -> PyResult<Option<(Read, rustymath::l
     use rustymath::layout::Layout;
     use std::sync::Arc;
     if obj.hasattr("__rustymath_array__")? {
-        let (source, keys, names): (Bound<'_, PyAny>, Vec<Option<Vec<Option<String>>>>, Vec<Option<String>>) = obj.call_method0("__rustymath_array__")?.extract()?;
+        let (source, keys, names): (Bound<'_, PyAny>, Vec<Option<Vec<Option<String>>>>, Vec<Option<String>>) =
+            obj.call_method0("__rustymath_array__")?.extract()?;
         let read = read(&source)?.ok_or_else(|| PyTypeError::new_err("array interchange requires compact items"))?;
         let keys = axis_keys(keys)?;
-        let layout = Layout::from(read.shape()).with_keys(keys).map_err(py_err)?.with_names(names.into_iter().map(|n| n.map(Arc::from)).collect()).map_err(py_err)?;
+        let layout =
+            Layout::from(read.shape()).with_keys(keys).map_err(py_err)?.with_names(names.into_iter().map(|n| n.map(Arc::from)).collect()).map_err(py_err)?;
         return Ok(Some((read, layout)));
     }
     let Some(read) = read(obj)? else { return Ok(None) };
@@ -269,8 +269,8 @@ fn strided_geometry(dtype: DType, shape: &[usize], strides: &[isize]) -> (Box<[i
 /// `view` must be the `Py_buffer` that CPython passed to `__getbuffer__`, and every address reached by the geometry must hold a valid item of `dtype`.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn export(
-    view: *mut ffi::Py_buffer, flags: c_int, owner: &Bound<'_, PyAny>, dtype: DType, data: *mut u8, len: usize, shape: &[isize], strides: &[isize], readonly: bool,
-) -> PyResult<()> {
+    view: *mut ffi::Py_buffer, flags: c_int, owner: &Bound<'_, PyAny>, dtype: DType, data: *mut u8, len: usize, shape: &[isize], strides: &[isize],
+    readonly: bool) -> PyResult<()> {
     if view.is_null() { return Err(PyBufferError::new_err("no Py_buffer to fill")); }
     if readonly && flags & ffi::PyBUF_WRITABLE != 0 { return Err(PyBufferError::new_err("the array is read-only")); }
     let size = layout(dtype).0;
@@ -309,7 +309,9 @@ struct Lent { _keep: Box<dyn std::any::Any + Send + Sync>, shape: Box<[isize]>, 
 /// # Safety
 /// `view` must be the `Py_buffer` that CPython passed to `__getbuffer__`, and every address that the geometry reaches from `first(&keep)` must hold a valid item of `dtype` that `keep` owns.
 #[allow(clippy::too_many_arguments)]
-pub unsafe fn lend<K: Send + Sync + 'static>(view: *mut ffi::Py_buffer, flags: c_int, py: Python<'_>, keep: K, first: impl FnOnce(&K) -> *const u8, dtype: DType, shape: &[usize], strides: Option<&[isize]>) -> PyResult<()> {
+pub unsafe fn lend<K: Send + Sync + 'static>(
+    view: *mut ffi::Py_buffer, flags: c_int, py: Python<'_>, keep: K, first: impl FnOnce(&K) -> *const u8, dtype: DType, shape: &[usize],
+    strides: Option<&[isize]>) -> PyResult<()> {
     let keep = Box::new(keep);
     let data = first(&keep);
     let (dims, steps) = match strides { Some(s) => strided_geometry(dtype, shape, s), None => geometry(dtype, shape) };

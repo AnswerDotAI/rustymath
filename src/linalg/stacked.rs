@@ -1,6 +1,5 @@
 //! Matrix functions on stacks of matrices, which [`Stacked`] runs. Each takes stacks of matrices in its arguments' last two axes, and only a one-dimensional right-hand side is a vector. The axes before those form each argument's frame. Frames pair as rustymath broadcasts, through [`Frames`]: axes with the same name first, then the rest from the front. A result has the frame's axes, then each cell's, and a cell axis keeps the keys and name of the argument axis it indexes. The cells of a stack split across rustymath's threads. A matrix that `cholesky`, `eigh`, `eig` or their value-only forms can't factor gives NaN results.
-use num_complex::Complex;
-use num_traits::Float as _;
+use super::{Lu, LuWork, QrWork, Scalar, Svd, exact};
 use crate::agreement::{Frames, Mapping};
 use crate::array::{Array, ArrayView};
 use crate::buffer::{Buffer, DType, Element, FloatWidth, Items, Width};
@@ -8,7 +7,8 @@ use crate::error::{Error, Kind};
 use crate::gather::Steps;
 use crate::layout::{Lanes, Layout};
 use crate::parallel::stack;
-use super::{exact, Lu, LuWork, QrWork, Scalar, Svd};
+use num_complex::Complex;
+use num_traits::Float as _;
 
 /// The int64 dtype of row positions and ranks.
 const I64: DType = DType::Integer(Width::I64);
@@ -54,7 +54,8 @@ impl Stacked {
     pub fn new(float: FloatWidth) -> Self { Self { float } }
 
     /// The `per` items of each cell of `frames`, which `f` writes into the cell's slot of the output, with scratch `S` that a thread's cells share.
-    fn slots<B: Clone + Default + Send + 'static, S: Default>(&self, frames: &Frames, per: usize, f: impl Fn(usize, &mut [B], &mut S) + Sync) -> Result<Vec<B>, Error> {
+    fn slots<B: Clone + Default + Send + 'static, S: Default>(
+        &self, frames: &Frames, per: usize, f: impl Fn(usize, &mut [B], &mut S) + Sync) -> Result<Vec<B>, Error> {
         Ok(stack::<(Vec<B>,), S>(frames.count, [per], &|i, (out,), s| { f(i, out, s); true })?.0.0)
     }
 
@@ -70,7 +71,8 @@ impl Stacked {
         let missing = |d: DType| Error::new(Kind::Domain, format!("{function} doesn't take {}", d.name()));
         let mut common = args[0].dtype();
         for a in &args[1..] { common = common.common(a.dtype()).ok_or_else(|| missing(DType::Character))?; }
-        let compute = common.computes_in(Width::I64, self.float, |d| matches!(d, DType::Float(FloatWidth::F32 | FloatWidth::F64) | DType::Complex(_))).ok_or_else(|| missing(common))?;
+        let compute = common.computes_in(Width::I64, self.float, |d| matches!(d, DType::Float(FloatWidth::F32 | FloatWidth::F64) | DType::Complex(_)))
+            .ok_or_else(|| missing(common))?;
         Ok((compute, if matches!(common, DType::Float(_) | DType::Complex(_)) { common } else { compute }))
     }
 
@@ -477,10 +479,7 @@ struct Matrices<'a> { compute: DType, store: DType, layout: &'a Layout, size: [u
 
 /// The rows and columns of the matrices in `layout`. A Rank error for fewer than two axes.
 fn matrix(function: &str, layout: &Layout) -> Result<[usize; 2], Error> {
-    match *layout.shape() {
-        [.., m, n] => Ok([m, n]),
-        _ => Err(Error::new(Kind::Rank, format!("{function} needs matrices, with at least two axes"))),
-    }
+    match *layout.shape() { [.., m, n] => Ok([m, n]), _ => Err(Error::new(Kind::Rank, format!("{function} needs matrices, with at least two axes"))) }
 }
 
 /// The size of `function`'s square matrices. A Length error for a matrix that isn't square.
@@ -491,23 +490,20 @@ fn square(function: &str, [m, n]: [usize; 2]) -> Result<usize, Error> {
 /// The cell axes of a right-hand side with `layout`, its number of columns, and whether it's one vector, beside matrices of `rows` rows. A Length error where its rows differ.
 fn rhs(function: &str, layout: &Layout, rows: usize) -> Result<(usize, usize, bool), Error> {
     let (core, r, k) = match *layout.shape() {
-        [] => return Err(Error::new(Kind::Rank, format!("{function} needs a right-hand side with at least one axis"))),
-        [r] => (1, r, 1),
-        [.., r, k] => (2, r, k),
+        [] => return Err(Error::new(Kind::Rank, format!("{function} needs a right-hand side with at least one axis"))), [r] => (1, r, 1),
+        [.., r, k] => (2, r, k)
     };
     if r != rows { return Err(Error::new(Kind::Length, format!("{function}'s right-hand side has {r} rows, not {rows}"))); }
     Ok((core, k, core == 1))
 }
 
 /// The cell axes of a solution: `rows`, then the right-hand side's columns unless it's a vector.
-fn solution(rows: Layout, rhs: &Layout, vector: bool) -> Layout {
-    let r = rhs.shape().len();
-    if vector { rows } else { rows.concat(&rhs.axes(r - 1..r)) }
-}
+fn solution(rows: Layout, rhs: &Layout, vector: bool) -> Layout { let r = rhs.shape().len(); if vector { rows } else { rows.concat(&rhs.axes(r - 1..r)) } }
 
 /// `items`, of an argument of `layout`, read so that its axis `axis` pairs by key with axis `along` of `with`, as [`Mapping::contract`] pairs them. Axes without keys pair by position. A Length error where both have keys and they differ.
 pub fn paired<'a>(items: Items<'a>, layout: &Layout, axis: usize, with: &Layout, along: usize, function: &str) -> Result<Items<'a>, Error> {
-    let contracted = Mapping::contract(with, along, layout, axis).map_err(|_| Error::new(Kind::Length, format!("{function} needs the same keys on the axes it pairs")))?;
+    let contracted =
+        Mapping::contract(with, along, layout, axis).map_err(|_| Error::new(Kind::Length, format!("{function} needs the same keys on the axes it pairs")))?;
     let Mapping::Steps { steps, .. } = contracted else { return Ok(items) };
     let [outer, len, inner] = Lanes::new(layout.shape(), axis)?.dims();
     let table = Vec::from(steps).into_iter().next().expect("a contraction maps one axis").scaled(inner);
@@ -520,7 +516,8 @@ fn factored(function: &str, factors: &Layout, p: ArrayView<'_>) -> Result<(usize
     let n = square(function, matrix(function, factors)?)?;
     if p.layout().shape().last() != Some(&n) { return Err(Error::new(Kind::Length, format!("{function} needs {n} row positions for each matrix"))); }
     let items = p.cast(p.dtype())?;
-    let positions = crate::structure::signed_positions(items.view())?.into_iter().map(|r| usize::try_from(r?).ok().filter(|&r| r < n)).collect::<Option<Vec<_>>>();
+    let positions =
+        crate::structure::signed_positions(items.view())?.into_iter().map(|r| usize::try_from(r?).ok().filter(|&r| r < n)).collect::<Option<Vec<_>>>();
     Ok((n, positions.ok_or_else(|| Error::new(Kind::Index, format!("{function} needs row positions from 0 to {}", n.saturating_sub(1))))?))
 }
 
@@ -528,7 +525,9 @@ fn factored(function: &str, factors: &Layout, p: ArrayView<'_>) -> Result<(usize
 fn factors(function: &str, u: ArrayView<'_>, s: ArrayView<'_>, v: ArrayView<'_>) -> Result<([usize; 2], usize), Error> {
     if matches!(s.dtype(), DType::Complex(_)) { return Err(Error::new(Kind::Domain, format!("{function} needs real singular values"))); }
     let ([m, p], [n, q]) = (matrix(function, u.layout())?, matrix(function, v.layout())?);
-    if p != q || s.layout().shape().last() != Some(&p) { return Err(Error::new(Kind::Length, format!("{function} needs u and v with as many columns as s has values"))); }
+    if p != q || s.layout().shape().last() != Some(&p) {
+        return Err(Error::new(Kind::Length, format!("{function} needs u and v with as many columns as s has values")));
+    }
     Ok(([m, n], p))
 }
 
@@ -539,4 +538,6 @@ pub fn stored(buffer: Buffer, frame: &Layout, cell: impl Into<Layout>, store: DT
 }
 
 /// [`stored`] for `items`.
-fn array<T: Element>(items: Vec<T>, frame: &Layout, cell: impl Into<Layout>, store: DType) -> Result<Array, Error> { stored(T::buffer(items), frame, cell, store) }
+fn array<T: Element>(items: Vec<T>, frame: &Layout, cell: impl Into<Layout>, store: DType) -> Result<Array, Error> {
+    stored(T::buffer(items), frame, cell, store)
+}

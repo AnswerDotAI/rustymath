@@ -1,7 +1,7 @@
 //! Probability distributions. Each has a density, a cumulative distribution, a quantile function and a sampler. The first three are also function objects, `Pdf`, `Cdf` and `Quantile`, which hold the distribution. Their slice forms choose the distribution's formulas once, outside the loop, so the loops of the closed-form distributions vectorize. Their one-item forms run the slice forms on one item. An item of a slice form fails where its result is NaN and its argument isn't, as for a quantile of p outside 0 to 1. A discrete distribution's density is its mass at a whole x, and its quantile function and sampler give whole numbers.
 use crate::{
-    Arg, Atan, Erfc, Erfcinv, Float, Ln, Log1p, Pow, Root, Tan, Unary, betainc, betaincinv, cos, erfcinv, exp, expm1, gammainc, gammaincc, gammaincinv, lgamma, ln, log1p, pow, sin,
-    slice::{Forms, CHUNK, written},
+    Arg, Atan, Erfc, Erfcinv, Float, Ln, Log1p, Pow, Root, Tan, Unary, betainc, betaincinv, cos, erfcinv, exp, expm1, gammainc, gammaincc, gammaincinv, lgamma,
+    ln, log1p, pow, sin, slice::{CHUNK, Forms, kept, written}
 };
 use rand::{Rng, distr::{Distribution as _, Open01, StandardUniform}};
 use std::{f64::consts::{FRAC_1_SQRT_2, PI, SQRT_2, TAU}, mem::MaybeUninit};
@@ -64,21 +64,35 @@ trait Formulas {
     #[inline(always)]
     fn quantile_map<F: Float>(&self) -> impl Fn(F) -> F + Copy { move |p| narrowed(p, |p| self.quantile(p)) }
     #[inline(always)]
-    fn pdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Ln: Forms<F, 1, Out = F>, Pow: Forms<F, 2, Out = F> { let pdf = self.pdf_map(); each!([x], n, out, |[x]| pdf(x)) }
+    fn pdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Ln: Forms<F, 1, Out = F>, Pow: Forms<F, 2, Out = F> {
+        let pdf = self.pdf_map();
+        each!([x], n, out, |[x]| pdf(x))
+    }
     #[inline(always)]
-    fn cdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool
-        where Erfc: Forms<F, 1, Out = F>, Atan: Forms<F, 1, Out = F>, Pow: Forms<F, 2, Out = F> { let cdf = self.cdf_map(); each!([x], n, out, |[x]| cdf(x)) }
+    fn cdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Erfc: Forms<F, 1, Out = F>, Atan: Forms<F, 1, Out = F>,
+        Pow: Forms<F, 2, Out = F> { let cdf = self.cdf_map(); each!([x], n, out, |[x]| cdf(x)) }
     #[inline(always)]
-    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool
-        where Erfcinv: Forms<F, 1, Out = F>, Log1p: Forms<F, 1, Out = F>, Tan: Forms<F, 1, Out = F>, Ln: Forms<F, 1, Out = F>, Root: Forms<F, 2, Out = F> { let q = self.quantile_map(); each!([p], n, out, |[p]| q(p)) }
+    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Erfcinv: Forms<F, 1, Out = F>,
+        Log1p: Forms<F, 1, Out = F>, Tan: Forms<F, 1, Out = F>, Ln: Forms<F, 1, Out = F>, Root: Forms<F, 2, Out = F> {
+        let q = self.quantile_map();
+        each!([p], n, out, |[p]| q(p))
+    }
 }
 
 /// `Formulas`' `f64` methods for a law whose generic methods hold its formulas: each runs its slice form on one item.
-macro_rules! through_slices { () => {
-    fn pdf(&self, x: f64) -> f64 { one_item(|out| self.pdf_many(Arg::One(x), 1, out)) }
-    fn cdf(&self, x: f64) -> f64 { one_item(|out| self.cdf_many(Arg::One(x), 1, out)) }
-    fn quantile(&self, p: f64) -> f64 { one_item(|out| self.quantile_many(Arg::One(p), 1, out)) }
-} }
+macro_rules! through_slices {
+    () => {
+        fn pdf(&self, x: f64) -> f64 {
+            one_item(|out| self.pdf_many(Arg::One(x), 1, out))
+        }
+        fn cdf(&self, x: f64) -> f64 {
+            one_item(|out| self.cdf_many(Arg::One(x), 1, out))
+        }
+        fn quantile(&self, p: f64) -> f64 {
+            one_item(|out| self.quantile_many(Arg::One(p), 1, out))
+        }
+    };
+}
 
 /// The result that `many`, a slice form, writes into its one slot.
 #[inline(always)]
@@ -119,7 +133,8 @@ fn quantiles<F: Float>(p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>], law:
 
 /// `finish(x, v)` for each of the `n` items x of `x`, written into `out`. `values` writes a block's values v into the block's slots of `out`, from the block's arguments `inner(x)`, usually through one slice form, as [`through`] gives it. It may overwrite the arguments. A `One` argument computes its result once. Each step runs over up to `CHUNK` items at a time, so the arguments and values between the steps stay in cache, and the arguments' buffer holds no more items than `x`. An item fails where its result is NaN and its argument isn't, as in every slice form. Gives whether every item succeeded.
 fn composed<F: Float>(
-    x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>], inner: impl Fn(F) -> F, values: impl Fn(&mut [F], &mut [MaybeUninit<F>]), finish: impl Fn(F, F) -> F) -> bool {
+    x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>], inner: impl Fn(F) -> F, values: impl Fn(&mut [F], &mut [MaybeUninit<F>]), finish: impl Fn(F, F) -> F
+) -> bool {
     let one;
     let (x, copies) = match x { Arg::Many(x) => (&x[..n], 0), Arg::One(v) => { one = [v]; (&one[..n.min(1)], n.saturating_sub(1)) } };
     let mut args = Vec::with_capacity(x.len().min(CHUNK));
@@ -128,12 +143,19 @@ fn composed<F: Float>(
         args.clear();
         args.extend(x.iter().map(|&v| inner(v)));
         values(&mut args, &mut out[..x.len()]);
-        for (r, &v) in written(&mut out[..x.len()]).iter_mut().zip(x) {
+        let results = written(&mut out[..x.len()]);
+        let mut clean = true;
+        // The flag reads only the result, as `slice::each`'s does. x86-64 leaves this loop scalar when the flag also reads the argument.
+        for (r, &v) in results.iter_mut().zip(x) {
             *r = finish(v, *r);
-            ok &= !r.is_nan() | v.is_nan();
+            clean &= !r.is_nan();
         }
+        ok &= clean || results.iter().zip(x).all(|(&r, &v)| kept(r, [v]));
     }
-    if copies > 0 { let r = written(&mut out[..1])[0]; out[1..n].fill(MaybeUninit::new(r)); }
+    if copies > 0 {
+        let r = written(&mut out[..1])[0];
+        out[1..n].fill(MaybeUninit::new(r));
+    }
     ok
 }
 
@@ -141,7 +163,9 @@ fn composed<F: Float>(
 fn through<F: Float, G: Forms<F, 1, Out = F>>(g: G) -> impl Fn(&mut [F], &mut [MaybeUninit<F>]) { move |a, v| { g.slice([Arg::Many(a)], a.len(), v); } }
 
 /// The values of `Pow`'s slice form, each argument of a block raised to `k`, for [`composed`].
-fn raised<F: Float>(k: F) -> impl Fn(&mut [F], &mut [MaybeUninit<F>]) where Pow: Forms<F, 2, Out = F> { move |a, v| { Pow.slice([Arg::Many(a), Arg::One(k)], a.len(), v); } }
+fn raised<F: Float>(k: F) -> impl Fn(&mut [F], &mut [MaybeUninit<F>]) where Pow: Forms<F, 2, Out = F> {
+    move |a, v| { Pow.slice([Arg::Many(a), Arg::One(k)], a.len(), v); }
+}
 
 impl Distribution {
     /// The density at x, or for a discrete distribution the probability of x.
@@ -291,10 +315,16 @@ struct Normal { mean: f64, sd: f64 }
 impl Normal {
     /// The argument of `erfc` in the cdf, (mean - x)/(sd√2), at float type `F`, as a map that multiplies by the reciprocal it computes when it's made. A loop over a closure that read `sd` through a reference divided for each item in x86-64 builds.
     #[inline(always)]
-    fn erfc_line<F: Float>(&self) -> impl Fn(F) -> F + Copy + use<F> { let (mean, scale) = (F::narrow(self.mean), F::narrow(FRAC_1_SQRT_2 / self.sd)); move |x| (mean - x) * scale }
+    fn erfc_line<F: Float>(&self) -> impl Fn(F) -> F + Copy + use<F> {
+        let (mean, scale) = (F::narrow(self.mean), F::narrow(FRAC_1_SQRT_2 / self.sd));
+        move |x| (mean - x) * scale
+    }
     /// The quantile from e = erfcinv(2p), mean - sd·√2·e, at float type `F`, as a map that holds its constants.
     #[inline(always)]
-    fn from_erfcinv<F: Float>(&self) -> impl Fn(F) -> F + Copy + use<F> { let (mean, step) = (F::narrow(self.mean), F::narrow(self.sd * SQRT_2)); move |e| mean - step * e }
+    fn from_erfcinv<F: Float>(&self) -> impl Fn(F) -> F + Copy + use<F> {
+        let (mean, step) = (F::narrow(self.mean), F::narrow(self.sd * SQRT_2));
+        move |e| mean - step * e
+    }
     /// The density at float type `F`, as a map that holds its constants, so that a loop over items computes them once.
     #[inline(always)]
     fn density<F: Float>(&self) -> impl Fn(F) -> F + Copy + use<F> {
@@ -341,11 +371,18 @@ impl Uniform {
 impl Formulas for Uniform {
     through_slices!();
     #[inline(always)]
-    fn pdf_map<F: Float>(&self) -> impl Fn(F) -> F + Copy { let (min, max, width) = self.bounds::<F>(); let height = width.recip(); move |x| if x >= min && x <= max { height } else { F::zero() } }
+    fn pdf_map<F: Float>(&self) -> impl Fn(F) -> F + Copy {
+        let (min, max, width) = self.bounds::<F>();
+        let height = width.recip();
+        move |x| if x >= min && x <= max { height } else { F::zero() }
+    }
     #[inline(always)]
     fn cdf_map<F: Float>(&self) -> impl Fn(F) -> F + Copy {
         let (min, _, width) = self.bounds::<F>();
-        move |x| { let c = (x - min) / width; if c < F::zero() { F::zero() } else if c > F::one() { F::one() } else { c } }
+        move |x| {
+            let c = (x - min) / width;
+            if c < F::zero() { F::zero() } else if c > F::one() { F::one() } else { c }
+        }
     }
     #[inline(always)]
     fn quantile_map<F: Float>(&self) -> impl Fn(F) -> F + Copy { let (min, _, width) = self.bounds::<F>(); move |p| min + p * width }
@@ -382,14 +419,23 @@ impl Formulas for Cauchy {
     #[inline(always)]
     fn cdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Atan: Forms<F, 1, Out = F> {
         let (location, rscale, rpi, half) = (F::narrow(self.location), F::narrow(self.scale.recip()), F::narrow(PI.recip()), F::narrow(0.5));
-        composed(x, n, out, move |x| { let z = (x - location) * rscale; let (num, den) = if z.abs() <= F::one() { (z, F::one()) } else { (-F::one(), z) }; num / den }, through(Atan),
-            move |x, a| { let (z, a) = ((x - location) * rscale, a * rpi); if z.abs() <= F::one() { half + a } else if z < F::zero() { a } else { F::one() + a } })
+        composed(x, n, out, move |x| {
+            let z = (x - location) * rscale;
+            let (num, den) = if z.abs() <= F::one() { (z, F::one()) } else { (-F::one(), z) };
+            num / den
+        }, through(Atan), move |x, a| {
+            let (z, a) = ((x - location) * rscale, a * rpi);
+            if z.abs() <= F::one() { half + a } else if z < F::zero() { a } else { F::one() + a }
+        })
     }
     /// The tangent, from `Tan`'s slice form, is of π·a, where a is p below p = 1/4, 1 - p above 3/4, and p - 1/2 between, so its argument stays within ±π/4. Near 0 and 1 the quantile is location ∓ scale/tan(π·a), which keeps p's digits there.
     #[inline(always)]
     fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Tan: Forms<F, 1, Out = F> {
-        let (location, scale, pi, low, high, half) = (F::narrow(self.location), F::narrow(self.scale), F::narrow(PI), F::narrow(0.25), F::narrow(0.75), F::narrow(0.5));
-        composed(p, n, out, move |p| pi * if p < low { p } else if p > high { F::one() - p } else { p - half }, through(Tan), move |p, t| {
+        let (location, scale, pi, low, high, half) =
+            (F::narrow(self.location), F::narrow(self.scale), F::narrow(PI), F::narrow(0.25), F::narrow(0.75), F::narrow(0.5));
+        composed(p, n, out, move |p| {
+            pi * if p < low { p } else if p > high { F::one() - p } else { p - half }
+        }, through(Tan), move |p, t| {
             let (num, den) = if p < low { (-scale, t) } else if p > high { (scale, t) } else { (scale * t, F::one()) };
             location + num / den
         })
@@ -403,9 +449,15 @@ struct Exponential { rate: f64 }
 impl Formulas for Exponential {
     through_slices!();
     #[inline(always)]
-    fn pdf_map<F: Float>(&self) -> impl Fn(F) -> F + Copy { let rate = F::narrow(self.rate); move |x| { let d = rate * exp(-rate * x); if x < F::zero() { F::zero() } else { d } } }
+    fn pdf_map<F: Float>(&self) -> impl Fn(F) -> F + Copy {
+        let rate = F::narrow(self.rate);
+        move |x| { let d = rate * exp(-rate * x); if x < F::zero() { F::zero() } else { d } }
+    }
     #[inline(always)]
-    fn cdf_map<F: Float>(&self) -> impl Fn(F) -> F + Copy { let rate = F::narrow(self.rate); move |x| { let c = -expm1(-rate * x); if x <= F::zero() { F::zero() } else { c } } }
+    fn cdf_map<F: Float>(&self) -> impl Fn(F) -> F + Copy {
+        let rate = F::narrow(self.rate);
+        move |x| { let c = -expm1(-rate * x); if x <= F::zero() { F::zero() } else { c } }
+    }
     #[inline(always)]
     fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Log1p: Forms<F, 1, Out = F> {
         let mean = F::narrow(self.rate.recip());
@@ -478,12 +530,19 @@ impl Formulas for Laplace {
     #[inline(always)]
     fn cdf_map<F: Float>(&self) -> impl Fn(F) -> F + Copy {
         let (location, rscale, half) = (F::narrow(self.location), F::narrow(self.scale.recip()), F::narrow(0.5));
-        move |x| { let z = (x - location) * rscale; let e = half * exp(-z.abs()); if z < F::zero() { e } else { F::one() - e } }
+        move |x| {
+            let z = (x - location) * rscale;
+            let e = half * exp(-z.abs());
+            if z < F::zero() { e } else { F::one() - e }
+        }
     }
     #[inline(always)]
     fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Ln: Forms<F, 1, Out = F> {
         let (location, scale, half) = (F::narrow(self.location), F::narrow(self.scale), F::narrow(0.5));
-        composed(p, n, out, move |p| { let r = if p < half { p } else { F::one() - p }; r + r }, through(Ln), move |p, l| if p < half { location + scale * l } else { location - scale * l })
+        composed(p, n, out, move |p| {
+            let r = if p < half { p } else { F::one() - p };
+            r + r
+        }, through(Ln), move |p, l| if p < half { location + scale * l } else { location - scale * l })
     }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { self.quantile(open(rng)) }
 }
@@ -497,12 +556,21 @@ impl Formulas for Logistic {
     #[inline(always)]
     fn pdf_map<F: Float>(&self) -> impl Fn(F) -> F + Copy {
         let (location, rscale) = (F::narrow(self.location), F::narrow(self.scale.recip()));
-        move |x| { let e = exp(-((x - location) * rscale).abs()); let d = F::one() + e; e / (d * d) * rscale }
+        move |x| {
+            let e = exp(-((x - location) * rscale).abs());
+            let d = F::one() + e;
+            e / (d * d) * rscale
+        }
     }
     #[inline(always)]
     fn cdf_map<F: Float>(&self) -> impl Fn(F) -> F + Copy {
         let (location, rscale) = (F::narrow(self.location), F::narrow(self.scale.recip()));
-        move |x| { let z = (x - location) * rscale; let e = exp(-z.abs()); let r = (F::one() + e).recip(); if z < F::zero() { e * r } else { r } }
+        move |x| {
+            let z = (x - location) * rscale;
+            let e = exp(-z.abs());
+            let r = (F::one() + e).recip();
+            if z < F::zero() { e * r } else { r }
+        }
     }
     #[inline(always)]
     fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Ln: Forms<F, 1, Out = F> {
@@ -526,12 +594,16 @@ impl Formulas for LogNormal {
     #[inline(always)]
     fn pdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Ln: Forms<F, 1, Out = F> {
         let pdf = self.normal().density();
-        composed(x, n, out, #[inline(always)] |x| if x > F::zero() { x } else { F::one() }, through(Ln), #[inline(always)] move |x, l| { let p = pdf(l) / x; if x <= F::zero() { F::zero() } else { p } })
+        composed(x, n, out, #[inline(always)] |x| if x > F::zero() { x } else { F::one() }, through(Ln), #[inline(always)] move |x, l| {
+            let p = pdf(l) / x;
+            if x <= F::zero() { F::zero() } else { p }
+        })
     }
     #[inline(always)]
     fn cdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Erfc: Forms<F, 1, Out = F> {
         let (line, half) = (self.normal().erfc_line(), F::narrow(0.5));
-        composed(x, n, out, #[inline(always)] move |x| line(ln(x)), through(Erfc), #[inline(always)] move |x, e| if x <= F::zero() { F::zero() } else { half * e })
+        composed(
+            x, n, out, #[inline(always)] move |x| line(ln(x)), through(Erfc), #[inline(always)] move |x, e| if x <= F::zero() { F::zero() } else { half * e })
     }
     #[inline(always)]
     fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Erfcinv: Forms<F, 1, Out = F> {
@@ -584,11 +656,15 @@ impl Formulas for Weibull {
     #[inline(always)]
     fn cdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Pow: Forms<F, 2, Out = F> {
         let rscale = F::narrow(self.scale.recip());
-        composed(x, n, out, move |x| if x <= F::zero() { F::one() } else { x * rscale }, raised(F::narrow(self.shape)), |x, w| { let c = -expm1(-w); if x <= F::zero() { F::zero() } else { c } })
+        composed(x, n, out, move |x| if x <= F::zero() { F::one() } else { x * rscale }, raised(F::narrow(self.shape)), |x, w| {
+            let c = -expm1(-w);
+            if x <= F::zero() { F::zero() } else { c }
+        })
     }
     /// scale·(-log1p(-p))^(1/shape), from `Log1p`'s slice form and then `Root`'s. `Root` takes shape itself as its degree, where `Pow` would need 1/shape rounded.
     #[inline(always)]
-    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Log1p: Forms<F, 1, Out = F>, Root: Forms<F, 2, Out = F> {
+    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Log1p: Forms<F, 1, Out = F>, Root: Forms<F, 2, Out = F>
+    {
         let (degree, scale) = (F::narrow(self.shape), F::narrow(self.scale));
         composed(p, n, out, |p| -p, move |a, v| {
             Log1p.slice([Arg::Many(a)], a.len(), v);

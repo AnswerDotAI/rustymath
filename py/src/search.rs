@@ -37,7 +37,10 @@ fn unique<'py>(py: Python<'py>, ar: &Bound<'py, PyAny>, mode: bool) -> PyResult<
     let firsts: Vec<i64> = firsts.into_iter().map(|p| p as i64).collect();
     let n = firsts.len();
     let values = Core::new(Layout::from([n].as_slice()), Buffer::gathered(view, &firsts)).map_err(py_err)?;
-    Ok([give(py, values, false)?, give(py, core(firsts, &[n])?, false)?, give(py, vector(numbers.into_iter().map(|k| k as usize))?, false)?, give(py, vector(counts)?, false)?])
+    Ok([
+        give(py, values, false)?, give(py, core(firsts, &[n])?, false)?, give(py, vector(numbers.into_iter().map(|k| k as usize))?, false)?,
+        give(py, vector(counts)?, false)?,
+    ])
 }
 
 /// `x` and `y` converted, with each item of `y`'s first matching position in flattened `x` under Mathish mode, or the size of `x` where none matches.
@@ -82,8 +85,10 @@ fn find<'py>(py: Python<'py>, pattern: &Bound<'py, PyAny>, target: &Bound<'py, P
 }
 
 fn _set<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>, how: &str, mode: bool) -> PyResult<Bound<'py, PyAny>> {
-    let how = match how { "union" => search::Set::Union, "intersection" => search::Set::Intersection, "difference" => search::Set::Difference,
-        _ => return Err(py_err(Error::new(Kind::Domain, "unknown set operation"))), };
+    let how = match how {
+        "union" => search::Set::Union, "intersection" => search::Set::Intersection, "difference" => search::Set::Difference,
+        _ => return Err(py_err(Error::new(Kind::Domain, "unknown set operation")))
+    };
     let call = convert(&[x, y])?;
     let (xs, ys) = (call.args[0].at(call.args[0].view().dtype())?, call.args[1].at(call.args[1].view().dtype())?);
     let (x, y, t) = (xs.view(), ys.view(), comparison(mode && mathish_at(Some(xs.view().dtype()))));
@@ -113,7 +118,8 @@ fn group_indices<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, mode: bool) -> PyR
 
 /// Stable positions that sort equally shaped `keys` along `axis`, with the last key primary, or along the flattened keys with no axis. The sorted axis keeps its name and drops its keys. A rank-0 key sorts as one item, as in NumPy.
 fn sorted<'py>(py: Python<'py>, function: &str, keys: &[Arg], axis: Option<Axis>) -> PyResult<Bound<'py, PyAny>> {
-    let layout = keys.first().map(Arg::layout).filter(|l| keys.iter().all(|k| k.layout().shape() == l.shape())).ok_or_else(|| py_err(Error::new(Kind::Length, format!("{function} needs one or more equally shaped keys"))))?;
+    let layout = keys.first().map(Arg::layout).filter(|l| keys.iter().all(|k| k.layout().shape() == l.shape()))
+        .ok_or_else(|| py_err(Error::new(Kind::Length, format!("{function} needs one or more equally shaped keys"))))?;
     let keys = keys.iter().map(|k| k.row_major()).collect::<PyResult<Vec<_>>>()?;
     for k in &keys { if matches!(k.view(), View::Complexes(_)) { return Err(missing(function, k.view().dtype())); } }
     let total = keys[0].view().len();
@@ -121,16 +127,15 @@ fn sorted<'py>(py: Python<'py>, function: &str, keys: &[Arg], axis: Option<Axis>
     let (dims, mut layout, position) = along_axis(layout, total, axis)?;
     if let Some(a) = position { layout = layout.without_keys(a); }
     let columns: Vec<_> = keys.iter().rev().map(|k| (k.view(), 0, 1)).collect();
-    let order = released(py, || search::view_lexgrade_along(&columns, dims, false)).map_err(py_err)?.ok_or_else(|| missing(function, keys[0].view().dtype()))?;
+    let order =
+        released(py, || search::view_lexgrade_along(&columns, dims, false)).map_err(py_err)?.ok_or_else(|| missing(function, keys[0].view().dtype()))?;
     give_items(py, layout, i64::buffer(order), false)
 }
 
 /// Stable positions that sort `a` along `axis`, the last axis by default, as in NumPy. `axis=None` sorts along the flattened `a`.
 #[pyfunction]
 #[pyo3(signature = (a, axis=LAST_AXIS), text_signature = "(a, axis=-1)")]
-pub fn argsort<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, axis: Option<Axis>) -> PyResult<Bound<'py, PyAny>> {
-    sorted(py, "argsort", &[one(a)?], axis)
-}
+pub fn argsort<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, axis: Option<Axis>) -> PyResult<Bound<'py, PyAny>> { sorted(py, "argsort", &[one(a)?], axis) }
 
 #[derive(Clone, Copy)]
 enum Ordering { Sort(bool), Partition(i64, bool), Extreme(bool) }
@@ -148,22 +153,27 @@ fn ordered<'py>(py: Python<'py>, name: &str, a: &Bound<'py, PyAny>, axis: Option
     } else { 0 };
     if matches!(how, Ordering::Extreme(_)) && n == 0 { return Err(py_err(Error::new(Kind::Length, "an empty axis has no minimum or maximum"))); }
     if let Some(a) = position.filter(|&a| layout.keys(a).is_some()) {
-        let order = if outer * inner == 1 { released(py, || match how {
-            Ordering::Sort(down) => search::view_grade(view, down),
-            Ordering::Partition(_, false) => search::view_argpartition(view, rank), _ => None,
-        })} else { None };
+        let order = if outer * inner == 1 {
+            released(py, || match how {
+                Ordering::Sort(down) => search::view_grade(view, down), Ordering::Partition(_, false) => search::view_argpartition(view, rank), _ => None
+            })
+        } else { None };
         if let Some(order) = order {
             let layout = layout.select(a, order.iter().map(|&p| Some(p as usize))).map_err(py_err)?;
             return give_items(py, layout, Buffer::gathered(view, &order), false);
         }
         layout = layout.without_keys(a);
     }
-    let result = released(py, || -> Result<Buffer, Error> { Ok(match how {
-        Ordering::Sort(down) => search::view_sort_along(view, dims, down)?.unwrap(),
-        Ordering::Partition(_, indices) => search::view_partition_along(view, dims, rank, indices)?.unwrap(),
-        Ordering::Extreme(down) => i64::buffer(search::view_argextremes(view, dims, down).unwrap()),
-    }) }).map_err(py_err)?;
-    let layout = if matches!(how, Ordering::Extreme(_)) { position.map_or(Layout::EMPTY, |a| layout.axes((0..layout.shape().len()).filter(move |&i| i != a))) } else { layout };
+    let result = released(py, || -> Result<Buffer, Error> {
+        Ok(match how {
+            Ordering::Sort(down) => search::view_sort_along(view, dims, down)?.unwrap(),
+            Ordering::Partition(_, indices) => search::view_partition_along(view, dims, rank, indices)?.unwrap(),
+            Ordering::Extreme(down) => i64::buffer(search::view_argextremes(view, dims, down).unwrap()),
+        })
+    }).map_err(py_err)?;
+    let layout = if matches!(how, Ordering::Extreme(_)) {
+        position.map_or(Layout::EMPTY, |a| layout.axes((0..layout.shape().len()).filter(move |&i| i != a)))
+    } else { layout };
     give_items(py, layout, result, matches!(how, Ordering::Extreme(_)) && position.is_none())
 }
 
@@ -206,7 +216,8 @@ pub fn quantile<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, q: &Bound<'py, PyAn
     let layout = x.layout();
     let (dims, _, position) = along_axis(layout.clone(), x.view().len(), axis)?;
     let input = x.row_major()?;
-    let items = released(py, || search::view_quantiles_along(input.view(), dims, &probabilities)).map_err(py_err)?.ok_or_else(|| missing("quantile", x.view().dtype()))?;
+    let items = released(py, || search::view_quantiles_along(input.view(), dims, &probabilities)).map_err(py_err)?
+        .ok_or_else(|| missing("quantile", x.view().dtype()))?;
     let frame = position.map_or(Layout::EMPTY, |a| layout.axes((0..layout.shape().len()).filter(move |&i| i != a)));
     let layout = if q.layout().shape().is_empty() { frame } else { q.layout().concat(&frame) };
     let out = Core::new(layout, items).map_err(py_err)?;
@@ -237,7 +248,8 @@ pub fn searchsorted<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, v: &Bound<'py, 
     let (x, y) = (call.args[0].at(call.args[0].view().dtype())?, call.args[1].at(call.args[1].view().dtype())?);
     let (xs, ys) = (x.view(), y.view());
     if call.args[0].layout().shape().len() != 1 { return Err(py_err(Error::new(Kind::Rank, "searchsorted needs a one-dimensional sorted array"))); }
-    let found = released(py, || if right { search::view_bins(xs, ys) } else { search::view_bins_below(xs, ys) }).ok_or_else(|| missing("searchsorted", xs.dtype()))?;
+    let found =
+        released(py, || if right { search::view_bins(xs, ys) } else { search::view_bins_below(xs, ys) }).ok_or_else(|| missing("searchsorted", xs.dtype()))?;
     give(py, positions(call.args[1].layout(), found.into_iter().map(|p| p as usize))?, call.args[1].scalar)
 }
 
@@ -259,9 +271,8 @@ pub fn bincount<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, minlength: i64) -> 
     let minlength = usize::try_from(minlength).map_err(|_| py_err(Error::new(Kind::Domain, "minlength must be nonnegative")))?;
     let input = x.row_major()?;
     let counts = released(py, || match input.view() {
-        View::Integers(ints) => rustymath::with_ints!(ints, |x| counted(x, minlength)),
-        View::Booleans(x) => counted(x, minlength),
-        view => Err(missing("bincount", view.dtype())),
+        View::Integers(ints) => rustymath::with_ints!(ints, |x| counted(x, minlength)), View::Booleans(x) => counted(x, minlength),
+        view => Err(missing("bincount", view.dtype()))
     })?;
     give(py, vector(counts)?, false)
 }
@@ -301,8 +312,8 @@ pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
     ordinary::add(m)?;
     for f in [
         wrap_pyfunction!(argsort, m)?, wrap_pyfunction!(sort, m)?, wrap_pyfunction!(partition, m)?, wrap_pyfunction!(argpartition, m)?,
-        wrap_pyfunction!(argmin, m)?, wrap_pyfunction!(argmax, m)?, wrap_pyfunction!(median, m)?, wrap_pyfunction!(quantile, m)?,
-        wrap_pyfunction!(lexsort, m)?, wrap_pyfunction!(searchsorted, m)?, wrap_pyfunction!(bincount, m)?,
+        wrap_pyfunction!(argmin, m)?, wrap_pyfunction!(argmax, m)?, wrap_pyfunction!(median, m)?, wrap_pyfunction!(quantile, m)?, wrap_pyfunction!(lexsort, m)?,
+        wrap_pyfunction!(searchsorted, m)?, wrap_pyfunction!(bincount, m)?,
     ] { m.add_function(f)?; }
     Ok(())
 }

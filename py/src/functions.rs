@@ -6,7 +6,7 @@
 //!
 //! [`checked`] keeps a failed integer result that its kernel wrapped, as NumPy does. It raises `OverflowError` for any other integer result that doesn't fit its dtype. [`py_err`] turns every other rustymath error into a Python exception. Step 2 runs with the GIL released ([`released`](crate::convert::released)), so other Python threads run meanwhile. A Python thread that writes to an argument's items during a call leaves the call's results undefined.
 use crate::array::{give, give_items};
-use crate::convert::{convert, convert_kinds, one, released, Call};
+use crate::convert::{Call, convert, convert_kinds, one, released};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rustymath::agreement::{Agreement, Mapping};
@@ -14,13 +14,13 @@ use rustymath::array::{Array as Core, ArrayView};
 use rustymath::buffer::{Buffer, ComplexWidth, DType, Element, Fill, FloatWidth, Items, View};
 use rustymath::error::{Error, Kind};
 use rustymath::gather::Steps;
-use rustymath::layout::{position, Lanes, Layout};
-use rustymath::operation::{AccumulationKernel, BinaryKernel, Kernels, MappedFoldKernel, SlidingKernel, TernaryKernel, UnaryKernel};
+use rustymath::layout::{Lanes, Layout, position};
 use rustymath::linalg::Scalar;
+use rustymath::operation::{AccumulationKernel, BinaryKernel, Kernels, MappedFoldKernel, SlidingKernel, TernaryKernel, UnaryKernel};
 use rustymath::stats;
-use rustymath::structure::{walked_source, Plan, Slide};
-use rustymath::tolerant::{Ceil, Equal, Floor, FloorDivide, MathishFloorDivide, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue, Tolerance};
-use rustymath::{Flipped, kernels, reduce, with_ints, Wrapped};
+use rustymath::structure::{Plan, Slide, walked_source};
+use rustymath::tolerant::{Ceil, Equal, Floor, FloorDivide, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, MathishFloorDivide, NotEqual, Residue, Tolerance};
+use rustymath::{Flipped, Wrapped, kernels, reduce, with_ints};
 use rustymath_buffer::py_err;
 
 /// The error for a function with no kernel for `dtype`.
@@ -40,18 +40,11 @@ fn fitted<F: Copy>(function: &str, kernels: &Kernels<F>, dtype: DType, out: DTyp
 }
 
 pub(crate) fn comparison(mathish: bool) -> Tolerance { if mathish { Tolerance::DEFAULT } else { Tolerance::EXACT } }
-pub(crate) fn mathish_at(dtype: Option<DType>) -> bool {
-    matches!(dtype, Some(DType::Float(FloatWidth::F64) | DType::Complex(ComplexWidth::F64)))
-}
+pub(crate) fn mathish_at(dtype: Option<DType>) -> bool { matches!(dtype, Some(DType::Float(FloatWidth::F64) | DType::Complex(ComplexWidth::F64))) }
 
 /// An axis, given as a position, negative from the end, or as an axis name.
 #[derive(FromPyObject)]
-pub enum Axis {
-    #[pyo3(annotation = "int")]
-    Position(i64),
-    #[pyo3(annotation = "str")]
-    Name(String),
-}
+pub enum Axis { #[pyo3(annotation = "int")] Position(i64), #[pyo3(annotation = "str")] Name(String) }
 
 impl Axis {
     /// The axis of `layout` that this names. An IndexError where it names none.
@@ -66,19 +59,11 @@ impl Axis {
 
 /// The axes a reduction runs over: one axis, or a tuple of them.
 #[derive(FromPyObject)]
-pub enum Axes {
-    #[pyo3(annotation = "int | str")]
-    One(Axis),
-    #[pyo3(annotation = "tuple")]
-    Many(Vec<Axis>),
-}
+pub enum Axes { #[pyo3(annotation = "int | str")] One(Axis), #[pyo3(annotation = "tuple")] Many(Vec<Axis>) }
 
 impl Axes {
     fn positions(&self, layout: &Layout) -> PyResult<Vec<usize>> {
-        let mut axes = match self {
-            Self::One(a) => vec![a.of(layout)?],
-            Self::Many(axes) => axes.iter().map(|a| a.of(layout)).collect::<PyResult<_>>()?,
-        };
+        let mut axes = match self { Self::One(a) => vec![a.of(layout)?], Self::Many(axes) => axes.iter().map(|a| a.of(layout)).collect::<PyResult<_>>()? };
         axes.sort_unstable();
         axes.dedup();
         Ok(axes)
@@ -90,9 +75,7 @@ fn axes_of(axis: Option<&Axes>, layout: &Layout) -> PyResult<Vec<usize>> {
 }
 
 /// Running a function object's kernels on a call's Python arguments, for each arity.
-pub trait Apply<K> {
-    fn apply<'py>(&self, py: Python<'py>, function: &str, k: &K, call: Call) -> PyResult<Bound<'py, PyAny>>;
-}
+pub trait Apply<K> { fn apply<'py>(&self, py: Python<'py>, function: &str, k: &K, call: Call) -> PyResult<Bound<'py, PyAny>>; }
 
 impl<K: Sync> Apply<K> for Kernels<UnaryKernel<K>> {
     fn apply<'py>(&self, py: Python<'py>, function: &str, k: &K, call: Call) -> PyResult<Bound<'py, PyAny>> {
@@ -103,13 +86,17 @@ impl<K: Sync> Apply<K> for Kernels<UnaryKernel<K>> {
 }
 
 /// `k` on two arguments. `domain` is the message of a Domain error for a failed integer result from a pair with a negative integer exponent and a base other than 1 or -1, as an integer power gives. Where `characters` gives the object's [`characters::binary`](rustymath::characters::binary), a call with a character argument runs it, and raises a Domain error where an offset isn't whole or a result isn't a Unicode scalar value.
-fn binary<'py, K: Sync>(kernels: &Kernels<BinaryKernel<K>>, py: Python<'py>, function: &str, k: &K, call: Call, domain: Option<&str>, characters: Option<rustymath::characters::Kernel<K>>) -> PyResult<Bound<'py, PyAny>> {
+fn binary<'py, K: Sync>(
+    kernels: &Kernels<BinaryKernel<K>>, py: Python<'py>, function: &str, k: &K, call: Call, domain: Option<&str>,
+    characters: Option<rustymath::characters::Kernel<K>>) -> PyResult<Bound<'py, PyAny>> {
     let Some(characters) = characters else { return binary_call(kernels, py, function, k, call, domain) };
     let (x, y) = (call.args[0].view(), call.args[1].view());
     if x.dtype() != DType::Character && y.dtype() != DType::Character { return binary_call(kernels, py, function, k, call, domain); }
     let agreement = Agreement::new(x.layout(), y.layout()).map_err(py_err)?;
     let (buffer, ok) = released(py, || characters(k, x, y, agreement.layout.shape(), &agreement)).ok_or_else(|| missing(function, DType::Character))?;
-    if !ok { return Err(py_err(Error::new(Kind::Domain, format!("{function} gives a character only for a whole offset and a result in Unicode")))); }
+    if !ok {
+        return Err(py_err(Error::new(Kind::Domain, format!("{function} gives a character only for a whole offset and a result in Unicode"))));
+    }
     give_items(py, agreement.layout, buffer, call.scalar())
 }
 
@@ -118,7 +105,8 @@ fn convert_binary<K>(_: &K, characters: Option<rustymath::characters::Kernel<K>>
 }
 
 /// [`binary`] on a call that [`convert`] or [`convert_kinds`] gave.
-fn binary_call<'py, K: Sync>(kernels: &Kernels<BinaryKernel<K>>, py: Python<'py>, function: &str, k: &K, call: Call, domain: Option<&str>) -> PyResult<Bound<'py, PyAny>> {
+fn binary_call<'py, K: Sync>(
+    kernels: &Kernels<BinaryKernel<K>>, py: Python<'py>, function: &str, k: &K, call: Call, domain: Option<&str>) -> PyResult<Bound<'py, PyAny>> {
     let (x, y) = (call.args[0].view(), call.args[1].view());
     let agreement = Agreement::new(x.layout(), y.layout()).map_err(py_err)?;
     let buffer = released(py, || checked_binary(function, kernels, kernels.binary(k, x, y, &agreement), x.dtype(), y, &agreement, domain))?;
@@ -130,13 +118,18 @@ fn negative_right(y: ArrayView<'_>, agreement: &Agreement) -> bool {
     let View::Integers(ints) = y.storage() else { return false };
     let (outer, inner) = (&agreement.right, y.mapping());
     with_ints!(ints, |items| (0..agreement.len).any(|i| {
-        let x = match outer.get(i) { None => Fill::item(outer.chosen()), Some(j) => inner.get(j).map_or_else(|| Fill::item(inner.chosen()), |o| items[o]) };
+        let x = match outer.get(i) {
+            None => Fill::item(outer.chosen()),
+            Some(j) => inner.get(j).map_or_else(|| Fill::item(inner.chosen()), |o| items[o]),
+        };
         i64::from(x) < 0
     }))
 }
 
 /// [`checked`] after raising `domain` for a failed integer call with a negative right argument.
-fn checked_binary<F: Copy>(function: &str, kernels: &Kernels<F>, result: Option<(Buffer, bool)>, dtype: DType, right: ArrayView<'_>, agreement: &Agreement, domain: Option<&str>) -> PyResult<Buffer> {
+fn checked_binary<F: Copy>(
+    function: &str, kernels: &Kernels<F>, result: Option<(Buffer, bool)>, dtype: DType, right: ArrayView<'_>, agreement: &Agreement, domain: Option<&str>
+) -> PyResult<Buffer> {
     if let (Some((buffer, false)), Some(message)) = (&result, domain) && matches!(buffer.dtype(), DType::Integer(_)) && negative_right(right, agreement) {
         return Err(py_err(Error::new(Kind::Domain, message.to_owned())));
     }
@@ -172,10 +165,7 @@ fn fold<'py, R: Sync>(py: Python<'py>, function: &str, folds: &Folds<R>, r: &R, 
 
 /// `r`'s totals of `x` over the axes that `axis` names, as [`fold`] takes them. `None` where `axis` is an empty tuple, which leaves the argument as it is. A fold along one axis of a view of windows slides over the view's storage without building the windows ([`slid`]). A view that reads a block of its storage folds the block in place, and a view that keeps what it gathers ([`ArrayView::keeps`]) gathers once where it reads runs that [`reduce::rereads_cheaply`] rejects, both through [`ArrayView::fold_items`]. Any other view folds through its mapping without building it ([`reduce::along_mapped`]). The totals keep `x`'s order.
 fn totals<R>(function: &str, folds: &Folds<R>, r: &R, x: ArrayView<'_>, axis: Option<&Axes>) -> PyResult<Option<Core>> {
-    let mut steps: Vec<Option<usize>> = match axis {
-        None => vec![None],
-        Some(axes) => axes.positions(x.layout())?.into_iter().map(Some).collect(),
-    };
+    let mut steps: Vec<Option<usize>> = match axis { None => vec![None], Some(axes) => axes.positions(x.layout())?.into_iter().map(Some).collect() };
     // The last axis first, so that each later position still names its axis.
     steps.sort_unstable_by(|a, b| b.cmp(a));
     let mut out: Option<Core> = None;
@@ -223,7 +213,9 @@ pub(crate) fn along_axis(layout: Layout, len: usize, axis: Option<Axis>) -> PyRe
 }
 
 /// `r`'s running totals of `x` along `axis`, or along the flattened `x` for `None`.
-fn scan<'py, R: Sync>(py: Python<'py>, function: &str, kernels: &Kernels<AccumulationKernel<R>>, r: &R, x: &Bound<'py, PyAny>, axis: Option<Axis>) -> PyResult<Bound<'py, PyAny>> {
+fn scan<'py, R: Sync>(
+    py: Python<'py>, function: &str, kernels: &Kernels<AccumulationKernel<R>>, r: &R, x: &Bound<'py, PyAny>, axis: Option<Axis>
+) -> PyResult<Bound<'py, PyAny>> {
     let call = convert(&[x])?;
     let items = call.args[0].at(call.args[0].view().dtype())?;
     let x = items.view();
@@ -646,7 +638,9 @@ fn logical_scan<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, table: [[bool; 2]; 
 
 #[pyfunction]
 #[pyo3(signature = (function, x, axis=None, start=None))]
-fn _accumulate<'py>(py: Python<'py>, function: NativeFunction<'_>, x: &Bound<'py, PyAny>, axis: Option<Axis>, start: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+fn _accumulate<'py>(
+    py: Python<'py>, function: NativeFunction<'_>, x: &Bound<'py, PyAny>, axis: Option<Axis>, start: Option<&Bound<'py, PyAny>>
+) -> PyResult<Bound<'py, PyAny>> {
     let call = convert(&[Some(x), start].into_iter().flatten().collect::<Vec<_>>())?;
     let x = &call.args[0];
     let start = call.args.get(1);
@@ -673,7 +667,8 @@ fn _sliding<'py>(py: Python<'py>, function: NativeFunction<'_>, x: &Bound<'py, P
         let kernels = kernels!(Sliding of r)$(.only($only))?;
         Some(checked(function, &kernels, view.dtype(), kernels.sliding(&r, view, lanes.dims(), width)))
     }}; }
-    let folds = released(py, || rustymath::facts!(known_reduction, function, run)).ok_or_else(|| PyValueError::new_err(format!("{function:?} has no associative reduction to slide")))??;
+    let folds = released(py, || rustymath::facts!(known_reduction, function, run))
+        .ok_or_else(|| PyValueError::new_err(format!("{function:?} has no associative reduction to slide")))??;
     give_items(py, layout, folds, false)
 }
 
@@ -683,13 +678,15 @@ fn _sliding_pick<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, width: usize, axis
     let x = one(x)?;
     let items = x.row_major()?;
     let (lanes, layout) = windowed(&x.layout(), width, &axis)?;
-    let rows = released(py, || reduce::view_picks(items.view(), lanes.dims(), reduce::Picks::Windows(width), max)).ok_or_else(|| missing(if max { "sliding_argmax" } else { "sliding_argmin" }, items.view().dtype()))?;
+    let rows = released(py, || reduce::view_picks(items.view(), lanes.dims(), reduce::Picks::Windows(width), max))
+        .ok_or_else(|| missing(if max { "sliding_argmax" } else { "sliding_argmin" }, items.view().dtype()))?;
     give_items(py, layout, i64::buffer(rows.into_iter().map(|r| r as i64).collect()), false)
 }
 
 /// `a`, with `b` broadcast over the selection that `index` makes, as brackets take it, and combined by `function` into each item it selects, in turn. A target selected more than once combines every item that selects it. `function` is add, subtract, multiply, divide, maximum or minimum. A failed integer result follows [`fitted`]'s rule.
 #[pyfunction]
-fn _at<'py>(py: Python<'py>, function: NativeFunction<'_>, a: &Bound<'py, PyAny>, index: &Bound<'py, PyAny>, b: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+fn _at<'py>(
+    py: Python<'py>, function: NativeFunction<'_>, a: &Bound<'py, PyAny>, index: &Bound<'py, PyAny>, b: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let (function, mode) = function;
     let mut args = convert(&[a, b])?.args.into_iter();
     let (a, b) = (args.next().expect("two arguments give two"), args.next().expect("two arguments give two"));
@@ -709,11 +706,11 @@ fn _at<'py>(py: Python<'py>, function: NativeFunction<'_>, a: &Bound<'py, PyAny>
         out
     }}; }
     let out = match function {
-        "add" => run!(Scatter, Wrapped(rustymath::Add)), "subtract" => run!(Scatter, Wrapped(rustymath::Subtract)), "multiply" => run!(Scatter, Wrapped(rustymath::Multiply)),
+        "add" => run!(Scatter, Wrapped(rustymath::Add)), "subtract" => run!(Scatter, Wrapped(rustymath::Subtract)),
+        "multiply" => run!(Scatter, Wrapped(rustymath::Multiply)),
         "divide" if mode && mathish_at(kernels!(Scatter of rustymath::Divide).computes(a.view().dtype())) => run!(Scatter, rustymath::MathishDivide),
-        "divide" => run!(Scatter, rustymath::Divide),
-        "maximum" => run!(Combine, reduce::Max), "minimum" => run!(Combine, reduce::Min),
-        _ => return Err(PyValueError::new_err(format!("at takes add, subtract, multiply, divide, maximum or minimum, not {function}"))),
+        "divide" => run!(Scatter, rustymath::Divide), "maximum" => run!(Combine, reduce::Max), "minimum" => run!(Combine, reduce::Min),
+        _ => return Err(PyValueError::new_err(format!("at takes add, subtract, multiply, divide, maximum or minimum, not {function}")))
     };
     give(py, out, false)
 }
@@ -723,7 +720,8 @@ fn windowed(layout: &Layout, width: usize, axis: &Axis) -> PyResult<(Lanes, Layo
     let a = axis.of(layout)?;
     let lanes = Lanes::new(layout.shape(), a).map_err(py_err)?;
     if !(1..=lanes.len).contains(&width) { return Err(PyValueError::new_err(format!("a window of {width} items doesn't fit an axis of {}", lanes.len))); }
-    let starts = rustymath::structure::select_axis(layout, a, rustymath::structure::Selector::Range { start: 0, len: lanes.len + 1 - width, step: 1 }).map_err(py_err)?;
+    let starts = rustymath::structure::select_axis(layout, a, rustymath::structure::Selector::Range { start: 0, len: lanes.len + 1 - width, step: 1 })
+        .map_err(py_err)?;
     Ok((lanes, starts.layout))
 }
 
@@ -736,15 +734,17 @@ fn summary<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, axis: Option<Axes>, how:
     let axes = stats::Axes::new(&layout, &axes_of(axis.as_ref(), &layout)?).map_err(py_err)?;
     let compute = x.view().dtype().inexact(FloatWidth::F64).ok_or_else(|| missing("statistics", x.view().dtype()))?.0;
     let items = x.at(compute)?;
-    let out = released(py, || rustymath::with_inexact!(compute, T => {
-        let data = axes.read(items.of::<T>());
-        match how {
-            Summary::Mean => T::buffer(stats::mean(&data, axes.dims)),
-            Summary::Variance(ddof) => <T as Scalar>::Real::buffer(stats::variance(&data, axes.dims, ddof)),
-            Summary::Std(ddof) => <T as Scalar>::Real::buffer(stats::stddev(&data, axes.dims, ddof)),
-            Summary::Norm(p) => <T as Scalar>::Real::buffer(stats::norm(&data, axes.dims, p)),
-        }
-    }));
+    let out = released(py, || {
+        rustymath::with_inexact!(compute, T => {
+            let data = axes.read(items.of::<T>());
+            match how {
+                Summary::Mean => T::buffer(stats::mean(&data, axes.dims)),
+                Summary::Variance(ddof) => <T as Scalar>::Real::buffer(stats::variance(&data, axes.dims, ddof)),
+                Summary::Std(ddof) => <T as Scalar>::Real::buffer(stats::stddev(&data, axes.dims, ddof)),
+                Summary::Norm(p) => <T as Scalar>::Real::buffer(stats::norm(&data, axes.dims, p)),
+            }
+        })
+    });
     let scalar = axes.layout.shape().is_empty();
     give_items(py, axes.layout, out, scalar)
 }
@@ -757,12 +757,16 @@ pub(crate) fn mean<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, axis: Option<Axe
 /// Two-pass variance, real for complex data, with denominator item count minus ddof. A nonpositive denominator gives NaN.
 #[pyfunction]
 #[pyo3(signature = (x, axis=None, ddof=0))]
-pub(crate) fn var<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, axis: Option<Axes>, ddof: usize) -> PyResult<Bound<'py, PyAny>> { summary(py, x, axis, Summary::Variance(ddof)) }
+pub(crate) fn var<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, axis: Option<Axes>, ddof: usize) -> PyResult<Bound<'py, PyAny>> {
+    summary(py, x, axis, Summary::Variance(ddof))
+}
 
 /// The square root of var, over the same axes and with the same ddof.
 #[pyfunction]
 #[pyo3(signature = (x, axis=None, ddof=0))]
-pub(crate) fn std<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, axis: Option<Axes>, ddof: usize) -> PyResult<Bound<'py, PyAny>> { summary(py, x, axis, Summary::Std(ddof)) }
+pub(crate) fn std<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, axis: Option<Axes>, ddof: usize) -> PyResult<Bound<'py, PyAny>> {
+    summary(py, x, axis, Summary::Std(ddof))
+}
 
 /// Elementwise p-norm over the selected axes. ord=0 counts nonzeros; ±inf gives the greatest/least magnitude. This is not a matrix-induced norm.
 #[pyfunction]
@@ -783,7 +787,8 @@ pub(crate) fn average<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, axis: Option<
     let axes = stats::Axes::new(&agreement.layout, &axes_of(axis.as_ref(), &agreement.layout)?).map_err(py_err)?;
     let compute = x.view().dtype().inexact(FloatWidth::F64).ok_or_else(|| missing("average", x.view().dtype()))?.0;
     let (x, w) = (x.at(compute)?, w.at(compute)?);
-    let out = released(py, || rustymath::with_inexact!(compute, T => T::buffer(stats::average(x.of::<T>(), w.of::<T>(), &axes, [&agreement.left, &agreement.right]))));
+    let out = released(
+        py, || rustymath::with_inexact!(compute, T => T::buffer(stats::average(x.of::<T>(), w.of::<T>(), &axes, [&agreement.left, &agreement.right]))));
     let scalar = axes.layout.shape().is_empty();
     give_items(py, axes.layout, out, scalar)
 }
@@ -797,7 +802,7 @@ fn covariance<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, rowvar: bool, ddof: u
         [rows, cols] => {
             let variables = layout.axes([usize::from(!rowvar)].into_iter());
             ([rows, cols], rowvar, variables.concat(&variables).unique_names())
-        },
+        }
         _ => return Err(PyValueError::new_err("covariance takes a vector or a matrix")),
     };
     let compute = x.view().dtype().inexact(FloatWidth::F64).ok_or_else(|| missing("covariance", x.view().dtype()))?.0;
@@ -810,7 +815,9 @@ fn covariance<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, rowvar: bool, ddof: u
 /// Covariance of variables in the rows of a matrix, or columns with rowvar=False. A vector gives its variance.
 #[pyfunction]
 #[pyo3(signature = (x, rowvar=true, ddof=1))]
-pub(crate) fn cov<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, rowvar: bool, ddof: usize) -> PyResult<Bound<'py, PyAny>> { covariance(py, x, rowvar, ddof, false) }
+pub(crate) fn cov<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, rowvar: bool, ddof: usize) -> PyResult<Bound<'py, PyAny>> {
+    covariance(py, x, rowvar, ddof, false)
+}
 
 /// Correlation of variables in the rows of a matrix, or columns with rowvar=False. Constant variables give NaN.
 #[pyfunction]
@@ -820,7 +827,8 @@ pub(crate) fn corrcoef<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, rowvar: bool
 /// Histogram counts and edges. bins is a positive count (10 by default), or strictly increasing edges. `range` sets the span of a bin count. Explicit edges take no `range`. The final bin includes its upper edge; out-of-range values and NaNs are ignored.
 #[pyfunction]
 #[pyo3(signature = (x, bins=None, range=None))]
-pub(crate) fn histogram<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, bins: Option<&Bound<'py, PyAny>>, range: Option<(f64, f64)>) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
+pub(crate) fn histogram<'py>(
+    py: Python<'py>, x: &Bound<'py, PyAny>, bins: Option<&Bound<'py, PyAny>>, range: Option<(f64, f64)>) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
     let count = bins.map_or(Ok(10), |b| b.extract::<usize>());
     let edges = if count.is_err() { bins } else { None };
     if edges.is_some() && range.is_some() { return Err(PyValueError::new_err("histogram's range applies to a bin count, not to explicit edges")); }
@@ -829,14 +837,16 @@ pub(crate) fn histogram<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, bins: Optio
     let compute = dtype.inexact(FloatWidth::F64).filter(|(d, _)| !matches!(d, DType::Complex(_))).ok_or_else(|| missing("histogram", dtype))?.0;
     let x = call.args[0].at(compute)?;
     let explicit = call.args.get(1).map(|a| a.at(compute)).transpose()?;
-    let (counts, edges) = released(py, || -> PyResult<_> { Ok(rustymath::with_float_width!(kernel match compute { DType::Float(w) => w, _ => unreachable!() }, F => Some({
-        let data = F::of(x.view()).expect("histogram computes at a float width");
-        let edges = match explicit.as_ref() {
-            Some(e) => e.of::<F>().to_vec(),
-            None => stats::histogram_edges(data, count.unwrap_or(10), range).map_err(py_err)?,
-        };
-        (stats::histogram(data, &edges).map_err(py_err)?, F::buffer(edges))
-    })).expect("histogram computes in float32 or float64")) })?;
+    let (counts, edges) = released(py, || -> PyResult<_> {
+        Ok(rustymath::with_float_width!(kernel match compute { DType::Float(w) => w, _ => unreachable!() }, F => Some({
+            let data = F::of(x.view()).expect("histogram computes at a float width");
+            let edges = match explicit.as_ref() {
+                Some(e) => e.of::<F>().to_vec(),
+                None => stats::histogram_edges(data, count.unwrap_or(10), range).map_err(py_err)?,
+            };
+            (stats::histogram(data, &edges).map_err(py_err)?, F::buffer(edges))
+        })).expect("histogram computes in float32 or float64"))
+    })?;
     let counts = give_items(py, Layout::from([counts.len()]), i64::buffer(counts), false)?;
     let edges = give_items(py, Layout::from([edges.len()]), edges, false)?;
     Ok((counts, edges))

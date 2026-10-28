@@ -1,7 +1,10 @@
 //! Python syntax for the shared structural plans and independent-value views.
-use crate::{array::{Array, core, give}, convert::{self, Arg, released}, functions::{Axis, Axes}};
+use crate::{array::{Array, core, give}, convert::{self, Arg, released}, functions::{Axes, Axis}};
 use pyo3::{exceptions::{PyIndexError, PyTypeError, PyValueError}, prelude::*, types::PyTuple};
-use rustymath::{array::{Array as Core, ArrayView}, buffer::{Buffer, DType, Element, Fill}, error::Error, layout::{Layout, element_count, generated_len, position}, structure::{self, Edge, Edged, Plan, Selector}};
+use rustymath::{
+    array::{Array as Core, ArrayView}, buffer::{Buffer, DType, Element, Fill}, error::Error, layout::{Layout, element_count, generated_len, position},
+    structure::{self, Edge, Edged, Plan, Selector}
+};
 use rustymath_buffer::py_err;
 use std::sync::Arc;
 
@@ -20,7 +23,8 @@ fn selector(layout: &Layout, axis: usize, obj: &Bound<'_, PyAny>) -> PyResult<Se
 }
 /// The edge mode named `name`, one of the names in `structure::Edge::MODES`.
 fn mode_named(name: &str) -> PyResult<Edge> {
-    Edge::named(name).ok_or_else(|| PyValueError::new_err(format!("unknown mode {name:?}, which must be one of {}", Edge::MODES.map(|(n, _)| format!("{n:?}")).join(", "))))
+    Edge::named(name)
+        .ok_or_else(|| PyValueError::new_err(format!("unknown mode {name:?}, which must be one of {}", Edge::MODES.map(|(n, _)| format!("{n:?}")).join(", "))))
 }
 /// `fill`, a Python value, as a fill of `x`'s dtype. It must be one item that keeps its value at that dtype (`Fill::new`).
 fn fill_of(x: &Arg, fill: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Arc<Fill>>> {
@@ -34,13 +38,12 @@ fn edged(layout: &Layout, axis: usize, indices: &Bound<'_, PyAny>, edge: Edge) -
     Ok(indexed(layout, axis, Core::new(indices.layout().clone(), buffer).map_err(py_err)?)?.0)
 }
 pub fn selection(layout: &Layout, index: &Bound<'_, PyAny>) -> PyResult<Plan> {
-    rustymath_buffer::selection::selection(layout, index,
-        |p| {
-            if let Ok(a) = p.cast::<Array>() { return Ok(structure::sole_name(a.borrow().core().layout()).map(str::to_owned)); }
-            Ok(if p.hasattr("__rustymath_array__")? { rustymath_buffer::read_array(p)?.and_then(|(_, layout)| structure::sole_name(&layout).map(str::to_owned)) } else { None })
-        },
-        array_selector,
-    ).map(|(plan, _)| plan)
+    rustymath_buffer::selection::selection(layout, index, |p| {
+        if let Ok(a) = p.cast::<Array>() { return Ok(structure::sole_name(a.borrow().core().layout()).map(str::to_owned)); }
+        Ok(if p.hasattr("__rustymath_array__")? {
+            rustymath_buffer::read_array(p)?.and_then(|(_, layout)| structure::sole_name(&layout).map(str::to_owned))
+        } else { None })
+    }, array_selector).map(|(plan, _)| plan)
 }
 
 fn planned(py: Python<'_>, arg: Arg, build: impl FnOnce(&Layout) -> Result<Plan, Error>) -> PyResult<Array> {
@@ -49,12 +52,21 @@ fn planned(py: Python<'_>, arg: Arg, build: impl FnOnce(&Layout) -> Result<Plan,
 }
 /// The layout that `axis` refers to, and the axis's position: `x`'s own layout, or the flattened layout and its one axis when `axis` is `None`.
 fn along(x: &Arg, axis: Option<Axis>) -> PyResult<(Layout, usize)> {
-    match axis { Some(a) => { let l = x.layout(); let a = a.of(&l)?; Ok((l, a)) }, None => Ok((Layout::from([x.view().len()]), 0)) }
+    match axis {
+        Some(a) => {
+            let l = x.layout();
+            let a = a.of(&l)?;
+            Ok((l, a))
+        }
+        None => Ok((Layout::from([x.view().len()]), 0)),
+    }
 }
 
 /// Shares compact items under a new shape; one -1 infers its length. Reshaping drops axis metadata.
 pub fn reshaped(py: Python<'_>, source: &Core, lengths: &[isize]) -> PyResult<Array> {
-    let mut sizes = lengths.iter().map(|&n| if n == -1 { Ok(1) } else { usize::try_from(n).map_err(|_| PyValueError::new_err("shape lengths must be nonnegative, or one -1")) }).collect::<PyResult<Vec<_>>>()?;
+    let mut sizes = lengths.iter()
+        .map(|&n| if n == -1 { Ok(1) } else { usize::try_from(n).map_err(|_| PyValueError::new_err("shape lengths must be nonnegative, or one -1")) })
+        .collect::<PyResult<Vec<_>>>()?;
     let free: Vec<_> = lengths.iter().enumerate().filter_map(|(a, &n)| (n == -1).then_some(a)).collect();
     if free.len() > 1 { return Err(PyValueError::new_err("only one length can be -1")); }
     if let Some(&a) = free.first() {
@@ -111,9 +123,8 @@ pub fn squeeze(py: Python<'_>, x: &Bound<'_, PyAny>, axis: Option<Axes>) -> PyRe
     let x = convert::one(x)?;
     let layout = x.view().layout();
     let axes = match axis {
-        None => layout.shape().iter().enumerate().filter_map(|(a, &n)| (n == 1).then_some(a)).collect(),
-        Some(Axes::One(a)) => vec![a.of(&layout)?],
-        Some(Axes::Many(axes)) => axes.iter().map(|a| a.of(&layout)).collect::<PyResult<Vec<_>>>()?,
+        None => layout.shape().iter().enumerate().filter_map(|(a, &n)| (n == 1).then_some(a)).collect(), Some(Axes::One(a)) => vec![a.of(&layout)?],
+        Some(Axes::Many(axes)) => axes.iter().map(|a| a.of(&layout)).collect::<PyResult<Vec<_>>>()?
     };
     if axes.iter().any(|&a| layout.shape()[a] != 1) { return Err(PyValueError::new_err("squeeze axes must have length one")); }
     let selectors = layout.shape().iter().enumerate().map(|(a, &n)| if axes.contains(&a) { Selector::At(0) } else { Selector::all(n) }).collect::<Vec<_>>();
@@ -123,7 +134,8 @@ pub fn squeeze(py: Python<'_>, x: &Bound<'_, PyAny>, axis: Option<Axes>) -> PyRe
 /// Gathers independent positions on one axis, or on the flattened input without `axis`. With `mode="raise"`, the default, a position outside the axis raises, and a negative one counts back from the end. Under `"clamp"`, `"wrap"`, `"reflect"` and `"symmetric"`, a position outside the axis, a negative one included, reads a position on the axis, as `structure::Edge` defines them. Under `"fill"`, it reads the fill, and under any mode so does every position of an empty axis. A NaN position reads the fill in every mode. The fill is `fill`, or else the dtype's fill.
 #[pyfunction]
 #[pyo3(signature = (x, indices, axis=None, mode="raise", fill=None))]
-pub fn take(py: Python<'_>, x: &Bound<'_, PyAny>, indices: &Bound<'_, PyAny>, axis: Option<Axis>, mode: &str, fill: Option<&Bound<'_, PyAny>>) -> PyResult<Array> {
+pub fn take(
+    py: Python<'_>, x: &Bound<'_, PyAny>, indices: &Bound<'_, PyAny>, axis: Option<Axis>, mode: &str, fill: Option<&Bound<'_, PyAny>>) -> PyResult<Array> {
     let x = convert::one(x)?;
     let (layout, axis) = along(&x, axis)?;
     let selector = if mode == "raise" { selector(&layout, axis, indices)? } else { edged(&layout, axis, indices, mode_named(mode)?)? };
@@ -153,9 +165,9 @@ pub fn flip(py: Python<'_>, x: &Bound<'_, PyAny>, axis: Option<Axis>) -> PyResul
     let x = convert::one(x)?;
     let layout = x.view().layout();
     let selected = axis.map(|a| a.of(&layout)).transpose()?;
-    let selectors: Vec<_> = layout.shape().iter().enumerate().map(|(a, &n)| if selected.is_none_or(|s| s == a) {
-        Selector::Range { start: n.saturating_sub(1), len: n, step: -1 }
-    } else { Selector::all(n) }).collect();
+    let selectors: Vec<_> = layout.shape().iter().enumerate()
+        .map(|(a, &n)| if selected.is_none_or(|s| s == a) { Selector::Range { start: n.saturating_sub(1), len: n, step: -1 } } else { Selector::all(n) })
+        .collect();
     planned(py, x, |layout| structure::select(layout, selectors, false))
 }
 
@@ -180,7 +192,8 @@ pub fn stack(py: Python<'_>, arrays: Vec<Bound<'_, PyAny>>, axis: i64) -> PyResu
     let first = call.args.first().ok_or_else(|| PyValueError::new_err("stack needs at least one array"))?;
     if call.args.iter().any(|a| a.layout().shape() != first.layout().shape()) { return Err(PyValueError::new_err("stack arrays must have one shape")); }
     let at = at(axis, first.layout().shape().len() + 1)?;
-    let layouts = call.args.iter().map(|a| structure::select_axis(&a.layout(), at, Selector::NewAxis).map(|p| p.layout).map_err(py_err)).collect::<PyResult<Vec<_>>>()?;
+    let layouts =
+        call.args.iter().map(|a| structure::select_axis(&a.layout(), at, Selector::NewAxis).map(|p| p.layout).map_err(py_err)).collect::<PyResult<Vec<_>>>()?;
     let pairs: Vec<_> = layouts.iter().zip(&call.args).map(|(l, a)| ArrayView::new(l, a.view().storage(), a.view().mapping())).collect();
     Ok(Array::new(released(py, || Core::concatenate(&pairs, at)).map_err(py_err)?))
 }
@@ -196,7 +209,8 @@ pub fn split(py: Python<'_>, x: &Bound<'_, PyAny>, sections: &Bound<'_, PyAny>, 
         if n == 0 || size % n != 0 { return Err(PyValueError::new_err("sections must divide the axis length")); }
         (1..n).map(|j| j * (size / n)).collect::<Vec<_>>()
     } else {
-        sections.extract::<Vec<i64>>()?.into_iter().map(|n| if n < 0 { (size as i128 + n as i128).clamp(0, size as i128) as usize } else { (n as usize).min(size) }).collect()
+        sections.extract::<Vec<i64>>()?.into_iter()
+            .map(|n| if n < 0 { (size as i128 + n as i128).clamp(0, size as i128) as usize } else { (n as usize).min(size) }).collect()
     };
     let mut start = 0;
     points.into_iter().chain([size]).map(|end| {
@@ -321,7 +335,8 @@ fn _diag(py: Python<'_>, x: &Bound<'_, PyAny>, k: i64, shape: Option<[usize; 2]>
     let shape = match (shape, x.layout().shape()) {
         (Some(shape), _) => shape,
         (None, &[len]) => {
-            let n = len.checked_add(usize::try_from(k.unsigned_abs()).unwrap_or(usize::MAX)).ok_or_else(|| PyValueError::new_err("diagonal shape is too large"))?;
+            let n =
+                len.checked_add(usize::try_from(k.unsigned_abs()).unwrap_or(usize::MAX)).ok_or_else(|| PyValueError::new_err("diagonal shape is too large"))?;
             [n, n]
         }
         (None, [_, _]) => return planned(py, x, |layout| structure::diagonal(layout, [0, 1], k)),
@@ -355,10 +370,13 @@ fn _difference(py: Python<'_>, x: &Bound<'_, PyAny>, axis: Axis) -> PyResult<Arr
 }
 
 pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    for f in [wrap_pyfunction!(reshape, m)?, wrap_pyfunction!(ravel, m)?, wrap_pyfunction!(transpose, m)?, wrap_pyfunction!(swapaxes, m)?,
+    for f in [
+        wrap_pyfunction!(reshape, m)?, wrap_pyfunction!(ravel, m)?, wrap_pyfunction!(transpose, m)?, wrap_pyfunction!(swapaxes, m)?,
         wrap_pyfunction!(expand_dims, m)?, wrap_pyfunction!(squeeze, m)?, wrap_pyfunction!(take, m)?, wrap_pyfunction!(roll, m)?, wrap_pyfunction!(flip, m)?,
-        wrap_pyfunction!(concatenate, m)?, wrap_pyfunction!(stack, m)?, wrap_pyfunction!(split, m)?, wrap_pyfunction!(repeat, m)?, wrap_pyfunction!(pad, m)?, wrap_pyfunction!(windows, m)?,
-        wrap_pyfunction!(nonzero, m)?, wrap_pyfunction!(argwhere, m)?, wrap_pyfunction!(where_, m)?, wrap_pyfunction!(diagonal, m)?,
-        wrap_pyfunction!(_diag, m)?, wrap_pyfunction!(_triangle, m)?, wrap_pyfunction!(broadcast_to, m)?, wrap_pyfunction!(_difference, m)?] { m.add_function(f)?; }
+        wrap_pyfunction!(concatenate, m)?, wrap_pyfunction!(stack, m)?, wrap_pyfunction!(split, m)?, wrap_pyfunction!(repeat, m)?, wrap_pyfunction!(pad, m)?,
+        wrap_pyfunction!(windows, m)?, wrap_pyfunction!(nonzero, m)?, wrap_pyfunction!(argwhere, m)?, wrap_pyfunction!(where_, m)?,
+        wrap_pyfunction!(diagonal, m)?, wrap_pyfunction!(_diag, m)?, wrap_pyfunction!(_triangle, m)?, wrap_pyfunction!(broadcast_to, m)?,
+        wrap_pyfunction!(_difference, m)?,
+    ] { m.add_function(f)?; }
     m.add("flatten", m.getattr("ravel")?)
 }

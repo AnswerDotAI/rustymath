@@ -234,7 +234,9 @@ impl Float for half::f16 {
     #[inline]
     fn narrow(x: f64) -> Self { half::f16::from_f64(x) }
     #[inline]
-    fn choose(x: Arg<'_, Self>, y: Arg<'_, Self>, mask: Arg<'_, Self>, n: usize, out: &mut Slots<'_, Self>) -> bool { crate::Choose.many_into(x, y, mask, n, out) }
+    fn choose(x: Arg<'_, Self>, y: Arg<'_, Self>, mask: Arg<'_, Self>, n: usize, out: &mut Slots<'_, Self>) -> bool {
+        crate::Choose.many_into(x, y, mask, n, out)
+    }
     // The float above a positive float has the next bit pattern. The float above a negative float has the previous one. Both zeros step to the least positive subnormal.
     #[inline]
     fn next_up(self) -> Self {

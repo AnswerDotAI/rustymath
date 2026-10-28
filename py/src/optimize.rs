@@ -12,7 +12,13 @@ use std::marker::PhantomData;
 /// Runs `$body` with `$f` as the float type that a search computes in for data of `$dtype`, as [`DType::inexact`] gives it: `f32` for 16- and 32-bit floats, and `f64` otherwise.
 macro_rules! float {
     ($dtype:expr, $f:ident => $body:expr) => {
-        if $dtype.inexact(FloatWidth::F64).map(|d| d.0) == Some(DType::Float(FloatWidth::F32)) { type $f = f32; $body } else { type $f = f64; $body }
+        if $dtype.inexact(FloatWidth::F64).map(|d| d.0) == Some(DType::Float(FloatWidth::F32)) {
+            type $f = f32;
+            $body
+        } else {
+            type $f = f64;
+            $body
+        }
     };
 }
 
@@ -20,10 +26,7 @@ macro_rules! float {
 fn array<'py, F: Element>(py: Python<'py>, x: Vec<F>, shape: &[usize]) -> PyResult<Bound<'py, Array>> { Bound::new(py, Array::new(core(x, shape)?)) }
 
 /// What `f` gives for `arg`, after checking for Ctrl-C.
-fn apply<'py>(f: &Bound<'py, PyAny>, arg: Bound<'py, Array>) -> PyResult<Bound<'py, PyAny>> {
-    f.py().check_signals()?;
-    f.call1((arg,))
-}
+fn apply<'py>(f: &Bound<'py, PyAny>, arg: Bound<'py, Array>) -> PyResult<Bound<'py, PyAny>> { f.py().check_signals()?; f.call1((arg,)) }
 
 /// `values`, which a Python function gave, read into `out` in row-major order, after checking that there's one for each slot of `out`. They convert to the search's float type `F`, narrowing included.
 fn read<F: Element>(values: &Bound<'_, PyAny>, out: &mut [F], what: &str) -> PyResult<()> {
@@ -34,7 +37,9 @@ fn read<F: Element>(values: &Bound<'_, PyAny>, out: &mut [F], what: &str) -> PyR
 }
 
 /// What `f` gives for the vector `x`, read into `out`.
-fn call<F: Element>(f: &Bound<'_, PyAny>, x: &[F], out: &mut [F], what: &str) -> PyResult<()> { read(&apply(f, array(f.py(), x.to_vec(), &[x.len()])?)?, out, what) }
+fn call<F: Element>(f: &Bound<'_, PyAny>, x: &[F], out: &mut [F], what: &str) -> PyResult<()> {
+    read(&apply(f, array(f.py(), x.to_vec(), &[x.len()])?)?, out, what)
+}
 
 /// A Python function to minimize, and its gradient if it has one. With `vectorized`, `fun` takes points as the columns of a 2-D array and gives a value for each, as SciPy's `differential_evolution` calls it.
 struct Callable<'py, F> { fun: Bound<'py, PyAny>, jac: Option<Bound<'py, PyAny>>, vectorized: bool, float: PhantomData<F> }
@@ -44,9 +49,7 @@ impl<F: Native + Element> Objective<F> for Callable<'_, F> {
     /// The value at `x`. A vectorized `fun` gets `x` as a one-column 2-D array, as it gets every point.
     fn value(&mut self, x: &[F]) -> PyResult<F> {
         let mut y = [F::zero()];
-        if self.vectorized {
-            self.values(x, &mut y)?;
-        } else {
+        if self.vectorized { self.values(x, &mut y)?; } else {
             let value = apply(&self.fun, array(self.fun.py(), x.to_vec(), &[x.len()])?)?;
             match value.extract::<f64>() { Ok(v) => y[0] = F::narrow(v), Err(_) => read(&value, &mut y, "fun")? }
         }
@@ -94,7 +97,10 @@ impl<'py, F: Element> Product<'py, F> where PlusTimes: Inner<F, Out = F> {
     fn transposed(&self, u: &[F], out: &mut [F], what: &str) -> PyResult<()> {
         match self {
             Self::Python { t, .. } => call(t.as_ref().expect("solve_linear asks only a mapping with a transpose for it"), u, out, what),
-            &Self::Matrix { ref a, shape: [m, n] } => { out.copy_from_slice(&PlusTimes.inner_ops(a, u, [Orientation::Transpose, Orientation::Normal], [n, m, 1])); Ok(()) }
+            &Self::Matrix { ref a, shape: [m, n] } => {
+                out.copy_from_slice(&PlusTimes.inner_ops(a, u, [Orientation::Transpose, Orientation::Normal], [n, m, 1]));
+                Ok(())
+            }
         }
     }
 }
@@ -146,8 +152,9 @@ fn minimize_at<'py, F: Native + Element>(
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 fn minimize<'py>(
-    fun: Bound<'py, PyAny>, x0: &Bound<'py, PyAny>, method: Option<&str>, jac: Option<Bound<'py, PyAny>>, limits: Option<(Bound<'py, PyAny>, Bound<'py, PyAny>)>,
-    tol: Option<f64>, maxfev: Option<usize>, popsize: Option<usize>, seed: u64, vectorized: bool) -> PyResult<Outcome<'py>> {
+    fun: Bound<'py, PyAny>, x0: &Bound<'py, PyAny>, method: Option<&str>, jac: Option<Bound<'py, PyAny>>,
+    limits: Option<(Bound<'py, PyAny>, Bound<'py, PyAny>)>, tol: Option<f64>, maxfev: Option<usize>, popsize: Option<usize>, seed: u64, vectorized: bool
+) -> PyResult<Outcome<'py>> {
     let method = method.map(str::parse::<Method>).transpose().map_err(py_err)?;
     let mut data = vec![x0];
     if let Some((lower, upper)) = &limits { data.extend([lower, upper]); }
@@ -177,7 +184,8 @@ fn root_scalar(
 
 /// `least_squares` at the float type `F`.
 fn least_squares_at<'py, F: Native + Element + Factor>(
-    fun: Bound<'py, PyAny>, x0: &Arg, jac: Option<Bound<'py, PyAny>>, tol: Option<f64>, maxfev: Option<usize>) -> PyResult<Outcome<'py>> where PlusTimes: Inner<F, Out = F> {
+    fun: Bound<'py, PyAny>, x0: &Arg, jac: Option<Bound<'py, PyAny>>, tol: Option<f64>, maxfev: Option<usize>) -> PyResult<Outcome<'py>> where
+    PlusTimes: Inner<F, Out = F> {
     let (py, start) = (fun.py(), x0.items::<F>()?);
     let options = Options { method: Some(Method::LevenbergMarquardt), tolerance: tol.map(F::narrow), evaluations: maxfev, ..Default::default() };
     let first = one(&apply(&fun, array(py, start.to_vec(), &[start.len()])?)?)?.cast::<F>()?;
@@ -204,19 +212,25 @@ fn linear_at<'py, F: Native + Element>(
     let b = data.next().expect("b comes first").items::<F>()?;
     let fun = if operator(a)? { Product::python(a)? } else { Product::matrix(data.next().expect("a matrix A follows b"))? };
     if normal && !fun.has_transpose() { return Err(PyTypeError::new_err(format!("{name} needs `A.rmatvec`"))); }
-    let start = if start {
-        data.next().expect("x0 follows A").items::<F>()?.into_owned()
-    } else {
-        vec![F::zero(); match &fun { Product::Matrix { shape, .. } => shape[1], Product::Python { .. } => a.getattr(intern!(py, "shape"))?.extract::<(usize, usize)>()?.1 }]
+    let start = if start { data.next().expect("x0 follows A").items::<F>()?.into_owned() } else {
+        vec![
+            F::zero();
+            match &fun {
+                Product::Matrix { shape, .. } => shape[1],
+                Product::Python { .. } => a.getattr(intern!(py, "shape"))?.extract::<(usize, usize)>()?.1,
+            }
+        ]
     };
     let n = start.len();
-    if let Product::Matrix { shape, .. } = &fun && *shape != [b.len(), n] { return Err(py_err(Error::new(Kind::Length, "A needs a row for each item of b and a column for each unknown"))); }
+    if let Product::Matrix { shape, .. } = &fun && *shape != [b.len(), n] {
+        return Err(py_err(Error::new(Kind::Length, "A needs a row for each item of b and a column for each unknown")));
+    }
     let msolve = match m {
-        None => None,
-        Some(m) if operator(m)? => Some(Product::python(m)?),
-        Some(_) => Some(Product::matrix(data.next().expect("a matrix M comes last"))?),
+        None => None, Some(m) if operator(m)? => Some(Product::python(m)?), Some(_) => Some(Product::matrix(data.next().expect("a matrix M comes last"))?)
     };
-    if let Some(Product::Matrix { shape, .. }) = &msolve && *shape != [n, n] { return Err(py_err(Error::new(Kind::Length, "M needs a row and a column for each unknown"))); }
+    if let Some(Product::Matrix { shape, .. }) = &msolve && *shape != [n, n] {
+        return Err(py_err(Error::new(Kind::Length, "M needs a row and a column for each unknown")));
+    }
     let mut vectors = Vectors { fun, jac: None, msolve, adjoint: normal };
     let task = Task::Linear { equations: b.len(), adjoint: normal };
     // SciPy's `maxiter` counts GMRES's restart cycles, and the other methods' steps. A step takes one product with A, and one with Aᵀ too for least squares, which also takes one product for Aᵀb. A cycle includes its residual's product. The other methods take the residual's once, before their first step.
@@ -253,5 +267,3 @@ pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(least_squares, m)?)?;
     m.add_function(wrap_pyfunction!(linear, m)?)
 }
-
-

@@ -4,7 +4,7 @@ use pyo3::prelude::*;
 use rustymath::array::Array as Core;
 use rustymath::buffer::{Buffer, DType, Element, FloatWidth};
 use rustymath::error::{Error, Kind};
-use rustymath::layout::{count, Layout};
+use rustymath::layout::{Layout, count};
 use rustymath::linalg::PlusTimes;
 use rustymath::signal::{self, Mode};
 use rustymath::structure::Plan;
@@ -12,7 +12,7 @@ use rustymath_buffer::py_err;
 
 use crate::array::{give, give_items};
 use crate::convert::{convert, one, released};
-use crate::functions::{missing, Axis, NativeFunction};
+use crate::functions::{Axis, NativeFunction, missing};
 
 /// `buffer`, computed at `compute`, as the dtype `store`.
 fn stored(buffer: Buffer, compute: DType, store: DType) -> PyResult<Buffer> {
@@ -22,9 +22,14 @@ fn stored(buffer: Buffer, compute: DType, store: DType) -> PyResult<Buffer> {
 /// The correlation of `x` with `kernel` by the native binary functions named `f` and `g`, along `x`'s first `slide` axes, or its convolution where `flip` is true. `stride` gives one stride for each sliding axis, or one for all of them. Float and complex sums of products read the windows a block at a time. Other pairs and dtypes build the windows as a matrix and take its inner product with the kernel, as `linalg.product` does.
 #[pyfunction]
 #[pyo3(signature = (f, g, x, kernel, mode, slide, stride, flip))]
-fn _correlate<'py>(py: Python<'py>, f: NativeFunction<'_>, g: NativeFunction<'_>, x: &Bound<'py, PyAny>, kernel: &Bound<'py, PyAny>, mode: &str, slide: Option<usize>, stride: Vec<usize>, flip: bool) -> PyResult<Bound<'py, PyAny>> {
+fn _correlate<'py>(
+    py: Python<'py>, f: NativeFunction<'_>, g: NativeFunction<'_>, x: &Bound<'py, PyAny>, kernel: &Bound<'py, PyAny>, mode: &str, slide: Option<usize>,
+    stride: Vec<usize>, flip: bool) -> PyResult<Bound<'py, PyAny>> {
     let name = if flip { "convolve" } else { "correlate" };
-    let mode = match mode { "valid" => Mode::Valid, "full" => Mode::Full, "same" => Mode::Same, _ => return Err(PyValueError::new_err(format!("mode must be 'valid', 'full' or 'same', not {mode:?}"))) };
+    let mode = match mode {
+        "valid" => Mode::Valid, "full" => Mode::Full, "same" => Mode::Same,
+        _ => return Err(PyValueError::new_err(format!("mode must be 'valid', 'full' or 'same', not {mode:?}")))
+    };
     let call = convert(&[x, kernel])?;
     let (lx, lk) = (call.args[0].layout(), call.args[1].layout());
     let slide = slide.unwrap_or(lx.shape().len());
@@ -43,7 +48,9 @@ fn _correlate<'py>(py: Python<'py>, f: NativeFunction<'_>, g: NativeFunction<'_>
     let product = released(py, || -> PyResult<Core> {
         let padded = c.padding.as_ref().map(|p| Core::gathered(xi.view(), p, None)).transpose().map_err(py_err)?;
         let source = match &padded { Some(p) => p.view().contiguous().expect("a gathered array is contiguous"), None => xi.view() };
-        let matrix = |view, plan: &Plan, rows, cols| Core::gathered(view, &Plan { layout: Layout::from(vec![rows, cols]), steps: plan.steps.clone() }, None).map_err(py_err);
+        let matrix = |view, plan: &Plan, rows, cols| {
+            Core::gathered(view, &Plan { layout: Layout::from(vec![rows, cols]), steps: plan.steps.clone() }, None).map_err(py_err)
+        };
         let [positions, cells, outputs] = c.size;
         let (windows, kernel) = (matrix(source, &c.windows, positions, cells)?, matrix(ki.view(), &c.kernel, cells, outputs)?);
         crate::linalg::inner(f, g, [windows.view(), kernel.view()], name)

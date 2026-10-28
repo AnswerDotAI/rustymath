@@ -1,7 +1,7 @@
 use crate::py_err;
 use pyo3::{exceptions::{PyIndexError, PyKeyError, PyTypeError}, prelude::*, types::{PyBool, PyInt, PyList, PySlice, PyString, PyTuple}};
-use std::sync::Arc;
 use rustymath::{buffer::View, gather::{IndexSource, Table}, layout::{Layout, position}, structure::{self, IndexPart, Plan, Selector}};
+use std::sync::Arc;
 
 pub fn key(layout: &Layout, axis: usize, name: &str) -> PyResult<usize> {
     layout.keys(axis).and_then(|k| k.position(name)).ok_or_else(|| PyKeyError::new_err(name.to_owned()))
@@ -21,8 +21,7 @@ pub fn selector(layout: &Layout, axis: usize, obj: &Bound<'_, PyAny>, array: imp
         let py = obj.py();
         let bound = |name| -> PyResult<Bound<'_, PyAny>> {
             let value = slice.getattr(name)?;
-            if let Ok(s) = value.cast::<PyString>() { Ok(key(layout, axis, s.to_str()?)?.into_pyobject(py)?.into_any()) }
-            else { Ok(value) }
+            if let Ok(s) = value.cast::<PyString>() { Ok(key(layout, axis, s.to_str()?)?.into_pyobject(py)?.into_any()) } else { Ok(value) }
         };
         let (start, mut stop, step) = (bound("start")?, bound("stop")?, slice.getattr("step")?);
         if slice.getattr("stop")?.is_instance_of::<PyString>() {
@@ -67,26 +66,25 @@ pub fn parts<'py>(index: &Bound<'py, PyAny>) -> PyResult<Vec<IndexPart<Bound<'py
     let parts: Vec<_> = match index.cast::<PyTuple>() { Ok(t) => t.iter().collect(), Err(_) => vec![index.clone()] };
     let ellipsis = index.py().Ellipsis();
     if parts.iter().filter(|p| p.is(&ellipsis)).count() > 1 { return Err(PyIndexError::new_err("only one ellipsis is allowed")); }
-    parts.into_iter().map(|p| Ok(if p.is_none() { IndexPart::NewAxis }
-        else if p.is(&ellipsis) { IndexPart::Rest }
-        else if p.is_instance_of::<PySlice>() && ["start", "stop", "step"].iter().all(|n| p.getattr(*n).is_ok_and(|v| v.is_none())) { IndexPart::All }
-        else { IndexPart::Axis(p) })).collect()
+    parts.into_iter().map(|p| {
+        Ok(if p.is_none() { IndexPart::NewAxis }
+        else if p.is(&ellipsis) {
+            IndexPart::Rest
+        } else if p.is_instance_of::<PySlice>() && ["start", "stop", "step"].iter().all(|n| p.getattr(*n).is_ok_and(|v| v.is_none())) { IndexPart::All }
+        else { IndexPart::Axis(p) })
+    }).collect()
 }
 
 /// Decodes brackets once for reads and assignment. Named selectors address their axis through `structure::addressed`.
 pub fn selection(
-    layout: &Layout, index: &Bound<'_, PyAny>,
-    name: impl FnMut(&Bound<'_, PyAny>) -> PyResult<Option<String>>,
-    array: impl FnMut(&Layout, usize, &Bound<'_, PyAny>) -> PyResult<(Selector, bool)>,
-) -> PyResult<(Plan, bool)> {
+    layout: &Layout, index: &Bound<'_, PyAny>, name: impl FnMut(&Bound<'_, PyAny>) -> PyResult<Option<String>>,
+    array: impl FnMut(&Layout, usize, &Bound<'_, PyAny>) -> PyResult<(Selector, bool)>) -> PyResult<(Plan, bool)> {
     select_parts(layout, parts(index)?, name, array)
 }
 
 pub fn select_parts(
-    layout: &Layout, written: Vec<IndexPart<Bound<'_, PyAny>>>,
-    mut name: impl FnMut(&Bound<'_, PyAny>) -> PyResult<Option<String>>,
-    mut array: impl FnMut(&Layout, usize, &Bound<'_, PyAny>) -> PyResult<(Selector, bool)>,
-) -> PyResult<(Plan, bool)> {
+    layout: &Layout, written: Vec<IndexPart<Bound<'_, PyAny>>>, mut name: impl FnMut(&Bound<'_, PyAny>) -> PyResult<Option<String>>,
+    mut array: impl FnMut(&Layout, usize, &Bound<'_, PyAny>) -> PyResult<(Selector, bool)>) -> PyResult<(Plan, bool)> {
     let names = written.iter().map(|p| p.axis().map_or(Ok(None), &mut name)).collect::<PyResult<Vec<_>>>()?;
     let claims: Vec<_> = written.iter().zip(&names).map(|(p, n)| p.as_ref().map(|_| (n.as_deref(), 1))).collect();
     structure::plan_parts(layout, &claims, None, true, |i, axis| {

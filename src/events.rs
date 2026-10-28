@@ -1,5 +1,5 @@
 //! The events that a frontend asks for while it runs code, as basedpl's `•explain` and rustymath's Python `explain` do. A run puts its sink in place for the whole process (`Run::start`), and code on every thread records into it, worker threads included. A process supports one run at a time, apart from runs nested on one thread: code that another thread runs during a run records into that run. Code in rustymath and its frontends records the routes it took (`taken`), the faster routes it considered and didn't take (`declined`) and stopped traces (`stopped`), each named by a [`Route`] that BPL and Python share, into one aggregate [`Report`]. The inventory also names the routes that handle items one at a time (`Route::reports_itemwise`), which basedpl records in `•explain`'s own rows. A frontend records its own events into its sink through `with`.
-use std::{any::Any, sync::{atomic::{AtomicUsize, Ordering::Relaxed}, Arc, Mutex, MutexGuard, PoisonError}};
+use std::{any::Any, sync::{Arc, Mutex, MutexGuard, PoisonError, atomic::{AtomicUsize, Ordering::Relaxed}}};
 
 macro_rules! routes {
     ($($id:ident: $name:literal, $taken:literal, $declined:literal, $itemwise:literal;)+) => {
@@ -53,7 +53,9 @@ routes! {
 /// A taken route, a declined optimization or a stopped trace.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EventKind { Taken, Declined, Stopped }
-impl EventKind { pub const fn name(self) -> &'static str { match self { Self::Taken => "taken", Self::Declined => "declined", Self::Stopped => "stopped" } } }
+impl EventKind {
+    pub const fn name(self) -> &'static str { match self { Self::Taken => "taken", Self::Declined => "declined", Self::Stopped => "stopped" } }
+}
 
 /// Calls with one kind, route and reason, and the total items they concerned.
 #[derive(Clone, Debug)]
@@ -65,7 +67,10 @@ pub struct Report { pub records: Vec<Record> }
 impl Report {
     pub fn record(&mut self, event: Record) {
         match self.records.iter_mut().find(|r| r.kind == event.kind && r.route == event.route && r.reason == event.reason) {
-            Some(r) => { r.calls += event.calls; r.items += event.items; }
+            Some(r) => {
+                r.calls += event.calls;
+                r.items += event.items;
+            }
             None => self.records.push(event),
         }
     }
@@ -88,15 +93,15 @@ pub fn running() -> bool { RUNS.load(Relaxed) > 0 }
 pub struct Run { outer: Option<Arc<dyn Sink>> }
 impl Run {
     /// Starts a run that records into `sink`.
-    pub fn start(sink: Arc<dyn Sink>) -> Self {
-        RUNS.fetch_add(1, Relaxed);
-        Self { outer: current().replace(sink) }
-    }
+    pub fn start(sink: Arc<dyn Sink>) -> Self { RUNS.fetch_add(1, Relaxed); Self { outer: current().replace(sink) } }
     /// The sink of the run that this one interrupted, if any.
     pub fn outer(&self) -> Option<&Arc<dyn Sink>> { self.outer.as_ref() }
 }
 impl Drop for Run {
-    fn drop(&mut self) { *current() = self.outer.take(); RUNS.fetch_sub(1, Relaxed); }
+    fn drop(&mut self) {
+        *current() = self.outer.take();
+        RUNS.fetch_sub(1, Relaxed);
+    }
 }
 fn current() -> MutexGuard<'static, Option<Arc<dyn Sink>>> { CURRENT.lock().unwrap_or_else(PoisonError::into_inner) }
 

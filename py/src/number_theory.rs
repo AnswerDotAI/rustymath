@@ -1,11 +1,11 @@
 //! Primality and factorization on arbitrary-size nonnegative Python integers. Prime enumeration/counting and factorial take `u64` arguments; enumerated primes must fit `int64`. Long calls check for Ctrl-C and stop with `KeyboardInterrupt`.
-use num_bigint::BigUint;
-use num_traits::Zero;
 use crate::array::{core, give};
 use crate::convert::released;
-use rustymath_buffer::py_err;
+use num_bigint::BigUint;
+use num_traits::Zero;
 use pyo3::{exceptions::{PyOverflowError, PyValueError}, prelude::*};
 use rustymath::number_theory as nt;
+use rustymath_buffer::py_err;
 
 fn positive(n: &BigUint, name: &str) -> PyResult<()> {
     if n.is_zero() { Err(PyValueError::new_err(format!("{name} needs a positive integer"))) } else { Ok(()) }

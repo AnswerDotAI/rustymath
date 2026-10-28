@@ -1,11 +1,11 @@
 //! Value-semantic arrays: a layout and a flat mapping into shared compact storage. Structural views share storage; mutation detaches it.
-use crate::buffer::{Buffer, DType, Element, Fill, Items, View};
 use crate::agreement::{Mapping, small_read};
+use crate::buffer::{Buffer, DType, Element, Fill, Items, View};
 use crate::error::{Error, Kind};
 use crate::gather::{Steps, Writes};
 use crate::layout::{Keys, Lanes, Layout, element_count};
-use std::sync::{Arc, OnceLock};
 use std::borrow::Cow;
+use std::sync::{Arc, OnceLock};
 
 /// Borrowed logical items: a layout and a mapping into compact storage, with the cache of an [`Array`] view that keeps the items it gathers ([`ArrayView::keeps`]).
 #[derive(Clone, Copy)]
@@ -31,7 +31,11 @@ impl<'a> ArrayView<'a> {
         let start = match self.mapping {
             Mapping::Linear(1) => 0,
             _ if n == 1 => self.mapping.get(0)?,
-            _ => { let (start, step) = self.mapping.run(0, n)?; if step != 1 { return None; } start },
+            _ => {
+                let (start, step) = self.mapping.run(0, n)?;
+                if step != 1 { return None; }
+                start
+            }
         };
         Some(self.storage.slice(start..start + n))
     }
@@ -121,7 +125,11 @@ impl Array {
     /// Compact storage with no retained items outside this array, reusing a uniquely held full allocation.
     pub fn into_compact(mut self) -> (Layout, Buffer) { self.detach(); (self.layout, Arc::unwrap_or_clone(self.storage)) }
     /// An explicit retention escape: even a contiguous subrange stops retaining its larger base.
-    pub fn compact(&self) -> Self { let mut out = self.clone(); out.detach(); out }
+    pub fn compact(&self) -> Self {
+        let mut out = self.clone();
+        out.detach();
+        out
+    }
     /// Writable compact items, detached from views, exports and any other owners.
     pub fn make_mut(&mut self) -> &mut Buffer { self.detach(); Arc::make_mut(&mut self.storage) }
     /// Selects by `plan`, reading `fill`, or the item type's fill, where the plan reaches no item. A selection by strides, padding or rotations is a view of this array's storage, and one by a table of positions copies its items. Where the plan doesn't compose with this view's mapping, a small selection lists its offsets ([`small_read`]), and a larger one gathers this view's items first.
@@ -131,7 +139,10 @@ impl Array {
         let (storage, mapping) = self.parts();
         let (storage, mapping) = match mapping.composed(&outer, self.layout.shape(), plan.layout.shape(), small_read(n, self.len())) {
             Some(mapping) => (storage.clone(), mapping),
-            None => { crate::events::declined(crate::events::Route::InPlace, "a selection that doesn't compose", n); (self.compacted(), outer) }
+            None => {
+                crate::events::declined(crate::events::Route::InPlace, "a selection that doesn't compose", n);
+                (self.compacted(), outer)
+            }
         };
         if mapping.tabled() { return Self::new(plan.layout, Buffer::cast_mapped(storage.view(), &mapping, n, self.dtype())?); }
         Ok(Self::viewed(plan.layout, storage, mapping))
@@ -228,9 +239,12 @@ impl Array {
         let select = |start| structure::select_axis(layout, axis, Selector::Range { start, len: n, step: 1 });
         let (next, previous) = (select(usize::from(size > 0))?, select(0)?);
         let len = crate::layout::element_count(next.layout.shape())?;
-        let agreement = Agreement { layout: next.layout, len, left: Mapping::Steps { base: 0, steps: next.steps.into() }, right: Mapping::Steps { base: 0, steps: previous.steps.into() } };
-        let result = if source.dtype() == DType::Boolean { let k = crate::reduce::Xor; crate::kernels!(Binary of k).binary(&k, source, source, &agreement) }
-            else { let k = crate::Subtract; crate::kernels!(Binary of k).binary(&k, source, source, &agreement) };
+        let agreement = Agreement { layout: next.layout, len, left: Mapping::Steps { base: 0, steps: next.steps.into() },
+            right: Mapping::Steps { base: 0, steps: previous.steps.into() } };
+        let result = if source.dtype() == DType::Boolean {
+            let k = crate::reduce::Xor;
+            crate::kernels!(Binary of k).binary(&k, source, source, &agreement)
+        } else { let k = crate::Subtract; crate::kernels!(Binary of k).binary(&k, source, source, &agreement) };
         let (buffer, _) = result.ok_or_else(|| Error::new(Kind::Domain, "differences need numerical items"))?;
         Self::new(agreement.layout, buffer)
     }
@@ -255,7 +269,9 @@ impl Array {
         Ok(())
     }
     /// Combines `source`, broadcast over a selection, into the items it selects by `k`, in turn, detaching shared storage first. A target selected more than once combines every item that selects it, as NumPy's `ufunc.at` does. `kernels` are `k`'s, from [`kernels!`](crate::kernels)`(Scatter of k)`. It gives whether every result succeeded, as [`Kernels::scatter`](crate::operation::Kernels::scatter) says. Its `plan` and checks are as [`Array::assign`] gives them. A Domain error where `k` has no kernel at this array's dtype.
-    pub fn combine_at<K>(&mut self, k: &K, kernels: &crate::operation::Kernels<crate::operation::ScatterKernel<K>>, plan: &crate::structure::Plan, source: &Self) -> Result<bool, Error> {
+    pub fn combine_at<K>(
+        &mut self, k: &K, kernels: &crate::operation::Kernels<crate::operation::ScatterKernel<K>>, plan: &crate::structure::Plan, source: &Self
+    ) -> Result<bool, Error> {
         let dtype = self.dtype();
         if kernels.at(dtype).is_none() { return Err(Error::new(Kind::Domain, format!("this function doesn't take {}", dtype.name()))); }
         let (writes, items) = self.targets(plan, source)?;
@@ -264,6 +280,4 @@ impl Array {
 }
 
 /// A contiguous array of whole numbers serves as index values that a selection's table reads in place, as [`Array::compact`] gives one.
-impl crate::gather::IndexSource for Array {
-    fn view(&self) -> View<'_> { Array::view(self).contiguous().expect("index values are contiguous") }
-}
+impl crate::gather::IndexSource for Array { fn view(&self) -> View<'_> { Array::view(self).contiguous().expect("index values are contiguous") } }

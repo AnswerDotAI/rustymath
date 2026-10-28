@@ -41,9 +41,7 @@ fn column<'py>(series: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
 /// Keys for the rows where every label of `index` is a string. An index of positions, numbers or dates labels nothing that a key can hold, so the rows stay unkeyed.
 fn row_keys(index: &Bound<'_, PyAny>) -> PyResult<Option<Arc<Keys>>> {
     let mut keys = Vec::new();
-    for label in index.try_iter()? {
-        match label?.cast::<PyString>() { Ok(s) => keys.push(Some(Arc::from(s.to_str()?))), Err(_) => return Ok(None) }
-    }
+    for label in index.try_iter()? { match label?.cast::<PyString>() { Ok(s) => keys.push(Some(Arc::from(s.to_str()?))), Err(_) => return Ok(None) } }
     Keys::partial(keys).map(Some).map_err(py_err)
 }
 

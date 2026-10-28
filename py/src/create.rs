@@ -1,7 +1,9 @@
 //! Familiar constructors over rustymath's compact buffers and sequence generators.
 use crate::{array::{Array, core}, convert::{self, released}};
 use pyo3::{exceptions::PyValueError, prelude::*, types::{PyInt, PyTuple}};
-use rustymath::{array::Array as Core, buffer::{Buffer, DType, Element, FloatWidth, Source}, layout::{Layout, generated_len}, with_dtype, with_float_width, with_width};
+use rustymath::{
+    array::Array as Core, buffer::{Buffer, DType, Element, FloatWidth, Source}, layout::{Layout, generated_len}, with_dtype, with_float_width, with_width
+};
 use rustymath_buffer::py_err;
 
 /// A shape given as one length or a sequence of lengths, checked against the shared allocation limits.
@@ -47,12 +49,14 @@ fn arange(py: Python<'_>, start: &Bound<'_, PyAny>, stop: Option<&Bound<'_, PyAn
         let (a, b) = match stop { Some(stop) => (start.extract()?, stop.extract()?), None => (0, start.extract()?) };
         let step = step.map(|x| x.extract()).transpose()?.unwrap_or(1);
         let values = released(py, || rustymath::create::arange_int(a, b, step)).map_err(py_err)?;
-        let n = values.len(); core(values, &[n])?
+        let n = values.len();
+        core(values, &[n])?
     } else {
         let (a, b) = match stop { Some(stop) => (start.extract()?, stop.extract()?), None => (0.0, start.extract()?) };
         let step = step.map(|x| x.extract()).transpose()?.unwrap_or(1.0);
         let values = released(py, || rustymath::create::arange(a, b, step)).map_err(py_err)?;
-        let n = values.len(); core(values, &[n])?
+        let n = values.len();
+        core(values, &[n])?
     };
     cast(py, core, dtype)
 }
@@ -94,7 +98,7 @@ fn issubdtype(dtype: &str, kind: &str) -> PyResult<bool> {
     let d = convert::dtype(dtype)?;
     Ok(match kind {
         "integer" => matches!(d, DType::Integer(_)), "floating" => matches!(d, DType::Float(_)), "complex" => matches!(d, DType::Complex(_)),
-        "number" => d != DType::Character, "character" => d == DType::Character, _ => d == convert::dtype(kind)?,
+        "number" => d != DType::Character, "character" => d == DType::Character, _ => d == convert::dtype(kind)?
     })
 }
 
@@ -110,9 +114,9 @@ fn result_type(dtypes: &Bound<'_, PyTuple>) -> PyResult<&'static str> {
 }
 
 pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    for f in [wrap_pyfunction!(_full, m)?, wrap_pyfunction!(arange, m)?, wrap_pyfunction!(linspace, m)?, wrap_pyfunction!(logspace, m)?,
-        wrap_pyfunction!(_finfo, m)?, wrap_pyfunction!(_iinfo, m)?, wrap_pyfunction!(issubdtype, m)?, wrap_pyfunction!(result_type, m)?] {
-        m.add_function(f)?;
-    }
+    for f in [
+        wrap_pyfunction!(_full, m)?, wrap_pyfunction!(arange, m)?, wrap_pyfunction!(linspace, m)?, wrap_pyfunction!(logspace, m)?, wrap_pyfunction!(_finfo, m)?,
+        wrap_pyfunction!(_iinfo, m)?, wrap_pyfunction!(issubdtype, m)?, wrap_pyfunction!(result_type, m)?,
+    ] { m.add_function(f)?; }
     Ok(())
 }

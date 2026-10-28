@@ -1,6 +1,6 @@
 //! Slice forms of rustymath's functions. Each function object, such as [`Pow`], has a scalar form `one` and a slice form `many`. Both run code that rustymath compiles once for each item type, inside its own crate. A caller's build settings can't change that code, and rustymath's speed test times what callers run. An edit to a function's body rebuilds only rustymath.
-use crate::float::Float;
 use crate::buffer::Element;
+use crate::float::Float;
 use num_complex::Complex;
 use std::mem::MaybeUninit;
 
@@ -268,14 +268,17 @@ fn mapped<E: Copy, O, const N: usize>(x: &[Arg<'_, E>; N], n: usize, out: &mut [
     match x.as_slice() {
         &[a] => pairs_into(a, Arg::One(()), n, out, #[inline(always)] |a, ()| f([a; N])),
         &[a, b] => pairs_into(a, b, n, out, #[inline(always)] |a, b| f(std::array::from_fn(|k| if k == 0 { a } else { b }))),
-        &[a, b, c] => triples_into(a, b, c, n, out, #[inline(always)] |a, b, c| f(std::array::from_fn(|k| match k { 0 => a, 1 => b, _ => c }))),
+        &[a, b, c] => triples_into(a, b, c, n, out, #[inline(always)] |a, b, c| {
+            f(std::array::from_fn(|k| match k { 0 => a, 1 => b, _ => c }))
+        }),
         _ => unreachable!("function objects take one to three arguments"),
     }
 }
 
 /// Writes `f` for each of `n` results into `out`, for arguments `x`, and gives whether every result succeeded, as [`Outcome`] says. Slice forms call it through [`each!`]. The loop judges each output alone, and a [`Total`] output not at all. Only where some output is NaN does a second pass look at the arguments of the NaN outputs, which is rare.
 #[inline(always)]
-pub(crate) fn each<E: KernelItem, O: KernelItem, R: Outcome<O>, const N: usize>(x: [Arg<'_, E>; N], n: usize, out: &mut [MaybeUninit<O>], f: impl Fn([E; N]) -> R) -> bool {
+pub(crate) fn each<E: KernelItem, O: KernelItem, R: Outcome<O>, const N: usize>(
+    x: [Arg<'_, E>; N], n: usize, out: &mut [MaybeUninit<O>], f: impl Fn([E; N]) -> R) -> bool {
     mapped(&x, n, out, #[inline(always)] |a| f(a).split()) || (R::RESCUE && written(&mut out[..n]).iter().enumerate().all(|(i, &r)| kept(r, items(&x, i))))
 }
 
@@ -292,9 +295,7 @@ pub(crate) fn blocks<E: Copy, O, const BLOCK: usize>(
     let mut ok = true;
     for (b, o) in blocks.iter().zip(slots.as_chunks_mut::<BLOCK>().0) {
         let (one, two) = uniform(b);
-        if one { for k in 0..BLOCK { o[k].write(first(b[k])); } }
-        else if two { for k in 0..BLOCK { o[k].write(second(b[k])); } }
-        else { ok &= mixed(b, o) }
+        if one { for k in 0..BLOCK { o[k].write(first(b[k])); } } else if two { for k in 0..BLOCK { o[k].write(second(b[k])); } } else { ok &= mixed(b, o) }
     }
     ok & mixed(rest, last)
 }
@@ -304,10 +305,13 @@ pub(crate) fn blocks<E: Copy, O, const BLOCK: usize>(
 pub(crate) fn each_usual<E: KernelItem, O: KernelItem, R: Outcome<O>>(
     x: Arg<'_, E>, n: usize, out: &mut [MaybeUninit<O>], usual: (impl Fn(E) -> bool, impl Fn(E) -> O), rare: (impl Fn(E) -> bool, impl Fn(E) -> O),
     body: impl Fn(E) -> R) -> bool {
-    let Arg::Many(xs) = x else { return each([x], n, out, #[inline(always)] |[x]| body(x)) };
+    let Arg::Many(xs) = x else { return each([x], n, out, #[inline(always)] |[x]| body(x)); };
     // With blocks of 16, f64's test and the fast form's constants outgrew AArch64's vector registers, and the loop rebuilt the constants for each block.
-    blocks::<_, _, 64>(&xs[..n], out, #[inline(always)] |b| b.iter().fold((true, true), |(one, two), &v| (one & (usual.0)(v), two & (rare.0)(v))), usual.1, rare.1,
-        #[inline(always)] |b, o| each([Arg::Many(b)], b.len(), o, #[inline(always)] |[x]| body(x)))
+    blocks::<_, _, 64>(
+        &xs[..n], out, #[inline(always)] |b| b.iter().fold((true, true), |(one, two), &v| (one & (usual.0)(v), two & (rare.0)(v))), usual.1, rare.1,
+        #[inline(always)] |b, o| {
+            each([Arg::Many(b)], b.len(), o, #[inline(always)] |[x]| body(x))
+        })
 }
 
 /// Declares a function object of one argument whose slice form runs `each_usual`. `$usual` says whether an item needs none of the function's special values, `$fast` computes such an item, and `$name` is the full function. An optional `$rare => $value` gives the form for a block whose items all take one rare value, as `exp` gives 0 below its underflow bound. A trailing `; total` wraps the full function's results in [`Total`].
@@ -495,7 +499,8 @@ pub(crate) fn pairs_into<X: Copy, Y: Copy, B>(x: Arg<'_, X>, y: Arg<'_, Y>, n: u
 
 /// [`pairs_into`] for three arguments, which `mapped` runs for a function object of three arguments.
 #[inline]
-fn triples_into<X: Copy, Y: Copy, Z: Copy, B>(x: Arg<'_, X>, y: Arg<'_, Y>, z: Arg<'_, Z>, n: usize, out: &mut [MaybeUninit<B>], f: impl Fn(X, Y, Z) -> (B, bool)) -> bool {
+fn triples_into<X: Copy, Y: Copy, Z: Copy, B>(
+    x: Arg<'_, X>, y: Arg<'_, Y>, z: Arg<'_, Z>, n: usize, out: &mut [MaybeUninit<B>], f: impl Fn(X, Y, Z) -> (B, bool)) -> bool {
     let (out, mut ok) = (&mut out[..n], true);
     each_triple!(x, y, z, n, |i, a, b, c| {
         let (r, good) = f(a, b, c);
@@ -512,7 +517,8 @@ pub fn choose<E: Element>(mask: Arg<'_, bool>, x: Arg<'_, E>, y: Arg<'_, E>, n: 
 }
 
 /// `k` on `x`, `y` and a Boolean `mask`, appending `n` results to `out`, and whether every result succeeded. Each chunk of the mask becomes items of `T` through [`Element::truth`] while the chunk is in the cache, because a kernel on lanes as wide as its items vectorizes where one on Booleans doesn't. Like [`pairs`], a long call splits across threads.
-pub(crate) fn masked<K: Ternary<T> + Sync, T: Element>(k: &K, x: Arg<'_, T>, y: Arg<'_, T>, mask: Arg<'_, bool>, n: usize, out: &mut Vec<K::Out>) -> bool where K::Out: Copy + Send {
+pub(crate) fn masked<K: Ternary<T> + Sync, T: Element>(k: &K, x: Arg<'_, T>, y: Arg<'_, T>, mask: Arg<'_, bool>, n: usize, out: &mut Vec<K::Out>) -> bool where
+    K::Out: Copy + Send {
     crate::parallel::extended(out, n, CHUNK, &|range, slots| {
         let mut lanes = Vec::new();
         (range.start..range.end).step_by(CHUNK).fold(true, |ok, at| {

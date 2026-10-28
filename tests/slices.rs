@@ -78,7 +78,9 @@ mod forms {
             assert_eq!((out.len(), out[0]), (n + 1, F::one()), "{name}");
             for i in 0..n { assert!(same(out[i + 1], k.one(at(x, i), at(y, i))), "{name}({:?}, {:?})", at(x, i), at(y, i)) }
             assert_eq!(ok, (0..n).all(|i| k.checked(at(x, i), at(y, i)).is_some()), "{name}");
-            if !K::TOTAL { assert_eq!(ok, (0..n).all(|i| !out[i + 1].is_nan() || [at(x, i), at(y, i)].iter().any(|v| v.is_nan())), "{name} breaks the NaN rule") }
+            if !K::TOTAL {
+                assert_eq!(ok, (0..n).all(|i| !out[i + 1].is_nan() || [at(x, i), at(y, i)].iter().any(|v| v.is_nan())), "{name} breaks the NaN rule")
+            }
             assert!(ok || !K::TOTAL, "{name} is total but fails");
         };
         let (xs, ys): (Vec<F>, Vec<F>) = items.iter().flat_map(|&x| items.iter().map(move |&y| (x, y))).unzip();
@@ -117,7 +119,9 @@ mod forms {
                 assert!(same(out[i + 1], k.one(at(x, i), at(y, i), at(z, i))), "{name}({:?}, {:?}, {:?})", at(x, i), at(y, i), at(z, i))
             }
             assert_eq!(ok, (0..n).all(|i| k.checked(at(x, i), at(y, i), at(z, i)).is_some()), "{name}");
-            if !K::TOTAL { assert_eq!(ok, (0..n).all(|i| !out[i + 1].is_nan() || [at(x, i), at(y, i), at(z, i)].iter().any(|v| v.is_nan())), "{name} breaks the NaN rule") }
+            if !K::TOTAL {
+                assert_eq!(ok, (0..n).all(|i| !out[i + 1].is_nan() || [at(x, i), at(y, i), at(z, i)].iter().any(|v| v.is_nan())), "{name} breaks the NaN rule")
+            }
             assert!(ok || !K::TOTAL, "{name} is total but fails");
         };
         let (mut xs, mut ys, mut zs) = (Vec::new(), Vec::new(), Vec::new());
@@ -181,10 +185,15 @@ mod forms {
             let exact = |a: F, b: F| (a == b && a.is_sign_negative() == b.is_sign_negative()) || (a.is_nan() && b.is_nan());
             let mut out = Vec::new();
             Sqrt.many(Arg::Many(z), z.len(), &mut out);
-            for (&z, &r) in z.iter().zip(&out) { let s = Sqrt.one(z); assert!(exact(r.re, s.re) && exact(r.im, s.im), "complex Sqrt({z:?}): {r:?} against {s:?}") }
+            for (&z, &r) in z.iter().zip(&out) {
+                let s = Sqrt.one(z);
+                assert!(exact(r.re, s.re) && exact(r.im, s.im), "complex Sqrt({z:?}): {r:?} against {s:?}")
+            }
         }
         let mut z: Vec<Complex<f64>> = (0..2000).map(|_| Complex::new(8.0 * rng.random::<f64>() - 4.0, 8.0 * rng.random::<f64>() - 4.0)).collect();
-        for (i, (re, im)) in [(0.0, 0.0), (f64::INFINITY, 1.0), (1.0, f64::NAN), (1e-300, 0.0), (2.0, 1e-160), (1e160, 1.0)].into_iter().enumerate() { z[300 * i + 5] = Complex::new(re, im) }
+        for (i, (re, im)) in [(0.0, 0.0), (f64::INFINITY, 1.0), (1.0, f64::NAN), (1e-300, 0.0), (2.0, 1e-160), (1e160, 1.0)].into_iter().enumerate() {
+            z[300 * i + 5] = Complex::new(re, im)
+        }
         for v in &mut z[1600..1700] { v.im = 0.0 }
         roots(&z);
         roots(&z.iter().map(|z| Complex::new(z.re as f32, z.im as f32)).collect::<Vec<_>>());
@@ -194,7 +203,9 @@ mod forms {
             assert!(x.iter().zip(&out).all(|(&v, &r)| same(r, Logb.one(b, v))), "Logb at base {b}");
             assert_eq!(ok, x.iter().all(|&v| Logb.checked(b, v).is_some()), "Logb at base {b}");
         }
-        assert!(<Exp as Results<f64, 1>>::TOTAL && <Maximum as Results<f32, 2>>::TOTAL && !<Pow as Results<f64, 2>>::TOTAL && !<Sqrt as Results<f16, 1>>::TOTAL);
+        assert!(
+            <Exp as Results<f64, 1>>::TOTAL && <Maximum as Results<f32, 2>>::TOTAL && !<Pow as Results<f64, 2>>::TOTAL && !<Sqrt as Results<f16, 1>>::TOTAL
+        );
         assert!(<Add as Results<i64, 2>>::WRAPS && <Pow as Results<u8, 2>>::WRAPS && !<Add as Results<f64, 2>>::WRAPS && !<Binom as Results<i64, 2>>::WRAPS);
     }
 
@@ -289,12 +300,20 @@ mod reductions {
     #[test]
     fn extrema_beside_nan() {
         fn routes<T: Copy + Into<f64> + Send + Sync>(from: fn(f64) -> T) where Max: Reduction<T, Total = T>, Min: Reduction<T, Total = T> {
-            let step = |a: f64, v: f64, greatest: bool| if v.is_nan() { a } else if greatest { a.max(v) } else { a.min(v) };
+            let step = |a: f64, v: f64, greatest: bool| {
+                if v.is_nan() { a } else if greatest { a.max(v) } else { a.min(v) }
+            };
             let unit = |greatest: bool| if greatest { f64::NEG_INFINITY } else { f64::INFINITY };
             let want = |items: &mut dyn Iterator<Item = T>, greatest: bool| items.fold(unit(greatest), |a, v| step(a, v.into(), greatest));
-            let check = |got: T, want: f64, case: &str| { let got: f64 = got.into(); assert!(got.is_nan() || got == want, "{case}: {got}, where {want} or NaN"); };
+            let check = |got: T, want: f64, case: &str| {
+                let got: f64 = got.into();
+                assert!(got.is_nan() || got == want, "{case}: {got}, where {want} or NaN");
+            };
             let piece = 1 << 18;
-            for (len, nans) in [(3, vec![0]), (3, vec![0, 1, 2]), (64, vec![0]), (64, vec![2, 4]), (200, vec![63, 64, 130]), (3 * piece + 5, vec![piece - 1, piece, 2 * piece + 7])] {
+            for (len, nans) in [
+                (3, vec![0]), (3, vec![0, 1, 2]), (64, vec![0]), (64, vec![2, 4]), (200, vec![63, 64, 130]),
+                (3 * piece + 5, vec![piece - 1, piece, 2 * piece + 7]),
+            ] {
                 let mut x: Vec<T> = (0..len).map(|i| from((i * 37 % 101) as f64 - 50.0)).collect();
                 let last = nans[nans.len() - 1];
                 if last + 1 < len { x[last + 1] = from(1e4) }
@@ -307,9 +326,13 @@ mod reductions {
                     check(if greatest { along::<T, Max>(&x, [1, len, 1]).0[0] } else { along::<T, Min>(&x, [1, len, 1]).0[0] }, all, &case);
                     for start in [None, Some(from(10.0)), Some(from(f64::NAN))] {
                         let mut out = Vec::new();
-                        if greatest { <Max as Reduction<T>>::scan(&x, start, &mut out); } else { <Min as Reduction<T>>::scan(&x, start, &mut out); }
+                        if greatest { <Max as Reduction<T>>::scan(&x, start, &mut out); }
+                        else { <Min as Reduction<T>>::scan(&x, start, &mut out); }
                         let mut seen = start.map_or(unit(greatest), |s| step(unit(greatest), s.into(), greatest));
-                        for (i, &got) in out.iter().enumerate() { seen = step(seen, x[i].into(), greatest); check(got, seen, &format!("{case}, scan from {:?}, item {i}", start.map(Into::<f64>::into))); }
+                        for (i, &got) in out.iter().enumerate() {
+                            seen = step(seen, x[i].into(), greatest);
+                            check(got, seen, &format!("{case}, scan from {:?}, item {i}", start.map(Into::<f64>::into)));
+                        }
                     }
                     for inner in [1, 3, 7] {
                         let rows = len / inner;
@@ -318,10 +341,15 @@ mod reductions {
                         let folds = if greatest { along::<T, Max>(data, [1, rows, inner]).0 } else { along::<T, Min>(data, [1, rows, inner]).0 };
                         for j in 0..inner { check(folds[j], want(&mut column(j), greatest), &format!("{case}, column {j} of {inner}")); }
                         for width in [3, 50].into_iter().filter(|&w| w <= rows && len <= 200) {
-                            let windows = if greatest { sliding::<T, Max>(data, [1, rows, inner], width).0 } else { sliding::<T, Min>(data, [1, rows, inner], width).0 };
-                            for w in 0..=rows - width { for j in 0..inner {
-                                check(windows[w * inner + j], want(&mut (w..w + width).map(|r| data[r * inner + j]), greatest), &format!("{case}, window {w} of {width} rows of {inner}"));
-                            } }
+                            let windows =
+                                if greatest { sliding::<T, Max>(data, [1, rows, inner], width).0 } else { sliding::<T, Min>(data, [1, rows, inner], width).0 };
+                            for w in 0..=rows - width {
+                                for j in 0..inner {
+                                    check(
+                                        windows[w * inner + j], want(&mut (w..w + width).map(|r| data[r * inner + j]), greatest),
+                                        &format!("{case}, window {w} of {width} rows of {inner}"));
+                                }
+                            }
                         }
                     }
                 }
@@ -344,13 +372,9 @@ mod reductions {
         let x: Vec<i64> = (0..120).map(|i| (i * 37 % 101) - 50).collect();
         let s = |start, len, step| Steps::Stride { start, len, step };
         for (shape, steps) in [
-            (vec![7, 6], vec![s(0, 7, 1), s(0, 6, 7)]),
-            (vec![6, 7], vec![s(0, 6, 7), s(6, 7, -1)]),
-            (vec![4, 7], vec![s(14, 4, 7), s(0, 7, 1)]),
-            (vec![6, 4, 5], vec![s(0, 6, 1), s(0, 4, 30), s(0, 5, 6)]),
-            (vec![6, 7], vec![s(35, 6, -7), s(0, 7, 1)]),
-            (vec![5, 3], vec![s(0, 5, 1), s(0, 3, 1)]),
-            (vec![2, 3, 2, 2], vec![s(0, 2, 12), s(0, 3, 2), s(0, 2, 6), s(0, 2, 1)]),
+            (vec![7, 6], vec![s(0, 7, 1), s(0, 6, 7)]), (vec![6, 7], vec![s(0, 6, 7), s(6, 7, -1)]), (vec![4, 7], vec![s(14, 4, 7), s(0, 7, 1)]),
+            (vec![6, 4, 5], vec![s(0, 6, 1), s(0, 4, 30), s(0, 5, 6)]), (vec![6, 7], vec![s(35, 6, -7), s(0, 7, 1)]),
+            (vec![5, 3], vec![s(0, 5, 1), s(0, 3, 1)]), (vec![2, 3, 2, 2], vec![s(0, 2, 12), s(0, 3, 2), s(0, 2, 6), s(0, 2, 1)]),
             (vec![4, 5], vec![s(0, 4, 0), s(0, 5, 1)]),
         ] {
             let mut built = Vec::new();
@@ -359,7 +383,11 @@ mod reductions {
             for axis in 0..shape.len() {
                 let dims = Lanes::new(&shape, axis).unwrap().dims();
                 let (mut totals, fits, order) = along_mapped::<i64, Sum>(&x, &mapping, &shape, axis);
-                if let Some(tables) = order { let mut moved = Vec::new(); walk(&mut moved, &totals, 0, &tables, 0, Same); totals = moved; }
+                if let Some(tables) = order {
+                    let mut moved = Vec::new();
+                    walk(&mut moved, &totals, 0, &tables, 0, Same);
+                    totals = moved;
+                }
                 assert_eq!((totals, fits), along::<i64, Sum>(&built, dims), "{shape:?} {axis}");
             }
         }
@@ -368,11 +396,12 @@ mod reductions {
         assert_eq!(pool.block(&[2, 3, 2, 2]), Some(block));
     }
 
-
     /// Folds and scans along the middle axis against the same taken lane by lane, item by item, for lanes of consecutive items and otherwise, short and long, and empty. Folding in blocks of 13 splits lanes at many offsets. Booleans fold by each of their reductions, and an `i64` sum that wraps reports it, along a lane and down the rows.
     #[test]
     fn axes_match_lane_by_lane() {
-        for shape in [[3, 37, 5], [15, 37, 1], [4, 3, 2], [2, 0, 3], [2, 200, 1], [70, 3, 1], [5, 64, 1], [65, 1, 1], [70, 2, 1], [3, 50, 2], [2, 5000, 1], [1, 5000, 2]] {
+        for shape in
+            [[3, 37, 5], [15, 37, 1], [4, 3, 2], [2, 0, 3], [2, 200, 1], [70, 3, 1], [5, 64, 1], [65, 1, 1], [70, 2, 1], [3, 50, 2], [2, 5000, 1], [1, 5000, 2]]
+        {
             let [outer, len, inner] = shape;
             let x: Vec<i64> = (0..outer * len * inner).map(|i| (i * 37 % 101) as i64 - 50).collect();
             let sums: Vec<i64> = lanes_of(&x, shape).iter().map(|l| l.iter().sum()).collect();
@@ -405,19 +434,25 @@ mod reductions {
             difference_scan_as::<_, i64>(&x, shape, None, &mut running);
             assert_eq!(running, ordered, "{shape:?}");
             let mut differences = Vec::new();
-            assert!(adjacent(&x, shape, &mut differences, |_, _| true, |before, next, out| {
-                out.extend(next.iter().zip(before).map(|(&a, &b)| a - b)); true
-            }));
+            assert!(adjacent(
+                &x, shape, &mut differences, |_, _| true, |before, next, out| {
+                    out.extend(next.iter().zip(before).map(|(&a, &b)| a - b));
+                    true
+                }
+            ));
             let want: Vec<_> = x.chunks((len * inner).max(1)).flat_map(|lane| lane[inner..].iter().zip(lane).map(|(&a, &b)| a - b)).collect();
             assert_eq!(differences, want, "{shape:?}");
             for seed in [None, Some(10)] {
                 ordered.clear();
                 assert!(left_scan(&Less(Tolerance::EXACT), &x, shape, seed, &mut ordered));
                 let starts = seed.map(|s| x.chunks((len * inner).max(1)).flat_map(|lane| lane[..inner].iter().map(move |&v| s < v)).collect::<Vec<_>>());
-                let (bits, ok) = comparison_scan(&x, shape, starts.as_deref(), 0, 1,
-                    &|t, xs, out| Less(Tolerance::EXACT).many(t, Arg::Many(xs), xs.len(), out));
+                let (bits, ok) =
+                    comparison_scan(&x, shape, starts.as_deref(), 0, 1, &|t, xs, out| Less(Tolerance::EXACT).many(t, Arg::Many(xs), xs.len(), out));
                 assert!(ok && bits.len() == ordered.len());
-                assert!(bits.iter().zip(&ordered).enumerate().all(|(i, (&bit, &v))| seed.is_none() && i % (len * inner) < inner || i64::from(bit) == v), "{shape:?} {seed:?}");
+                assert!(
+                    bits.iter().zip(&ordered).enumerate().all(|(i, (&bit, &v))| seed.is_none() && i % (len * inner) < inner || i64::from(bit) == v),
+                    "{shape:?} {seed:?}"
+                );
             }
             // `SumAs`'s running sums of Booleans and of narrow integers match `Sum`'s, which run at 64 bits.
             let wide = |items: Vec<i64>, start: Option<i64>| {
@@ -509,7 +544,9 @@ mod reductions {
                 let count = (len + 1).saturating_sub(width);
                 // The items of window `a` of the lane at `(i, k)`.
                 let window = |a: usize, i: usize, k: usize| (a..a + width).map(move |j| (i * len + j) * inner + k);
-                let each = |push: &mut dyn FnMut(usize, usize, usize)| for i in 0..outer { for a in 0..count { for k in 0..inner { push(a, i, k) } } };
+                let each = |push: &mut dyn FnMut(usize, usize, usize)| {
+                    for i in 0..outer { for a in 0..count { for k in 0..inner { push(a, i, k) } } }
+                };
                 let (mut sums, mut maxima, mut anys) = (Vec::new(), Vec::new(), Vec::new());
                 each(&mut |a, i, k| {
                     sums.push(window(a, i, k).map(|p| x[p]).sum::<i64>());
@@ -518,10 +555,21 @@ mod reductions {
                 });
                 assert_eq!(sliding::<i64, Sum>(&x, shape, width), (sums, true), "{shape:?} {width}");
                 let (got, ok) = sliding::<f64, Max>(&f, shape, width);
-                assert!(ok && got.len() == maxima.len() && got.iter().zip(&maxima).all(|(&g, &m)| same(g, m)), "{shape:?} {width} {:?}", got.iter().zip(&maxima).find(|&(&g, &m)| !same(g, m)));
+                assert!(
+                    ok && got.len() == maxima.len() && got.iter().zip(&maxima).all(|(&g, &m)| same(g, m)), "{shape:?} {width} {:?}",
+                    got.iter().zip(&maxima).find(|&(&g, &m)| !same(g, m))
+                );
                 assert_eq!(sliding::<bool, Max>(&b, shape, width).0, anys, "{shape:?} {width}");
                 // Each pick is the first row of its window whose item, folded alone, gives the window's fold.
-                let pick = |r: &dyn Fn(f64) -> f64, folds: &[f64]| { let mut at = 0; let mut picks = Vec::new(); each(&mut |a, i, k| { picks.push(window(a, i, k).position(|p| same(r(f[p]), folds[at])).map_or(a, |j| a + j)); at += 1; }); picks };
+                let pick = |r: &dyn Fn(f64) -> f64, folds: &[f64]| {
+                    let mut at = 0;
+                    let mut picks = Vec::new();
+                    each(&mut |a, i, k| {
+                        picks.push(window(a, i, k).position(|p| same(r(f[p]), folds[at])).map_or(a, |j| a + j));
+                        at += 1;
+                    });
+                    picks
+                };
                 let (maxima, minima) = (sliding::<f64, Max>(&f, shape, width).0, sliding::<f64, Min>(&f, shape, width).0);
                 assert_eq!(picks::<f64, Max>(&f, shape, Picks::Windows(width)), pick(&|x| <Max as Reduction<f64>>::one(x).0, &maxima), "{shape:?} {width}");
                 assert_eq!(picks::<f64, Min>(&f, shape, Picks::Windows(width)), pick(&|x| <Min as Reduction<f64>>::one(x).0, &minima), "{shape:?} {width}");
@@ -545,22 +593,35 @@ mod reductions {
     /// Each window along two axes folds as its items do, for windows that slide or tile along either axis, a window of one row along one of them, and a float maximum beside NaN. A window wider than the direct folds take gives `None`.
     #[test]
     fn windows_along_two_axes_fold_as_their_items_do() {
-        for (dims, widths, every) in [([2, 7, 3, 9, 2], [3, 2], [1, 1]), ([1, 8, 1, 6, 4], [2, 2], [2, 2]), ([3, 6, 2, 5, 1], [2, 3], [2, 1]), ([1, 4, 1, 4, 3], [4, 1], [1, 1])] {
-            let [outer, len1, mid, len2, inner] = dims;
-            let x: Vec<i64> = (0..dims.iter().product::<usize>()).map(|i| (i * 37 % 101) as i64 - 50).collect();
-            let f: Vec<f64> = x.iter().map(|&v| if v == 7 { f64::NAN } else { v as f64 / 7.0 }).collect();
-            let at = |o: usize, r: usize, m: usize, s: usize, c: usize| (((o * len1 + r) * mid + m) * len2 + s) * inner + c;
-            let (c1, c2) = ((len1 - widths[0]) / every[0] + 1, (len2 - widths[1]) / every[1] + 1);
-            let (mut sums, mut maxima) = (Vec::new(), Vec::new());
-            for o in 0..outer { for i in 0..c1 { for m in 0..mid { for j in 0..c2 { for c in 0..inner {
-                let items: Vec<usize> = (0..widths[0]).flat_map(|a| (0..widths[1]).map(move |b| (a, b))).map(|(a, b)| at(o, every[0] * i + a, m, every[1] * j + b, c)).collect();
-                sums.push(items.iter().map(|&p| x[p]).sum::<i64>());
-                maxima.push(items.iter().map(|&p| f[p]).fold(<Max as Reduction<f64>>::unit(), <Max as Reduction<f64>>::step));
-            }}}}}
-            assert_eq!(sliding_2d::<i64, Sum>(&x, dims, widths, every), Some((sums, true)), "{dims:?} {widths:?} {every:?}");
-            let (got, ok) = sliding_2d::<f64, Max>(&f, dims, widths, every).expect("windows of at most 8 rows fold directly");
-            assert!(ok && got.len() == maxima.len() && got.iter().zip(&maxima).all(|(&g, &m)| g == m || g.is_nan() && m.is_nan()), "{dims:?} {widths:?} {every:?}");
-        }
+        for (dims, widths, every) in
+            [([2, 7, 3, 9, 2], [3, 2], [1, 1]), ([1, 8, 1, 6, 4], [2, 2], [2, 2]), ([3, 6, 2, 5, 1], [2, 3], [2, 1]), ([1, 4, 1, 4, 3], [4, 1], [1, 1])] {
+                let [outer, len1, mid, len2, inner] = dims;
+                let x: Vec<i64> = (0..dims.iter().product::<usize>()).map(|i| (i * 37 % 101) as i64 - 50).collect();
+                let f: Vec<f64> = x.iter().map(|&v| if v == 7 { f64::NAN } else { v as f64 / 7.0 }).collect();
+                let at = |o: usize, r: usize, m: usize, s: usize, c: usize| (((o * len1 + r) * mid + m) * len2 + s) * inner + c;
+                let (c1, c2) = ((len1 - widths[0]) / every[0] + 1, (len2 - widths[1]) / every[1] + 1);
+                let (mut sums, mut maxima) = (Vec::new(), Vec::new());
+                for o in 0..outer {
+                    for i in 0..c1 {
+                        for m in 0..mid {
+                            for j in 0..c2 {
+                                for c in 0..inner {
+                                    let items: Vec<usize> = (0..widths[0]).flat_map(|a| (0..widths[1]).map(move |b| (a, b)))
+                                        .map(|(a, b)| at(o, every[0] * i + a, m, every[1] * j + b, c)).collect();
+                                    sums.push(items.iter().map(|&p| x[p]).sum::<i64>());
+                                    maxima.push(items.iter().map(|&p| f[p]).fold(<Max as Reduction<f64>>::unit(), <Max as Reduction<f64>>::step));
+                                }
+                            }
+                        }
+                    }
+                }
+                assert_eq!(sliding_2d::<i64, Sum>(&x, dims, widths, every), Some((sums, true)), "{dims:?} {widths:?} {every:?}");
+                let (got, ok) = sliding_2d::<f64, Max>(&f, dims, widths, every).expect("windows of at most 8 rows fold directly");
+                assert!(
+                    ok && got.len() == maxima.len() && got.iter().zip(&maxima).all(|(&g, &m)| g == m || g.is_nan() && m.is_nan()),
+                    "{dims:?} {widths:?} {every:?}"
+                );
+            }
         assert_eq!(sliding_2d::<i64, Sum>(&[0; 80], [1, 4, 1, 20, 1], [2, 9], [1, 1]), None);
     }
 
@@ -568,22 +629,23 @@ mod reductions {
     #[test]
     fn long_and_many_lanes() {
         let _threads = crate::support::threads_lock();
-        for shape in [[1, (3 << 18) + 5, 1], [2, (1 << 18) + 7, 3], [5000, 200, 1], [300, 50, 70], [1, 2000, 300], [1, 600, 2000], [1, 8, 100000], [3, 5, 60000]] {
-            let x: Vec<i64> = (0..shape.iter().product::<usize>()).map(|i| (i * 37 % 101) as i64 - 50).collect();
-            let lanes = lanes_of(&x, shape);
-            let sums: Vec<i64> = lanes.iter().map(|l| l.iter().sum()).collect();
-            let sizes: Vec<f64> = lanes.iter().map(|l| l.iter().map(|&v| v.abs() as f64 / 7.0).sum()).collect();
-            let f: Vec<f64> = x.iter().map(|&v| v as f64 / 7.0).collect();
-            for threads in [1, 4] {
-                rustymath::parallel::set_threads(threads);
-                assert_eq!(along::<i64, Sum>(&x, shape), (sums.clone(), true), "{shape:?} {threads}");
-                let floats = along::<f64, Sum>(&f, shape).0;
-                for ((&got, &sum), &size) in floats.iter().zip(&sums).zip(&sizes) {
-                    assert!((got - sum as f64 / 7.0).abs() <= 1e-10 * size, "{shape:?} {threads}: {got} against {}", sum as f64 / 7.0);
+        for shape in
+            [[1, (3 << 18) + 5, 1], [2, (1 << 18) + 7, 3], [5000, 200, 1], [300, 50, 70], [1, 2000, 300], [1, 600, 2000], [1, 8, 100000], [3, 5, 60000]] {
+                let x: Vec<i64> = (0..shape.iter().product::<usize>()).map(|i| (i * 37 % 101) as i64 - 50).collect();
+                let lanes = lanes_of(&x, shape);
+                let sums: Vec<i64> = lanes.iter().map(|l| l.iter().sum()).collect();
+                let sizes: Vec<f64> = lanes.iter().map(|l| l.iter().map(|&v| v.abs() as f64 / 7.0).sum()).collect();
+                let f: Vec<f64> = x.iter().map(|&v| v as f64 / 7.0).collect();
+                for threads in [1, 4] {
+                    rustymath::parallel::set_threads(threads);
+                    assert_eq!(along::<i64, Sum>(&x, shape), (sums.clone(), true), "{shape:?} {threads}");
+                    let floats = along::<f64, Sum>(&f, shape).0;
+                    for ((&got, &sum), &size) in floats.iter().zip(&sums).zip(&sizes) {
+                        assert!((got - sum as f64 / 7.0).abs() <= 1e-10 * size, "{shape:?} {threads}: {got} against {}", sum as f64 / 7.0);
+                    }
                 }
+                rustymath::parallel::set_threads(0);
             }
-            rustymath::parallel::set_threads(0);
-        }
     }
 
     #[test]
@@ -639,7 +701,7 @@ mod search {
 
     #[test]
     fn float_sorts_follow_total_keys() {
-        use rustymath::{buffer::Element, Float};
+        use rustymath::{Float, buffer::Element};
         fn check<F: Float + Element>(x: &[F], dims @ [outer, n, inner]: [usize; 3], bits: impl Fn(F) -> u64) {
             for down in [false, true] {
                 let got = F::vec(view_sort_along(F::view(x), dims, down).unwrap().unwrap()).unwrap();
@@ -658,8 +720,8 @@ mod search {
         // Lengths below, inside and above the range that the network sorts, and around its powers of two.
         for n in [0, 1, 7, 31, 32, 33, 63, 64, 65, 100, 255, 256, 257, 1000, 1024, 8191, 8192, 8193, 16384, 16385] {
             for dims in [[1, n, 1], [3, n, 2]] {
-                let x: Vec<f64> = (0..dims.iter().product()).map(|i| if i % 11 == 0 { specials[i / 11 % specials.len()] }
-                    else { (i as f64 * 0.618034 % 1.0 * 64.0).round() - 32.0 }).collect();
+                let x: Vec<f64> = (0..dims.iter().product())
+                    .map(|i| if i % 11 == 0 { specials[i / 11 % specials.len()] } else { (i as f64 * 0.618034 % 1.0 * 64.0).round() - 32.0 }).collect();
                 check(&x, dims, f64::to_bits);
                 check(&x.iter().map(|&v| v as f32).collect::<Vec<_>>(), dims, |v: f32| v.to_bits().into());
             }
@@ -668,7 +730,7 @@ mod search {
 
     #[test]
     fn search_and_sort() {
-        use rustymath::{buffer::Element, tolerant::Tolerance, Float};
+        use rustymath::{Float, buffer::Element, tolerant::Tolerance};
         let x = [30, 10, 20, 10];
         assert_eq!(index_of(&x, &[10, 40]), [1, 4]);
         // More than `SCANNED` needles build the index in place of scanning.
@@ -700,7 +762,12 @@ mod search {
         assert_eq!(sort_rows(300, vec![wide.clone()]), rows);
         rows.sort_by_key(|&r| (wide[r as usize], second[r as usize]));
         assert_eq!(sort_rows(300, vec![wide, second]), rows);
-        assert_eq!((grouped(&[1, 0, 1, 1], 2).each().collect::<Vec<_>>(), grouped(&[0, 0], 1).each().collect::<Vec<_>>(), grouped(&[0, 0], 2).each().collect::<Vec<_>>()), (vec![&[1][..], &[0, 2, 3][..]], vec![&[0, 1][..]], vec![&[0, 1][..], &[][..]]));
+        assert_eq!(
+            (
+                grouped(&[1, 0, 1, 1], 2).each().collect::<Vec<_>>(), grouped(&[0, 0], 1).each().collect::<Vec<_>>(),
+                grouped(&[0, 0], 2).each().collect::<Vec<_>>()
+            ), (vec![&[1][..], &[0, 2, 3][..]], vec![&[0, 1][..]], vec![&[0, 1][..], &[][..]])
+        );
         // `grouped_keys` gives the classes that `classes` and `numbered` give, each with its positions. The five keys first appear out of their order, and a range of 2^20 + 1 is too wide for a table.
         let together = |k: &[i32]| {
             let n = numbered(&classes(k));
@@ -735,7 +802,10 @@ mod search {
             let second: Vec<f32> = (0..n).map(|i| if i % 19 == 0 { f32::NAN } else { (i % 17) as f32 / 7. }).collect();
             for down in [false, true] {
                 let mut expected: Vec<u32> = (0..n as u32).collect();
-                expected.sort_by_key(|&i| { let k = (rows[i as usize * 3] as u16 ^ 1 << 15, second[i as usize].order_key()); if down { (!k.0, !k.1) } else { k } });
+                expected.sort_by_key(|&i| {
+                    let k = (rows[i as usize * 3] as u16 ^ 1 << 15, second[i as usize].order_key());
+                    if down { (!k.0, !k.1) } else { k }
+                });
                 let order = view_lexgrade(n, [(i16::view(&rows), 0, 3), (f32::view(&second), 0, 1)].into_iter(), down).unwrap();
                 assert_eq!(order, expected);
                 let ranks = inverse_permutation::<u32>(order.iter().map(|&i| i as usize));
@@ -748,11 +818,15 @@ mod search {
         let groups = numbered(&[0, 1, 0]);
         assert_eq!(groups.fold::<_, rustymath::reduce::Sum>(&[i64::MAX, 2, 1]), (vec![i64::MIN, 2], false));
         assert_eq!(find_with(&[2], &[2, 3], |i, j| Ok::<_, ()>([1, 2][i] == [1, 2, 1, 1, 2, 3][j])).unwrap(), [true, false, false, true, false, false]);
-        assert_eq!(view_find(i16::view(&[1, 2]), &[2], u8::view(&[1, 2, 1, 1, 2, 3]), &[2, 3], Tolerance::EXACT), Some(vec![true, false, false, true, false, false]));
+        assert_eq!(
+            view_find(i16::view(&[1, 2]), &[2], u8::view(&[1, 2, 1, 1, 2, 3]), &[2, 3], Tolerance::EXACT), Some(vec![true, false, false, true, false, false])
+        );
         assert_eq!(view_find(bool::view(&[true, false]), &[2], bool::view(&[true, false, true]), &[3], Tolerance::EXACT), Some(vec![true, false, false]));
         assert_eq!(view_find(char::view(&['a']), &[1], char::view(&['b', 'a']), &[2], Tolerance::EXACT), Some(vec![false, true]));
         for (t, first) in [(Tolerance::DEFAULT, true), (Tolerance::EXACT, false)] {
-            assert_eq!(view_find(f32::view(&[1., f32::NAN]), &[2], f64::view(&[1. + 1e-15, f64::NAN, 1., f64::NAN]), &[4], t), Some(vec![first, false, true, false]));
+            assert_eq!(
+                view_find(f32::view(&[1., f32::NAN]), &[2], f64::view(&[1. + 1e-15, f64::NAN, 1., f64::NAN]), &[4], t), Some(vec![first, false, true, false])
+            );
         }
         assert!(view_find(u8::view(&[1]), &[1], f64::view(&[1.]), &[1], Tolerance::DEFAULT).is_none());
         for size in [4, 1_000_000] { assert_eq!(occurrences(&[1, 2, 1, 3, 1], size), Some((vec![0, 0, 1, 0, 2], 3))); }
@@ -999,10 +1073,17 @@ mod tolerant {
                 assert_eq!(lanes, bools.iter().map(|&b| F::narrow(if b { 1.0 } else { 0.0 })).collect::<Vec<_>>());
             }
         }
-        macro_rules! comparisons { ($f:ty, $t:expr) => {
-            check::<$f, _>(Equal($t)); check::<$f, _>(NotEqual($t)); check::<$f, _>(Less($t)); check::<$f, _>(LessEqual($t));
-            check::<$f, _>(Greater($t)); check::<$f, _>(GreaterEqual($t)); check::<$f, _>(Matches($t));
-        } }
+        macro_rules! comparisons {
+            ($f:ty, $t:expr) => {
+                check::<$f, _>(Equal($t));
+                check::<$f, _>(NotEqual($t));
+                check::<$f, _>(Less($t));
+                check::<$f, _>(LessEqual($t));
+                check::<$f, _>(Greater($t));
+                check::<$f, _>(GreaterEqual($t));
+                check::<$f, _>(Matches($t));
+            };
+        }
         for t in [T, Tolerance::EXACT] {
             comparisons!(f64, t);
             comparisons!(f32, t);
@@ -1046,7 +1127,7 @@ mod tolerant {
 }
 
 mod gather {
-    use rustymath::{agreement::{expanded_items, Mapping}, buffer::Element, gather::{scatter, scatter_walk, walk, Same, Steps}, structure::Walk};
+    use rustymath::{agreement::{Mapping, expanded_items}, buffer::Element, gather::{Same, Steps, scatter, scatter_walk, walk}, structure::Walk};
     /// The items of `s` that `steps` reach from `base`, with -1 for a fill.
     fn read(s: &[i64], base: usize, steps: &[Steps]) -> Vec<i64> {
         let mut out = vec![];
@@ -1108,17 +1189,19 @@ mod gather {
         assert_eq!(Steps::run(0, &[along(30, 2), along(1, 0)], 3, 20), Some((6, 2)));
         for (base, steps) in &cases {
             let len: usize = steps.iter().map(Steps::len).product();
-            for from in 0..len.min(20) { for n in 1..=(len - from).min(20) {
-                if let Some((first, step)) = Steps::run(*base, steps, from, n) {
-                    for i in 0..n { assert_eq!(Steps::reach(*base, steps, from + i), first.checked_add_signed(step * i as isize)); }
+            for from in 0..len.min(20) {
+                for n in 1..=(len - from).min(20) {
+                    if let Some((first, step)) = Steps::run(*base, steps, from, n) {
+                        for i in 0..n { assert_eq!(Steps::reach(*base, steps, from + i), first.checked_add_signed(step * i as isize)); }
+                    }
                 }
-            } }
+            }
         }
     }
     /// Index arrays pair by broadcasting and take the place of the first one, while a range keeps its axis in place. With one index array, pairing is the cross product.
     #[test]
     fn index_arrays_pair() {
-        use rustymath::{layout::Layout, structure::{select, Selector}};
+        use rustymath::{layout::Layout, structure::{Selector, select}};
         let s: Vec<i64> = (0..24).collect();
         let layout = Layout::from([2, 3, 4]);
         let ix = |positions: Vec<usize>| Selector::Indices { layout: Layout::from([positions.len()]), positions: rustymath::gather::Table::new(positions) };
@@ -1131,7 +1214,7 @@ mod gather {
     /// Index arrays read as strides wherever their positions step evenly along each of their axes, alone or paired. Paired arrays that share no axis keep their own positions, as `⌷` keeps them, so a data-dependent array beside an evenly spaced one reads as a table and a stride. Arrays that share axes sum their positions, and an array that lacks one of those axes repeats along it.
     #[test]
     fn index_arrays_read_as_strides() {
-        use rustymath::{gather::{Steps, Table}, layout::Layout, structure::{select, Selector}};
+        use rustymath::{gather::{Steps, Table}, layout::Layout, structure::{Selector, select}};
         let ix = |names: &[&str], shape: &[usize], positions: Vec<usize>| {
             let layout = Layout::from(shape.to_vec()).with_names(names.iter().map(|&n| Some(n.into())).collect()).unwrap();
             Selector::Indices { layout, positions: Table::new(positions) }
@@ -1160,13 +1243,14 @@ mod gather {
     /// An index array whose positions read a stretch of one axis past its ends, as `•edge`'s modes and positions that count back from the end give them, reads as one `Padded` entry, or as a `Rotated` one where it wraps once round the whole axis. Each reads what its table reads. Positions in any other order stay a table.
     #[test]
     fn index_arrays_read_past_edges() {
-        use rustymath::{gather::{Steps, Table}, layout::Layout, structure::{select, Edge, Selector}};
+        use rustymath::{gather::{Steps, Table}, layout::Layout, structure::{Edge, Selector, select}};
         const F: usize = Steps::FILL;
         let s: Vec<i64> = (0..24).collect();
         // The rows of a 4 by 6 array at `positions`, checked against a table of them.
         let rows = |positions: &[usize]| {
             let layout = Layout::from([positions.len()]).with_names(vec![Some("r".into())]).unwrap();
-            let plan = select(&Layout::from([4, 6]), vec![Selector::Indices { layout, positions: Table::new(positions.to_vec()) }, Selector::all(6)], true).unwrap();
+            let plan =
+                select(&Layout::from([4, 6]), vec![Selector::Indices { layout, positions: Table::new(positions.to_vec()) }, Selector::all(6)], true).unwrap();
             let table = Steps::table(positions.iter().map(|&p| if p == F { F } else { 6 * p }).collect());
             assert_eq!(read(&s, 0, &plan.steps), read(&s, 0, &[table, along(6, 1)]));
             plan.steps[0].clone()
@@ -1184,7 +1268,7 @@ mod gather {
     /// A padded axis reads its edge mode's positions past its ends. Centred windows of 3 over 4 items read one position before the axis and one after it. A padded size of 0 is an error.
     #[test]
     fn window_padding() {
-        use rustymath::{gather::{walk, Same}, structure::{Edge, Windows}};
+        use rustymath::{gather::{Same, walk}, structure::{Edge, Windows}};
         let read = |edge| {
             let mut out = vec![];
             walk(&mut out, &[10i64, 11, 12, 13], 0, &Windows::new(&[3], &[], |_| Some(edge), &[4]).unwrap().padding().unwrap().steps, -1, Same);
@@ -1205,8 +1289,7 @@ mod gather {
         for outer in [
             vec![Steps::Stride { start: 50, len: 6, step: -10 }, along(10, 1)],
             vec![Steps::Stride { start: 10, len: 4, step: 10 }, Steps::Stride { start: 2, len: 5, step: 1 }],
-            vec![along(6, 10), Steps::Rotated { shift: 3, len: 10, stride: 1 }],
-            vec![along(6, 10), Steps::clipped(-2, 12, 10, 1)],
+            vec![along(6, 10), Steps::Rotated { shift: 3, len: 10, stride: 1 }], vec![along(6, 10), Steps::clipped(-2, 12, 10, 1)],
             vec![Steps::clipped(-2, 6, 1, 0), along(10, 1)],
         ] {
             let (base, steps) = Steps::through(&outer, &shape, 5, &inner).expect("these reads compose");

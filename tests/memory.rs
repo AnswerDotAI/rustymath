@@ -1,15 +1,16 @@
-//! The memory guard, registered here with a limit of 64 MiB: its count of large allocations, the Limit error that `generated_len` gives through `admit`, and its refusal past the limit.
-use rustymath::{error::Kind, layout::generated_len, memory::Guard};
+//! The memory guard, registered here, with each test setting the process's limit to 64 MiB: its count of large allocations, the Limit error that `generated_len` gives through `admit`, and its refusal past the limit.
+use rustymath::{error::Kind, layout::generated_len, memory::{Guard, set_limit}};
 use std::{hint::black_box, process::Command};
 
 #[global_allocator]
-static GUARD: Guard = Guard::with_limit(64 << 20);
+static GUARD: Guard = Guard::new();
 
 const MIB: usize = 1 << 20;
 
-/// `generated_len` admits an array of f64 items only where the bytes held in large allocations leave room for it, which shows the guard's count. The guard reads its limit at its first large allocation.
+/// `generated_len` admits an array of f64 items only where the bytes held in large allocations leave room for it, which shows the guard's count.
 #[test]
 fn counts_large_allocations() {
+    set_limit(64 * MIB);
     let fits = |items: usize| generated_len(&[items]).is_ok();
     let held = vec![1u8; 40 * MIB];
     assert!(fits(2 * MIB) && !fits(4 * MIB));
@@ -26,10 +27,15 @@ fn counts_large_allocations() {
     drop(black_box(grown));
 }
 
-/// The guard refuses an allocation past its limit and says so on stderr, and the process aborts. The allocation runs in a child process: this test binary, run again on this test alone.
+/// In a fresh process, `generated_len` gives a Limit error for an array past the limit before any large allocation. The guard refuses an allocation past its limit and says so on stderr, and the process aborts. Both run in a child process: this test binary, run again on this test alone.
 #[test]
 fn refuses_past_the_limit() {
-    if std::env::var_os("RUSTYMATH_GUARD_CHILD").is_some() { drop(black_box(vec![0u8; 80 * MIB])); return; }
+    if std::env::var_os("RUSTYMATH_GUARD_CHILD").is_some() {
+        set_limit(64 * MIB);
+        assert_eq!(generated_len(&[9 * MIB]).unwrap_err().kind, Kind::Limit);
+        drop(black_box(vec![0u8; 80 * MIB]));
+        return;
+    }
     let exe = std::env::current_exe().unwrap();
     let out = Command::new(exe).args(["--exact", "refuses_past_the_limit", "--nocapture"]).env("RUSTYMATH_GUARD_CHILD", "1").output().unwrap();
     assert!(!out.status.success());

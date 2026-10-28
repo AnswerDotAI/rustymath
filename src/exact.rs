@@ -14,8 +14,7 @@ pub fn gcd<T: Clone + Integer>(x: &Ratio<T>, y: &Ratio<T>) -> Ratio<T> { Ratio::
 pub fn lcm<T: Clone + Integer>(x: &Ratio<T>, y: &Ratio<T>) -> Ratio<T> { let g = gcd(x, y); if g.is_zero() { g } else { x / &g * y } }
 
 /// The binomial coefficient C(n, k) for a rational `n` and a whole `k`, with J's extension to negative `k`. For a whole `n` from 0, a `k` above `n` gives 0. A negative `k` gives 0, unless `n` is a whole number with `k ≤ n < 0`, where the result is (-1)^(n-k) C(-k-1, n-k). Otherwise the result is the product of (n-i)/(i+1) for each `i` from 0 below `k`. It checks for an interrupt once every 1,024 steps of that product.
-pub fn binom<T>(n: &Ratio<T>, k: i64) -> Result<Ratio<T>, Error> where
-    T: Clone + Integer + Signed + ToPrimitive + From<i64> {
+pub fn binom<T>(n: &Ratio<T>, k: i64) -> Result<Ratio<T>, Error> where T: Clone + Integer + Signed + ToPrimitive + From<i64> {
     let whole = n.is_integer().then(|| n.to_integer());
     if k < 0 {
         let Some(n) = whole else { return Ok(Ratio::zero()) };

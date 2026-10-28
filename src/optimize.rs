@@ -152,7 +152,8 @@ impl std::str::FromStr for Method {
     type Err = crate::error::Error;
     fn from_str(name: &str) -> Result<Method, Self::Err> {
         let found = Method::NAMES.iter().find(|(key, _)| key.eq_ignore_ascii_case(name));
-        let unknown = || crate::error::Error::new(crate::error::Kind::Domain, format!("unknown method: use one of {}", Method::NAMES.map(|(key, _)| key).join(", ")));
+        let unknown =
+            || crate::error::Error::new(crate::error::Kind::Domain, format!("unknown method: use one of {}", Method::NAMES.map(|(key, _)| key).join(", ")));
         found.map(|&(_, method)| method).ok_or_else(unknown)
     }
 }

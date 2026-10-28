@@ -2,9 +2,9 @@
 #![doc = include_str!("lib.md")]
 #[macro_use]
 mod slice;
+pub mod agreement;
 mod arc;
 mod arith;
-pub mod agreement;
 #[macro_use]
 pub mod buffer;
 pub mod array;
@@ -43,8 +43,8 @@ pub mod reduce;
 pub mod search;
 pub mod signal;
 mod special;
-pub mod stats;
 mod sqrts;
+pub mod stats;
 pub mod structure;
 mod table;
 pub mod timing;
@@ -53,19 +53,22 @@ mod trig;
 #[cfg(accelerate)]
 mod vforce;
 
-pub use arith::{Add, Divide, MathishDivide, Multiply, Subtract, BitAnd, BitOr, BitXor, BitNot, LeftShift, RightShift, Negate, Reciprocal, PiTimes, WholeDivide, Bitwise, Not, Nand, Nor, bitwise};
-/// The crates whose types compact buffers hold, which the exported width macros name.
-pub use {half, num_complex};
+pub use arith::{
+    Add, BitAnd, BitNot, BitOr, BitXor, Bitwise, Divide, LeftShift, MathishDivide, Multiply, Nand, Negate, Nor, Not, PiTimes, Reciprocal, RightShift, Subtract,
+    WholeDivide, bitwise,
+};
 pub use complex::{Cis, divide};
-pub use float::{FUSED, Float, Native};
 pub use exp::{Exp, Expm1};
+pub use float::{FUSED, Float, Native};
 pub use ln::{Ln, Log1p, Log2, Log10, Logb, MathishLogb};
-pub use parts::{Abs, Angle, Sign, Isnan, Isfinite, Isinf, Real, Imag, Conj, Trunc, Rint, Clip, Choose, Scale, Round};
+pub use parts::{Abs, Angle, Choose, Clip, Conj, Imag, Isfinite, Isinf, Isnan, Real, Rint, Round, Scale, Sign, Trunc};
 pub use pow::{Pow, Root, WholePow, WrappingPow};
 pub use slice::{Arg, Binary, CHUNK, Flipped, Forms, KernelItem, Results, Ternary, Unary, Wrapped, choose, pairs};
 pub use special::{Erfc, Erfcinv, Erfinv};
 pub use sqrts::Sqrt;
 pub use trig::{Cos, Sin, Tan};
+/// The crates whose types compact buffers hold, which the exported width macros name.
+pub use {half, num_complex};
 
 /// How many items a function handles between checks for an interrupt ([`interrupt::check`]), which keeps the check out of the loop over items.
 pub const BETWEEN_CHECKS: usize = 1024;

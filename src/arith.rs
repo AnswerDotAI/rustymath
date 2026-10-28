@@ -94,7 +94,8 @@ fn pi_times<F: crate::Float>(y: F) -> F { y * F::narrow(std::f64::consts::PI) }
 
 /// Applies the Boolean function whose truth table is `table`, indexed by `2*x+y`, to every bit of `x` and `y`, the leading sign bits included. It computes the table's algebraic normal form, `a0 ^ (a1 & x) ^ (a2 & y) ^ (a3 & x & y)`, with each coefficient spread to every bit, so every table runs the same code. A `match` on the table would put 16 paths into each loop that inlines it. It takes any integer type, exact ones included.
 #[inline]
-pub fn bitwise<T>(table: u8, x: T, y: T) -> T where T: Clone + std::ops::BitAnd<Output = T> + std::ops::BitOr<Output = T> + std::ops::BitXor<Output = T> + std::ops::Not<Output = T> {
+pub fn bitwise<T>(table: u8, x: T, y: T) -> T where
+    T: Clone + std::ops::BitAnd<Output = T> + std::ops::BitOr<Output = T> + std::ops::BitXor<Output = T> + std::ops::Not<Output = T> {
     let ones = x.clone() | !x.clone();
     let zero = ones.clone() ^ ones.clone();
     let spread = |bit: u8| if bit & 1 == 1 { ones.clone() } else { zero.clone() };
@@ -172,8 +173,7 @@ macro_rules! signed {
     )+};
 }
 signed!(
-    i16: |x, y| wide_product!(i16, i32, x, y), i32: |x, y| wide_product!(i32, i64, x, y),
-    i64: |x, y| { let (p, over) = x.overflowing_mul(y); (p, !over) }
+    i16: |x, y| wide_product!(i16, i32, x, y), i32: |x, y| wide_product!(i32, i64, x, y), i64: |x, y| { let (p, over) = x.overflowing_mul(y); (p, !over) }
 );
 
 /// The unsigned types' arithmetic. A sum overflows where it wraps below an argument, and a difference where it would be negative.

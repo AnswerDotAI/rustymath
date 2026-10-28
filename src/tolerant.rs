@@ -3,7 +3,10 @@
 //! A tolerance is a value of a type that implements `Tolerant`: a `Tolerance`, or `Exactly`, whose methods compile to plain IEEE comparisons and `floor`. A function written once over `Tolerant` compiles to a version for each. `with_tolerance!` picks one when the program runs, outside any loop. The methods are generic over the float type and compute at its width. `TolerantComplex` gives the complex versions. The function objects `Equal`, `NotEqual`, `Less`, `LessEqual`, `Greater`, `GreaterEqual`, `Matches`, `Compare`, `Floor`, `Ceil`, `Residue`, `FloorDivide`, `Gcd` and `Lcm` each hold a `Tolerance` and give the same results as the methods, one item at a time or over slices. A slice form picks its loop with `with_tolerance!` once. A comparison's slice form compares many items with one number through the range of floats equal to it (`Tolerant::range`), so each item takes one or two plain comparisons. All but `Matches` and `Compare` also have integer forms, from the `integer` module, which ignore the tolerance. `Floor` and `Ceil` also take Booleans.
 //!
 //! Tolerant equality isn't transitive: `x` can equal `y` and `y` equal `z` while `x` doesn't equal `z`. Hash maps and sorting need a transitive `PartialEq`. This module therefore has no float type with a tolerant `==`. Each comparison is a method of the tolerance.
-use crate::{Arg, BETWEEN_CHECKS, buffer::Element, convert::{float, int}, error::Error, float::{FUSED, Float, Native, sealed::Core}, interrupt::check, search::{self, Chains, Key, Links}, slice::{Total, pairs_into}};
+use crate::{
+    Arg, BETWEEN_CHECKS, buffer::Element, convert::{float, int}, error::Error, float::{FUSED, Float, Native, sealed::Core}, interrupt::check,
+    search::{self, Chains, Key, Links}, slice::{Total, pairs_into}
+};
 use num_bigint::BigInt;
 use num_complex::Complex;
 use num_rational::BigRational;
@@ -118,7 +121,10 @@ pub trait Tolerant: Copy + Send + Sync {
 
 /// `x / y`, for finite positive `x` and `y`, as `n / d` with `n = mx·2^sx` and `d = my·2^sy`: odd mantissas, with the larger exponent's excess as a shift on its side.
 fn ratio_parts(x: f64, y: f64) -> ((u64, u32), (u64, u32)) {
-    let odd = |v: f64| { let (m, e, _) = num_traits::Float::integer_decode(v); (m >> m.trailing_zeros(), i32::from(e) + m.trailing_zeros() as i32) };
+    let odd = |v: f64| {
+        let (m, e, _) = num_traits::Float::integer_decode(v);
+        (m >> m.trailing_zeros(), i32::from(e) + m.trailing_zeros() as i32)
+    };
     let ((mx, ex), (my, ey)) = (odd(x), odd(y));
     if ex >= ey { ((mx, (ex - ey) as u32), (my, 0)) } else { ((mx, 0), (my, (ey - ex) as u32)) }
 }
@@ -147,12 +153,15 @@ fn fixed_gcd(x: f64, y: f64, (mx, sx): (u64, u32), (my, sy): (u64, u32), t: f64)
         // `|p/q − n/d| ≤ t·n/d`, multiplied through by `q·d`. The float estimates decide unless they lie within 1e-15 of each other.
         let gap = (u128::from(p) * u128::from(d)).abs_diff(u128::from(q) * u128::from(n));
         let bound = t * (u128::from(n) * u128::from(q)) as f64;
-        let within = if gap == 0 { true } else if bound < 0.5 { false } else {
+        let within = if gap == 0 { true }
+        else if bound < 0.5 { false } else {
             let g = gap as f64;
-            if g <= bound * (1.0 - 1e-15) { true } else if g >= bound * (1.0 + 1e-15) { false } else { return Some(None) }
+            if g <= bound * (1.0 - 1e-15) { true } else if g >= bound * (1.0 + 1e-15) { false } else { return Some(None); }
         };
         // The result is `x / p`, which IEEE division rounds as the exact walk does while `p` is below 2^53. An exact end has `x / p = y / q`, with the smaller `q`.
-        within.then(|| if p <= 1 << 53 { Some(x / p as f64) } else if gap == 0 && q <= 1 << 53 { Some(y / q as f64) } else { None })
+        within.then(|| {
+            if p <= 1 << 53 { Some(x / p as f64) } else if gap == 0 && q <= 1 << 53 { Some(y / q as f64) } else { None }
+        })
     })
 }
 
@@ -286,7 +295,9 @@ macro_rules! tolerant {
 
 /// `b` as 1 or 0 for an [`Indicator`]. Choosing between the two constants turns a comparison's lane mask into the result with one `and`. [`Element::truth`] converts through an integer instead, which suits the stored Booleans that `slice::masked` reads but would narrow and widen a lane mask here.
 #[inline(always)]
-fn indicated<E: Element>(b: bool) -> E where bool: crate::buffer::Source<E> { if b { crate::buffer::Source::<E>::read(true) } else { crate::buffer::Source::<E>::read(false) } }
+fn indicated<E: Element>(b: bool) -> E where bool: crate::buffer::Source<E> {
+    if b { crate::buffer::Source::<E>::read(true) } else { crate::buffer::Source::<E>::read(false) }
+}
 
 /// Writes an [`Indicator`]'s forms for the tolerant comparison `$object` at each float type `$e`, through `forms!`: its item body over a tolerance `$t` as 1 or 0, and a slice form that compares many items with one number through `against`, writing each float in the same loop.
 macro_rules! indicator {
@@ -343,7 +354,9 @@ macro_rules! with_band {
 /// Writes into `out`, through `from`, whether each item of `xs` lies in `band` against the range `lo` to `hi`. Its loop, through `pairs_into`, vectorizes.
 #[inline(always)]
 fn in_band<F: Copy + PartialOrd, O>(xs: &[F], lo: F, hi: F, band: Band, out: &mut [std::mem::MaybeUninit<O>], from: impl Fn(bool) -> O + Copy) {
-    with_band!(band, |B| pairs_into(Arg::Many(xs), Arg::One(()), xs.len(), out, #[inline(always)] |v, ()| (from(B.holds(lo, hi, v)), true)));
+    with_band!(band, |B| pairs_into(
+        Arg::Many(xs), Arg::One(()), xs.len(), out, #[inline(always)] |v, ()| (from(B.holds(lo, hi, v)), true)
+    ));
 }
 
 /// The float types that `against` compares with one number to give Booleans. The default writes them through `in_band`. Wasm's `f64` and `f32` override it in `narrowed`.
@@ -372,7 +385,6 @@ fn against<F: Float, O>(
 /// A comparison's results as floats, 1 where it holds and 0 where it doesn't, as a [`Binary`](crate::Binary) at `f32` and `f64` for each comparison here. A caller that computes in floats reads a comparison's results this way, rather than storing Booleans and converting them. Its slice form compares each item and writes its float in one loop.
 #[derive(Clone, Copy, Debug)]
 pub struct Indicator<K>(pub K);
-
 
 /// Wasm has no instruction that narrows a 64-bit lane to a byte. LLVM writes a float comparison's results two items at a time, in about ten instructions for each item. Where it can prove that lanes hold masks, it also replaces wasm's narrowing instructions with slower code. Here each block of 16 items compares with vector instructions, then shuffles the first byte of each mask into place: 7 shuffles for `f64`'s 8 vectors, and 3 for `f32`'s 4.
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
@@ -506,19 +518,19 @@ tolerant!(Ceil at Complex<f32>, Complex<f64>: |t, [y]| Total(t.complex_ceil(y)))
 /// [`Tolerant::residue`], or [`TolerantComplex::complex_residue`] for complex items, at the tolerance it holds, as a function object: `y` modulo `x`, for arguments `x` and `y` in that order. At no tolerance, where `y/x` passes the float's precision ([`far`]), the rounded quotient has lost its low digits, and [`exact_residue`] gives the residue. The slice form recomputes those items in a second pass. Its `i64` form is [`integer::residue`](crate::integer::residue), which needs no tolerance.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Residue(pub Tolerance);
-forms!(#[inline] Residue at real: |k, [x, y]| Total(if k.0.is_exact() && far(x, y) { exact_residue(x, y) } else { k.0.residue(x, y) }),
-    many |k, [x, y], n, out| with_tolerance!(k.0, |t| {
-        if t.value() != 0.0 { return each!([x, y], n, out, |[x, y]| Total(t.residue(x, y))); }
-        if !each!([x, y], n, out, |[x, y]| (t.residue(x, y), !far(x, y))) { replace_far(x, y, n, out); }
-        true
-    }));
+forms!(#[inline] Residue at real: |k, [x, y]| Total(if k.0.is_exact() { exact_residue(x, y) } else { k.0.residue(x, y) }),
+many |k, [x, y], n, out| with_tolerance!(k.0, |t| {
+    if t.value() != 0.0 { return each!([x, y], n, out, |[x, y]| Total(t.residue(x, y))); }
+    if !each!([x, y], n, out, |[x, y]| (t.residue(x, y), near(x, y))) { replace_far(x, y, n, out); }
+    true
+}));
 tolerant!(Residue at Complex<f32>, Complex<f64>: |t, [x, y]| t.complex_residue(x, y));
 
-/// Replaces the residue in `out` of each item that [`far`] picks with [`exact_residue`]. The slice form's loop judges each item by `far` as it computes it, and runs this only where one is picked.
+/// Recomputes through [`exact_residue`] the residue in `out` of each item that isn't [`near`]. Of those, only the items that [`far`] picks change. The slice form runs this only where its loop finds an item that isn't near.
 fn replace_far<F: Float>(x: Arg<'_, F>, y: Arg<'_, F>, n: usize, out: &mut [std::mem::MaybeUninit<F>]) {
     for (i, r) in crate::slice::written(&mut out[..n]).iter_mut().enumerate() {
         let (x, y) = (x.nth(i), y.nth(i));
-        if far(x, y) { *r = exact_residue(x, y); }
+        if !near(x, y) { *r = exact_residue(x, y); }
     }
 }
 
@@ -526,8 +538,13 @@ fn replace_far<F: Float>(x: Arg<'_, F>, y: Arg<'_, F>, n: usize, out: &mut [std:
 #[inline(always)]
 fn far<F: Float>(x: F, y: F) -> bool { (x != F::zero()) & (y.abs() >= F::narrow(2.0) / F::epsilon() * x.abs()) }
 
-/// `y` modulo `x` from Rust's float remainder, which is exact. The remainder keeps `y`'s sign, so one whose sign differs from `x`'s moves up by `x`. A zero remainder is +0, as [`Tolerant::residue`] gives.
+/// Whether `|y|` is below 2^p times `|x|`. It is `!far(x, y)` without `far`'s test of `x`. Where `x` is zero or NaN it is false, and [`replace_far`] recomputes the item. The slice form's loop judges each item by `near`. x86-64 leaves that loop scalar when the judgment also tests `x == 0`, as the residue's own select does.
+#[inline(always)]
+fn near<F: Float>(x: F, y: F) -> bool { y.abs() < F::narrow(2.0) / F::epsilon() * x.abs() }
+
+/// `y` modulo `x` at no tolerance. It is [`Exactly`]'s residue, except where [`far`] picks `y/x`. There it comes from Rust's float remainder, which is exact and has `y`'s sign. Where `x`'s sign differs, the residue is that remainder plus `x`. A zero remainder gives +0, as [`Tolerant::residue`] does.
 fn exact_residue<F: Float>(x: F, y: F) -> F {
+    if !far(x, y) { return Exactly.residue(x, y); }
     let r = y % x;
     if r == F::zero() { F::zero() } else if (r < F::zero()) != (x < F::zero()) { r + x } else { r }
 }
@@ -593,7 +610,7 @@ pub fn classes<F: Float>(t: impl Tolerant, x: &[F]) -> Result<Vec<u32>, Error> {
     if let Some((keys, _)) = wholes(t, x, whole_limit(t)) { return Ok(search::classes(&keys)); }
     if t.value() == 0.0 { return Ok(search::first_classes(x, F::order_key)); }
     let mut classes = vec![0; x.len()];
-    checked_runs(t, x, |run| for &i in run { classes[i] = run[0] as u32 })?;
+    checked_runs(t, x, |run| { for &i in run { classes[i] = run[0] as u32 } })?;
     Ok(classes)
 }
 
@@ -629,8 +646,7 @@ pub fn runs<F: Float, E>(t: impl Tolerant, x: &[F], mut each: impl FnMut(&[usize
     for end in 1..=keys.len() {
         if end < keys.len() && t.matches(F::from_order_key(keys[end - 1]), F::from_order_key(keys[end])) { continue; }
         // Most runs hold one item, which needs no list of positions to sort.
-        if end - start == 1 { each(&[order[start] as usize])?; }
-        else {
+        if end - start == 1 { each(&[order[start] as usize])?; } else {
             run.clear();
             run.extend(order[start..end].iter().map(|&i| i as usize));
             run.sort_unstable();

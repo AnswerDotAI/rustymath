@@ -89,10 +89,7 @@ pub fn value<T: Clone + NumAssignRef>(c: &[T], x: &T) -> Result<T, Error> {
 /// The value at `x` of `m` times the product of `x - r` over the roots `r`. It checks for an interrupt between groups of `BETWEEN_CHECKS` roots.
 pub fn factored<T: Clone + NumAssignRef>(m: &T, roots: &[T], x: &T) -> Result<T, Error> {
     let mut y = m.clone();
-    for (i, group) in roots.chunks(BETWEEN_CHECKS).enumerate() {
-        if i > 0 { check()?; }
-        for r in group { y *= &minus(x, r); }
-    }
+    for (i, group) in roots.chunks(BETWEEN_CHECKS).enumerate() { if i > 0 { check()?; } for r in group { y *= &minus(x, r); } }
     Ok(y)
 }
 
@@ -111,7 +108,10 @@ pub fn decode<T: Clone + NumAssignRef>(bases: &[T], digits: &[T]) -> Vec<T> {
 pub fn encode<T: Clone + NumAssignRef>(bases: &[T], values: &[T], residue: impl Fn(&T, &T) -> T) -> Vec<T> {
     encoded(bases, values, |b, mut v| {
         let digit = residue(b, &v);
-        if b.is_zero() { v.set_zero() } else { v -= &digit; v /= b; }
+        if b.is_zero() { v.set_zero() } else {
+            v -= &digit;
+            v /= b;
+        }
         Some((v, digit))
     }).expect("a step in a field gives a value")
 }

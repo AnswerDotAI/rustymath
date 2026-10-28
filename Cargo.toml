@@ -55,7 +55,7 @@ rayon = ">=1.12.0, <2"
 web-time = ">=1.1.0, <2"
 
 [target.'cfg(unix)'.dependencies]
-# The memory guard reads physical memory through `libc`. On macOS, the timing lock also makes its QoS call through it, to favour the performance cores for a timing.
+# The memory guard calls `libc` to read physical memory and, on Linux, to ask for huge pages. On macOS, the timing lock also makes its QoS call through it, to favour the performance cores for a timing.
 libc = ">=0.2.190, <1"
 
 [profile.test]

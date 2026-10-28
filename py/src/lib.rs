@@ -20,6 +20,9 @@ mod signal;
 mod structure;
 mod timing;
 
+#[global_allocator]
+static GUARD: rustymath::memory::Guard = rustymath::memory::Guard::new();
+
 /// Sets the thread limit for calls in the whole process, returning its previous setting. 0 restores the default, 1 runs serially.
 #[pyfunction]
 fn set_threads(n: usize) -> usize { rustymath::parallel::set_threads(n) }
@@ -33,11 +36,7 @@ fn threads() -> usize { rustymath::parallel::threads() }
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     rustymath::interrupt::install(convert::signals);
     functions::add_to(m)?;
-    for f in [
-        wrap_pyfunction!(set_threads, m)?, wrap_pyfunction!(thread_setting, m)?, wrap_pyfunction!(threads, m)?,
-    ] {
-        m.add_function(f)?;
-    }
+    for f in [wrap_pyfunction!(set_threads, m)?, wrap_pyfunction!(thread_setting, m)?, wrap_pyfunction!(threads, m)?] { m.add_function(f)?; }
     array::add(m)?;
     create::add(m)?;
     structure::add(m)?;

@@ -35,15 +35,11 @@ impl Collect for Exact {
             let shape = r.shape().to_vec();
             return Ok(Some((Rationals(Arg::from(r).items::<i64>()?.iter().map(|&n| R::from_integer(n.into())).collect()), shape)));
         }
-        let value = if obj.is_instance_of::<PyInt>() {
-            R::from_integer(obj.extract()?)
-        } else if obj.is_instance(fraction(obj.py())?)? {
+        let value = if obj.is_instance_of::<PyInt>() { R::from_integer(obj.extract()?) }
+        else if obj.is_instance(fraction(obj.py())?)? {
             R::new(obj.getattr("numerator")?.extract()?, obj.getattr("denominator")?.extract()?)
-        } else if obj.is_instance_of::<PyFloat>() || obj.is_instance_of::<PyComplex>() {
-            return Err(inexact());
-        } else {
-            return Ok(None);
-        };
+        } else if obj.is_instance_of::<PyFloat>() || obj.is_instance_of::<PyComplex>() { return Err(inexact()); }
+        else { return Ok(None); };
         Ok(Some((Rationals(vec![value]), vec![])))
     }
 }
@@ -63,10 +59,7 @@ fn shaped(x: &Bound<'_, PyAny>, axes: usize, expected: &str) -> PyResult<(Vec<us
 
 fn vector(x: &Bound<'_, PyAny>) -> PyResult<Vec<R>> { Ok(shaped(x, 1, "expected a vector")?.1) }
 
-fn matrix_of(a: &Bound<'_, PyAny>) -> PyResult<([usize; 2], Vec<R>)> {
-    let (shape, a) = shaped(a, 2, "expected a matrix")?;
-    Ok(([shape[0], shape[1]], a))
-}
+fn matrix_of(a: &Bound<'_, PyAny>) -> PyResult<([usize; 2], Vec<R>)> { let (shape, a) = shaped(a, 2, "expected a matrix")?; Ok(([shape[0], shape[1]], a)) }
 
 fn square(a: &Bound<'_, PyAny>) -> PyResult<(usize, Vec<R>)> {
     let ([m, n], a) = matrix_of(a)?;
@@ -89,10 +82,7 @@ fn output<'py>(py: Python<'py>, shape: &[usize], items: Vec<R>) -> PyResult<Boun
 
 /// `f` on each of `items`, calling `check` every 1024 items, whose error stops the loop.
 fn each<T, U>(items: impl IntoIterator<Item = T>, mut check: impl FnMut() -> PyResult<()>, mut f: impl FnMut(T) -> PyResult<U>) -> PyResult<Vec<U>> {
-    items.into_iter().enumerate().map(|(i, x)| {
-        if i % 1024 == 0 { check()?; }
-        f(x)
-    }).collect()
+    items.into_iter().enumerate().map(|(i, x)| { if i % 1024 == 0 { check()?; } f(x) }).collect()
 }
 
 /// `f` on each pair of items of `x` and `y`, broadcast together, with the GIL released.
@@ -100,7 +90,11 @@ fn binary<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>, f:
     let ((lx, x), (ly, y)) = (values(x)?, values(y)?);
     let agreement = Agreement::new(&lx, &ly).map_err(py_err)?;
     let fill = || py_err(Error::new(Kind::Domain, "exact arithmetic has no fill for a missing key"));
-    let out = released(py, || each(0..agreement.len, || rustymath::interrupt::check().map_err(py_err), |i| f(&x[agreement.left.get(i).ok_or_else(fill)?], &y[agreement.right.get(i).ok_or_else(fill)?])))?;
+    let out = released(py, || {
+        each(
+            0..agreement.len, || rustymath::interrupt::check().map_err(py_err),
+            |i| f(&x[agreement.left.get(i).ok_or_else(fill)?], &y[agreement.right.get(i).ok_or_else(fill)?]))
+    })?;
     output(py, agreement.layout.shape(), out)
 }
 
@@ -121,7 +115,9 @@ fn lcm<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>) -> Py
 
 /// `x` modulo `y`, with `y`'s sign. A zero `y` gives `x`.
 #[pyfunction]
-fn remainder<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { binary(py, x, y, |x, y| Ok(exact::residue(y, x))) }
+fn remainder<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, y: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    binary(py, x, y, |x, y| Ok(exact::residue(y, x)))
+}
 
 /// The binomial coefficient `n` choose `k`, for a rational `n` and a whole `k` that fits `int64`.
 #[pyfunction]
@@ -139,9 +135,8 @@ fn solve<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, b: &Bound<'py, PyAny>) -> 
     let ([m, n], a) = matrix_of(a)?;
     let (layout, b) = values(b)?;
     let (k, shape) = match *layout.shape() {
-        [r] if r == m => (1, vec![n]),
-        [r, k] if r == m => (k, vec![n, k]),
-        _ => return Err(py_err(Error::new(Kind::Length, "b must be a vector or a matrix with a row for each row of a"))),
+        [r] if r == m => (1, vec![n]), [r, k] if r == m => (k, vec![n, k]),
+        _ => return Err(py_err(Error::new(Kind::Length, "b must be a vector or a matrix with a row for each row of a")))
     };
     output(py, &shape, released(py, || matrix::solve(&a, &b, [m, n], k)).map_err(py_err)?)
 }
@@ -236,4 +231,3 @@ pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
     ] { m.add_function(f)?; }
     Ok(())
 }
-

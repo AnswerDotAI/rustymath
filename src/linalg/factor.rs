@@ -229,9 +229,7 @@ impl<T: Factor> LuWork<T> {
 /// Buffers that QR factorizations reuse. A matrix with at most `LEAF` reflections factors in them, so a run of calls on such matrices of one size allocates only in its first call. A larger matrix factors as [`qr`] does.
 pub struct QrWork<T> { at: Vec<T>, taus: Vec<T>, qt: Vec<T> }
 
-impl<T> Default for QrWork<T> {
-    fn default() -> Self { QrWork { at: Vec::new(), taus: Vec::new(), qt: Vec::new() } }
-}
+impl<T> Default for QrWork<T> { fn default() -> Self { QrWork { at: Vec::new(), taus: Vec::new(), qt: Vec::new() } } }
 
 impl<T: Factor> QrWork<T> {
     /// [`qr`], or [`qr_complete`] where `complete` is true, of the matrix `a` of `size` `[m, n]`, written into `q` and `r`, which hold Q's and R's items, using these buffers.
@@ -330,7 +328,9 @@ pub fn norm<T: Factor>(a: &[T], [m, n]: [usize; 2], p: Norm) -> T::Real {
 pub fn cond<T: Factor>(a: &[T], [m, n]: [usize; 2], p: Norm) -> T::Real {
     if p == Norm::Two {
         let s = singular_values(a, [m, n]);
-        return match (s.first(), s.last()) { (Some(&large), Some(&small)) => if large == T::Real::zero() { T::Real::infinity() } else { large / small }, _ => T::Real::nan() };
+        return match (s.first(), s.last()) {
+            (Some(&large), Some(&small)) => { if large == T::Real::zero() { T::Real::infinity() } else { large / small } } _ => T::Real::nan()
+        };
     }
     if m != n { return T::Real::infinity(); }
     let mut inverse = filled(n * n, T::zero());
@@ -396,7 +396,9 @@ pub fn from_lu<T: Factor>(l: &[T], u: &[T], p: &[T], n: usize) -> Option<Vec<T>>
 pub fn is_hermitian<T: Scalar>(a: &[T], n: usize) -> bool { (0..n).all(|i| (0..n).all(|j| a[i * n + j] == a[j * n + i].conj())) }
 
 /// `a`, whose rows hold `columns` items, with each column multiplied by the item of `d` at its position.
-fn scaled_columns<T: Scalar>(a: &[T], d: &[T], columns: usize) -> Vec<T> { a.chunks_exact(columns.max(1)).flat_map(|row| row.iter().zip(d).map(|(&x, &s)| x * s)).collect() }
+fn scaled_columns<T: Scalar>(a: &[T], d: &[T], columns: usize) -> Vec<T> {
+    a.chunks_exact(columns.max(1)).flat_map(|row| row.iter().zip(d).map(|(&x, &s)| x * s)).collect()
+}
 
 /// Whether every item of `x` is finite, in both parts where it's complex.
 fn finite<T: Scalar>(x: &[T]) -> bool { x.iter().all(|x| x.re().is_finite() && x.im().is_finite()) }
@@ -449,15 +451,11 @@ fn eig_factor<T: Tiled>(a: &[T], n: usize, vectors: bool) -> Option<Eig<T::Real>
 
 /// `y += a x`, item by item.
 #[inline(always)]
-pub(crate) fn axpy<T: Scalar>(y: &mut [T], a: T, x: &[T]) {
-    for (y, &x) in y.iter_mut().zip(x) { *y = x.mul_acc(a, *y) }
-}
+pub(crate) fn axpy<T: Scalar>(y: &mut [T], a: T, x: &[T]) { for (y, &x) in y.iter_mut().zip(x) { *y = x.mul_acc(a, *y) } }
 
 /// `y += a conj(x)`, item by item, which for real items is `axpy`.
 #[inline(always)]
-fn axpyc<T: Scalar>(y: &mut [T], a: T, x: &[T]) {
-    for (y, &x) in y.iter_mut().zip(x) { *y = x.conj().mul_acc(a, *y) }
-}
+fn axpyc<T: Scalar>(y: &mut [T], a: T, x: &[T]) { for (y, &x) in y.iter_mut().zip(x) { *y = x.conj().mul_acc(a, *y) } }
 
 /// The sum of `x[i] y[i]`.
 #[inline(always)]
@@ -1051,7 +1049,9 @@ fn leaf_qr<T: Tiled>(a: &[T], [m, n]: [usize; 2], work: &mut QrWork<T>, q: &mut 
     taus.resize(p, T::zero());
     reflect_columns(at, m, [0, p, n], |c, tau| taus[c] = tau);
     // R returns to `a`'s scale. The reflections don't depend on the scale.
-    for i in 0..p { for j in 0..n { r[i * n + j] = if j < i { T::zero() } else { scale.map_or(at[j * m + i], |s| at[j * m + i].div_real(s)) } } }
+    for i in 0..p {
+        for j in 0..n { r[i * n + j] = if j < i { T::zero() } else { scale.map_or(at[j * m + i], |s| at[j * m + i].div_real(s)) } }
+    }
     one_at_a_time(m, p, (0..p).map(|c| (c, taus[c], &at[c * m + c + 1..(c + 1) * m])), qt, q)
 }
 

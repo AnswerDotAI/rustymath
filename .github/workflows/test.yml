@@ -9,12 +9,13 @@ permissions:
   contents: read
 
 # Every test step after the first runs even when an earlier step fails, to report every test's result in one run.
-# A build step that runs past 10 minutes has stalled. It normally takes about 3.
 jobs:
   test:
     runs-on: ubicloud-standard-4-ubuntu-2604
     steps:
       - uses: actions/checkout@v7
+      # The speed tests' costs for large new arrays depend on whether the kernel gives them transparent huge pages.
+      - run: cat /sys/kernel/mm/transparent_hugepage/enabled
       - uses: dtolnay/rust-toolchain@stable
       # The repository has no `Cargo.lock`. Creating one first makes rust-cache's key change when a dependency publishes a new version.
       - run: cargo generate-lockfile
@@ -27,7 +28,6 @@ jobs:
           python-version: '3.12'
       - run: pip install -e '.[dev]'
       - run: cargo develop
-        timeout-minutes: 10
       # With `RUSTYMATH_COSTS`, the Rust and Python speed tests log every cost, which `basedpl.bpltests.logged_costs` reads.
       - run: RUSTYMATH_COSTS=1 cargo test
       - run: RUSTYMATH_COSTS=1 pytest -q

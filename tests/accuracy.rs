@@ -444,7 +444,9 @@ fn digamma_accuracy() {
     let (lifted, reflected): (Vec<_>, Vec<_>) = cases.iter().copied().partition(|&(x, _)| !(x < -20.0));
     for (wide, narrow, how) in variants!(digamma) {
         check(&format!("f64 digamma, {how}"), scaled(lifted.iter().copied(), wide, f64::EPSILON, 1.0));
-        check(&format!("f64 reflected digamma, {how}"), reflected.iter().map(|&c| scaled([c], wide, f64::EPSILON, (1.0 - c.0).ln())).max_by_key(|w| w.0).unwrap());
+        check(
+            &format!("f64 reflected digamma, {how}"), reflected.iter().map(|&c| scaled([c], wide, f64::EPSILON, (1.0 - c.0).ln())).max_by_key(|w| w.0).unwrap()
+        );
         check(&format!("f32 digamma, {how}"), scaled(at32(&cases).into_iter().map(|(x, y)| (x, y.into())), |x| narrow(x).into(), f32::EPSILON.into(), 1.0));
     }
     check("f16 digamma", worst(1 << 16, |i| f16::from_bits(i as u16), rustymath::digamma, |x| f16::from_f64(rustymath::digamma::<f64>(x.into()))));
@@ -674,9 +676,9 @@ mod complex {
     fn tiny_parts() {
         let (e, q) = (1e-30, 1.16f64.sqrt());
         let cases = [
-            ("sqrt1mx2", c(e, 0.4), c(q, -e * 0.4 / q), true), ("sqrt1px2", c(0.4, e), c(q, e * 0.4 / q), true), ("sqrtx2m1", c(e, 0.4), c(e * 0.4 / q, q), true),
-            ("sqrtx2m1", c(1e200, 1e-200), c(1e200, 1e-200), false), ("sqrt1mx2", c(1e200, 1e-200), c(1e-200, -1e200), false),
-            ("sqrtx2m1", c(1e300, 1e-300), c(1e300, 1e-300), false),
+            ("sqrt1mx2", c(e, 0.4), c(q, -e * 0.4 / q), true), ("sqrt1px2", c(0.4, e), c(q, e * 0.4 / q), true),
+            ("sqrtx2m1", c(e, 0.4), c(e * 0.4 / q, q), true), ("sqrtx2m1", c(1e200, 1e-200), c(1e200, 1e-200), false),
+            ("sqrt1mx2", c(1e200, 1e-200), c(1e-200, -1e200), false), ("sqrtx2m1", c(1e300, 1e-300), c(1e300, 1e-300), false),
         ];
         let close = |g: f64, w: f64, eps: f64| (g - w).abs() <= 4.0 * eps * w.abs();
         for (name, z, want, narrow) in cases {

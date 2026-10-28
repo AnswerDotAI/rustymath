@@ -1,10 +1,10 @@
 //! The `rustymath.Array` class: a rustymath [`Array`](rustymath::array::Array) that readers of the buffer protocol, such as NumPy, can view without a copy.
-use crate::functions;
 use crate::convert::released;
+use crate::functions;
 use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::pyclass::CompareOp;
 use pyo3::types::{PyComplex, PyTuple};
 use pyo3::{IntoPyObjectExt, ffi, prelude::*};
-use pyo3::pyclass::CompareOp;
 use rustymath::array::{Array as Core, ArrayView};
 use rustymath::buffer::{Buffer, Element, FloatWidth, Items, View};
 use rustymath::layout::Layout;
@@ -23,11 +23,14 @@ impl Array {
 
 /// `core` as a Python object: with `scalar`, a rank-0 result is a Python number, and anything else is a `rustymath.Array`. A function passes `scalar` where every argument was a Python scalar, and where its result covers the whole of its arguments, as a reduction of a whole array or one decoded vector of digits does.
 pub fn give(py: Python<'_>, core: Core, scalar: bool) -> PyResult<Bound<'_, PyAny>> {
-    if scalar && core.layout().shape().is_empty() { item(py, core.strided().contiguous().expect("one strided item is contiguous"), 0) } else { Ok(Bound::new(py, Array::new(core))?.into_any()) }
+    if scalar && core.layout().shape().is_empty() { item(py, core.strided().contiguous().expect("one strided item is contiguous"), 0) }
+    else { Ok(Bound::new(py, Array::new(core))?.into_any()) }
 }
 
 /// The array of `buffer`'s items laid out by `layout`, given as [`give`] gives it.
-pub fn give_items(py: Python<'_>, layout: Layout, buffer: Buffer, scalar: bool) -> PyResult<Bound<'_, PyAny>> { give(py, Core::new(layout, buffer).map_err(py_err)?, scalar) }
+pub fn give_items(py: Python<'_>, layout: Layout, buffer: Buffer, scalar: bool) -> PyResult<Bound<'_, PyAny>> {
+    give(py, Core::new(layout, buffer).map_err(py_err)?, scalar)
+}
 
 /// `items` as a rustymath array of `shape`, with no keys or names.
 pub fn core<T: Element>(items: Vec<T>, shape: &[usize]) -> PyResult<Core> { Core::new(shape.into(), T::buffer(items)).map_err(py_err) }
@@ -49,7 +52,10 @@ fn shown<'py>(py: Python<'py>, view: ArrayView<'_>, i: usize) -> PyResult<Bound<
     let i = view.mapping().get(i).expect("a strided view has no fills");
     match view.storage() {
         View::Floats(v) => display_float(v.get(i), v.tag()).into_bound_py_any(py),
-        View::Complexes(v) => { let (z, w) = (v.get(i), v.tag().into()); Ok(PyComplex::from_doubles(py, display_float(z.re, w), display_float(z.im, w)).into_any()) }
+        View::Complexes(v) => {
+            let (z, w) = (v.get(i), v.tag().into());
+            Ok(PyComplex::from_doubles(py, display_float(z.re, w), display_float(z.im, w)).into_any())
+        }
         view => item(py, view, i),
     }
 }
@@ -246,7 +252,4 @@ fn array(x: &Bound<'_, PyAny>, dtype: Option<&str>, keys: Option<Vec<Option<Vec<
     Ok(array)
 }
 
-pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<Array>()?;
-    m.add_function(wrap_pyfunction!(array, m)?)
-}
+pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> { m.add_class::<Array>()?; m.add_function(wrap_pyfunction!(array, m)?) }

@@ -1,23 +1,21 @@
 //! Turns a call's data arguments into views of one dtype. Arrays of different dtypes take the dtype that NumPy promotes them to, which [`DType::common`] gives, and characters beside numbers raise. An array or NumPy scalar inside a list counts as an array. The Python values in a call convert together. Beside an array they follow NEP 50: a value of the array's kind or a lower one takes the array's dtype, and a value of a higher kind promotes the array. On their own, they take the dtype of their highest kind: `bool`, `i64`, `f64`, then `c128`.
 use crate::array::Array;
-use rustymath::half::f16;
-use rustymath::num_complex::{Complex32, Complex64};
 use pyo3::exceptions::{PySystemError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyComplex, PyFloat, PyInt, PyList, PyString};
 use rustymath::array::{Array as Core, ArrayView};
 use rustymath::buffer::{Buffer, ComplexWidth, DType, Element, Fill, FloatWidth, Items, Width};
 use rustymath::error::{Error, Kind};
+use rustymath::half::f16;
 use rustymath::layout::Layout;
+use rustymath::num_complex::{Complex32, Complex64};
 use rustymath::structure::transpose;
 use rustymath::with_dtype;
 use rustymath_buffer::{Read, frame::{Frame, frame}, py_err, read, read_array, walk::{Collect, walked}};
 use std::{borrow::Cow, cell::Cell, sync::Arc};
 
 /// The shared compact dtype named `name`, or a Python argument error.
-pub fn dtype(name: &str) -> PyResult<DType> {
-    DType::named(name).ok_or_else(|| PyValueError::new_err(format!("unknown dtype {name:?}")))
-}
+pub fn dtype(name: &str) -> PyResult<DType> { DType::named(name).ok_or_else(|| PyValueError::new_err(format!("unknown dtype {name:?}"))) }
 
 thread_local! {
     /// Whether this thread is running work that [`released`] runs, the one place where [`signals`] checks for a pending signal.
@@ -35,10 +33,7 @@ pub fn released<R: Send>(py: Python<'_>, work: impl FnOnce() -> R + Send) -> R {
 }
 
 /// This module's interrupt check, which its init installs as rustymath's ([`rustymath::interrupt::install`]): the Interrupt error for the exception of a pending signal, such as Ctrl-C. Only work that [`released`] runs takes the GIL to check. Rustymath's worker threads, and calls that hold the GIL, pass without taking it.
-pub fn signals() -> Result<(), Error> {
-    if !RELEASED.get() { return Ok(()); }
-    Python::attach(|py| py.check_signals()).map_err(rustymath_buffer::raised)
-}
+pub fn signals() -> Result<(), Error> { if !RELEASED.get() { return Ok(()); } Python::attach(|py| py.check_signals()).map_err(rustymath_buffer::raised) }
 
 /// One data argument, converted, and whether it was a Python scalar, as `scalar` tests.
 pub struct Arg { source: Source, pub scalar: bool }
@@ -69,10 +64,7 @@ impl Arg {
     pub fn layout(&self) -> Layout { self.view().layout().clone() }
     /// The argument as an owned array. Only borrowed items are copied.
     pub fn into_core(self) -> PyResult<Core> {
-        match self.source {
-            Source::Read { read, layout } => Core::new(layout, read.into_buffer()).map_err(py_err),
-            Source::Owned(c) => Ok(c),
-        }
+        match self.source { Source::Read { read, layout } => Core::new(layout, read.into_buffer()).map_err(py_err), Source::Owned(c) => Ok(c) }
     }
     /// Selects by `plan` before taking ownership, with the GIL released, reading `fill`, or the item type's fill, where the plan reaches no item: foreign items gather directly, and rustymath arrays select as [`Core::selected`] does.
     pub fn selected(&self, py: Python<'_>, plan: rustymath::structure::Plan, fill: Option<Arc<Fill>>) -> PyResult<Core> {
@@ -85,15 +77,15 @@ impl Arg {
     pub fn at(&self, dtype: DType) -> PyResult<Items<'_>> {
         let view = self.view();
         if view.is_empty() && view.dtype() != dtype { return Ok(Items::Owned(Buffer::with_capacity(dtype, 0))); }
-        if !view.is_empty() && !view.dtype().widens_to(dtype) { return Err(py_err(Error::new(Kind::Domain, format!("{} doesn't widen to {}", view.dtype().name(), dtype.name())))); }
+        if !view.is_empty() && !view.dtype().widens_to(dtype) {
+            return Err(py_err(Error::new(Kind::Domain, format!("{} doesn't widen to {}", view.dtype().name(), dtype.name()))));
+        }
         view.cast(dtype).map_err(py_err)
     }
     /// The items in row-major order at the argument's own dtype, borrowed where they're stored that way.
     pub fn row_major(&self) -> PyResult<Items<'_>> { self.at(self.view().dtype()) }
     /// The items in row-major order as `T`, widened as [`Arg::at`] widens them: borrowed where the argument already has `T`'s dtype, and otherwise the widened copy.
-    pub fn items<T: Element>(&self) -> PyResult<Cow<'_, [T]>> {
-        Ok(self.at(T::DTYPE)?.items())
-    }
+    pub fn items<T: Element>(&self) -> PyResult<Cow<'_, [T]>> { Ok(self.at(T::DTYPE)?.items()) }
     /// The items in row-major order as `T`, converted as [`Buffer::cast`] converts them, narrowing included.
     pub fn cast<T: Element>(&self) -> PyResult<Vec<T>> { Ok(self.view().items::<T>().map_err(py_err)?.into_owned()) }
 }
@@ -114,11 +106,8 @@ impl Leaf {
     /// The dtype that the leaf takes on its own.
     fn dtype(self) -> DType {
         match self {
-            Self::Bool(_) => DType::Boolean,
-            Self::Int(_) | Self::Big(_) => DType::Integer(Width::I64),
-            Self::Float(_) => DType::Float(FloatWidth::F64),
-            Self::Complex(_) => DType::Complex(ComplexWidth::F64),
-            Self::Char(_) => DType::Character,
+            Self::Bool(_) => DType::Boolean, Self::Int(_) | Self::Big(_) => DType::Integer(Width::I64), Self::Float(_) => DType::Float(FloatWidth::F64),
+            Self::Complex(_) => DType::Complex(ComplexWidth::F64), Self::Char(_) => DType::Character
         }
     }
 }
@@ -134,16 +123,12 @@ fn join(strong: &mut Option<DType>, dtype: DType) -> PyResult<()> {
 /// The dtype of a call whose arrays have `strong` and whose Python values reach `weak`, as [`DType::common_weak`] promotes them. A call with neither takes `float64`.
 fn target(strong: Option<DType>, weak: Option<DType>) -> PyResult<DType> {
     Ok(match (strong, weak) {
-        (Some(s), Some(w)) => s.common_weak(w).ok_or_else(mixed)?,
-        (Some(d), None) | (None, Some(d)) => d,
-        (None, None) => DType::Float(FloatWidth::F64),
+        (Some(s), Some(w)) => s.common_weak(w).ok_or_else(mixed)?, (Some(d), None) | (None, Some(d)) => d, (None, None) => DType::Float(FloatWidth::F64)
     })
 }
 
 /// An item of the dtype that a Python value converts to.
-trait FromLeaf: Sized {
-    fn from_leaf(leaf: Leaf, dtype: DType) -> Result<Self, Error>;
-}
+trait FromLeaf: Sized { fn from_leaf(leaf: Leaf, dtype: DType) -> Result<Self, Error>; }
 
 fn unfit(leaf: Leaf, dtype: DType) -> Error {
     let name = dtype.name();
@@ -217,25 +202,19 @@ impl Collect for Pieces {
 
 /// The value of a Python scalar, a one-character `str`, or `None`, which reads as NaN. `Ok(None)` for any other object.
 fn leaf(obj: &Bound<'_, PyAny>) -> PyResult<Option<Leaf>> {
-    Ok(Some(if obj.is_instance_of::<PyBool>() {
-        Leaf::Bool(obj.extract()?)
-    } else if obj.is_instance_of::<PyInt>() {
+    Ok(Some(if obj.is_instance_of::<PyBool>() { Leaf::Bool(obj.extract()?) }
+    else if obj.is_instance_of::<PyInt>() {
         obj.extract().map(Leaf::Int).or_else(|_| obj.extract().map(Leaf::Big))?
-    } else if obj.is_instance_of::<PyFloat>() {
-        Leaf::Float(obj.extract()?)
-    } else if let Ok(z) = obj.cast::<PyComplex>() {
-        Leaf::Complex(Complex64::new(z.real(), z.imag()))
-    } else if let Ok(s) = obj.cast::<PyString>() {
+    } else if obj.is_instance_of::<PyFloat>() { Leaf::Float(obj.extract()?) }
+    else if let Ok(z) = obj.cast::<PyComplex>() { Leaf::Complex(Complex64::new(z.real(), z.imag())) }
+    else if let Ok(s) = obj.cast::<PyString>() {
         let mut chars = s.to_str()?.chars();
         match (chars.next(), chars.next()) {
             (Some(c), None) => Leaf::Char(c),
             _ => return Err(py_err(Error::new(Kind::Domain, "a str inside a sequence must be one character; use list(s) for its characters"))),
         }
-    } else if obj.is_none() {
-        Leaf::Float(f64::NAN)
-    } else {
-        return Ok(None);
-    }))
+    } else if obj.is_none() { Leaf::Float(f64::NAN) }
+    else { return Ok(None); }))
 }
 
 /// An argument before the call's dtype is known: an array, or nested values with their layout and whether they were a Python scalar.
@@ -243,7 +222,8 @@ enum Pending { Array(Arg), Values(Layout, Vec<Piece>, bool) }
 
 /// Whether `obj` is a Python scalar: a `bool`, `int`, `float` or `complex`, not a subclass such as NumPy's `float64`.
 fn scalar(obj: &Bound<'_, PyAny>) -> bool {
-    obj.is_exact_instance_of::<PyBool>() || obj.is_exact_instance_of::<PyInt>() || obj.is_exact_instance_of::<PyFloat>() || obj.is_exact_instance_of::<PyComplex>()
+    obj.is_exact_instance_of::<PyBool>() || obj.is_exact_instance_of::<PyInt>() || obj.is_exact_instance_of::<PyFloat>()
+        || obj.is_exact_instance_of::<PyComplex>()
 }
 
 /// Classifies one data argument, adding the dtype of any array it holds to `strong`.
@@ -252,11 +232,11 @@ fn classify(obj: &Bound<'_, PyAny>, strong: &mut Option<DType>) -> PyResult<Pend
     // `None` is a missing value only as an item, so an operator given a bare `None` returns `NotImplemented`.
     if obj.is_none() { return Err(PyTypeError::new_err("rustymath can't convert NoneType")); }
     if let Some(frame) = frame(obj)? { return framed(obj.py(), frame, strong); }
-    let source = if let Ok(a) = obj.cast::<Array>() {
-        Some(Source::Owned(a.try_borrow()?.core().clone()))
-    } else {
+    let source = if let Ok(a) = obj.cast::<Array>() { Some(Source::Owned(a.try_borrow()?.core().clone())) } else {
         let read = match read_array(obj)? {
-            None if obj.hasattr("__array__")? => Some(read_array(&obj.call_method0("__array__")?)?.ok_or_else(|| PyTypeError::new_err("__array__ gave an object without a buffer"))?),
+            None if obj.hasattr("__array__")? => {
+                Some(read_array(&obj.call_method0("__array__")?)?.ok_or_else(|| PyTypeError::new_err("__array__ gave an object without a buffer"))?)
+            }
             read => read,
         };
         read.map(|(read, layout)| Source::read(read, layout))
@@ -284,7 +264,8 @@ fn framed(py: Python<'_>, frame: Frame<'_>, strong: &mut Option<DType>) -> PyRes
         return Err(py_err(Error::new(Kind::Domain, format!("column {label} holds text, which a rustymath array can't hold"))));
     }
     let columns = one(&PyList::new(py, &frame.columns)?.into_any())?.into_core()?;
-    let mut core = if frame.columns.is_empty() { columns.reshape(Layout::from([frame.rows, 0])) } else { columns.selected(transpose(columns.layout(), &[1, 0]).map_err(py_err)?, None) }.map_err(py_err)?;
+    let mut core = if frame.columns.is_empty() { columns.reshape(Layout::from([frame.rows, 0])) }
+    else { columns.selected(transpose(columns.layout(), &[1, 0]).map_err(py_err)?, None) }.map_err(py_err)?;
     core.set_keys(frame.keys.to_vec()).map_err(py_err)?;
     core.set_names(frame.names.to_vec()).map_err(py_err)?;
     join(strong, core.dtype())?;
@@ -330,19 +311,20 @@ fn convert_at(args: &[&Bound<'_, PyAny>], forced: Option<DType>) -> PyResult<Cal
         return Err(PySystemError::new_err(format!("internal error: promotion would narrow {} to {}", s.name(), target.name())));
     }
     let args = pending.into_iter().map(|p| {
-        let a = match p {
-            Pending::Array(a) => a,
-            Pending::Values(layout, pieces, scalar) => {
-                // Leaf readers narrow within a kind. Lowering a kind uses the shared whole-buffer cast's truncation/validation rules.
-                let at = if target.kind() < inferred.kind() { inferred } else { target };
-                Arg { source: Source::Owned(build(layout, &pieces, at)?), scalar }
-            }
-        };
-        if a.view().dtype() == target { return Ok(a); }
-        let items = a.view().cast(target).map_err(py_err)?;
-        let Items::Owned(buffer) = items else { unreachable!("different dtypes need a cast") };
-        Core::new(a.layout(), buffer).map(|c| Arg { source: Source::Owned(c), scalar: a.scalar }).map_err(py_err)
-    }).collect::<PyResult<Vec<_>>>()?;
+            let a = match p {
+                Pending::Array(a) => a,
+                Pending::Values(layout, pieces, scalar) => {
+                    // Leaf readers narrow within a kind. Lowering a kind uses the shared whole-buffer cast's truncation/validation rules.
+                    let at = if target.kind() < inferred.kind() { inferred } else { target };
+                    Arg { source: Source::Owned(build(layout, &pieces, at)?), scalar }
+                }
+            };
+            if a.view().dtype() == target { return Ok(a); }
+            let items = a.view().cast(target).map_err(py_err)?;
+            let Items::Owned(buffer) = items else { unreachable!("different dtypes need a cast") };
+            Core::new(a.layout(), buffer).map(|c| Arg { source: Source::Owned(c), scalar: a.scalar }).map_err(py_err)
+        })
+        .collect::<PyResult<Vec<_>>>()?;
     Ok(Call { args })
 }
 

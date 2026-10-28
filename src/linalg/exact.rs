@@ -14,8 +14,7 @@ pub struct Echelon<T> {
 }
 
 /// The reduced row echelon form of the `m`×`width` matrix `e`, reducing only its first `columns` columns.
-pub fn echelon<T: Clone + NumAssignRef>(
-    mut e: Vec<T>, [m, width]: [usize; 2], columns: usize) -> Result<Echelon<T>, Error> {
+pub fn echelon<T: Clone + NumAssignRef>(mut e: Vec<T>, [m, width]: [usize; 2], columns: usize) -> Result<Echelon<T>, Error> {
     assert_eq!(e.len(), m * width, "`e` must hold `m`×`width` items");
     let (mut pivots, mut determinant) = (Vec::new(), T::one());
     for c in 0..columns.min(width) {
@@ -44,13 +43,11 @@ pub fn echelon<T: Clone + NumAssignRef>(
     Ok(Echelon { rows: e, pivots, determinant })
 }
 
-
 /// The determinant of the `n`×`n` matrix `a`.
 pub fn determinant<T: Clone + NumAssignRef>(a: &[T], n: usize) -> Result<T, Error> {
     let e = echelon(a.to_vec(), [n, n], n)?;
     Ok(if e.pivots.len() < n { T::zero() } else { e.determinant })
 }
-
 
 /// The solution `x` of `c x = r` and the determinant of `c`, for the `n`×`n` matrix `c` and the `n`×`k` matrix `r`, from the echelon form of `[c r]`. `None` where `c` is singular.
 fn square<T: Clone + NumAssignRef>(c: &[T], r: &[T], n: usize, k: usize) -> Result<Option<(Vec<T>, T)>, Error> {
@@ -75,12 +72,8 @@ pub fn solve<T: Clone + NumAssignRef>(a: &[T], b: &[T], [m, n]: [usize; 2], k: u
     Ok((0..n * k).map(|ij| sum((0..r).map(|i| times(&f[i * n + ij / k], &w[i * k + ij % k])))).collect())
 }
 
-
 /// The pseudoinverse of the real `m`×`n` matrix `a`, as an `n`×`m` matrix: its inverse where `a` is square and of full rank.
-pub fn pinv<T: Clone + NumAssignRef>(a: &[T], [m, n]: [usize; 2]) -> Result<Vec<T>, Error> {
-    solve(a, &identity(m), [m, n], m)
-}
-
+pub fn pinv<T: Clone + NumAssignRef>(a: &[T], [m, n]: [usize; 2]) -> Result<Vec<T>, Error> { solve(a, &identity(m), [m, n], m) }
 
 /// The inverse of the `n`×`n` matrix `a` and its determinant, from one elimination, or `None` where `a` is singular or empty.
 pub fn inverse<T: Clone + NumAssignRef>(a: &[T], n: usize) -> Result<Option<(Vec<T>, T)>, Error> {
@@ -88,7 +81,6 @@ pub fn inverse<T: Clone + NumAssignRef>(a: &[T], n: usize) -> Result<Option<(Vec
     if n == 0 { return Ok(None); }
     square(a, &identity(n), n, n)
 }
-
 
 /// The permanent of the `n`×`n` matrix `a`: the determinant's sum over permutations, with every sign positive. It follows Ryser's formula, a sum over the subsets of the columns that visits them in Gray code order, so each step adds or removes one column. That takes about 2ⁿ n operations. Panics if `n` is 64 or more.
 pub fn permanent<T: Clone + NumAssignRef>(a: &[T], n: usize) -> Result<T, Error> {
@@ -109,4 +101,3 @@ pub fn permanent<T: Clone + NumAssignRef>(a: &[T], n: usize) -> Result<T, Error>
     }
     Ok(if n == 0 { T::one() } else { total })
 }
-

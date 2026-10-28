@@ -23,17 +23,10 @@ pub enum Kind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Error {
-    pub kind: Kind,
-    pub message: Cow<'static, str>,
-}
+pub struct Error { pub kind: Kind, pub message: Cow<'static, str> }
 
-impl Error {
-    pub fn new(kind: Kind, message: impl Into<Cow<'static, str>>) -> Self { Self { kind, message: message.into() } }
-}
+impl Error { pub fn new(kind: Kind, message: impl Into<Cow<'static, str>>) -> Self { Self { kind, message: message.into() } } }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.message) }
-}
+impl std::fmt::Display for Error { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.message) } }
 
 impl std::error::Error for Error {}

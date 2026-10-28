@@ -321,9 +321,7 @@ const fn product(xs: &[u64]) -> u64 {
 }
 
 /// A factor of the odd composite `n` other than 1 and `n`, found in the narrowest type `n` fits.
-fn narrow_divisor<N: Natural>(n: &N) -> Result<N, Error> {
-    match n.narrow() { Some(x) => Ok(N::widen(narrow_divisor(&x)?)), None => N::divisor(n) }
-}
+fn narrow_divisor<N: Natural>(n: &N) -> Result<N, Error> { match n.narrow() { Some(x) => Ok(N::widen(narrow_divisor(&x)?)), None => N::divisor(n) } }
 
 /// Whether `n` is prime.
 pub fn is_prime<N: Natural>(n: &N) -> Result<bool, Error> {
@@ -410,7 +408,6 @@ pub fn factorial(n: u64) -> Result<BigUint, Error> {
     }
     Ok(product)
 }
-
 
 /// The primes below 7. The sieve stores only numbers that none of them divide, so it gives these separately.
 const WHEEL: [u64; 3] = [2, 3, 5];
@@ -526,7 +523,6 @@ impl Primes {
         }
         k
     }
-
 }
 
 impl Iterator for Primes {

@@ -49,10 +49,7 @@ pub fn coordinates(mut flat: usize, shape: &[usize]) -> impl Iterator<Item = (us
 
 /// The position among `len` that `n` gives, counting from the end when negative. `None` outside the range.
 #[inline]
-pub fn position(n: i64, len: usize) -> Option<usize> {
-    let i = if n < 0 { len as i64 + n } else { n };
-    usize::try_from(i).ok().filter(|&i| i < len)
-}
+pub fn position(n: i64, len: usize) -> Option<usize> { let i = if n < 0 { len as i64 + n } else { n }; usize::try_from(i).ok().filter(|&i| i < len) }
 
 /// An array's items as lanes along one axis: `outer` lanes before it, each `len` items long, with `inner` items between neighbours along it.
 #[derive(Clone, Copy, Debug)]
@@ -84,10 +81,7 @@ pub fn agreed<'a, T: PartialEq + Clone + 'a>(values: impl IntoIterator<Item = Op
 }
 
 /// The first name that appears more than once in `names`.
-pub fn repeated_name(names: &[Option<Arc<str>>]) -> Option<&Arc<str>> {
-    let mut seen = HashSet::new();
-    names.iter().flatten().find(|n| !seen.insert(*n))
-}
+pub fn repeated_name(names: &[Option<Arc<str>>]) -> Option<&Arc<str>> { let mut seen = HashSet::new(); names.iter().flatten().find(|n| !seen.insert(*n)) }
 
 /// Whether an axis name is hidden: it starts with `_`. Hidden and visible names are separate namespaces.
 #[inline]
@@ -98,10 +92,7 @@ pub const FRESH: char = '·';
 
 /// `name` as messages and display show it: a hidden name that holds [`FRESH`] cut after the last one, as in `_b·…`. Any other name stays as it is.
 pub fn shown(name: &str) -> Cow<'_, str> {
-    match name.rfind(FRESH) {
-        Some(i) if hidden(name) => format!("{}…", &name[..i + FRESH.len_utf8()]).into(),
-        _ => name.into(),
-    }
+    match name.rfind(FRESH) { Some(i) if hidden(name) => format!("{}…", &name[..i + FRESH.len_utf8()]).into(), _ => name.into() }
 }
 
 /// Whether two axis names conflict: both are names, they differ, and they're in the same namespace. A name meets a name from the other namespace as if that axis were unnamed.
@@ -227,11 +218,14 @@ impl Keys {
     /// For each position of `wanted`, the matching position here. With `subset`, `wanted` may have fewer positions, and one with no match is an Index error. Otherwise both need the same positions, and a mismatch is a Length error.
     pub fn positions(&self, wanted: &Self, subset: bool) -> Result<Vec<usize>, Error> {
         let kind = if subset { Kind::Index } else { Kind::Length };
-        if !subset && self.len() != wanted.len() { return Err(Error::new(kind, format!("keyed axes of lengths {} and {} don't pair", self.len(), wanted.len()))); }
-        self.align(wanted).into_iter().zip(&wanted.names).map(|(p, name)| p.ok_or_else(|| match name {
-            Some(name) => Error::new(kind, format!("missing key: {}", shown(name))),
-            None => Error::new(kind, "too few positions without keys"),
-        })).collect()
+        if !subset && self.len() != wanted.len() {
+            return Err(Error::new(kind, format!("keyed axes of lengths {} and {} don't pair", self.len(), wanted.len())));
+        }
+        self.align(wanted).into_iter().zip(&wanted.names).map(|(p, name)| {
+            p.ok_or_else(|| match name {
+                Some(name) => Error::new(kind, format!("missing key: {}", shown(name))), None => Error::new(kind, "too few positions without keys")
+            })
+        }).collect()
     }
     /// Keys at source positions, in the order given. A position with no source has no name.
     pub fn select(&self, positions: impl IntoIterator<Item = Option<usize>>) -> Result<Arc<Self>, Error> {
@@ -300,7 +294,9 @@ impl Layout {
     }
     /// The layout with `names` on its axes. A Rank error when the count differs from the rank, and a Domain error when a name repeats.
     pub fn with_names(self, names: Vec<Option<Arc<str>>>) -> Result<Self, Error> {
-        if !names.is_empty() && names.len() != self.shape.len() { return Err(Error::new(Kind::Rank, format!("{} names for {} axes", names.len(), self.shape.len()))); }
+        if !names.is_empty() && names.len() != self.shape.len() {
+            return Err(Error::new(Kind::Rank, format!("{} names for {} axes", names.len(), self.shape.len())));
+        }
         if let Some(name) = repeated_name(&names) { return Err(Error::new(Kind::Domain, format!("the result would have two axes named {}", shown(name)))); }
         Ok(self.inherit_names(names))
     }
@@ -336,8 +332,9 @@ impl Layout {
     /// Whether shapes, assigned axis names and assigned keys match. An unlabelled axis matches either label set.
     pub fn matches(&self, other: &Self) -> bool {
         self.shape == other.shape && (0..self.shape.len()).all(|a| {
-            !names_conflict(self.name(a).map(AsRef::as_ref), other.name(a).map(AsRef::as_ref)) &&
-                match (self.keys(a), other.keys(a)) { (Some(x), Some(y)) => !y.align(x).contains(&None), _ => true }
+            !names_conflict(self.name(a).map(AsRef::as_ref), other.name(a).map(AsRef::as_ref)) && match (self.keys(a), other.keys(a)) {
+                (Some(x), Some(y)) => !y.align(x).contains(&None), _ => true
+            }
         })
     }
     /// The layout without keys on `axis`.
@@ -349,7 +346,9 @@ impl Layout {
     }
     /// The layout with `keys` on its axes. A Rank error when the count differs from the rank, and a Length error when an axis's keys differ from its length.
     pub fn with_keys(self, keys: Vec<Option<Arc<Keys>>>) -> Result<Self, Error> {
-        if !keys.is_empty() && keys.len() != self.shape.len() { return Err(Error::new(Kind::Rank, format!("keys for {} axes of an array with {} axes", keys.len(), self.shape.len()))); }
+        if !keys.is_empty() && keys.len() != self.shape.len() {
+            return Err(Error::new(Kind::Rank, format!("keys for {} axes of an array with {} axes", keys.len(), self.shape.len())));
+        }
         if let Some((k, n)) = keys.iter().zip(self.shape.iter()).find_map(|(k, &n)| k.as_ref().filter(|k| k.len() != n).map(|k| (k.len(), n))) {
             return Err(Error::new(Kind::Length, format!("{k} keys for an axis of length {n}")));
         }

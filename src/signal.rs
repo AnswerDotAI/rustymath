@@ -1,9 +1,9 @@
 //! Correlations and convolutions, which slide a kernel along an array's leading axes, and overlap-add, which adds windows back where they were read.
-use crate::agreement::{Mapping, LINE};
+use crate::agreement::{LINE, Mapping};
 use crate::buffer::Element;
 use crate::error::{Error, Kind};
 use crate::gather::{self, Steps};
-use crate::layout::{count, strides, Layout};
+use crate::layout::{Layout, count, strides};
 use crate::linalg::{Inner, Mapped, Orientation, Scalar};
 use crate::structure::{self, Plan, Windows};
 use std::borrow::Cow;
@@ -39,18 +39,19 @@ pub fn correlation(input: &[usize], kernel: &[usize], slide: usize, mode: Mode, 
     let rank = input.len();
     if slide == 0 || slide > rank { return Err(Error::new(Kind::Rank, format!("a correlation slides along 1 to {rank} axes, not {slide}"))); }
     if kernel.len() < rank || kernel[slide..rank] != input[slide..] {
-        return Err(Error::new(Kind::Length, format!("a kernel of shape {kernel:?} needs {slide} window sizes, then the array's other axes {:?}", &input[slide..])));
+        return Err(Error::new(
+            Kind::Length, format!("a kernel of shape {kernel:?} needs {slide} window sizes, then the array's other axes {:?}", &input[slide..])));
     }
-    if stride.len() != slide || stride.contains(&0) { return Err(Error::new(Kind::Domain, format!("a correlation needs a positive stride for each of its {slide} sliding axes"))); }
+    if stride.len() != slide || stride.contains(&0) {
+        return Err(Error::new(Kind::Domain, format!("a correlation needs a positive stride for each of its {slide} sliding axes")));
+    }
     let window = &kernel[..slide];
     for (&w, &n) in window.iter().zip(input) {
         if w == 0 { return Err(Error::new(Kind::Length, "a window needs at least one item")); }
         if mode == Mode::Valid && w > n { return Err(Error::new(Kind::Length, format!("a window of {w} doesn't fit an axis of {n} in valid mode"))); }
     }
     let widths: Vec<(usize, usize)> = (0..rank).map(|a| match (window.get(a), mode) {
-        (None, _) | (_, Mode::Valid) => (0, 0),
-        (Some(&w), Mode::Full) => (w - 1, w - 1),
-        (Some(&w), Mode::Same) => (w / 2, (w - 1) / 2),
+        (None, _) | (_, Mode::Valid) => (0, 0), (Some(&w), Mode::Full) => (w - 1, w - 1), (Some(&w), Mode::Same) => (w / 2, (w - 1) / 2)
     }).collect();
     let layout = Layout::from(input.to_vec());
     let padding = widths.iter().any(|&w| w != (0, 0)).then(|| structure::pad(&layout, &widths, structure::Edge::Fill)).transpose()?;
@@ -60,8 +61,7 @@ pub fn correlation(input: &[usize], kernel: &[usize], slide: usize, mode: Mode, 
     let windows = slid.plan(padded, padded.shape())?;
     let at = strides(kernel);
     let steps = (0..kernel.len()).map(|a| match a < slide && flip {
-        true => Steps::Stride { start: (kernel[a] - 1) * at[a], len: kernel[a], step: -(at[a] as isize) },
-        false => Steps::along(kernel[a], at[a]),
+        true => Steps::Stride { start: (kernel[a] - 1) * at[a], len: kernel[a], step: -(at[a] as isize) }, false => Steps::along(kernel[a], at[a])
     }).collect();
     let outputs = &kernel[rank..];
     let size = [count(slid.frame()), count(slid.cell()), count(outputs)];

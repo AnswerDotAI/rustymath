@@ -1,7 +1,7 @@
 //! Compact buffers: owned items of one element type, borrowed views of them, and the [`DType`] that names each. Booleans take one byte each. Integers come in four widths, floats in three and complex numbers in two, named by the width of their parts. [`Source`] reads an item of one element type as another.
+use crate::error::{Error, Kind};
 use num_complex::{Complex32, Complex64};
 use std::borrow::Cow;
-use crate::error::{Error, Kind};
 
 /// Declares the owned buffers `$owned`, their borrowed view `$view` and the width `$tag` that names a variant, with one variant for each element type, which fills with `$fill`. `$outer` is the family's variant in `Buffer` and `View`, and `$widest` its widest type, which `widened` reads every width as. Code that needs a variant's element type matches on the variant, as `with_ints!` does.
 macro_rules! buffers {
@@ -256,9 +256,7 @@ impl FloatBuf {
 impl ComplexBuf {
     /// The complex numbers `values` at `width`, each part rounded to it.
     pub fn collect(width: ComplexWidth, values: impl Iterator<Item = Complex64>) -> Self {
-        match width {
-            ComplexWidth::F32 => Self::F32(values.map(Source::read).collect()), ComplexWidth::F64 => Self::F64(values.collect())
-        }
+        match width { ComplexWidth::F32 => Self::F32(values.map(Source::read).collect()), ComplexWidth::F64 => Self::F64(values.collect()) }
     }
 }
 
@@ -271,14 +269,16 @@ impl DType {
     #[inline]
     pub fn is_integral(self) -> bool { matches!(self, Self::Boolean | Self::Integer(_)) }
     /// This dtype's kind, in the order that NEP 50 promotes kinds: 0 for Booleans, 1 for integers, 2 for floats, 3 for complex numbers and 4 for characters, which don't mix with numbers.
-    pub fn kind(self) -> u8 { match self { Self::Boolean => 0, Self::Integer(_) => 1, Self::Float(_) => 2, Self::Complex(_) => 3, Self::Character => 4 } }
+    pub fn kind(self) -> u8 {
+        match self { Self::Boolean => 0, Self::Integer(_) => 1, Self::Float(_) => 2, Self::Complex(_) => 3, Self::Character => 4 }
+    }
     /// The dtype's name, as NumPy names its dtypes: `"bool"`, `"uint8"`, `"int16"`, `"int32"`, `"int64"`, `"float16"`, `"float32"`, `"float64"`, `"complex64"` and `"complex128"`. NumPy has no dtype for characters, which are `"character"`. Rustymath's Python API and BPL's `•storage` both use these names.
     pub fn name(self) -> &'static str {
         match self {
             Self::Boolean => "bool", Self::Integer(Width::U8) => "uint8", Self::Integer(Width::I16) => "int16", Self::Integer(Width::I32) => "int32",
             Self::Integer(Width::I64) => "int64", Self::Float(FloatWidth::F16) => "float16", Self::Float(FloatWidth::F32) => "float32",
             Self::Float(FloatWidth::F64) => "float64", Self::Complex(ComplexWidth::F32) => "complex64", Self::Complex(ComplexWidth::F64) => "complex128",
-            Self::Character => "character",
+            Self::Character => "character"
         }
     }
     /// The dtype that [`DType::name`] calls `name`, or `None` for any other name.
@@ -289,20 +289,17 @@ impl DType {
     pub fn inexact(self, limit: FloatWidth) -> Option<(DType, DType)> {
         let at_least_f32 = |w: FloatWidth| { let f = Self::Float(w.max(FloatWidth::F32)); (f, f) };
         Some(match self {
-            Self::Boolean => at_least_f32(FloatWidth::F16),
-            Self::Integer(w) => at_least_f32(w.float(limit)),
-            Self::Float(FloatWidth::F16) => (Self::Float(FloatWidth::F32), self),
-            Self::Float(_) | Self::Complex(_) => (self, self),
-            Self::Character => return None,
+            Self::Boolean => at_least_f32(FloatWidth::F16), Self::Integer(w) => at_least_f32(w.float(limit)),
+            Self::Float(FloatWidth::F16) => (Self::Float(FloatWidth::F32), self), Self::Float(_) | Self::Complex(_) => (self, self),
+            Self::Character => return None
         })
     }
     /// The dtype that an argument of this dtype computes in, for a function with a kernel at each dtype where `has` holds. That's this dtype where it has a kernel. Otherwise it's the first with a kernel of these: for a Boolean or an integer, integers of `int` or of this dtype's width, whichever is wider, then floats of `float`; for a float or a complex number, the dtype that [`DType::inexact`] gives it; then each wider float, and each complex dtype whose parts are at least as wide. `int` and `float` are the caller's policy for exact numbers. NumPy's is `i64` and the float that `inexact` gives under `f64`. `None` where no dtype on the way has a kernel.
     pub fn computes_in(self, int: Width, float: FloatWidth, has: impl Fn(DType) -> bool) -> Option<DType> {
         if has(self) { return Some(self); }
         let (integer, float) = match self {
-            Self::Boolean => (Some(Self::Integer(int)), Self::Float(float)),
-            Self::Integer(w) => (Some(Self::Integer(w.join(int))), Self::Float(float)),
-            _ => (None, self.inexact(float)?.0),
+            Self::Boolean => (Some(Self::Integer(int)), Self::Float(float)), Self::Integer(w) => (Some(Self::Integer(w.join(int))), Self::Float(float)),
+            _ => (None, self.inexact(float)?.0)
         };
         integer.into_iter().chain(Self::ALL.into_iter().filter(|&d| float.widens_to(d))).find(|&d| has(d))
     }
@@ -311,34 +308,30 @@ impl DType {
         use DType::*;
         let (low, high) = if self.kind() <= other.kind() { (self, other) } else { (other, self) };
         Some(match (low, high) {
-            (Character, Character) => Character,
-            (_, Character) => return None,
-            (Boolean, d) | (Integer(_), d @ (Float(_) | Complex(_))) => d,
-            (Integer(a), Integer(b)) => Integer(a.join(b)),
-            (Float(a), Float(b)) => Float(a.max(b)),
-            (Float(f), Complex(c)) => Complex(c.max(f.into())),
-            (Complex(a), Complex(b)) => Complex(a.max(b)),
-            _ => unreachable!("the pair is ordered by kind"),
+            (Character, Character) => Character, (_, Character) => return None, (Boolean, d) | (Integer(_), d @ (Float(_) | Complex(_))) => d,
+            (Integer(a), Integer(b)) => Integer(a.join(b)), (Float(a), Float(b)) => Float(a.max(b)), (Float(f), Complex(c)) => Complex(c.max(f.into())),
+            (Complex(a), Complex(b)) => Complex(a.max(b)), _ => unreachable!("the pair is ordered by kind")
         })
     }
     /// The dtype that NEP 50 promotes an array of this dtype and a weak value of dtype `weak` to. A weak value is a Python scalar, which has no dtype of its own. BPL's weak numbers follow the same rule. The caller gives the weak value's dtype at the default width of its kind. Where its kind is no higher, the array's dtype wins. A weak complex value beside floats takes their width. Otherwise the weak dtype wins. `None` for characters beside numbers.
     pub fn common_weak(self, weak: DType) -> Option<DType> {
         use DType::*;
         Some(match (self, weak) {
-            (Character, Character) => Character,
-            (Character, _) | (_, Character) => return None,
-            (Float(_) | Complex(_), Complex(_)) => self.complex(),
-            _ if weak.kind() > self.kind() => weak,
-            _ => self,
+            (Character, Character) => Character, (Character, _) | (_, Character) => return None, (Float(_) | Complex(_), Complex(_)) => self.complex(),
+            _ if weak.kind() > self.kind() => weak, _ => self
         })
     }
     /// The real dtype of a complex dtype's parts. Other dtypes are their own.
     pub fn real(self) -> DType {
-        match self { Self::Complex(ComplexWidth::F32) => Self::Float(FloatWidth::F32), Self::Complex(ComplexWidth::F64) => Self::Float(FloatWidth::F64), d => d }
+        match self {
+            Self::Complex(ComplexWidth::F32) => Self::Float(FloatWidth::F32), Self::Complex(ComplexWidth::F64) => Self::Float(FloatWidth::F64), d => d
+        }
     }
     /// The complex dtype that numbers of this dtype take: `complex64` for `f16`, `f32` and `complex64`, and `complex128` for everything else.
     pub fn complex(self) -> DType {
-        Self::Complex(match self { Self::Float(FloatWidth::F16 | FloatWidth::F32) | Self::Complex(ComplexWidth::F32) => ComplexWidth::F32, _ => ComplexWidth::F64 })
+        Self::Complex(match self {
+            Self::Float(FloatWidth::F16 | FloatWidth::F32) | Self::Complex(ComplexWidth::F32) => ComplexWidth::F32, _ => ComplexWidth::F64
+        })
     }
 }
 
@@ -348,14 +341,11 @@ impl DType {
 macro_rules! element_types {
     (($($callback:tt)+) $($args:tt)*) => {
         $($callback)+! {$($args)* [
-            Boolean: ($crate::buffer::DType::Boolean) bool,
-            U8: ($crate::buffer::DType::Integer($crate::buffer::Width::U8)) u8,
-            I16: ($crate::buffer::DType::Integer($crate::buffer::Width::I16)) i16,
-            I32: ($crate::buffer::DType::Integer($crate::buffer::Width::I32)) i32,
+            Boolean: ($crate::buffer::DType::Boolean) bool, U8: ($crate::buffer::DType::Integer($crate::buffer::Width::U8)) u8,
+            I16: ($crate::buffer::DType::Integer($crate::buffer::Width::I16)) i16, I32: ($crate::buffer::DType::Integer($crate::buffer::Width::I32)) i32,
             I64: ($crate::buffer::DType::Integer($crate::buffer::Width::I64)) i64,
             F16: ($crate::buffer::DType::Float($crate::buffer::FloatWidth::F16)) $crate::half::f16,
-            F32: ($crate::buffer::DType::Float($crate::buffer::FloatWidth::F32)) f32,
-            F64: ($crate::buffer::DType::Float($crate::buffer::FloatWidth::F64)) f64,
+            F32: ($crate::buffer::DType::Float($crate::buffer::FloatWidth::F32)) f32, F64: ($crate::buffer::DType::Float($crate::buffer::FloatWidth::F64)) f64,
             C32: ($crate::buffer::DType::Complex($crate::buffer::ComplexWidth::F32)) $crate::num_complex::Complex32,
             C64: ($crate::buffer::DType::Complex($crate::buffer::ComplexWidth::F64)) $crate::num_complex::Complex64,
             Character: ($crate::buffer::DType::Character) char
@@ -428,7 +418,8 @@ impl Buffer {
         match dtype {
             DType::Boolean => Self::Booleans(Vec::with_capacity(capacity)), DType::Integer(width) => Self::Integers(IntBuf::with_capacity(width, capacity)),
             DType::Float(width) => Self::Floats(FloatBuf::with_capacity(width, capacity)),
-            DType::Complex(width) => Self::Complexes(ComplexBuf::with_capacity(width, capacity)), DType::Character => Self::Characters(Vec::with_capacity(capacity))
+            DType::Complex(width) => Self::Complexes(ComplexBuf::with_capacity(width, capacity)),
+            DType::Character => Self::Characters(Vec::with_capacity(capacity))
         }
     }
     #[inline]
@@ -453,16 +444,16 @@ impl Buffer {
     /// The address of the first item, for writing through, as an exported buffer may.
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         match self {
-            Self::Booleans(v) => v.as_mut_ptr().cast(), Self::Integers(v) => v.as_mut_ptr(), Self::Floats(v) => v.as_mut_ptr(), Self::Complexes(v) => v.as_mut_ptr(),
-            Self::Characters(v) => v.as_mut_ptr().cast()
+            Self::Booleans(v) => v.as_mut_ptr().cast(), Self::Integers(v) => v.as_mut_ptr(), Self::Floats(v) => v.as_mut_ptr(),
+            Self::Complexes(v) => v.as_mut_ptr(), Self::Characters(v) => v.as_mut_ptr().cast()
         }
     }
     /// Copies `range` of `source` when it has this buffer's dtype, and gives whether it could. Integers of another width don't copy.
     pub fn extend_from(&mut self, source: View<'_>, range: std::ops::Range<usize>) -> bool {
         match (self, source) {
             (Self::Booleans(d), View::Booleans(s)) => crate::gather::copied(d, &s[range]),
-            (Self::Integers(d), View::Integers(s)) => return d.extend_from(s, range),
-            (Self::Floats(d), View::Floats(s)) => return d.extend_from(s, range), (Self::Complexes(d), View::Complexes(s)) => return d.extend_from(s, range),
+            (Self::Integers(d), View::Integers(s)) => return d.extend_from(s, range), (Self::Floats(d), View::Floats(s)) => return d.extend_from(s, range),
+            (Self::Complexes(d), View::Complexes(s)) => return d.extend_from(s, range),
             (Self::Characters(d), View::Characters(s)) => crate::gather::copied(d, &s[range]), _ => return false
         }
         true
@@ -509,18 +500,22 @@ impl PartialEq for Buffer { fn eq(&self, other: &Self) -> bool { self.view() == 
 impl<'a> View<'a> {
     /// Borrows a consecutive range without copying or changing its dtype.
     #[inline]
-    pub fn slice(self, range: std::ops::Range<usize>) -> Self {
-        with_dtype!(self.dtype(), T => T::view(&T::of(self).expect("the view has its dtype")[range]))
-    }
+    pub fn slice(self, range: std::ops::Range<usize>) -> Self { with_dtype!(self.dtype(), T => T::view(&T::of(self).expect("the view has its dtype")[range])) }
     #[inline]
     pub fn len(self) -> usize {
-        match self { Self::Booleans(v) => v.len(), Self::Integers(v) => v.len(), Self::Floats(v) => v.len(), Self::Complexes(v) => v.len(), Self::Characters(v) => v.len() }
+        match self {
+            Self::Booleans(v) => v.len(), Self::Integers(v) => v.len(), Self::Floats(v) => v.len(), Self::Complexes(v) => v.len(),
+            Self::Characters(v) => v.len()
+        }
     }
     #[inline]
     pub fn is_empty(self) -> bool { self.len() == 0 }
     #[inline]
     pub fn as_ptr(self) -> *const u8 {
-        match self { Self::Booleans(v) => v.as_ptr().cast(), Self::Integers(v) => v.as_ptr(), Self::Floats(v) => v.as_ptr(), Self::Complexes(v) => v.as_ptr(), Self::Characters(v) => v.as_ptr().cast() }
+        match self {
+            Self::Booleans(v) => v.as_ptr().cast(), Self::Integers(v) => v.as_ptr(), Self::Floats(v) => v.as_ptr(), Self::Complexes(v) => v.as_ptr(),
+            Self::Characters(v) => v.as_ptr().cast()
+        }
     }
     #[inline]
     pub fn dtype(self) -> DType {
@@ -643,9 +638,12 @@ pub fn read_all<A: Element, S: Source<A>>(items: &[S]) -> Vec<A> {
 }
 
 /// The real items of `view` read as `A`, or `None` for complex numbers or characters.
-fn reals<A: Element>(view: View<'_>, mapping: &crate::agreement::Mapping, n: usize) -> Option<Vec<A>>
-where bool: Source<A>, u8: Source<A>, i16: Source<A>, i32: Source<A>, i64: Source<A>, half::f16: Source<A>, f32: Source<A>, f64: Source<A> {
-    Some(match view { View::Booleans(v) => read_as(v, mapping, n), View::Integers(v) => with_ints!(v, |x| read_as(x, mapping, n)), View::Floats(v) => with_floats!(v, |x| read_as(x, mapping, n)), _ => return None })
+fn reals<A: Element>(view: View<'_>, mapping: &crate::agreement::Mapping, n: usize) -> Option<Vec<A>> where bool: Source<A>, u8: Source<A>, i16: Source<A>,
+    i32: Source<A>, i64: Source<A>, half::f16: Source<A>, f32: Source<A>, f64: Source<A> {
+    Some(match view {
+        View::Booleans(v) => read_as(v, mapping, n), View::Integers(v) => with_ints!(v, |x| read_as(x, mapping, n)),
+        View::Floats(v) => with_floats!(v, |x| read_as(x, mapping, n)), _ => return None
+    })
 }
 
 /// Gathers source items in blocks, then converts each block contiguously.
@@ -667,11 +665,8 @@ fn real_part(z: Complex64) -> Result<f64, Error> {
 /// Item `i` of a numeric `view` as an `i64`. A float truncates toward zero, and gives an Overflow error where it doesn't fit, as do NaN and infinities.
 fn integer(view: View<'_>, i: usize) -> Result<i64, Error> {
     let x = match view {
-        View::Booleans(v) => return Ok(v[i].into()),
-        View::Integers(v) => return Ok(v.get(i)),
-        View::Floats(v) => v.get(i),
-        View::Complexes(v) => real_part(v.get(i))?,
-        View::Characters(_) => unreachable!("cast refuses characters first"),
+        View::Booleans(v) => return Ok(v[i].into()), View::Integers(v) => return Ok(v.get(i)), View::Floats(v) => v.get(i),
+        View::Complexes(v) => real_part(v.get(i))?, View::Characters(_) => unreachable!("cast refuses characters first")
     };
     let t = x.trunc();
     // -2^63 and 2^63 are exact floats. NaN fails both comparisons.
@@ -681,11 +676,8 @@ fn integer(view: View<'_>, i: usize) -> Result<i64, Error> {
 /// Item `i` of a numeric `view` as a Boolean. Only exactly 0 and 1 convert, and anything else gives an Overflow error.
 fn boolean(view: View<'_>, i: usize) -> Result<bool, Error> {
     let x = match view {
-        View::Booleans(v) => return Ok(v[i]),
-        View::Integers(v) => return match v.get(i) { 0 => Ok(false), 1 => Ok(true), k => Err(overflow(k)) },
-        View::Floats(v) => v.get(i),
-        View::Complexes(v) => real_part(v.get(i))?,
-        View::Characters(_) => unreachable!("cast refuses characters first"),
+        View::Booleans(v) => return Ok(v[i]), View::Integers(v) => { return match v.get(i) { 0 => Ok(false), 1 => Ok(true), k => Err(overflow(k)) }; }
+        View::Floats(v) => v.get(i), View::Complexes(v) => real_part(v.get(i))?, View::Characters(_) => unreachable!("cast refuses characters first")
     };
     if x == 0.0 { Ok(false) } else if x == 1.0 { Ok(true) } else { Err(overflow(x)) }
 }
@@ -725,20 +717,17 @@ impl Buffer {
             T::buffer(out)
         }
         match view {
-            View::Booleans(v) => taken(v, indices),
-            View::Characters(v) => taken(v, indices),
-            View::Integers(v) => with_ints!(v, |v| taken(v, indices)),
-            View::Floats(v) => with_floats!(v, |v| taken(v, indices)),
-            View::Complexes(v) => with_complexes!(v, |v| taken(v, indices)),
+            View::Booleans(v) => taken(v, indices), View::Characters(v) => taken(v, indices), View::Integers(v) => with_ints!(v, |v| taken(v, indices)),
+            View::Floats(v) => with_floats!(v, |v| taken(v, indices)), View::Complexes(v) => with_complexes!(v, |v| taken(v, indices))
         }
     }
     /// The items of `view` at `dtype`. Matching dtypes copy. Otherwise each item converts as [`Source`] reads it, and conversions to a narrower dtype follow these rules. A float converts to an integer by truncating toward zero. A value that doesn't fit its target gives an Overflow error, as do NaN, infinities and anything but exactly 0 or 1 for Booleans. A complex number converts to a real dtype only when its imaginary part is zero, and otherwise gives a Domain error. Characters convert only to characters.
-    pub fn cast(view: View<'_>, dtype: DType) -> Result<Self, Error> {
-        Self::cast_mapped(view, &crate::agreement::Mapping::Linear(1), view.len(), dtype)
-    }
+    pub fn cast(view: View<'_>, dtype: DType) -> Result<Self, Error> { Self::cast_mapped(view, &crate::agreement::Mapping::Linear(1), view.len(), dtype) }
     /// The items of `view` at `dtype`, where every item keeps its value. Items convert as [`Buffer::cast`] converts them, and a float that becomes a Boolean or an integer must be whole. A float rounds to a float of another width. A Domain error where an item doesn't keep its value.
     pub fn kept(view: View<'_>, dtype: DType) -> Result<Self, Error> {
-        let whole = match view { View::Floats(v) => (0..v.len()).all(|i| v.get(i).fract() == 0.0), View::Complexes(v) => (0..v.len()).all(|i| v.get(i).re.fract() == 0.0), _ => true };
+        let whole = match view {
+            View::Floats(v) => (0..v.len()).all(|i| v.get(i).fract() == 0.0), View::Complexes(v) => (0..v.len()).all(|i| v.get(i).re.fract() == 0.0), _ => true
+        };
         let lost = || Error::new(Kind::Domain, format!("a {} item doesn't keep its value as {}", view.dtype().name(), dtype.name()));
         if dtype.is_integral() && !whole { return Err(lost()); }
         Self::cast(view, dtype).map_err(|_| lost())
@@ -746,7 +735,9 @@ impl Buffer {
     /// Shared conversion dispatch for compact and mapped logical items. Unselected storage never participates in checked conversion.
     pub(crate) fn cast_mapped(view: View<'_>, mapping: &crate::agreement::Mapping, n: usize, dtype: DType) -> Result<Self, Error> {
         // The checked conversions below read 0 at a fill, so a chosen fill is read at the items' own dtype first.
-        if mapping.chosen().is_some() { return Self::cast(with_dtype!(view.dtype(), T => T::buffer(read_as::<T, T>(T::of(view).expect("matching dtype"), mapping, n))).view(), dtype); }
+        if mapping.chosen().is_some() {
+            return Self::cast(with_dtype!(view.dtype(), T => T::buffer(read_as::<T, T>(T::of(view).expect("matching dtype"), mapping, n))).view(), dtype);
+        }
         if view.dtype() == dtype {
             if matches!(mapping, crate::agreement::Mapping::Linear(1)) { return Ok(Self::copied(view, 0..n)); }
             if let crate::agreement::Mapping::Steps { base, steps } = mapping { return Ok(Self::walked(view, *base, steps, n)); }
@@ -759,9 +750,13 @@ impl Buffer {
             (DType::Integer(Width::I32), View::Integers(Ints::I16(v))) => i32::buffer(read_as(v, mapping, n)),
             (DType::Integer(Width::I32), View::Integers(Ints::U8(v))) => i32::buffer(read_as(v, mapping, n)),
             (DType::Integer(Width::I16), View::Integers(Ints::U8(v))) => i16::buffer(read_as(v, mapping, n)),
-            (DType::Integer(w), _) => with_width!(w, A => A::buffer((0..n).map(|i| mapping.get(i).map_or(Ok(0), |j| integer(view, j)).and_then(|k| A::try_from(k).map_err(|_| overflow(k)))).collect::<Result<_, _>>()?)),
+            (DType::Integer(w), _) => {
+                with_width!(w, A => A::buffer((0..n).map(|i| mapping.get(i).map_or(Ok(0), |j| integer(view, j)).and_then(|k| A::try_from(k).map_err(|_| overflow(k)))).collect::<Result<_, _>>()?))
+            }
             (DType::Boolean, _) => Self::Booleans((0..n).map(|i| mapping.get(i).map_or(Ok(false), |j| boolean(view, j))).collect::<Result<_, _>>()?),
-            (DType::Float(w), View::Complexes(v)) => with_float_width!(w, A => A::buffer((0..n).map(|i| mapping.get(i).map_or(Ok(0.), |j| real_part(v.get(j))).map(Source::<A>::read)).collect::<Result<_, _>>()?)),
+            (DType::Float(w), View::Complexes(v)) => {
+                with_float_width!(w, A => A::buffer((0..n).map(|i| mapping.get(i).map_or(Ok(0.), |j| real_part(v.get(j))).map(Source::<A>::read)).collect::<Result<_, _>>()?))
+            }
             (DType::Float(w), v) => with_float_width!(w, A => A::buffer(reals::<A>(v, mapping, n).expect("cast handles complex numbers and characters first"))),
             (DType::Complex(w), View::Complexes(v)) => with_complex_width!(w, A => A::buffer(with_complexes!(v, |x| read_as(x, mapping, n)))),
             (DType::Complex(w), v) => with_complex_width!(w, A => A::buffer(reals::<A>(v, mapping, n).expect("cast handles characters first"))),

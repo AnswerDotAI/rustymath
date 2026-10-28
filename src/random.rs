@@ -4,10 +4,7 @@ use rand::Rng;
 
 /// Appends `n` integers to `out`, each uniform from 0 up to but not including its bound: the one bound, or each of the bounds in turn. Each bound must be at least 1. Each draw is the number that `rand`'s `Uniform` gives for its bound, by Lemire's method. A draw maps a word `w` to the high word of `w × b`, unless the low word is below 2⁶⁴ mod b. Then it discards `w` and maps the next word instead. Drawing every word before mapping any lets the mapping run as a separate pass. A discarded word, about once in 2⁶⁴ ÷ bound draws, ends the pass, and the draws from it on replay in turn, from the words already drawn and then from `rng`.
 pub fn roll<R: Rng + ?Sized>(bounds: Arg<'_, u64>, n: usize, rng: &mut R, out: &mut Vec<u64>) {
-    match bounds {
-        Arg::One(b) => rolled(std::iter::repeat_n(b, n), rng, out),
-        Arg::Many(bs) => rolled(bs[..n].iter().copied(), rng, out),
-    }
+    match bounds { Arg::One(b) => rolled(std::iter::repeat_n(b, n), rng, out), Arg::Many(bs) => rolled(bs[..n].iter().copied(), rng, out) }
 }
 
 /// One integer from 0 up to but not including `b`, as [`roll`] draws it.
@@ -26,9 +23,7 @@ fn rolled<R: Rng + ?Sized>(bounds: impl ExactSizeIterator<Item = u64> + Clone, r
 }
 
 /// The draw below `b` from the first word that `next` gives and Lemire's method keeps.
-fn kept(b: u64, mut next: impl FnMut() -> u64) -> u64 {
-    loop { let (hi, lo) = product(next(), b); if lo >= b || lo >= b.wrapping_neg() % b { break hi } }
-}
+fn kept(b: u64, mut next: impl FnMut() -> u64) -> u64 { loop { let (hi, lo) = product(next(), b); if lo >= b || lo >= b.wrapping_neg() % b { break hi; } } }
 
 /// The high and low words of `w × b`. The high word is the draw.
 #[inline]

@@ -77,7 +77,9 @@ def over_budget(cases, namespace, timing, show):
     return [line for _, line in over]
 
 def test_speed(capsys, timing):
-    "Every case costs no more than its budget. `RUSTYMATH_COSTS` prints every cost."
+    "Every case costs no more than its budget, on the CPU that the budgets were set for (`timing.checks_budgets`). On any other CPU, it prints every cost, then each case still over its budget, marked `over`, and fails on none. `RUSTYMATH_COSTS` prints every cost."
     namespace, cases = arrays(), budgets()
-    with capsys.disabled(): over = over_budget(cases, namespace, timing, 'RUSTYMATH_COSTS' in os.environ)
-    assert not over, '\n'.join(over)
+    with capsys.disabled():
+        over = over_budget(cases, namespace, timing, not timing.checks_budgets or 'RUSTYMATH_COSTS' in os.environ)
+        if timing.checks_budgets: assert not over, '\n'.join(over)
+        for line in over: print(f'{line}: over', file=sys.stderr)

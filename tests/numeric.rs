@@ -68,8 +68,8 @@ mod distribution {
             Distribution::normal(1.0, 2.0), Distribution::uniform(-1.0, 3.0), Distribution::beta(0.5, 2.0), Distribution::beta(3.0, 4.0),
             Distribution::cauchy(0.0, 1.0), Distribution::chi_squared(3.0), Distribution::exponential(2.0), Distribution::fisher(4.0, 7.0),
             Distribution::gamma(0.5, 2.0), Distribution::gamma(5.0, 1.0), Distribution::inverse_gamma(3.0, 2.0), Distribution::laplace(1.0, 2.0),
-            Distribution::logistic(0.0, 1.0), Distribution::log_normal(0.0, 0.5), Distribution::student_t(3.0), Distribution::weibull(1.5, 2.0), Distribution::weibull(199.0, 1.0), d(10, 0.3),
-            d(1000, 0.4), d(100, 0.9), Distribution::poisson(3.0), Distribution::poisson(50.0),
+            Distribution::logistic(0.0, 1.0), Distribution::log_normal(0.0, 0.5), Distribution::student_t(3.0), Distribution::weibull(1.5, 2.0),
+            Distribution::weibull(199.0, 1.0), d(10, 0.3), d(1000, 0.4), d(100, 0.9), Distribution::poisson(3.0), Distribution::poisson(50.0),
         ].into_iter().map(Result::unwrap).collect()
     }
 
@@ -118,7 +118,10 @@ mod distribution {
     /// Each distribution's density and cdf succeed at every x, and its quantile at every p from 0 to 1. A quantile fails at a p outside 0 to 1, where it gives NaN.
     #[test]
     fn domains() {
-        fn many(f: impl Unary<f64, Out = f64>, items: &[f64]) -> (bool, Vec<f64>) { let mut out = Vec::new(); (f.many(Arg::Many(items), items.len(), &mut out), out) }
+        fn many(f: impl Unary<f64, Out = f64>, items: &[f64]) -> (bool, Vec<f64>) {
+            let mut out = Vec::new();
+            (f.many(Arg::Many(items), items.len(), &mut out), out)
+        }
         let (xs, ps) = ([-1.0, 0.0, 0.25, 0.5, 1.0, 3.0, 100.0, f64::NAN], [0.001, 0.25, 0.5, 0.999, f64::NAN]);
         for d in cases() {
             assert!(many(Pdf(d), &xs).0 && many(Cdf(d), &xs).0 && many(Quantile(d), &ps).0, "{d:?}");
@@ -141,16 +144,23 @@ mod distribution {
     /// The closed-form laws compute in f32 at f32. Their densities, cdfs and quantiles stay within a relative error of 1e-4 of the same laws at f64, in the tails as well as near the centre. The worst cases are quantiles near 0, where `location + scale·l` cancels, and the Weibull density near f32's underflow. At shape 50 the Weibull density's power overflows in f32 where the density is 0, and at shape 0.5 the density at 0 is infinite.
     #[test]
     fn closed_forms_at_f32() {
-        let laws = [Distribution::uniform(-1.0, 3.0), Distribution::exponential(2.0), Distribution::cauchy(1.0, 2.0), Distribution::laplace(1.0, 2.0),
-            Distribution::logistic(1.0, 2.0), Distribution::weibull(1.5, 2.0), Distribution::weibull(50.0, 1.0), Distribution::weibull(0.5, 1.0)].map(Result::unwrap);
-        let xs: Vec<f32> = (-960..=960).map(|i| i as f32 / 16.0).chain((0..=24).flat_map(|k| { let t = 2f32.powi(k); [t, -t] })).collect();
-        let ps: Vec<f32> = (1..1000).map(|i| i as f32 / 1000.0).chain((1..24).flat_map(|k| { let t = 0.5f32.powi(k); [t, 1.0 - t] })).collect();
+        let laws = [
+            Distribution::uniform(-1.0, 3.0), Distribution::exponential(2.0), Distribution::cauchy(1.0, 2.0), Distribution::laplace(1.0, 2.0),
+            Distribution::logistic(1.0, 2.0), Distribution::weibull(1.5, 2.0), Distribution::weibull(50.0, 1.0), Distribution::weibull(0.5, 1.0),
+        ].map(Result::unwrap);
+        let xs: Vec<f32> = (-960..=960).map(|i| i as f32 / 16.0).chain((0..=24).flat_map(|k| {
+            let t = 2f32.powi(k);
+            [t, -t]
+        })).collect();
+        let ps: Vec<f32> = (1..1000).map(|i| i as f32 / 1000.0).chain((1..24).flat_map(|k| {
+            let t = 0.5f32.powi(k);
+            [t, 1.0 - t]
+        })).collect();
         for d in laws {
             let errors = [worst_at_f32(Pdf(d), |x| d.pdf(x), &xs), worst_at_f32(Cdf(d), |x| d.cdf(x), &xs), worst_at_f32(Quantile(d), |p| d.quantile(p), &ps)];
             assert!(errors.iter().all(|&e| e <= 1e-4), "{d:?}: relative errors {errors:?} in the density, cdf and quantile");
         }
     }
-
 }
 
 mod exact {
@@ -177,7 +187,7 @@ mod integer {
     use num_bigint::BigInt;
     use rustymath::integer::*;
     use rustymath::{
-        Abs, Arg, Binary, Binom, Pow, Sign, Unary, tolerant::{Ceil, Equal, Floor, Gcd, Greater, GreaterEqual, Lcm, LessEqual, NotEqual, Residue, FloorDivide}
+        Abs, Arg, Binary, Binom, Pow, Sign, Unary, tolerant::{Ceil, Equal, Floor, FloorDivide, Gcd, Greater, GreaterEqual, Lcm, LessEqual, NotEqual, Residue}
     };
 
     /// Integers that exercise overflow and sign: the extremes, small numbers, powers of two and random bits.
@@ -247,17 +257,20 @@ mod integer {
         assert_eq!(binom(-1, i64::MAX), Some(-1));
         // A whole k with a non-whole n takes the falling factorial, which stays accurate beside the polynomial's roots, where Γ(n + 1)/(Γ(k + 1) Γ(n - k + 1)) cancels: C(n, k) and its slope in n against mpmath, within the documented 2k ulps.
         let near = |got: f64, want: f64, k: f64| assert!((got - want).abs() <= 2.0 * k * f64::EPSILON * want.abs(), "{got} against {want}");
-        for (n, k, c, slope) in [(0.999999999, 2.0, -4.9999998535903429657e-10, 0.49999999900000002828), (3.000000001, 5.0, -5.0000004178685223475e-11, -0.050000000083333340103),
-                                 (-21.20622351098135, 64.0, 14366238820115916784.0, -20237195289673071829.0), (4.001, 20.0, -1.2883957254018030871e-8, -0.000012868008206733345107)] {
+        for (n, k, c, slope) in [
+            (0.999999999, 2.0, -4.9999998535903429657e-10, 0.49999999900000002828), (3.000000001, 5.0, -5.0000004178685223475e-11, -0.050000000083333340103),
+            (-21.20622351098135, 64.0, 14366238820115916784.0, -20237195289673071829.0), (4.001, 20.0, -1.2883957254018030871e-8, -0.000012868008206733345107),
+        ] {
             near(rustymath::binom(n, k), c, k);
             near(rustymath::binom_dn(n, k), slope, k);
         }
         // Other real arguments take the Γ ratio in double words, which keeps C(n, k) within 4 ulps of mpmath for large n, negative arguments and a whole k above 64, and its slope in n where both ψ arguments are from 10 up.
         let close = |got: f64, want: f64| assert!((got - want).abs() <= 4.0 * f64::EPSILON * want.abs(), "{got} against {want}");
-        for (n, k, c) in [(1.3e16, 2.5, 5.798052885632725e39), (1e36, 1.64, 7.439939859224348e58), (-35.249400585757215, -16.771288022576677, -6.434749405414238e-12),
-                          (0.8465836218811786, 3.865135317059345, -0.0018154754878552631), (92.57318691468267, 117.0, 1.3012421741507206e-27), (7.25, 1.5, 13.909723913795338)] {
-            close(rustymath::binom(n, k), c);
-        }
+        for (n, k, c) in [
+            (1.3e16, 2.5, 5.798052885632725e39), (1e36, 1.64, 7.439939859224348e58), (-35.249400585757215, -16.771288022576677, -6.434749405414238e-12),
+            (0.8465836218811786, 3.865135317059345, -0.0018154754878552631), (92.57318691468267, 117.0, 1.3012421741507206e-27),
+            (7.25, 1.5, 13.909723913795338),
+        ] { close(rustymath::binom(n, k), c); }
         for (n, k, slope) in [(1.3e16, 2.5, 1.1150101703139856e24), (1e36, 1.64, 1.220150136912793e23), (92.57318691468267, 117.0, 8.106595581093816e-28)] {
             close(rustymath::binom_dn(n, k), slope);
         }
@@ -285,6 +298,21 @@ mod integer {
             let mut out = Vec::new();
             assert!(Residue(t).many(Arg::One(d), Arg::Many(&ys16), ys16.len(), &mut out));
             assert_eq!(out, ys16.iter().map(|&y| residue(d.into(), y.into()) as i16).collect::<Vec<_>>());
+        }
+        // Every `u8` and `i16` divisor of magnitude 2 or more divides through a 16-bit high product. A quotient too large would show first one below a multiple of the divisor's magnitude, or at 2¹⁵, the largest dividend's magnitude. A quotient too small would show first at a multiple. These dividends therefore test every dividend.
+        for d in (i16::MIN..=i16::MAX).filter(|d| d.unsigned_abs() >= 2) {
+            let m = i32::from(d.unsigned_abs());
+            let ys: Vec<i16> =
+                (1..).flat_map(|q| [q * m - 1, q * m]).take_while(|&a| a < 1 << 15).flat_map(|a| [a as i16, -a as i16]).chain([i16::MIN]).collect();
+            let mut out = Vec::new();
+            assert!(Residue(t).many(Arg::One(d), Arg::Many(&ys), ys.len(), &mut out));
+            assert_eq!(out, ys.iter().map(|&y| residue(d.into(), y.into()) as i16).collect::<Vec<_>>(), "divisor {d}");
+        }
+        let ys8: Vec<u8> = (0..=u8::MAX).collect();
+        for d in 2..=u8::MAX {
+            let mut out = Vec::new();
+            assert!(Residue(t).many(Arg::One(d), Arg::Many(&ys8), ys8.len(), &mut out));
+            assert_eq!(out, ys8.iter().map(|&y| residue(d.into(), y.into()) as u8).collect::<Vec<_>>(), "divisor {d}");
         }
         // Below 2⁵¹ in magnitude, 64-bit dividends take the residue by one divisor through its reciprocal, and every `i32` dividend does. Dividends beside multiples of each divisor, and beside 2⁵¹, test the step that corrects the quotient.
         let limit = (1i64 << 51) - 1;
@@ -483,7 +511,9 @@ mod operation {
         assert!(matches!(r, Buffer::Floats(rustymath::buffer::FloatBuf::F64(ref v)) if v[0] == 1.0 && (v[1] - std::f64::consts::E).abs() < 1e-15));
         let (two, row) = (Layout::from([1usize].as_slice()), Layout::from([3usize].as_slice()));
         let agreement = Agreement::new(&two, &row).unwrap();
-        let (s, ok) = kernels!(Binary rustymath::Add).binary(&rustymath::Add, ArrayView::compact(&two, rustymath::buffer::View::Booleans(&[true])), ArrayView::compact(&row, rustymath::buffer::View::Booleans(&[true, false, true])), &agreement).unwrap();
+        let (s, ok) = kernels!(Binary rustymath::Add).binary(
+                &rustymath::Add, ArrayView::compact(&two, rustymath::buffer::View::Booleans(&[true])),
+                ArrayView::compact(&row, rustymath::buffer::View::Booleans(&[true, false, true])), &agreement).unwrap();
         assert!(ok && matches!(s, Buffer::Integers(rustymath::buffer::IntBuf::I64(ref v)) if *v == [2, 1, 2]));
         // An integer result that doesn't fit fails.
         let big = Buffer::Integers(rustymath::buffer::IntBuf::I64(vec![i64::MAX]));
@@ -500,7 +530,8 @@ mod operation {
         let (fold, ok) = right.run(&rustymath::Subtract, data.view(), [1, 3, 1], Some(seed.view())).unwrap();
         assert!(ok && matches!(fold, Buffer::Integers(rustymath::buffer::IntBuf::I16(ref v)) if *v == [-89]));
         // A failed scalar step retains its actual value and the healthy lanes in the raw kernel result.
-        let (fold, ok) = kernels!(RightFold rustymath::Pow).run(&rustymath::Pow, Buffer::Floats(rustymath::buffer::FloatBuf::F64(vec![-1., 1., 0.5, 2.])).view(), [1, 2, 2], None).unwrap();
+        let (fold, ok) = kernels!(RightFold rustymath::Pow)
+            .run(&rustymath::Pow, Buffer::Floats(rustymath::buffer::FloatBuf::F64(vec![-1., 1., 0.5, 2.])).view(), [1, 2, 2], None).unwrap();
         assert!(!ok && matches!(fold, Buffer::Floats(rustymath::buffer::FloatBuf::F64(ref v)) if v[0].is_nan() && v[1] == 1.));
     }
 
@@ -518,11 +549,13 @@ mod operation {
         assert_eq!(ArrayView::new(&shape, f64::view(&data), &composed).items::<f64>().unwrap().as_ref(), &[2., 5., 1., 4., 0., 3.]);
         let compact = ArrayView::compact(&shape, f64::view(&data));
         let (sum, ok) = kernels!(Binary rustymath::Add).binary(&rustymath::Add, x, compact, &Agreement::new(&shape, &shape).unwrap()).unwrap();
-        assert!(ok); assert_eq!(f64::of(sum.view()).unwrap(), &[0., 4., 3., 7., 6., 10.]);
+        assert!(ok);
+        assert_eq!(f64::of(sum.view()).unwrap(), &[0., 4., 3., 7., 6., 10.]);
         let (one, two) = (Agreement::new(&shape, &Layout::EMPTY).unwrap(), Agreement::new(&shape, &Layout::EMPTY).unwrap());
         let args = [x, ArrayView::compact(&Layout::EMPTY, f64::view(&[1.])), ArrayView::compact(&Layout::EMPTY, f64::view(&[4.]))];
         let (clipped, ok) = kernels!(Ternary rustymath::Clip).ternary(&rustymath::Clip, args, &one, &two).unwrap();
-        assert!(ok); assert_eq!(f64::of(clipped.view()).unwrap(), &[1., 3., 1., 4., 2., 4.]);
+        assert!(ok);
+        assert_eq!(f64::of(clipped.view()).unwrap(), &[1., 3., 1., 4., 2., 4.]);
         // A table of positions reads through its offsets before broadcasting.
         let row = Layout::from([3]);
         let positions = Mapping::Steps { base: 0, steps: vec![Steps::table(vec![5, 0, 3])].into() };
@@ -557,9 +590,11 @@ mod operation {
         let first = Agreement { layout: row, len: 3, left: chosen, right: Mapping::Single };
         let outer = Mapping::Steps { base: 0, steps: vec![Steps::clipped(-1, 5, 3, 1)].into() }.filled(Some(fill(8.)));
         let second = Agreement { layout: Layout::from([5]), len: 5, left: outer, right: Mapping::Single };
-        let data = [2., 1., 10.]; let args = data.each_ref().map(|x| ArrayView::compact(&Layout::EMPTY, f64::view(std::slice::from_ref(x))));
+        let data = [2., 1., 10.];
+        let args = data.each_ref().map(|x| ArrayView::compact(&Layout::EMPTY, f64::view(std::slice::from_ref(x))));
         let (clipped, ok) = kernels!(Ternary rustymath::Clip).ternary(&rustymath::Clip, args, &first, &second).unwrap();
-        assert!(ok); assert_eq!(f64::of(clipped.view()).unwrap(), &[8., 4., 2., 4., 8.]);
+        assert!(ok);
+        assert_eq!(f64::of(clipped.view()).unwrap(), &[8., 4., 2., 4., 8.]);
     }
 
     #[test]
@@ -589,8 +624,8 @@ mod operation {
     }
 
     /// `binary` of characters and `x` or `y`, laid out as vectors.
-    fn characters<K>(k: K, x: &Buffer, y: &Buffer) -> Option<(Buffer, bool)>
-    where K: rustymath::characters::Characters + rustymath::Binary<i32, Out: rustymath::buffer::Element> + rustymath::Binary<i64, Out: rustymath::buffer::Element> + Sync {
+    fn characters<K>(k: K, x: &Buffer, y: &Buffer) -> Option<(Buffer, bool)> where K: rustymath::characters::Characters
+            + rustymath::Binary<i32, Out: rustymath::buffer::Element> + rustymath::Binary<i64, Out: rustymath::buffer::Element> + Sync {
         let (lx, ly) = (Layout::from([x.len()]), Layout::from([y.len()]));
         let agreement = Agreement::new(&lx, &ly).unwrap();
         rustymath::characters::binary(&k, ArrayView::compact(&lx, x.view()), ArrayView::compact(&ly, y.view()), agreement.layout.shape(), &agreement)
@@ -601,7 +636,11 @@ mod operation {
         use rustymath::{Add, Subtract, buffer::{Element, IntBuf}, reduce::{Maximum, Minimum}, tolerant::{Less, Tolerance}};
         let text = |s: &str| Buffer::Characters(s.chars().collect());
         let (ab, ba, ints) = (text("ab"), text("ba"), Buffer::Integers(IntBuf::I64(vec![1, 2])));
-        let run = |result: Option<(Buffer, bool)>| { let (b, ok) = result.unwrap(); assert!(ok); b };
+        let run = |result: Option<(Buffer, bool)>| {
+            let (b, ok) = result.unwrap();
+            assert!(ok);
+            b
+        };
         // Characters order by code point, and the maximum gives a character.
         assert_eq!(bool::vec(run(characters(Less(Tolerance::DEFAULT), &ab, &ba))), Some(vec![true, false]));
         assert_eq!(char::vec(run(characters(Maximum, &ab, &ba))), Some(vec!['b', 'b']));
@@ -707,7 +746,8 @@ mod optimize {
         let reversed = Options { bounds: Some(Bounds { lower: &[1.0], upper: &[0.0] }), ..Default::default() };
         assert_eq!(reversed.check(Task::Minimize { gradient: false }, 1).unwrap_err().message, "each lower limit must be at most its upper limit");
         assert_eq!(
-            Options { tolerance: Some(0.0), ..Default::default() }.check(Task::Minimize { gradient: false }, 1).unwrap_err().message, "the tolerance must be a positive number"
+            Options { tolerance: Some(0.0), ..Default::default() }.check(Task::Minimize { gradient: false }, 1).unwrap_err().message,
+            "the tolerance must be a positive number"
         );
     }
 
@@ -905,7 +945,10 @@ mod optimize {
             let found = solve_linear(&mut a, &y, &vec![0.0; k], &Options { method, ..tight }).unwrap();
             assert!(found.converged && off(&found.x, &best) < 1e-8, "{method:?}: {found:?}");
         }
-        assert_eq!(Options::<f64>::default().check(Task::Linear { equations: m, adjoint: false }, k).unwrap_err().message, "least squares needs products with the transpose");
+        assert_eq!(
+            Options::<f64>::default().check(Task::Linear { equations: m, adjoint: false }, k).unwrap_err().message,
+            "least squares needs products with the transpose"
+        );
         // A right-hand side of zeros gives zeros, from any start.
         let found = solve_linear(&mut product(&spd, n), &zeros, &b, &tight).unwrap();
         assert!(found.converged && found.x == zeros, "{found:?}");

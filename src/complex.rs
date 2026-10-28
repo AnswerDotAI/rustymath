@@ -4,8 +4,8 @@
 //!
 //! `exp` and the powers that compute through it give an exact direction at the float nearest a whole number of quarter turns. e^(iπ/2) is then exactly i, where the exponential of that float has a real part of about 6e-17. These results lie outside the error bound.
 use crate::{
-    Abs, Acos, Acosh, Angle, Arg, Asin, Asinh, Atan, Atan2, Atanh, Binary, Binom, Cos, Cosh, Exp, Factorial, Gamma, Hypot, Lgamma, Ln, Log1p, Logb, MathishLogb, Pow, Sign,
-    Sin, Sinh, Sqrt, Sqrt1mx2, Sqrt1px2, Sqrtx2m1, Tan, Tanh, Unary,
+    Abs, Acos, Acosh, Angle, Arg, Asin, Asinh, Atan, Atan2, Atanh, Binary, Binom, Cos, Cosh, Exp, Factorial, Gamma, Hypot, Lgamma, Ln, Log1p, Logb,
+    MathishLogb, Pow, Sign, Sin, Sinh, Sqrt, Sqrt1mx2, Sqrt1px2, Sqrtx2m1, Tan, Tanh, Unary,
 };
 use crate::{Native, arc, exp as e, float::ln2, hyperbolic, ln as l, pow as p, special, trig};
 use num_complex::Complex;
@@ -470,13 +470,15 @@ fn moduli<R: Native>(x: &[R], y: &[R], out: &mut Vec<R>) where Hypot: Binary<R, 
 fn sqrt_parts<R: Native>(x: &[R], y: &[R], re: &mut Vec<R>, im: &mut Vec<R>) where Hypot: Binary<R, Out = R> {
     let mut h = Vec::new();
     moduli(x, y, &mut h);
-    crate::slice::appended(re, x.len(), |re| crate::slice::appended(im, x.len(), |im| {
-        for ((((&x, &y), &h), re), im) in x.iter().zip(y).zip(&h).zip(re).zip(im) {
-            let (r, i) = root::<R, { crate::FUSED }>(x, y, h);
-            re.write(r);
-            im.write(i);
-        }
-    }))
+    crate::slice::appended(re, x.len(), |re| {
+        crate::slice::appended(im, x.len(), |im| {
+            for ((((&x, &y), &h), re), im) in x.iter().zip(y).zip(&h).zip(re).zip(im) {
+                let (r, i) = root::<R, { crate::FUSED }>(x, y, h);
+                re.write(r);
+                im.write(i);
+            }
+        })
+    })
 }
 
 /// Whether `sqrt` takes a path for `z` that `sqrt_parts` leaves out: a tiny `z`, which it scales first, an infinite imaginary part, or zero.
@@ -533,7 +535,9 @@ fn root_products_parts<R: Native>(roots: impl Fn(&[R], &[R]) -> [(Vec<R>, Vec<R>
 }
 
 /// Appends √(1 - z²) for each `z` = `x + iy`, as `sqrt1mx2` computes it.
-fn sqrt1mx2_parts<R: Native>(x: &[R], y: &[R], re: &mut Vec<R>, im: &mut Vec<R>) where Hypot: Binary<R, Out = R> { root_products_parts(roots_parts, true, x, y, re, im) }
+fn sqrt1mx2_parts<R: Native>(x: &[R], y: &[R], re: &mut Vec<R>, im: &mut Vec<R>) where Hypot: Binary<R, Out = R> {
+    root_products_parts(roots_parts, true, x, y, re, im)
+}
 
 /// Appends `g` of `turned(z)`, which is iz, for each `z` = `x + iy`, where `g` appends its results' parts.
 fn turned_parts<R: Native>(x: &[R], y: &[R], g: impl Fn(&[R], &[R], &mut Vec<R>, &mut Vec<R>), re: &mut Vec<R>, im: &mut Vec<R>) {

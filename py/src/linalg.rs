@@ -9,12 +9,12 @@ use rustymath::error::{Error, Kind};
 use rustymath::gather::Steps;
 use rustymath::layout::Layout;
 use rustymath::linalg::{self, Inner, Mapped, Orientation, PlusTimes, Stacked};
-use rustymath_buffer::py_err;
 use rustymath::operation::numpy_float;
+use rustymath_buffer::py_err;
 
 use crate::array::give;
 use crate::convert::{Call, convert, one, released};
-use crate::functions::{native_binary, mathish_at, NativeFunction};
+use crate::functions::{NativeFunction, mathish_at, native_binary};
 
 /// The [`Stacked`] for `call`'s arguments, where exact numbers compute as floats of the width that rustymath's own policy gives them ([`numpy_float`]).
 fn stacked(call: &Call) -> Stacked { Stacked::new(numpy_float(call.args[0].view().dtype())) }
@@ -23,10 +23,7 @@ fn stacked(call: &Call) -> Stacked { Stacked::new(numpy_float(call.args[0].view(
 fn views<'c, const N: usize>(call: &'c Call) -> [ArrayView<'c>; N] { std::array::from_fn(|k| call.args[k].view()) }
 
 /// `core` as a Python result: a Python number where it has no axes.
-fn result(py: Python<'_>, core: Core) -> PyResult<Bound<'_, PyAny>> {
-    let scalar = core.layout().shape().is_empty();
-    give(py, core, scalar)
-}
+fn result(py: Python<'_>, core: Core) -> PyResult<Bound<'_, PyAny>> { let scalar = core.layout().shape().is_empty(); give(py, core, scalar) }
 
 /// The int64 dtype of the matrix products' integer results.
 const I64: DType = DType::Integer(Width::I64);
@@ -196,10 +193,8 @@ fn order(ord: Option<&Bound<'_, PyAny>>, default: linalg::Norm) -> PyResult<lina
     let Some(ord) = ord else { return Ok(default) };
     if ord.extract::<String>().is_ok_and(|s| s == "fro") { return Ok(linalg::Norm::Frobenius); }
     match ord.extract::<f64>() {
-        Ok(x) if x == 1.0 => Ok(linalg::Norm::One),
-        Ok(x) if x == 2.0 => Ok(linalg::Norm::Two),
-        Ok(x) if x == f64::INFINITY => Ok(linalg::Norm::Inf),
-        _ => Err(pyo3::exceptions::PyValueError::new_err("a matrix norm's order must be 1, 2, inf or \"fro\"")),
+        Ok(x) if x == 1.0 => Ok(linalg::Norm::One), Ok(x) if x == 2.0 => Ok(linalg::Norm::Two), Ok(x) if x == f64::INFINITY => Ok(linalg::Norm::Inf),
+        _ => Err(pyo3::exceptions::PyValueError::new_err("a matrix norm's order must be 1, 2, inf or \"fro\""))
     }
 }
 
@@ -311,10 +306,13 @@ impl Operands<'_> {
         }
         let (frames, size) = (self.frames, self.size);
         let parts = linalg::cells(frames, |i, _: &mut ()| {
-            linalg::inner_with(x.slice(frames.items(0, i, n * k)), y.slice(frames.items(1, i, k * m)), size, |x, y, a| (g.apply)(x, y, a, gm), |x, d, s| (f.fold)(x, d, s, fm))
+            linalg::inner_with(
+                x.slice(frames.items(0, i, n * k)), y.slice(frames.items(1, i, k * m)), size, |x, y, a| (g.apply)(x, y, a, gm), |x, d, s| (f.fold)(x, d, s, fm))
         }).map_err(py_err)?;
         let mut parts = parts.into_iter();
-        let mut out = parts.next().unwrap_or_else(|| linalg::inner_with(x.slice(0..0), y.slice(0..0), [0, k, 0], |x, y, a| (g.apply)(x, y, a, gm), |x, d, s| (f.fold)(x, d, s, fm)))?;
+        let mut out = parts.next().unwrap_or_else(|| {
+            linalg::inner_with(x.slice(0..0), y.slice(0..0), [0, k, 0], |x, y, a| (g.apply)(x, y, a, gm), |x, d, s| (f.fold)(x, d, s, fm))
+        })?;
         for part in parts {
             let part = part?;
             assert!(out.extend_from(part.view(), 0..part.len()), "native inner-product cells have one dtype");
@@ -342,7 +340,8 @@ impl Cells {
 /// `x +.× y` of 32- or 64-bit floats or complex numbers, where a view holds an operand out of order but gemm can read both operands where they lie, as strided or transposed matrices. `Inner::inner_mapped` multiplies them without copying either. `None` where both operands are contiguous, for other dtypes, and where an operand would need a copy, as reversed rows do. A copy and one gemm cost less than gemm over blocks read in turn.
 fn mapped(views: [ArrayView<'_>; 2], sides: [usize; 2], frames: &Frames, size @ [n, k, m]: [usize; 3], cell: &Layout) -> PyResult<Option<Core>> {
     let dtype = views[0].dtype();
-    if frames.count == 0 || views.iter().all(|v| v.contiguous().is_some()) || views[1].dtype() != dtype || !matches!(dtype, DType::Float(FloatWidth::F32 | FloatWidth::F64) | DType::Complex(_)) { return Ok(None); }
+    if frames.count == 0 || views.iter().all(|v| v.contiguous().is_some()) || views[1].dtype() != dtype
+        || !matches!(dtype, DType::Float(FloatWidth::F32 | FloatWidth::F64) | DType::Complex(_)) { return Ok(None); }
     let Some(cells) = [0, 1].map(|j| Cells::new(views[j], sides[j], j == 0)).into_iter().collect::<Option<Vec<_>>>() else { return Ok(None) };
     rustymath::with_inexact!(dtype, T => {
         let [x, y] = views.map(|v| T::of(v.storage()).expect("a view's storage holds its dtype"));
@@ -360,7 +359,9 @@ fn mapped(views: [ArrayView<'_>; 2], sides: [usize; 2], frames: &Frames, size @ 
 /// The inner product of native binary functions `f` and `g`, each with its Mathish choice, on vectors, matrices or broadcast stacks. Recognized pairs use specialized kernels; other pairs apply `g` in bounded blocks and fold `f` from the right. `name` names the product in errors.
 #[pyfunction]
 #[pyo3(signature = (f, g, x1, x2, name=None))]
-pub fn product<'py>(py: Python<'py>, f: NativeFunction<'_>, g: NativeFunction<'_>, x1: &Bound<'py, PyAny>, x2: &Bound<'py, PyAny>, name: Option<&str>) -> PyResult<Bound<'py, PyAny>> {
+pub fn product<'py>(
+    py: Python<'py>, f: NativeFunction<'_>, g: NativeFunction<'_>, x1: &Bound<'py, PyAny>, x2: &Bound<'py, PyAny>, name: Option<&str>
+) -> PyResult<Bound<'py, PyAny>> {
     let call = convert(&[x1, x2])?;
     let views = [call.args[0].view(), call.args[1].view()];
     result(py, released(py, || inner(f, g, views, name.unwrap_or("inner")))?)
@@ -382,15 +383,15 @@ pub fn inner(f: NativeFunction<'_>, g: NativeFunction<'_>, [x1, x2]: [ArrayView<
     let named = rustymath::facts!(known_product, (f.0, g.0), (dtype == DType::Boolean)).filter(|pair| exact || !pair.compares_exactly());
     let (l1, l2) = (x1.layout().clone(), x2.layout().clone());
     let side = |l: &Layout| match l.shape().len() {
-        0 => Err(py_err(Error::new(Kind::Rank, format!("{name} needs matrices or vectors, with at least one axis")))),
-        1 => Ok(1),
-        _ => Ok(2),
+        0 => Err(py_err(Error::new(Kind::Rank, format!("{name} needs matrices or vectors, with at least one axis")))), 1 => Ok(1), _ => Ok(2)
     };
     let (c1, c2) = (side(&l1)?, side(&l2)?);
     let (s1, s2, r1, r2) = (l1.shape(), l2.shape(), l1.shape().len(), l2.shape().len());
     let (n, k) = if c1 == 1 { (1, s1[0]) } else { (s1[r1 - 2], s1[r1 - 1]) };
     let (j, m) = if c2 == 1 { (s2[0], 1) } else { (s2[r2 - 2], s2[r2 - 1]) };
-    if k != j { return Err(py_err(Error::new(Kind::Length, format!("{name} needs as many columns on the left as rows on the right, not {k} and {j}")))); }
+    if k != j {
+        return Err(py_err(Error::new(Kind::Length, format!("{name} needs as many columns on the left as rows on the right, not {k} and {j}"))));
+    }
     let frames = Frames::new(&[(&l1, c1), (&l2, c2)]).map_err(py_err)?;
     let cell = l1.axes(r1 - c1..r1).contracted(&l2.axes(r2 - c2..r2));
     let keyless = l1.keys(r1 - 1).is_none() && l2.keys(r2 - c2).is_none();
@@ -404,18 +405,20 @@ pub fn inner(f: NativeFunction<'_>, g: NativeFunction<'_>, [x1, x2]: [ArrayView<
 
 /// The matrix product of `x1` and `x2`. A vector on the left acts as one row, and a vector on the right as one column, and the result leaves that axis out. Booleans give whether some `k` has both `x1[i, k]` and `x2[k, j]`. Integers compute in int64, and raise `OverflowError` for a result that doesn't fit.
 #[pyfunction]
-pub fn matmul<'py>(py: Python<'py>, x1: &Bound<'py, PyAny>, x2: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { product(py, ("add", false), ("multiply", false), x1, x2, Some("matmul")) }
+pub fn matmul<'py>(py: Python<'py>, x1: &Bound<'py, PyAny>, x2: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    product(py, ("add", false), ("multiply", false), x1, x2, Some("matmul"))
+}
 
 /// Adds the linear algebra functions to the submodule `m`.
 pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
     for f in [
         wrap_pyfunction!(solve, m)?, wrap_pyfunction!(lstsq, m)?, wrap_pyfunction!(pinv, m)?, wrap_pyfunction!(det, m)?, wrap_pyfunction!(slogdet, m)?,
-        wrap_pyfunction!(lu, m)?, wrap_pyfunction!(lu_solve, m)?, wrap_pyfunction!(lu_inverse, m)?, wrap_pyfunction!(lu_det, m)?, wrap_pyfunction!(lu_slogdet, m)?,
-        wrap_pyfunction!(lu_lower, m)?, wrap_pyfunction!(lu_upper, m)?, wrap_pyfunction!(cholesky, m)?, wrap_pyfunction!(qr, m)?, wrap_pyfunction!(svd, m)?,
-        wrap_pyfunction!(svd_solve, m)?, wrap_pyfunction!(svd_pinv, m)?, wrap_pyfunction!(svdvals, m)?, wrap_pyfunction!(matrix_rank, m)?, wrap_pyfunction!(norm, m)?, wrap_pyfunction!(cond, m)?, wrap_pyfunction!(eig, m)?,
-        wrap_pyfunction!(eigvals, m)?, wrap_pyfunction!(eigh, m)?, wrap_pyfunction!(eigvalsh, m)?, wrap_pyfunction!(permanent, m)?, wrap_pyfunction!(echelon, m)?,
+        wrap_pyfunction!(lu, m)?, wrap_pyfunction!(lu_solve, m)?, wrap_pyfunction!(lu_inverse, m)?, wrap_pyfunction!(lu_det, m)?,
+        wrap_pyfunction!(lu_slogdet, m)?, wrap_pyfunction!(lu_lower, m)?, wrap_pyfunction!(lu_upper, m)?, wrap_pyfunction!(cholesky, m)?,
+        wrap_pyfunction!(qr, m)?, wrap_pyfunction!(svd, m)?, wrap_pyfunction!(svd_solve, m)?, wrap_pyfunction!(svd_pinv, m)?, wrap_pyfunction!(svdvals, m)?,
+        wrap_pyfunction!(matrix_rank, m)?, wrap_pyfunction!(norm, m)?, wrap_pyfunction!(cond, m)?, wrap_pyfunction!(eig, m)?, wrap_pyfunction!(eigvals, m)?,
+        wrap_pyfunction!(eigh, m)?, wrap_pyfunction!(eigvalsh, m)?, wrap_pyfunction!(permanent, m)?, wrap_pyfunction!(echelon, m)?,
         wrap_pyfunction!(product, m)?, wrap_pyfunction!(matmul, m)?,
     ] { m.add_function(f)?; }
     Ok(())
 }
-

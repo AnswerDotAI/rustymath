@@ -131,11 +131,10 @@ fn logb_many<R: Native, const MATHISH: bool>([b, x]: [Arg<'_, R>; 2], n: usize, 
             if MATHISH && c == R::one() {
                 each!([b, x], n, out, |[_, x]| if x == R::one() { R::zero() } else { log::<_, { crate::FUSED }>(x, to) / d })
             } else if d == R::one() {
-                crate::slice::each_usual(x, n, out, (usual, #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), to)), crate::slice::none(),
-                    #[inline(always)] |x| log::<_, { crate::FUSED }>(x, to))
-            } else {
-                each!([b, x], n, out, |[_, x]| log::<_, { crate::FUSED }>(x, to) / d)
-            }
+                crate::slice::each_usual(
+                    x, n, out, (usual, #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), to),), crate::slice::none(), #[inline(always)]
+                    |x| log::<_, { crate::FUSED }>(x, to))
+            } else { each!([b, x], n, out, |[_, x]| log::<_, { crate::FUSED }>(x, to) / d) }
         }
         (Arg::Many(bs), Arg::One(c)) => {
             // A base of exactly 2 or 10 takes `log2` or `log10` of c. A second pass writes those items, because a select in the main loop stops it vectorizing. At those bases either result is NaN only where c is negative or NaN. The main loop's outcome holds.

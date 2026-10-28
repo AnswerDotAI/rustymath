@@ -3,7 +3,7 @@ use crate::agreement::Mapping;
 use crate::buffer::{Element, Fill};
 use crate::error::{Error, Kind};
 use crate::gather::{self, Steps};
-use crate::layout::{count, Layout};
+use crate::layout::{Layout, count};
 use crate::linalg::{Inner, Orientation, PlusTimes, Scalar};
 use crate::reduce::{self, Reduction, Sum};
 use crate::{Float, Native};
@@ -25,12 +25,14 @@ impl Axes {
         let result = layout.axes(remaining.iter().copied());
         let (first, end) = axes.first().zip(axes.last()).map_or((0, 0), |(&a, &b)| (a, b + 1));
         if end - first == axes.len() {
-            return Ok(Self { dims: [count(&shape[..first]), count(&shape[first..end]), count(&shape[end..])], layout: result, shape: shape.to_vec(), steps: None });
+            return Ok(Self { dims: [count(&shape[..first]), count(&shape[first..end]), count(&shape[end..])], layout: result, shape: shape.to_vec(), steps: None
+            });
         }
         let mut destinations = vec![0; shape.len()];
         for (to, &from) in remaining.iter().chain(&axes).enumerate() { destinations[from] = to; }
         let plan = crate::structure::transpose(layout, &destinations)?;
-        Ok(Self { dims: [remaining.iter().map(|&a| shape[a]).product(), axes.iter().map(|&a| shape[a]).product(), 1], layout: result, shape: shape.to_vec(), steps: Some(plan.steps) })
+        Ok(Self { dims: [remaining.iter().map(|&a| shape[a]).product(), axes.iter().map(|&a| shape[a]).product(), 1], layout: result, shape: shape.to_vec(),
+            steps: Some(plan.steps) })
     }
 
     pub fn read<'a, T: Element>(&self, data: &'a [T]) -> Cow<'a, [T]> {
@@ -44,7 +46,9 @@ impl Axes {
     fn plan<T: Element>(&self, mapping: &Mapping) -> (usize, Vec<Steps>, T) {
         let frame: Vec<usize> = self.steps.as_ref().map_or_else(|| self.shape.clone(), |steps| steps.iter().map(Steps::len).collect());
         let ordered = match &self.steps {
-            Some(steps) => mapping.composed(&Mapping::Steps { base: 0, steps: steps.clone().into() }, &self.shape, &frame, true).expect("a table always composes"),
+            Some(steps) => {
+                mapping.composed(&Mapping::Steps { base: 0, steps: steps.clone().into() }, &self.shape, &frame, true).expect("a table always composes")
+            }
             None => mapping.clone(),
         };
         let (base, steps, fill) = ordered.to_walk(&frame);
@@ -120,7 +124,9 @@ pub fn stddev<T: Scalar>(data: &[T], dims: [usize; 3], ddof: usize) -> Vec<T::Re
 /// The elementwise p-norm along the selected axes: 0 counts nonzero values, ±infinity selects the greatest/least magnitude, and a finite p gives `(sum |x|^p)^(1/p)`. A pair of axes still gives this norm, not a matrix-induced norm. For p = 2, each square is computed and summed in f64, where an f32's square neither overflows nor underflows.
 pub fn norm<T: Scalar>(data: &[T], dims: [usize; 3], p: f64) -> Vec<T::Real> {
     if p == 1.0 { return values::<_, _, Sum>(data, dims, #[inline(always)] |x| x.modulus()); }
-    if p == 0.0 { return values::<_, _, Sum>(data, dims, #[inline(always)] |x| if x == T::zero() { T::Real::zero() } else { T::Real::one() }); }
+    if p == 0.0 {
+        return values::<_, _, Sum>(data, dims, #[inline(always)] |x| if x == T::zero() { T::Real::zero() } else { T::Real::one() });
+    }
     if p == f64::INFINITY { return values::<_, _, reduce::Max>(data, dims, #[inline(always)] |x| x.modulus()); }
     if p == f64::NEG_INFINITY { return values::<_, _, reduce::Min>(data, dims, #[inline(always)] |x| x.modulus()); }
     if p == 2.0 { return reduce::along::<T, reduce::Squares>(data, dims).0.into_iter().map(|v| T::Real::narrow(v.sqrt())).collect(); }
@@ -133,7 +139,9 @@ pub fn norm<T: Scalar>(data: &[T], dims: [usize; 3], p: f64) -> Vec<T::Real> {
 pub fn average<T: Scalar + Element>(data: &[T], weights: &[T], axes: &Axes, mappings: [&Mapping; 2]) -> Vec<T> where Sum: Reduction<T, Total = T> {
     let [(xbase, xsteps, xfill), (wbase, wsteps, wfill)] = mappings.map(|mapping| axes.plan::<T>(mapping));
     let [(xbase, xplan), (wbase, wplan)] = [Steps::simplify(xbase, &xsteps), Steps::simplify(wbase, &wsteps)];
-    let read = |x: &[T], base, plan: &[Cow<Steps>], fill, range: Range<usize>, out: &mut Vec<T>| gather::walk_plan(out, x, base, plan, fill, range.start, range.len(), gather::Same);
+    let read = |x: &[T], base, plan: &[Cow<Steps>], fill, range: Range<usize>, out: &mut Vec<T>| {
+        gather::walk_plan(out, x, base, plan, fill, range.start, range.len(), gather::Same)
+    };
     let mut sums = mapped::<_, Sum>(axes.dims, |range, out| {
         read(data, xbase, &xplan, xfill, range.clone(), out);
         let mut w = Vec::with_capacity(range.len());
@@ -146,29 +154,23 @@ pub fn average<T: Scalar + Element>(data: &[T], weights: &[T], axes: &Axes, mapp
 }
 
 /// The covariance or correlation of a row-major `variables × observations` matrix. The centered Gram product uses the same native/Accelerate product as linear algebra. Complex covariance conjugates the second variable.
-pub fn covariance<T: Scalar>(data: &[T], [rows, cols]: [usize; 2], rowvar: bool, ddof: usize, correlation: bool) -> Vec<T>
-where Sum: Reduction<T, Total = T>, PlusTimes: Inner<T, Out = T> {
+pub fn covariance<T: Scalar>(data: &[T], [rows, cols]: [usize; 2], rowvar: bool, ddof: usize, correlation: bool) -> Vec<T> where Sum: Reduction<T, Total = T>,
+    PlusTimes: Inner<T, Out = T> {
     let (variables, observations, dims) = if rowvar { (rows, cols, [rows, cols, 1]) } else { (cols, rows, [1, rows, cols]) };
     let means = mean(data, dims);
     let mut centered = Vec::with_capacity(data.len());
-    if rowvar { centered.extend_from_slice(data); }
-    else {
+    if rowvar { centered.extend_from_slice(data); } else {
         centered.resize(data.len(), T::zero());
         crate::linalg::transpose_into(data, cols, &mut centered, rows, [rows, cols], |x| x);
     }
-    if observations > 0 {
-        for (row, &m) in centered.chunks_mut(observations).zip(&means) { for x in row { *x = *x - m; } }
-    }
-    let conjugate = if !T::COMPLEX { Cow::Borrowed(&centered[..]) }
-        else { Cow::Owned(centered.iter().map(|&x| x.conj()).collect()) };
+    if observations > 0 { for (row, &m) in centered.chunks_mut(observations).zip(&means) { for x in row { *x = *x - m; } } }
+    let conjugate = if !T::COMPLEX { Cow::Borrowed(&centered[..]) } else { Cow::Owned(centered.iter().map(|&x| x.conj()).collect()) };
     let mut out = PlusTimes.inner_ops(&centered, &conjugate, [Orientation::Normal, Orientation::Transpose], [variables, observations, variables]);
     let count = T::Real::narrow(observations.saturating_sub(ddof) as f64);
     if correlation {
         let scales: Vec<_> = (0..variables).map(|j| out[j * (variables + 1)].re().sqrt()).collect();
         for (ij, x) in out.iter_mut().enumerate() { *x = x.div_real(scales[ij / variables] * scales[ij % variables]); }
-    } else {
-        for x in &mut out { *x = if ddof >= observations { T::from_real(T::Real::nan()) } else { x.div_real(count) }; }
-    }
+    } else { for x in &mut out { *x = if ddof >= observations { T::from_real(T::Real::nan()) } else { x.div_real(count) }; } }
     out
 }
 
@@ -176,7 +178,10 @@ where Sum: Reduction<T, Total = T>, PlusTimes: Inner<T, Out = T> {
 pub fn histogram_edges<F: Native>(data: &[F], bins: usize, range: Option<(f64, f64)>) -> Result<Vec<F>, Error> {
     if bins == 0 { return Err(Error::new(Kind::Domain, "histogram needs a positive bin count")); }
     let (mut lo, mut hi) = range.unwrap_or_else(|| if data.is_empty() { (0.0, 1.0) } else { (reduce::min(data).wide(), reduce::max(data).wide()) });
-    if lo == hi { lo -= 0.5; hi += 0.5; }
+    if lo == hi {
+        lo -= 0.5;
+        hi += 0.5;
+    }
     if !lo.is_finite() || !hi.is_finite() || lo >= hi { return Err(Error::new(Kind::Domain, "histogram needs a finite increasing range")); }
     Ok((0..=bins).map(|j| F::narrow(lo + (hi - lo) * (j as f64 / bins as f64))).collect())
 }
@@ -189,10 +194,6 @@ pub fn histogram<F: Native>(data: &[F], edges: &[F]) -> Result<Vec<i64>, Error> 
     let bins = crate::search::bins(&crate::tolerant::order_keys(edges), &crate::tolerant::order_keys(data));
     let n = edges.len() - 1;
     let mut out = vec![0; n];
-    for (&x, b) in data.iter().zip(bins) {
-        let b = b as usize;
-        if b > 0 && b <= n { out[b - 1] += 1; }
-        else if x == edges[n] { out[n - 1] += 1; }
-    }
+    for (&x, b) in data.iter().zip(bins) { let b = b as usize; if b > 0 && b <= n { out[b - 1] += 1; } else if x == edges[n] { out[n - 1] += 1; } }
     Ok(out)
 }

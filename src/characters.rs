@@ -31,7 +31,8 @@ macro_rules! characters {
     (of $k:expr) => {{
         #[allow(unused_imports)]
         use $crate::operation::probe::{Found as _, Missing as _};
-        let found: Option<($crate::characters::Kernel<_>, bool)> = (&$crate::operation::probe::Probe::<_, (), $crate::operation::probe::Characters>::of(&$k)).kernel();
+        let found: Option<($crate::characters::Kernel<_>, bool)> =
+            (&$crate::operation::probe::Probe::<_, (), $crate::operation::probe::Characters>::of(&$k)).kernel();
         found.map(|(f, _)| f)
     }};
 }
@@ -57,8 +58,8 @@ pub fn codes(chars: &[char]) -> &[i32] {
 pub fn as_codes(view: View<'_>) -> View<'_> { match view { View::Characters(c) => View::Integers(Ints::I32(codes(c))), view => view } }
 
 /// `k` on `x` and `y`, paired as `agreement` says over the result's `frame`, by `k`'s [`Rule`], with whether every result succeeded. `None` where neither argument is characters, or where the rule doesn't take arguments of these kinds. A character result that isn't a Unicode scalar value fails, as does an offset that isn't a whole number. A missing entry of a keyed character argument reads as a space, as character storage fills.
-pub fn binary<K, L>(k: &K, x: ArrayView<'_>, y: ArrayView<'_>, frame: &[usize], agreement: &Agreement<L>) -> Option<(Buffer, bool)>
-where K: Characters + Binary<i32, Out: Element> + Binary<i64, Out: Element> + Sync {
+pub fn binary<K, L>(k: &K, x: ArrayView<'_>, y: ArrayView<'_>, frame: &[usize], agreement: &Agreement<L>) -> Option<(Buffer, bool)> where
+    K: Characters + Binary<i32, Out: Element> + Binary<i64, Out: Element> + Sync {
     let (xc, yc) = (x.dtype() == DType::Character, y.dtype() == DType::Character);
     if !xc && !yc { return None; }
     let (xi, left) = laid(x, &agreement.left, frame, agreement.len);
@@ -66,10 +67,7 @@ where K: Characters + Binary<i32, Out: Element> + Binary<i64, Out: Element> + Sy
     let paired = Agreement { layout: (), len: agreement.len, left, right };
     let (xv, yv) = (xi.view(), yi.view());
     Some(match (K::RULE, xc, yc) {
-        (Rule::Ordered, true, true) => {
-            let (out, ok) = binary_at::<K, i32, _>(k, as_codes(xv), as_codes(yv), &paired);
-            (characters_of(out), ok)
-        }
+        (Rule::Ordered, true, true) => { let (out, ok) = binary_at::<K, i32, _>(k, as_codes(xv), as_codes(yv), &paired); (characters_of(out), ok) }
         (Rule::Ordered, _, _) => kinds(k, [(xv, &paired.left), (yv, &paired.right)], xc, agreement.len),
         (Rule::Difference, true, true) => binary_at::<K, i32, _>(k, as_codes(xv), as_codes(yv), &paired),
         (Rule::Shift, true, false) | (Rule::Shift, false, true) | (Rule::Difference, true, false) => {
@@ -129,7 +127,7 @@ pub fn by_kinds<K: Binary<i32, Out: Element>>(k: &K, x_character: bool) -> ByKin
     let out = <<K as Results<i32, 2>>::Out as Element>::buffer(vec![<K as Binary<i32>>::one(k, rank(x_character), rank(!x_character))]);
     match out.view() {
         View::Booleans(&[b]) => ByKinds::Truth(b),
-        View::Integers(Ints::I32(&[winner])) => if (winner == 1) == x_character { ByKinds::Left } else { ByKinds::Right },
+        View::Integers(Ints::I32(&[winner])) => { if (winner == 1) == x_character { ByKinds::Left } else { ByKinds::Right } }
         _ => unreachable!("an ordered function gives a Boolean or one of its arguments"),
     }
 }
@@ -137,9 +135,7 @@ pub fn by_kinds<K: Binary<i32, Out: Element>>(k: &K, x_character: bool) -> ByKin
 /// An ordered function of numbers and characters ([`by_kinds`]): Booleans, all the same, or the argument that the maximum or minimum picks, laid over the call.
 fn kinds<K: Binary<i32, Out: Element>>(k: &K, sides: [(View<'_>, &Mapping); 2], x_character: bool, len: usize) -> (Buffer, bool) {
     let (view, mapping) = match by_kinds(k, x_character) {
-        ByKinds::Truth(b) => return (Buffer::Booleans(vec![b; len]), true),
-        ByKinds::Left => sides[0],
-        ByKinds::Right => sides[1],
+        ByKinds::Truth(b) => return (Buffer::Booleans(vec![b; len]), true), ByKinds::Left => sides[0], ByKinds::Right => sides[1]
     };
     (Buffer::cast_mapped(view, mapping, len, view.dtype()).expect("an argument gathers at its own dtype"), true)
 }

@@ -82,7 +82,8 @@ pub fn polyroots<'py>(py: Python<'py>, c: &Bound<'py, PyAny>) -> PyResult<Bound<
     if dtype == DType::Character { return Err(missing("polyroots", dtype)); }
     let result = dtype.complex();
     let c = cs.items::<Complex64>()?;
-    let roots = released(py, || polynomial::roots(&c)).unwrap_or_else(|| vec![Complex64::new(f64::NAN, f64::NAN); polynomial::trimmed(&c).len().saturating_sub(1)]);
+    let roots =
+        released(py, || polynomial::roots(&c)).unwrap_or_else(|| vec![Complex64::new(f64::NAN, f64::NAN); polynomial::trimmed(&c).len().saturating_sub(1)]);
     give(py, vector_of(roots, result)?, false)
 }
 
@@ -106,7 +107,8 @@ pub fn polyder<'py>(py: Python<'py>, c: &Bound<'py, PyAny>) -> PyResult<Bound<'p
     let cs = one(c)?;
     vector(&cs.layout(), "the coefficients")?;
     let (work, result) = working("polyder", cs.view().dtype())?;
-    let core = rustymath::with_inexact!(work, T => { let c = cs.items::<T>()?; vector_of(released(py, || polynomial::derivative(&c)).map_err(py_err)?, result)? });
+    let core =
+        rustymath::with_inexact!(work, T => { let c = cs.items::<T>()?; vector_of(released(py, || polynomial::derivative(&c)).map_err(py_err)?, result)? });
     give(py, core, false)
 }
 

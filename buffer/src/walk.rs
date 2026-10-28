@@ -59,7 +59,10 @@ impl<C: Collect> Walk<'_, C> {
         if obj.is_instance_of::<PyRange>() {
             let len = generated_len(&[obj.len()?]).map_err(py_err)?;
             let (first, step): (i128, i128) = (obj.getattr("start")?.extract()?, obj.getattr("step")?.extract()?);
-            for i in 0..len as i128 { let piece = self.collect.int(first + i * step); self.pieces.push(piece); }
+            for i in 0..len as i128 {
+                let piece = self.collect.int(first + i * step);
+                self.pieces.push(piece);
+            }
             self.axes.push((len, None));
             return Ok(start);
         }
@@ -85,7 +88,10 @@ impl<C: Collect> Walk<'_, C> {
             if ragged {
                 self.pieces.truncate(pieces);
                 self.axes.truncate(start);
-                for v in values.try_iter()? { let piece = self.collect.element(&v?)?; self.pieces.push(piece); }
+                for v in values.try_iter()? {
+                    let piece = self.collect.element(&v?)?;
+                    self.pieces.push(piece);
+                }
             }
             self.axes.push((values.len()?, keys));
             Ok(start)

@@ -1,5 +1,7 @@
 //! Special functions: gamma, its logarithm and its logarithmic derivative digamma, binomial coefficients, the error function and its inverses, and the regularized incomplete gamma and beta functions with their inverses. f64 computes in f64. Narrower types round an f64 result, from a cheaper f64 algorithm where one has the precision they need. `gamma`, `lgamma` and `erf` have no branch on their usual path, and loops that call them vectorize. The others choose a method by range, or iterate until they converge.
-use crate::{Arg, Native, dd::Double, exp::{exp, exp_narrow, exp_plus}, float::{horner, sealed::Core}, ln::{ln, ln_double, ln_narrow, ln_split, log1p}, slice::written};
+use crate::{
+    Arg, Native, dd::Double, exp::{exp, exp_narrow, exp_plus}, float::{horner, sealed::Core}, ln::{ln, ln_double, ln_narrow, ln_split, log1p}, slice::written
+};
 use std::{f64::consts::PI, mem::MaybeUninit};
 
 /// Each function at every type: it computes in f64, and narrower types round the result.
@@ -41,10 +43,7 @@ const FALLING_STEPS: f64 = 64.0;
 
 /// a × m / d. It multiplies first, so that a whole quotient stays exact, and divides first only where the product overflows, so that a quotient the type holds stays finite.
 #[inline(always)]
-fn ratio_step<R: Native>(a: R, m: R, d: R) -> R {
-    let p = a * m;
-    if p.is_finite() { p / d } else { a / d * m }
-}
+fn ratio_step<R: Native>(a: R, m: R, d: R) -> R { let p = a * m; if p.is_finite() { p / d } else { a / d * m } }
 
 /// C(n, k) for a whole k from 0, as the falling factorial n(n - 1)…(n - k + 1)/k!, and its slope in n by the product rule, which stays finite at the polynomial's roots.
 fn falling(n: f64, k: f64) -> (f64, f64) {
@@ -107,8 +106,8 @@ fn binom_real<const FUSED: bool>(n: f64, k: f64) -> f64 {
         }
     }
     let gap = |&(i, j): &(usize, usize)| (terms[i].0.hi - terms[j].0.hi).abs();
-    let pair = (0..3).flat_map(|i| (0..3).map(move |j| (i, j)))
-        .filter(|&(i, j)| terms[i].1 && !terms[j].1 && terms[i].0.hi >= 10.0 && terms[j].0.hi >= 10.0).min_by(|p, q| gap(p).total_cmp(&gap(q)));
+    let pair = (0..3).flat_map(|i| (0..3).map(move |j| (i, j))).filter(|&(i, j)| terms[i].1 && !terms[j].1 && terms[i].0.hi >= 10.0 && terms[j].0.hi >= 10.0)
+        .min_by(|p, q| gap(p).total_cmp(&gap(q)));
     if let Some((i, j)) = pair { log = log.plus(lgamma_gap::<FUSED>(terms[i].0, terms[j].0)); }
     for (i, &(z, up)) in terms.iter().enumerate() {
         if pair.is_some_and(|(p, q)| i == p || i == q) { continue; }
@@ -596,18 +595,21 @@ fn erfc_blocks<R: Native, const FUSED: bool>(x: &[R], out: &mut [MaybeUninit<R>]
     #[inline(always)]
     fn far<R: Native, const FUSED: bool>(v: R) -> R { erfc_ends(v, erfc_far::<R, FUSED>(v)) }
     crate::slice::blocks::<_, _, BLOCK>(x, out, #[inline(always)] |b| {
-            let (low, high) = b.iter().fold((R::infinity(), R::zero()), |(low, high), &v| (low.min(v.abs()), high.max(v.abs())));
-            (high < split, low >= split)
-        }, near::<R, FUSED>, far::<R, FUSED>,
-        #[inline(always)] |xs, os| {
-            if branches::<R>() {
-                let n = placed(0..xs.len() as u16, &mut place, |i| xs[usize::from(i)].abs() < split);
-                let (nears, fars) = written(&mut place[..xs.len()]).split_at(n);
-                gathered(nears, &mut t, os, |i| xs[i], #[inline(always)] |t| { for v in t { *v = near::<R, FUSED>(*v) } }, |_, v| v);
-                gathered(fars, &mut t, os, |i| xs[i], #[inline(always)] |t| { for v in t { *v = far::<R, FUSED>(*v) } }, |_, v| v);
-            } else { for (o, &v) in os.iter_mut().zip(xs) { o.write(erfc::<R, FUSED>(v)); } }
-            true
-        })
+        let (low, high) = b.iter().fold((R::infinity(), R::zero()), |(low, high), &v| (low.min(v.abs()), high.max(v.abs())));
+        (high < split, low >= split)
+    }, near::<R, FUSED>, far::<R, FUSED>, #[inline(always)] |xs, os| {
+        if branches::<R>() {
+            let n = placed(0..xs.len() as u16, &mut place, |i| xs[usize::from(i)].abs() < split);
+            let (nears, fars) = written(&mut place[..xs.len()]).split_at(n);
+            gathered(nears, &mut t, os, |i| xs[i], #[inline(always)] |t| {
+                for v in t { *v = near::<R, FUSED>(*v) }
+            }, |_, v| v);
+            gathered(fars, &mut t, os, |i| xs[i], #[inline(always)] |t| {
+                for v in t { *v = far::<R, FUSED>(*v) }
+            }, |_, v| v);
+        } else { for (o, &v) in os.iter_mut().zip(xs) { o.write(erfc::<R, FUSED>(v)); } }
+        true
+    })
 }
 /// [`erfinv`](crate::erfinv) as a function object, with the slice form `many`, which runs `regions` on a slice of f64s.
 #[derive(Clone, Copy, Debug)]
@@ -630,7 +632,8 @@ fn inverses<R: Native>(x: Arg<'_, R>, n: usize, out: &mut [MaybeUninit<R>], f: i
 fn regions<R: Native, const FUSED: bool>(x: &[R], out: &mut [MaybeUninit<R>], f: impl Fn(R) -> R, parts: impl Fn(f64) -> (f64, f64, f64)) -> bool {
     const BLOCK: usize = 512;
     let (mut place, mut split) = ([const { MaybeUninit::uninit() }; BLOCK], [const { MaybeUninit::uninit() }; BLOCK]);
-    let (mut ps, mut qs, mut signs, mut t) = ([const { MaybeUninit::uninit() }; BLOCK], [const { MaybeUninit::uninit() }; BLOCK], [const { MaybeUninit::uninit() }; BLOCK], [const { MaybeUninit::uninit() }; BLOCK]);
+    let (mut ps, mut qs, mut signs, mut t) = ([const { MaybeUninit::uninit() }; BLOCK], [const { MaybeUninit::uninit() }; BLOCK],
+        [const { MaybeUninit::uninit() }; BLOCK], [const { MaybeUninit::uninit() }; BLOCK]);
     let mut ok = true;
     for (xs, os) in x.chunks(BLOCK).zip(out.chunks_mut(BLOCK)) {
         let mut outside = false;
@@ -646,8 +649,12 @@ fn regions<R: Native, const FUSED: bool>(x: &[R], out: &mut [MaybeUninit<R>], f:
         let upper = placed(others.iter().copied(), &mut split, |i| qs[usize::from(i)] >= 0.25);
         let (upper, below) = written(&mut split[..others.len()]).split_at(upper);
         let signed = |i: usize, v: f64| R::narrow(v.copysign(signs[i]));
-        gathered(central, &mut t, os, |i| ps[i], #[inline(always)] |t| { for v in t { *v = maddock_central::<FUSED>(*v) } }, signed);
-        gathered(upper, &mut t, os, |i| qs[i], #[inline(always)] |t| { for v in t { *v = maddock_upper::<FUSED>(*v) } }, signed);
+        gathered(central, &mut t, os, |i| ps[i], #[inline(always)] |t| {
+            for v in t { *v = maddock_central::<FUSED>(*v) }
+        }, signed);
+        gathered(upper, &mut t, os, |i| qs[i], #[inline(always)] |t| {
+            for v in t { *v = maddock_upper::<FUSED>(*v) }
+        }, signed);
         gathered(below, &mut t, os, |i| qs[i], #[inline(always)] |t| {
             for v in t.iter_mut() { *v = maddock_g::<FUSED>(*v) }
             for v in t { *v = maddock_below::<FUSED>(*v) }
@@ -667,12 +674,17 @@ fn regions<R: Native, const FUSED: bool>(x: &[R], out: &mut [MaybeUninit<R>], f:
 
 /// `formula` on the values that `arg` gives at `positions`, gathered into `t`. Each result goes to its item's place in `os`, through `result`, which also gets the item's position.
 #[inline(always)]
-fn gathered<T: Copy, R>(positions: &[u16], t: &mut [MaybeUninit<T>], os: &mut [MaybeUninit<R>], arg: impl Fn(usize) -> T, formula: impl Fn(&mut [T]), result: impl Fn(usize, T) -> R) {
+fn gathered<T: Copy, R>(
+    positions: &[u16], t: &mut [MaybeUninit<T>], os: &mut [MaybeUninit<R>], arg: impl Fn(usize) -> T, formula: impl Fn(&mut [T]), result: impl Fn(usize, T) -> R
+) {
     let t = &mut t[..positions.len()];
     for (v, &i) in t.iter_mut().zip(positions) { v.write(arg(usize::from(i))); }
     let t = written(t);
     formula(t);
-    for (&v, &i) in t.iter().zip(positions) { let i = usize::from(i); os[i].write(result(i, v)); }
+    for (&v, &i) in t.iter().zip(positions) {
+        let i = usize::from(i);
+        os[i].write(result(i, v));
+    }
 }
 
 /// Places each of `positions` for which `first` holds at the front of `place`, in order, and each other one at the back, with no branch, and gives how many went to the front.

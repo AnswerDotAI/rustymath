@@ -25,8 +25,7 @@ mod products {
                         use rustymath::{array::ArrayView, layout::Layout};
                         assert!(agreement.len <= rustymath::CHUNK);
                         checked(gk.binary(&g, ArrayView::compact(&Layout::from([x.len()]), x), ArrayView::compact(&Layout::from([y.len()]), y), agreement).unwrap())
-                    },
-                    |x, dims, tail| checked(fk.run(&f, x, dims, tail).unwrap()),
+                    }, |x, dims, tail| checked(fk.run(&f, x, dims, tail).unwrap()),
                 )
             }};
         }
@@ -34,7 +33,9 @@ mod products {
         let a = (0..m * k).map(|i| (i % 7) as i64 - 3).collect::<Vec<_>>();
         let b = (0..k * n).map(|i| (i % 5) as i64 - 2).collect::<Vec<_>>();
         let out = inner!(rustymath::Subtract, rustymath::Multiply, i64::view(&a), i64::view(&b), [m, k, n]).unwrap();
-        let expected = (0..m * n).map(|ij| (0..k - 1).rev().fold(a[ij / n * k + k - 1] * b[(k - 1) * n + ij % n], |t, p| a[ij / n * k + p] * b[p * n + ij % n] - t)).collect::<Vec<_>>();
+        let expected = (0..m * n)
+            .map(|ij| (0..k - 1).rev().fold(a[ij / n * k + k - 1] * b[(k - 1) * n + ij % n], |t, p| a[ij / n * k + p] * b[p * n + ij % n] - t))
+            .collect::<Vec<_>>();
         assert_eq!(i64::of(out.view()).unwrap(), expected);
         let out = inner!(Equal(Tolerance::EXACT), rustymath::Add, i64::view(&a), i64::view(&b), [m, k, n]).unwrap();
         let expected = (0..m * n).map(|ij| {
@@ -78,7 +79,8 @@ mod products {
             assert_eq!(p.inner_ops(&at, b, [Orientation::Transpose, Orientation::Normal], [m, k, n]), expected);
             assert_eq!(p.inner_ops(a, &bt, [Orientation::Normal, Orientation::Transpose], [m, k, n]), expected);
             assert_eq!(p.inner_ops(&at, &bt, [Orientation::Transpose, Orientation::Transpose], [m, k, n]), expected);
-            let read = |[(s0, l0, d0), (s1, l1, d1)]: [(usize, usize, isize); 2]| Mapping::Steps { base: 0, steps: vec![Steps::Stride { start: s0, len: l0, step: d0 }, Steps::Stride { start: s1, len: l1, step: d1 }].into() };
+            let read = |[(s0, l0, d0), (s1, l1, d1)]: [(usize, usize, isize); 2]| Mapping::Steps { base: 0,
+                steps: vec![Steps::Stride { start: s0, len: l0, step: d0 }, Steps::Stride { start: s1, len: l1, step: d1 }].into() };
             let (held, (mi, ki, ni)) = (Mapping::Linear(1), (m as isize, k as isize, n as isize));
             let padded: Vec<f64> = b.chunks(n).flat_map(|row| row.iter().copied().chain([0.0; 2])).collect();
             let reversed: Vec<f64> = a.iter().rev().copied().collect();
@@ -87,7 +89,9 @@ mod products {
             let normal = [Orientation::Normal; 2];
             assert_eq!(p.inner_mapped(Mapped { data: &at, mapping: &from_at }, Mapped { data: &padded, mapping: &padded_rows }, normal, [m, k, n]), expected);
             assert_eq!(p.inner_mapped(Mapped { data: &reversed, mapping: &backwards }, Mapped { data: b, mapping: &held }, normal, [m, k, n]), expected);
-            assert_eq!(p.inner_mapped(Mapped { data: a, mapping: &stored_t }, Mapped { data: &bt, mapping: &held }, [Orientation::Transpose; 2], [m, k, n]), expected);
+            assert_eq!(
+                p.inner_mapped(Mapped { data: a, mapping: &stored_t }, Mapped { data: &bt, mapping: &held }, [Orientation::Transpose; 2], [m, k, n]), expected
+            );
         }
         for [m, k, n] in [[5, 7, 9], [1, 11, 37], [37, 11, 1]] {
             let a: Vec<f64> = (0..m * k).map(|i| (i * 7 % 17) as f64 - 8.0).collect();
@@ -107,7 +111,8 @@ mod products {
             let stored = expanded_items(&mapping, data, 0, m * k, &mut buf).to_vec();
             let a = if o == Orientation::Normal { stored } else { transpose(&stored, k, m) };
             let b: Vec<f64> = (0..k).map(|i| (i * 5 % 13) as f64 - 6.0).collect();
-            let got = PlusTimes.inner_mapped(Mapped { data, mapping: &mapping }, Mapped { data: &b, mapping: &Mapping::Linear(1) }, [o, Orientation::Normal], [m, k, 1]);
+            let got = PlusTimes.inner_mapped(
+                Mapped { data, mapping: &mapping }, Mapped { data: &b, mapping: &Mapping::Linear(1) }, [o, Orientation::Normal], [m, k, 1]);
             assert_eq!(got, PlusTimes.inner(&a, &b, [m, k, 1]));
         };
         let x: Vec<f64> = (0..300).map(|i| (i * 7 % 17) as f64 - 8.0).collect();
@@ -177,7 +182,8 @@ mod products {
                 assert_eq!(checked(&PlusTimes, &a, &b, size), products);
                 if let Some(products) = products { assert_eq!(PlusTimes.inner(&a, &b, size), products); }
                 let exact = |unit: i64, step: fn(i128, i128) -> i128| {
-                    folded(&a, &b, size, i128::from(unit), |s, x, y| step(s, i128::from(x) + i128::from(y))).into_iter().map(|t| i64::try_from(t).ok()).collect::<Option<Vec<_>>>()
+                    folded(&a, &b, size, i128::from(unit), |s, x, y| step(s, i128::from(x) + i128::from(y))).into_iter().map(|t| i64::try_from(t).ok())
+                        .collect::<Option<Vec<_>>>()
                 };
                 let maxima = exact(i64::MIN, i128::max);
                 assert_eq!(checked(&MaxPlus, &a, &b, size), maxima);
@@ -251,14 +257,26 @@ mod products {
         let mut a: Vec<f64> = (0..m * k).map(|i| (i % 23) as f64).collect();
         let b: Vec<f64> = (0..k * n).map(|i| (i % 19) as f64).collect();
         (a[0], a[3 * k + 280]) = (f64::NAN, f64::NAN);
-        let fold = |i: usize, j: usize, max: bool| (0..k).map(|p| a[i * k + p] + b[p * n + j]).filter(|t| !t.is_nan()).fold(if max { f64::NEG_INFINITY } else { f64::INFINITY }, |s, t| if max { s.max(t) } else { s.min(t) });
+        let fold = |i: usize, j: usize, max: bool| {
+            (0..k).map(|p| a[i * k + p] + b[p * n + j]).filter(|t| !t.is_nan())
+                .fold(if max { f64::NEG_INFINITY } else { f64::INFINITY }, |s, t| if max { s.max(t) } else { s.min(t) })
+        };
         let nan_row = |i: usize| (0..k).any(|p| a[i * k + p].is_nan());
-        let check = |c: &[f64], max: bool| for i in 0..m { for j in 0..n { let (got, want) = (c[i * n + j], fold(i, j, max)); assert!(got == want || (nan_row(i) && got.is_nan()), "row {i}: {got}, where {want}") } };
+        let check = |c: &[f64], max: bool| {
+            for i in 0..m {
+                for j in 0..n {
+                    let (got, want) = (c[i * n + j], fold(i, j, max));
+                    assert!(got == want || (nan_row(i) && got.is_nan()), "row {i}: {got}, where {want}")
+                }
+            }
+        };
         check(&MaxPlus.inner(&a, &b, size), true);
         check(&MinPlus.inner(&a, &b, size), false);
         let a32: Vec<f32> = a.iter().map(|&x| x as f32).collect();
         let b32: Vec<f32> = b.iter().map(|&x| x as f32).collect();
-        for (c, max) in [(MaxPlus.inner(&a32, &b32, size), true), (MinPlus.inner(&a32, &b32, size), false)] { check(&c.iter().map(|&x| x as f64).collect::<Vec<_>>(), max) }
+        for (c, max) in [(MaxPlus.inner(&a32, &b32, size), true), (MinPlus.inner(&a32, &b32, size), false)] {
+            check(&c.iter().map(|&x| x as f64).collect::<Vec<_>>(), max)
+        }
     }
 }
 mod factor {
@@ -489,7 +507,9 @@ mod factor {
         let mut x = vec![T::narrow(0.0); 36];
         let d = LuWork::default().inverse_into(&regular, [6, 6], &mut x).expect("a regular matrix has an inverse");
         assert!(x == inverse && d.wide() == det(&regular, 6), "a regular matrix's inverse, which pinv gives, and its determinant, which lu gives");
-        assert!(LuWork::default().inverse_into(&[1., 2., 2., 4.].map(T::narrow), [2, 2], &mut [T::narrow(0.0); 4]).is_none(), "a singular matrix has no inverse");
+        assert!(
+            LuWork::default().inverse_into(&[1., 2., 2., 4.].map(T::narrow), [2, 2], &mut [T::narrow(0.0); 4]).is_none(), "a singular matrix has no inverse"
+        );
         let (sign, log) = lu(&regular, 6).log_determinant();
         assert!((sign.wide() * log.wide().exp() / det(&regular, 6) - 1.0).abs() < bound, "log-determinant");
         // diag(1, 2, 3, 4) with two rows swapped has determinant -24, and with a zero column, 0 and a logarithm of -∞.
@@ -1232,7 +1252,10 @@ mod exact {
         assert_eq!(pinv(&q(&[1, 1]), [2, 1])?, vec![half.clone(), half.clone()]);
         // An inverse exists only for a matrix of full rank.
         assert_eq!(inverse(&q(&[1, 1, 2, 2]), 2)?, None);
-        assert_eq!(inverse(&q(&[2, 0, 0, 1]), 2)?, Some((vec![half, BigRational::default(), BigRational::default(), BigRational::from_integer(1.into())], BigRational::from_integer(2.into()))));
+        assert_eq!(
+            inverse(&q(&[2, 0, 0, 1]), 2)?,
+            Some((vec![half, BigRational::default(), BigRational::default(), BigRational::from_integer(1.into())], BigRational::from_integer(2.into())))
+        );
         let e = echelon(q(&[1, 2, 3, 2, 4, 7]), [2, 3], 3)?;
         assert_eq!((e.pivots, e.rows), (vec![0, 2], q(&[1, 2, 0, 0, 0, 1])));
         Ok(())

@@ -12,7 +12,8 @@ use rustymath_buffer::py_err;
 pub struct Distribution(pub(crate) dist::Distribution);
 
 /// The common sampler for fresh-seed distribution calls and persistent generators.
-pub(crate) fn sampled<'py>(py: Python<'py>, distribution: dist::Distribution, rng: &mut (impl Rng + Send), size: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn sampled<'py>(
+    py: Python<'py>, distribution: dist::Distribution, rng: &mut (impl Rng + Send), size: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
     let Some(size) = size else { return Ok(PyFloat::new(py, distribution.sample(rng)).into_any()) };
     let shape = crate::create::shape(size)?;
     let n = generated_len(&shape).map_err(py_err)?;
@@ -24,13 +25,22 @@ pub(crate) fn sampled<'py>(py: Python<'py>, distribution: dist::Distribution, rn
 #[pymethods]
 impl Distribution {
     /// The density at each item of `x`, or for a discrete distribution the probability of each.
-    fn pdf<'py>(&self, py: Python<'py>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { let k = dist::Pdf(self.0); kernels!(Unary of k).apply(py, "pdf", &k, convert(&[x])?) }
+    fn pdf<'py>(&self, py: Python<'py>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        let k = dist::Pdf(self.0);
+        kernels!(Unary of k).apply(py, "pdf", &k, convert(&[x])?)
+    }
 
     /// The probability of a value at most each item of `x`.
-    fn cdf<'py>(&self, py: Python<'py>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { let k = dist::Cdf(self.0); kernels!(Unary of k).apply(py, "cdf", &k, convert(&[x])?) }
+    fn cdf<'py>(&self, py: Python<'py>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        let k = dist::Cdf(self.0);
+        kernels!(Unary of k).apply(py, "cdf", &k, convert(&[x])?)
+    }
 
     /// The least value whose `cdf` is at least each item of `p`. A `p` outside 0 to 1 gives NaN.
-    fn quantile<'py>(&self, py: Python<'py>, p: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> { let k = dist::Quantile(self.0); kernels!(Unary of k).apply(py, "quantile", &k, convert(&[p])?) }
+    fn quantile<'py>(&self, py: Python<'py>, p: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        let k = dist::Quantile(self.0);
+        kernels!(Unary of k).apply(py, "quantile", &k, convert(&[p])?)
+    }
 
     /// Values drawn from the distribution: one float with no `size`, or else an array of shape `size`. The same `seed` gives the same values.
     #[pyo3(signature = (size=None, seed=None))]
