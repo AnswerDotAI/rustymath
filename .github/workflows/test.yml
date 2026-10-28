@@ -9,6 +9,7 @@ permissions:
   contents: read
 
 # Every test step after the first runs even when an earlier step fails, to report every test's result in one run.
+# A build step that runs past 10 minutes has stalled. It normally takes about 3.
 jobs:
   test:
     runs-on: ubicloud-standard-4-ubuntu-2604
@@ -26,6 +27,7 @@ jobs:
           python-version: '3.12'
       - run: pip install -e '.[dev]'
       - run: cargo develop
+        timeout-minutes: 10
       # With `RUSTYMATH_COSTS`, the Rust and Python speed tests log every cost, which `basedpl.bpltests.logged_costs` reads.
       - run: RUSTYMATH_COSTS=1 cargo test
       - run: RUSTYMATH_COSTS=1 pytest -q

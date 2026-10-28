@@ -769,7 +769,7 @@ pub(crate) trait Tiled: Scalar + Default + Vendor {
         if m == 0 || n == 0 { return; }
         dispatch!(accelerate::triangular(x, ldx, a, [m, n], side, triangle), factor::triangular_native(x, ldx, a, [m, n], side, triangle))
     }
-    /// `alpha a b` on rustymath's own packed kernels, replacing `c` with `start` and added to it otherwise. Complex items run four real products through `complex_product`.
+    /// `alpha a b` on rustymath's own packed kernels, written over `c` where `start` is true and added to it otherwise. Complex items run four real products through `complex_product`.
     #[cfg(native)]
     fn native_product(c: &mut [Self], ldc: usize, a: Matrix<'_, Self>, alpha: Self, b: Matrix<'_, Self>, size: [usize; 3], start: bool, part: Part);
     /// The thin SVD of the finite, nonempty `m`×`n` matrix `a` as `(U, s, V)`, with its singular vectors only where `vectors` is true, or `None` where it doesn't converge.
@@ -819,6 +819,8 @@ fn contracted<T: Tiled + Element>(op: Mapped<'_, T>, [rows, cols]: [usize; 2], c
 const COLUMN_ROWS: usize = 4096;
 /// The results that [`scaled_runs`] keeps in registers while every column adds into them.
 const COLUMN_STRIP: usize = 32;
+/// The results in each strip that [`scaled_runs`] takes after its strips of [`COLUMN_STRIP`], before it takes one result at a time. The windows of an image 256 items wide leave 30 results in each row after its strips of 32.
+const TAIL_STRIP: usize = 8;
 /// The fewest adjacent rows of `a` that [`by_columns`] reads at once. Shorter runs cost more in loop overhead than gathering saves.
 const COLUMN_RUN: usize = 64;
 
@@ -845,7 +847,7 @@ fn by_columns<T: Tiled + Element>(a: Mapped<'_, T>, b: Mapped<'_, T>, oa: Orient
         while r < first + part.len() {
             let len = (width - r % width).min(COLUMN_ROWS).min(first + part.len() - r);
             // A row whose outer entries give a fill reads only fills, and its result stays 0.
-            if let Some(at) = Steps::reach(*base, rows, r) { scaled_runs(&mut part[r - first..r - first + len], a.data, at, &columns) }
+            if let Some(at) = Steps::reach(*base, rows, r) { scaled_runs(&mut part[r - first..r - first + len], a.data, at, &columns, true) }
             r += len;
         }
         true
@@ -853,19 +855,26 @@ fn by_columns<T: Tiled + Element>(a: Mapped<'_, T>, b: Mapped<'_, T>, oa: Orient
     Some(c)
 }
 
-/// Adds into `out`'s results, for adjacent rows of a matrix whose first row starts at `data[at]` and each next row one item later, the item at each row's start plus each column's offset, times the column's weight, for each of `columns`. A strip of [`COLUMN_STRIP`] results stays in registers while every column adds into it.
-fn scaled_runs<T: Tiled>(out: &mut [T], data: &[T], at: usize, columns: &[(T, usize)]) {
-    let (strips, tail) = out.as_chunks_mut::<COLUMN_STRIP>();
+/// For adjacent rows of a matrix whose first row starts at `data[at]` and each next row one item later, adds to each of `out`'s results the sum over `columns` of each column's weight times the row's item at the column's offset. Where `start` is true, it writes the sums in place of `out`'s results. Strips of [`COLUMN_STRIP`] results, then of [`TAIL_STRIP`], stay in registers while every column adds into them ([`scaled_strips`]). The rest take one result at a time.
+fn scaled_runs<T: Tiled>(out: &mut [T], data: &[T], at: usize, columns: &[(T, usize)], start: bool) {
+    let wide = scaled_strips::<T, COLUMN_STRIP>(out, data, at, columns, start);
+    let done = wide + scaled_strips::<T, TAIL_STRIP>(&mut out[wide..], data, at + wide, columns, start);
+    let at = at + done;
+    for (t, y) in out[done..].iter_mut().enumerate() { *y = columns.iter().fold(if start { T::zero() } else { *y }, |acc, &(w, o)| w.mul_acc(data[at + o + t], acc)) }
+}
+
+/// [`scaled_runs`] for the whole strips of `N` results at the start of `out`, each kept in registers while every column adds into it. Gives how many results the strips hold.
+fn scaled_strips<T: Tiled, const N: usize>(out: &mut [T], data: &[T], at: usize, columns: &[(T, usize)], start: bool) -> usize {
+    let (strips, _) = out.as_chunks_mut::<N>();
     for (s, strip) in strips.iter_mut().enumerate() {
-        let (at, mut acc) = (at + s * COLUMN_STRIP, *strip);
+        let (at, mut acc) = (at + s * N, if start { [T::zero(); N] } else { *strip });
         for &(w, o) in columns {
-            let x = &data[at + o..][..COLUMN_STRIP];
-            for t in 0..COLUMN_STRIP { acc[t] = w.mul_acc(x[t], acc[t]) }
+            let x = &data[at + o..][..N];
+            for t in 0..N { acc[t] = w.mul_acc(x[t], acc[t]) }
         }
         *strip = acc;
     }
-    let at = at + strips.len() * COLUMN_STRIP;
-    for (t, y) in tail.iter_mut().enumerate() { *y = columns.iter().fold(*y, |acc, &(w, o)| w.mul_acc(data[at + o + t], acc)) }
+    strips.len() * N
 }
 
 /// Writes `out`'s results for stored rows `first..` of a matrix whose rows start `ld` items apart in `data`: each the sum of products of its row with `x`. Four rows at a time share each read of `x`, each row in eight running sums, which vectorize and then add pairwise.
@@ -946,7 +955,7 @@ const VECTOR_ROWS: usize = 8;
 #[cfg(native)]
 const VECTOR_PIECE: usize = 2 * THREAD_WORK;
 
-/// `alpha a b`, where `m` or `n` is 1, replacing `c` with `start` and added to it otherwise, as [`Tiled::native_product`] gives it. The packed kernels would pack the whole matrix and pad the vector to a tile. As a matrix times a vector, `a b` or the transpose of `bᵀ aᵀ`, each result is the sum of products of a stored row with the vector ([`dots`]) where the matrix's stored rows run along the contraction. Otherwise the stored rows, scaled by the vector's items, add into a strip of [`VECTOR_STRIP`] results [`VECTOR_ROWS`] rows at a time ([`scaled_runs`]), which reads each block of rows in storage order. The results split across threads, or, where they fit one strip of a transposed matrix, the stored rows do, each piece adding into results of its own. `false` for any other size, and for `Part::Lower`.
+/// `alpha a b`, where `m` or `n` is 1, written over `c` where `start` is true and added to it otherwise, as [`Tiled::native_product`] gives it. The packed kernels would pack the whole matrix and pad the vector to a tile. As a matrix times a vector, `a b` or the transpose of `bᵀ aᵀ`, each result is the sum of products of a stored row with the vector ([`dots`]) where the matrix's stored rows run along the contraction. Otherwise the stored rows, scaled by the vector's items, add into a strip of [`VECTOR_STRIP`] results [`VECTOR_ROWS`] rows at a time ([`scaled_runs`]), which reads each block of rows in storage order. The results split across threads, or, where they fit one strip of a transposed matrix, the stored rows do, each piece adding into results of its own. `false` for any other size, and for `Part::Lower`.
 #[cfg(native)]
 fn by_vector<T: Tiled>(c: &mut [T], ldc: usize, a: Matrix<'_, T>, alpha: T, b: Matrix<'_, T>, [m, k, n]: [usize; 3], start: bool, part: Part) -> bool {
     let (matrix, vector, rows, step) = match (m, n, part) {
@@ -965,12 +974,12 @@ fn by_vector<T: Tiled>(c: &mut [T], ldc: usize, a: Matrix<'_, T>, alpha: T, b: M
         if rows <= VECTOR_STRIP {
             // Results that fit one strip leave each thread a narrow part of every stored row, so the stored rows split instead. Each piece reads its rows whole into results of its own, which add into `y` ([`parallel::summed`]).
             parallel::summed(columns.len(), (VECTOR_PIECE / rows).max(1), &mut y, &mut Vec::new(), &|range, part| {
-                for block in columns[range].chunks(VECTOR_ROWS) { scaled_runs(part, data, 0, block) }
+                for (i, block) in columns[range].chunks(VECTOR_ROWS).enumerate() { scaled_runs(part, data, 0, block, i == 0) }
             });
         } else {
             parallel::split(&mut y, unit, &|first, part| {
                 for (s, strip) in part.chunks_mut(VECTOR_STRIP).enumerate() {
-                    for block in columns.chunks(VECTOR_ROWS) { scaled_runs(strip, data, first + s * VECTOR_STRIP, block) }
+                    for (i, block) in columns.chunks(VECTOR_ROWS).enumerate() { scaled_runs(strip, data, first + s * VECTOR_STRIP, block, i == 0) }
                 }
                 true
             });

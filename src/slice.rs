@@ -488,13 +488,13 @@ pub fn pairs<X: Copy + Sync, Y: Copy + Sync, B: Send>(x: Arg<'_, X>, y: Arg<'_, 
 }
 
 /// [`pairs`], writing into the `n` slots of `out` in place of appending to a vector. It runs [`triples_into`]'s loops with a unit first argument, which go straight to [`each_pair!`]'s.
-#[inline(always)]
+#[inline]
 pub(crate) fn pairs_into<X: Copy, Y: Copy, B>(x: Arg<'_, X>, y: Arg<'_, Y>, n: usize, out: &mut [MaybeUninit<B>], f: impl Fn(X, Y) -> (B, bool)) -> bool {
     triples_into(Arg::One(()), x, y, n, out, #[inline(always)] |(), a, b| f(a, b))
 }
 
 /// [`pairs_into`] for three arguments, which `mapped` runs for a function object of three arguments.
-#[inline(always)]
+#[inline]
 fn triples_into<X: Copy, Y: Copy, Z: Copy, B>(x: Arg<'_, X>, y: Arg<'_, Y>, z: Arg<'_, Z>, n: usize, out: &mut [MaybeUninit<B>], f: impl Fn(X, Y, Z) -> (B, bool)) -> bool {
     let (out, mut ok) = (&mut out[..n], true);
     each_triple!(x, y, z, n, |i, a, b, c| {

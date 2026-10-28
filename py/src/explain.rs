@@ -12,7 +12,7 @@ impl Sink for Store { fn record(&self, event: Record) { self.lock().record(event
 struct RouteEvent { kind: &'static str, route: &'static str, reason: &'static str, calls: usize, items: usize }
 #[pymethods]
 impl RouteEvent {
-    fn __repr__(&self) -> String { format!("{} {}: {} ({} calls, {} items)", self.kind, self.route, self.reason, self.calls, self.items) }
+    fn __repr__(&self) -> String { format!("{} {}{} ({} calls, {} items)", self.kind, self.route, if self.reason.is_empty() { String::new() } else { format!(": {}", self.reason) }, self.calls, self.items) }
 }
 
 #[pyclass(name = "Explanation", module = "rustymath")]
@@ -33,9 +33,14 @@ impl Explanation {
     fn routes(&self) -> Vec<&'static str> { self.store.lock().records.iter().filter(|r| r.kind == EventKind::Taken).map(|r| r.route.name()).collect() }
     #[getter]
     fn records(&self) -> Vec<RouteEvent> { self.store.lock().records.iter().map(|r| RouteEvent { kind: r.kind.name(), route: r.route.name(), reason: r.reason, calls: r.calls, items: r.items }).collect() }
+    /// One line for each record, as its `RouteEvent` displays, or `no route events` where the capture recorded none.
+    fn __repr__(&self) -> String {
+        let records = self.records();
+        if records.is_empty() { "no route events".into() } else { records.iter().map(RouteEvent::__repr__).collect::<Vec<_>>().join("\n") }
+    }
 }
 
-/// Capture route events with `with rm.explain() as report:`. `report.routes` lists routes taken; `report.records` gives their counts, declined optimizations and stopped traces. Captures include every thread and must not overlap, apart from nesting on one thread.
+/// Capture route events with `with rm.explain() as report:`. `report.routes` lists routes taken; `report.records` gives their counts, declined optimizations and stopped traces. A report displays its records, one a line. Captures include every thread and must not overlap, apart from nesting on one thread.
 #[pyfunction]
 fn explain() -> Explanation { Explanation { store: Arc::default(), run: None } }
 
