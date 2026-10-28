@@ -499,11 +499,31 @@ mod lanes {
     }
 }
 
-/// Elsewhere, the folds and scans use `Folds`' defaults. A fold's loop of `Core::maximum` vectorizes, and each step of a scan is one `maxsd` or `minsd` on x86-64.
+/// Elsewhere, the folds and scans use `Folds`' defaults. A fold's loop of `Core::maximum` vectorizes, and each step of a scan is one `maxsd` or `minsd` on x86-64. With AVX2, `ordered_lanes` compares each row of `search::network` as one vector, through `vminps` and `vmaxps` or their `f64` forms, which give what `Core::minimum` and `Core::maximum` give. The default leaves its lanes to LLVM, which vectorizes `f32`'s block of 8 rows of 8 lanes across its rows, with shuffles and spills, and stores each lesser row through a masked store.
 #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
 mod plain {
-    impl super::Folds for f32 {}
-    impl super::Folds for f64 {}
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    use core::arch::x86_64::*;
+    macro_rules! plain {
+        ($($t:ty: $lanes:literal, $load:ident, $min:ident, $max:ident;)+) => {$(
+            impl super::Folds for $t {
+                #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+                #[inline(always)]
+                fn ordered_lanes<const W: usize>(a: [$t; W], c: [$t; W]) -> ([$t; W], [$t; W]) {
+                    const { assert!(W == $lanes) };
+                    // SAFETY: this code compiles only with AVX2, and each row of `$lanes` items is one 256-bit vector. `$min(y, x)` and `$max(x, y)` give `c[j].minimum(a[j])` and `a[j].maximum(c[j])`, as the default does.
+                    unsafe {
+                        let (x, y) = ($load(a.as_ptr()), $load(c.as_ptr()));
+                        (core::mem::transmute_copy(&$min(y, x)), core::mem::transmute_copy(&$max(x, y)))
+                    }
+                }
+            }
+        )+};
+    }
+    plain! {
+        f32: 8, _mm256_loadu_ps, _mm256_min_ps, _mm256_max_ps;
+        f64: 4, _mm256_loadu_pd, _mm256_min_pd, _mm256_max_pd;
+    }
 }
 
 /// The sum of 32-bit integers, wrapped to `i64`, and whether it fits. Sums of up to 2^31 of them fit `i64`, which their running results hold.
