@@ -4,7 +4,7 @@ Rustymath provides fast elementary and special functions, statistics, searching 
 
 The Python package needs no NumPy. Its eager operations use the same broadcasting, selection and tolerant-comparison rules as the shared Rust core. For richer array notation, operators and fusion, use BasedPL.
 
-Float functions target four units in the last place (ulps), with [documented exceptions](accuracy.qmd). Rustymath prioritizes speed over last-bit agreement and reproducibility.
+Float functions give results within four units in the last place (ulps) of the correctly rounded result, apart from [documented exceptions](accuracy.qmd). Rustymath prioritizes speed over last-bit agreement and reproducibility.
 
 [Arrays and indexing](https://answerdotai.github.io/rustymath/arrays.html) covers construction, dtypes, selection, reshaping, axis names, keys and interoperability.
 
@@ -32,10 +32,10 @@ from .linalg import matmul
 from .integer import encode, decode
 from .search import (Unique, unique, index, isin, argsort, lexsort, searchsorted, bins, bincount, counts, group_indices, sort, partition, argpartition,
     argmin, argmax, median, quantile, percentile, union1d, intersect1d, setdiff1d, find)
-from ._core import (__version__, Array, absolute, add, all, angle, any, arccos, arccosh, arcsin, arcsinh, arctan, arctan2, arctanh, array, betainc,
+from ._core import (__version__, Array, absolute, add, all, angle, any, arccos, arccosh, arcsin, arcsinh, arctan, arctan2, arctanh, array, beta, betainc,
     betaincinv, binom, binom_dk, binom_dn, cbrt, ceil, cis, cos, cosh, cumprod, cumsum, digamma, distribution, divide, equal, erf, erfc, erfcinv, erfinv, exp, expm1, factorial, floor,
     gamma, gammainc, gammaincc, gammaincinv, gammaln, gcd, greater, greater_equal, hypot, lambertw, lcm, less, less_equal, log, log10, log1p, log2, logb,
-    loggamma, logical_and, logical_or, logical_scan, logical_xor, logical_xnor, max, maximum, min, minimum, minmax, multiply, not_equal, number_theory, power,
+    loggamma, logical_and, logical_or, logical_scan, logical_xor, logical_xnor, max, maximum, min, minimum, minmax, multiply, not_equal, number_theory, polygamma, power,
     prod, remainder, root, set_threads, sign, sin, sinh, sqrt, sqrt1mx2, sqrt1px2, sqrtx2m1, subtract, sum, tan, tanh, threads, thread_setting, timing, explain)
 from .create import arange, finfo, full, full_like, iinfo, issubdtype, linspace, logspace, ones, ones_like, result_type, zeros, zeros_like
 from ._core import clip, conj, imag, isfinite, isinf, isnan, real, rint, trunc
@@ -45,12 +45,22 @@ from ._core import (argwhere, concatenate, expand_dims, flatten, flip, nonzero, 
     transpose, where, windows)
 from .structure import diag, diagonal, eye, identity, tril, triu, trace, diff, ptp, broadcast_to
 from .signal import correlate, convolve, overlap_add
-from ._naming import _binary_function
+from ._naming import _binary_function, _elementwise_function
 Generator, default_rng = random.Generator, random.default_rng
 
 def accumulate(f, x, axis=None, start=None):
     "Left-to-right running results of a native binary function, along the flattened input or one axis by position/name. A scalar start precedes each lane without adding an output item. Comparisons retain the input's computing dtype, reading each later result as 0 or 1; ordinary arithmetic promotion and overflow rules apply"
     return _core._accumulate(_binary_function(f), x, axis, start)
+
+def value_and_derivative(f, *args):
+    "f at args, with its derivative there: an array for a native function of one argument, and a tuple of its partial derivatives for a native function of two. Each slope reads f's result where its formula needs it, as tanh's slope is 1 - tanh², so f runs once. Any other f raises ValueError, as does a native function with no derivative"
+    function = _elementwise_function(f)
+    value = f(*args)
+    return value, _core._slopes(function, value, *args)
+
+def derivative(f, *args):
+    "f's derivative at args, as `value_and_derivative` gives it"
+    return value_and_derivative(f, *args)[1]
 
 def sliding(f, x, width, axis=-1):
     "Folds of each window of `width` neighbouring items along one axis, by position or name, by a native binary function with an associative reduction: `add`, `multiply`, `maximum`, `minimum` or a logical one. A lane of n items gives n - width + 1 folds, each keyed as the item that starts its window. A fold costs the same for each item whatever the width"

@@ -38,7 +38,7 @@ macro_rules! characters {
 }
 
 macro_rules! rules {
-    (() folds $folds:tt booleans $booleans:tt comparisons { $($comparison:path => [$($cbpl:tt)*];)* } characters { $($rule:ident: $object:path [$($new:tt)*] => [$($bpl:tt)*];)* } products $products:tt boolean_products $boolean_products:tt) => {
+    (() folds $folds:tt booleans $booleans:tt comparisons { $($comparison:path => [$($cbpl:tt)*];)* } characters { $($rule:ident: $object:path [$($new:tt)*] => [$($bpl:tt)*];)* } products $products:tt boolean_products $boolean_products:tt identities $identities:tt) => {
         $(impl Characters for $comparison { const RULE: Rule = Rule::Ordered; })*
         $(impl Characters for $object { const RULE: Rule = Rule::$rule; })*
     };

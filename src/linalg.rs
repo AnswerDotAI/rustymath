@@ -11,7 +11,7 @@ use crate::{
 };
 use num_complex::Complex;
 use num_traits::{One, Zero};
-use std::{mem::MaybeUninit, sync::LazyLock};
+use std::{borrow::Cow, mem::MaybeUninit, sync::LazyLock};
 
 #[cfg(accelerate)]
 mod accelerate;
@@ -788,6 +788,7 @@ fn gemm<T: Tiled>(c: &mut [T], ldc: usize, a: Matrix<'_, T>, b: Matrix<'_, T>, [
     Matrix::rows(c, ldc).check(m, n);
     if m == 0 || n == 0 { return; }
     if k == 0 || alpha == T::zero() { return scale(c, ldc, [m, n], beta, part); }
+    if by_vector(c, ldc, a, alpha, b, [m, k, n], beta, part) { return; }
     dispatch!(accelerate::product(c, ldc, a, b, [m, k, n], alpha, beta, part), native_gemm(c, ldc, a, b, [m, k, n], alpha, beta, part))
 }
 
@@ -884,7 +885,6 @@ fn scaled_strips<T: Tiled, const N: usize>(out: &mut [T], data: &[T], at: usize,
 }
 
 /// Writes `out`'s results for stored rows `first..` of a matrix whose rows start `ld` items apart in `data`: each the sum of products of its row with `x`. Four rows at a time share each read of `x`, each row in eight running sums, which vectorize and then add pairwise.
-#[cfg(native)]
 fn dots<T: Tiled>(out: &mut [T], data: &[T], ld: usize, first: usize, x: &[T]) {
     let k = x.len();
     let (quads, tail) = out.as_chunks_mut::<4>();
@@ -899,6 +899,47 @@ fn dots<T: Tiled>(out: &mut [T], data: &[T], ld: usize, first: usize, x: &[T]) {
     }
     let first = first + 4 * quads.len();
     for (i, y) in tail.iter_mut().enumerate() { *y = factor::dot(&data[(first + i) * ld..][..k], x) }
+}
+
+/// The most items in the stored rows of a matrix that [`by_vector`] takes where Accelerate serves the process. Accelerate pays a fixed cost for each stored row. [`narrow_sums`] takes up to this many results, and [`narrow_dots`] stored rows of up to this many items.
+const NARROW: usize = 8;
+
+/// [`dots`] for stored rows of `K` items, at most [`NARROW`], where `x` holds as many. Each row's products add into two running sums. Each pair of rows then adds its sums pairwise into both results in one vector step.
+fn narrow_dots<T: Tiled, const K: usize>(out: &mut [T], data: &[T], ld: usize, first: usize, x: &[T]) {
+    let x: &[T; K] = x.try_into().expect("`x` must hold `K` items");
+    let sums = |i: usize| {
+        let a = &data[i * ld..][..K];
+        let mut s = [T::zero(); 2];
+        for l in 0..K { s[l % 2] = a[l].mul_acc(x[l], s[l % 2]) }
+        s
+    };
+    let last = first + out.len().saturating_sub(1);
+    let (pairs, odd) = out.as_chunks_mut::<2>();
+    for (p, pair) in pairs.iter_mut().enumerate() {
+        let (s, t) = (sums(first + 2 * p), sums(first + 2 * p + 1));
+        *pair = [s[0] + s[1], t[0] + t[1]];
+    }
+    if let [y] = odd { let s = sums(last); *y = s[0] + s[1] }
+}
+
+/// Writes each of `out`'s results, at most [`NARROW`], as the sum over the stored rows of `data`, which start `ld` items apart, of the row's item in `w` times its item at the result's position: a vector times the matrix whose columns those rows hold. Every sum stays in registers across all the rows, in four sets that each take every fourth row. A row's multiply-adds therefore don't wait on the row before. Each row adds [`NARROW`] items at once into its set, and the items past the results, which belong to the next row, reach no result. The last rows, whose [`NARROW`] items would pass the end of `data`, add one result at a time.
+fn narrow_sums<T: Tiled>(out: &mut [T], data: &[T], ld: usize, w: &[T]) {
+    let n = out.len();
+    let whole = if data.len() < NARROW { 0 } else { ((data.len() - NARROW) / ld.max(1) + 1).min(w.len()) };
+    let mut acc = [[T::zero(); NARROW]; 4];
+    let (quads, rest) = w[..whole].as_chunks::<4>();
+    for (q, ws) in quads.iter().enumerate() {
+        for s in 0..4 {
+            let a = &data[(4 * q + s) * ld..][..NARROW];
+            for t in 0..NARROW { acc[s][t] = a[t].mul_acc(ws[s], acc[s][t]) }
+        }
+    }
+    for (p, &wp) in rest.iter().enumerate() {
+        let a = &data[(4 * quads.len() + p) * ld..][..NARROW];
+        for t in 0..NARROW { acc[0][t] = a[t].mul_acc(wp, acc[0][t]) }
+    }
+    for (p, &wp) in w.iter().enumerate().skip(whole) { for t in 0..n { acc[0][t] = data[p * ld + t].mul_acc(wp, acc[0][t]) } }
+    for (t, y) in out.iter_mut().enumerate() { *y = (acc[0][t] + acc[2][t]) + (acc[1][t] + acc[3][t]) }
 }
 
 /// `+.×` of mapped operands on the tiled kernels, for [`Inner::inner_mapped`]. An operand whose mapping reads it at positive strides, one of them 1, is used where it lies, row by row or as a transpose. Any other operand is read a block of its stored rows at a time, and each block's product goes straight into the result. Where `a`'s stored rows are the result's rows, and the product runs on one thread or `b` has at most [`PIECE_MATRIX`] items, the result's rows split into one piece for each thread. Each thread multiplies its piece's rows itself, reading them in blocks that hold at least [`BLOCK_ITEMS`] items and at least as many as `b`. Otherwise an operand of up to [`WHOLE_ITEMS`] items is read whole, and a larger one in blocks of at least that many. Each block is gathered across threads and multiplied in one threaded call. Rows along the contraction add into the whole result, as [`contracted`] reads them. Blocks of the result's columns hold at least as many items as the result. Where neither operand can be used where it lies, `b` is read whole. A vector `b` beside an `a` whose rows are adjacent in storage goes to [`by_columns`], which reads `a` where it lies. Reading an operand larger than the result through its map, by blocks or by columns, records the route `mapped product`.
@@ -956,62 +997,72 @@ fn scale<T: Tiled>(c: &mut [T], ldc: usize, [m, n]: [usize; 2], beta: T, part: P
 }
 
 /// The multiply-adds in each unit of [`by_vector`]'s split across threads. `parallel::split` times the first unit to choose the pieces.
-#[cfg(native)]
 const VECTOR_WORK: usize = 1 << 15;
 /// The results that [`by_vector`] keeps in the first-level cache while the stored rows of a transposed matrix add into them.
-#[cfg(native)]
 const VECTOR_STRIP: usize = 2048;
 /// The stored rows of a transposed matrix that [`by_vector`] adds into its results together, read side by side in storage order.
-#[cfg(native)]
 const VECTOR_ROWS: usize = 8;
 /// The fewest multiply-adds in each piece of [`by_vector`]'s split of stored rows across threads: twice what waking one more thread costs ([`THREAD_WORK`]), so that every split gains. At 4 threads on an M5 Max, a split cost about 10 to 12 µs whether it made two pieces or four, and pieces of 2^15 to 2^17 made a vector times a matrix of 1024 columns up to 76% slower than one piece where their work came to less than that. With pieces of 2^18, 128 and 256 rows ran as one piece, and 512 and 1024 rows ran 20 and 28% faster than before in two and four pieces.
-#[cfg(native)]
 const VECTOR_PIECE: usize = 2 * THREAD_WORK;
 
-/// `alpha a b`, where `m` or `n` is 1, written over `c` where `start` is true and added to it otherwise, as [`Tiled::native_product`] gives it. The packed kernels would pack the whole matrix and pad the vector to a tile. As a matrix times a vector, `a b` or the transpose of `bᵀ aᵀ`, each result is the sum of products of a stored row with the vector ([`dots`]) where the matrix's stored rows run along the contraction. Otherwise the stored rows, scaled by the vector's items, add into a strip of [`VECTOR_STRIP`] results [`VECTOR_ROWS`] rows at a time ([`scaled_runs`]), which reads each block of rows in storage order. The results split across threads, or, where they fit one strip of a transposed matrix, the stored rows do, each piece adding into results of its own. `false` for any other size, and for `Part::Lower`.
-#[cfg(native)]
-fn by_vector<T: Tiled>(c: &mut [T], ldc: usize, a: Matrix<'_, T>, alpha: T, b: Matrix<'_, T>, [m, k, n]: [usize; 3], start: bool, part: Part) -> bool {
+/// `alpha a b + beta c`, where `m` or `n` is 1, for a nonzero `k` and `alpha`. The packed kernels would pack the whole matrix and pad the vector to a tile. As a matrix times a vector, `a b` or the transpose of `bᵀ aᵀ`, each result is the sum of products of a stored row with the vector where the matrix's stored rows run along the contraction: [`narrow_dots`] for stored rows of up to [`NARROW`] items, and [`dots`] for longer ones. Otherwise each result reads one item of every stored row. At most [`NARROW`] results keep their sums in registers across every stored row ([`narrow_sums`]). More results take strips of [`VECTOR_STRIP`]. [`scaled_runs`] adds [`VECTOR_ROWS`] stored rows at a time into each strip, in storage order. The results split across threads, or, where they fit one strip of a transposed matrix, the stored rows do, each piece adding into results of its own. The vector is read where it lies where its items are adjacent and need no conjugate, and the results are written straight into `c` where they need no scaling, conjugate or step. `false` for any other size and for `Part::Lower`. Accelerate multiplies longer stored rows faster: where it serves the process, `by_vector` gives `false` for stored rows of more than [`NARROW`] items.
+fn by_vector<T: Tiled>(c: &mut [T], ldc: usize, a: Matrix<'_, T>, alpha: T, b: Matrix<'_, T>, [m, k, n]: [usize; 3], beta: T, part: Part) -> bool {
     let (matrix, vector, rows, step) = match (m, n, part) {
         (_, 1, Part::Whole) => (a, b.transpose(), m, ldc), (1, _, Part::Whole) => (b.transpose(), a, n, 1), _ => return false
     };
+    let narrow = if matrix.op.transposed() { rows } else { k } <= NARROW;
+    if accelerated() && !narrow { return false; }
     // A conjugated matrix's results are the conjugates of its stored items' results with the conjugated vector.
     let conj = matches!(matrix.op, Op::Adjoint | Op::Conjugate);
-    let x: Vec<T> = (0..k).map(|p| if conj { vector.at(0, p).conj() } else { vector.at(0, p) }).collect();
+    let flip = T::COMPLEX && conj != matches!(vector.op, Op::Adjoint | Op::Conjugate);
+    let stride = if vector.op.transposed() { vector.ld } else { 1 };
+    let x: Cow<'_, [T]> = if stride == 1 && !flip { Cow::Borrowed(&vector.data[..k]) }
+        else { (0..k).map(|p| if flip { vector.data[p * stride].conj() } else { vector.data[p * stride] }).collect() };
     let (data, ld, unit) = (matrix.data, matrix.ld, (VECTOR_WORK / k).max(1).next_multiple_of(4));
-    let mut y = filled(rows, T::zero());
+    let (one, start) = (alpha == T::one(), beta == T::zero());
+    let direct = step == 1 && one && start && !conj;
+    let mut kept = if direct { Vec::new() } else { filled(rows, T::zero()) };
+    let y = if direct { &mut c[..rows] } else { &mut kept[..] };
     if matrix.op.transposed() {
-        // Stored row `p` holds the matrix's column `p`, so the matrix's row `i` starts at `data[i]`. A strip of results takes the stored rows a block at a time, reading the block's rows side by side in storage order.
-        let columns: Vec<(T, usize)> = x.iter().enumerate().map(|(p, &w)| (w, p * ld)).collect();
-        if rows <= VECTOR_STRIP {
-            // Results that fit one strip leave each thread a narrow part of every stored row, so the stored rows split instead. Each piece reads its rows whole into results of its own, which add into `y` ([`parallel::summed`]).
-            parallel::summed(columns.len(), (VECTOR_PIECE / rows).max(1), &mut y, &mut Vec::new(), &|range, part| {
-                for (i, block) in columns[range].chunks(VECTOR_ROWS).enumerate() { scaled_runs(part, data, 0, block, i == 0) }
-            });
+        // Stored row `p` holds the matrix's column `p`, so the matrix's row `i` starts at `data[i]`. Results that fit one strip leave each thread a narrow part of every stored row, so the stored rows split instead. Each piece writes its rows' sums into results of its own, which add into `y` ([`parallel::summed`]).
+        let piece = (VECTOR_PIECE / rows).max(1);
+        if narrow {
+            parallel::summed(k, piece, y, &mut Vec::new(), &|range, part| narrow_sums(part, &data[range.start * ld..], ld, &x[range]));
         } else {
-            parallel::split(&mut y, unit, &|first, part| {
-                for (s, strip) in part.chunks_mut(VECTOR_STRIP).enumerate() {
-                    for (i, block) in columns.chunks(VECTOR_ROWS).enumerate() { scaled_runs(strip, data, first + s * VECTOR_STRIP, block, i == 0) }
-                }
-                true
-            });
+            let columns: Vec<(T, usize)> = x.iter().enumerate().map(|(p, &w)| (w, p * ld)).collect();
+            if rows <= VECTOR_STRIP {
+                parallel::summed(columns.len(), piece, y, &mut Vec::new(), &|range, part| {
+                    for (i, block) in columns[range].chunks(VECTOR_ROWS).enumerate() { scaled_runs(part, data, 0, block, i == 0) }
+                });
+            } else {
+                parallel::split(y, unit, &|first, part| {
+                    for (s, strip) in part.chunks_mut(VECTOR_STRIP).enumerate() {
+                        for (i, block) in columns.chunks(VECTOR_ROWS).enumerate() { scaled_runs(strip, data, first + s * VECTOR_STRIP, block, i == 0) }
+                    }
+                    true
+                });
+            }
         }
-    } else { parallel::split(&mut y, unit, &|first, part| { dots(part, data, ld, first, &x); true }); }
+    } else {
+        let dots = match k { 1 => narrow_dots::<T, 1>, 2 => narrow_dots::<T, 2>, 3 => narrow_dots::<T, 3>, 4 => narrow_dots::<T, 4>, 5 => narrow_dots::<T, 5>, 6 => narrow_dots::<T, 6>, 7 => narrow_dots::<T, 7>, 8 => narrow_dots::<T, 8>, _ => dots::<T> };
+        parallel::split(y, unit, &|first, part| { dots(part, data, ld, first, &x); true });
+    }
+    if direct { return true; }
     // As the packed kernels do, `alpha` scales only where it isn't 1, which keeps a complex result's infinite part from making NaN.
-    let one = alpha == T::one();
-    for (i, y) in y.into_iter().enumerate() {
+    for (i, &y) in kept.iter().enumerate() {
         let y = if conj { y.conj() } else { y };
         let (y, z) = (if one { y } else { alpha * y }, &mut c[i * step]);
-        *z = if start { y } else { *z + y };
+        *z = if start { y } else { beta.mul_acc(*z, y) };
     }
     true
 }
 
-/// `gemm` on rustymath's own kernels, for a nonzero `k` and `alpha`: [`by_vector`] for a product with a vector, and the packed kernels otherwise.
+/// `gemm` on rustymath's own packed kernels, for a nonzero `k` and `alpha`.
 #[cfg(native)]
 fn native_gemm<T: Tiled>(c: &mut [T], ldc: usize, a: Matrix<'_, T>, b: Matrix<'_, T>, [m, k, n]: [usize; 3], alpha: T, beta: T, part: Part) {
     let start = beta == T::zero();
     if !start { scale(c, ldc, [m, n], beta, part) }
-    if !by_vector(c, ldc, a, alpha, b, [m, k, n], start, part) { T::native_product(c, ldc, a, alpha, b, [m, k, n], start, part) }
+    T::native_product(c, ldc, a, alpha, b, [m, k, n], start, part)
 }
 /// The items of a product's result that it must fold: all of them, or those on and below its diagonal.
 #[derive(Clone, Copy)]
@@ -1334,11 +1385,12 @@ fn product<T: Copy + Default + Send + Sync, P: Pair<T>, const MR: usize, const N
                                     let bj = &bp[jr / NR * unit + step * NR * KC..][..NR * kc];
                                     if lower && ic + ir + MR.min(mc - ir) <= jc + jr { continue; }
                                     let (rows, cols) = (MR.min(mc - ir), NR.min(nc - jr));
-                                    let at = |r: usize, s: usize| (ic - i0 + ir + r) * ldc + jc + jr + s;
+                                    let at = |r: usize| (ic - i0 + ir + r) * ldc + jc + jr;
                                     let mut t = [[P::UNIT; NR]; MR];
-                                    if load { for r in 0..rows { for s in 0..cols { t[r][s] = band[at(r, s)] } } }
+                                    // A whole row moves as one run of `NR` items, which compiles to vector moves. Item by item, each move compiles to a scalar load, a store and a bounds check.
+                                    if load { for r in 0..rows { if cols == NR { t[r].copy_from_slice(&band[at(r)..][..NR]) } else { for s in 0..cols { t[r][s] = band[at(r) + s] } } } }
                                     kernel(&ap[ir * kc..(ir + MR) * kc], bj, &mut t, !load);
-                                    for r in 0..rows { for s in 0..cols { band[at(r, s)] = t[r][s] } }
+                                    for r in 0..rows { if cols == NR { band[at(r)..][..NR].copy_from_slice(&t[r]) } else { for s in 0..cols { band[at(r) + s] = t[r][s] } } }
                                 }
                             }
                         }

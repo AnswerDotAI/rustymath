@@ -14,6 +14,8 @@ macro_rules! in_f64 {
 
 in_f64! {
     digamma(x) = digamma64;
+    polygamma(n, x) = polygamma64;
+    beta(a, b) = beta64;
     binom_dn(n, k) = binom_dn64;
     binom_dk(n, k) = binom_dk64;
     gammaincinv(a, p) = gammaincinv64;
@@ -88,15 +90,28 @@ fn gamma_args(n: f64, k: f64) -> (Double<f64>, Double<f64>, Double<f64>) {
     (Double::sum(n, 1.0), Double::sum(k, 1.0), Double::sum(n, -k).plus(Double::new(1.0, 0.0)).normalize())
 }
 
-/// C(n, k) for real n and k as Γ(n + 1)/(Γ(k + 1) Γ(n - k + 1)), on exact double-word arguments. Each Γ below 1/2 reflects (`reflection`), so each factor gives ±ln Γ(z) for some z from 1/2 up, a sign, and a logarithm of π/|sin πx|. One positive and one negative ln Γ with arguments from 10 up, the closest such pair, are taken as one difference (`lgamma_gap`), which keeps the result's relative accuracy for large n. A pole of Γ(k + 1) or Γ(n - k + 1) gives 0, and a pole of Γ(n + 1) gives NaN. An infinite k with a finite n gives 0, and an infinite n gives NaN.
+/// C(n, k) for real n and k as Γ(n + 1)/(Γ(k + 1) Γ(n - k + 1)), through `gamma_ratio` on exact double-word arguments. An infinite k with a finite n gives 0, and an infinite n gives NaN.
 fn binom_real<const FUSED: bool>(n: f64, k: f64) -> f64 {
     if !(n.is_finite() && k.is_finite()) { return if n.is_finite() && k.is_infinite() { 0.0 } else { f64::NAN }; }
     let (a, b, c) = gamma_args(n, k);
+    gamma_ratio::<FUSED>([(a, true), (b, false), (c, false)])
+}
+
+/// B(a, b) = Γ(a) Γ(b)/Γ(a + b), through `gamma_ratio` on exact double-word arguments. An infinite argument beside a finite positive one gives 0, and other infinities give NaN.
+fn beta64<const FUSED: bool>(a: f64, b: f64) -> f64 {
+    if !(a.is_finite() && b.is_finite()) {
+        let vanishes = |x: f64, y: f64| x == f64::INFINITY && y.is_finite() && y > 0.0;
+        return if vanishes(a, b) || vanishes(b, a) { 0.0 } else { f64::NAN };
+    }
+    gamma_ratio::<FUSED>([(Double::new(a, 0.0), true), (Double::new(b, 0.0), true), (Double::sum(a, b), false)])
+}
+
+/// The product of each term's Γ where it multiplies (`true`) and of its 1/Γ where it divides, for exact double-word arguments. Each Γ below 1/2 reflects (`reflection`), so each factor gives ±ln Γ(z) for some z from 1/2 up, a sign, and a logarithm of π/|sin πx|. One positive and one negative ln Γ with arguments from 10 up, the closest such pair, are taken as one difference (`lgamma_gap`), which keeps the result's relative accuracy for large arguments. A pole of a Γ that multiplies gives NaN, and a pole of one that divides gives 0.
+fn gamma_ratio<const FUSED: bool>(mut terms: [(Double<f64>, bool); 3]) -> f64 {
     let pole = |y: Double<f64>| y.hi <= 0.0 && y.hi.fract() == 0.0 && y.lo.fract() == 0.0;
-    if pole(a) { return f64::NAN; }
-    if pole(b) || pole(c) { return 0.0; }
+    if terms.iter().any(|&(y, up)| up && pole(y)) { return f64::NAN; }
+    if terms.iter().any(|&(y, up)| !up && pole(y)) { return 0.0; }
     let (mut sign, mut log) = (1.0, Double::new(0.0, 0.0));
-    let mut terms = [(a, true), (b, false), (c, false)];
     for t in &mut terms {
         if t.0.hi < 0.5 {
             let (z, l, s) = reflection::<FUSED>(t.0);
@@ -338,6 +353,42 @@ fn digamma64<const FUSED: bool>(x: f64) -> f64 {
     for k in 0..n as u32 { lifted = lifted.plus(Double::new(1.0, 0.0).div::<FUSED>(Double::sum(x, k as f64))); }
     let r = psi_series::<FUSED>(Double::sum(x, n)).plus(-lifted);
     r.hi + r.lo
+}
+
+/// ψ⁽ⁿ⁾'s asymptotic series after its two leading terms: B_2k/(2k)! for k from 1 to 8. Each term multiplies its coefficient by the rising factorial n(n + 1)…(n + 2k - 1).
+const POLYGAMMA_SERIES: [f64; 8] =
+    [1.0 / 12.0, -1.0 / 720.0, 1.0 / 30240.0, -1.0 / 1209600.0, 1.0 / 47900160.0, -691.0 / 1307674368000.0, 1.0 / 74724249600.0, -3617.0 / 10670622842880000.0];
+
+/// ψ⁽ⁿ⁾(x), the nth derivative of ψ, for a whole n from 1 to 170 and an x above 0: (-1)^(n+1) n! Σ 1/(x + k)^(n+1) over k from 0. The sum's first terms lift x to z = x + m of at least 15 + 2n, where the asymptotic series ψ⁽ⁿ⁾(z) ≈ (-1)^(n+1) ((n-1)!/zⁿ) (1 + n/(2z) + Σ B_2k n(n + 1)…(n + 2k - 1)/((2k)! z^2k)) gives the rest. Every term has one sign, so the double-word sum keeps the result's digits. n = 0 gives ψ. x from 0 down, a fractional or negative n, an n above 170, whose (n - 1)! overflows, and NaN give NaN.
+fn polygamma64<const FUSED: bool>(n: f64, x: f64) -> f64 {
+    if n == 0.0 { return digamma64::<FUSED>(x); }
+    if !(n > 0.0 && n <= 170.0 && n == n.trunc() && x > 0.0) { return f64::NAN; }
+    let odd = n % 2.0 == 1.0;
+    if x == f64::INFINITY { return if odd { 0.0 } else { -0.0 }; }
+    // y^-e for an exact double word y and a whole e: y.hi^e by exact products, times 1 + e y.lo/y.hi for y's low word.
+    let inverse_power = |y: Double<f64>, e: f64| {
+        let mut p = Double::new(y.hi, 0.0);
+        for _ in 1..e as u32 { p = p.mul_float::<FUSED>(y.hi); }
+        Double::new(1.0, 0.0).div::<FUSED>(p.plus(p.mul_float::<FUSED>(e * y.lo / y.hi)))
+    };
+    let m = (15.0 + 2.0 * n - x).ceil().max(0.0);
+    let mut lifted = Double::new(0.0, 0.0);
+    for k in (0..m as u32).rev() { lifted = lifted.plus(inverse_power(Double::sum(x, k as f64), n + 1.0)); }
+    let z = Double::sum(x, m);
+    let w = 1.0 / (z.hi * z.hi);
+    let (mut rising, mut tail) = (1.0, [0.0; 8]);
+    for (k, c) in POLYGAMMA_SERIES.into_iter().enumerate() {
+        let j = 2.0 * k as f64;
+        rising *= (n + j) * (n + j + 1.0);
+        tail[7 - k] = c * rising;
+    }
+    let series = Double::sum(1.0, n / (2.0 * z.hi)).plus(Double::new(w * horner::<f64, FUSED, 8>(w, tail), 0.0));
+    let leading = inverse_power(z, n);
+    let total = lifted.mul_float::<FUSED>(n).plus(leading.mul_float::<FUSED>(series.hi).plus(Double::new(leading.hi * series.lo, 0.0)));
+    let r = total.mul_float::<FUSED>((1..n as u32).fold(1.0, |f, i| f * i as f64));
+    // An overflowing sum leaves NaN in the low word, so an infinite high word stands alone.
+    let r = if r.hi.is_finite() { r.hi + r.lo } else { r.hi };
+    if odd { r } else { -r }
 }
 
 /// ∂C(n, k)/∂n and ∂C(n, k)/∂k. For a whole k up to `FALLING_STEPS`, the slope in n is the falling factorial's, by the product rule (`falling`), and the slope in k is C(n, k) times ψ(n - k + 1) - ψ(k + 1). Other arguments take C(n, k) times ψ(n + 1) - ψ(n - k + 1), and times ψ(n - k + 1) - ψ(k + 1), each difference through `psi_gap` where both arguments are from 10 up. A whole n below a whole k from 0 puts those ψ at a pole, where C(n, k) is the polynomial n(n - 1)…(n - k + 1)/k! in n, with a finite slope.

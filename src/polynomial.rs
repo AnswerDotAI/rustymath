@@ -129,7 +129,7 @@ pub(crate) fn encoded<B, T: Clone + Zero>(bases: &[B], values: &[T], div_mod: im
 /// The polynomial of degree `degree` that fits the points `(x[i], y[i])` by least squares, which [`lstsq`](crate::linalg::lstsq) solves in f64. Where fewer than `degree + 1` distinct points fix the polynomial, it's the fit whose coefficients have the least norm. Panics if `x` and `y` differ in length.
 pub fn fit<F: Float>(x: &[F], y: &[F], degree: usize) -> Vec<F> {
     assert_eq!(x.len(), y.len(), "fit needs one y for each x");
-    let powers: Vec<f64> = x.iter().flat_map(|x| (0..=degree).map(move |j| x.wide().powi(j as i32))).collect();
+    let powers: Vec<f64> = x.iter().flat_map(|x| { let x = x.wide(); std::iter::successors(Some(1.0), move |p| Some(p * x)).take(degree + 1) }).collect();
     let y: Vec<f64> = y.iter().map(|y| y.wide()).collect();
     crate::linalg::lstsq(&powers, &y, [x.len(), degree + 1], 1).0.into_iter().map(F::narrow).collect()
 }

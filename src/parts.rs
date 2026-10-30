@@ -13,7 +13,11 @@ pub struct Sign;
 pub struct Angle;
 
 forms!(Abs at real: |_, [x]| Total(x.abs()));
-forms!(#[inline] Sign at real: |_, [x]| Total(if x == 0.0 { x } else { x.signum() }));
+forms!(#[inline] Sign at real: |_, [x]| Total(sign(x)));
+
+/// `recipe::sign` on one float.
+#[inline(always)]
+fn sign<F: crate::Float>(x: F) -> F { crate::recipe::sign::<F, _>(&crate::recipe::Floats, x) }
 forms!(Angle at real: |_, [x]| Total(crate::arc::real_angle(x)));
 
 macro_rules! objects {

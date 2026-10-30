@@ -12,13 +12,14 @@ pub mod characters;
 mod complex;
 pub mod convert;
 pub mod create;
+pub mod derivative;
 mod dd;
 pub mod distribution;
 pub mod error;
 pub mod events;
 pub mod exact;
 mod exp;
-mod facts;
+pub mod facts;
 mod field;
 mod float;
 pub mod gather;
@@ -39,6 +40,7 @@ mod parts;
 pub mod polynomial;
 mod pow;
 pub mod random;
+pub mod recipe;
 pub mod reduce;
 pub mod search;
 pub mod signal;
@@ -62,7 +64,7 @@ pub use exp::{Exp, Expm1};
 pub use float::{FUSED, Float, Native};
 pub use ln::{Ln, Log1p, Log2, Log10, Logb, MathishLogb};
 pub use parts::{Abs, Angle, Choose, Clip, Conj, Imag, Isfinite, Isinf, Isnan, Real, Rint, Round, Scale, Sign, Trunc};
-pub use pow::{Pow, Root, WholePow, WrappingPow};
+pub use pow::{Exponent, Pow, Root, WholePow, WrappingPow};
 pub use slice::{Arg, Binary, CHUNK, Flipped, Forms, KernelItem, Results, Ternary, Unary, Wrapped, choose, pairs};
 pub use special::{Erfc, Erfcinv, Erfinv};
 pub use sqrts::Sqrt;
@@ -73,7 +75,7 @@ pub use {half, num_complex};
 /// How many items a function handles between checks for an interrupt ([`interrupt::check`]), which keeps the check out of the loop over items.
 pub const BETWEEN_CHECKS: usize = 1024;
 
-/// Declares each function at the crate root, where it multiplies and adds as the target's `FUSED` says, and in `fused` and `unfused`, which choose for themselves. Each entry names the module whose function of the same name implements it, generic over `R: Native` and `const FUSED: bool`. Every wrapper is `#[inline(always)]`, because LLVM leaves a large function such as `gamma` out of line in a caller's loop, and the call stops that loop vectorizing. An entry marked `as` also declares a function object of that name, whose forms rustymath compiles and never inlines into a caller. Its scalar form calls the function, and its slice form runs the function on each item. An entry marked `: total` never gives NaN from arguments that aren't NaN. Its object's body gives a [`Total`](slice::Total) output, and the object's slice loop tests no item. An object with forms of its own, such as [`Pow`], is written with `forms!` beside its function.
+/// Declares each function at the crate root, where it multiplies and adds as the target's `FUSED` says, and in `fused` and `unfused`, which choose for themselves. Each entry names the module whose function of the same name implements it, generic over `R: Native` and `const FUSED: bool`. Every wrapper is `#[inline(always)]`, because LLVM leaves a large function such as `gamma` out of line in a caller's loop, and the call stops that loop vectorizing. An entry marked `as` also declares a function object of that name, whose forms rustymath compiles and never inlines into a caller. Its scalar form calls the function, and its slice form runs the function on each item. An entry marked `: total` never gives NaN from arguments that aren't NaN. Its object's body gives a [`Total`](slice::Total) output, and the object's slice loop tests no item. An object with forms of its own, such as [`Pow`], is written with `forms!` beside its function. `function_doc!(ln)` gives an entry's doc by its name. The Python package's functions take their docs from it.
 macro_rules! functions {
     ($($(#[doc = $doc:literal])* $name:ident($($x:ident),+) in $module:ident $(as $object:ident $(: $outcome:ident)?)?;)+) => {
         $(
@@ -82,6 +84,11 @@ macro_rules! functions {
             pub fn $name<F: Float>($($x: F),+) -> F { functions!(@call FUSED, $module, $name, ($($x),+)) }
         )+
         $(functions!(@object $($object $(: $outcome)?)?; $name, $module, ($($x),+));)+
+        /// Each function's doc by its name, as `function_doc!(ln)`, with its lines joined by newlines.
+        #[macro_export]
+        macro_rules! function_doc {
+            $(($name) => { concat!($($doc, "\n"),*) };)+
+        }
         /// rustymath's functions with `mla` fused, whatever the target's `FUSED`. Code compiled with FMA enabled for itself, such as an AVX2 version of a loop chosen when the program runs, calls these on a target whose baseline lacks FMA.
         pub mod fused {
             use crate::Float;
@@ -118,7 +125,7 @@ functions! {
     exp(x) in exp;
     /// e^x - 1, without the loss of digits near 0 that `exp(x) - 1` has.
     expm1(x) in exp;
-    /// The natural logarithm of x. `ln(0)` is -∞, `ln(∞)` is ∞, and a negative x or NaN gives NaN.
+    /// The natural logarithm of x. `ln(0)` is -∞, `ln(∞)` is ∞, and a negative real x or NaN gives NaN.
     ln(x) in ln;
     /// ln(1 + x), without the loss of digits near 0 that `ln(1 + x)` has. `log1p(-1)` is -∞.
     log1p(x) in ln;
@@ -128,19 +135,19 @@ functions! {
     log10(x) in ln;
     /// The logarithm of x to base b, ln x / ln b. Base 2 and base 10 take `log2` and `log10`, which are exact at powers of their base.
     logb(b, x) in ln;
-    /// sin x. `sin(±0)` is ±0, and `sin(±∞)` and `sin(NaN)` are NaN. Beyond a magnitude of 2^23 at f64 or 2^20 at f32, x takes an exact reduction, which is slower and has a branch. A loop that calls `sin` therefore doesn't vectorize. [`Sin`]'s slice form does: it reduces every item the fast way, then gives only the rare large ones the exact reduction.
+    /// sin x. `sin(±0)` is ±0, and `sin(±∞)` and `sin(NaN)` are NaN. Beyond a magnitude of 2^23 at f64 or 2^20 at f32, x takes a slower, exact reduction.
     sin(x) in trig;
     /// cos x. `cos(±0)` is 1, and `cos(±∞)` and `cos(NaN)` are NaN. Beyond the magnitude that `sin` gives, x takes the same exact reduction.
     cos(x) in trig;
     /// tan x. `tan(±0)` is ±0, and `tan(±∞)` and `tan(NaN)` are NaN. Beyond the magnitude that `sin` gives, x takes the same exact reduction.
     tan(x) in trig;
-    /// asin x, from -π/2 to π/2. A magnitude beyond 1 gives NaN.
+    /// asin x. A real x gives a result from -π/2 to π/2 and NaN beyond a magnitude of 1.
     asin(x) in arc as Asin;
-    /// acos x, from 0 to π. A magnitude beyond 1 gives NaN.
+    /// acos x. A real x gives a result from 0 to π and NaN beyond a magnitude of 1.
     acos(x) in arc as Acos;
-    /// atan x, from -π/2 to π/2.
+    /// atan x. A real x gives a result from -π/2 to π/2.
     atan(x) in arc as Atan: total;
-    /// The angle of the point (x, y) from the positive x axis, from -π to π, with y first as in `f64::atan2`. Zeros and infinities give C99's angles: atan2(±0, -0) is ±π, and atan2(±∞, ±∞) is an odd multiple of ±π/4.
+    /// The angle of the point (x, y) from the positive x axis, from -π to π, with y first as in C's `atan2`. Zeros and infinities give C99's angles: atan2(±0, -0) is ±π, and atan2(±∞, ±∞) is an odd multiple of ±π/4.
     atan2(y, x) in arc as Atan2: total;
     /// sinh x. It stays finite up to where sinh itself overflows, beyond the point where e^x does.
     sinh(x) in hyperbolic as Sinh: total;
@@ -150,9 +157,9 @@ functions! {
     tanh(x) in hyperbolic as Tanh: total;
     /// asinh x.
     asinh(x) in hyperbolic as Asinh: total;
-    /// acosh x. x below 1 gives NaN.
+    /// acosh x. A real x below 1 gives NaN.
     acosh(x) in hyperbolic as Acosh;
-    /// atanh x. ±1 gives ±∞, and a magnitude beyond 1 gives NaN.
+    /// atanh x. ±1 gives ±∞, and a real x of magnitude beyond 1 gives NaN.
     atanh(x) in hyperbolic as Atanh;
     /// x^y. Special values follow IEEE 754's `pow`: x^0 and 1^y are 1, even for NaN, and a negative x has a power only for a whole y.
     pow(x, y) in pow;
@@ -162,11 +169,11 @@ functions! {
     cbrt(x) in pow as Cbrt: total;
     /// √(x² + y²), with no overflow or underflow in between. An infinite argument gives ∞, even beside NaN.
     hypot(x, y) in pow as Hypot: total;
-    /// √(1 - x²), without the digits that squaring x first loses near |x| = 1. A magnitude beyond 1 gives NaN.
+    /// √(1 - x²), without the digits that squaring x first loses near |x| = 1. A real x of magnitude beyond 1 gives NaN.
     sqrt1mx2(x) in sqrts as Sqrt1mx2;
     /// √(1 + x²), with no overflow where x² would overflow.
     sqrt1px2(x) in sqrts as Sqrt1px2: total;
-    /// √(x - 1) √(x + 1): √(x² - 1) with the sign of x, without the digits that squaring x first loses near |x| = 1. A magnitude below 1 gives NaN.
+    /// √(x - 1) √(x + 1): √(x² - 1) with the sign of a real x, without the digits that squaring x first loses near |x| = 1. A real x of magnitude below 1 gives NaN.
     sqrtx2m1(x) in sqrts as Sqrtx2m1;
     /// Γ(x). Γ(±0) is ±∞, a negative whole x and -∞ give NaN, and Γ(∞) is ∞.
     gamma(x) in special as Gamma;
@@ -176,6 +183,10 @@ functions! {
     lgamma(x) in special as Lgamma: total;
     /// ψ(x), the digamma function: the derivative of ln Γ(x), Γ′(x)/Γ(x). ψ(+0) is -∞, ψ(-0) is ∞, a negative whole x and -∞ give NaN, and ψ(∞) is ∞. Near its zeros its error is within 4 ulps of 1, not of the result, and below -20 within 4 ulps of ln(1 - x).
     digamma(x) in special as Digamma;
+    /// ψ⁽ⁿ⁾(x), the polygamma function: the nth derivative of ψ, for a whole n from 0 to 170. For n from 1, x from 0 down gives NaN, as do a fractional or negative n and an n above 170.
+    polygamma(n, x) in special as Polygamma;
+    /// B(a, b) = Γ(a) Γ(b)/Γ(a + b), the beta function. A pole of Γ(a) or Γ(b) gives NaN, and a pole of Γ(a + b) alone gives 0.
+    beta(a, b) in special as Beta;
     /// C(n, k), the binomial coefficient. Whole n and k from 0 multiply out exactly while the result times |n| + k is a whole number the type holds, and a negative whole n gives (-1)^k C(k - n - 1, k). Other n with a whole k from 0 to 64 multiply out n(n - 1)…(n - k + 1)/k!, within 2k ulps. Other real arguments take Γ(n + 1)/(Γ(k + 1) Γ(n - k + 1)) in double words, within 4 ulps in tests against mpmath, for large n and negative arguments too.
     binom(n, k) in special as Binom;
     /// ∂C(n, k)/∂n, the binomial coefficient's slope in n. For a whole k from 0 to 64 it is the slope of the polynomial n(n - 1)…(n - k + 1)/k! by the product rule, within 2k ulps. Other arguments take C(n, k)(ψ(n + 1) - ψ(n - k + 1)), with the ψ difference in double words where both arguments are from 10 up, with the polynomial's slope where a whole n below a whole k puts those ψ at a pole. Other poles of ψ give NaN.
@@ -190,7 +201,7 @@ functions! {
     erfinv(p) in special;
     /// The x with erfc(x) = q. 0 gives ∞, 2 gives -∞, and q outside 0 to 2 gives NaN.
     erfcinv(q) in special;
-    /// W0(x), the principal branch of the Lambert W function: the w of at least -1 with w e^w = x. x below -1/e gives NaN, except within half an ulp of -1/e, where W0 is -1.
+    /// W0(x), the principal branch of the Lambert W function: the w of at least -1 with w e^w = x. A real x below -1/e gives NaN, except within half an ulp of -1/e, where W0 is -1.
     lambertw(x) in lambert as LambertW;
     /// The regularized lower incomplete gamma function P(a, x): the integral of t^(a-1) e^-t from 0 to x, divided by Γ(a). a must be positive and x nonnegative, or the result is NaN.
     gammainc(a, x) in special as Gammainc;

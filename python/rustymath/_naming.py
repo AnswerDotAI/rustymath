@@ -7,11 +7,18 @@ def _named(f, name, doc):
     f.__doc__ = doc
     return f
 
-def _binary_function(f):
-    "A native binary function's name and Mathish choice, rejecting Python callbacks and lookalikes"
+def _native(f, names, kind):
+    "A native function's name and Mathish choice, where `names` holds its name, rejecting Python callbacks and lookalikes"
     name = getattr(f, '__name__', None)
-    if name not in _core._binary_names:
-        raise ValueError(f"expected a rustymath native binary function, not {f!r}")
-    if f is getattr(_core, name): return name, False
-    if f is getattr(_core._mathish, name, None): return name, True
-    raise ValueError(f"expected a rustymath native binary function, not {f!r}")
+    if name in names:
+        if f is getattr(_core, name): return name, False
+        if f is getattr(_core._mathish, name, None): return name, True
+    raise ValueError(f"expected a rustymath native {kind} function, not {f!r}")
+
+def _binary_function(f):
+    "A native binary function's name and Mathish choice"
+    return _native(f, _core._binary_names, 'binary')
+
+def _elementwise_function(f):
+    "A native elementwise function's name and Mathish choice"
+    return _native(f, _core._elementwise_names, 'elementwise')

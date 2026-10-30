@@ -649,31 +649,45 @@ mod reductions {
     }
 
     #[test]
-    fn alternating_folds_match_the_right_fold() {
+    fn alternated_folds_match_the_right_fold() {
         fn right<T: Copy>(x: &[T], unit: T, f: impl Fn(T, T) -> T) -> T { x.iter().rev().copied().reduce(|t, v| f(v, t)).unwrap_or(unit) }
+        // `R`'s fold of `x` by `slice`, by `along`, and by `fold_into` in blocks of 7 items, whose odd counts make `merge` subtract or divide, each with whether it fits.
+        fn folds<T: Copy + Sync, S: Copy, R: Reduction<T, Total = (S, bool)>>(x: &[T]) -> [(S, bool); 3] {
+            let mut blocks = vec![R::unit()];
+            let fits = x.chunks(7).enumerate().fold(true, |fits, (k, b)| fits & fold_into::<T, R>(&mut blocks, [1, x.len(), 1], 7 * k, b));
+            let ((sliced, _), sliced_fits) = R::slice(x);
+            let (along, along_fits) = along::<T, R>(x, [1, x.len(), 1]);
+            [(sliced, sliced_fits), (along[0].0, along_fits), (blocks[0].0, fits)]
+        }
         for n in [0, 1, 2, 3, 64, 101] {
             let x: Vec<i64> = (0..n).map(|i| (i * 7919) % 23 - 11).collect();
             let want = right(&x, 0, |a, b| a - b);
-            assert_eq!(<Sum as Alternating<i64>>::alternating(&x), (want, true));
-            assert_eq!(<Sum as Alternating<i16>>::alternating(&x.iter().map(|&v| v as i16).collect::<Vec<_>>()), (want, true));
+            assert_eq!(folds::<i64, _, Alternated<Sum>>(&x), [(want, true); 3]);
+            assert_eq!(folds::<i16, _, Alternated<Sum>>(&x.iter().map(|&v| v as i16).collect::<Vec<_>>()), [(want, true); 3]);
             // Whole numbers, and powers of 2, keep every sum and quotient exact in any order.
             let f: Vec<f64> = x.iter().map(|&v| v as f64).collect();
-            assert_eq!(<Sum as Alternating<f64>>::alternating(&f), (want as f64, true));
+            assert_eq!(folds::<f64, _, Alternated<Sum>>(&f), [(want as f64, true); 3]);
             let z: Vec<Complex<f64>> = f.iter().map(|&v| Complex::new(v, -v)).collect();
-            assert_eq!(<Sum as Alternating<Complex<f64>>>::alternating(&z), (Complex::new(want as f64, -want as f64), true));
+            assert_eq!(folds::<Complex<f64>, _, Alternated<Sum>>(&z), [(Complex::new(want as f64, -want as f64), true); 3]);
             let p: Vec<f64> = x.iter().map(|&v| 2f64.powi(v as i32 % 5)).collect();
             let q = right(&p, 1.0, |a, b| a / b);
-            assert_eq!(<Product as Alternating<f64>>::alternating(&p), (q, true));
+            assert_eq!(folds::<f64, _, Alternated<ScaledProduct>>(&p).map(|(s, fits)| (s.value(), fits)), [(q, true); 3]);
             let pz: Vec<Complex<f64>> = p.iter().map(|&v| Complex::new(v, 0.0)).collect();
-            assert_eq!(<Product as Alternating<Complex<f64>>>::alternating(&pz), (Complex::new(q, 0.0), true));
+            assert_eq!(folds::<Complex<f64>, _, Alternated<Product>>(&pz), [(Complex::new(q, 0.0), true); 3]);
         }
-        assert!(!<Sum as Alternating<i64>>::alternating(&[i64::MAX, -1]).1);
-        assert_eq!(alternating_lanes::<_, Sum>(&[1i64, 2, 3, 4, 5, 6], 3), Some(vec![2, 5]));
-        // The pairs' ratios alternate between 1e200 and 1e-200, so the right fold is 1. Each running product takes every 16th ratio, or every 8th in wasm, so half of them overflow and half underflow.
+        assert!(!<Alternated<Sum> as Reduction<i64>>::slice(&[i64::MAX, -1]).1);
+        // Two lanes of 3 consecutive items, then the columns of a 3×2 matrix.
+        assert_eq!(along::<i64, Alternated<Sum>>(&[1, 2, 3, 4, 5, 6], [2, 3, 1]), (vec![(2, true), (5, true)], true));
+        assert_eq!(along::<i64, Alternated<Sum>>(&[1, 2, 3, 4, 5, 6], [1, 3, 2]), (vec![(3, true), (4, true)], true));
+        // The pairs' ratios alternate between 1e200 and 1e-200, so the right fold is 1. Running products of plain floats would overflow and underflow. A scaled product keeps its exponent apart, and fits.
         let x: Vec<f64> = (0..256).map(|i| if (i % 4 == 0) | (i % 4 == 3) { 1e200 } else { 1.0 }).collect();
         assert_eq!(right(&x, 1.0, |a, b| a / b), 1.0);
-        assert!(!<Product as Alternating<f64>>::alternating(&x).1);
-        assert!(!<Product as Alternating<f64>>::alternating(&[1.0, 0.0]).1);
+        let ((s, _), fits) = <Alternated<ScaledProduct> as Reduction<f64>>::slice(&x);
+        assert!(fits && (s.value() - 1.0).abs() < 1e-13, "{}", s.value());
+        // A quotient past the floats' range fits, and rounds to infinity.
+        let ((s, _), fits) = <Alternated<ScaledProduct> as Reduction<f64>>::slice(&[1e200, 1.0].repeat(32));
+        assert!(fits && s.value() == f64::INFINITY);
+        assert!(!<Alternated<ScaledProduct> as Reduction<f64>>::slice(&[1.0, 0.0]).1);
     }
 }
 
@@ -762,6 +776,11 @@ mod search {
         assert_eq!(sort_rows(300, vec![wide.clone()]), rows);
         rows.sort_by_key(|&r| (wide[r as usize], second[r as usize]));
         assert_eq!(sort_rows(300, vec![wide, second]), rows);
+        // Where at most 1/64 of the keys leave one bucket of a byte, each block of 64 keys that all share it moves with one copy. Here 2 of 300 keys differ in the top byte: one in the first block and one in the last, which is partial.
+        let top: Vec<u64> = (0..300u64).map(|i| (if i == 5 || i == 290 { 0x40 } else { 0x3F }) << 56 | i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 8).collect();
+        rows = (0..300).collect();
+        rows.sort_by_key(|&r| top[r as usize]);
+        assert_eq!(sort_rows(300, vec![top]), rows);
         assert_eq!(
             (
                 grouped(&[1, 0, 1, 1], 2).each().collect::<Vec<_>>(), grouped(&[0, 0], 1).each().collect::<Vec<_>>(),

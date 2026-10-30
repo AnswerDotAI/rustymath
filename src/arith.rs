@@ -59,7 +59,7 @@ forms!(#[inline] Subtract at Complex<f32>, Complex<f64>: |_, [x, y]| Total(x - y
 forms!(#[inline] Multiply at Complex<f32>, Complex<f64>: |_, [x, y]| Total(x * y));
 forms!(#[inline] Divide at real: |_, [x, y]| Total(x / y));
 forms!(#[inline] Divide at Complex<f32>, Complex<f64>: |_, [x, y]| Total(crate::divide(x, y)));
-forms!(#[inline] MathishDivide at real: |_, [x, y]| Total(if both_zero(x, y) { x } else { x / y }));
+forms!(#[inline] MathishDivide at real: |_, [x, y]| Total(mathish_divide(x, y)));
 forms!(#[inline] MathishDivide at Complex<f32>, Complex<f64>: |_, [x, y]| Total(if both_zero(x, y) { x } else { crate::divide(x, y) }));
 
 /// -x. A float or complex result never fails. An integer result fails where it doesn't fit its type, as the negation of a signed type's least value or of an unsigned byte other than 0 doesn't, and holds the result wrapped to the type.
@@ -77,20 +77,26 @@ pub struct WholeDivide;
 forms!(#[inline] Negate at real: |_, [x]| Total(-x));
 forms!(#[inline] Negate at Complex<f32>, Complex<f64>: |_, [x]| Total(-x));
 forms!(#[inline] Negate at u8, i16, i32, i64: |_, [x]| { let (r, overflowed) = x.overflowing_neg(); (r, !overflowed) });
-forms!(#[inline] Reciprocal at real: |_, [x]| Total(1.0 / x));
+forms!(#[inline] Reciprocal at real: |_, [x]| Total(reciprocal(x)));
 forms!(#[inline] Reciprocal at Complex<f32>, Complex<f64>: |_, [x]| Total(crate::divide(Complex::new(1.0, 0.0), x)));
 forms!(#[inline] Reciprocal at u8, i16, i32, i64: |_, [x]| (x.checked_mul(x) == Some(1)).then_some(x));
 forms!(#[inline] PiTimes at real: |_, [x]| Total(pi_times(x)));
-forms!(#[inline] PiTimes at real: |_, [x, y]| Total(pi_times(x / y)));
+forms!(#[inline] PiTimes at real: |_, [x, y]| Total(pi_ratio(x, y)));
 forms!(#[inline] PiTimes at Complex<f32>: |_, [x]| Total(x * std::f32::consts::PI));
 forms!(#[inline] PiTimes at Complex<f64>: |_, [x]| Total(x * std::f64::consts::PI));
 forms!(#[inline] PiTimes at Complex<f32>: |_, [x, y]| Total(crate::divide(x, y) * std::f32::consts::PI));
 forms!(#[inline] PiTimes at Complex<f64>: |_, [x, y]| Total(crate::divide(x, y) * std::f64::consts::PI));
 forms!(#[inline] WholeDivide at u8, i16, i32, i64: |_, [x, y]| if x.checked_rem(y) == Some(0) { x.checked_div(y) } else { None });
 
-/// π × y, at the width of `y`.
-#[inline]
-fn pi_times<F: crate::Float>(y: F) -> F { y * F::narrow(std::f64::consts::PI) }
+/// `recipe`'s formulas on one float, which the kernels above compute.
+#[inline(always)]
+fn reciprocal<F: crate::Float>(x: F) -> F { crate::recipe::reciprocal::<F, _>(&crate::recipe::Floats, x) }
+#[inline(always)]
+fn pi_times<F: crate::Float>(x: F) -> F { crate::recipe::pi_times::<F, _>(&crate::recipe::Floats, x) }
+#[inline(always)]
+fn pi_ratio<F: crate::Float>(x: F, y: F) -> F { crate::recipe::pi_ratio::<F, _>(&crate::recipe::Floats, x, y) }
+#[inline(always)]
+fn mathish_divide<F: crate::Float>(x: F, y: F) -> F { crate::recipe::mathish_divide::<F, _>(&crate::recipe::Floats, x, y) }
 
 /// Applies the Boolean function whose truth table is `table`, indexed by `2*x+y`, to every bit of `x` and `y`, the leading sign bits included. It computes the table's algebraic normal form, `a0 ^ (a1 & x) ^ (a2 & y) ^ (a3 & x & y)`, with each coefficient spread to every bit, so every table runs the same code. A `match` on the table would put 16 paths into each loop that inlines it. It takes any integer type, exact ones included.
 #[inline]

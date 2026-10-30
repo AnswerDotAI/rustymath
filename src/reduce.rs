@@ -10,16 +10,16 @@ use std::ops::Range;
 
 /// The sum of `x`, 0 for an empty slice, and whether it fits. An integer sum that doesn't fit wraps.
 #[inline]
-pub fn sum<T>(x: &[T]) -> (<Sum as Reduction<T>>::Total, bool) where Sum: Reduction<T> { Sum::slice(x) }
+pub fn sum<T: Copy>(x: &[T]) -> (<Sum as Reduction<T>>::Total, bool) where Sum: Reduction<T> { Sum::slice(x) }
 /// The product of `x`, 1 for an empty slice, and whether it fits. An integer product that doesn't fit wraps.
 #[inline]
-pub fn prod<T>(x: &[T]) -> (<Product as Reduction<T>>::Total, bool) where Product: Reduction<T> { Product::slice(x) }
+pub fn prod<T: Copy>(x: &[T]) -> (<Product as Reduction<T>>::Total, bool) where Product: Reduction<T> { Product::slice(x) }
 /// The greatest item of `x`.
 #[inline]
-pub fn max<T>(x: &[T]) -> T where Max: Reduction<T, Total = T> { Max::slice(x).0 }
+pub fn max<T: Copy>(x: &[T]) -> T where Max: Reduction<T, Total = T> { Max::slice(x).0 }
 /// The least item of `x`.
 #[inline]
-pub fn min<T>(x: &[T]) -> T where Min: Reduction<T, Total = T> { Min::slice(x).0 }
+pub fn min<T: Copy>(x: &[T]) -> T where Min: Reduction<T, Total = T> { Min::slice(x).0 }
 /// The least and the greatest item of `x`, in one pass of comparisons and selects. For floats, [`min`] and [`max`] take less time together, because their folds run AArch64's `fmin` and `fmax`.
 #[inline]
 pub fn extremes<T: Copy>(x: &[T]) -> (T, T) where Min: Reduction<T, Total = T>, Max: Reduction<T, Total = T> { extremes_of(x, |v| v) }
@@ -49,19 +49,19 @@ fn extremes_by<A: Copy, T: Copy, const R: usize>(x: &[A], key: impl Fn(A) -> T) 
 }
 /// Appends the running sums of `x` to `out`, the first being `start` plus the first item where `start` is given, and gives whether every sum fits.
 #[inline]
-pub fn cumsum<T>(x: &[T], start: Option<<Sum as Reduction<T>>::Total>, out: &mut Vec<<Sum as Reduction<T>>::Total>) -> bool where Sum: Reduction<T> {
+pub fn cumsum<T: Copy>(x: &[T], start: Option<<Sum as Reduction<T>>::Total>, out: &mut Vec<<Sum as Reduction<T>>::Total>) -> bool where Sum: Reduction<T> {
     Sum::scan(x, start, out)
 }
 /// Appends the running products of `x` to `out`, as `cumsum` does sums.
 #[inline]
-pub fn cumprod<T>(x: &[T], start: Option<<Product as Reduction<T>>::Total>, out: &mut Vec<<Product as Reduction<T>>::Total>) -> bool where Product: Reduction<T>
+pub fn cumprod<T: Copy>(x: &[T], start: Option<<Product as Reduction<T>>::Total>, out: &mut Vec<<Product as Reduction<T>>::Total>) -> bool where Product: Reduction<T>
 { Product::scan(x, start, out) }
 /// Appends the running maximums of `x` to `out`, the first taking `start` into account where it is given.
 #[inline]
-pub fn cummax<T>(x: &[T], start: Option<T>, out: &mut Vec<T>) where Max: Reduction<T, Total = T> { Max::scan(x, start, out); }
+pub fn cummax<T: Copy>(x: &[T], start: Option<T>, out: &mut Vec<T>) where Max: Reduction<T, Total = T> { Max::scan(x, start, out); }
 /// Appends the running minimums of `x` to `out`, as `cummax` does maximums.
 #[inline]
-pub fn cummin<T>(x: &[T], start: Option<T>, out: &mut Vec<T>) where Min: Reduction<T, Total = T> { Min::scan(x, start, out); }
+pub fn cummin<T: Copy>(x: &[T], start: Option<T>, out: &mut Vec<T>) where Min: Reduction<T, Total = T> { Min::scan(x, start, out); }
 
 /// The greater of x and y, as [`max`] gives the greatest item. Beside NaN, or where they're equal, it gives y. A fold that passes its running result as y keeps it beside a NaN item. NumPy calls it `maximum`.
 #[inline(always)]
@@ -85,9 +85,9 @@ forms!(#[inline] Minimum at real: |_, [x, y]| crate::slice::Total(minimum(x, y))
 forms!(#[inline] Minimum at u8, i16, i32, i64: |_, [x, y]| x.min(y));
 forms!(#[inline] Minimum at bool: |_, [x, y]| x & y);
 
-/// A reduction by [`Sum`], [`Product`], [`Max`], [`Min`], [`And`], [`Or`], [`Xor`], [`Xnor`], [`SumAs`] or [`Squares`], implemented inside rustymath once for each item type it takes. `slice` folds a whole slice of consecutive items, in any order, `merge` combines the folds of two neighbouring runs, and `scan` gives the running folds. [`along`], [`fold_into`] and [`scan_along`] fold along an axis whose items aren't consecutive. [`Sum`] and [`Product`] take floats, integers and complex numbers. [`Max`] and [`Min`] take floats, integers and Booleans, [`And`], [`Or`] and [`Xor`] take integers and Booleans, [`Xnor`] takes signed integers, bytes and Booleans, [`SumAs`] takes Booleans and integers, and [`Squares`] takes floats and complex numbers. An `f16` reduction computes in `f32`. A sum or product of `f16`s gives an `f32` total, for its caller to round once. A total that doesn't fit its type fails, with its value wrapped to that type.
+/// A reduction by [`Sum`], [`Product`], [`ScaledProduct`], [`Max`], [`Min`], [`And`], [`Or`], [`Xor`], [`Xnor`], [`SumAs`], [`Squares`] or [`Alternated`], implemented inside rustymath once for each item type it takes. `slice` folds a whole slice of consecutive items, in any order, `merge` combines the folds of two neighbouring runs, and `scan` gives the running folds. [`along`], [`fold_into`] and [`scan_along`] fold along an axis whose items aren't consecutive. [`Sum`] and [`Product`] take floats, integers and complex numbers. [`Max`] and [`Min`] take floats, integers and Booleans, [`And`], [`Or`] and [`Xor`] take integers and Booleans, [`Xnor`] takes signed integers, bytes and Booleans, [`SumAs`] takes Booleans and integers, [`Squares`] takes floats and complex numbers, [`ScaledProduct`] takes floats, `Alternated<Sum>` takes floats, integers and complex numbers, `Alternated<ScaledProduct>` takes floats, and `Alternated<Product>` takes complex numbers. An `f16` reduction computes in `f32`. A sum or product of `f16`s gives an `f32` total, for its caller to round once. A total that doesn't fit its type fails, with its value wrapped to that type.
 pub trait Reduction<T> {
-    /// The type of a fold: the item type, `i64` for a sum or product of integers narrower than 64 bits, `f32` for a sum or product of `f16`s, `i16` for an XNOR of bytes, the `C` of [`SumAs`], or `f64` for [`Squares`].
+    /// The type of a fold: the item type, `i64` for a sum or product of integers narrower than 64 bits, `f32` for a sum or product of `f16`s, `i16` for an XNOR of bytes, the `C` of [`SumAs`], `f64` for [`Squares`], a [`Scaled`] product for [`ScaledProduct`], or a total with the parity of its count for [`Alternated`].
     type Total: Copy + Send + Sync;
     /// The fold of no items: 0, 1, -∞ or ∞, the integer type's least or greatest value, all ones, or false or true.
     fn unit() -> Self::Total;
@@ -107,13 +107,36 @@ pub trait Reduction<T> {
     /// `merge`, for a chain of folds whose every step waits for the one before, as van Herk-Gil-Werman's suffixes and prefixes do. As in `merge`, `a` folds the earlier items. Float maximums and minimums override it with `Folds::step_max` and `step_min`, which use AArch64's one-instruction `fmaxnm` and `fminnm`. LLVM can't vectorize those, so they stay out of `merge`.
     #[inline(always)]
     fn chain(a: Self::Total, b: Self::Total) -> (Self::Total, bool) { Self::merge(a, b) }
-    /// The fold of `x`, which is `unit()` where `x` is empty, and whether it fits.
-    fn slice(x: &[T]) -> (Self::Total, bool);
-    /// Appends the running folds of `x` to `out`, the first combining `start` where it is given, and gives whether every one fits.
-    fn scan(x: &[T], start: Option<Self::Total>, out: &mut Vec<Self::Total>) -> bool;
+    /// The fold of `x`, which is `unit()` where `x` is empty, and whether it fits. The default takes each item in turn by `checked`.
+    fn slice(x: &[T]) -> (Self::Total, bool) where Self: Sized, T: Copy {
+        if x.is_empty() { return (Self::unit(), true); }
+        x.iter().fold((Self::identity(), true), |(t, fits), &v| { let (t, ok) = Self::checked(t, v); (t, fits & ok) })
+    }
+    /// Appends the running folds of `x` to `out`, the first combining `start` where it is given, and gives whether every one fits. The default takes each item in turn by `checked` (`checked_steps`).
+    fn scan(x: &[T], start: Option<Self::Total>, out: &mut Vec<Self::Total>) -> bool where Self: Sized, T: Copy { checked_steps::<T, Self>(x, start, out) }
     /// Folds each row of `data`, a matrix with `columns` items in each row, into the matching item of `out`, and gives whether every fold fits. The default is `fold_rows`, which folds each row of 16 items or more by `slice`. Float sums and products, integer maximums and minimums, and bitwise folds fold rows of 16 to 63 items by `checked` instead, eight rows side by side (`rows_side_by_side`). Each of their steps is one instruction, so keeping several rows' steps in flight costs less than a call of `slice` for each row. Other reductions keep `fold_rows`, where `slice` vectorizes within the row: an integer sum's step checks for overflow, and a float maximum's or minimum's `slice` runs `Folds`' vector kernels. Nobody has timed float maximums side by side since their step became one select on x86.
     #[inline]
     fn rows(data: &[T], columns: usize, out: &mut [Self::Total]) -> bool where Self: Sized, T: Copy { fold_rows::<T, Self>(data, columns, out) }
+    /// The most classes for which [`crate::search::Numbered::fold`] folds each class into four totals by position. Each step of a class's total waits on the last through memory, so a reduction whose step takes longer gains from the split over more classes.
+    const SPLIT: usize = 8;
+}
+
+/// A fold's total as an item of a buffer: an [`Element`] stores itself, a [`Scaled`] product stores its value, and [`Alternated`]'s total stores its fold without the parity of its count.
+pub trait Totals: Copy {
+    /// The buffer that holds `totals`.
+    fn buffer_of(totals: Vec<Self>) -> crate::buffer::Buffer;
+}
+impl<T: Element> Totals for T {
+    #[inline]
+    fn buffer_of(totals: Vec<T>) -> crate::buffer::Buffer { T::buffer(totals) }
+}
+impl<S: Totals> Totals for (S, bool) {
+    #[inline]
+    fn buffer_of(totals: Vec<(S, bool)>) -> crate::buffer::Buffer { S::buffer_of(totals.into_iter().map(|(s, _)| s).collect()) }
+}
+impl<F: Native + Element> Totals for Scaled<F> {
+    #[inline]
+    fn buffer_of(totals: Vec<Scaled<F>>) -> crate::buffer::Buffer { F::buffer(totals.into_iter().map(Scaled::value).collect()) }
 }
 
 /// [`sum`] as a [`Reduction`].
@@ -254,6 +277,7 @@ macro_rules! floats {
     ($($r:ident: $unit:ident, $(identity: $identity:expr,)? $(rows: $rows:ident,)? $(chain: $chain:expr,)? |$a:ident, $b:ident| $step:expr, $fold:expr, $scan:expr;)+) => {$(
         impl<F: Native> Reduction<F> for $r {
             type Total = F;
+            const SPLIT: usize = 64;
             #[inline(always)]
             fn unit() -> F { F::$unit() }
             #[inline(always)]
@@ -806,6 +830,26 @@ fn long_runs(mapping: &Mapping, positions: usize) -> Option<(usize, Vec<usize>)>
 /// Whether [`along_mapped`] reads the array of `shape` that `mapping` lays over storage where it lies, with no copy: a block of storage, as [`Mapping::block`] finds, or runs of at least [`RUN`] items. Elsewhere each read copies the array's items a piece at a time, at about a gather's cost, so a caller that will read the array again keeps a compact copy instead, as basedpl does for a pending copy that a name holds and the Python API does for a view that keeps what it gathers.
 pub fn rereads_cheaply(mapping: &Mapping, shape: &[usize]) -> bool {
     mapping.block(shape).is_some() || long_runs(mapping, crate::layout::count(shape)).is_some()
+}
+
+/// How a fold reads an array that a mapping lays over storage, as [`fold_route`] chooses.
+pub enum FoldRoute {
+    /// Sliding folds over the source, as [`Slide`](crate::structure::Slide) classifies the array as windows along the folded axes.
+    Slide(crate::structure::Slide),
+    /// Through the mapping, as [`along_mapped`] reads it.
+    Mapped,
+    /// From the array's items, which it gathers once and keeps, or reads in place where a fold of every item reads a block of storage.
+    Lanes,
+}
+
+/// The route of a fold along `axes`, one axis or two, of the array of `shape` that `mapping` lays over storage. It slides where `source` gives the shape of what the mapping reads and the array is windows along `axes`. Otherwise it reads through the mapping, unless the array keeps the items it gathers (`keeps`) and [`rereads_cheaply`] is false, where it folds the kept items. A fold of every item takes no axes, never slides, and folds a block of storage from the array's items ([`ArrayView::fold_items`](crate::array::ArrayView::fold_items) reads it in place). Python's folds of views and basedpl's folds of pending copies both choose here.
+pub fn fold_route(mapping: &Mapping, shape: &[usize], source: Option<&[usize]>, keeps: bool, axes: &[usize]) -> FoldRoute {
+    if !axes.is_empty() && let Some(source) = source && let Some(s) = crate::structure::Slide::new(&mapping.tables(shape), shape, source, axes) {
+        return FoldRoute::Slide(s);
+    }
+    // A fold of every item reads a block of storage where it lies, in any order, through the array's items. Through the mapping it would read the block as a vector of every item, where the block isn't one.
+    if axes.is_empty() && mapping.block(shape).is_some() { return FoldRoute::Lanes; }
+    if !keeps || rereads_cheaply(mapping, shape) { FoldRoute::Mapped } else { FoldRoute::Lanes }
 }
 
 /// [`along`] of the array of `shape` that `mapping` lays `data` over, folding axis `axis`, without building that array: its totals, whether they all fit, and the tables that read the totals in the order of the array's other axes, where they come in another order. A reduction combines each lane's items in any order. Where the array reads a contiguous block of `data` with its axes in another order, as [`Mapping::block`] finds, the block folds in its own order, as [`Block::fold`] plans it, and its totals keep the block's order. A caller can then copy them through the tables, or read them through the tables as another view. Otherwise each run of at least [`RUN`] items folds where it lies, shorter runs are copied [`MAPPED`] items at a time through [`expanded_items`], and the array folds as [`fold_pieces`] folds it.
@@ -1672,20 +1716,6 @@ impl<T: Scalar> Reduction<T> for Squares {
     fn scan(x: &[T], start: Option<f64>, out: &mut Vec<f64>) -> bool { grouped(x, start, out, |v| add_square(0.0, v), |a, b| a + b, |t| t, false); true }
 }
 
-/// The right fold of a slice by the inverse of a reduction, through pairs of items: `-` for [`Sum`], and `÷` for [`Product`]. The fold `x0 - (x1 - (x2 - …))` is the sum of the pairs' differences, and `x0 ÷ (x1 ÷ (x2 ÷ …))` is the product of the pairs' ratios, each with the last item where it has no pair. Both combine the pairs in any order, as sums and products do.
-pub trait Alternating<T> {
-    /// The type of the fold: the item type, or `i64` for integers.
-    type Total;
-    /// The right fold of `x` by the inverse, 0 or 1 for an empty slice, and whether it fits. An integer fold fits where it is within `i64`. A quotient of floats doesn't fit where a running product or the result reaches zero, a subnormal number, an infinity or NaN. The right fold taken item by item may still be finite there.
-    fn alternating(x: &[T]) -> (Self::Total, bool);
-}
-
-/// Alternating folds of consecutive lanes, retaining [`Alternating`]'s slice kernels. Gives `None` where a lane's result doesn't fit.
-#[inline]
-pub fn alternating_lanes<T: Copy, R: Alternating<T>>(data: &[T], len: usize) -> Option<Vec<R::Total>> {
-    data.chunks(len.max(1)).map(|lane| match R::alternating(lane) { (total, true) => Some(total), _ => None }).collect()
-}
-
 /// The fold by `merge` from `unit` of the pairs of `x`, each combined into a total by `pair`, and then of the item left over where `x` has an odd length, combined by `last`.
 #[inline(always)]
 fn pairwise<A: Copy, S: Copy>(x: &[A], unit: S, pair: impl Fn(S, A, A) -> S, merge: impl Fn(S, S) -> S, last: impl Fn(S, A) -> S) -> S {
@@ -1718,26 +1748,78 @@ fn alternated<A: Copy, S: Copy + std::ops::Sub<Output = S>>(x: &[A], unit: S, ad
     })
 }
 
-impl<F: Native> Alternating<F> for Sum {
-    type Total = F;
-    #[inline]
-    fn alternating(x: &[F]) -> (F, bool) { (pairwise(x, F::zero(), |s, a, b| s.algebraic_add(a - b), F::algebraic_add, |s, z| s + z), true) }
+/// The running folds of `x` by `R`, each item taken in turn by `checked` from `start` or `R`'s identity, appended to `out`, and whether every one fits.
+fn checked_steps<T: Copy, R: Reduction<T>>(x: &[T], start: Option<R::Total>, out: &mut Vec<R::Total>) -> bool {
+    let (mut total, mut fits) = (start.unwrap_or_else(R::identity), true);
+    out.extend(x.iter().map(|&v| { let ok; (total, ok) = R::checked(total, v); fits &= ok; total }));
+    fits
 }
 
-impl<F: Native> Alternating<Complex<F>> for Sum {
-    type Total = Complex<F>;
-    #[inline]
-    fn alternating(x: &[Complex<F>]) -> (Complex<F>, bool) {
-        let add = <Sum as Reduction<Complex<F>>>::step;
-        (pairwise(x, Complex::new(F::zero(), F::zero()), |s, a, b| add(s, a - b), add, |s, z| s + z), true)
+/// The right fold by the inverse of a reduction: `-` for [`Sum`], and `÷` for [`ScaledProduct`] on floats and [`Product`] on complex numbers. `x0 - (x1 - (x2 - …))` is the sum of the items at even positions less the sum of those at odd positions, and `x0 ÷ (x1 ÷ (x2 ÷ …))` is the quotient of their products. A total holds that sum or quotient for the items folded so far, with whether their number is odd. `step` takes an item at an odd position away, and `merge` takes the later run's total away where the earlier run's count is odd, each through [`Inverse`]. Every fold that takes a [`Reduction`] folds it, as [`along`], [`fold_into`], [`along_mapped`] and [`fold_pieces`] do. [`Totals`] stores its folds without the parity.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Alternated<R>(std::marker::PhantomData<R>);
+
+/// A reduction whose step can be undone, as [`Alternated`] folds by it: [`Sum`] subtracts, and [`ScaledProduct`] and [`Product`] divide. An integer difference fits only within `i64`, a complex quotient only inside the normal range, and a float quotient only where no item, or product of the running mantissa and an item, leaves the normal floats. An alternated fold can then fail where the right fold taken item by item, or its exact result, would fit.
+pub trait Inverse<T>: Reduction<T> {
+    /// `acc` with the item `x` taken away, and whether it fits.
+    fn inverse(acc: Self::Total, x: T) -> (Self::Total, bool);
+    /// The fold `a` with the fold `b` of the next run taken away, and whether it fits.
+    fn undo(a: Self::Total, b: Self::Total) -> (Self::Total, bool);
+    /// Whether a running total fits, as every one does apart from a float quotient outside the normal range.
+    #[inline(always)]
+    fn fits(_: Self::Total) -> bool { true }
+    /// The right fold of the slice `x` by the inverse, and whether it fits: for sums through a sum at each parity (`alternated`), and for products through the pairs' quotients (`pairwise`).
+    fn alternating(x: &[T]) -> (Self::Total, bool);
+}
+
+impl<T: Copy, R: Inverse<T>> Reduction<T> for Alternated<R> {
+    type Total = (R::Total, bool);
+    #[inline(always)]
+    fn unit() -> Self::Total { (R::unit(), false) }
+    #[inline(always)]
+    fn identity() -> Self::Total { (R::identity(), false) }
+    #[inline(always)]
+    fn step((s, odd): Self::Total, x: T) -> Self::Total { (if odd { R::inverse(s, x).0 } else { R::step(s, x) }, !odd) }
+    #[inline(always)]
+    fn checked((s, odd): Self::Total, x: T) -> (Self::Total, bool) {
+        let (t, ok) = if odd { R::inverse(s, x) } else { R::checked(s, x) };
+        ((t, !odd), ok && R::fits(t))
     }
+    #[inline(always)]
+    fn merge((a, odd): Self::Total, (b, more): Self::Total) -> (Self::Total, bool) {
+        let (t, ok) = if odd { R::undo(a, b) } else { R::merge(a, b) };
+        ((t, odd ^ more), ok && R::fits(t))
+    }
+    #[inline]
+    fn slice(x: &[T]) -> (Self::Total, bool) { let (t, ok) = R::alternating(x); ((t, x.len() % 2 == 1), ok) }
 }
 
-/// [`Sum`]'s alternating folds of integers: the sum of the items at even positions less the sum of those at odd positions, which is exact. Each run of `$run` items, an even number, sums at `$acc`, where it can't overflow, and the runs total at `i128`. Bytes and 16-bit integers sum at `i32`, which fits twice as many in each vector as `i64`. Separate running sums for each parity take less time than `pairwise`, which must split each pair out of the vector lanes.
-macro_rules! alternating_integers {
+impl<F: Native> Inverse<F> for Sum {
+    #[inline(always)]
+    fn inverse(acc: F, x: F) -> (F, bool) { (acc.algebraic_add(-x), true) }
+    #[inline(always)]
+    fn undo(a: F, b: F) -> (F, bool) { (a.algebraic_add(-b), true) }
+    #[inline]
+    fn alternating(x: &[F]) -> (F, bool) { (alternated(x, F::zero(), |s, v| s + v, |a, b| a + b), true) }
+}
+
+impl<F: Native> Inverse<Complex<F>> for Sum {
+    #[inline(always)]
+    fn inverse(acc: Complex<F>, x: Complex<F>) -> (Complex<F>, bool) { (<Sum as Reduction<Complex<F>>>::step(acc, -x), true) }
+    #[inline(always)]
+    fn undo(a: Complex<F>, b: Complex<F>) -> (Complex<F>, bool) { (<Sum as Reduction<Complex<F>>>::step(a, -b), true) }
+    #[inline]
+    fn alternating(x: &[Complex<F>]) -> (Complex<F>, bool) { (alternated(x, Complex::new(F::zero(), F::zero()), |s, v| s + v, |a, b| a + b), true) }
+}
+
+/// [`Sum`]'s inverse on integers, which subtracts at `i64`. A slice sums the items at even positions less those at odd positions, which is exact: each run of `$run` items, an even number, sums at `$acc`, where it can't overflow, and the runs total at `i128`. Bytes and 16-bit integers sum at `i32`, which fits twice as many in each vector as `i64`. Separate running sums for each parity take less time than `pairwise`, which must split each pair out of the vector lanes.
+macro_rules! alternated_integers {
     ($($t:ty => $acc:ty, $run:expr);+) => {$(
-        impl Alternating<$t> for Sum {
-            type Total = i64;
+        impl Inverse<$t> for Sum {
+            #[inline(always)]
+            fn inverse(acc: i64, x: $t) -> (i64, bool) { let (t, over) = acc.overflowing_sub(i64::from(x)); (t, !over) }
+            #[inline(always)]
+            fn undo(a: i64, b: i64) -> (i64, bool) { let (t, over) = a.overflowing_sub(b); (t, !over) }
             #[inline]
             fn alternating(x: &[$t]) -> (i64, bool) {
                 let run = |c: &[$t]| i128::from(alternated(c, 0 as $acc, |s, v| s + <$acc>::from(v), |s, t| s + t));
@@ -1747,23 +1829,101 @@ macro_rules! alternating_integers {
         }
     )+};
 }
-alternating_integers!(i16 => i32, 1 << 15; u8 => i32, 1 << 15; i32 => i64, 1 << 31; i64 => i128, 1 << 31);
+alternated_integers!(i16 => i32, 1 << 15; u8 => i32, 1 << 15; i32 => i64, 1 << 31; i64 => i128, 1 << 31);
 
-impl<F: Native> Alternating<F> for Product {
-    type Total = F;
+/// Whether a quotient lies inside the normal range of floats, where [`Product`]'s inverse on complex numbers fits.
+#[inline(always)]
+fn normal<F: Native>(q: F) -> bool { q.abs() >= F::min_positive_value() && q.is_finite() }
+
+/// A product of floats held as `m × 2^e`, a mantissa `m` and a whole exponent `e` kept apart, so that the product never leaves the normal floats however many items it takes. A step leaves the mantissa where it is while its magnitude stays inside 2^±511 (2^±63 in `f32`), half the floats' exponents, so that the product of two mantissas stays normal, and moves the mantissa's exponent into `e` once it leaves. `normal` says whether every step so far was a nonzero normal float. [`ScaledProduct`] folds into it. The exponent sums exactly up to 2^53 in `f64` and 2^24 in `f32`, which a product that ends inside the floats' range never nears.
+#[derive(Clone, Copy, Debug)]
+pub struct Scaled<F> { m: F, e: F, normal: bool }
+
+impl<F: Native> Scaled<F> {
+    /// `p × 2^e`, with `p`'s exponent moved into `e` where `p`'s magnitude lies outside 2^±511 (2^±63 in `f32`), still `normal` where `p` is a nonzero normal float.
+    #[inline(always)]
+    fn of(p: F, e: F, normal: bool) -> Self {
+        let (lo, hi) = if F::WIDE { (1.4916681462400413e-154, 6.703903964971299e153) } else { (1.0842021724855044e-19, 9.223372036854776e18) };
+        if p.abs() >= F::narrow(lo) && p.abs() <= F::narrow(hi) { Self { m: p, e, normal } } else { Self::rescaled(p, e, normal) }
+    }
+    /// `p × 2^e` with all of `p`'s exponent moved into `e`, its mantissa from 0.75 to 1.5 in magnitude, still `normal` where `p` is a nonzero normal float.
     #[inline]
-    fn alternating(x: &[F]) -> (F, bool) { quotient(x, F::one(), |a, b| a / b, F::algebraic_mul, F::abs, F::is_finite) }
+    fn rescaled(p: F, e: F, normal: bool) -> Self {
+        let (m, f) = p.abs().split();
+        Self { m: if p < F::zero() { -m } else { m }, e: e + f, normal: normal & p.abs().positive_normal() }
+    }
+    /// This product times `q`.
+    #[inline(always)]
+    fn times(self, q: F) -> Self { Self::of(self.m * q, self.e, self.normal) }
+    /// This product divided by `q`.
+    #[inline(always)]
+    fn over(self, q: F) -> Self { Self::of(self.m / q, self.e, self.normal) }
+    /// This product times the product `b`.
+    #[inline(always)]
+    fn joined(self, b: Self) -> Self { Self::of(self.m * b.m, self.e + b.e, self.normal & b.normal) }
+    /// This product divided by the product `b`.
+    #[inline(always)]
+    fn undone(self, b: Self) -> Self { Self::of(self.m / b.m, self.e - b.e, self.normal & b.normal) }
+    /// The float nearest the product: infinite or zero where it lies past the floats' range, and rounded at most once, where it lies below the normal floats.
+    #[inline]
+    pub fn value(self) -> F {
+        let Self { m, e, .. } = Self::rescaled(self.m, self.e, true);
+        let far = F::narrow(if F::WIDE { 2040.0 } else { 250.0 });
+        crate::float::pow2_times::<F, { crate::FUSED }>(m, e.max(-far).min(far))
+    }
 }
 
-impl<F: Native> Alternating<Complex<F>> for Product {
-    type Total = Complex<F>;
-    /// The pairs' ratios divide as [`crate::divide`] does.
+/// The product of floats with its exponent kept apart, as [`Scaled`] holds it, so that a running product can't overflow or underflow where the whole product doesn't. A step fails only where an item, or a step's product, isn't a nonzero normal float: on zeros, infinities and NaNs, on subnormals, and on items so large or small that a mantissa times them leaves the normal floats. The exact fold takes those. [`Alternated`] folds `÷` on floats by it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScaledProduct;
+
+impl<F: Native> Reduction<F> for ScaledProduct {
+    type Total = Scaled<F>;
+    #[inline(always)]
+    fn unit() -> Scaled<F> { Scaled { m: F::one(), e: F::zero(), normal: true } }
+    #[inline(always)]
+    fn step(acc: Scaled<F>, x: F) -> Scaled<F> { acc.times(x) }
+    #[inline(always)]
+    fn checked(acc: Scaled<F>, x: F) -> (Scaled<F>, bool) { let t = acc.times(x); (t, t.normal) }
+    #[inline(always)]
+    fn merge(a: Scaled<F>, b: Scaled<F>) -> (Scaled<F>, bool) { let t = a.joined(b); (t, t.normal) }
+}
+
+impl<F: Native> Inverse<F> for ScaledProduct {
+    #[inline(always)]
+    fn inverse(acc: Scaled<F>, x: F) -> (Scaled<F>, bool) { let t = acc.over(x); (t, t.normal) }
+    #[inline(always)]
+    fn undo(a: Scaled<F>, b: Scaled<F>) -> (Scaled<F>, bool) { let t = a.undone(b); (t, t.normal) }
+    #[inline]
+    fn alternating(x: &[F]) -> (Scaled<F>, bool) {
+        // The quotient of plain floats vectorizes, so it goes first. One that leaves the normal floats runs again with its exponent apart.
+        let (q, fits) = quotient(x, F::one(), |a, b| a / b, F::algebraic_mul, F::abs, F::is_finite);
+        let t = if fits { Scaled::of(q, F::zero(), true) } else { pairwise(x, <Self as Reduction<F>>::unit(), |s, a, b| s.times(a / b), Scaled::joined, Scaled::times) };
+        (t, t.normal)
+    }
+}
+
+/// The product of two complex numbers, as the quotients of [`Product`]'s inverse on complex numbers take it.
+#[inline(always)]
+fn complex_times<F: Native>(p: Complex<F>, q: Complex<F>) -> Complex<F> {
+    Complex::new(p.re.algebraic_mul(q.re).algebraic_add(-p.im.algebraic_mul(q.im)), p.re.algebraic_mul(q.im).algebraic_add(p.im.algebraic_mul(q.re)))
+}
+
+/// The larger magnitude of a complex number's parts, which [`Product`]'s inverse on complex numbers keeps inside the normal range.
+#[inline(always)]
+fn complex_size<F: Native>(p: Complex<F>) -> F { p.re.abs().max(p.im.abs()) }
+
+/// [`Product`]'s inverse on complex numbers, which divides as [`crate::divide`] does.
+impl<F: Native> Inverse<Complex<F>> for Product {
+    #[inline(always)]
+    fn inverse(acc: Complex<F>, x: Complex<F>) -> (Complex<F>, bool) { (crate::divide(acc, x), true) }
+    #[inline(always)]
+    fn undo(a: Complex<F>, b: Complex<F>) -> (Complex<F>, bool) { (crate::divide(a, b), true) }
+    #[inline(always)]
+    fn fits(q: Complex<F>) -> bool { normal(complex_size(q)) }
     #[inline]
     fn alternating(x: &[Complex<F>]) -> (Complex<F>, bool) {
-        let times = |p: Complex<F>, q: Complex<F>| {
-            Complex::new(p.re.algebraic_mul(q.re).algebraic_add(-p.im.algebraic_mul(q.im)), p.re.algebraic_mul(q.im).algebraic_add(p.im.algebraic_mul(q.re)))
-        };
-        quotient(x, Complex::new(F::one(), F::zero()), crate::divide, times, |p| p.re.abs().max(p.im.abs()), |p| p.re.is_finite() & p.im.is_finite())
+        quotient(x, Complex::new(F::one(), F::zero()), crate::divide, complex_times, complex_size, |p| p.re.is_finite() & p.im.is_finite())
     }
 }
 

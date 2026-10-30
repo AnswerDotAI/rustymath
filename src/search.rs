@@ -124,12 +124,12 @@ pub const SCANNED: usize = 16;
 pub fn index_of<K: Key>(x: &[K], y: &[K]) -> Vec<u32> {
     let miss = x.len() as u32;
     if y.len() <= SCANNED { return y.iter().map(|n| x.iter().position(|h| h == n).map_or(miss, |p| p as u32)).collect(); }
-    let Some((min, mut table)) = table(x, usize::MAX) else { return first_matches(x, y) };
+    let Some((min, mut table)) = table(x, u32::MAX) else { return first_matches(x, y) };
     let first = write_first(x, min, &mut table, None, |_, _| ());
     // `move` keeps `min`, `first` and `miss` in registers. Captured by reference, they would load again for every item.
     let at = move |n: K| usize::try_from(n.key().wrapping_sub(min)).ok().and_then(|i| first.get(i));
     let mut found = Vec::with_capacity(y.len());
-    look_up(&mut found, y, move |n| at(n).map_or(miss, |&f| f.min(miss as usize) as u32));
+    look_up(&mut found, y, move |n| at(n).map_or(miss, |&f| f.min(miss)));
     found
 }
 
@@ -148,15 +148,15 @@ pub(crate) fn look_up<K: Copy + Sync>(found: &mut Vec<u32>, y: &[K], look: impl 
 /// The first position of each item's key in `x`, which represents the item's class.
 #[inline(never)]
 pub fn classes<K: Key>(x: &[K]) -> Vec<u32> {
-    let Some((min, mut table)) = table(x, usize::MAX) else { return first_classes(x, |n| n) };
+    let Some((min, mut table)) = table(x, u32::MAX) else { return first_classes(x, |n| n) };
     let first = write_first(x, min, &mut table, None, |_, _| ());
-    x.iter().map(move |&n| first[n.key().wrapping_sub(min) as usize] as u32).collect()
+    x.iter().map(move |&n| first[n.key().wrapping_sub(min) as usize]).collect()
 }
 
 /// Whether each item of `x` is the first with its key. The pass that writes each key's first position marks it as it goes, with no second pass over `x`. Wider keys mark the items that are their own class.
 #[inline(never)]
 pub fn firsts<K: Key>(x: &[K]) -> Vec<bool> {
-    let Some((min, mut table)) = table(x, usize::MAX) else { return first_mask(&first_classes(x, |n| n)) };
+    let Some((min, mut table)) = table(x, u32::MAX) else { return first_mask(&first_classes(x, |n| n)) };
     let mut mask = vec![false; x.len()];
     write_first(x, min, &mut table, None, |p, new| mask[p] |= new);
     mask
@@ -211,16 +211,25 @@ pub struct Numbered {
 }
 
 impl Numbered {
-    /// Folds each class of `data` in position order by `R`, starting from `R`'s exact identity, and whether every fold fits.
+    /// Folds each class of `data` by `R`, starting from `R`'s exact identity, and whether every fold fits. With few classes, a class's items lie close together, and each step of its total waits on the last through memory. So with at most `R::SPLIT` classes, each class folds into four totals, one for each position modulo 4, which the end merges in turn. A float sum then adds its items in another order.
     #[inline]
     pub fn fold<T: Copy, R: crate::reduce::Reduction<T>>(&self, data: &[T]) -> (Vec<R::Total>, bool) {
-        let (mut totals, mut fits) = (vec![R::identity(); self.firsts.len()], true);
-        for (&c, &x) in self.numbers.iter().zip(data) {
+        if self.firsts.len() <= R::SPLIT { self.folded::<T, R, 4>(data) } else { self.folded::<T, R, 1>(data) }
+    }
+
+    /// [`Self::fold`] with `PARTS` totals for each class, each taking the items at one position modulo `PARTS`. A constant `PARTS` of 1 leaves one total for each class and no merge.
+    #[inline]
+    fn folded<T: Copy, R: crate::reduce::Reduction<T>, const PARTS: usize>(&self, data: &[T]) -> (Vec<R::Total>, bool) {
+        let (mut totals, mut fits) = (vec![R::identity(); self.firsts.len() * PARTS], true);
+        for (k, (&c, &x)) in self.numbers.iter().zip(data).enumerate() {
+            let i = c as usize * PARTS + k % PARTS;
             let ok;
-            (totals[c as usize], ok) = R::checked(totals[c as usize], x);
+            (totals[i], ok) = R::checked(totals[i], x);
             fits &= ok;
         }
-        (totals, fits)
+        if PARTS == 1 { return (totals, fits); }
+        let merged = totals.chunks_exact(PARTS).map(|t| t[1..].iter().fold(t[0], |a, &b| { let (m, ok) = R::merge(a, b); fits &= ok; m })).collect();
+        (merged, fits)
     }
 
     /// The number of items in each class.
@@ -312,7 +321,7 @@ pub fn view_find(pattern: View<'_>, pattern_shape: &[usize], target: View<'_>, s
 #[inline(never)]
 pub fn class_counts<K: Key>(x: &[K]) -> Vec<usize> {
     let Some((min, counts)) = counts(x) else { return numbered(&classes(x)).counts() };
-    let mut first = vec![usize::MAX; counts.len()];
+    let mut first = vec![u32::MAX; counts.len()];
     first_positions(x, min, &mut first, Some(counts.iter().filter(|&&c| c > 0).count())).into_iter().map(|f| counts[x[f].key().wrapping_sub(min) as usize])
         .collect()
 }
@@ -356,7 +365,7 @@ pub fn bins<K: Key>(boundaries: &[K], values: &[K]) -> Vec<u32> {
 }
 
 /// The least key of `x`, and a table with an entry for each key from it to the greatest, each `empty`, when `table_size` allows that range. `Key::range` finds the least and the greatest key in one pass.
-fn table<K: Key>(x: &[K], empty: usize) -> Option<(i64, Vec<usize>)> {
+fn table<K: Key, E: Copy>(x: &[K], empty: E) -> Option<(i64, Vec<E>)> {
     if x.is_empty() { return None; }
     let (min, max) = K::range(x);
     table_size(max.abs_diff(min), x.len()).map(|range| (min, vec![empty; range]))
@@ -365,16 +374,16 @@ fn table<K: Key>(x: &[K], empty: usize) -> Option<(i64, Vec<usize>)> {
 /// The number of entries in a table indexed by `len` keys that span `span + 1` values, when that's at most twice `len`, or 1024.
 fn table_size(span: u64, len: usize) -> Option<usize> { usize::try_from(span).ok()?.checked_add(1).filter(|&r| r <= len.saturating_mul(2).max(1024)) }
 
-/// Writes the first position of each key in `x` to its entry in `first`, whose entries start at key `min` and hold `usize::MAX` until written. The pass runs forward and stops after the first block of 64 positions that fills the entry of the last key `x` holds. Keys that fill their range, such as Booleans, soon do. Keys that leave gaps in their range, as the characters of text do, never fill it. A caller that knows how many keys `x` holds passes that number as `present`. Otherwise, where the keys span at most 128 values, the pass counts them once after `STALL` blocks in a row with no new key. It stops when it has found them all. `found` hears of each position the pass reads, with whether it holds its key's first item, so a caller can record or mark first positions in the same pass. Each entry takes its new position by a select, not a branch. The table is a slice, not a `Vec`, so that the compiler keeps its bounds in registers.
-fn write_first<'t, K: Key>(x: &[K], min: i64, first: &'t mut [usize], present: Option<usize>, mut found: impl FnMut(usize, bool)) -> &'t [usize] {
+/// Writes the first position of each key in `x` to its entry in `first`, whose entries start at key `min` and hold `u32::MAX` until written, as no position of a slice of at most `u32::MAX` items does. The pass runs forward and stops after the first block of 64 positions that fills the entry of the last key `x` holds. Keys that fill their range, such as Booleans, soon do. Keys that leave gaps in their range, as the characters of text do, never fill it. A caller that knows how many keys `x` holds passes that number as `present`. Otherwise, where the keys span at most 128 values, the pass counts them once after `STALL` blocks in a row with no new key. It stops when it has found them all. `found` hears of each position the pass reads, with whether it holds its key's first item, so a caller can record or mark first positions in the same pass. Each entry takes its new position by a select, not a branch. The table is a slice, not a `Vec`, so that the compiler keeps its bounds in registers.
+fn write_first<'t, K: Key>(x: &[K], min: i64, first: &'t mut [u32], present: Option<usize>, mut found: impl FnMut(usize, bool)) -> &'t [u32] {
     let (mut empty, mut stall, mut counted) = match present { Some(h) => (h, 0, true), None => (first.len(), 0, first.len() > 128) };
     for (b, block) in x.chunks(64).enumerate() {
         let before = empty;
         for (j, &n) in block.iter().enumerate() {
             let entry = &mut first[n.key().wrapping_sub(min) as usize];
-            let new = *entry == usize::MAX;
+            let new = *entry == u32::MAX;
             empty -= usize::from(new);
-            *entry = if new { b * 64 + j } else { *entry };
+            *entry = if new { (b * 64 + j) as u32 } else { *entry };
             found(b * 64 + j, new);
         }
         stall = if empty == before { stall + 1 } else { 0 };
@@ -399,7 +408,7 @@ fn held<K: Key>(x: &[K], min: i64) -> usize {
 }
 
 /// The first position of each key of `x`, in ascending order, from the one pass of `write_first`, which writes `first`'s entries as it does for its other callers. The pass meets keys in order of their first positions, so recording each new one keeps the list in order with no sort.
-fn first_positions<K: Key>(x: &[K], min: i64, first: &mut [usize], present: Option<usize>) -> Vec<usize> {
+fn first_positions<K: Key>(x: &[K], min: i64, first: &mut [u32], present: Option<usize>) -> Vec<usize> {
     // Every position goes to the end of the list, which grows only where the position is new, so the pass needs no branch.
     let (mut positions, mut count) = (vec![0; first.len().min(x.len()) + 1], 0);
     write_first(x, min, first, present, |p, new| {
@@ -475,11 +484,11 @@ impl Grouped {
 }
 
 /// The classes of `x` numbered from 0 in order of first position, as a table from each key's offset from `min` to its class number, with `min` and each class's first position, or `None` when its keys span too many values for a table. The table entry of each key takes its first position, then its class number, so no pass gives each item its first position.
-fn numbered_table<K: Key>(x: &[K]) -> Option<(i64, Vec<usize>, Vec<usize>)> {
+fn numbered_table<K: Key>(x: &[K]) -> Option<(i64, Vec<u32>, Vec<usize>)> {
     checked_len(x);
-    let (min, mut table) = table(x, usize::MAX)?;
+    let (min, mut table) = table(x, u32::MAX)?;
     let firsts = first_positions(x, min, &mut table, None);
-    for (g, &f) in firsts.iter().enumerate() { table[x[f].key().wrapping_sub(min) as usize] = g; }
+    for (g, &f) in firsts.iter().enumerate() { table[x[f].key().wrapping_sub(min) as usize] = g as u32; }
     Some((min, table, firsts))
 }
 
@@ -489,8 +498,8 @@ pub fn grouped_keys<K: Key>(x: &[K]) -> Option<Grouped> {
     let (min, table, firsts) = numbered_table(x)?;
     let table = &table[..];
     // With two keys, each item's class is its offset from the lower key, flipped when the higher key comes first.
-    Some(if let [lower, _] = *table { grouped_classes(x, firsts, move |k| k.key().wrapping_sub(min) as usize ^ lower) }
-    else { grouped_classes(x, firsts, move |k| table[k.key().wrapping_sub(min) as usize]) })
+    Some(if let [lower, _] = *table { grouped_classes(x, firsts, move |k| k.key().wrapping_sub(min) as usize ^ lower as usize) }
+    else { grouped_classes(x, firsts, move |k| table[k.key().wrapping_sub(min) as usize] as usize) })
 }
 
 /// The classes of `x` as [`Numbered`] gives them, numbered as `grouped_keys` numbers them, or `None` when its keys span too many values for a table. A fold of each class reads these numbers in one pass, where each class's positions would take a pass to build and a gather to read. A pass that numbers each key as it first meets it, in place of `numbered_table`, measured slower: it stores to a table entry for every item, and repeated keys then wait on those stores.
@@ -499,10 +508,10 @@ pub fn numbered_keys<K: Key>(x: &[K]) -> Option<Numbered> {
     let (min, table, firsts) = numbered_table(x)?;
     let (at, mut numbers) = (move |k: K| k.key().wrapping_sub(min) as usize, Vec::new());
     if let [lower, _] = table[..] {
-        crate::pairs(crate::Arg::Many(x), crate::Arg::One(()), x.len(), &mut numbers, |k, ()| ((at(k) ^ lower) as u32, true));
+        crate::pairs(crate::Arg::Many(x), crate::Arg::One(()), x.len(), &mut numbers, |k, ()| ((at(k) ^ lower as usize) as u32, true));
     } else {
         let table = &table[..];
-        crate::pairs(crate::Arg::Many(x), crate::Arg::One(()), x.len(), &mut numbers, |k, ()| (table[at(k)] as u32, true));
+        crate::pairs(crate::Arg::Many(x), crate::Arg::One(()), x.len(), &mut numbers, |k, ()| (table[at(k)], true));
     }
     Some(Numbered { firsts, numbers })
 }
@@ -649,24 +658,47 @@ pub(crate) fn sorted<K: RadixKey>(mut keys: Vec<K>) -> (Vec<K>, Vec<u32>) {
     (keys, order)
 }
 
+/// How many of `keys` hold each value of each of their bytes, from the lowest byte.
+fn byte_counts<K: RadixKey>(keys: &[K]) -> [[u32; 256]; 8] {
+    let mut counts = [[0u32; 256]; 8];
+    for &k in keys { for (b, count) in counts[..K::BYTES].iter_mut().enumerate() { count[k.byte(b)] += 1; } }
+    counts
+}
+
+/// Moves each of `keys`, with its payload in `carried`, to the next place in `dest` and `places` of the bucket of its byte `b`, as `next` gives it.
+fn scattered<K: RadixKey, P: Copy>(keys: &[K], carried: &[P], b: usize, next: &mut [usize; 256], dest: &mut [K], places: &mut [P]) {
+    let carried = &carried[..keys.len()];
+    for j in 0..keys.len() {
+        let place = &mut next[keys[j].byte(b)];
+        (dest[*place], places[*place]) = (keys[j], carried[j]);
+        *place += 1;
+    }
+}
+
 /// Sorts `keys` in place, keeping the order of equal keys, and moves `payload` with them: an LSD radix sort, one byte at a time from the lowest, which skips any byte that is the same in every key. Each pass moves the keys and payload into `spare`, which holds as many, and the two then trade places. Where the passes end in `spare`, a last copy brings the result back. Keys and payload move as two arrays, so a pass over 64-bit keys with `u32` positions moves 12 bytes for each, where pairs would move 16. A grade carries positions. A value sort carries nothing, since its keys read back to its values. A key no wider than its float keeps each pass's bytes in proportion to the float's width.
 fn radix<K: RadixKey, P: Copy + Send + Sync>(keys: &mut [K], payload: &mut [P], spare: (&mut [K], &mut [P])) {
     let n = keys.len();
     if n > RADIX_PIECE && crate::parallel::threads() > 1 { return radix_pieces(keys, payload, spare); }
-    let mut counts = [[0u32; 256]; 8];
-    let counts = &mut counts[..K::BYTES];
-    for &k in keys.iter() { for (b, count) in counts.iter_mut().enumerate() { count[k.byte(b)] += 1; } }
+    let counts = byte_counts(keys);
+    let counts = &counts[..K::BYTES];
     let (mut from, mut to, mut passes) = ((keys, payload), spare, 0);
     for (b, count) in counts.iter().enumerate() {
         if count.contains(&(n as u32)) { continue; }
         let (mut next, mut total) = ([0usize; 256], 0);
         for (place, &c) in next.iter_mut().zip(count) { (*place, total) = (total, total + c as usize) }
         let (source, carried, dest, places) = (&from.0[..n], &from.1[..n], &mut to.0[..n], &mut to.1[..n]);
-        for j in 0..n {
-            let place = &mut next[source[j].byte(b)];
-            (dest[*place], places[*place]) = (source[j], carried[j]);
-            *place += 1;
-        }
+        // Where nearly every key shares the byte, as the top byte of floats of one sign and size does, a block of 64 keys that all share it moves with one copy. Moved one at a time, each key's place would wait on the store of the key before. Such a bucket holds at least 63 keys in 64. The test reads the first key's bucket, which is that bucket unless the first key is one of the few outside it. The keys then move one at a time.
+        let heavy = source[0].byte(b);
+        if count[heavy] as usize >= n - n / 64 {
+            for (keys, carried) in source.chunks(64).zip(carried.chunks(64)) {
+                if keys.iter().fold(true, |all, k| all & (k.byte(b) == heavy)) {
+                    let at = next[heavy];
+                    next[heavy] = at + keys.len();
+                    dest[at..next[heavy]].copy_from_slice(keys);
+                    places[at..next[heavy]].copy_from_slice(carried);
+                } else { scattered(keys, carried, b, &mut next, dest, places) }
+            }
+        } else { scattered(source, carried, b, &mut next, dest, places) }
         (from, to, passes) = (to, from, passes + 1);
     }
     if passes % 2 == 1 {
@@ -689,7 +721,7 @@ fn radix_pieces<K: RadixKey, P: Copy + Send + Sync>(keys: &mut [K], payload: &mu
     let piece = move |p: usize| p * size..n.min((p + 1) * size);
     let mut every = vec![[[0u32; 256]; 8]; count];
     pieces_of(&mut every, 1, usize::MAX, &|p, c| {
-        for &k in &keys[piece(p)] { for b in 0..K::BYTES { c[0][b][k.byte(b)] += 1; } }
+        c[0] = byte_counts(&keys[piece(p)]);
         true
     });
     let (mut from, mut to, mut passes) = ((keys, payload), spare, 0);

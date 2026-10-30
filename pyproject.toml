@@ -39,6 +39,7 @@ cache-keys = [{ file = "pyproject.toml" }, { file = "Cargo.toml" }, { file = "py
 testpaths = ["tests"]
 timeout = 60
 timeout_func_only = true
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.nbdev]
 lib_path = "python/rustymath"

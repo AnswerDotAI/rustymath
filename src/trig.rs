@@ -27,7 +27,7 @@ pub(crate) fn tan<R: Native, const FUSED: bool>(x: R) -> R { if within(x) { fast
 /// Writes the function objects of sine, cosine and tangent. Each slice form gives every item the fast reduction, and the rare items beyond `limit` the scalar function, with its exact reduction, in a second pass. A closure's type comes from where it's written. Closures written once in a shared function would give all three kinds one loop that tests the kind on every item. Each object writes its own closures, so that its loop has its kind fixed. The objects never fail: ±∞ give NaN, which is each function's value there, as NaN is the value of ∞ - ∞.
 macro_rules! objects {
     ($($object:ident = $name:ident: $kind:expr;)+) => {$(
-        #[doc = concat!("[`", stringify!($name), "`](crate::", stringify!($name), ") as a function object. Its slice form `many` gives every")]
+        #[doc = concat!("[`", stringify!($name), "`](crate::", stringify!($name), ") as a function object. Because the exact reduction for a large item branches, a loop that calls `", stringify!($name), "` doesn't vectorize. The slice form `many` vectorizes. It gives every")]
         /// item the fast reduction, and only the rare large ones the exact reduction.
         #[derive(Clone, Copy, Debug)]
         pub struct $object;

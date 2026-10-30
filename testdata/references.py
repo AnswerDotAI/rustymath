@@ -114,6 +114,11 @@ INCOMPLETE = dict(
     gammaincc=(lambda a, x: mp.gammainc(a, x, mp.inf, regularized=True), gamma_sets),
     betainc=(lambda a, b, x: mp.betainc(a, b, 0, x, regularized=True), beta_sets),
 )
+# The special functions of two arguments that need no looser bound, with ranges for each argument. polygamma's order is whole.
+PAIRS = dict(
+    polygamma=(lambda n, x: mp.polygamma(int(n), x), [(range(1, 4), (0, 3)), (range(1, 21), (0.5, 60)), (range(1, 6), (10, 1e6))]),
+    beta=(mp.beta, [((0.1, 5), (0.1, 5)), ((1, 100), (1, 100)), ((-4.9, 5), (0.5, 20))]),
+)
 SAMPLES = 512
 
 def narrow(x):
@@ -137,11 +142,13 @@ def special_functions():
         rng = random.Random(name)
         rows += [f'{name} {show(x)} {show(y)}' for x, y in SPECIAL[name]]
         rows += [f'{name} {show(x)} {show(f64(guarded(f)(mp.mpf(x))))}' for x in inputs(rng, ranges, extra) if not special(x)]
-    for name, (f, sets) in INCOMPLETE.items():
+    # A `range` gives whole numbers, as polygamma's order. Other ranges give floats at both widths.
+    draw = lambda rng, r: float(rng.choice(r)) if isinstance(r, range) else narrow(rng.uniform(*r))
+    for name, (f, sets) in {**INCOMPLETE, **PAIRS}.items():
         rng = random.Random(name)
         for ranges in sets:
             for _ in range(SAMPLES):
-                xs = [narrow(rng.uniform(lo, hi)) for lo, hi in ranges]
+                xs = [draw(rng, r) for r in ranges]
                 if not special(*xs): rows.append(' '.join([name, *map(show, xs), show(f64(guarded(f)(*map(mp.mpf, xs))))]))
     (HERE/'mpmath.txt').write_text('\n'.join(rows) + '\n')
 

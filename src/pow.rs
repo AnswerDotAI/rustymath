@@ -1,4 +1,4 @@
-//! Powers and roots. `pow` and `root` compute e^(y ln |x|): at f64 through `table`'s logarithm and exponential, and for narrower types through `ln_narrow` and `exp_narrow` in f64. A whole exponent from 2 to `MULTIPLIED` squares and multiplies instead. A degree of 2 or 3 takes `sqrt` or `cbrt`. `cbrt` refines an estimate taken from x's bits with Newton steps. `hypot` scales both arguments by a power of two before squaring them. See `THIRD-PARTY.md`.
+//! Powers and roots. `pow` and `root` compute e^(y ln |x|): at f64 through `table`'s logarithm and exponential, and for narrower types through `ln_narrow` and `exp_narrow` in f64. `Exponent` sends a whole exponent from 1 to `MULTIPLIED`, or to `COMPENSATED` where the target fuses multiply-add, to squaring and multiplying instead (`recipe::power`). One of 1 or 3 halves takes √x first. A degree of 2 or 3 takes `sqrt` or `cbrt`. `cbrt` refines an estimate taken from x's bits with Newton steps. `hypot` scales both arguments by a power of two before squaring them. See `THIRD-PARTY.md`.
 use crate::{Arg, dd::Double, exp::exp_narrow, float::Native, ln::ln_narrow, slice::Total, table};
 use num_complex::Complex;
 
@@ -8,7 +8,7 @@ fn positive_finite(a: f64) -> bool { a.to_bits().wrapping_sub(1) < f64::INFINITY
 
 /// Whether y is a whole number, and whether it is an odd one. Infinities count as even whole numbers, and NaN as neither.
 #[inline]
-fn parity<R: Native>(y: R) -> (bool, bool) {
+pub(crate) fn parity<R: Native>(y: R) -> (bool, bool) {
     let half = R::narrow(0.5) * y;
     let whole = y.trunc() == y;
     (whole, whole & (half.trunc() != half))
@@ -43,18 +43,22 @@ pub(crate) fn pow<R: Native, const FUSED: bool>(x: R, y: R) -> R { if R::WIDE { 
 #[inline(always)]
 pub(crate) fn root<R: Native, const FUSED: bool>(n: R, y: R) -> R { if R::WIDE { root_one::<R, FUSED>(n, y) } else { root_any::<R, FUSED>(n, y) } }
 
-/// `pow` with one branch to its fast path wherever that applies, at every width, as Arm's scalar `pow` and `powf` do. A whole exponent from 2 to `MULTIPLIED` takes another branch, to squaring and multiplying. `Pow`'s scalar form takes it, because each call computes one value, which no loop around it can vectorize. At f64 the fast path is `fast`, and at narrower widths `fast_single`.
+/// `pow` with one branch to its fast path wherever that applies, at every width, as Arm's scalar `pow` and `powf` do. An exponent that `Exponent::of` doesn't send to the general route takes another branch, to squaring and multiplying. `Pow`'s scalar form takes it, because each call computes one value, which no loop around it can vectorize. At f64 the fast path is `fast`, and at narrower widths `fast_single`.
 #[inline(always)]
 pub(crate) fn pow_one<R: Native, const FUSED: bool>(x: R, y: R) -> R {
-    if let Some((m, negative)) = small_whole(y) {
-        return if negative { counted!(m, K => times::<R, K, true>(x)) } else { counted!(m, K => times::<R, K, false>(x)) };
+    match Exponent::of(y.wide()) {
+        Exponent::Whole { m, negative } if m > MULTIPLIED => times(Exponent::Whole { m, negative }, x),
+        Exponent::Whole { m, negative: true } => counted!(m, K => times(Exponent::Whole { m: K, negative: true }, x)),
+        Exponent::Whole { m, negative: false } => counted!(m, K => times(Exponent::Whole { m: K, negative: false }, x)),
+        Exponent::Halves { m, negative: true } => halved!(m, K => times(Exponent::Halves { m: K, negative: true }, x)),
+        Exponent::Halves { m, negative: false } => halved!(m, K => times(Exponent::Halves { m: K, negative: false }, x)),
+        Exponent::General => match if R::WIDE { fast::<R, FUSED>(x, y, false) } else { fast_single::<R, FUSED>(x, y, false) } { Some(r) => r, None => pow_any::<R, FUSED>(x, y) },
     }
-    match if R::WIDE { fast::<R, FUSED>(x, y, false) } else { fast_single::<R, FUSED>(x, y, false) } { Some(r) => r, None => pow_any::<R, FUSED>(x, y) }
 }
 
-/// The root of degree 2 through `sqrt`, with the values that `root_any` gives at -0 and -∞: 0 and ∞.
+/// The root of degree 2, as `recipe::root2` gives it.
 #[inline(always)]
-fn root2<R: Native>(y: R) -> R { if y == R::neg_infinity() { -y } else { y.sqrt() + R::zero() } }
+fn root2<R: Native>(y: R) -> R { crate::recipe::root2::<R, _>(&crate::recipe::Floats, y) }
 
 /// `root` with one branch, as `pow_one` has, and one each to `sqrt` and `cbrt` for degrees 2 and 3. `Root`'s scalar form takes it.
 #[inline(always)]
@@ -110,22 +114,42 @@ fn root_any<R: Native, const FUSED: bool>(n: R, y: R) -> R {
     if (n == R::zero()) | !n.is_finite() { R::nan() } else { r }
 }
 
-/// The greatest whole exponent that `pow` reaches by squaring and multiplying. x^8 takes three roundings and its reciprocal a fourth. Four roundings keep every such result within 4 ulps.
-const MULTIPLIED: u32 = 8;
+/// The greatest whole exponent that `pow` raises to by squaring and multiplying in single words (`recipe::multiplied`). Without fused multiply-add, larger exponents take the general route. `Pow`'s slice form compiles a loop for each such exponent (`counted!`).
+pub(crate) const MULTIPLIED: u32 = 8;
 
-/// The magnitude m of a whole y from 2 to `MULTIPLIED`, and whether y is negative.
-#[inline(always)]
-fn small_whole<R: Native>(y: R) -> Option<(u32, bool)> {
-    let a = y.abs();
-    // Clamped to the range and truncated, a is unchanged only if it's a whole number in that range. That one comparison is one branch. Separate tests compile to separate branches on x86, which mispredict for exponents in a random order.
-    let m = a.max(R::narrow(2.0)).min(R::narrow(MULTIPLIED.into())).trunc();
-    (m == a).then(|| (a.wide() as u32, y < R::zero()))
+/// The greatest whole exponent that `pow` raises to by squaring and multiplying where the target fuses multiply-add (`FUSED`). Above `MULTIPLIED`, every step but those of bit position 0 runs in double words (`recipe::whole`). Larger exponents take the general route. From 64 on, squaring and multiplying is slower than the general route for some exponents.
+pub(crate) const COMPENSATED: u32 = 63;
+
+/// How [`Pow`] raises to an exponent y. Its slice form reads it once for a constant y, and its scalar form for each item. The JIT's lowering of a constant power reads it too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exponent {
+    /// x^m, or x^-m where `negative`, by squaring and multiplying (`recipe::power`): a whole y of magnitude m from 1 to `MULTIPLIED`, or to `COMPENSATED` where the target fuses multiply-add. No result fails.
+    Whole { m: u32, negative: bool },
+    /// √x^m, or 1/√x^m where `negative`: a y of m halves, for m of 1 or 3. √x^3 carries √x's rounding three times and two roundings of its own, within 4 ulps. 1/√x^3 adds the reciprocal's rounding and passes 4 ulps, as rustymath's accuracy page lists. √x gives `pow`'s values at -0 and -∞, and a negative finite x has no real power, as on the general route.
+    Halves { m: u32, negative: bool },
+    /// Any other y: e^(y ln |x|).
+    General,
 }
 
-/// `$body` with `$k` a const for the magnitude m that `small_whole` gives, from 2 to `MULTIPLIED`.
+impl Exponent {
+    /// The route for y.
+    #[inline(always)]
+    pub fn of(y: f64) -> Self {
+        let (a, negative) = (y.abs(), y < 0.0);
+        // Clamped to the range and truncated, a is unchanged only if it's a whole number in that range. That one comparison is one branch. Separate tests compile to separate branches on x86, which mispredict for exponents in a random order.
+        let most = if crate::FUSED { COMPENSATED } else { MULTIPLIED };
+        let m = a.max(1.0).min(most.into()).trunc();
+        if m == a { return Self::Whole { m: m as u32, negative }; }
+        let halves = a + a;
+        if (halves == 1.0) | (halves == 3.0) { Self::Halves { m: halves as u32, negative } } else { Self::General }
+    }
+}
+
+/// `$body` with `$k` a const for the magnitude m of `Exponent::Whole`, from 1 to `MULTIPLIED`.
 macro_rules! counted {
     ($m:expr, $k:ident => $body:expr) => {
         match $m {
+            1 => { const $k: u32 = 1; $body }
             2 => { const $k: u32 = 2; $body }
             3 => { const $k: u32 = 3; $body }
             4 => { const $k: u32 = 4; $body }
@@ -138,25 +162,51 @@ macro_rules! counted {
 }
 use counted;
 
-/// x^K, or 1/x^K when `NEGATIVE`, by squaring and multiplying. A result that the float holds exactly comes out exactly.
-#[inline(always)]
-fn times<R: Native, const K: u32, const NEGATIVE: bool>(x: R) -> R {
-    let (mut r, mut b, mut k) = (if K & 1 == 1 { x } else { R::one() }, x, K >> 1);
-    while k > 0 {
-        b = b * b;
-        if k & 1 == 1 { r = r * b; }
-        k >>= 1;
-    }
-    if NEGATIVE { R::one() / r } else { r }
+/// `$body` with `$k` a const for the count m of `Exponent::Halves`, 1 or 3.
+macro_rules! halved {
+    ($m:expr, $k:ident => $body:expr) => { if $m == 1 { const $k: u32 = 1; $body } else { const $k: u32 = 3; $body } };
+}
+use halved;
+
+/// One `each` loop for each bit length of a whole exponent m from `MULTIPLIED` + 1 to `COMPENSATED`, 4 to 6, and each sign, with a `recipe::step` written out for each bit position below m's highest (`steps!`). Rolled, as LLVM leaves such a loop at opt-level 2, those steps would stop the loop around them vectorizing.
+macro_rules! unrolled {
+    ($m:expr, $negative:expr, $x:expr, $n:expr, $out:expr; $($len:literal: [$($i:literal)+]),+) => {
+        match (u32::BITS - $m.leading_zeros(), $negative) {
+            $(
+                ($len, false) => each!([$x], $n, $out, |[x]| Total(steps!($m, false, x; $($i)+))),
+                ($len, true) => each!([$x], $n, $out, |[x]| Total(steps!($m, true, x; $($i)+))),
+            )+
+            _ => unreachable!("a whole exponent from `MULTIPLIED` + 1 to `COMPENSATED`"),
+        }
+    };
 }
 
-/// `Pow`'s and `WholePow`'s slice form. A constant whole exponent from 2 to `MULTIPLIED` squares and multiplies. Those items never fail, and their loop vectorizes with no test of each result. Any other call computes every item the fast way, then redoes only the rare items with special values.
+/// `recipe::whole` of `$x`, with a `recipe::step` for each bit position `$i` of `$m`.
+macro_rules! steps {
+    ($m:expr, $negative:literal, $x:expr; $($i:literal)+) => {{
+        let o = &crate::recipe::Floats;
+        let m = $m;
+        let (b, mut error) = crate::recipe::base(o, $negative, $x);
+        let mut w = (b, None);
+        $( w = crate::recipe::step(o, w, b, m, $i, &mut error); )+
+        w.0
+    }};
+}
+
+/// `recipe::power` on one float, for an exponent off the general route. `counted!` and `halved!` make the exponent's magnitude a const in each arm, so each loop unrolls.
+#[inline(always)]
+fn times<R: Native>(e: Exponent, x: R) -> R { crate::recipe::power::<R, _>(&crate::recipe::Floats, e, x).expect("an exponent off the general route") }
+
+/// `Pow`'s slice form, which `WholePow`'s runs too. A constant exponent takes its `Exponent` route. Whole exponents never fail, and their loop vectorizes with no test of each result. Any other call computes every item the fast way, then redoes only the rare items with special values.
 macro_rules! pow_many {
     ($x:expr, $y:expr, $n:expr, $out:expr) => {
-        match if let Arg::One(k) = $y { small_whole(k) } else { None } {
-            Some((m, true)) => counted!(m, K => each!([$x], $n, $out, |[x]| Total(times::<_, K, true>(x)))),
-            Some((m, false)) => counted!(m, K => each!([$x], $n, $out, |[x]| Total(times::<_, K, false>(x)))),
-            None => two_pass!([$x, $y], $n, $out, |[a, b]| fast::<_, { crate::FUSED }>(a, b, false), |[a, b]| pow_any::<_, { crate::FUSED }>(a, b)),
+        match if let Arg::One(k) = $y { Exponent::of(<_ as crate::float::Float>::wide(k)) } else { Exponent::General } {
+            Exponent::Whole { m, negative } if m > MULTIPLIED => unrolled!(m, negative, $x, $n, $out; 4: [2 1 0], 5: [3 2 1 0], 6: [4 3 2 1 0]),
+            Exponent::Whole { m, negative: true } => counted!(m, K => each!([$x], $n, $out, |[x]| Total(times(Exponent::Whole { m: K, negative: true }, x)))),
+            Exponent::Whole { m, negative: false } => counted!(m, K => each!([$x], $n, $out, |[x]| Total(times(Exponent::Whole { m: K, negative: false }, x)))),
+            Exponent::Halves { m, negative: true } => halved!(m, K => each!([$x], $n, $out, |[x]| times(Exponent::Halves { m: K, negative: true }, x))),
+            Exponent::Halves { m, negative: false } => halved!(m, K => each!([$x], $n, $out, |[x]| times(Exponent::Halves { m: K, negative: false }, x))),
+            Exponent::General => two_pass!([$x, $y], $n, $out, |[a, b]| fast::<_, { crate::FUSED }>(a, b, false), |[a, b]| pow_any::<_, { crate::FUSED }>(a, b)),
         }
     };
 }
@@ -175,7 +225,7 @@ forms!(WrappingPow at Complex<f32>, Complex<f64>: |_, [x, y]| crate::Binary::one
 /// [`Pow`] for a whole exponent, where every real base has a real power and no result fails. Its forms are `Pow`'s. A caller passes it whole exponents only.
 #[derive(Clone, Copy, Debug)]
 pub struct WholePow;
-forms!(WholePow at real: |_, [x, y]| Total(pow_one::<_, { crate::FUSED }>(x, y)), many |_, [x, y], n, out| pow_many!(x, y, n, out));
+forms!(WholePow at real: |_, [x, y]| Total(pow_one::<_, { crate::FUSED }>(x, y)), many |_, [x, y], n, out| crate::slice::Forms::slice(&Pow, [x, y], n, out));
 
 /// [`root`](crate::root) as a function object, with a scalar form and a slice form that work as [`Pow`]'s do. A constant degree of 2 or 3 takes `sqrt` or `cbrt`.
 #[derive(Clone, Copy, Debug)]

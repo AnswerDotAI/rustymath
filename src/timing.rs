@@ -1,8 +1,8 @@
-//! What speed tests share: the machine's timing lock, the timing loop, the copy that costs count in with the copy times stored for each machine that runs them, the format of cost lines, the format of budget files, the CPU that budgets were set for, and the retries. rustymath's and basedpl's speed tests use all of it, and basedpl's browser build uses all but the lock.
+//! What speed tests share: the machine's timing lock, the timing loop, the copy that costs count in with the copy times stored for each machine that runs them, the copy of a case's footprint that its line shows, the format of cost lines, the format of budget files, the CPU that budgets were set for, and the retries. rustymath's and basedpl's speed tests use all of it, and basedpl's browser build uses all but the lock.
 //!
-//! The lock keeps timings apart from builds and test runs on one machine. A timing takes it exclusively. A build or a test run takes it shared. It is an `flock` on the file `LOCK`. `fastws.cargo.timing_lock` takes the same lock from Python. The browser build has no timing lock.
+//! The lock keeps timings apart from builds and test runs on one machine. A timing takes it exclusively. A build or a test run takes it shared. It is an `flock` on the file `LOCK`. A timing holds a second file, `GATE`, exclusively from before it takes `LOCK` until it releases it, and a shared hold passes `GATE` before it takes `LOCK`. A waiting timing then stops new builds and test runs from starting, and it runs once the holds already taken end. `fastws.timelock` takes the same locks from Python. The browser build has no timing lock.
 #[cfg(not(target_arch = "wasm32"))]
-pub use lock::{Hold, LOCK, exclusive, shared};
+pub use lock::{GATE, Hold, LOCK, exclusive, shared};
 /// The clock that timings and `parallel`'s rounds read: the browser's in a browser build, where `std::time::Instant` panics.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) use std::time::Instant;
@@ -122,15 +122,31 @@ pub fn copy_time<T: Copy + Default + Neg<Output = T>>(items: usize) -> CopyTime 
     t
 }
 
-/// One copy's time for each item, measured on `items` items of type `T`: the fastest of `RUNS` copies of the same two buffers, which stay in cache where they fit. Copying both ways first maps every page, so no copy reads the shared page of zeros that a fresh allocation reads as.
+/// One copy's time for each item, measured on `items` items of type `T`: the fastest of `RUNS` copies between the two parts of one block, which stay in cache where they fit. The destination starts a whole number of 4 KB pages after the source, wherever the allocator puts the block. A store then never shares the low 12 bits of its address with a load just ahead of it, which on x86 stalls the load (4K aliasing). Copying both ways first maps every page, so no copy reads the shared page of zeros that a fresh allocation reads as.
 fn measured_copy<T: Copy + Default + Neg<Output = T>>(items: usize) -> f64 {
-    let (mut data, mut out) = (vec![T::default(); items], vec![T::default(); items]);
-    copy(&data, &mut out);
-    copy(&out, &mut data);
+    let gap = items.next_multiple_of(4096 / size_of::<T>());
+    let mut block = vec![T::default(); gap + items];
+    let (data, out) = block.split_at_mut(gap);
+    let (data, out) = (&mut data[..items], &mut out[..items]);
+    copy(data, out);
+    copy(out, data);
     fastest(|_| {
-        copy(std::hint::black_box(&data), &mut out);
-        std::hint::black_box(&mut out);
+        copy(std::hint::black_box(&*data), out);
+        std::hint::black_box(&mut *out);
     }) / items.max(1) as f64
+}
+
+/// The bytes of a case's footprint, its input and the most it holds at once, above which the speed tests measure a copy of it: 1 MiB, the L2 cache of each core on CI's runner. A larger footprint reaches the L3 cache and memory, which the runner shares with other VMs on its host. In basedpl's `Test` runs 56 to 62, cases with footprints of up to 1.5 MB held their times, while cases from about 2 MB up swung by up to 4 times between runs.
+pub const CORE_CACHE_BYTES: usize = 1 << 20;
+
+/// A case's footprint in bytes, and the time for each item of a copy whose source and destination take as many bytes together, measured beside the case.
+#[derive(Clone, Copy, Debug)]
+pub struct Footprint { pub bytes: usize, pub seconds: f64 }
+
+/// A case's [`Footprint`], with its copy measured now: the bytes of `items` items of type `T` and the `held` bytes that the case held at once, as `memory::peak_held` counts them. `None` for a footprint of at most [`CORE_CACHE_BYTES`]. The speed tests measure it beside each case and print it in the case's line, so the logs show whether a case's time follows its copy's.
+pub fn footprint<T: Copy + Default + Neg<Output = T>>(items: usize, held: usize) -> Option<Footprint> {
+    let bytes = items * size_of::<T>() + held;
+    (bytes > CORE_CACHE_BYTES).then(|| Footprint { bytes, seconds: measured_copy::<T>(bytes / (2 * size_of::<T>())) })
 }
 
 /// A line saying what a copy of `t`'s items costs for each item, and whether that time was stored for this machine or measured, as the speed tests print it before their costs. A measured copy that fits in `CACHED_BYTES` adds that it belongs in [`COPIES`]: the line reaches the log where the speed tests' own lines do.
@@ -143,37 +159,134 @@ pub fn copy_line(t: &CopyTime) -> String {
     format!("copy of {} {}-byte items: {:.3} ns an item, {source}", t.items, t.bytes, t.seconds * 1e9)
 }
 
-/// A case's line in a speed test's log: its section, code, cost, budget and time for each item. `basedpl.bpltests.logged_costs` reads these lines.
-pub fn line(section: &str, code: &str, cost: f64, budget: &str, seconds: f64) -> String {
-    format!("{section} {code}: {cost:.2}, budget {budget}, {:.3} ns", seconds * 1e9)
+/// A case's line in a speed test's log: its section, code, cost, budget and time for each item, then, where it has one, its [`Footprint`]. `basedpl.bpltests.logged_costs` reads these lines.
+pub fn line(section: &str, code: &str, cost: f64, budget: &str, seconds: f64, footprint: Option<Footprint>) -> String {
+    let mut line = format!("{section} {code}: {cost:.2}, budget {budget}, {:.3} ns", seconds * 1e9);
+    if let Some(f) = footprint { line += &format!(", footprint {:.1} MiB copied at {:.3} ns", f.bytes as f64 / (1 << 20) as f64, f.seconds * 1e9); }
+    line
 }
 
-/// One section of a budget file: its name, the rest of its header line, such as basedpl's prefs, and its lines.
-pub type Section<'a> = (&'a str, &'a str, Vec<&'a str>);
+/// The budget columns, in the order that basedpl's speed-file footers and both projects' budget files give them: native macOS on Apple silicon, native Linux on CI's x86 runner, and basedpl's browser build on CI's runner, which only basedpl's files have.
+pub const COLUMNS: [&str; 3] = ["macos", "linux", "wasm"];
 
-/// The sections of `text`, a budget file such as either project's `tests/speed.txt`. A line `[name]` or `[name] rest` starts each section. Each line under it holds a case's code, then its budgets, separated by tabs. Blank lines and lines that start with `#` are skipped.
-pub fn sections(text: &str) -> Result<Vec<Section<'_>>, String> {
-    let mut sections: Vec<Section> = Vec::new();
-    for line in text.lines().filter(|l| !l.is_empty() && !l.starts_with('#')) {
-        match header(line) {
-            Some((name, rest)) => sections.push((name, rest, Vec::new())),
-            None => sections.last_mut().ok_or_else(|| format!("{line:?} comes before the first section"))?.2.push(line),
+/// A case's budget for a cost, by the rule in basedpl's DEV.md: in copies, the cost times 2 under 50 copies, 1.5 from 50 to 500 and 1.3 over 500, or 2 for an `estimate`, rounded up to two significant figures and at least 0.5; in the section `widths`, a 32/64-bit ratio plus 0.25, rounded up to two decimal places.
+pub fn budget(section: &str, cost: f64, estimate: bool) -> f64 {
+    // Rounds `x` up to `places` decimal places, or to tens, hundreds and so on for negative `places`. The tolerance keeps a product such as 2 × 0.27, which f64 holds a little above 0.54, from rounding up a step.
+    let up = |x: f64, places: i32| {
+        let scale = 10f64.powi(places.abs());
+        if places >= 0 { (x * scale - 1e-9).ceil() / scale } else { (x / scale - 1e-9).ceil() * scale }
+    };
+    if section == "widths" { return up(cost + 0.25, 2); }
+    let factor = if estimate || cost < 50.0 { 2.0 } else if cost <= 500.0 { 1.5 } else { 1.3 };
+    let b = (factor * cost).max(0.5);
+    up(b, 1 - b.log10().floor() as i32)
+}
+
+/// Why a column's budget is held above its rule budget: a gap in the code, which a `held` line names, or CI's busy hosts, which a `busy` line names. A busy neighbour on CI's runner slows cases whose data passes one core's cache, in some runs and not in others.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Cause { Gap, Busy }
+
+impl Cause {
+    /// The keyword of a line that holds a column for this cause: `held` or `busy`.
+    pub fn name(self) -> &'static str { match self { Cause::Gap => "held", Cause::Busy => "busy" } }
+}
+
+/// One column of a case held above its rule budget, at the cost that the case's `held` or `busy` line gives. A cost that is an `estimate` keeps twice the estimate as its budget, as [`budget`] gives an estimate's.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Held { pub column: usize, pub cost: f64, pub cause: Cause, pub estimate: bool }
+
+/// Adds to `holds` the columns that a `held` or `busy` line holds, from its text after its file's marker, and says whether `text` was such a line. The line gives its keyword, then each column's name from [`COLUMNS`] with the cost it is held at, then a colon and the reason, as in `held linux 15.6 wasm 18.9: the cause isn't known yet`. A `~` before a cost marks an estimate that no run has measured on that column's platform, as in `held linux ~107`. Text that starts with either keyword in any other form is an error, as is a column that `holds` already holds.
+pub fn hold(text: &str, holds: &mut Vec<Held>) -> Result<bool, String> {
+    let (cause, rest) = match text.split_once(' ') {
+        Some((keyword, rest)) if keyword == Cause::Gap.name() => (Cause::Gap, rest),
+        Some((keyword, rest)) if keyword == Cause::Busy.name() => (Cause::Busy, rest),
+        _ => return Ok(false),
+    };
+    let fail = || format!("{text:?} should be a column, the cost it's held at, any more columns and costs, then a colon and the reason");
+    let (columns, _) = rest.split_once(':').filter(|(_, reason)| !reason.trim().is_empty()).ok_or_else(fail)?;
+    let fields: Vec<&str> = columns.split_whitespace().collect();
+    if fields.is_empty() || fields.len() % 2 == 1 { return Err(fail()); }
+    for pair in fields.chunks(2) {
+        let column = COLUMNS.iter().position(|&c| c == pair[0]).ok_or_else(fail)?;
+        let (estimate, cost) = pair[1].strip_prefix('~').map_or((false, pair[1]), |c| (true, c));
+        let cost = cost.parse::<f64>().ok().filter(|c| c.is_finite() && *c > 0.0).ok_or_else(fail)?;
+        if holds.iter().any(|h| h.column == column) { return Err(format!("{text:?}: the {} column is held twice", pair[0])); }
+        holds.push(Held { column, cost, cause, estimate });
+    }
+    Ok(true)
+}
+
+/// The budget that a case meets in one column: its rule budget, from its footer or budget line, or, where a `held` or `busy` line holds the column, the budget for the cost it is held at, if that is larger.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Budget { pub value: f64, pub rule: f64, pub cause: Option<Cause> }
+
+impl Budget {
+    /// The budget in `column` of a case in `section` whose footer or budget line gives `budgets`, held where `holds` holds that column. `None` where `column` is `None` or the case has no budget there.
+    pub fn of(section: &str, budgets: &[impl AsRef<str>], holds: &[Held], column: Option<usize>) -> Option<Self> {
+        let column = column?;
+        let rule: f64 = budgets.get(column)?.as_ref().parse().ok()?;
+        Some(match holds.iter().find(|h| h.column == column) {
+            Some(h) => Self { value: budget(section, h.cost, h.estimate).max(rule), rule, cause: Some(h.cause) },
+            None => Self { value: rule, rule, cause: None },
+        })
+    }
+
+    /// Whether `cost` is over the budget.
+    pub fn over(&self, cost: f64) -> bool { cost > self.value }
+
+    /// Whether a gap's hold has outlived the gap: `cost` is at most 0.9 times the rule budget, inside the margin of 10% under which basedpl's budget review holds a column. A busy host's hold is never stale, since a quiet host's run meets the rule budget anyway.
+    pub fn stale(&self, cost: f64) -> bool { self.cause == Some(Cause::Gap) && cost <= 0.9 * self.rule }
+}
+
+/// The budget as a speed test's line gives it: `16`, or with the hold and the rule budget, `32 held from 16` or `5.4 busy from 2.5`.
+impl std::fmt::Display for Budget {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self.cause {
+            None => write!(f, "{}", self.value),
+            Some(cause) => write!(f, "{} {} from {}", self.value, cause.name(), self.rule),
         }
     }
-    Ok(sections)
 }
 
-/// The name and the rest of a budget file's header line: `[name]` or `[name] rest`.
-pub fn header(line: &str) -> Option<(&str, &str)> {
-    line.strip_prefix('[').and_then(|l| l.split_once(']')).filter(|(name, rest)| !name.contains(' ') && (rest.is_empty() || rest.starts_with(' ')))
-        .map(|(name, rest)| (name, rest.trim()))
+/// One case of a budget file: its section, its code, its budgets as written, the columns that its `held` and `busy` lines hold, and the byte span of its line.
+pub struct Listed<'a> { pub section: &'a str, pub code: &'a str, pub budgets: Vec<&'a str>, pub holds: Vec<Held>, pub span: (usize, usize) }
+
+/// The cases of `text`, a budget file such as rustymath's `tests/speed.txt`. A line `[name]`, or `[name] ` and more text, starts each section. Each line under it holds a case's code, then its budgets, separated by tabs. A line `# held ...` or `# busy ...` above a case's line holds columns of that case, as [`hold`] reads it. Blank lines and other lines that start with `#` are skipped.
+pub fn cases(text: &str) -> Result<Vec<Listed<'_>>, String> {
+    let (mut cases, mut section, mut holds, mut start) = (Vec::new(), None, Vec::new(), 0);
+    for whole in text.split_inclusive('\n') {
+        let line = whole.trim_end_matches(['\n', '\r']);
+        let span = (start, start + line.len());
+        start += whole.len();
+        if line.starts_with('#') { hold(line.strip_prefix("# ").unwrap_or_default(), &mut holds)?; continue; }
+        if line.is_empty() { continue; }
+        let named = line.strip_prefix('[').and_then(|l| l.split_once(']')).filter(|(name, rest)| !name.contains(' ') && (rest.is_empty() || rest.starts_with(' ')));
+        if let Some((name, _)) = named { section = Some(name); continue; }
+        let section = section.ok_or_else(|| format!("{line:?} comes before the first section"))?;
+        let mut fields = line.split('\t');
+        let (code, budgets): (&str, Vec<&str>) = (fields.next().unwrap_or_default(), fields.collect());
+        if budgets.iter().any(|b| b.parse::<f64>().map_or(true, |b| !b.is_finite() || b < 0.0)) { return Err(format!("{line:?} has a budget that isn't a number")); }
+        cases.push(Listed { section, code, budgets, holds: std::mem::take(&mut holds), span });
+    }
+    if holds.is_empty() { Ok(cases) } else { Err("a held or busy line ends the file, with no case after it".into()) }
 }
 
-/// A case line's code: the text before its first tab.
-pub fn code_of(line: &str) -> &str { line.split('\t').next().unwrap_or_default() }
+/// Each case of `text`, a budget file, as its section, its code and its budget in `column`, as [`Budget::of`] gives it, or with `None` for every case where `column` is `None`. A case with no budget in `column` is an error.
+pub fn budgeted(text: &str, column: Option<usize>) -> Result<Vec<(&str, &str, Option<Budget>)>, String> {
+    cases(text)?.into_iter().map(|c| match (column, Budget::of(c.section, &c.budgets, &c.holds, column)) {
+        (Some(i), None) => Err(format!("{} {} has no {} budget", c.section, c.code, COLUMNS[i])),
+        (_, budget) => Ok((c.section, c.code, budget)),
+    }).collect()
+}
 
-/// The pauses, in seconds, before each retry in `retried`. All of a case's runs together take a fraction of a millisecond, and one disturbance on a shared machine can last that long.
-pub const RETRY_PAUSES: [f64; 2] = [0.1, 1.0];
+/// The pauses, in seconds, before each retry in `retried`. All of a case's runs together take a fraction of a millisecond, and one disturbance on a shared machine can last that long. The last pause waits out a neighbour's longer burst: in basedpl's `Test` run 62 on CI's runner, cases over their budgets ran slower at each of the first two retries.
+pub const RETRY_PAUSES: [f64; 3] = [0.1, 1.0, 10.0];
+
+/// Keeps the calling thread busy for 0.1 s by reading the clock, so that a timing after a pause runs at the core's full speed. An idle core runs slower until it has been busy for a while. A timing's `RUNS` calls of a small case finish within microseconds, before the core speeds up: on the development Mac, cases of 65,536 items that cost 0.74-0.84 copies cost 2.28-3.06 straight after a 10 s pause (30 October 2026). [`retried`] calls it after each pause, and the Python and browser speed tests call it after theirs.
+pub fn warm() {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(100) {}
+}
 
 /// Which of a budget file's two native budgets this machine's speed tests compare costs with: 0, for macOS on Apple silicon, where matrix products run on Accelerate, or 1, for Linux on x86-64, as CI's runner is. Other machines, such as Linux on Arm, have no budgets: their speed tests report costs without comparing them. [`checks_budgets`] says whether a cost over its budget fails.
 pub const NATIVE_COLUMN: Option<usize> = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
@@ -189,11 +302,12 @@ pub const BUDGET_CPU: Option<&str> = match NATIVE_COLUMN {
 /// Whether this machine's speed tests fail on a case still over its budget after the retries: only where [`cpu`] is [`BUDGET_CPU`]. On any other CPU they print every cost, then each case still over its budget, marked `over`, and fail on none.
 pub fn checks_budgets() -> bool { BUDGET_CPU.is_some_and(|c| cpu() == Some(c)) }
 
-/// The failures of a timing test that still fail after every retry. After each pause in `RETRY_PAUSES`, `retime` gets the failures and the pause, times them again, prints the retry and gives those that still fail. A speed test calls it after timing every case.
+/// The failures of a timing test that still fail after every retry. After each pause in `RETRY_PAUSES`, and [`warm`] after it, `retime` gets the failures and the pause, times them again, prints the retry and gives those that still fail. A speed test calls it after timing every case.
 pub fn retried<T>(mut failures: Vec<T>, mut retime: impl FnMut(Vec<T>, f64) -> Vec<T>) -> Vec<T> {
     for pause in RETRY_PAUSES {
         if failures.is_empty() { break; }
         std::thread::sleep(Duration::from_secs_f64(pause));
+        warm();
         failures = retime(failures, pause);
     }
     failures
@@ -207,19 +321,24 @@ mod lock {
     /// The file whose lock keeps timings apart from builds and test runs.
     pub const LOCK: &str = "/tmp/aai-ws-timing.lock";
 
+    /// The file that a timing holds exclusively while it waits for `LOCK` and while it holds it. A shared hold locks it for a moment first, so it waits behind any timing.
+    pub const GATE: &str = "/tmp/aai-ws-timing.gate";
+
     /// A hold on the timing lock, released when dropped. The operating system also releases it when its process ends, even by a crash. An exclusive hold runs every call on its calling thread alone until it's dropped, because speed budgets are for one thread.
     pub struct Hold {
         _file: File,
+        /// `GATE`, which an exclusive hold keeps until it's dropped.
+        _gate: Option<File>,
         /// The thread setting that an exclusive hold replaced, to restore when dropped.
         threads: Option<usize>,
     }
 
     impl Drop for Hold { fn drop(&mut self) { if let Some(n) = self.threads { set_threads(n); } } }
 
-    /// Takes the timing lock exclusively, for a timing. It waits up to 5 minutes for builds, test runs and other timings, then fails. After waiting 30 seconds it prints, once, the other processes that have the lock's file open. On macOS it also sets the calling thread's QoS class to user-interactive. macOS then favours the performance cores for that thread. QoS isn't CPU affinity.
+    /// Takes the timing lock exclusively, for a timing. It waits up to 5 minutes for builds, test runs and other timings, then fails. From the start of its wait it holds `GATE`, so no build or test run starts meanwhile. After waiting 30 seconds it prints, once, the other processes that have the lock's file open. On macOS it also sets the calling thread's QoS class to user-interactive. macOS then favours the performance cores for that thread. QoS isn't CPU affinity.
     pub fn exclusive() -> io::Result<Hold> { hold(false) }
 
-    /// Takes the timing lock shared, for a build or a test run. It waits up to 5 minutes for a timing, then goes ahead without the lock.
+    /// Takes the timing lock shared, for a build or a test run. It waits behind any timing that holds `GATE` or the lock, for up to 5 minutes, then goes ahead without the lock.
     pub fn shared() -> io::Result<Hold> { hold(true) }
 
     fn hold(shared: bool) -> io::Result<Hold> {
@@ -227,27 +346,40 @@ mod lock {
         if !shared {
             unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
         }
-        let failed = |e: io::Error| io::Error::new(e.kind(), format!("{LOCK}: {e}"));
-        let held = |file| Ok(Hold { _file: file, threads: (!shared).then(|| set_threads(1)) });
-        let file = File::options().create(true).append(true).open(LOCK).map_err(failed)?;
-        let others = if shared { "a timing" } else { "a build or another timing" };
-        let (start, mut waiting, mut reported) = (Instant::now(), false, false);
-        loop {
-            match if shared { file.try_lock_shared() } else { file.try_lock() } {
-                Ok(()) => return held(file), Err(TryLockError::WouldBlock) => {} Err(TryLockError::Error(e)) => return Err(failed(e))
+        let open = |path: &str| File::options().create(true).append(true).open(path).map_err(|e| io::Error::new(e.kind(), format!("{path}: {e}")));
+        let (gate, file) = (open(GATE)?, open(LOCK)?);
+        let mut wait = Wait { start: Instant::now(), shared, waiting: false, reported: false, late: false };
+        wait.take(&gate, GATE)?;
+        wait.take(&file, LOCK)?;
+        Ok(Hold { _file: file, _gate: (!shared).then_some(gate), threads: (!shared).then(|| set_threads(1)) })
+    }
+
+    /// One hold's wait for `GATE` and then `LOCK`, against one deadline of 5 minutes.
+    struct Wait { start: Instant, shared: bool, waiting: bool, reported: bool, late: bool }
+
+    impl Wait {
+        /// Locks `file`, which is the file at `path`, as the hold needs it, waiting while others hold it. After 5 minutes a shared hold goes ahead without it, and an exclusive hold fails.
+        fn take(&mut self, file: &File, path: &str) -> io::Result<()> {
+            let others = if self.shared { "a timing" } else { "a build or another timing" };
+            loop {
+                if self.late { return Ok(()); }
+                match if self.shared { file.try_lock_shared() } else { file.try_lock() } {
+                    Ok(()) => return Ok(()), Err(TryLockError::WouldBlock) => {} Err(TryLockError::Error(e)) => return Err(io::Error::new(e.kind(), format!("{path}: {e}")))
+                }
+                if self.start.elapsed() > Duration::from_secs(300) {
+                    if !self.shared { return Err(io::Error::new(io::ErrorKind::TimedOut, format!("{others} has held {LOCK} for 5 minutes"))); }
+                    eprintln!("going ahead although {others} still holds {LOCK}");
+                    self.late = true;
+                    return Ok(());
+                }
+                if !self.waiting { eprintln!("waiting for {others} to release {LOCK}"); }
+                if !self.shared && !self.reported && self.start.elapsed() > Duration::from_secs(30) {
+                    eprintln!("{LOCK} is still taken after 30 seconds. Processes with it open: {}", users());
+                    self.reported = true;
+                }
+                self.waiting = true;
+                std::thread::sleep(Duration::from_millis(250));
             }
-            if start.elapsed() > Duration::from_secs(300) {
-                if !shared { return Err(io::Error::new(io::ErrorKind::TimedOut, format!("{others} has held {LOCK} for 5 minutes"))); }
-                eprintln!("going ahead although {others} still holds {LOCK}");
-                return held(file);
-            }
-            if !waiting { eprintln!("waiting for {others} to release {LOCK}"); }
-            if !shared && !reported && start.elapsed() > Duration::from_secs(30) {
-                eprintln!("{LOCK} is still taken after 30 seconds. Processes with it open: {}", users());
-                reported = true;
-            }
-            waiting = true;
-            std::thread::sleep(Duration::from_millis(250));
         }
     }
 

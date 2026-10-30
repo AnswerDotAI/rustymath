@@ -290,9 +290,10 @@ fn cbrt_accuracy() {
 
 #[test]
 fn pow_accuracy() {
-    // Three kinds of points: powers that are floats, whole powers from 2 to 8 of bases that aren't whole, and powers near overflow and underflow of a base near 1. The second kind squares and multiplies. The third is where the error of ln |x| grows most.
-    let wholes = [0.3, 1.7, 3.14159, 123.456, -2.71828, 1e10, 1e-10].into_iter().flat_map(|x| (2..=8).flat_map(move |k| [(x, k as f64), (x, -k as f64)]));
-    let exact: Vec<(f64, f64)> = (2..=12).flat_map(|b| (-30..=60).map(move |k| (b as f64, k as f64))).chain(wholes).collect();
+    // Three kinds of points: powers that are floats, whole powers from 1 to 8 and powers of 1 or 3 halves of bases that aren't whole, and powers near overflow and underflow of a base near 1. The second kind squares and multiplies, after a square root for halves. The third is where the error of ln |x| grows most.
+    let wholes = [0.3, 1.7, 3.14159, 123.456, -2.71828, 1e10, 1e-10].into_iter().flat_map(|x| (1..=8).flat_map(move |k| [(x, k as f64), (x, -k as f64)]));
+    let halves = [0.3, 1.7, 3.14159, 123.456, 1e10, 1e-10].into_iter().flat_map(|x| [0.5, 1.5].into_iter().flat_map(move |h| [(x, h), (x, -h)]));
+    let exact: Vec<(f64, f64)> = (2..=12).flat_map(|b| (-30..=60).map(move |k| (b as f64, k as f64))).chain(wholes).chain(halves).collect();
     let near = [((0.5, 2.0), (-1000.0, 1000.0)), ((1.2, 1.5), (1500.0, 2700.0)), ((0.0, 4.0), (-30.0, 30.0)), ((-8.0, 0.0), (-20.0, 20.0))];
     binary("pow", variants!(pow, 2).into_iter().chain([POW_ONE]), rustymath::pow, f64::powf, &near, &exact);
 }
@@ -497,6 +498,22 @@ fn incomplete_beta_accuracy() {
         ((a, b, p), rustymath::betaincinv(a, b, p) as f32 as f64)
     });
     check("f32 betaincinv", scaled(narrow, |(a, b, p)| rustymath::betaincinv(a as f32, b as f32, p as f32).into(), f32::EPSILON.into(), 1e-30));
+}
+
+/// The error that `beta` allows at f64, in units of epsilon times the result. Two of its three ln Γ pair up as one difference (`lgamma_gap`), and the third carries the logarithm of its Lanczos sum in floats, about an ulp of that logarithm.
+const BETA: u64 = 6;
+
+/// polygamma and beta against their rows in `testdata/mpmath.txt`: at f64 within `BOUND`, or `BETA` for beta, and at f32 within `BOUND`, where every input is a float at both widths.
+#[test]
+fn polygamma_and_beta_accuracy() {
+    for (name, wide, narrow, bound) in [
+        ("polygamma", rustymath::polygamma::<f64> as fn(f64, f64) -> f64, rustymath::polygamma::<f32> as fn(f32, f32) -> f32, BOUND),
+        ("beta", rustymath::beta::<f64>, rustymath::beta::<f32>, BETA),
+    ] {
+        let cases: Vec<((f64, f64), f64)> = vectors(MPMATH, name);
+        within(&format!("f64 {name}"), bound, scaled(cases.iter().copied(), |(a, x)| wide(a, x), f64::EPSILON, 1e-300));
+        check(&format!("f32 {name}"), scaled(cases.iter().map(|&(x, y)| (x, y as f32 as f64)), |(a, x): (f64, f64)| narrow(a as f32, x as f32).into(), f32::EPSILON.into(), 1e-30));
+    }
 }
 
 mod complex {

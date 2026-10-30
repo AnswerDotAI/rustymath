@@ -1,4 +1,4 @@
-//! How fast each function object's slice form runs on 65,536 inputs. The slice form is the code that callers such as basedpl and the Python package run. `speed.txt` gives each function a budget at f64 and at f32, in copies of the same number of items: the most time it may take, as a multiple of the time to copy those items. Each copy's time is this machine's stored copy time, or one measured once at the start, as `timing::copy_time` gives it. A loop that stops vectorizing takes several times as long and goes over budget. Where the standard library has the function, its time item by item is measured too, for the comparison table in `src/lib.md`, but sets no limit. The rows `Pow.one` and `Root.one` time the scalar forms pair by pair, as a caller with one value at a time runs them. The inner products multiply 256×256 matrices, whose results hold the same number of items. The decompositions factor 256×256 real matrices and 128×128 complex ones, and `lstsq` solves a 4096×16 real one. Sorts, partitions, medians and variances run along the rows of a 256×256 matrix. One sort runs along two lanes of 32,768. A weighted average reduces the first and last axes of a 16×64×64 array. Each of these counts copies of as many items as its matrix holds. A row over its budget fails only if it stays over after each pause in `timing::RETRY_PAUSES`, when every row is measured again. Each retry prints the row's earlier and new costs. The test fails listing every cost still over its budget after the last retry, as its width, name, cost and budget, in the form that `basedpl.bpltests.logged_costs` reads. It fails on budgets only on the CPU they were set for, as `timing::checks_budgets` decides. On any other CPU, it writes what `RUSTYMATH_COSTS` writes, then each cost still over its budget, marked `over`, and fails on none. With `RUSTYMATH_COSTS` set, as in `RUSTYMATH_COSTS=1 cargo test --test speed`, the test writes that table, then every cost in that form, straight to stderr. The test harness captures `println!` output from a passing test, but not these lines. CI's `Test` and `Speed` workflows set it. The test holds the machine's timing lock while it runs, as `rustymath::timing::exclusive` describes. Array guards time f32 differences on length-2 lanes and on one long vector, and a compact broadcast repeating each input 64 times. Safe i32-to-i64 widening counts i64 copies. These rows use only the demonstrated dtypes. Like `bpl` and rustymath's Python extension, this test registers the memory guard as its global allocator. Each row then allocates as a caller's process does, including the guard's request for huge pages on large blocks on Linux.
+//! How fast each function object's slice form runs on 65,536 inputs. The slice form is the code that callers such as basedpl and the Python package run. `speed.txt` gives each function a budget at f64 and at f32, in copies of the same number of items: the most time it may take, as a multiple of the time to copy those items. Each copy's time is this machine's stored copy time, or one measured once at the start, as `timing::copy_time` gives it. A row whose footprint, `N` items of its type and the most bytes it holds at once, passes one core's cache adds that footprint and the time of a copy of it, measured beside the row, to its line, as `timing::footprint` describes. A loop that stops vectorizing takes several times as long and goes over budget. Where the standard library has the function, its time item by item is measured too, for the comparison table in `src/lib.md`, but sets no limit. The rows `Pow.one` and `Root.one` time the scalar forms pair by pair, as a caller with one value at a time runs them. The inner products multiply 256×256 matrices, whose results hold the same number of items. The decompositions factor 256×256 real matrices and 128×128 complex ones, and `lstsq` solves a 4096×16 real one. Sorts, partitions, medians and variances run along the rows of a 256×256 matrix. One sort runs along two lanes of 32,768. A weighted average reduces the first and last axes of a 16×64×64 array. Each of these counts copies of as many items as its matrix holds. A row over its budget fails only if it stays over after each pause in `timing::RETRY_PAUSES`, when every row is measured again. Each retry prints the row's earlier and new costs. The test fails listing every cost still over its budget after the last retry, as its width, name, cost and budget, in the form that `basedpl.bpltests.logged_costs` reads. It fails on budgets only on the CPU they were set for, as `timing::checks_budgets` decides. On any other CPU, it writes what `RUSTYMATH_COSTS` writes, then each cost still over its budget, marked `over`, and fails on none. With `RUSTYMATH_COSTS` set, as in `RUSTYMATH_COSTS=1 cargo test --test speed`, the test writes that table, then every cost in that form, straight to stderr. The test harness captures `println!` output from a passing test, but not these lines. CI's `Test` and `Speed` workflows set it. The test holds the machine's timing lock while it runs, as `rustymath::timing::exclusive` describes. Array guards time f32 differences on length-2 lanes and on one long vector, and a compact broadcast repeating each input 64 times. Safe i32-to-i64 widening counts i64 copies. These rows use only the demonstrated dtypes. Like `bpl` and rustymath's Python extension, this test registers the memory guard as its global allocator. Each row then allocates as a caller's process does, including the guard's request for huge pages on large blocks on Linux.
 use rand::seq::SliceRandom;
 use rustymath::timing::RUNS;
 use rustymath::*;
@@ -13,8 +13,8 @@ const N: usize = 65_536;
 type Compared = (&'static str, [f64; 4], [Timed; 2]);
 /// A function's name and its costs, at f64 and at f32.
 type Costed = (&'static str, [Timed; 2]);
-/// A cost in copies, and the time per item in ns that gives it.
-type Timed = (f64, f64);
+/// A cost in copies, the time per item in ns that gives it, and the case's footprint where it passes one core's cache, with a copy of it measured beside the case (`timing::footprint`).
+type Timed = (f64, f64, Option<timing::Footprint>);
 
 /// The fastest of `RUNS` runs of `run`, as `timing::fastest` times them, in ns for each of `n` items. First it reads one byte in every 64 of each of `inputs`, which hold the sets that `set` gives the runs. That brings every set into cache, whatever ran since the sets were built, without calling the function on them, so its branch predictor still meets each set fresh. Runs that read the same inputs each time pass none: their first run brings them into cache.
 fn fastest(n: usize, inputs: &[&[u8]], run: impl FnMut(usize)) -> f64 {
@@ -103,9 +103,9 @@ fn widths(lo: f64, hi: f64, step: f64, len: usize) -> (Vec<f64>, Vec<f32>) {
 fn compare(
     units: &Units<f64, f32>, name: &'static str, ours64: impl FnOnce() -> f64, std64: impl FnOnce() -> f64, ours32: impl FnOnce() -> f64,
     std32: impl FnOnce() -> f64) -> Compared {
-    let ((c64, t64), s64) = (units.0.cost(ours64), std64());
-    let ((c32, t32), s32) = (units.1.cost(ours32), std32());
-    (name, [t64, s64, t32, s32], [(c64, t64), (c32, t32)])
+    let (own64, s64) = (units.0.cost(ours64), std64());
+    let (own32, s32) = (units.1.cost(ours32), std32());
+    (name, [own64.1, s64, own32.1, s32], [own64, own32])
 }
 
 /// The times of `$object`'s slice form and of the standard library's `$std` item by item, at f64 and then f32, on inputs from `$lo` to `$hi`, with its costs against `$units`.
@@ -205,8 +205,11 @@ struct Unit<T>(timing::CopyTime, PhantomData<T>);
 impl<T: Copy + Default + Neg<Output = T>> Unit<T> {
     fn new() -> Self { Self(timing::copy_time::<T>(N), PhantomData) }
 
-    /// The cost in copies, and the time per item in ns, of `run`, which gives a time per item in ns.
-    fn cost(&self, run: impl FnOnce() -> f64) -> Timed { let t = run(); (t / (self.0.seconds * 1e9), t) }
+    /// The cost in copies, the time per item in ns, and the footprint of `run`, which gives a time per item in ns. The footprint counts `N` items of `T` as the case's input, with the most bytes that `run` held at once.
+    fn cost(&self, run: impl FnOnce() -> f64) -> Timed {
+        let (t, held) = memory::peak_held(run);
+        (t / (self.0.seconds * 1e9), t, timing::footprint::<T>(N, held))
+    }
 }
 
 /// A unit at f64 and one at f32, for real or for complex items.
@@ -450,16 +453,22 @@ fn decompositions(units: &Units<f64, f32>, complex_units: &Units<num_complex::Co
     ]
 }
 
-/// This machine's budget of each function at each item type, keyed by `(type, name)`. Each section of `text` (`timing::sections`) is an item type, and each line under it holds a name and its two native budgets. `timing::NATIVE_COLUMN` picks the budget this machine checks, and a machine with no column has `None` for each.
-fn budgets(text: &str) -> HashMap<(&str, &str), Option<f64>> {
-    let budget = |line: &str| {
-        timing::NATIVE_COLUMN.map(|column| {
-            line.split('\t').nth(1 + column).expect("a budget line holds a name and two budgets, separated by tabs").parse::<f64>()
-                .expect("a budget is a number")
-        })
-    };
-    timing::sections(text).expect("speed.txt starts with a section").into_iter()
-        .flat_map(|(width, _, lines)| lines.into_iter().map(move |line| ((width, timing::code_of(line)), budget(line)))).collect()
+/// This machine's budget of each function at each item type, keyed by `(type, name)`, from `text`, a budget file whose sections are item types, as `timing::budgeted` gives it for the column that `timing::NATIVE_COLUMN` picks. A machine with no column has `None` for each.
+fn budgets(text: &str) -> HashMap<(&str, &str), Option<timing::Budget>> {
+    timing::budgeted(text, timing::NATIVE_COLUMN).expect("speed.txt is a budget file with this machine's budgets").into_iter().map(|(s, c, b)| ((s, c), b)).collect()
+}
+
+/// A budget is the expected cost times its multiplier, rounded up, and a `held` or `busy` line raises one column's budget to the budget for the cost it gives, or to twice a cost marked as an estimate. Only a gap's hold goes stale, once a cost is within 90% of the rule budget.
+#[test]
+fn budgets_follow_the_rule_and_holds() {
+    assert_eq!([0.2, 0.27, 15.6, 142.0, 12682.0].map(|c| timing::budget("f64", c, false)), [0.5, 0.54, 32.0, 220.0, 17000.0]);
+    assert_eq!((timing::budget("f64", 60.0, true), timing::budget("widths", 0.72, false)), (120.0, 0.97));
+    let text = "[f64]\n# 2 copies: one read and one write.\n# held linux 15.6: the cause isn't known yet\nExp\t4\t4\n# busy macos 2.7: a busy host\nLog\t4\t4\n# held linux ~60: no run has measured it\nSin\t4\t4\n";
+    let cases = timing::cases(text).unwrap();
+    let budget = |i: usize, column| timing::Budget::of(cases[i].section, &cases[i].budgets, &cases[i].holds, Some(column)).unwrap();
+    assert_eq!([budget(0, 0), budget(0, 1), budget(1, 0), budget(2, 1)].map(|b| b.to_string()), ["4", "32 held from 4", "5.4 busy from 4", "120 held from 4"]);
+    assert!(budget(0, 1).stale(3.6) && !budget(0, 1).stale(3.7) && !budget(1, 0).stale(1.0));
+    for bad in ["# held linux: no cost", "# held linux 15.6", "# held linux 1 linux 2: twice"] { assert!(timing::cases(&format!("[f64]\n{bad}\nExp\t4\t4\n")).is_err(), "{bad}"); }
 }
 
 /// Every row's comparison with the standard library, where there is one, and every row's cost in copies, as `(width, name, cost)`.
@@ -533,11 +542,12 @@ fn speed() {
         writeln!(stderr).unwrap();
     }
     let budgets = budgets(include_str!("speed.txt"));
-    let line = |&(width, name, (cost, ns)): &(&str, &str, Timed)| match budgets.get(&(width, name)) {
-        Some(budget) => timing::line(width, name, cost, &budget.map_or("-".into(), |b| b.to_string()), ns * 1e-9),
+    let line = |&(width, name, (cost, ns, footprint)): &(&str, &str, Timed)| match budgets.get(&(width, name)) {
+        Some(budget) => timing::line(width, name, cost, &budget.map_or("-".into(), |b| b.to_string()), ns * 1e-9, footprint),
         None => format!("{width} {name}: {cost:.2}, with no budget in speed.txt"),
     };
-    let over = |&(width, name, (cost, _)): &(&str, &str, Timed)| budgets.get(&(width, name)).copied().flatten().is_some_and(|budget| cost > budget);
+    let budget = |&(width, name, _): &(&str, &str, Timed)| budgets.get(&(width, name)).copied().flatten();
+    let over = |row: &(&str, &str, Timed)| budget(row).is_some_and(|b| b.over(row.2.0));
     let mut failures = Vec::new();
     for row in &costed {
         if print_all { writeln!(stderr, "{}", line(row)).unwrap(); }
@@ -550,6 +560,7 @@ fn speed() {
     });
     if checks { failures.extend(slow.iter().map(line)); }
     else { for row in &slow { writeln!(stderr, "{}: over", line(row)).unwrap(); } }
+    for row in costed.iter().filter(|row| budget(row).is_some_and(|b| b.stale(row.2.0))) { writeln!(stderr, "{}: stale", line(row)).unwrap(); }
     for &(width, name) in budgets.keys().filter(|&&(w, n)| !costed.iter().any(|&(width, name, _)| (width, name) == (w, n))) {
         failures.push(format!("{width} {name} has a budget in speed.txt, but the test doesn't time it"));
     }

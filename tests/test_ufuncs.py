@@ -302,6 +302,21 @@ def test_native_accumulation():
         with pytest.raises(ValueError, match='window'): rm.sliding(rm.add, x, width)
     with pytest.raises(ValueError): rm.sliding(rm.subtract, x, 3)
 
+def test_derivative():
+    x = np.linspace(-2, 2, 9)
+    value, slope = rm.value_and_derivative(rm.tanh, x)
+    assert np.allclose(value, np.tanh(x)) and np.allclose(slope, 1 - np.tanh(x) ** 2)
+    assert np.allclose(rm.derivative(rm.sin, x), np.cos(x))
+    y = np.linspace(0.5, 3, 9)
+    dx, dy = rm.derivative(rm.power, y, 2.5)
+    assert np.allclose(dx, 2.5 * y ** 1.5) and np.allclose(dy, y ** 2.5 * np.log(y))
+    assert rm.derivative(rm.multiply, 3., 4.) == (4., 3.)
+    assert np.isclose(rm.derivative(rm.erf, 0.5), 2 / np.sqrt(np.pi) * np.exp(-0.25))
+    da, dx = rm.derivative(rm.gammainc, 2., 1.)
+    assert np.isnan(da) and np.isclose(dx, np.exp(-1)) and np.isclose(rm.derivative(rm.gammainc, 1., 0.)[1], 1)
+    with pytest.raises(ValueError, match='floor has no derivative'): rm.derivative(rm.floor, x)
+    with pytest.raises(ValueError, match='native elementwise'): rm.derivative(np.sin, x)
+
 def test_explain():
     x = rm.array([[1., 2., 3.], [4., 5., 6.]])
     with rm.explain() as outer:

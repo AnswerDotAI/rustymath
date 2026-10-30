@@ -4,7 +4,7 @@
 //!
 //! Tolerant equality isn't transitive: `x` can equal `y` and `y` equal `z` while `x` doesn't equal `z`. Hash maps and sorting need a transitive `PartialEq`. This module therefore has no float type with a tolerant `==`. Each comparison is a method of the tolerance.
 use crate::{
-    Arg, BETWEEN_CHECKS, buffer::Element, convert::{float, int}, error::Error, float::{FUSED, Float, Native, sealed::Core}, interrupt::check,
+    Arg, BETWEEN_CHECKS, buffer::Element, convert::{float, int}, error::Error, float::{Float, Native}, interrupt::check, recipe::{self, Floats},
     search::{self, Chains, Key, Links}, slice::{Total, pairs_into}
 };
 use num_bigint::BigInt;
@@ -41,21 +41,21 @@ pub trait Tolerant: Copy + Send + Sync {
     fn close<F: Float>(self, x: F, y: F) -> bool;
     /// Whether `x` equals `y`: it is `y`, or `close` to it. NaN equals nothing, as in IEEE, and an infinity equals only itself.
     #[inline]
-    fn equal<F: Float>(self, x: F, y: F) -> bool { (x == y) | self.close(x, y) }
+    fn equal<F: Float>(self, x: F, y: F) -> bool { recipe::equal::<F, _>(&Floats, x, y, |_| self.close(x, y)) }
     /// The floor of `y`: the whole number nearest to `y`, unless it lies above `y` and doesn't equal it. Then the whole number below. A floor or ceiling that is zero is `0`, never `-0`, as BPL's numbers give it.
     fn floor<F: Float>(self, y: F) -> F;
     /// The ceiling of `y`: the whole number nearest to `y`, unless it lies below `y` and doesn't equal it. Then the whole number above.
     #[inline]
-    fn ceil<F: Float>(self, y: F) -> F { F::narrow(0.0) - self.floor(-y) }
+    fn ceil<F: Float>(self, y: F) -> F { recipe::ceil::<F, _>(&Floats, y, |_, v| self.floor(v)) }
     /// Whether `x` and `y` match: they are equal, or both are NaN. A search that must find NaN compares with `matches`.
     #[inline]
     fn matches<F: Float>(self, x: F, y: F) -> bool { self.equal(x, y) | (x.is_nan() & y.is_nan()) }
     /// Whether `x` is below `y` and doesn't equal it. Comparisons with NaN are false.
     #[inline]
-    fn less<F: Float>(self, x: F, y: F) -> bool { (x < y) & !self.close(x, y) }
+    fn less<F: Float>(self, x: F, y: F) -> bool { recipe::less::<F, _>(&Floats, x, y, |_| self.close(x, y)) }
     /// Whether `x` is below `y` or equals it. Comparisons with NaN are false.
     #[inline]
-    fn less_equal<F: Float>(self, x: F, y: F) -> bool { (x <= y) | self.close(x, y) }
+    fn less_equal<F: Float>(self, x: F, y: F) -> bool { recipe::less_equal::<F, _>(&Floats, x, y, |_| self.close(x, y)) }
     /// Whether `x` is above `y` and doesn't equal it. Comparisons with NaN are false.
     #[inline]
     fn greater<F: Float>(self, x: F, y: F) -> bool { self.less(y, x) }
@@ -68,13 +68,10 @@ pub trait Tolerant: Copy + Send + Sync {
     /// The tolerant floor of rounded `x/y`.
     #[inline]
     fn floor_quotient<F: Float>(self, x: F, y: F) -> F { self.floor(x / y) }
-    /// `y - x·floor(y/x)`, through `floor_quotient`, using native fused multiply-add where available. At nonzero tolerance, a product equal to `y` within tolerance leaves no remainder. `x` = 0 gives `y`.
+    /// `y` modulo `x`, through `recipe::residue`: `y - x·floor(y/x)` from this tolerance's floor of the quotient, rounded once where the target fuses multiply-add. At nonzero tolerance, a product equal to `y` within tolerance leaves no remainder. `x` = 0 gives `y`.
     #[inline]
     fn residue<F: Float>(self, x: F, y: F) -> F {
-        let q = self.floor_quotient(y, x);
-        let r = F::from_working((-x.working()).mla::<FUSED>(q.working(), y.working()));
-        let r = if self.value() != 0.0 && self.equal(x * q, y) { F::zero() } else { r };
-        if x == F::zero() { y } else { r }
+        recipe::residue::<F, _>(&Floats, (self.value() != 0.0).then(|| F::narrow(self.value())), x, y, |_, v| self.floor(v))
     }
     /// The whole number nearest `y`, and whether `y` equals it within this tolerance.
     #[inline]
@@ -183,22 +180,16 @@ impl Tolerant for Exactly {
     #[inline]
     fn close<F: Float>(self, _: F, _: F) -> bool { false }
     #[inline]
-    // Adding 0 turns IEEE's `-0` into `0`.
-    fn floor<F: Float>(self, y: F) -> F { y.floor() + F::narrow(0.0) }
+    fn floor<F: Float>(self, y: F) -> F { recipe::exact_floor::<F, _>(&Floats, y) }
 }
 
 impl Tolerant for Tolerance {
     #[inline]
     fn value(self) -> f64 { Tolerance::value(self) }
-    // A loop of comparisons vectorizes only when the test has no branch, so `close` and `Tolerant`'s methods use `&` and `|`, not `&&` and `||`. With a strict `<`, an infinity is close to no number without a finiteness test, because `inf < inf` is false. NaN fails every comparison.
     #[inline]
-    fn close<F: Float>(self, x: F, y: F) -> bool { (x - y).abs() < F::narrow(self.0) * larger(x.abs(), y.abs()) }
+    fn close<F: Float>(self, x: F, y: F) -> bool { recipe::close(&Floats, F::narrow(self.0), x, y) }
     #[inline]
-    fn floor<F: Float>(self, y: F) -> F {
-        // `y` equals the whole number above it when raising `y` by `t·|y|` reaches that number. Capping the raise just below a half keeps a whole number from reaching the next one where `t·|y|` exceeds a half. Where floats are 1 or more apart, the sum rounds back to `y`.
-        let (raise, most) = (F::narrow(self.0) * y.abs(), F::narrow(0.5).next_down());
-        (y + if raise < most { raise } else { most }).floor()
-    }
+    fn floor<F: Float>(self, y: F) -> F { recipe::floor(&Floats, F::narrow(self.0), y) }
 }
 
 /// The complex versions of `Tolerant`'s comparisons, for every tolerance.
@@ -319,22 +310,29 @@ macro_rules! compared {
                 None => with_tolerance!(k.0, |$t| each!([$x, $y], n, out, |[$x, $y]| $body)),
             });
         indicator!($object: |$t, [$x, $y]| $body, $left, $right, f32, f64);
+        impl Banding for $object { const BANDS: (Band, Band) = (Band::$left, Band::$right); }
     };
 }
 
 /// Where an item must lie against the range of floats equal to one number (`Tolerant::range`) for a comparison with that number to hold. `NotAbove` and `NotBelow` include the range itself.
 #[derive(Clone, Copy)]
-enum Band { Inside, Outside, Below, NotAbove, Above, NotBelow }
+pub enum Band { Inside, Outside, Below, NotAbove, Above, NotBelow }
 
 impl Band {
     /// Whether `v` lies in this band against the range `lo` to `hi`.
     #[inline(always)]
-    fn holds<F: PartialOrd>(self, lo: F, hi: F, v: F) -> bool {
-        match self {
-            Band::Inside => (lo <= v) & (v <= hi), Band::Outside => !((lo <= v) & (v <= hi)), Band::Below => v < lo, Band::NotAbove => v <= hi,
-            Band::Above => v > hi, Band::NotBelow => v >= lo
-        }
-    }
+    fn holds<F: Float>(self, lo: F, hi: F, v: F) -> bool { recipe::in_band(&Floats, self, lo, hi, v) }
+}
+
+/// The bands that an item must lie in for a comparison with one number to hold, when the item is on the left of that number and when it's on the right (`against`).
+pub trait Banding { const BANDS: (Band, Band); }
+
+/// Comparison `k` of `v` with the one number `c`, at tolerance `t`, as steps through `o`, as `k`'s slice form compares many items with one number: the band that `v` must lie in against the range of floats equal to `c` (`Tolerant::range`). `left` says whether `v` is the left argument. `None` where `c` is NaN.
+pub fn against_steps<K: Banding, F: Float, O: recipe::Ops<F>>(_k: K, t: Tolerance, o: &O, c: F, v: O::V, left: bool) -> Option<O::B> {
+    let (lo, hi) = t.range(c)?;
+    let band = if left { K::BANDS.0 } else { K::BANDS.1 };
+    let (lo, hi) = (o.number(lo), o.number(hi));
+    Some(recipe::in_band(o, band, lo, hi, v))
 }
 
 /// Runs `$body` with `$b` naming the band `$band` holds, as a constant item in each arm. A closure in `$body` then compiles with the band folded in. It doesn't capture a variable, which would leave each item to test the band.
@@ -353,14 +351,14 @@ macro_rules! with_band {
 
 /// Writes into `out`, through `from`, whether each item of `xs` lies in `band` against the range `lo` to `hi`. Its loop, through `pairs_into`, vectorizes.
 #[inline(always)]
-fn in_band<F: Copy + PartialOrd, O>(xs: &[F], lo: F, hi: F, band: Band, out: &mut [std::mem::MaybeUninit<O>], from: impl Fn(bool) -> O + Copy) {
+fn in_band<F: Float, O>(xs: &[F], lo: F, hi: F, band: Band, out: &mut [std::mem::MaybeUninit<O>], from: impl Fn(bool) -> O + Copy) {
     with_band!(band, |B| pairs_into(
         Arg::Many(xs), Arg::One(()), xs.len(), out, #[inline(always)] |v, ()| (from(B.holds(lo, hi, v)), true)
     ));
 }
 
 /// The float types that `against` compares with one number to give Booleans. The default writes them through `in_band`. Wasm's `f64` and `f32` override it in `narrowed`.
-trait Banded: Copy + PartialOrd {
+trait Banded: Float {
     /// Writes into `out` whether each item of `xs` lies in `band` against the range `lo` to `hi`.
     #[inline(always)]
     fn banded(xs: &[Self], lo: Self, hi: Self, band: Band, out: &mut [std::mem::MaybeUninit<bool>]) { in_band(xs, lo, hi, band, out, |b| b) }
@@ -492,6 +490,51 @@ compared!(Greater: |t, [x, y]| t.greater(x, y), Above, Below);
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GreaterEqual(pub Tolerance);
 compared!(GreaterEqual: |t, [x, y]| t.greater_equal(x, y), NotBelow, NotAbove);
+
+/// A tolerant comparison as steps of `recipe`'s formulas, which a compiler records through its `recipe::Ops`: the composition that `Tolerant`'s method of the same name uses, with `recipe::close` at the object's tolerance and the arguments in the same order.
+pub trait Stepped {
+    /// The comparison of `x` and `y` through `o`, at float type `F`.
+    fn steps<F: Float, O: recipe::Ops<F>>(self, o: &O, x: O::V, y: O::V) -> O::B;
+}
+
+impl Stepped for Equal {
+    #[inline(always)]
+    fn steps<F: Float, O: recipe::Ops<F>>(self, o: &O, x: O::V, y: O::V) -> O::B {
+        recipe::equal(o, x, y, |o| recipe::close(o, F::narrow(self.0.value()), x, y))
+    }
+}
+
+impl Stepped for NotEqual {
+    #[inline(always)]
+    fn steps<F: Float, O: recipe::Ops<F>>(self, o: &O, x: O::V, y: O::V) -> O::B {
+        let equal = Equal(self.0).steps(o, x, y);
+        o.not(equal)
+    }
+}
+
+impl Stepped for Less {
+    #[inline(always)]
+    fn steps<F: Float, O: recipe::Ops<F>>(self, o: &O, x: O::V, y: O::V) -> O::B {
+        recipe::less(o, x, y, |o| recipe::close(o, F::narrow(self.0.value()), x, y))
+    }
+}
+
+impl Stepped for LessEqual {
+    #[inline(always)]
+    fn steps<F: Float, O: recipe::Ops<F>>(self, o: &O, x: O::V, y: O::V) -> O::B {
+        recipe::less_equal(o, x, y, |o| recipe::close(o, F::narrow(self.0.value()), x, y))
+    }
+}
+
+impl Stepped for Greater {
+    #[inline(always)]
+    fn steps<F: Float, O: recipe::Ops<F>>(self, o: &O, x: O::V, y: O::V) -> O::B { Less(self.0).steps(o, y, x) }
+}
+
+impl Stepped for GreaterEqual {
+    #[inline(always)]
+    fn steps<F: Float, O: recipe::Ops<F>>(self, o: &O, x: O::V, y: O::V) -> O::B { LessEqual(self.0).steps(o, y, x) }
+}
 
 /// [`Tolerant::matches`] at the tolerance it holds, as a function object: `equal`, except that NaN matches NaN.
 #[derive(Clone, Copy, Debug, PartialEq)]

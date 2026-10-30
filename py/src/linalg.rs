@@ -370,7 +370,7 @@ pub fn product<'py>(
 /// The product kernel for the native functions named `$names`, from rustymath's table of facts ([`facts!`](rustymath::facts)): a `boolean_products` row first where `$booleans` holds, then a `products` row.
 macro_rules! known_product {
     (($names:expr, $booleans:expr) folds $folds:tt booleans $truths:tt comparisons $comparisons:tt characters $characters:tt
-        products { $($kernel:ident: [$($p:tt)*] [$(($pf:literal, $pg:literal)),*];)* } boolean_products { $($truth:ident: [$($tp:tt)*] [$(($tf:literal, $tg:literal)),*];)* }) => {
+        products { $($kernel:ident: [$($p:tt)*] [$(($pf:literal, $pg:literal)),*];)* } boolean_products { $($truth:ident: [$($tp:tt)*] [$(($tf:literal, $tg:literal)),*];)* } identities $identities:tt) => {
         match $names { $($(($tf, $tg) if $booleans => Some(linalg::Product::$truth),)*)* $($(($pf, $pg) => Some(linalg::Product::$kernel),)*)* _ => None }
     };
 }

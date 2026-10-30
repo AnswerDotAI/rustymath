@@ -7,7 +7,7 @@ Rustymath provides fast elementary and special functions, statistics, searching 
 
 The Python package needs no NumPy. Its eager operations use the same broadcasting, selection and tolerant-comparison rules as the shared Rust core. For richer array notation, operators and fusion, use BasedPL.
 
-Float functions target four units in the last place (ulps), with [documented exceptions](https://answerdotai.github.io/rustymath/accuracy.html). Rustymath prioritizes speed over last-bit agreement and reproducibility.
+Float functions give results within four units in the last place (ulps) of the correctly rounded result, apart from [documented exceptions](https://answerdotai.github.io/rustymath/accuracy.html). Rustymath prioritizes speed over last-bit agreement and reproducibility.
 
 ## Install
 

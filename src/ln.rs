@@ -150,20 +150,16 @@ fn logb_many<R: Native, const MATHISH: bool>([b, x]: [Arg<'_, R>; 2], n: usize, 
     }
 }
 
-/// The part of `log1p` that computes ln(1 + x) from u = 1 + x, split as `(m, e)`, with none of its special values.
+/// ln u + c/u, for u = 1 + x split as `(m, e)` and c = x - (u - 1), the part of 1 + x that rounding u lost. It gives none of `log1p`'s special values.
 #[inline(always)]
-fn log1p_of<R: Native, const FUSED: bool>(x: R, u: R, (m, e): (R, R)) -> R {
-    let top = R::narrow(if R::WIDE { 1000.0 } else { 100.0 });
-    let c = (x - (u - R::one())) * R::pow2(R::SHIFT - if e > top { top } else { e });
-    ln_parts::<R, FUSED>((m - R::one() + c) / (m + R::one() + c), e)
-}
+fn log1p_of<R: Native, const FUSED: bool>(x: R, u: R, split: (R, R)) -> R { log_of::<R, FUSED>(split, natural()) + (x - (u - R::one())) / u }
 
-/// ln(1 + x). Rounding u = 1 + x loses c = x - (u - 1). With u = m × 2^e and c' = c × 2^-e, the quotient s = (m - 1 + c')/(m + 1 + c') restores it, and a small x keeps its relative accuracy with one division. Beyond 2^53, c is 0. e stops at `top` there, to keep 2^-e a normal float.
+/// ln(1 + x), computed as ln u + c/u. Since u + c = 1 + x exactly, ln(1 + x) = ln u + ln(1 + c/u). With |c/u| at most 2^-53, ln(1 + c/u) lies within 2^-106 of c/u. Where |x| is below 2^-53, u rounds to 1 and the result c equals x.
 #[inline]
 pub(crate) fn log1p<R: Native, const FUSED: bool>(x: R) -> R {
     let u = x + R::one();
     let y = log1p_of::<R, FUSED>(x, u, split_positive(u));
-    // -0 must give -0, which the quotient turns into 0.
+    // -0 must give -0, which the sum turns into 0.
     let y = if (x == R::infinity()) | (x == R::zero()) { x } else { y };
     let y = if u == R::zero() { R::neg_infinity() } else { y };
     if u >= R::zero() { y } else { R::nan() }

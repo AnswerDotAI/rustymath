@@ -35,6 +35,7 @@ routes! {
     Contraction: "contraction", true, true, false;
     Program: "program", false, true, false;
     FusedFold: "fused fold", true, true, false;
+    Compiled: "compiled", true, true, false;
     InPlace: "in place", true, true, false;
     ItemPairs: "item pairs", false, false, true;
     ItemLanes: "item lanes", false, false, true;

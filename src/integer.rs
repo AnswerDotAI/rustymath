@@ -95,6 +95,10 @@ pub(crate) fn wrapped_power(x: i64, y: i64) -> (i64, bool) {
 #[inline]
 pub fn residue(x: i64, y: i64) -> i64 { if x == 0 { y } else { floored(y.wrapping_rem(x), x) } }
 
+/// The mask whose bitwise and with an integer y gives y's residue modulo x, where x is a positive power of two: x - 1. In two's complement, y ∧ (x - 1) is y - x⌊y/x⌋ for every y of every width. `None` for any other x.
+#[inline]
+pub fn mask(x: i64) -> Option<i64> { (x > 0 && x.count_ones() == 1).then(|| x - 1) }
+
 /// The floor of x/y, or `None` for a zero y or a quotient that overflows. A dividend below 2^53 in magnitude divides in `f64`, where integer division is slow: the quotient then rounds by less than its distance from the nearest whole number, so its floor is exact. A divisor that `f64` rounds then exceeds the dividend in magnitude, and the quotient's floor is 0 or ¯1 either way.
 #[inline]
 pub fn floor_quotient(x: i64, y: i64) -> Option<i64> {
@@ -208,7 +212,9 @@ forms!(#[inline] Pow at i64: |_, [x, y]| wrapped_power(x, y));
 fn wrapping_power(x: i64, y: i64) -> Option<i64> { let (p, exact) = wrapped_power(x, y); (exact | (y >= 0)).then_some(p) }
 forms!(#[inline] WrappingPow at i64: |_, [x, y]| wrapping_power(x, y));
 forms!(
-    #[inline] Residue at i64: |_, [x, y]| residue(x, y), many |_, [x, y], n, out| if let Arg::One(d) = x && let Some(r) = FloatDivisor::new(d) && fit(y, n) {
+    #[inline] Residue at i64: |_, [x, y]| residue(x, y), many |_, [x, y], n, out| if let Arg::One(d) = x && let Some(m) = mask(d) {
+        each!([y], n, out, |[y]| y & m)
+    } else if let Arg::One(d) = x && let Some(r) = FloatDivisor::new(d) && fit(y, n) {
         each!([y], n, out, |[y]| r.residue(y))
     } else if let Arg::One(d) = x && let Some(d) = Divisor::new(d) {
         each!([y], n, out, |[y]| d.residue(y))
@@ -227,7 +233,9 @@ macro_rules! narrower {
         forms!(#[inline] WrappingPow at $t: |_, [x, y]| wrapping_power(x.into(), y.into()).map(|p| p as $t));
         forms!(
             #[inline] Residue at $t: |_, [x, y]| residue(x.into(), y.into()) as $t,
-            many |_, [x, y], n, out| if let Arg::One(d) = x && <$t>::BITS <= 16 && let Some(s) = Short::new(d as i16) {
+            many |_, [x, y], n, out| if let Arg::One(d) = x && let Some(m) = mask(d.into()) {
+                each!([y], n, out, |[y]| y & m as $t)
+            } else if let Arg::One(d) = x && <$t>::BITS <= 16 && let Some(s) = Short::new(d as i16) {
                 each!([y], n, out, |[y]| s.residue(y as i16) as $t)
             } else if let Arg::One(d) = x && let Some(r) = FloatDivisor::new(d.into()) {
                 each!([y], n, out, |[y]| r.residue(y.into()) as $t)

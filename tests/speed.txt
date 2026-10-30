@@ -1,5 +1,5 @@
 # The budgets that `tests/speed.rs` checks. Each section starts with an item type in brackets. Each line under it holds a function's name and its two native budgets at that type, separated by tabs: first for macOS on Apple silicon, where matrix products and decompositions run on Accelerate, then for Linux on CI's x86 runner, where they run on rustymath's own kernels. `rustymath::timing::NATIVE_COLUMN` picks the budget a machine checks. A budget counts copies of as many items as the function's inputs hold, or its output for broadcasting.
-# A budget is the function's expected cost times the multiplier that `basedpl.bpltests.set_budgets` applies, as basedpl's DEV.md gives, and at least 0.5. The expected cost starts from a first-principles analysis of what the function should cost. A later expected cost comes from a fuller understanding of the function than that analysis gives, such as a platform difference or a cost the analysis missed. A comment above each function, or above its group, gives the expected cost and its reason, as in "1 copy: one read and one write per item", and records each later change with its reason.
+# A budget is the function's expected cost times the multiplier that `rustymath::timing::budget` holds, as basedpl's DEV.md describes, and at least 0.5. A line such as `# held linux 14.2: REASON` above a function's line holds that column at the budget for the cost it gives, until the gap it names is fixed, and `# busy` does the same for CI's busy hosts, as `rustymath::timing::hold` reads them. The expected cost starts from a first-principles analysis of what the function should cost. A later expected cost comes from a fuller understanding of the function than that analysis gives, such as a platform difference or a cost the analysis missed. A comment above each function, or above its group, gives the expected cost and its reason, as in "1 copy: one read and one write per item", and records each later change with its reason.
 # One expected cost serves both platforms at first. A platform's budget differs only where a specific difference on that platform is found, such as Accelerate's matrix products on macOS.
 # A function that costs more than its budget needs study, which finds either a speed bug to fix or something the analysis missed. Avoid raising a budget to match a run without understanding why the function costs what it does.
 # CI's x86 runner is an AMD Ryzen 9 7950X3D 16-Core Processor.
@@ -82,8 +82,10 @@ Erfinv	40	40
 # 21 copies, for 85 vector ops: as erfinv, from 1 - q.
 Erfcinv	42	42
 # 450 copies, for 900 scalar ops: a double-word prefactor (300) and about 50 series or continued-fraction steps of 12 ops, at half a copy each.
+# held linux 761.5: margin against noise for a case within 10% of its budget (30 October 2026)
 Gammainc	900	900
 # 450 copies, for Gammainc's 900 scalar ops.
+# held linux 761.5: margin against noise for a case within 10% of its budget (30 October 2026)
 Gammaincc	900	900
 # 1800 copies, for about four evaluations of Gammainc and its derivative, 3,600 scalar ops.
 Gammaincinv	3600	3600

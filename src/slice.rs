@@ -23,6 +23,9 @@ impl<'a, T: Copy> Arg<'a, T> {
     /// Item `i` of this argument, or its one item.
     #[inline(always)]
     pub fn nth(self, i: usize) -> T { match self { Arg::One(v) => v, Arg::Many(s) => s[i] } }
+    /// The one item of an argument that holds one for every result.
+    #[inline(always)]
+    pub fn one(self) -> Option<T> { match self { Arg::One(v) => Some(v), Arg::Many(_) => None } }
     /// Items `start..start + n` of this argument, each converted by `f`. A `Many` argument converts into `buf`.
     #[inline]
     pub fn converted<'b, A>(self, start: usize, n: usize, buf: &'b mut Vec<A>, f: impl Fn(T) -> A) -> Arg<'b, A> {
@@ -499,7 +502,7 @@ pub(crate) fn pairs_into<X: Copy, Y: Copy, B>(x: Arg<'_, X>, y: Arg<'_, Y>, n: u
 
 /// [`pairs_into`] for three arguments, which `mapped` runs for a function object of three arguments.
 #[inline]
-fn triples_into<X: Copy, Y: Copy, Z: Copy, B>(
+pub(crate) fn triples_into<X: Copy, Y: Copy, Z: Copy, B>(
     x: Arg<'_, X>, y: Arg<'_, Y>, z: Arg<'_, Z>, n: usize, out: &mut [MaybeUninit<B>], f: impl Fn(X, Y, Z) -> (B, bool)) -> bool {
     let (out, mut ok) = (&mut out[..n], true);
     each_triple!(x, y, z, n, |i, a, b, c| {

@@ -27,7 +27,7 @@ pub enum Period<'a> {
     Repeats(usize),
     /// Every this many positions read the source's first items again, in order, as `Tiled` reads them.
     Cycles(usize),
-    /// Every `len` positions read the same items again, through entries: those that `steps` reach from `base`. Reading a cycle in place walks its entries, so a reader gathers one cycle first (`gather_cycle`).
+    /// Every `len` positions read the same items again, through entries: those that `steps` reach from `base`. Reading a cycle in place walks its entries, so a reader gathers one cycle first (`tiled_cycle`).
     Walks { len: usize, base: usize, steps: &'a [Steps] },
 }
 
@@ -282,11 +282,14 @@ impl Mapping {
     pub fn line_block(&self, size: usize) -> usize {
         match self.inner() { Some(inner) if inner.skips() => (inner.len() * (LINE / size).max(1)).min(LINE_BLOCK), _ => 0 }
     }
-    /// What this mapping's positions read again, and over how many positions (`Period`): each item repeated (`repeats`), `Tiled`'s cycle, or the cycle of a `Steps` mapping whose outer axes step by 0, as a broadcast along outer axes reads. `None` for one item, adjacent items, a mapping that fills, and other steps.
+    /// What this mapping's positions read again, and over how many positions (`Period`): each item repeated (`repeats`), `Tiled`'s cycle, the cycle of a `Steps` mapping whose outer axes step by 0, as a broadcast along outer axes reads, or the cycle of one entry that wraps its whole source from the first item, as a reshape reads. `None` for one item, adjacent items, a mapping that fills, and other steps.
     pub fn period(&self) -> Option<Period<'_>> {
         if let Self::Tiled(m) = *self { return Some(Period::Cycles(m)); }
         if let Some(r) = self.repeats() { return Some(Period::Repeats(r)); }
         let Self::Steps { base, steps } = self else { return None };
+        if let [Steps::Padded { start: 0, len, size, stride: 1, edge: crate::structure::Edge::Wrap }] = **steps && *base == 0 && size >= 2 && len > size {
+            return Some(Period::Cycles(size));
+        }
         let k = steps.iter().position(|s| !matches!(*s, Steps::Stride { step: 0, .. }))?;
         let (outer, inner) = steps.split_at(k);
         let p = inner.iter().map(Steps::len).product::<usize>();
@@ -495,19 +498,22 @@ impl Frames {
 
 /// The shortest broadcast block that runs as one call, where one argument repeats each of its items along the block. A shorter block expands into a chunk buffer instead, which measured faster than a call for each block of up to 5 items.
 const SHORT_REPEATED: usize = 6;
-/// The shortest broadcast block that runs as one call, where an argument cycles and no argument repeats its items. A shorter block expands into a chunk buffer, which measured faster than a call for each block of up to 12 items.
-const SHORT_CYCLED: usize = 16;
-/// The shortest repeat or cycle at which runs of positions end with its periods, so that a read takes the repeated item, or the cycle's items, where they lie. A shorter repeat or cycle fills the run's buffer. On a broadcast `clip` through `read_runs`, reading a repeat of 128 as one item cost about 20% less than filling it, and a repeat of 64 cost about the same either way.
+/// The shortest repeat at which runs of positions end with its periods, so that a read takes the repeated item where it lies. A shorter repeat fills the run's buffer. On a broadcast `clip` through `read_runs`, reading a repeat of 128 as one item cost about 20% less than filling it, and a repeat of 64 cost about the same either way.
 const LONG_PERIOD: usize = 128;
+/// The shortest cycle that reads in place a period at a time. `Side` writes a shorter cycle out once (`tiled_cycle`), so that runs a chunk long read it in place at any phase. On comparisons of two cycles of 65,536 characters, writing the cycle out cost 61-65% less than the earlier reads at 16 items and below, 43% less at 43, 5% less at 128 and 2% less at 256, then 11%, 24% and 32% more than reading a period at a time at 512, 1,000 and 2,048.
+const LONG_CYCLE: usize = 256;
 /// Bytes in a cache line on the Apple processors that rustymath is tuned on. An x86-64 line holds half as many.
 pub(crate) const LINE: usize = 128;
 /// The most items in a block of whole rows from [`Mapping::line_block`].
 const LINE_BLOCK: usize = 1 << 16;
 
-/// Runs `leaf` over a frame of `len` items that one argument lays out through `mapping`, appending its results to `out` in order, and gives whether every call succeeded. Ranges of the frame run in parallel, and `leaf` writes each range's results into its slots. Contiguous arguments and long enough broadcast blocks go to `leaf` whole, as in [`blocks`]. Other mappings expand a run of items at a time, as `chunks` sizes it, into a buffer for each range.
+/// Runs `leaf` over a frame of `len` items that one argument lays out through `mapping`, appending its results to `out` in order, and gives whether every call succeeded. Ranges of the frame run in parallel, and `leaf` writes each range's results into its slots. Long enough broadcast blocks go to `leaf` a period at a time, as in [`blocks`]. Otherwise the argument reads through a `Side`: a contiguous argument goes to `leaf` whole, and other mappings expand a run of items at a time, as `chunks` sizes it, into a buffer for each range.
 #[inline]
 pub fn block<Y: Element, B: Copy + Send>(
     y: &[Y], mapping: &Mapping, len: usize, out: &mut Vec<B>, leaf: impl Fn(Arg<'_, Y>, usize, &mut Slots<'_, B>) -> bool + Sync) -> bool {
+    if let Some((p, [w])) = by_periods([mapping]) {
+        return extended(out, len, CHUNK, &|range, slots| periods(range, p, |k, part| leaf(w.items(y, k, &part), part.len(), slots)));
+    }
     let side = Side::new(y, mapping);
     let (y, mapping) = (&*side.data, &*side.mapping);
     extended(out, len, CHUNK, &|range, slots| {
@@ -516,27 +522,27 @@ pub fn block<Y: Element, B: Copy + Send>(
         match *mapping {
             Single => leaf(One(y[0]), range.len(), slots),
             Linear(1) => leaf(Many(&y[range.clone()]), range.len(), slots),
-            _ => match by_periods([mapping]) {
-                Some((p, [w])) => periods(range, p, |k, part| leaf(w.items(y, k, &part), part.len(), slots)),
-                None => {
-                    let mut ys = Vec::new();
-                    chunks(range, &[(mapping, size_of::<Y>())], &mut |at, n| leaf(expanded(mapping, y, at, n, &mut ys), n, slots))
-                }
-            },
+            _ => {
+                let mut ys = Vec::new();
+                chunks(range, &[(mapping, size_of::<Y>())], &mut |at, n| leaf(expanded(mapping, y, at, n, &mut ys), n, slots))
+            }
         }
     })
 }
 
-/// Runs `leaf` over the frame of `agreement`, appending its results to `out` in order, and gives whether every call succeeded. Ranges of the frame run in parallel, and `leaf` writes each range's results into its slots. Within a range, contiguous arguments and long enough broadcast blocks go to `leaf` whole: an item beside a slice, or two slices. Shorter blocks and other mappings expand a run of items at a time, as `chunks` sizes it, into buffers for each range.
+/// Runs `leaf` over the frame of `agreement`, appending its results to `out` in order, and gives whether every call succeeded. Ranges of the frame run in parallel, and `leaf` writes each range's results into its slots. Long enough broadcast blocks go to `leaf` a period at a time, as `by_periods` finds them, with each argument's items read where they lie. A block that a range cuts goes to `leaf` in its parts. Otherwise both arguments read through `Side`s: contiguous arguments go to `leaf` whole within a range, as an item beside a slice or two slices, and other mappings expand a run of items at a time, as `chunks` sizes it, into buffers for each range.
 #[inline]
 pub fn blocks<X: Element, Y: Element, B: Copy + Send, L>(
     x: &[X], y: &[Y], agreement: &Agreement<L>, out: &mut Vec<B>, leaf: impl Fn(Arg<'_, X>, Arg<'_, Y>, usize, &mut Slots<'_, B>) -> bool + Sync) -> bool {
+    if let Some((p, [l, r])) = by_periods([&agreement.left, &agreement.right]) {
+        return extended(out, agreement.len, CHUNK, &|range, slots| periods(range, p, |k, part| leaf(l.items(x, k, &part), r.items(y, k, &part), part.len(), slots)));
+    }
     let (xs, ys) = (Side::new(x, &agreement.left), Side::new(y, &agreement.right));
     let ((x, left), (y, right)) = ((&*xs.data, &*xs.mapping), (&*ys.data, &*ys.mapping));
     extended(out, agreement.len, CHUNK, &|range, slots| paired(x, y, left, right, range, slots, &leaf))
 }
 
-/// `leaf` on positions `range` of a frame that `left` and `right` lay `x` and `y` over, in order, as [`blocks`] describes. A broadcast block that `range` cuts goes to `leaf` in its parts.
+/// `leaf` on positions `range` of a frame that `left` and `right` lay `x` and `y` over, in order, as [`blocks`] describes for reads through `Side`s.
 fn paired<X: Element, Y: Element, B>(
     x: &[X], y: &[Y], left: &Mapping, right: &Mapping, range: Range<usize>, out: &mut Slots<'_, B>,
     leaf: &impl Fn(Arg<'_, X>, Arg<'_, Y>, usize, &mut Slots<'_, B>) -> bool) -> bool {
@@ -547,15 +553,12 @@ fn paired<X: Element, Y: Element, B>(
         (Single, Linear(1)) => leaf(One(x[0]), Many(&y[range]), n, out),
         (Linear(1), Single) => leaf(Many(&x[range]), One(y[0]), n, out),
         (Linear(1), Linear(1)) => leaf(Many(&x[range.clone()]), Many(&y[range]), n, out),
-        _ => match by_periods([left, right]) {
-            Some((p, [l, r])) => periods(range, p, |k, part| leaf(l.items(x, k, &part), r.items(y, k, &part), part.len(), out)),
-            None => {
-                let (mut xs, mut ys) = (Vec::new(), Vec::new());
-                chunks(range, &[(left, size_of::<X>()), (right, size_of::<Y>())], &mut |at, n| {
-                    leaf(expanded(left, x, at, n, &mut xs), expanded(right, y, at, n, &mut ys), n, out)
-                })
-            }
-        },
+        _ => {
+            let (mut xs, mut ys) = (Vec::new(), Vec::new());
+            chunks(range, &[(left, size_of::<X>()), (right, size_of::<Y>())], &mut |at, n| {
+                leaf(expanded(left, x, at, n, &mut xs), expanded(right, y, at, n, &mut ys), n, out)
+            })
+        }
     }
 }
 
@@ -586,22 +589,22 @@ impl Within {
     }
 }
 
-/// The period at which `mappings` run as one call for each period, with how each lays its items within it. Every mapping must read in order, repeat or cycle, those that repeat or cycle must share the period, and the period must be long enough that a call for each period beats expanding it: `SHORT_REPEATED` where a mapping repeats, and `SHORT_CYCLED` otherwise.
+/// The period at which `mappings` run as one call for each period, with how each lays its items within it. Every mapping must read in order, repeat or cycle, and those that repeat or cycle must share the period. The period must be long enough that a call for each period beats expanding it: `SHORT_REPEATED` where a mapping repeats. Without a repeat, a cycle shorter than `LONG_CYCLE` reads a run at a time from the cycle that `Side` writes out instead.
 fn by_periods<const N: usize>(mappings: [&Mapping; N]) -> Option<(usize, [Within; N])> {
     let mut ps = mappings.iter().filter_map(|m| m.period()?.in_place());
     let p = ps.next()?;
     if ps.any(|q| q != p) { return None; }
-    let short = if mappings.iter().any(|m| m.repeats().is_some()) { SHORT_REPEATED } else { SHORT_CYCLED };
+    let short = if mappings.iter().any(|m| m.repeats().is_some()) { SHORT_REPEATED } else { LONG_CYCLE };
     let within = mappings.map(Within::of);
     (p >= short && within.iter().all(Option::is_some)).then(|| (p, within.map(|w| w.unwrap_or(Within::Same))))
 }
 
-/// `f` on each run of positions of `range`, with the run's first position and length. A run holds `CHUNK` positions, or more where one of `reads`, each a mapping with the size of the items it reads, asks for whole rows through `Mapping::line_block`. Where a read repeats each item, or cycles, over at least `LONG_PERIOD` positions, runs also end where its periods do, so that it reads its item, or its cycle's items, where they lie (`in_place`). Periods under leading-axis agreement nest, so runs end where the shortest such period does. Gives whether every call succeeded. It calls `f` on every run even after a failure, so that every slot gets written. It takes `f` as `dyn` and stays out of line, so it compiles once.
+/// `f` on each run of positions of `range`, with the run's first position and length. A run holds `CHUNK` positions, or more where one of `reads`, each a mapping with the size of the items it reads, asks for whole rows through `Mapping::line_block`. Where a read repeats each item over at least `LONG_PERIOD` positions, or cycles over at least `LONG_CYCLE`, runs also end where its periods do, so that it reads its item, or its cycle's items, where they lie (`in_place`). A shorter cycle reads at any phase from the cycle that `Side` writes out. Periods under leading-axis agreement nest, so runs end where the shortest such period does. Gives whether every call succeeded. It calls `f` on every run even after a failure, so that every slot gets written. It takes `f` as `dyn` and stays out of line, so it compiles once.
 #[inline(never)]
 pub(crate) fn chunks(range: Range<usize>, reads: &[(&Mapping, usize)], f: &mut dyn FnMut(usize, usize) -> bool) -> bool {
     let len = reads.iter().fold(CHUNK, |n, &(mapping, size)| n.max(mapping.line_block(size)));
     let mut runs = |part: Range<usize>| part.clone().step_by(len).fold(true, |ok, at| f(at, len.min(part.end - at)) & ok);
-    match reads.iter().filter_map(|&(mapping, _)| mapping.period()?.in_place()).filter(|&p| p >= LONG_PERIOD).min() {
+    match reads.iter().filter_map(|&(mapping, _)| match mapping.period()? { Period::Repeats(r) if r >= LONG_PERIOD => Some(r), Period::Cycles(p) if p >= LONG_CYCLE => Some(p), _ => None }).min() {
         Some(p) => periods(range, p, |_, part| runs(part)), None => runs(range)
     }
 }
@@ -648,14 +651,19 @@ pub trait Read<A>: Sync {
     fn reads(&self) -> (&Mapping, usize);
 }
 
-/// An argument's items and the mapping that lays them over the frame. It reads them as any type they convert to through [`Source`]. Where the mapping's positions walk entries (`Period::Walks`), it holds one cycle's items, gathered once, which `Tiled` reads in place: walking the entries for each run would read every cycle's items again.
+/// An argument's items and the mapping that lays them over the frame. It reads them as any type they convert to through [`Source`]. Where the mapping cycles with a period shorter than `LONG_CYCLE`, it holds the cycle written out once over a chunk (`tiled_cycle`), which `Tiled` reads in place at any phase. Where it walks entries for each longer cycle (`Period::Walks`), it holds one cycle, gathered once. Walking the entries, or copying a short cycle, for each run would read the same items again.
 pub struct Side<'a, X: Clone> { data: Cow<'a, [X]>, mapping: Cow<'a, Mapping> }
 
 impl<'a, X: Element> Side<'a, X> {
     pub fn new(data: &'a [X], mapping: &'a Mapping) -> Self {
         let mapping = mapping.cast_fill(X::DTYPE).expect("a fill converts with its source").map_or(Cow::Borrowed(mapping), Cow::Owned);
         let mut items = Vec::new();
-        match gather_cycle(data, &mapping, &mut items) {
+        let cover = match mapping.period() {
+            Some(Period::Cycles(p) | Period::Walks { len: p, .. }) if p < LONG_CYCLE => Some(CHUNK),
+            Some(Period::Walks { .. }) => Some(0),
+            _ => None,
+        };
+        match cover.and_then(|cover| tiled_cycle(data, &mapping, cover, &mut items)) {
             Some(tiled) => Self { data: Cow::Owned(items), mapping: Cow::Owned(tiled) }, None => Self { data: Cow::Borrowed(data), mapping }
         }
     }
@@ -706,13 +714,14 @@ pub fn expanded_items<'a, A: Element>(mapping: &Mapping, data: &'a [A], start: u
     match expanded(mapping, data, start, n, buf) { Arg::Many(items) => items, Arg::One(_) => unreachable!("`single` gives every repeated item") }
 }
 
-/// Items `start..start + n` of an argument that `mapping` lays out, where they need no copy: a single item, a contiguous run, or items within one repeat or one cycle. A `Steps` mapping reads a forward run in place through `run`.
+/// Items `start..start + n` of an argument that `mapping` lays out, where they need no copy: a single item, a contiguous run, items within one repeat, or items of a cycle: within one period of a mapping that cycles (`Period::Cycles`), and as far as `data` holds a `Tiled` cycle, once or written out past its end (`tiled_cycle`). A `Steps` mapping reads a forward run in place through `run`.
 pub fn in_place<'a, A: Copy>(mapping: &Mapping, data: &'a [A], start: usize, n: usize) -> Option<Arg<'a, A>> {
     if let Some(x) = single(mapping, data, start, n) { return Some(Arg::One(x)); }
     match *mapping {
         Mapping::Linear(1) => Some(Arg::Many(&data[start..start + n])),
-        Mapping::Steps { .. } => mapping.run(start, n).and_then(|(o, step)| (step == 1).then(|| Arg::Many(&data[o..o + n]))),
-        Mapping::Tiled(m) if n <= m - start % m => Some(Arg::Many(&data[start % m..start % m + n])), _ => None
+        Mapping::Steps { .. } => mapping.run(start, n).and_then(|(o, step)| (step == 1).then(|| Arg::Many(&data[o..o + n])))
+            .or_else(|| match mapping.period()? { Period::Cycles(p) if start % p + n <= p => Some(Arg::Many(&data[start % p..start % p + n])), _ => None }),
+        Mapping::Tiled(m) if start % m + n <= data.len() => Some(Arg::Many(&data[start % m..start % m + n])), _ => None
     }
 }
 
@@ -722,11 +731,16 @@ pub fn expanded<'a, A: Element>(mapping: &Mapping, data: &'a [A], start: usize, 
     Arg::Many(copied(mapping, data, start, n, buf))
 }
 
-/// One cycle's items of `data`, copied into `buf` once, where `mapping`'s positions walk entries (`Period::Walks`), with the `Tiled` mapping that then reads them in place. `None` for any other mapping, leaving `buf` alone. Walking the entries for every cycle would read the same items again each time.
-pub fn gather_cycle<A: Element>(data: &[A], mapping: &Mapping, buf: &mut Vec<A>) -> Option<Mapping> {
-    let Some(Period::Walks { len, base, steps }) = mapping.period() else { return None };
-    copied(&Mapping::Steps { base, steps: steps.to_vec().into() }, data, 0, len, buf);
-    Some(Mapping::Tiled(len))
+/// The cycle that `mapping`'s positions read from `data`, written into `buf` once, with the `Tiled` mapping that then reads it in place, where the positions cycle (`Period::Cycles`) or walk entries for each cycle (`Period::Walks`). Walking entries gathers the cycle through them. A cycle shorter than `cover` positions is written out past its end, so that a run of up to `cover` positions reads it in place at any phase. `None` for any other mapping, leaving `buf` alone.
+pub fn tiled_cycle<A: Element>(data: &[A], mapping: &Mapping, cover: usize, buf: &mut Vec<A>) -> Option<Mapping> {
+    let p = match mapping.period()? {
+        Period::Walks { len, base, steps } => { copied(&Mapping::Steps { base, steps: steps.to_vec().into() }, data, 0, len, buf); len }
+        Period::Cycles(p) => { buf.clear(); buf.extend_from_slice(&data[..p]); p }
+        _ => return None,
+    };
+    buf.truncate(p);
+    if p < cover { *buf = buf.repeat(cover.div_ceil(p) + 1); }
+    Some(Mapping::Tiled(p))
 }
 
 /// Items `start..start + n` that `expanded` copies into `buf`, cleared first. It's out of line, so it compiles once for each item type rather than in each caller.
@@ -735,7 +749,17 @@ fn copied<'a, A: Element>(mapping: &Mapping, data: &[A], start: usize, n: usize,
     buf.clear();
     let reason = match *mapping {
         Mapping::Single => { buf.resize(n, data[0]); "a repeated item" }
-        Mapping::Linear(r) => { periods(start..start + n, r, |k, p| { buf.resize(buf.len() + p.len(), data[k]); true }); "repeats of each item" }
+        Mapping::Linear(r) => {
+            // The range can start and end inside an item's run. The whole runs between go through `repeat`.
+            let (k0, end) = (start / r, start + n);
+            buf.resize(((k0 + 1) * r).min(end) - start, data[k0]);
+            if buf.len() < n {
+                let (k1, k2) = (k0 + 1, end / r);
+                crate::gather::repeat(buf, &data[k1..k2], &[r as i64], (k2 - k1) * r, |x| x);
+                if end % r != 0 { buf.resize(n, data[k2]) }
+            }
+            "repeats of each item"
+        }
         Mapping::Tiled(m) => { cycled(buf, &data[..m], start, n); "a cycle that wraps" }
         Mapping::Steps { base, ref steps } => {
             let (offset, plan) = steps.plan();
