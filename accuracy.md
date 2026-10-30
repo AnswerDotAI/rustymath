@@ -1,0 +1,73 @@
+
+
+# Accuracy
+
+Float functions give results within 4 units in the last place (ulps) of
+the correctly rounded result, apart from the exceptions below. Where
+rustymath gives up a few ulps for real speed or a simpler
+implementation, it lists the loss here.
+
+## Exceptions
+
+- `lgamma` near its zeros at 1 and 2 is within 4 ulps of 2, not of the
+  result. `digamma` near its zeros is within 4 ulps of 1, and below -20
+  within 4 ulps of ln(1 - x).
+- `binom` and `binom_dn` of a non-whole n with a whole k up to 64 are
+  within 2k ulps.
+- `binom_dk` has no relative bound near n = 2k, where its two ψ terms
+  cancel.
+- `beta` is within 6 ulps at `f64`: two of its three ln Γ pair up as one
+  difference, and the third carries the logarithm of its Lanczos sum in
+  floats.
+- `pow` by a whole exponent from -8 to 8, or by -1.5, squares and
+  multiplies in single words. A rounding at the step that gives x^k
+  carries into x^m about m/k times. The worst errors measured over every
+  `f32` significand and a million random `f64` ones are 4.4 ulps for
+  x^7, 5.2 for x^8, 4.1 for x^-5, 5.2 for x^-6, 5.7 for x^-7, 7.1 for
+  x^-8 and 4.4 for 1/√x^3. Where x^m overflows, x^-m is 0, though the
+  true result is subnormal: for |x| from 2^(1024/m) to 2^(1075/m) at
+  `f64`, and from 2^(128/m) to 2^(150/m) at `f32`, for m from 2 to 8 and
+  for m = 1.5.
+- Normal and log-normal evaluation of `f32` inputs uses `f32`
+  arithmetic, with parameters and precomputed coefficients rounded to
+  `f32`. Their densities are within 12 ulps and their cdfs within 14
+  where |z| \< 3, z being the standard score of x or of ln x. They lose
+  accuracy as z² grows, to about 80 and 170 ulps at |z| = 12. Their
+  quantiles are within 13 ulps, except near a quantile of 0, where
+  cancellation leaves an absolute error of up to 8 ulps of the standard
+  deviation. These figures exclude additional error from parameter
+  rounding and ill-conditioned location/scale transformations.
+- Uniform, exponential, Cauchy, Laplace, logistic and Weibull evaluation
+  of `f32` inputs uses `f32` arithmetic too, with parameters and
+  precomputed coefficients rounded to `f32`. At both widths their
+  densities and cdfs are within 4 ulps, with two exceptions. The
+  logistic density at `f64` is within 4.4 ulps, from the rounding of its
+  exponential, square and quotient. The Weibull density loses accuracy
+  as z^shape grows, z being x/scale: within 4 ulps up to z^shape = 4,
+  then about z^shape ulps, such as 15, 50 and 240 at 16, 64 and 256.
+  Rounding z^shape into the exponent of e<sup>(-z</sup>shape) costs that
+  much, whatever computes the power. Their quantiles are within 4 ulps,
+  except near a quantile of 0 for the Cauchy, Laplace and logistic laws,
+  where cancellation in location + scale·l leaves an absolute error of
+  up to 4 ulps of the scale. These figures exclude additional error from
+  parameter rounding, ill-conditioned location/scale transformations,
+  and arguments whose standardized value is subnormal.
+- Complex functions count ulps of the result’s magnitude, so a much
+  smaller part can carry most of the error. Complex powers, Γ and
+  binomial coefficients allow ulps of their magnitude times one more
+  than the exponent’s magnitude. `exp` gives an exact direction at the
+  float nearest a whole number of quarter turns, so e^(iπ/2) is exactly
+  i.
+
+## Not promised
+
+- Last bits. A result’s last bits can differ between thread counts,
+  array sizes, platforms, builds and runs. A fold such as a sum adds in
+  an order that depends on these.
+- NaN behaviour. Where an argument is NaN, a function can give NaN or,
+  as max and min can, another argument. Which it gives isn’t promised,
+  nor which NaN it gives, with which sign and payload. These can differ
+  by function, route and platform.
+- The sign of zero. A zero result can be +0 or -0, which can differ by
+  function, route and platform. Today `sign` returns a zero argument
+  unchanged. Floor and ceiling give +0 for any zero result.
