@@ -5,7 +5,7 @@
 //! [`minimize`] and [`solve`] start from the start point moved inside the bounds, evaluate the function only inside them, and return the best point they evaluated. A NaN value counts as +∞. An error from the function stops the search and comes back as the front's error. A search that uses up its evaluations returns its best point with `converged` false.
 //!
 //! The Krylov methods use A only through its products. Conjugate gradients (CG) solves a symmetric positive definite system, MINRES a symmetric one, and GMRES any square one. Least squares runs CG or MINRES on the normal equations AᵀA x = Aᵀb, with one product with A and one with Aᵀ for each product with AᵀA. MINRES there gives the iterates of Fong and Saunders' LSMR, and CG those of CGLS, which match Paige and Saunders' LSQR. Running on AᵀA squares A's condition number. On ill-conditioned problems that costs some accuracy next to LSMR's and LSQR's own Golub–Kahan bidiagonalization, which works on A itself. A mapping's [`Mapping::precondition`] gives a preconditioner, an approximation to the inverse of the matrix the method runs on, which cuts the steps a solve needs. CG and MINRES apply it on each step, and GMRES on the right. CG and MINRES both build on the Lanczos process. MINRES and GMRES both track the residual through plane rotations, the same ones the tridiagonal and bidiagonal iterations use.
-use crate::{Native, linalg::{Factor, axpy, dot, givens, lstsq}, random::{SplitMix64, unit}};
+use crate::{Native, linalg::{Factor, axpy, dot, givens, lstsq}, random::{Key, unit}};
 use rand::Rng;
 use std::collections::VecDeque;
 
@@ -729,7 +729,7 @@ fn evolution<F: Native, O: Objective<F>>(search: &mut Search<'_, F, O>, populati
     const SETTLED: f64 = 0.01;
     let Some(Bounds { lower, upper }) = search.bounds else { unreachable!() };
     let n = search.best.len();
-    let mut rng = SplitMix64(seed);
+    let mut rng = Key::seeded(seed).stream(0).at(0);
     let mut uniform = move || F::narrow(unit(rng.next_u64()));
     let mut members = Vec::with_capacity(population * n);
     members.extend_from_slice(&search.best);

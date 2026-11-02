@@ -37,6 +37,12 @@ pub fn strides(shape: &[usize]) -> Vec<usize> {
     strides
 }
 
+/// The offsets of parts of `sizes` laid end to end, each the sum of the sizes before it.
+pub fn exclusive_sums(sizes: impl IntoIterator<Item = usize>) -> Vec<usize> {
+    let mut at = 0;
+    sizes.into_iter().map(|n| { let start = at; at += n; start }).collect()
+}
+
 /// Each axis's coordinate of flat position `flat`, from the last axis to the first. `flat` must be within the shape.
 #[inline]
 pub fn coordinates(mut flat: usize, shape: &[usize]) -> impl Iterator<Item = (usize, usize)> + '_ {
@@ -101,14 +107,22 @@ pub fn names_conflict(a: Option<&str>, b: Option<&str>) -> bool { matches!((a, b
 
 /// An array's shape: the length of each axis. Ranks 0 to 2 are held inline with no allocation, and higher ranks in one allocation of exactly their length. Convert a `Vec`, an array or a slice of lengths into one, or collect it from lengths.
 #[derive(Clone)]
-pub struct Shape(Lengths);
+pub struct Shape(Repr);
 
 #[derive(Clone)]
-enum Lengths { Small(u8, [usize; 2]), Large(Box<[usize]>) }
+enum Repr { Small(u8, [usize; 2]), Large(Box<[usize]>) }
 
 impl Shape {
     /// The shape of a rank-0 array.
-    pub const EMPTY: Self = Self(Lengths::Small(0, [0; 2]));
+    pub const EMPTY: Self = Self(Repr::Small(0, [0; 2]));
+    /// The lengths of `parts`, one after another.
+    fn spliced(parts: [&[usize]; 3]) -> Self {
+        let len: usize = parts.iter().map(|p| p.len()).sum();
+        if len > 2 { return Self(Repr::Large(parts.concat().into_boxed_slice())); }
+        let mut small = [0; 2];
+        for (slot, &n) in small.iter_mut().zip(parts.into_iter().flatten()) { *slot = n; }
+        Self(Repr::Small(len as u8, small))
+    }
 }
 impl Default for Shape {
     #[inline]
@@ -117,12 +131,12 @@ impl Default for Shape {
 impl std::ops::Deref for Shape {
     type Target = [usize];
     #[inline]
-    fn deref(&self) -> &[usize] { match &self.0 { Lengths::Small(n, lengths) => &lengths[..usize::from(*n)], Lengths::Large(lengths) => &lengths[..] } }
+    fn deref(&self) -> &[usize] { match &self.0 { Repr::Small(n, lengths) => &lengths[..usize::from(*n)], Repr::Large(lengths) => &lengths[..] } }
 }
 impl std::ops::DerefMut for Shape {
     #[inline]
     fn deref_mut(&mut self) -> &mut [usize] {
-        match &mut self.0 { Lengths::Small(n, lengths) => &mut lengths[..usize::from(*n)], Lengths::Large(lengths) => &mut lengths[..] }
+        match &mut self.0 { Repr::Small(n, lengths) => &mut lengths[..usize::from(*n)], Repr::Large(lengths) => &mut lengths[..] }
     }
 }
 impl PartialEq for Shape {
@@ -134,13 +148,13 @@ impl From<&[usize]> for Shape {
     #[inline]
     fn from(lengths: &[usize]) -> Self {
         match *lengths {
-            [] => Self::EMPTY, [a] => Self(Lengths::Small(1, [a, 0])), [a, b] => Self(Lengths::Small(2, [a, b])), _ => Self(Lengths::Large(lengths.into()))
+            [] => Self::EMPTY, [a] => Self(Repr::Small(1, [a, 0])), [a, b] => Self(Repr::Small(2, [a, b])), _ => Self(Repr::Large(lengths.into()))
         }
     }
 }
 impl From<Vec<usize>> for Shape {
     #[inline]
-    fn from(lengths: Vec<usize>) -> Self { if lengths.len() > 2 { Self(Lengths::Large(lengths.into_boxed_slice())) } else { Self::from(lengths.as_slice()) } }
+    fn from(lengths: Vec<usize>) -> Self { if lengths.len() > 2 { Self(Repr::Large(lengths.into_boxed_slice())) } else { Self::from(lengths.as_slice()) } }
 }
 impl<const N: usize> From<[usize; N]> for Shape { fn from(lengths: [usize; N]) -> Self { Self::from(lengths.as_slice()) } }
 impl FromIterator<usize> for Shape {
@@ -148,11 +162,11 @@ impl FromIterator<usize> for Shape {
         let mut lengths = lengths.into_iter();
         let mut small = [0; 2];
         for n in 0..2 {
-            let Some(len) = lengths.next() else { return Self(Lengths::Small(n, small)) };
+            let Some(len) = lengths.next() else { return Self(Repr::Small(n, small)) };
             small[usize::from(n)] = len;
         }
         match lengths.next() {
-            None => Self(Lengths::Small(2, small)), Some(third) => Self(Lengths::Large(small.into_iter().chain([third]).chain(lengths).collect()))
+            None => Self(Repr::Small(2, small)), Some(third) => Self(Repr::Large(small.into_iter().chain([third]).chain(lengths).collect()))
         }
     }
 }
@@ -233,13 +247,16 @@ impl Keys {
     }
     /// How these positions lie along those of `wanted`: as the same positions, at its first positions, or as [`Keys::align`] finds them.
     pub fn aligned(self: &Arc<Self>, wanted: &Arc<Self>) -> Alignment {
-        if self == wanted { Alignment::Same } else if wanted.names.starts_with(&self.names) { Alignment::Leading } else { Alignment::Table(self.align(wanted)) }
+        if Arc::ptr_eq(self, wanted) || self == wanted { Alignment::Same }
+        else if wanted.names.starts_with(&self.names) { Alignment::Leading }
+        else { Alignment::Table(self.align(wanted)) }
     }
     /// These positions, then the named positions of `other` that these lack, with how these positions and `other`'s lie along them. Unnamed positions pair in order. Both sides need the same number of them.
     pub fn union(self: &Arc<Self>, other: &Arc<Self>) -> Result<(Arc<Self>, [Alignment; 2]), Error> {
-        if self == other { return Ok((self.clone(), [Alignment::Same, Alignment::Same])); }
+        if Arc::ptr_eq(self, other) { return Ok((self.clone(), [Alignment::Same, Alignment::Same])); }
         let (a, b) = (self.len() - self.index.len(), other.len() - other.index.len());
         if a != b { return Err(Error::new(Kind::Length, format!("axes with {a} and {b} positions without keys don't align"))); }
+        if self == other { return Ok((self.clone(), [Alignment::Same, Alignment::Same])); }
         if other.names.starts_with(&self.names) { return Ok((other.clone(), [Alignment::Leading, Alignment::Same])); }
         if self.names.starts_with(&other.names) { return Ok((self.clone(), [Alignment::Same, Alignment::Leading])); }
         let places = self.align(other);
@@ -254,6 +271,7 @@ impl Keys {
 
 /// The Domain error for a key that appears twice on one axis.
 fn duplicate(key: &str) -> Error { Error::new(Kind::Domain, format!("duplicate key: {}", shown(key))) }
+
 
 /// An array's shape, with optional keys and a name for each axis. A layout with no keys or names holds no `Meta`.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -275,6 +293,10 @@ impl Layout {
     /// The number of items in an array of this layout (`count`).
     #[inline]
     pub fn count(&self) -> usize { count(&self.shape) }
+    /// This layout with lengths `shape`, keeping its keys and names: each axis with keys keeps its length.
+    pub fn resized(&self, shape: impl Into<Shape>) -> Self { Self { shape: shape.into(), meta: self.meta.clone() } }
+    /// Whether `other` has this layout's rank, keys and names, whatever its lengths.
+    pub fn same_but_lengths(&self, other: &Self) -> bool { self.shape.len() == other.shape.len() && self.meta == other.meta }
     /// The name of each axis, with `None` for an axis without one. Empty when no axis has a name (`has_names`).
     #[inline]
     pub fn names(&self) -> &[Option<Arc<str>>] { self.meta.as_ref().map_or(&[], |l| &l.names) }
@@ -370,17 +392,26 @@ impl Layout {
     pub fn concat(&self, other: &Self) -> Self { Self::gathered((0..self.shape.len()).map(|a| (self, a)).chain((0..other.shape.len()).map(|a| (other, a)))) }
     /// The layout of a product such as `+.×`, which contracts the last axis of a left argument of this layout with the first axis of a right argument of `right`.
     pub fn contracted(&self, right: &Self) -> Self { self.axes(0..self.shape.len().saturating_sub(1)).concat(&right.axes(1..right.shape.len())) }
-    /// The layout with `other`'s axes in place of `axes`.
-    pub fn replace(&self, axes: std::ops::Range<usize>, other: &Self) -> Self {
-        self.axes(0..axes.start).concat(other).concat(&self.axes(axes.end..self.shape.len()))
+    /// The layout with the axes in `axes` merged into one axis of `len` positions, which has no keys or name. An empty range adds that axis.
+    pub fn merged(&self, axes: std::ops::Range<usize>, len: usize) -> Self {
+        let shape = Shape::spliced([&self.shape[..axes.start], &[len], &self.shape[axes.end..]]);
+        if self.plain() { return Self::from(shape); }
+        let source = |a: usize| match a.cmp(&axes.start) { std::cmp::Ordering::Less => Some(a), std::cmp::Ordering::Equal => None, std::cmp::Ordering::Greater => Some(a - 1 + axes.len()) };
+        let keys = (0..shape.len()).map(|a| source(a).and_then(|s| self.keys(s).cloned())).collect();
+        let names = (0..shape.len()).map(|a| source(a).and_then(|s| self.name(s).cloned())).collect();
+        Self::from(shape).with_keys(keys).unwrap().inherit_names(names)
     }
-    /// The layout with `axis` holding the positions it reads at `positions`, keeping their keys. `None` reads no position and has no key.
-    pub fn select(&self, axis: usize, positions: impl ExactSizeIterator<Item = Option<usize>>) -> Result<Self, Error> {
+    /// The layout with `axis` holding the positions it reads at `positions`, keeping their keys. `None` reads no position and has no key. A Domain error where a key repeats.
+    pub fn select(&self, axis: usize, positions: impl ExactSizeIterator<Item = Option<usize>>) -> Result<Self, Error> { self.picked(axis, positions, false) }
+    /// The layout that a write through `positions` along `axis` reaches: as `select` gives it, except that the axis keeps no keys where one repeats, since a write can reach a position more than once.
+    pub fn written(&self, axis: usize, positions: impl ExactSizeIterator<Item = Option<usize>>) -> Result<Self, Error> { self.picked(axis, positions, true) }
+    /// `select`'s layout. Where `repeats` holds, a repeated key leaves the axis without keys instead of failing.
+    fn picked(&self, axis: usize, positions: impl ExactSizeIterator<Item = Option<usize>>, repeats: bool) -> Result<Self, Error> {
         let mut layout = self.clone();
         layout.shape[axis] = positions.len();
         let Some(keys) = self.keys(axis) else { return Ok(layout) };
         let mut all = self.all_keys();
-        all[axis] = Some(keys.select(positions)?);
+        all[axis] = if repeats { keys.select(positions).ok() } else { Some(keys.select(positions)?) };
         layout.with_keys(all)
     }
     /// Grows the first axis by `len` positions. `names` gives their keys. A Domain error, with the layout unchanged, when one of them is already on that axis or appears twice.

@@ -1,400 +1,887 @@
-//! Running a function object on compact arrays, at the dtype that each argument computes in. [`kernels!`](crate::kernels) finds an object's kernels by testing its [`Unary`], [`Binary`], [`Ternary`], [`Reduction`] or [`Inner`] impl at each element type, so only the object's forms say which dtypes it takes. [`Kernels::computes`] gives the dtype that an argument computes in, and the method for each arity casts an argument there where its own dtype differs, then runs the kernel.
+//! Resolved numerical operations over shared [`Read`](crate::agreement::Read) plans. [`Kernel::resolve`] fixes the computing dtype, result dtype and character policy from an object's [`Formula`](crate::facts::Formula). The same definition supplies native execution and graph formulas.
 //!
-//! An argument computes in the dtype that [`DType::computes_in`] gives for the object's kernels, under NumPy's policy for exact numbers: a Boolean or an integer without a kernel at its own dtype tries `i64`, then the float that [`DType::inexact`] gives it under `f64`. A character, or a number with no kernel on that ladder, has no kernel.
-use crate::agreement::{Agreement, Frames, Mapping, Read, Side, expanded, map1, map2, read_runs};
-use crate::array::ArrayView;
+//! [`DType::computes_in`] promotes unsupported Boolean and integer inputs to i64, then to the NumPy float width. Unsupported character arithmetic is a domain error.
 use crate::buffer::{Buffer, DType, Element, FloatWidth, Source, View, Width};
-use crate::error::Error;
-use crate::linalg::Inner;
-use crate::parallel::{Slots, stack};
-use crate::reduce::{Reduction, scan_along};
-use crate::slice::{Arg, Binary, Results, Ternary, Unary};
+use crate::error::{Error, Kind};
+use crate::slice::Arg;
 
-/// An object's kernel at one dtype for one argument: its result at each of `len` positions, which read the argument through the mapping, and whether every result succeeded.
-pub type UnaryKernel<K> = for<'a> fn(&K, View<'a>, &Mapping, usize) -> (Buffer, bool);
-/// An object's kernel at one dtype for two arguments, which pair as the agreement says.
-pub type BinaryKernel<K> = for<'a> fn(&K, View<'a>, View<'a>, &Agreement) -> (Buffer, bool);
-/// An object's kernel at one dtype for three arguments. The first agreement pairs the first two arguments, and the second pairs the first agreement's layout with the third.
-pub type TernaryKernel<K> = for<'a> fn(&K, [View<'a>; 3], &Agreement, &Agreement) -> (Buffer, bool);
-/// An accumulation along the middle of `[outer, len, inner]`. The probe selects `Fold`, `Scan`, `RightFold` or `LeftScan`; the optional argument is a right tail per lane for folds or a scalar start for scans. The selected kernel reads it in its total or computing dtype.
-pub type AccumulationKernel<K> = for<'a> fn(&K, View<'a>, [usize; 3], Option<View<'a>>) -> (Buffer, bool);
-/// A reduction's folds of each window of a number of neighbouring rows along the middle of `[outer, len, inner]`, with that number.
-pub type SlidingKernel<K> = for<'a> fn(&K, View<'a>, [usize; 3], usize) -> (Buffer, bool);
-/// A reduction's fold along one axis of an array that a mapping lays over storage, read through the mapping without building the array, given the array's shape and the axis: its totals, whether they all fit, and the tables that read the totals in the order of the other axes, where they come in another order.
-pub type MappedFoldKernel<K> = for<'a> fn(&K, View<'a>, &Mapping, &[usize], usize) -> (Buffer, bool, Option<Vec<crate::gather::Steps>>);
-/// A matrix product's kernel at one dtype: the product of each pair of cells that the frames pair, each of sizes `[n, k, m]`, and whether every product fit. It checks for an interrupt between rounds of cells, and an interrupt's error stops the products.
-pub type ProductKernel<P> = for<'a> fn(&P, [View<'a>; 2], &Frames, [usize; 3]) -> Result<(Buffer, bool), Error>;
-/// An object's kernel at one dtype for combining items into an array in place, as [`Kernels::scatter`] describes.
-pub type ScatterKernel<K> = for<'a> fn(&K, &mut Buffer, crate::gather::Writes<'a>, View<'a>) -> bool;
+/// Numeric settings rebound for each execution, outside item loops.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Settings { pub tolerance: Option<f64> }
 
-/// An object's kernel at each dtype where it has one, in the order of [`DType::ALL`], with whether it leaves a failed result wrapped to its type.
-pub struct Kernels<F>([Option<(F, bool)>; DType::ALL.len()]);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction { Left, Right }
 
+#[derive(Clone, Copy)]
+pub enum Seed<'a> { Identity, Initial(crate::agreement::Read<'a>), Tail(crate::agreement::Read<'a>) }
+
+/// Write positions from numeric indices or the addresses of a selection's root source.
+#[derive(Clone, Copy)]
+pub enum Positions<'a> { Indices(crate::agreement::Read<'a>, DType), Route(&'a crate::agreement::ReadPlan, usize) }
+
+impl Positions<'_> {
+    fn len(self) -> usize { match self { Self::Indices(read, _) => read.plan.len(), Self::Route(plan, _) => plan.len() } }
+    fn chunk(self, range: std::ops::Range<usize>, size: usize, checked: bool, scratch: &mut Buffer) -> Result<Vec<usize>, Error> {
+        use crate::{agreement::ReadAt, gather::Steps};
+        match self {
+            Self::Indices(read, dtype) => crate::structure::positions_mode(read.part_view(range, dtype, checked, scratch)?, size, checked),
+            Self::Route(plan, root) => range.map(|i| match plan.at(i) {
+                ReadAt::Input { source, position } if source == root && position < size => Ok(position),
+                ReadAt::Invalid => Err(Error::new(Kind::Index, "a checked selection has an invalid position")),
+                ReadAt::Input { source, .. } if source == root && checked => Err(Error::new(Kind::Index, "write position is outside the array")),
+                _ => Ok(Steps::FILL),
+            }).collect(),
+        }
+    }
+}
+
+/// A write's logical root, or storage transferred by its final reader.
+pub enum WriteRoot<'a> { Read(crate::agreement::Read<'a>), Owned(Buffer) }
+impl WriteRoot<'_> {
+    fn len(&self) -> usize { match self { Self::Read(read) => read.plan.len(), Self::Owned(buffer) => buffer.len() } }
+    fn initialize(self, dtype: DType, checked: bool, codes: bool, output: &mut Buffer) -> Result<(), Error> {
+        match self {
+            Self::Read(read) if codes => with_codes(&[read], |reads| reads[0].read_into(0..read.plan.len(), dtype, checked, output)),
+            Self::Read(read) => read.read_into(0..read.plan.len(), dtype, checked, output),
+            Self::Owned(buffer) if buffer.dtype() == dtype => { *output = buffer; Ok(()) }
+            Self::Owned(buffer) => {
+                let view = if codes { crate::characters::as_codes(buffer.view()) } else { buffer.view() };
+                *output = Buffer::cast_results(view, dtype, checked)?;
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Total { pub items: usize, pub bits: u64 }
+impl Total {
+    pub fn value<T: crate::buffer::Cast>(self) -> Result<T, Error> {
+        use crate::buffer::{Ints, Floats};
+        match T::DTYPE {
+            DType::Boolean => T::cast(View::Booleans(&[self.bits != 0]), 0),
+            DType::Integer(width) => {
+                let value = match width { Width::U8 => self.bits as u8 as i64, Width::I16 => self.bits as i16 as i64, Width::I32 => self.bits as i32 as i64, Width::I64 => self.bits as i64 };
+                T::cast(View::Integers(Ints::I64(&[value])), 0)
+            }
+            DType::Float(FloatWidth::F16) => T::cast(View::Floats(Floats::F16(&[half::f16::from_bits(self.bits as u16)])), 0),
+            DType::Float(FloatWidth::F32) => T::cast(View::Floats(Floats::F32(&[f32::from_bits(self.bits as u32)])), 0),
+            DType::Float(FloatWidth::F64) => T::cast(View::Floats(Floats::F64(&[f64::from_bits(self.bits)])), 0),
+            _ => Err(Error::new(Kind::Domain, "compiled totals have a real machine dtype")),
+        }
+    }
+}
+
+pub enum Piece<'a> { Items(View<'a>), Total(Total) }
+
+pub type Pieces<'a> = dyn Fn(std::ops::Range<usize>, &mut dyn FnMut(usize, Piece<'_>)) -> Result<(), Error> + Sync + 'a;
+
+/// One resolved mathematical definition and its captured numerical policies.
+#[derive(Clone)]
+pub struct Kernel {
+    pub variant: crate::facts::Variant,
+    result: DType,
+    boolean_inputs: bool,
+    characters: Option<crate::characters::Policy>,
+    definition: std::sync::Arc<dyn Application>,
+}
+
+impl std::fmt::Debug for Kernel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Kernel").field("variant", &self.variant).field("arity", &self.arity()).finish()
+    }
+}
+
+trait Application: Send + Sync {
+    fn exact(&self, args: &[num_rational::BigRational]) -> Result<Option<num_rational::BigRational>, Error>;
+    fn has_exact(&self) -> bool;
+    fn real(&self, variant: crate::facts::Variant, args: &[f64], settings: Settings) -> Result<f64, Error>;
+    fn complex(&self, variant: crate::facts::Variant, args: &[num_complex::Complex64], settings: Settings) -> Result<num_complex::Complex64, Error>;
+    fn arity(&self) -> usize;
+    fn integer_formula(&self) -> bool;
+    fn formula(&self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>, x: &[crate::facts::Slot]) -> Option<crate::facts::Slot>;
+    fn test(&self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>, x: &[crate::facts::Slot]) -> Option<crate::facts::Slot>;
+    fn repair_predicate(&self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>, x: &[crate::facts::Slot]) -> Option<crate::facts::Slot>;
+    fn repair_routine(&self) -> Option<crate::facts::Repair>;
+    fn validity(&self, variant: crate::facts::Variant, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>, x: &[crate::facts::Slot], result: crate::facts::Slot) -> Option<(Kind, crate::facts::Slot)>;
+    fn partials(&self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>, x: &[crate::facts::Slot], result: crate::facts::Slot, needed: &[bool], output: &mut [Option<crate::facts::Slot>]);
+    fn range(&self, x: &[crate::facts::Range]) -> crate::facts::Range;
+    fn domain(&self, x: &[crate::facts::Range]) -> bool;
+    fn identity(&self) -> Option<f64>;
+    fn fold(&self) -> Option<crate::reduce::Reduce>;
+    fn truth_table(&self) -> Option<u8>;
+    fn product(&self, variant: crate::facts::Variant, fold: Option<crate::reduce::Reduce>, boolean_inputs: bool, wanted: Option<DType>, settings: Settings) -> Option<NativeProduct>;
+    fn map(&self, variant: crate::facts::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, output: &mut Buffer) -> Result<(), Error>;
+    fn fold_pieces(&self, variant: crate::facts::Variant, dims: [usize; 3], seed: Seed<'_>, direction: Direction, settings: Settings, pieces: &Pieces<'_>, output: &mut Buffer) -> Result<(), Error>;
+    fn fold_read(&self, variant: crate::facts::Variant, shape: &[usize], axis: usize, seed: Seed<'_>, direction: Direction, settings: Settings, input: crate::agreement::Read<'_>, output: &mut Buffer) -> Result<(), Error>;
+    fn at(&self, variant: crate::facts::Variant, values: crate::agreement::Read<'_>, ids: Positions<'_>, checked: bool, settings: Settings, output: &mut Buffer) -> Result<(), Error>;
+    fn scan(&self, variant: crate::facts::Variant, dims: [usize; 3], seed: Seed<'_>, direction: Direction, settings: Settings, input: crate::agreement::Read<'_>, output: &mut Buffer) -> Result<(), Error>;
+}
+
+struct Definition<K, const N: usize> { object: K }
+
+impl<K: crate::facts::Formula<N>, const N: usize> Application for Definition<K, N> {
+    fn exact(&self, args: &[num_rational::BigRational]) -> Result<Option<num_rational::BigRational>, Error> {
+        if args.len() != N { return Err(Error::new(Kind::Length, "scalar operand count changed")); }
+        self.object.exact(std::array::from_fn(|i| &args[i]))
+    }
+    fn has_exact(&self) -> bool { self.object.has_exact() }
+    fn real(&self, variant: crate::facts::Variant, args: &[f64], settings: Settings) -> Result<f64, Error> {
+        let x: [f64; N] = args.try_into().map_err(|_| Error::new(Kind::Length, "scalar operand count changed"))?;
+        let ops = crate::recipe::NativeOps::<{ crate::FUSED }> { tolerance: settings.tolerance };
+        match variant.dtype {
+            DType::Float(FloatWidth::F64) => scalar_result(real_value(&self.object, variant, &ops, x, true)),
+            DType::Float(width) => {
+                let value = scalar_result(real_value(&self.object, variant, &ops, x.map(|x| x as f32), true))?;
+                Ok(if width == FloatWidth::F16 { half::f16::from_f32(value).to_f64() } else { f64::from(value) })
+            }
+            _ => Err(Error::new(Kind::Domain, "a real scalar call needs a floating computing dtype")),
+        }
+    }
+    fn complex(&self, variant: crate::facts::Variant, args: &[num_complex::Complex64], settings: Settings) -> Result<num_complex::Complex64, Error> {
+        let x: [num_complex::Complex64; N] = args.try_into().map_err(|_| Error::new(Kind::Length, "scalar operand count changed"))?;
+        let ops = crate::recipe::NativeOps::<{ crate::FUSED }> { tolerance: settings.tolerance };
+        match variant.dtype {
+            DType::Complex(crate::buffer::ComplexWidth::F64) => scalar_result(complex_value(&self.object, variant, &ops, x)),
+            DType::Complex(crate::buffer::ComplexWidth::F32) => {
+                let value = scalar_result(complex_value(&self.object, variant, &ops, x.map(|x| num_complex::Complex32::new(x.re as f32, x.im as f32))))?;
+                Ok(num_complex::Complex64::new(f64::from(value.re), f64::from(value.im)))
+            }
+            _ => Err(Error::new(Kind::Domain, "a complex scalar call needs a complex computing dtype")),
+        }
+    }
+    fn arity(&self) -> usize { N }
+    fn integer_formula(&self) -> bool { self.object.integer_formula() }
+    fn formula(&self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>, x: &[crate::facts::Slot]) -> Option<crate::facts::Slot> {
+        self.object.emit(ops, x.try_into().ok()?)
+    }
+    fn test(&self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>, x: &[crate::facts::Slot]) -> Option<crate::facts::Slot> {
+        self.object.emit_test(ops, x.try_into().ok()?)
+    }
+    fn repair_predicate(&self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>, x: &[crate::facts::Slot]) -> Option<crate::facts::Slot> {
+        self.object.emit_repair(ops, x.try_into().ok()?)
+    }
+    fn repair_routine(&self) -> Option<crate::facts::Repair> { crate::facts::Formula::repair_routine(&self.object) }
+    fn validity(&self, variant: crate::facts::Variant, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>, x: &[crate::facts::Slot], result: crate::facts::Slot) -> Option<(Kind, crate::facts::Slot)> {
+        self.object.emit_valid(variant, ops, x.try_into().ok()?, result)
+    }
+    fn partials(&self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>, x: &[crate::facts::Slot], result: crate::facts::Slot, needed: &[bool], output: &mut [Option<crate::facts::Slot>]) {
+        let (Ok(x), Ok(needed)) = (x.try_into(), needed.try_into()) else { output.fill(None); return };
+        output.copy_from_slice(&self.object.emit_partials(ops, x, result, needed));
+    }
+    fn range(&self, x: &[crate::facts::Range]) -> crate::facts::Range {
+        x.try_into().map_or(crate::facts::Range::ANY, |x| self.object.range(x))
+    }
+    fn domain(&self, x: &[crate::facts::Range]) -> bool { x.try_into().is_ok_and(|x| self.object.domain(x).is_some()) }
+    fn identity(&self) -> Option<f64> { self.object.identity().last().copied().flatten() }
+    fn fold(&self) -> Option<crate::reduce::Reduce> { self.object.fold() }
+    fn truth_table(&self) -> Option<u8> { self.object.truth_table() }
+    fn product(&self, variant: crate::facts::Variant, fold: Option<crate::reduce::Reduce>, boolean_inputs: bool, wanted: Option<DType>, settings: Settings) -> Option<NativeProduct> { product_for::<K, N>(&self.object, variant, fold, boolean_inputs, wanted, settings) }
+    fn map(&self, variant: crate::facts::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, output: &mut Buffer) -> Result<(), Error> {
+        map_formula::<K, N>(&self.object, variant, inputs, range, settings, output)
+    }
+    fn fold_pieces(&self, variant: crate::facts::Variant, dims: [usize; 3], seed: Seed<'_>, direction: Direction, settings: Settings, pieces: &Pieces<'_>, output: &mut Buffer) -> Result<(), Error> {
+        fold_formula::<K, N>(&self.object, variant, dims, seed, direction, settings, pieces, output)
+    }
+    fn fold_read(&self, variant: crate::facts::Variant, shape: &[usize], axis: usize, seed: Seed<'_>, direction: Direction, settings: Settings, input: crate::agreement::Read<'_>, output: &mut Buffer) -> Result<(), Error> {
+        fold_read_formula::<K, N>(&self.object, variant, shape, axis, seed, direction, settings, input, output)
+    }
+    fn at(&self, variant: crate::facts::Variant, values: crate::agreement::Read<'_>, ids: Positions<'_>, checked: bool, settings: Settings, output: &mut Buffer) -> Result<(), Error> {
+        at_formula(&self.object, variant, values, ids, checked, settings, output)
+    }
+    fn scan(&self, variant: crate::facts::Variant, dims: [usize; 3], seed: Seed<'_>, direction: Direction, settings: Settings, input: crate::agreement::Read<'_>, output: &mut Buffer) -> Result<(), Error> {
+        scan_formula(&self.object, variant, dims, seed, direction, settings, input, output)
+    }
+}
+
+impl Kernel {
+    pub fn circle(code: i64, inverse: bool, real_part: bool, variant: crate::facts::Variant, types: [DType; 1]) -> Result<Option<Self>, Error> {
+        macro_rules! picked {
+            ($normal:expr, $real:expr) => {
+                if real_part && !matches!(variant.dtype, DType::Complex(_)) { Self::resolve($real, variant, types) }
+                else { Self::resolve($normal, variant, types) }
+            };
+        }
+        let mut kernel = match (code, inverse) {
+            (0, _) => picked!(crate::Sqrt1mx2, crate::RealSqrt1mx2),
+            (1, false) => picked!(crate::Sin, crate::Sin), (2, false) => picked!(crate::Cos, crate::Cos),
+            (3, false) => picked!(crate::Tan, crate::Tan), (4, false) => picked!(crate::Sqrt1px2, crate::Sqrt1px2),
+            (5, false) => picked!(crate::Sinh, crate::Sinh), (6, false) => picked!(crate::Cosh, crate::Cosh), (7, false) => picked!(crate::Tanh, crate::Tanh),
+            (1, true) => picked!(crate::Asin, crate::RealAsin), (2, true) => picked!(crate::Acos, crate::RealAcos),
+            (3, true) => picked!(crate::Atan, crate::Atan), (4, true) => picked!(crate::Sqrtx2m1, crate::RealSqrtx2m1),
+            (5, true) => picked!(crate::Asinh, crate::Asinh), (6, true) => picked!(crate::Acosh, crate::RealAcosh), (7, true) => picked!(crate::Atanh, crate::RealAtanh),
+            (8, inverse) => Self::resolve(crate::sqrts::Sqrtm1mx2(inverse), variant, types),
+            _ => return Ok(None),
+        }?;
+        if real_part && let DType::Complex(width) = kernel.result { kernel.result = DType::Float(width.into()); }
+        Ok(Some(kernel))
+    }
+    pub fn unary(op: crate::recipe::Unary, variant: crate::facts::Variant) -> Option<Self> {
+        use crate::recipe::Unary::*;
+        macro_rules! kernel { ($object:expr) => { crate::facts::Formula::kernel(&$object, variant) }; }
+        match op {
+            Negate => kernel!(crate::Negate), Magnitude => kernel!(crate::Abs), Sqrt => kernel!(crate::Sqrt),
+            Floor => kernel!(crate::tolerant::Floor(crate::tolerant::Tolerance::EXACT)), Ln => kernel!(crate::Ln),
+            Sin => kernel!(crate::Sin), Cos => kernel!(crate::Cos), Sinh => kernel!(crate::Sinh), Cosh => kernel!(crate::Cosh),
+            Sqrt1mx2 => kernel!(crate::Sqrt1mx2), Sqrt1px2 => kernel!(crate::Sqrt1px2), Digamma => kernel!(crate::Digamma),
+            Exp => kernel!(crate::Exp), Lgamma => kernel!(crate::Lgamma), Not => kernel!(crate::facts::Complement),
+        }
+    }
+    pub fn binary(op: crate::recipe::Binary, variant: crate::facts::Variant) -> Option<Self> {
+        use crate::recipe::Binary::*;
+        macro_rules! kernel { ($object:expr) => { crate::facts::Formula::kernel(&$object, variant) }; }
+        match op {
+            Add => kernel!(crate::Add), Subtract => kernel!(crate::Subtract), Multiply => kernel!(crate::Multiply), Divide => kernel!(crate::Divide),
+            Larger => kernel!(crate::Maximum), Smaller => kernel!(crate::Minimum), Binom => kernel!(crate::Binom),
+            BinomDn => kernel!(crate::BinomDn), BinomDk => kernel!(crate::BinomDk), Polygamma => kernel!(crate::Polygamma), BitAnd => kernel!(crate::BitAnd),
+        }
+    }
+    pub fn compare(op: crate::recipe::Cmp, variant: crate::facts::Variant) -> Option<Self> { crate::facts::Formula::kernel(&crate::facts::Comparison(op), variant) }
+    pub fn integer(op: crate::recipe::Integer, variant: crate::facts::Variant) -> Option<Self> { crate::facts::Formula::kernel(&crate::facts::IntegerOperation(op), variant) }
+    pub fn integer_compare(op: crate::recipe::Cmp, variant: crate::facts::Variant) -> Option<Self> { crate::facts::Formula::kernel(&crate::facts::IntegerComparison(op), variant) }
+    pub fn new<K: crate::facts::Formula<N>, const N: usize>(object: K, variant: crate::facts::Variant) -> Self {
+        Self { result: object.result_dtype(variant.dtype), characters: None, boolean_inputs: variant.dtype == DType::Boolean, variant, definition: std::sync::Arc::new(Definition::<K, N> { object }) }
+    }
+    pub fn resolve<K: crate::facts::Formula<N>, const N: usize>(object: K, mut variant: crate::facts::Variant, types: [DType; N]) -> Result<Self, Error> {
+        use crate::characters::{Policy, ByKinds};
+        let characters = if N == 2 { object.character_policy([types[0], types[1]])? }
+        else if N == 1 && types[0] == DType::Character && object.character_rule() == Some(crate::characters::Rule::Identity) {
+            Some(Policy::Codes { computing: DType::Integer(Width::I32), result: DType::Character })
+        } else {
+            if types.contains(&DType::Character) { return Err(Error::new(Kind::Domain, "function does not take character arguments")); }
+            None
+        };
+        let result = match characters {
+            Some(Policy::Codes { computing, result }) => { variant.dtype = computing; result }
+            Some(Policy::Kinds(kind)) => {
+                variant.dtype = DType::Integer(Width::I32);
+                match kind { ByKinds::Truth(_) => DType::Boolean, ByKinds::Left => types[0], ByKinds::Right => types[1] }
+            }
+            None => {
+                variant.dtype = object.computing_dtype(variant.dtype).ok_or_else(|| Error::new(Kind::Domain, "function has no numerical body for these arguments"))?;
+                object.result_dtype(variant.dtype)
+            }
+        };
+        Ok(Self { result, characters, boolean_inputs: types.iter().all(|&d| d == DType::Boolean), variant, definition: std::sync::Arc::new(Definition::<K, N> { object }) })
+    }
+    pub fn arity(&self) -> usize { self.definition.arity() }
+    pub fn result_dtype(&self) -> DType { self.result }
+    pub fn character_policy(&self) -> Option<crate::characters::Policy> { self.characters }
+    pub fn exact(&self, args: &[num_rational::BigRational]) -> Result<Option<num_rational::BigRational>, Error> { self.definition.exact(args) }
+    pub fn has_exact(&self) -> bool { self.definition.has_exact() }
+    pub fn real(&self, args: &[f64], settings: Settings) -> Result<f64, Error> { self.definition.real(self.variant, args, settings) }
+    pub fn complex(&self, args: &[num_complex::Complex64], settings: Settings) -> Result<num_complex::Complex64, Error> {
+        let value = self.definition.complex(self.variant, args, settings)?;
+        Ok(if matches!(self.result, DType::Complex(_)) { value } else { num_complex::Complex64::new(value.re, 0.0) })
+    }
+    pub fn formula(&self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>, x: &[crate::facts::Slot]) -> Option<crate::facts::Slot> {
+        if self.variant.dtype.is_integral() && self.variant.checked && !self.variant.wrapping && !self.definition.integer_formula() { return None; }
+        self.definition.formula(ops, x)
+    }
+    pub fn test(&self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>, x: &[crate::facts::Slot]) -> Option<crate::facts::Slot> {
+        self.definition.test(ops, x)
+    }
+    pub fn repair_predicate(&self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>, x: &[crate::facts::Slot]) -> Option<crate::facts::Slot> {
+        self.definition.repair_predicate(ops, x)
+    }
+    pub fn repair_routine(&self) -> Option<crate::facts::Repair> { self.definition.repair_routine() }
+    pub fn validity(&self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>, x: &[crate::facts::Slot], result: crate::facts::Slot) -> Option<(Kind, crate::facts::Slot)> {
+        self.definition.validity(self.variant, ops, x, result)
+    }
+    pub fn partials(&self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>, x: &[crate::facts::Slot], result: crate::facts::Slot, needed: &[bool], output: &mut [Option<crate::facts::Slot>]) {
+        self.definition.partials(ops, x, result, needed, output)
+    }
+    pub fn range(&self, x: &[crate::facts::Range]) -> crate::facts::Range { self.definition.range(x) }
+    pub fn domain(&self, x: &[crate::facts::Range]) -> bool { self.definition.domain(x) }
+    pub fn identity(&self) -> Option<f64> { self.definition.identity() }
+    pub fn fold(&self) -> Option<crate::reduce::Reduce> { self.definition.fold() }
+    pub fn truth_table(&self) -> Option<u8> { self.definition.truth_table() }
+    pub fn total_dtype(&self) -> Option<DType> { self.fold()?.total_dtype(self.variant) }
+    pub fn product_dtype(&self, fold: &Kernel, input: DType) -> Option<DType> {
+        self.definition.product(crate::facts::Variant { dtype: input, ..self.variant }, fold.fold(), input == DType::Boolean, None, Settings::default()).map(|p| p.result)
+    }
+    pub fn map(&self, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, output: &mut Buffer) -> Result<(), Error> {
+        use crate::characters::{Policy, ByKinds};
+        if inputs.len() != self.arity() { return Err(Error::new(Kind::Length, "kernel operand count changed")); }
+        let wanted = output.dtype();
+        if output.dtype() != self.result { *output = Buffer::with_capacity(self.result, range.len()); }
+        match self.characters {
+            Some(Policy::Kinds(ByKinds::Truth(value))) => *output = Buffer::Booleans(vec![value; range.len()]),
+            Some(Policy::Kinds(side)) => {
+                let side = usize::from(side == ByKinds::Right);
+                inputs[side].read_into(range, self.result, self.variant.checked, output)?;
+            }
+            Some(Policy::Codes { .. }) => with_codes(inputs, |inputs| self.definition.map(self.variant, inputs, range, settings, output))?,
+            None => self.definition.map(self.variant, inputs, range, settings, output)?,
+        }
+        finish(output, wanted, self.variant.checked)
+    }
+    pub fn fold_pieces(&self, dims: [usize; 3], seed: Seed<'_>, direction: Direction, settings: Settings, pieces: &Pieces<'_>, output: &mut Buffer) -> Result<(), Error> {
+        let dtype = output.dtype();
+        if matches!(self.characters, Some(crate::characters::Policy::Codes { .. })) {
+            let projected = |range, f: &mut dyn FnMut(usize, Piece<'_>)| pieces(range, &mut |range, piece| {
+                match piece { Piece::Items(view) => f(range, Piece::Items(crate::characters::as_codes(view))), Piece::Total(total) => f(range, Piece::Total(total)) }
+            });
+            with_code_inputs(&[], seed, |_, seed| self.definition.fold_pieces(self.variant, dims, seed, direction, settings, &projected, output))?;
+        } else { self.definition.fold_pieces(self.variant, dims, seed, direction, settings, pieces, output)?; }
+        finish(output, dtype, self.variant.checked)
+    }
+    pub fn scan(&self, dims: [usize; 3], seed: Seed<'_>, direction: Direction, settings: Settings, input: crate::agreement::Read<'_>, output: &mut Buffer) -> Result<(), Error> {
+        let dtype = output.dtype();
+        if matches!(self.characters, Some(crate::characters::Policy::Codes { .. })) {
+            with_code_inputs(&[input], seed, |inputs, seed| self.definition.scan(self.variant, dims, seed, direction, settings, inputs[0], output))?;
+        } else { self.definition.scan(self.variant, dims, seed, direction, settings, input, output)?; }
+        finish(output, dtype, self.variant.checked)
+    }
+    pub fn fold_read(&self, shape: &[usize], axis: usize, seed: Seed<'_>, direction: Direction, settings: Settings, input: crate::agreement::Read<'_>, output: &mut Buffer) -> Result<(), Error> {
+        let dtype = output.dtype();
+        if matches!(self.characters, Some(crate::characters::Policy::Codes { .. })) {
+            with_code_inputs(&[input], seed, |inputs, seed| self.definition.fold_read(self.variant, shape, axis, seed, direction, settings, inputs[0], output))?;
+        } else { self.definition.fold_read(self.variant, shape, axis, seed, direction, settings, input, output)?; }
+        finish(output, dtype, self.variant.checked)
+    }
+}
+
+pub fn choose(inputs: [crate::agreement::Read<'_>; 3], dtype: DType, checked: bool, output: &mut Buffer) -> Result<(), Error> {
+    let len = inputs.iter().map(|r| r.plan.len()).find(|&n| n != 1).unwrap_or(1);
+    if inputs.iter().any(|r| r.plan.len() != 1 && r.plan.len() != len) { return Err(Error::new(Kind::Length, "selection operands have different lengths")); }
+    if output.dtype() != dtype { *output = Buffer::with_capacity(dtype, len); }
+    with_dtype!(dtype, T => choose_typed::<T>(inputs, len, checked, T::vec_mut(output).expect("selection output dtype")))
+}
+
+fn choose_typed<T: crate::buffer::Cast>(inputs: [crate::agreement::Read<'_>; 3], len: usize, checked: bool, output: &mut Vec<T>) -> Result<(), Error> {
+    output.clear();
+    crate::error::checked(|| {
+        crate::parallel::extended(output, len, crate::CHUNK, &|range, slots| {
+            let mut mask = Vec::new();
+            let (mut left, mut right) = (Vec::new(), Vec::new());
+            let part = |i: usize| if inputs[i].plan.len() == 1 { 0..1 } else { range.clone() };
+            let args = inputs[0].part::<bool>(part(0), checked, &mut mask)
+                .and_then(|m| inputs[1].part::<T>(part(1), checked, &mut left).map(|x| (m, x)))
+                .and_then(|(m, x)| inputs[2].part::<T>(part(2), checked, &mut right).map(|y| (m, x, y)));
+            match args {
+                Ok((m, x, y)) => slots.fill(range.len(), |out| crate::slice::triples_into(m, x, y, out.len(), out, |m, x, y| (if m { x } else { y }, true))),
+                Err(error) => { crate::error::record(error); slots.fill(range.len(), |out| { for slot in out { slot.write(T::FILL); } false }) }
+            }
+        });
+        Ok(())
+    })
+}
+pub fn product(
+    map: &Kernel, fold: &Kernel, inputs: [crate::agreement::Read<'_>; 2], plan: &crate::linalg::ProductPlan, settings: Settings, output: &mut Buffer,
+) -> Result<(), Error> {
+    use crate::agreement::{Missing, Read};
+    let dtype = output.dtype();
+    if let Some(native) = map.definition.product(map.variant, fold.fold(), map.boolean_inputs, Some(dtype), settings) {
+        if (native.run)(map.variant, inputs, plan, output)? { return finish(output, dtype, (map.variant.checked || fold.variant.checked) && !map.variant.wrapping); }
+    }
+    let plans = std::array::from_fn::<_, 2, _>(|i| inputs[i].plan.remapped(plan.mappings[i].clone(), plan.iteration.count(), Missing::Invalid));
+    let inputs = std::array::from_fn::<_, 2, _>(|i| Read { sources: inputs[i].sources, plan: &plans[i] });
+    let shape = plan.iteration.shape();
+    let split = shape.len() - plan.contracted;
+    let dims = [crate::layout::count(&shape[..split]), crate::layout::count(&shape[split..]), 1];
+    let pieces = |range: std::ops::Range<usize>, f: &mut dyn FnMut(usize, Piece<'_>)| {
+        let mut values = Buffer::with_capacity(map.result_dtype(), range.len());
+        map.map(&inputs, range.clone(), settings, &mut values)?;
+        f(range.start, Piece::Items(values.view()));
+        Ok(())
+    };
+    fold.fold_pieces(dims, Seed::Identity, Direction::Right, settings, &pieces, output)
+}
+
+#[derive(Clone, Copy)]
+struct NativeProduct {
+    result: DType,
+    run: fn(crate::facts::Variant, [crate::agreement::Read<'_>; 2], &crate::linalg::ProductPlan, &mut Buffer) -> Result<bool, Error>,
+}
+
+fn product_for<K: crate::facts::Formula<N>, const N: usize>(
+    object: &K, mut variant: crate::facts::Variant, fold: Option<crate::reduce::Reduce>, boolean_inputs: bool, wanted: Option<DType>, settings: Settings,
+) -> Option<NativeProduct> {
+    use std::any::TypeId;
+    let fold = fold?;
+    if wanted == Some(DType::Boolean) && !boolean_inputs { return None; }
+    if matches!(wanted, Some(DType::Boolean | DType::Float(FloatWidth::F16))) { variant.dtype = wanted.unwrap(); }
+    if !variant.wrapping && matches!(variant.dtype, DType::Integer(_)) { variant.dtype = DType::Integer(Width::I64); }
+    macro_rules! pairs {
+        (($($arg:tt)*) folds {$($folds:tt)*} booleans {$($booleans:tt)*}
+            products {$($pair:ident: [$(($map:ty, $reduce:ident)),*] at [$($t:ty),*] $(wrapping [$($wt:ty),*])? => [$($names:tt)*];)*}
+            boolean_products {$($bp:ident: [$(($bm:ty, $bf:ident)),*] at [$($bt:ty),*] => [$($bn:tt)*];)*}
+        ) => {
+            pairs!(@rows $($pair: [$(($map, $reduce)),*] at [$($t),*] $(wrapping [$($wt),*])?;)* $($bp: [$(($bm, $bf)),*] at [$($bt),*];)*);
+        };
+        (@rows $($pair:ident: [$(($map:ty, $reduce:ident)),*] at [$($t:ty),*] $(wrapping [$($wt:ty),*])?;)*) => {$(
+            if false $(|| (TypeId::of::<K>() == TypeId::of::<$map>() && fold == crate::reduce::Reduce::$reduce))* {
+                let pair = crate::linalg::Product::$pair;
+                if wanted.is_some() && pair.compares_exactly() && !variant.dtype.is_integral() && settings.tolerance.or(object.tolerance()).unwrap_or(0.0) != 0.0 { return None; }
+                if !(variant.wrapping && matches!(variant.dtype, DType::Integer(_))) {
+                    $(if variant.dtype == <$t as Element>::DTYPE {
+                        let result = product_result::<$t, crate::linalg::$pair>(variant);
+                        if wanted.is_some_and(|d| d != result) { return None; }
+                        return Some(NativeProduct { result, run: |v, x, p, out| product_typed::<$t, _>(crate::linalg::$pair, v, x, p, out) });
+                    })*
+                }
+                $($(if variant.wrapping && variant.dtype == <$wt as Element>::DTYPE {
+                    let result = variant.dtype;
+                    if wanted.is_some_and(|d| d != result) { return None; }
+                    return Some(NativeProduct { result, run: |v, x, p, out| product_typed::<$wt, _>(crate::Wrapped(crate::linalg::$pair), v, x, p, out) });
+                })*)?
+            }
+        )*};
+    }
+    crate::facts!(pairs);
+    None
+}
+
+fn product_result<T: Element, P: crate::linalg::Inner<T>>(variant: crate::facts::Variant) -> DType where P::Out: Element {
+    if variant.wrapping && T::DTYPE.is_integral() || T::DTYPE == DType::Float(FloatWidth::F16) { T::DTYPE } else if matches!(P::Out::DTYPE, DType::Integer(_)) { DType::Integer(Width::I64) } else { P::Out::DTYPE }
+}
+
+fn product_typed<T: crate::buffer::Cast, P: crate::linalg::Inner<T>>(
+    pair: P, variant: crate::facts::Variant, inputs: [crate::agreement::Read<'_>; 2], plan: &crate::linalg::ProductPlan, output: &mut Buffer,
+) -> Result<bool, Error>
+where P::Out: crate::buffer::Cast {
+    use crate::agreement::{Mapping, Missing, Read, Walked};
+    use crate::gather::Steps;
+    use crate::linalg::{Mapped, Orientation};
+    let Some(matrix) = &plan.matrix else { return Ok(false); };
+    let [m, k, n] = matrix.size;
+    if !variant.wrapping && matches!(P::Out::DTYPE, DType::Integer(w) if k > i64::MAX as usize || !w.holds(k as i64)) { return Ok(false); }
+    let frames = crate::layout::count(&plan.layout.shape()[..matrix.frame_rank]);
+    let expanded = std::array::from_fn::<_, 2, _>(|i| inputs[i].plan.remapped(plan.mappings[i].clone(), plan.iteration.count(), Missing::Invalid));
+    let mut result = Vec::with_capacity(plan.layout.count());
+    for frame in 0..frames {
+        let base = frame * m * n * k;
+        let left = expanded[0].remapped(Mapping::Steps { base, steps: vec![Steps::along(m, n * k), Steps::along(k, 1)].into() }, m * k, Missing::Invalid);
+        let right = expanded[1].remapped(Mapping::Steps { base, steps: vec![Steps::along(k, 1), Steps::along(n, k)].into() }, k * n, Missing::Invalid);
+        let reads = [Read { sources: inputs[0].sources, plan: &left }, Read { sources: inputs[1].sources, plan: &right }];
+        if T::DTYPE.is_integral() {
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            let a = reads[0].part::<T>(0..m * k, variant.checked, &mut a)?;
+            let b = reads[1].part::<T>(0..k * n, variant.checked, &mut b)?;
+            let a = match a { Arg::One(x) => std::borrow::Cow::Owned(vec![x; m * k]), Arg::Many(x) => std::borrow::Cow::Borrowed(x) };
+            let b = match b { Arg::One(x) => std::borrow::Cow::Owned(vec![x; k * n]), Arg::Many(x) => std::borrow::Cow::Borrowed(x) };
+            let start = result.len();
+            result.resize(start + m * n, P::Out::default());
+            if !pair.checked_into(&a, &b, matrix.size, &mut result[start..]) { return if variant.checked { Err(Error::new(Kind::Overflow, "product does not fit its integer result")) } else { Ok(false) }; }
+        } else {
+            let (Some((av, am)), Some((bv, bm))) = (reads[0].positional(&[m, k]), reads[1].positional(&[k, n])) else { return Ok(false); };
+            let (Some(a), Some(b)) = (T::of(av), T::of(bv)) else { return Ok(false); };
+            let (am, bm) = (Walked::from(am), Walked::from(bm));
+            result.extend(pair.inner_mapped(Mapped { data: a, mapping: &am }, Mapped { data: b, mapping: &bm }, [Orientation::Normal; 2], matrix.size));
+        }
+    }
+    *output = P::Out::buffer(result);
+    Ok(true)
+}
+
+pub fn gather(
+    source: crate::agreement::Read<'_>, layout: &crate::layout::Layout, routes: &crate::structure::Routes,
+    indices: &[(crate::agreement::Read<'_>, DType)], broadcast: bool, checked: bool,
+    fill: Option<crate::agreement::Read<'_>>, output: &mut Buffer,
+) -> Result<(), Error> {
+    use crate::agreement::{Binding, Mapping, Missing, Read};
+    if source.plan.len() != layout.count() { return Err(Error::new(Kind::Length, "gather source does not fit its layout")); }
+    let mut scratch: Vec<_> = indices.iter().map(|(_, dtype)| Buffer::with_capacity(*dtype, 0)).collect();
+    let views = indices.iter().zip(&mut scratch).map(|((read, dtype), scratch)| read.part_view(0..read.plan.len(), *dtype, checked, scratch))
+        .collect::<Result<Vec<_>, _>>()?;
+    let plan = crate::structure::bound_routes(layout, routes, &views, broadcast, checked)?;
+    let mut sources = source.sources.to_vec();
+    let mut prototype = Buffer::with_capacity(output.dtype(), 1);
+    let missing = match fill {
+        None => Missing::Default,
+        Some(fill) => {
+            if fill.plan.len() != 1 { return Err(Error::new(Kind::Length, "gather fill must be scalar")); }
+            fill.read_into(0..1, output.dtype(), checked, &mut prototype)?;
+            let index = sources.len();
+            sources.push(Binding::full(prototype.view()));
+            Missing::Input(index)
+        },
+    };
+    let read = source.plan.remapped(Mapping::from(plan.steps), plan.layout.count(), missing);
+    Read { sources: &sources, plan: &read }.read_into(0..read.len(), output.dtype(), checked, output)
+}
+
+pub fn at(
+    combine: Option<&Kernel>, root: WriteRoot<'_>, values: crate::agreement::Read<'_>, ids: Positions<'_>, checked: bool,
+    settings: Settings, output: &mut Buffer,
+) -> Result<(), Error> {
+    let (wanted, len, n) = (output.dtype(), root.len(), ids.len());
+    if values.plan.len() != 1 && values.plan.len() != n { return Err(Error::new(Kind::Length, "write values do not match positions")); }
+    if checked || matches!(ids, Positions::Route(..)) {
+        let mut scratch = Buffer::with_capacity(DType::Boolean, 0);
+        for start in (0..n).step_by(crate::CHUNK) { ids.chunk(start..n.min(start + crate::CHUNK), len, checked, &mut scratch)?; }
+    }
+    let codes = combine.is_some_and(|kernel| matches!(kernel.characters, Some(crate::characters::Policy::Codes { .. })));
+    root.initialize(combine.map_or(wanted, |kernel| kernel.variant.dtype), checked, codes, output)?;
+    match combine {
+        None => with_dtype!(wanted, T => at_typed::<T>(values, ids, checked, None::<fn(T, T) -> (T, Option<Kind>)>, output))?,
+        Some(kernel) if codes => with_codes(&[values], |inputs| kernel.definition.at(kernel.variant, inputs[0], ids, checked, settings, output))?,
+        Some(kernel) => kernel.definition.at(kernel.variant, values, ids, checked, settings, output)?,
+    }
+    finish(output, wanted, checked)
+}
+
+fn with_code_inputs<R>(inputs: &[crate::agreement::Read<'_>], seed: Seed<'_>, call: impl FnOnce(&[crate::agreement::Read<'_>], Seed<'_>) -> R) -> R {
+    let mut all = inputs.to_vec();
+    match seed { Seed::Initial(r) | Seed::Tail(r) => all.push(r), Seed::Identity => {} }
+    with_codes(&all, |projected| {
+        let seed = match seed { Seed::Initial(_) => Seed::Initial(projected[inputs.len()]), Seed::Tail(_) => Seed::Tail(projected[inputs.len()]), Seed::Identity => Seed::Identity };
+        call(&projected[..inputs.len()], seed)
+    })
+}
+
+fn with_codes<R>(inputs: &[crate::agreement::Read<'_>], call: impl FnOnce(&[crate::agreement::Read<'_>]) -> R) -> R {
+    let sources: Vec<Vec<_>> = inputs.iter().map(|r| r.sources.iter().map(|s| s.as_codes()).collect()).collect();
+    let projected: Vec<_> = inputs.iter().zip(&sources).map(|(r, sources)| crate::agreement::Read { sources, plan: r.plan }).collect();
+    call(&projected)
+}
+
+fn at_typed<T: crate::buffer::Cast>(
+    values: crate::agreement::Read<'_>, ids: Positions<'_>, checked: bool,
+    apply: Option<impl Fn(T, T) -> (T, Option<Kind>)>, output: &mut Buffer,
+) -> Result<(), Error> {
+    let (len, n) = (output.len(), ids.len());
+    let mut indices = Buffer::with_capacity(DType::Boolean, 0);
+    let out = T::vec_mut(output).expect("write output has its working dtype");
+    let mut scratch = Vec::new();
+    for start in (0..n).step_by(crate::CHUNK) {
+        let end = n.min(start + crate::CHUNK);
+        let positions = ids.chunk(start..end, len, checked, &mut indices)?;
+        let source = values.part::<T>(if values.plan.len() == 1 { 0..1 } else { start..end }, checked, &mut scratch)?;
+        let writes = crate::gather::Writes::Offsets(&positions);
+        match &apply {
+            None => match source {
+                Arg::One(value) => writes.write(out, &[value], crate::gather::Same),
+                Arg::Many(values) => writes.write(out, values, crate::gather::Same),
+            },
+            Some(apply) => {
+                let error = std::cell::Cell::new(None);
+                writes.combine(out, source, |x, y| { let (value, failed) = apply(x, y); if failed.is_some() { error.set(failed); } value });
+                if let Some(kind) = error.get() { return Err(Error::new(kind, "modified write is outside the function's domain")); }
+            },
+        }
+    }
+    Ok(())
+}
+
+macro_rules! with_binary_body {
+    ($object:expr, $variant:expr, $settings:expr, |$T:ident, $apply:ident| $body:expr) => {{
+        let (object, variant, settings) = ($object, $variant, $settings);
+        let ops = crate::recipe::NativeOps::<{ crate::FUSED }> { tolerance: settings.tolerance };
+        match variant.dtype {
+            DType::Boolean | DType::Integer(_) => {
+                let width = match variant.dtype { DType::Integer(w) => w, _ => Width::U8 };
+                with_width!(width, $T => {
+                    let ops = crate::recipe::IntegerOps::<$T>::new(variant);
+                    let $apply = |x: $T, y: $T| integer_value(object, variant, &ops, std::array::from_fn(|i| if i == 0 { x } else { y }));
+                    $body
+                })
+            },
+            DType::Float(FloatWidth::F16 | FloatWidth::F32) => {
+                type $T = f32;
+                let $apply = |x, y| real_value(object, variant, &ops, std::array::from_fn(|i| if i == 0 { x } else { y }), true);
+                $body
+            },
+            DType::Float(FloatWidth::F64) => {
+                type $T = f64;
+                let $apply = |x, y| real_value(object, variant, &ops, std::array::from_fn(|i| if i == 0 { x } else { y }), true);
+                $body
+            },
+            DType::Complex(w) => with_complex_width!(w, $T => {
+                let $apply = |x, y| complex_value(object, variant, &ops, std::array::from_fn(|i| if i == 0 { x } else { y }));
+                $body
+            }),
+            DType::Character => Err(Error::new(Kind::Domain, "a numerical body needs code-point inputs for characters")),
+        }
+    }};
+}
+
+fn at_formula<K: crate::facts::Formula<N>, const N: usize>(
+    object: &K, variant: crate::facts::Variant, values: crate::agreement::Read<'_>,
+    ids: Positions<'_>, checked: bool, settings: Settings, output: &mut Buffer,
+) -> Result<(), Error> {
+    if N != 2 { return Err(Error::new(Kind::Length, "a modified write needs a binary function")); }
+    with_binary_body!(object, variant, settings, |T, apply| at_typed::<T>(values, ids, checked, Some(apply), output))
+}
+
+fn map_formula<K: crate::facts::Formula<N>, const N: usize>(
+    object: &K, variant: crate::facts::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, output: &mut Buffer,
+) -> Result<(), Error> {
+    if inputs.len() != N { return Err(Error::new(Kind::Length, "kernel operand count changed")); }
+    if let Some(slices) = object.native_slices() {
+        let valid = |ok| if variant.checked && !ok { Err(Kind::Domain) } else { Ok(()) };
+        return match variant.dtype {
+            DType::Float(FloatWidth::F64) => map_blocks::<f64, f64, N>(inputs, range, variant.checked, output,
+                &|args, n, out| valid((slices.double)(object, args, n, out))),
+            DType::Float(FloatWidth::F32) => map_blocks::<f32, f32, N>(inputs, range, variant.checked, output,
+                &|args, n, out| valid((slices.single)(object, args, n, out))),
+            DType::Float(FloatWidth::F16) => map_blocks::<f32, half::f16, N>(inputs, range, variant.checked, output,
+                &|args, n, out| valid(crate::slice::buffered(n, out, |out| (slices.single)(object, args, n, out), half::f16::from_f32))),
+            _ => Err(Error::new(Kind::Domain, "native real body needs floating arguments")),
+        };
+    }
+    match variant.dtype {
+        DType::Float(FloatWidth::F16) => map_real::<K, f32, half::f16, N>(object, variant, inputs, range, settings, output),
+        DType::Float(FloatWidth::F32) => map_real::<K, f32, f32, N>(object, variant, inputs, range, settings, output),
+        DType::Float(FloatWidth::F64) => map_real::<K, f64, f64, N>(object, variant, inputs, range, settings, output),
+        DType::Boolean => map_integer::<K, u8, N>(object, variant, inputs, range, output),
+        DType::Integer(width) => with_width!(width, I => map_integer::<K, I, N>(object, variant, inputs, range, output)),
+        DType::Complex(crate::buffer::ComplexWidth::F32) => map_complex::<K, f32, N>(object, variant, inputs, range, settings, output),
+        DType::Complex(crate::buffer::ComplexWidth::F64) => map_complex::<K, f64, N>(object, variant, inputs, range, settings, output),
+        DType::Character => Err(Error::new(Kind::Domain, "characters are not numerical kernel operands")),
+    }
+}
+
+#[inline(always)]
+fn real_value<K, F, const N: usize>(object: &K, variant: crate::facts::Variant, ops: &crate::recipe::NativeOps<{ crate::FUSED }>, x: [F; N], repair: bool) -> (F, Option<Kind>)
+where K: crate::facts::Formula<N>, F: crate::float::Native {
+    let result = if repair && object.emit_repair(ops, x) == Some(true) {
+        crate::facts::Formula::repair_routine(object).map(|r| r.apply(x[0]))
+    } else { object.real(ops, x) };
+    let Some(result) = result else { return (F::zero(), variant.checked.then_some(Kind::Domain)); };
+    let error = if variant.checked { object.emit_valid(variant, ops, x, result).and_then(|(kind, valid)| (!valid).then_some(kind)) } else { None };
+    (result, error)
+}
+
+#[inline(always)]
+fn integer_value<K, I, const N: usize>(object: &K, variant: crate::facts::Variant, ops: &crate::recipe::IntegerOps<I>, x: [I; N]) -> (I, Option<Kind>)
+where K: crate::facts::Formula<N>, I: crate::recipe::Overflowing {
+    let Some(result) = object.integer(ops, x) else { return (I::FILL, variant.checked.then_some(Kind::Domain)); };
+    let error = if variant.checked { object.emit_valid(variant, ops, x, result).and_then(|(kind, valid)| (!valid).then_some(kind)) } else { None };
+    (result, error)
+}
+
+#[inline(always)]
+fn complex_value<K, F, const N: usize>(object: &K, variant: crate::facts::Variant, ops: &crate::recipe::NativeOps<{ crate::FUSED }>, x: [num_complex::Complex<F>; N]) -> (num_complex::Complex<F>, Option<Kind>)
+where K: crate::facts::Formula<N>, F: crate::float::Native {
+    let Some(result) = object.complex(ops, x) else { return (num_complex::Complex::new(F::zero(), F::zero()), variant.checked.then_some(Kind::Domain)); };
+    let valid = !variant.checked || !object.fails_nan() || crate::facts::nan_valid(ops, x.into_iter().flat_map(|x| [x.re, x.im]), [result.re, result.im]);
+    (result, (!valid).then_some(Kind::Domain))
+}
+
+fn scalar_result<T>((value, error): (T, Option<Kind>)) -> Result<T, Error> {
+    match error { Some(kind) => Err(Error::new(kind, "numerical argument is outside the function's domain")), None => Ok(value) }
+}
+fn map_real<K, F, Dst, const N: usize>(
+    object: &K, variant: crate::facts::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, output: &mut Buffer,
+) -> Result<(), Error>
+where K: crate::facts::Formula<N>, F: crate::float::Native + crate::buffer::Cast + Source<Dst>, Dst: Element + crate::Float {
+    let ops = crate::recipe::NativeOps::<{ crate::FUSED }> { tolerance: settings.tolerance };
+    if object.boolean() {
+        return map_values::<F, bool, N>(inputs, range, variant.checked, output, &|x| {
+            (object.emit_test(&ops, x).expect("a Boolean object has a test body"), None)
+        });
+    }
+    let body = |x| object.real(&ops, x).expect("a resolved object has a real body");
+    if let Some(repair) = crate::facts::Formula::repair_routine(object) {
+        return map_blocks::<F, Dst, N>(inputs, range, variant.checked, output, &|args, n, out| {
+            let needs = |x| object.emit_repair(&ops, x).unwrap_or(false);
+            let ok = crate::slice::two_pass(args, n, out, |x| (!needs(x)).then(|| body(x)), |x| if needs(x) { repair.apply(x[0]) } else { body(x) });
+            if variant.checked && object.fails_nan() && !ok { Err(Kind::Domain) } else { Ok(()) }
+        });
+    }
+    map_values::<F, Dst, N>(inputs, range, variant.checked, output, &|x| {
+        let (result, error) = real_value(object, variant, &ops, x, false);
+        (Source::<Dst>::read(result), error)
+    })
+}
+
+fn map_integer<K, I, const N: usize>(
+    object: &K, variant: crate::facts::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, output: &mut Buffer,
+) -> Result<(), Error>
+where K: crate::facts::Formula<N>, I: crate::recipe::Overflowing {
+    let ops = crate::recipe::IntegerOps::<I>::new(variant);
+    let apply = |x| integer_value(object, variant, &ops, x);
+    if object.boolean() {
+        return map_values::<I, bool, N>(inputs, range, variant.checked, output, &|x| { let (x, e) = apply(x); (Into::<i64>::into(x) != 0, e) });
+    }
+    map_values::<I, I, N>(inputs, range, variant.checked, output, &apply)
+}
+
+fn map_complex<K, F, const N: usize>(
+    object: &K, variant: crate::facts::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, output: &mut Buffer,
+) -> Result<(), Error>
+where K: crate::facts::Formula<N>, F: crate::float::Native + crate::buffer::Cast, num_complex::Complex<F>: crate::buffer::Cast {
+    let ops = crate::recipe::NativeOps::<{ crate::FUSED }> { tolerance: settings.tolerance };
+    let apply = |x| complex_value(object, variant, &ops, x);
+    if object.boolean() {
+        map_values::<num_complex::Complex<F>, bool, N>(inputs, range, variant.checked, output, &|x| { let (x, e) = apply(x); (x.re != F::zero(), e) })
+    } else if output.dtype().is_real() {
+        map_values::<num_complex::Complex<F>, F, N>(inputs, range, variant.checked, output, &|x| { let (x, e) = apply(x); (x.re, e) })
+    } else { map_values::<num_complex::Complex<F>, num_complex::Complex<F>, N>(inputs, range, variant.checked, output, &apply) }
+}
+
+fn map_values<F: crate::buffer::Cast, O: Element, const N: usize>(
+    inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, checked: bool, output: &mut Buffer,
+    apply: &(impl Fn([F; N]) -> (O, Option<Kind>) + Sync),
+) -> Result<(), Error> {
+    map_blocks(inputs, range, checked, output, &|args, n, out| {
+        let ok = crate::slice::mapped(&args, n, out, #[inline(always)] |x| { let (r, error) = apply(x); (r, error.is_none()) });
+        if !ok && checked {
+            for i in 0..n {
+                if let Some(kind) = apply(std::array::from_fn(|j| args[j].nth(i))).1 { return Err(kind); }
+            }
+        }
+        Ok(())
+    })
+}
+
+fn map_blocks<F: crate::buffer::Cast, O: Element, const N: usize>(
+    inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, checked: bool, output: &mut Buffer,
+    apply: &(impl Fn([Arg<'_, F>; N], usize, &mut [std::mem::MaybeUninit<O>]) -> Result<(), Kind> + Sync),
+) -> Result<(), Error> {
+    if output.dtype() != O::DTYPE { *output = Buffer::with_capacity(O::DTYPE, range.len()); }
+    let values = O::vec_mut(output).expect("kernel output has its selected dtype");
+    values.clear();
+    crate::error::checked(|| {
+        crate::parallel::extended(values, range.len(), crate::CHUNK, &|part, slots| {
+            let part = part.start + range.start..part.end + range.start;
+            let n = part.len();
+            let mut scratch: [Vec<F>; N] = std::array::from_fn(|_| Vec::new());
+            let mut args = [Arg::Many(&[]); N];
+            for ((arg, input), scratch) in args.iter_mut().zip(inputs).zip(scratch.iter_mut()) {
+                match input.part::<F>(part.clone(), checked, scratch) {
+                    Ok(read) => *arg = read,
+                    Err(error) => {
+                        crate::error::record(error);
+                        return slots.fill(n, |out| { for slot in out { slot.write(O::FILL); } false });
+                    }
+                }
+            }
+            slots.fill(n, |out| match apply(args, n, out) {
+                Ok(()) => true,
+                Err(kind) => { crate::error::record(Error::new(kind, "numerical kernel argument is outside its domain")); false }
+            })
+        });
+        Ok(())
+    })
+}
+
+fn fold_formula<K: crate::facts::Formula<N>, const N: usize>(
+    object: &K, variant: crate::facts::Variant, dims: [usize; 3], seed: Seed<'_>, direction: Direction, settings: Settings, pieces: &Pieces<'_>, output: &mut Buffer,
+) -> Result<(), Error> {
+    if let Some(fold) = object.fold() { return fold.run_pieces(variant, dims, seed, pieces, output); }
+    if N != 2 { return Err(Error::new(Kind::Length, "a fold needs a binary function")); }
+    with_binary_body!(object, variant, settings, |T, apply| ordered_fold::<T>(dims, seed, direction, variant.checked, object.identity()[1], pieces, apply, output))
+}
+
+fn piece_values<T: crate::buffer::Cast>(range: std::ops::Range<usize>, checked: bool, pieces: &Pieces<'_>, out: &mut Vec<T>) -> Result<(), Error> {
+    out.clear();
+    let (mut next, mut failure) = (range.start, None);
+    pieces(range.clone(), &mut |at, piece| {
+        if failure.is_some() { return; }
+        let Piece::Items(view) = piece else { failure = Some(Error::new(Kind::Length, "ordered fold received a precomputed total")); return };
+        if at != next || at + view.len() > range.end { failure = Some(Error::new(Kind::Length, "fold pieces do not cover the requested range")); return; }
+        for i in 0..view.len() {
+            match T::cast(view, i) {
+                Ok(value) => out.push(value),
+                Err(error) if checked => { failure = Some(error); return; },
+                Err(_) => out.push(T::FILL),
+            }
+        }
+        next += view.len();
+    })?;
+    if let Some(error) = failure { return Err(error); }
+    if next != range.end { return Err(Error::new(Kind::Length, "fold pieces left an unread range")); }
+    Ok(())
+}
+
+fn ordered_fold<T: crate::buffer::Cast + Source<T>>(
+    [outer, len, inner]: [usize; 3], seed: Seed<'_>, direction: Direction, checked: bool, identity: Option<f64>, pieces: &Pieces<'_>,
+    apply: impl Fn(T, T) -> (T, Option<Kind>), output: &mut Buffer,
+) -> Result<(), Error> {
+    let (mut result, mut items, mut seed_scratch) = (Vec::with_capacity(outer * inner), Vec::new(), Vec::new());
+    if inner == 0 { *output = T::buffer(result); return Ok(()); }
+    let right = direction == Direction::Right;
+    for cell in 0..outer {
+        let mut given = match seed {
+            Seed::Identity => None,
+            Seed::Initial(read) | Seed::Tail(read) => {
+                let one = read.plan.len() == 1;
+                let arg = read.part::<T>(if one { 0..1 } else { cell * inner..(cell + 1) * inner }, checked, &mut seed_scratch)?;
+                Some((0..inner).map(|i| arg.nth(if one { 0 } else { i })).collect::<Vec<_>>())
+            },
+        };
+        let upfront = len == 0 || match seed { Seed::Tail(_) => right, Seed::Initial(_) => !right, Seed::Identity => false };
+        let mut carry = if upfront { given.take() } else { None };
+        let error = std::cell::Cell::new(None);
+        let step = |x, y| {
+            let (value, failed) = if right { apply(x, y) } else { apply(y, x) };
+            if failed.is_some() { error.set(failed); }
+            (value, failed.is_none())
+        };
+        let rows = (crate::CHUNK / inner).max(1);
+        let mut remaining = len;
+        while remaining != 0 {
+            let n = rows.min(remaining);
+            let start = if right { remaining - n } else { len - remaining };
+            let at = (cell * len + start) * inner;
+            piece_values(at..at + n * inner, checked, pieces, &mut items)?;
+            if !right { crate::reduce::reverse_rows(&mut items, [1, n, inner]); }
+            carry = Some(if carry.is_none() && n == 1 { items.clone() }
+                else { crate::reduce::right_fold(&items, [1, n, inner], carry.as_deref(), step).0 });
+            remaining -= n;
+        }
+        let mut total = match carry {
+            Some(total) => total,
+            None => {
+                let value = identity.ok_or_else(|| Error::new(Kind::Length, "an empty fold needs an identity or a seed"))?;
+                vec![T::cast(View::Floats(crate::buffer::Floats::F64(&[value])), 0)?; inner]
+            },
+        };
+        if let Some(seed) = given {
+            for (total, value) in total.iter_mut().zip(seed) {
+                let (result, failed) = if right { apply(value, *total) } else { apply(*total, value) };
+                *total = result;
+                if failed.is_some() { error.set(failed); }
+            }
+        }
+        if let Some(kind) = error.get() { return Err(Error::new(kind, "ordered fold is outside the function's domain")); }
+        result.extend(total);
+    }
+    *output = T::buffer(result);
+    Ok(())
+}
+
+fn scan_formula<K: crate::facts::Formula<N>, const N: usize>(
+    object: &K, variant: crate::facts::Variant, dims: [usize; 3], seed: Seed<'_>, direction: Direction, settings: Settings,
+    input: crate::agreement::Read<'_>, output: &mut Buffer,
+) -> Result<(), Error> {
+    if let Some(fold) = object.fold() { return fold.run_scan(variant, dims, seed, direction, input, output); }
+    if N != 2 { return Err(Error::new(Kind::Length, "a scan needs a binary function")); }
+    with_binary_body!(object, variant, settings, |T, apply| crate::reduce::scan_read::<T, T>(
+        dims, seed, direction, variant.checked, input, output, |items, dims, seed, out| {
+            let error = std::cell::Cell::new(None);
+            let step = |x, y| {
+                let (value, failed) = if direction == Direction::Right { apply(y, x) } else { apply(x, y) };
+                if failed.is_some() { error.set(failed); }
+                (value, failed.is_none())
+            };
+            crate::reduce::left_scan(items, dims, seed, out, step);
+            match error.get() { Some(kind) => Err(Error::new(kind, "ordered scan is outside the function's domain")), None => Ok(()) }
+        },
+    ))
+}
+fn fold_read_formula<K: crate::facts::Formula<N>, const N: usize>(
+    object: &K, variant: crate::facts::Variant, shape: &[usize], axis: usize, seed: Seed<'_>, direction: Direction, settings: Settings,
+    input: crate::agreement::Read<'_>, output: &mut Buffer,
+) -> Result<(), Error> {
+    if let Some(fold) = object.fold() { return fold.run_read(variant, shape, axis, seed, input, output); }
+    let dims = crate::layout::Lanes::new(shape, axis)?.dims();
+    let pieces = |range: std::ops::Range<usize>, emit: &mut dyn FnMut(usize, Piece<'_>)| {
+        let mut scratch = Buffer::with_capacity(variant.dtype, 0);
+        let start = range.start;
+        let view = input.part_view(range, variant.dtype, variant.checked, &mut scratch)?;
+        emit(start, Piece::Items(view));
+        Ok(())
+    };
+    fold_formula(object, variant, dims, seed, direction, settings, &pieces, output)
+}
 /// The float width that a Boolean or integer computes in under rustymath's own policy, NumPy's: the float that [`DType::inexact`] gives it under `f64`. `f64` for any other dtype.
 pub fn numpy_float(dtype: DType) -> FloatWidth { match dtype.inexact(FloatWidth::F64) { Some((DType::Float(w), _)) => w, _ => FloatWidth::F64 } }
 
-impl<F: Copy> Kernels<F> {
-    /// The kernels that [`kernels!`](crate::kernels) finds.
-    #[doc(hidden)]
-    pub const fn new(at: [Option<(F, bool)>; DType::ALL.len()]) -> Self { Self(at) }
-    /// The kernel at `dtype`, where the object has one.
-    pub fn at(&self, dtype: DType) -> Option<F> { self.0[dtype.index()].map(|(f, _)| f) }
-    /// These kernels without any at a dtype outside `dtypes`.
-    #[inline]
-    pub fn only(mut self, dtypes: &[DType]) -> Self {
-        let kept = dtypes.iter().fold(0u32, |kept, d| kept | 1 << d.index());
-        for (i, k) in self.0.iter_mut().enumerate() { if kept >> i & 1 == 0 { *k = None; } }
-        self
-    }
-    /// The dtype that an argument of `dtype` computes in, as the module describes, or `None` where the object has no kernel for it.
-    pub fn computes(&self, dtype: DType) -> Option<DType> { dtype.computes_in(Width::I64, numpy_float(dtype), |d| self.at(d).is_some()) }
-    /// Whether the kernel that an argument of `dtype` computes with leaves a failed result wrapped to its type, as integer arithmetic and every [`Reduction`] do. False where the object has no kernel for it.
-    pub fn wraps(&self, dtype: DType) -> bool { self.computes(dtype).and_then(|d| self.0[d.index()]).is_some_and(|(_, wraps)| wraps) }
-    /// The kernel for arguments of `dtype`, and their dtype if they need casting first.
-    fn chosen(&self, dtype: DType) -> Option<(F, DType)> {
-        let at = self.computes(dtype)?;
-        Some((self.at(at).expect("computes gives a dtype with a kernel"), at))
-    }
-}
-
-/// `x` at `dtype`: itself where it already has `dtype`, and otherwise a cast that `cast` holds.
-#[inline]
-fn cast<'a>(x: View<'a>, dtype: DType, cast: &'a mut Option<Buffer>) -> View<'a> {
-    if x.dtype() == dtype { return x; }
-    cast.insert(Buffer::cast(x, dtype).expect("an argument casts to the dtype it computes in")).view()
-}
-
-impl<K> Kernels<UnaryKernel<K>> {
-    /// `k` on the logical items of `x`, and whether every result succeeded. `None` where `k` has no kernel for `x`'s dtype.
-    pub fn unary(&self, k: &K, x: ArrayView<'_>) -> Option<(Buffer, bool)> {
-        let (kernel, at) = self.chosen(x.dtype())?;
-        if at == x.dtype() { return Some(kernel(k, x.storage(), x.mapping(), x.len())); }
-        Some(kernel(k, x.cast(at).expect("computing dtype").view(), &Mapping::Linear(1), x.len()))
-    }
-}
-
-/// Keeps an ordinary compact call's agreement borrowed; only changed input mappings need a new one.
-fn remapped(a: &Agreement, left: Option<Mapping>, right: Option<Mapping>) -> Option<Agreement> {
-    (left.is_some() || right.is_some()).then(|| Agreement { layout: a.layout.clone(), len: a.len, left: left.unwrap_or_else(|| a.left.clone()),
-        right: right.unwrap_or_else(|| a.right.clone()) })
-}
-
-impl<K> Kernels<BinaryKernel<K>> {
-    /// `k` on `x` and `y`, which share a dtype and pair as `agreement` says, and whether every result succeeded. `None` where `k` has no kernel for their dtype.
-    pub fn binary(&self, k: &K, x: ArrayView<'_>, y: ArrayView<'_>, agreement: &Agreement) -> Option<(Buffer, bool)> {
-        let (kernel, at) = self.chosen(x.dtype())?;
-        let (x, left) = x.mapped(&agreement.left, agreement.layout.shape(), at);
-        let (y, right) = y.mapped(&agreement.right, agreement.layout.shape(), at);
-        let changed = remapped(agreement, left, right);
-        Some(kernel(k, x.view(), y.view(), changed.as_ref().unwrap_or(agreement)))
-    }
-}
-
-impl<K> Kernels<TernaryKernel<K>> {
-    /// `k` on three arguments of one dtype, or on two of one dtype and a Boolean mask, paired as [`TernaryKernel`] describes, and whether every result succeeded. `None` where `k` has no kernel for their dtype.
-    pub fn ternary(&self, k: &K, [x, y, z]: [ArrayView<'_>; 3], first: &Agreement, second: &Agreement) -> Option<(Buffer, bool)> {
-        let (kernel, at) = self.chosen(x.dtype())?;
-        let (x, left) = x.mapped(&first.left, first.layout.shape(), at);
-        let (y, right) = y.mapped(&first.right, first.layout.shape(), at);
-        // A Boolean third argument keeps its dtype: `ternary_at` turns it into items of `at` a chunk at a time, through `Element::truth`.
-        let (z, last) = z.mapped(&second.right, second.layout.shape(), if z.dtype() == DType::Boolean { DType::Boolean } else { at });
-        let middle = second.left.cast_fill(at).ok()?;
-        let (one, two) = (remapped(first, left, right), remapped(second, middle, last));
-        Some(kernel(k, [x.view(), y.view(), z.view()], one.as_ref().unwrap_or(first), two.as_ref().unwrap_or(second)))
-    }
-}
-
-impl<K> Kernels<AccumulationKernel<K>> {
-    /// Runs the accumulation selected by the probe, and reports whether every result succeeded. `None` where there is no kernel for `x`'s dtype. Folds take an optional right tail per lane; scans take an optional scalar start. `RightFold` needs two items per lane without a tail, because a singleton retains its input dtype and is handled by the caller.
-    pub fn run(&self, k: &K, x: View<'_>, dims: [usize; 3], start: Option<View<'_>>) -> Option<(Buffer, bool)> {
-        let (kernel, at) = self.chosen(x.dtype())?;
-        Some(kernel(k, cast(x, at, &mut None), dims, start))
-    }
-}
-
-impl<K> Kernels<SlidingKernel<K>> {
-    /// The folds of each window of `width` rows along the middle of `dims`, as [`reduce::sliding`](crate::reduce::sliding) gives them, and whether every fold fits. `None` where there is no kernel for `x`'s dtype.
-    pub fn sliding(&self, k: &K, x: View<'_>, dims: [usize; 3], width: usize) -> Option<(Buffer, bool)> {
-        let (kernel, at) = self.chosen(x.dtype())?;
-        Some(kernel(k, cast(x, at, &mut None), dims, width))
-    }
-}
-
-impl<K> Kernels<MappedFoldKernel<K>> {
-    /// The folds along `axis` of the array of `shape` that `mapping` lays `x` over, as [`reduce::along_mapped`](crate::reduce::along_mapped) gives them. `None` where there is no kernel at `x`'s own dtype: this kernel reads `x` where it lies, and never casts it.
-    pub fn mapped_fold(
-        &self, k: &K, x: View<'_>, mapping: &Mapping, shape: &[usize], axis: usize) -> Option<(Buffer, bool, Option<Vec<crate::gather::Steps>>)> {
-        let (kernel, at) = self.chosen(x.dtype())?;
-        (at == x.dtype()).then(|| kernel(k, x, mapping, shape, axis))
-    }
-}
-
-impl<P> Kernels<ProductKernel<P>> {
-    /// `p`'s products of the cells of `x` and `y`, which share a dtype and pair as `frames` says, each of sizes `[n, k, m]`, and whether every product fit. `None` where `p` has no kernel for their dtype, and an error where an interrupt stopped them.
-    pub fn product(&self, p: &P, [x, y]: [View<'_>; 2], frames: &Frames, size: [usize; 3]) -> Option<Result<(Buffer, bool), Error>> {
-        let (kernel, at) = self.chosen(x.dtype())?;
-        Some(kernel(p, [cast(x, at, &mut None), cast(y, at, &mut None)], frames, size))
-    }
-}
-
-impl<K> Kernels<ScatterKernel<K>> {
-    /// Combines each item of `values`, or its only item, into the item of `out` at each of `writes` by `k`, in turn: a function object combines the item with the value, and a reduction steps the item by the value as it folds. It gives whether every result succeeded. A failed result is written as `k`'s slice form writes it: wrapped to its type, or NaN. `values` reads at `out`'s dtype. `None` where `k` has no kernel at `out`'s dtype.
-    pub fn scatter(&self, k: &K, out: &mut Buffer, writes: crate::gather::Writes<'_>, values: View<'_>) -> Option<bool> {
-        let kernel = self.at(out.dtype())?;
-        Some(kernel(k, out, writes, cast(values, out.dtype(), &mut None)))
-    }
-}
-
-/// The items of `x`, which has the kernel's dtype.
-fn items<T: Element>(x: View<'_>) -> &[T] { T::of(x).expect("an argument has its kernel's dtype") }
-
-fn unary_at<K: Unary<T, Out: Element> + Sync, T: Element>(k: &K, x: View<'_>, mapping: &Mapping, len: usize) -> (Buffer, bool) {
-    let mut out = Vec::with_capacity(len);
-    let ok = map1(items::<T>(x), mapping, len, k, &mut out);
-    (<<K as Results<T, 1>>::Out as Element>::buffer(out), ok)
-}
-
-pub(crate) fn binary_at<K: Binary<T, Out: Element> + Sync, T: Element, L>(k: &K, x: View<'_>, y: View<'_>, agreement: &Agreement<L>) -> (Buffer, bool) {
-    let mut out = Vec::with_capacity(agreement.len);
-    let ok = map2(items::<T>(x), items::<T>(y), agreement, k, &mut out);
-    (<<K as Results<T, 2>>::Out as Element>::buffer(out), ok)
-}
-
-/// A contiguous or constant argument through two mappings, without an expansion buffer.
-#[inline]
-fn direct<'a, T: Element>(data: &'a [T], mapping: &Mapping, parent: &Mapping) -> Option<Arg<'a, T>> {
-    match (parent, mapping) {
-        (Mapping::Single, _) => Some(Arg::One(mapping.get(0).map_or_else(|| crate::buffer::Fill::item(mapping.chosen()), |i| data[i]))),
-        (Mapping::Linear(1), Mapping::Single) => Some(Arg::One(data[0])), (Mapping::Linear(1), Mapping::Linear(1)) => Some(Arg::Many(data)), _ => None
-    }
-}
-
-/// A third argument at a kernel's item type `T`, or a Boolean mask that [`Kernels::ternary`] leaves uncast, which becomes items of `T` through [`Element::truth`].
-#[derive(Clone, Copy)]
-enum Third<'a, T> { Items(&'a [T]), Mask(&'a [bool]) }
-
-impl<'a, T: Element> Third<'a, T> {
-    fn of(z: View<'a>) -> Self {
-        match bool::of(z) { Some(mask) if T::DTYPE != DType::Boolean => Third::Mask(mask), _ => Third::Items(items::<T>(z)) }
-    }
-}
-
-/// Contiguous or constant arguments go to the slice form directly, and a mask through [`masked`](crate::slice::masked). Otherwise each argument reads through its two mappings composed into one, as [`read_runs`] reads it. Where the two don't compose structurally, they compose into a table of offsets. Where they can't compose at all, as two different chosen fills can't, the argument's items are first read through its own mapping (`read_as`).
-fn ternary_at<K: Ternary<T, Out: Element> + Sync, T: Element>(k: &K, [x, y, z]: [View<'_>; 3], first: &Agreement, second: &Agreement) -> (Buffer, bool) {
-    let (x, y, z) = (items::<T>(x), items::<T>(y), Third::<T>::of(z));
-    let mut out = Vec::with_capacity(second.len);
-    let pair = if second.len == 0 { None } else { direct(x, &first.left, &second.left).zip(direct(y, &first.right, &second.left)) };
-    let done = pair.and_then(|(xa, ya)| match z {
-        Third::Items(z) => direct(z, &second.right, &Mapping::Linear(1)).map(|za| k.many(xa, ya, za, second.len, &mut out)),
-        Third::Mask(m) => direct(m, &second.right, &Mapping::Linear(1)).map(|ma| crate::slice::masked(k, xa, ya, ma, second.len, &mut out)),
-    });
-    let ok = done.unwrap_or_else(|| {
-        let [(x, xm), (y, ym)] =
-            [(x, &first.left), (y, &first.right)].map(|(data, map)| match map.composed(&second.left, first.layout.shape(), second.layout.shape(), true) {
-                Some(m) => (std::borrow::Cow::Borrowed(data), m),
-                None => (std::borrow::Cow::Owned(crate::buffer::read_as(data, map, first.len)), second.left.clone()),
-            });
-        let (xs, ys) = (Side::new(x.as_ref(), &xm), Side::new(y.as_ref(), &ym));
-        let leaf = |[a, b, c]: [Arg<'_, T>; 3], n: usize, slots: &mut Slots<'_, _>| k.many_into(a, b, c, n, slots);
-        match z {
-            Third::Items(z) => read_runs([&xs, &ys, &Side::new(z, &second.right)], second.len, &mut out, &leaf),
-            Third::Mask(mask) => read_runs([&xs, &ys, &Truths { mask, mapping: &second.right }], second.len, &mut out, &leaf),
-        }
-    });
-    (<<K as Results<T, 3>>::Out as Element>::buffer(out), ok)
-}
-
-/// A Boolean mask read as items of `T` through [`Element::truth`], as a ternary's third argument.
-struct Truths<'a> { mask: &'a [bool], mapping: &'a Mapping }
-
-impl<T: Element> Read<T> for Truths<'_> {
-    fn read<'b>(&'b self, start: usize, n: usize, buf: &'b mut Vec<T>) -> Arg<'b, T> {
-        expanded(self.mapping, self.mask, start, n, &mut Vec::new()).converted(0, n, buf, T::truth)
-    }
-    fn constant(&self) -> Option<T> { matches!(self.mapping, Mapping::Single).then(|| T::truth(self.mask[0])) }
-    fn reads(&self) -> (&Mapping, usize) { (self.mapping, 1) }
-}
-
-fn fold_at<R: Reduction<T>, T: Element>(_: &R, x: View<'_>, dims: [usize; 3], tail: Option<View<'_>>) -> (Buffer, bool) where R::Total: Element {
-    let mut tc = None;
-    let tail = tail.map(|tail| cast(tail, R::Total::DTYPE, &mut tc));
-    let (totals, ok) = crate::reduce::along_with_tail::<T, R>(items::<T>(x), dims, tail.map(items::<R::Total>));
-    (R::Total::buffer(totals), ok)
-}
-
-fn scan_at<R: Reduction<T>, T: Element>(_: &R, x: View<'_>, dims: [usize; 3], start: Option<View<'_>>) -> (Buffer, bool) where R::Total: Element {
-    let mut sc = None;
-    let start = start.map(|s| items::<R::Total>(cast(s, R::Total::DTYPE, &mut sc))[0]);
-    let mut out = Vec::with_capacity(crate::layout::count(&dims));
-    let ok = scan_along::<T, R>(items::<T>(x), dims, start, &mut out);
-    (R::Total::buffer(out), ok)
-}
-
-fn sliding_at<R: Reduction<T>, T: Element>(_: &R, x: View<'_>, dims: [usize; 3], width: usize) -> (Buffer, bool) where R::Total: Element {
-    let (totals, ok) = crate::reduce::sliding::<T, R>(items::<T>(x), dims, width);
-    (R::Total::buffer(totals), ok)
-}
-
-fn mapped_fold_at<R: Reduction<T>, T: Element>(
-    _: &R, x: View<'_>, mapping: &Mapping, shape: &[usize], axis: usize) -> (Buffer, bool, Option<Vec<crate::gather::Steps>>) where R::Total: Element {
-    let (totals, ok, order) = crate::reduce::along_mapped::<T, R>(items::<T>(x), mapping, shape, axis);
-    (R::Total::buffer(totals), ok, order)
-}
-
-fn right_fold_at<K: Binary<T, Out: Element + Source<T>>, T: Element>(k: &K, x: View<'_>, dims: [usize; 3], tail: Option<View<'_>>) -> (Buffer, bool) {
-    let mut tc = None;
-    let tail = tail.map(|t| cast(t, T::DTYPE, &mut tc));
-    let (out, ok) = crate::reduce::right_fold(k, items::<T>(x), dims, tail.map(items::<T>));
-    (K::Out::buffer(out), ok)
-}
-
-fn scatter_at<K: Binary<T, Out = T>, T: Element>(k: &K, out: &mut Buffer, writes: crate::gather::Writes<'_>, values: View<'_>) -> bool {
-    let ok = std::cell::Cell::new(true);
-    let (out, values) = (T::of_mut(out).expect("the output has its kernel's dtype"), items::<T>(values));
-    writes.combine(out, Arg::of(values), |a, y| {
-        let (v, fine) = k.judged(a, y);
-        ok.set(ok.get() & fine);
-        v
-    });
-    ok.get()
-}
-
-/// [`scatter_at`] for a reduction, through [`Writes::fold`](crate::gather::Writes::fold).
-fn fold_writes_at<R: Reduction<T, Total = T>, T: Element>(_: &R, out: &mut Buffer, writes: crate::gather::Writes<'_>, values: View<'_>) -> bool {
-    writes.fold::<R, T>(T::of_mut(out).expect("the output has its kernel's dtype"), Arg::of(items::<T>(values)))
-}
-
-fn left_scan_at<K: Binary<T, Out: Element + Source<T>>, T: Element>(k: &K, x: View<'_>, dims: [usize; 3], seed: Option<View<'_>>) -> (Buffer, bool) {
-    let mut sc = None;
-    let seed = seed.map(|s| cast(s, T::DTYPE, &mut sc));
-    let mut out = Vec::with_capacity(x.len());
-    let ok = crate::reduce::left_scan(k, items::<T>(x), dims, seed.map(|s| items::<T>(s)[0]), &mut out);
-    (T::buffer(out), ok)
-}
-
-fn product_at<P: Inner<T, Out: Element + Default> + Sync, T: Element>(
-    p: &P, [x, y]: [View<'_>; 2], frames: &Frames, size @ [n, k, m]: [usize; 3]) -> Result<(Buffer, bool), Error> {
-    let (x, y) = (items::<T>(x), items::<T>(y));
-    let write = |i: usize, (out,): (&mut [P::Out],), _: &mut ()| p.checked_into(&x[frames.items(0, i, n * k)], &y[frames.items(1, i, k * m)], size, out);
-    let ((out,), ok) = stack::<(Vec<P::Out>,), ()>(frames.count, [n * m], &write)?;
-    Ok((P::Out::buffer(out), ok))
-}
-
-/// The machinery of [`kernels!`](crate::kernels), which tests a trait impl at each element type by autoref specialization. [`Found`] gives the kernel on `Probe` where the impl holds. Method lookup tries `Probe` before `&Probe`, so [`Missing`]'s `None` on `&Probe` applies only where it doesn't.
-#[doc(hidden)]
-pub mod probe {
-    use super::*;
-    use std::marker::PhantomData;
-
-    pub struct Probe<K, T, A>(PhantomData<(K, T, A)>);
-    impl<K, T, A> Probe<K, T, A> {
-        #[inline(always)]
-        pub const fn new() -> Self { Self(PhantomData) }
-        /// The probe for `k`'s type, for a [`kernels!`](crate::kernels) given a value.
-        #[inline(always)]
-        pub const fn of(_: &K) -> Self { Self(PhantomData) }
-    }
-    /// The operations that `kernels!` names.
-    pub enum Unary {}
-    pub enum Binary {}
-    pub enum Ternary {}
-    pub enum Fold {}
-    pub enum Scan {}
-    pub enum RightFold {}
-    pub enum LeftScan {}
-    pub enum Sliding {}
-    pub enum MappedFold {}
-    pub enum Product {}
-    pub enum Scatter {}
-    /// A reduction's [`ScatterKernel`], which folds each place's item with the values written to it, as the reduction folds.
-    pub enum Combine {}
-    /// The test that [`characters!`](crate::characters!) makes.
-    pub enum Characters {}
-
-    /// A kernel where the impl holds, with whether it leaves a failed result wrapped to its type.
-    pub trait Found<F> { fn kernel(&self) -> Option<(F, bool)>; }
-    pub trait Missing<F> {
-        #[inline(always)]
-        fn kernel(&self) -> Option<(F, bool)> { None }
-    }
-    impl<K, T, A, F> Missing<F> for &Probe<K, T, A> {}
-
-    impl<K: crate::Unary<T, Out: Element> + Sync, T: Element> Found<UnaryKernel<K>> for Probe<K, T, Unary> {
-        #[inline(always)]
-        fn kernel(&self) -> Option<(UnaryKernel<K>, bool)> { Some((unary_at::<K, T>, K::WRAPS)) }
-    }
-    impl<K: crate::Binary<T, Out: Element> + Sync, T: Element> Found<BinaryKernel<K>> for Probe<K, T, Binary> {
-        #[inline(always)]
-        fn kernel(&self) -> Option<(BinaryKernel<K>, bool)> { Some((binary_at::<K, T, crate::layout::Layout>, K::WRAPS)) }
-    }
-    impl<K: crate::Ternary<T, Out: Element> + Sync, T: Element> Found<TernaryKernel<K>> for Probe<K, T, Ternary> {
-        #[inline(always)]
-        fn kernel(&self) -> Option<(TernaryKernel<K>, bool)> { Some((ternary_at::<K, T>, K::WRAPS)) }
-    }
-    // Every reduction wraps a total that doesn't fit, as `Reduction` says.
-    impl<R: Reduction<T>, T: Element> Found<AccumulationKernel<R>> for Probe<R, T, Fold> where R::Total: Element {
-        #[inline(always)]
-        fn kernel(&self) -> Option<(AccumulationKernel<R>, bool)> { Some((fold_at::<R, T>, true)) }
-    }
-    impl<R: Reduction<T>, T: Element> Found<AccumulationKernel<R>> for Probe<R, T, Scan> where R::Total: Element {
-        #[inline(always)]
-        fn kernel(&self) -> Option<(AccumulationKernel<R>, bool)> { Some((scan_at::<R, T>, true)) }
-    }
-    impl<R: Reduction<T>, T: Element> Found<SlidingKernel<R>> for Probe<R, T, Sliding> where R::Total: Element {
-        #[inline(always)]
-        fn kernel(&self) -> Option<(SlidingKernel<R>, bool)> { Some((sliding_at::<R, T>, true)) }
-    }
-    impl<R: Reduction<T>, T: Element> Found<MappedFoldKernel<R>> for Probe<R, T, MappedFold> where R::Total: Element {
-        #[inline(always)]
-        fn kernel(&self) -> Option<(MappedFoldKernel<R>, bool)> { Some((mapped_fold_at::<R, T>, true)) }
-    }
-    impl<K: crate::Binary<T, Out: Element + Source<T>>, T: Element> Found<AccumulationKernel<K>> for Probe<K, T, RightFold> {
-        #[inline(always)]
-        fn kernel(&self) -> Option<(AccumulationKernel<K>, bool)> { Some((right_fold_at::<K, T>, K::WRAPS)) }
-    }
-    impl<K: crate::Binary<T, Out: Element + Source<T>>, T: Element> Found<AccumulationKernel<K>> for Probe<K, T, LeftScan> {
-        #[inline(always)]
-        fn kernel(&self) -> Option<(AccumulationKernel<K>, bool)> { Some((left_scan_at::<K, T>, K::WRAPS)) }
-    }
-    impl<P: crate::linalg::Inner<T, Out: Element> + Sync, T: Element> Found<ProductKernel<P>> for Probe<P, T, Product> {
-        #[inline(always)]
-        fn kernel(&self) -> Option<(ProductKernel<P>, bool)> { Some((product_at::<P, T>, false)) }
-    }
-    impl<K: crate::Binary<T, Out = T>, T: Element> Found<ScatterKernel<K>> for Probe<K, T, Scatter> {
-        #[inline(always)]
-        fn kernel(&self) -> Option<(ScatterKernel<K>, bool)> { Some((scatter_at::<K, T>, K::WRAPS)) }
-    }
-    impl<R: Reduction<T, Total = T>, T: Element> Found<ScatterKernel<R>> for Probe<R, T, Combine> {
-        #[inline(always)]
-        fn kernel(&self) -> Option<(ScatterKernel<R>, bool)> { Some((fold_writes_at::<R, T>, true)) }
-    }
-    impl<K: crate::characters::Characters + crate::Binary<i32, Out: Element> + crate::Binary<i64, Out: Element> + Sync> Found<crate::characters::Kernel<K>>
-        for Probe<K, (), Characters> {
-        #[inline(always)]
-        fn kernel(&self) -> Option<(crate::characters::Kernel<K>, bool)> { Some((crate::characters::binary::<K, crate::layout::Layout>, false)) }
-    }
-}
-
-/// The [`Kernels`](crate::operation::Kernels) of a function object or reduction: `Unary`, `Binary` or `Ternary` for that arity, `RightFold` or `LeftScan` for ordered accumulation by a binary function, `Scatter` for combining a binary function's results into an array in place, `Fold`, `Scan`, `Sliding` or `MappedFold` for a [`Reduction`](crate::reduce::Reduction), and `Product` for a matrix product's [`Inner`](crate::linalg::Inner) pair. Name the object by its type, or by a value after `of`. Each kernel's test resolves where the macro expands, so the type must be concrete there. In generic code the tests see only the type parameter's bounds, not the impls of the type it later stands for, so a kernel that the bounds don't promise comes out as `None`, with no error.
-#[macro_export]
-macro_rules! kernels {
-    ($arity:ident of $k:expr) => {{
-        let k = &$k;
-        $crate::kernels!(@all $arity [of k])
-    }};
-    ($arity:ident $k:ty) => { $crate::kernels!(@all $arity [type $k]) };
-    (@all $arity:ident $how:tt) => {{
-        #[allow(unused_imports)]
-        use $crate::operation::probe::{Found as _, Missing as _};
-        $crate::element_types!(($crate::kernels) @list $arity $how)
-    }};
-    (@list $arity:ident $how:tt [$($name:ident: $d:tt $t:ty),+]) => {
-        $crate::operation::Kernels::new([$($crate::kernels!(@at $arity $how $t)),+])
-    };
-    (@at $arity:ident [type $k:ty] $t:ty) => {
-        (&$crate::operation::probe::Probe::<$k, $t, $crate::operation::probe::$arity>::new()).kernel()
-    };
-    (@at $arity:ident [of $k:ident] $t:ty) => {
-        (&$crate::operation::probe::Probe::<_, $t, $crate::operation::probe::$arity>::of($k)).kernel()
-    };
+fn finish(output: &mut Buffer, dtype: DType, checked: bool) -> Result<(), Error> {
+    if output.dtype() != dtype { *output = Buffer::cast_results(output.view(), dtype, checked)?; }
+    Ok(())
 }

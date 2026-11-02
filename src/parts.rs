@@ -13,11 +13,8 @@ pub struct Sign;
 pub struct Angle;
 
 forms!(Abs at real: |_, [x]| Total(x.abs()));
-forms!(#[inline] Sign at real: |_, [x]| Total(sign(x)));
+forms!(#[inline] Sign at real: |k, [x]| Total(crate::facts::formula_at(k, [x])));
 
-/// `recipe::sign` on one float.
-#[inline(always)]
-fn sign<F: crate::Float>(x: F) -> F { crate::recipe::sign::<F, _>(&crate::recipe::Floats, x) }
 forms!(Angle at real: |_, [x]| Total(crate::arc::real_angle(x)));
 
 macro_rules! objects {
@@ -60,7 +57,7 @@ fn scaled<F: crate::Float>(x: F, scale: f64) -> F { x * F::narrow(scale) }
 
 /// Decimal rounding to nearest, ties to even. Constructing it precomputes the scale; extreme negative/positive precisions give zero/leave inputs unchanged.
 #[derive(Clone, Copy, Debug)]
-pub struct Round { scale: f64 }
+pub struct Round { pub(crate) scale: f64 }
 impl Round {
     /// Rounds to this many digits after the decimal point; negative values round to tens, hundreds and so on.
     pub fn new(decimals: i32) -> Self { Self { scale: 10f64.powi(decimals) } }
@@ -70,16 +67,16 @@ forms!(Round at Complex32, Complex64: |k, [x]| Total(num_complex::Complex::new(r
 forms!(Round at u8, i16, i32, i64: |k, [x]| rounded_integer(x, k.scale));
 
 #[inline(always)]
-fn rounded<F: crate::Float>(x: F, scale: f64) -> F where Rint: crate::Unary<F, Out = F> {
+pub(crate) fn rounded<F: crate::Float>(x: F, scale: f64) -> F {
     let scale = F::narrow(scale);
     let scaled = x * scale;
     if !x.is_finite() || scale.is_infinite() || scaled.is_infinite() { x }
     else if scale == F::zero() { x * F::zero() }
-    else { crate::Unary::one(&Rint, scaled) / scale }
+    else { scaled.round_ties_even() / scale }
 }
 
 #[inline(always)]
-fn rounded_integer<T: Into<i128> + TryFrom<i128>>(x: T, scale: f64) -> Option<T> {
+pub(crate) fn rounded_integer<T: Into<i128> + TryFrom<i128>>(x: T, scale: f64) -> Option<T> {
     if scale >= 1.0 { return Some(x); }
     let scale = (1.0 / scale).round() as i128;
     let x = x.into();
@@ -126,3 +123,4 @@ forms!(Choose at Complex32, Complex64: |_, [x, y, m]| Total(if m.re != 0.0 { x }
 forms!(Choose at u8, i16, i32, i64: |_, [x, y, m]| if m != 0 { x } else { y });
 forms!(Choose at bool: |_, [x, y, m]| (m & x) | (!m & y));
 forms!(Choose at char: |_, [x, y, m]| if m == '\u{1}' { x } else { y });
+

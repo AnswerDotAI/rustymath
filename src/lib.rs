@@ -48,7 +48,6 @@ mod special;
 mod sqrts;
 pub mod stats;
 pub mod structure;
-mod table;
 pub mod timing;
 pub mod tolerant;
 mod trig;
@@ -61,13 +60,15 @@ pub use arith::{
 };
 pub use complex::{Cis, divide};
 pub use exp::{Exp, Expm1};
+pub use arc::{RealAcos, RealAsin};
 pub use float::{FUSED, Float, Native};
-pub use ln::{Ln, Log1p, Log2, Log10, Logb, MathishLogb};
+pub use hyperbolic::{RealAcosh, RealAtanh};
+pub use ln::{Ln, Log1p, Log2, Log10, Logb, MathishLogb, RealLn};
 pub use parts::{Abs, Angle, Choose, Clip, Conj, Imag, Isfinite, Isinf, Isnan, Real, Rint, Round, Scale, Sign, Trunc};
-pub use pow::{Exponent, Pow, Root, WholePow, WrappingPow};
-pub use slice::{Arg, Binary, CHUNK, Flipped, Forms, KernelItem, Results, Ternary, Unary, Wrapped, choose, pairs};
+pub use pow::{Exponent, Pow, RealPow, Root, WholePow, WrappingPow};
+pub use slice::{Arg, Binary, CHUNK, Flipped, KernelItem, Results, Ternary, Unary, Wrapped, choose, pairs};
 pub use special::{Erfc, Erfcinv, Erfinv};
-pub use sqrts::Sqrt;
+pub use sqrts::{RealSqrt, RealSqrt1mx2, RealSqrtm1mx2, RealSqrtx2m1, Sqrt};
 pub use trig::{Cos, Sin, Tan};
 /// The crates whose types compact buffers hold, which the exported width macros name.
 pub use {half, num_complex};

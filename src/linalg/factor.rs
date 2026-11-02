@@ -232,7 +232,7 @@ pub struct QrWork<T> { at: Vec<T>, taus: Vec<T>, qt: Vec<T> }
 impl<T> Default for QrWork<T> { fn default() -> Self { QrWork { at: Vec::new(), taus: Vec::new(), qt: Vec::new() } } }
 
 impl<T: Factor> QrWork<T> {
-    /// [`qr`], or [`qr_complete`] where `complete` is true, of the matrix `a` of `size` `[m, n]`, written into `q` and `r`, which hold Q's and R's items, using these buffers.
+    /// [`qr`] of the matrix `a` of `size` `[m, n]`, or where `complete` is true the complete factorization, in which Q is `m`×`m` and unitary, R is `m`×`n`, Q's first columns and R's first rows are `qr`'s, and R's other rows are zero. Q's and R's items go into `q` and `r`, using these buffers.
     pub fn qr_into(&mut self, a: &[T], size: [usize; 2], complete: bool, q: &mut [T], r: &mut [T]) { T::matrix_qr_into(a, size, complete, self, q, r) }
 }
 
@@ -267,8 +267,6 @@ pub fn lu<T: Factor>(a: &[T], n: usize) -> Lu<T> {
 pub fn cholesky<T: Factor>(a: &[T], n: usize) -> Option<Vec<T>> { T::matrix_cholesky(a, n) }
 /// The thin QR factorization `(Q, R)` of the matrix `a` of `size` `[m, n]`. Where `p` is the smaller of `m` and `n`, Q is `m`×`p` with orthonormal columns, and R is `p`×`n` and upper triangular, with a real diagonal.
 pub fn qr<T: Factor>(a: &[T], size: [usize; 2]) -> (Vec<T>, Vec<T>) { T::matrix_qr(a, size, false) }
-/// The complete QR factorization `(Q, R)` of the matrix `a` of `size` `[m, n]`: Q is `m`×`m` and unitary, and R is `m`×`n`. Q's first columns and R's first rows are `qr`'s, and R's other rows are zero.
-pub fn qr_complete<T: Factor>(a: &[T], size: [usize; 2]) -> (Vec<T>, Vec<T>) { T::matrix_qr(a, size, true) }
 /// The thin SVD of the matrix `a` of `size` `[m, n]`.
 pub fn svd<T: Factor>(a: &[T], size: [usize; 2]) -> Svd<T> { T::matrix_svd(a, size, true) }
 /// The singular values of the matrix `a` of `size` `[m, n]`, in descending order.
@@ -1013,7 +1011,7 @@ impl<T: Tiled> Reflections<T> {
 /// Whether a QR factorization of a matrix of `size` factors as one leaf, through `leaf_qr`: a thin one with at most `LEAF` reflections.
 fn leaf([m, n]: [usize; 2], complete: bool) -> bool { !complete && m.min(n) <= LEAF }
 
-/// `qr` and `qr_complete` for `T`. A thin factorization of a tall matrix comes from `tall_qr` where that succeeds, and a leaf from `leaf_qr`. Otherwise Q and R come from the reflections. A complete Q applies the reflections to the `m`×`m` identity, and R gains rows of zeros to be `m`×`n`.
+/// `qr`, and the complete factorization, for `T`. A thin factorization of a tall matrix comes from `tall_qr` where that succeeds, and a leaf from `leaf_qr`. Otherwise Q and R come from the reflections. A complete Q applies the reflections to the `m`×`m` identity, and R gains rows of zeros to be `m`×`n`.
 fn qr_factor<T: Tiled>(a: &[T], [m, n]: [usize; 2], complete: bool) -> (Vec<T>, Vec<T>) {
     if !complete && tall_for_qr([m, n]) && let Some((r, q)) = tall_qr(a, [m, n], Tall::Q) { return (q, r); }
     if leaf([m, n], complete) {

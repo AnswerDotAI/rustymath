@@ -1,12 +1,13 @@
 //! Reductions and scans over a contiguous slice: sums, products, maximums and minimums, and their running versions. Each compiles inside rustymath once for each item type. A float sum or product may combine the items in any order, which lets its loop vectorize, so its last bits can differ from a sum taken item by item. Beside NaN, a float maximum or minimum gives NaN or the greatest or least of the items that aren't NaN, and never any other number. Which of the two it gives can depend on the target and the loop. An empty slice gives -∞ or ∞. `f16` items compute in `f32`. Their sum or product is an `f32` total. An integer sum or product computes at `i64`, or at `u64` for `u64` items. Where it doesn't fit, it wraps, and reports that it doesn't fit, as the running versions do.
 pub use crate::slice::running;
 use crate::{
-    Arg, Float, Native, agreement::{Mapping, expanded_items}, arith::Overflowing, buffer::{Element, View}, float::sealed::{Core, Folds}, gather::Steps,
+    Arg, Float, Native, agreement::{Mapping, Walked, expanded_items}, arith::Overflowing, buffer::{Element, View}, float::sealed::{Core, Folds}, gather::Steps,
     layout::Lanes, linalg::Scalar, parallel, slice::{CHUNK, appended, written}
 };
 use half::f16;
 use num_complex::Complex;
 use std::ops::Range;
+use crate::error::{Error, Kind};
 
 /// The sum of `x`, 0 for an empty slice, and whether it fits. An integer sum that doesn't fit wraps.
 #[inline]
@@ -47,21 +48,6 @@ fn extremes_by<A: Copy, T: Copy, const R: usize>(x: &[A], key: impl Fn(A) -> T) 
     let (lo, hi) = (lo.into_iter().fold(<Min as Reduction<T>>::unit(), min), hi.into_iter().fold(<Max as Reduction<T>>::unit(), max));
     rest.iter().fold((lo, hi), |(lo, hi), &v| { let v = key(v); (min(lo, v), max(hi, v)) })
 }
-/// Appends the running sums of `x` to `out`, the first being `start` plus the first item where `start` is given, and gives whether every sum fits.
-#[inline]
-pub fn cumsum<T: Copy>(x: &[T], start: Option<<Sum as Reduction<T>>::Total>, out: &mut Vec<<Sum as Reduction<T>>::Total>) -> bool where Sum: Reduction<T> {
-    Sum::scan(x, start, out)
-}
-/// Appends the running products of `x` to `out`, as `cumsum` does sums.
-#[inline]
-pub fn cumprod<T: Copy>(x: &[T], start: Option<<Product as Reduction<T>>::Total>, out: &mut Vec<<Product as Reduction<T>>::Total>) -> bool where Product: Reduction<T>
-{ Product::scan(x, start, out) }
-/// Appends the running maximums of `x` to `out`, the first taking `start` into account where it is given.
-#[inline]
-pub fn cummax<T: Copy>(x: &[T], start: Option<T>, out: &mut Vec<T>) where Max: Reduction<T, Total = T> { Max::scan(x, start, out); }
-/// Appends the running minimums of `x` to `out`, as `cummax` does maximums.
-#[inline]
-pub fn cummin<T: Copy>(x: &[T], start: Option<T>, out: &mut Vec<T>) where Min: Reduction<T, Total = T> { Min::scan(x, start, out); }
 
 /// The greater of x and y, as [`max`] gives the greatest item. Beside NaN, or where they're equal, it gives y. A fold that passes its running result as y keeps it beside a NaN item. NumPy calls it `maximum`.
 #[inline(always)]
@@ -117,7 +103,7 @@ pub trait Reduction<T> {
     /// Folds each row of `data`, a matrix with `columns` items in each row, into the matching item of `out`, and gives whether every fold fits. The default is `fold_rows`, which folds each row of 16 items or more by `slice`. Float sums and products, integer maximums and minimums, and bitwise folds fold rows of 16 to 63 items by `checked` instead, eight rows side by side (`rows_side_by_side`). Each of their steps is one instruction, so keeping several rows' steps in flight costs less than a call of `slice` for each row. Other reductions keep `fold_rows`, where `slice` vectorizes within the row: an integer sum's step checks for overflow, and a float maximum's or minimum's `slice` runs `Folds`' vector kernels. Nobody has timed float maximums side by side since their step became one select on x86.
     #[inline]
     fn rows(data: &[T], columns: usize, out: &mut [Self::Total]) -> bool where Self: Sized, T: Copy { fold_rows::<T, Self>(data, columns, out) }
-    /// The most classes for which [`crate::search::Numbered::fold`] folds each class into four totals by position. Each step of a class's total waits on the last through memory, so a reduction whose step takes longer gains from the split over more classes.
+    /// The most classes for which [`crate::search::ClassNumbers`] folds each class into four totals by position. Each step of a class's total waits on the last through memory, so a reduction whose step takes longer gains from the split over more classes.
     const SPLIT: usize = 8;
 }
 
@@ -852,24 +838,21 @@ pub fn fold_route(mapping: &Mapping, shape: &[usize], source: Option<&[usize]>, 
     if !keeps || rereads_cheaply(mapping, shape) { FoldRoute::Mapped } else { FoldRoute::Lanes }
 }
 
-/// [`along`] of the array of `shape` that `mapping` lays `data` over, folding axis `axis`, without building that array: its totals, whether they all fit, and the tables that read the totals in the order of the array's other axes, where they come in another order. A reduction combines each lane's items in any order. Where the array reads a contiguous block of `data` with its axes in another order, as [`Mapping::block`] finds, the block folds in its own order, as [`Block::fold`] plans it, and its totals keep the block's order. A caller can then copy them through the tables, or read them through the tables as another view. Otherwise each run of at least [`RUN`] items folds where it lies, shorter runs are copied [`MAPPED`] items at a time through [`expanded_items`], and the array folds as [`fold_pieces`] folds it.
+/// Folds each lane of the array described by `mapping` without gathering it. Returns totals, whether every integer total fits, and an optional mapping from those totals to result order.
 pub fn along_mapped<T: Element, R: Reduction<T>>(data: &[T], mapping: &Mapping, shape: &[usize], axis: usize) -> (Vec<R::Total>, bool, Option<Vec<Steps>>) {
     let positions = crate::layout::count(shape);
-    let finished = |(totals, fits, order)| {
-        if fits { crate::events::taken(crate::events::Route::MappedFold, positions); }
-        (totals, fits, order)
-    };
+    crate::events::taken(crate::events::Route::MappedFold, positions);
     if let Some(block) = mapping.block(shape) {
         crate::events::taken(crate::events::Route::InPlace, positions);
         let (dims, order) = block.fold(Some(axis));
-        let (totals, fits) = along::<T, R>(&data[block.range.clone()], dims);
-        return finished((totals, fits, order));
+        let (totals, fits) = along::<T, R>(&data[block.range.clone()], dims); return (totals, fits, order);
     }
     let dims = Lanes::new(shape, axis).expect("the folded axis is within the shape").dims();
     let mut totals = vec![R::unit(); dims[0] * dims[2]];
-    if dims[1] == 0 || totals.is_empty() { return finished((totals, true, None)); }
+    if dims[1] == 0 || totals.is_empty() { return (totals, true, None); }
     let runs = long_runs(mapping, positions);
     if runs.is_some() { crate::events::taken(crate::events::Route::InPlace, positions); }
+    let walked = Walked::from(mapping);
     let fits = fold_pieces::<T, R>(&mut totals, dims, &|range, fold| match &runs {
         Some((len, starts)) => {
             let (len, mut at) = (*len, range.start);
@@ -881,10 +864,10 @@ pub fn along_mapped<T: Element, R: Reduction<T>>(data: &[T], mapping: &Mapping, 
         }
         None => {
             let mut buf = Vec::new();
-            for at in range.clone().step_by(MAPPED) { fold(at, Part::Items(expanded_items(mapping, data, at, MAPPED.min(range.end - at), &mut buf))); }
+            for at in range.clone().step_by(MAPPED) { fold(at, Part::Items(expanded_items(&walked, data, at, MAPPED.min(range.end - at), &mut buf))); }
         }
     });
-    finished((totals, fits, None))
+    (totals, fits, None)
 }
 
 /// The widest window that [`sliding`] folds directly, with one pass over each block of a lane for each of the window's rows. Wider windows take van Herk-Gil-Werman.
@@ -1166,8 +1149,9 @@ pub fn view_picks(x: View<'_>, dims: [usize; 3], of: Picks, max: bool) -> Option
 
 /// Folds each lane of `[outer, len, inner]` from the right by `k`: `x0 k (x1 k (...))`. A `tail` supplies the already-folded items to the right of each lane, in the input type. Otherwise each lane needs at least two items. Each running result reads as the next step's right argument through [`Source`](crate::buffer::Source), as a Boolean comparison result reads as 0 or 1. A step that fails keeps the result that `k`'s slice form writes, such as a wrapped integer. Gives whether every step succeeded.
 #[inline]
-pub fn right_fold<K: crate::Binary<T, Out: crate::buffer::Source<T>>, T: Copy>(
-    k: &K, data: &[T], [outer, len, inner]: [usize; 3], tail: Option<&[T]>) -> (Vec<K::Out>, bool) {
+pub fn right_fold<T: Copy, O: Copy + crate::buffer::Source<T>>(
+    data: &[T], [outer, len, inner]: [usize; 3], tail: Option<&[T]>, combine: impl Fn(T, T) -> (O, bool),
+) -> (Vec<O>, bool) {
     assert_eq!(data.len(), outer * len * inner, "the data must fill its dimensions");
     assert!(inner == 0 || if tail.is_some() { len > 0 } else { len >= 2 }, "a right fold needs two items or a tail");
     if let Some(tail) = tail { assert_eq!(tail.len(), outer * inner, "one tail per lane"); }
@@ -1177,9 +1161,9 @@ pub fn right_fold<K: crate::Binary<T, Out: crate::buffer::Source<T>>, T: Copy>(
         // Each loop below finds its lanes' items and `last` itself, so that the lane loop holds few values. With `tail`'s match inside one loop, a lane's start went to the stack and back on every lane.
         let mut lane = |items: &[T], last: T| {
             let (&x, rest) = items.split_last().expect("each lane has an item to fold");
-            let (mut total, mut fits) = k.judged(x, last);
+            let (mut total, mut fits) = combine(x, last);
             for &x in rest.iter().rev() {
-                let (t, f) = k.judged(x, read(total));
+                let (t, f) = combine(x, read(total));
                 (total, fits) = (t, fits & f);
             }
             result.push(total);
@@ -1195,13 +1179,13 @@ pub fn right_fold<K: crate::Binary<T, Out: crate::buffer::Source<T>>, T: Copy>(
             let (last, first) = match tail { Some(tail) => (&tail[i * inner..(i + 1) * inner], len - 1), None => (row(len - 1), len - 2) };
             let start = result.len();
             for (&x, &y) in row(first).iter().zip(last) {
-                let (t, f) = k.judged(x, y);
+                let (t, f) = combine(x, y);
                 result.push(t);
                 ok &= f;
             }
             for j in (0..first).rev() {
                 for (value, &x) in result[start..].iter_mut().zip(row(j)) {
-                    let (t, f) = k.judged(x, read(*value));
+                    let (t, f) = combine(x, read(*value));
                     *value = t;
                     ok &= f;
                 }
@@ -1297,12 +1281,13 @@ fn fold_total<T, R: Reduction<T>>(totals: &mut [R::Total], [_, len, inner]: [usi
 fn lanes<T: Copy, R: Reduction<T>>(totals: &mut [R::Total], first: usize, data: &[T], [_, len, inner]: [usize; 3]) -> bool {
     if inner == 1 { return R::rows(&data[first * len..(first + totals.len()) * len], len, totals); }
     let (mut rest, mut k, mut fits) = (totals, first, true);
+    let streamed = size_of_val(data) > STREAMED_BYTES;
     while !rest.is_empty() {
         let (i, c) = (k / inner, k % inner);
         let n = (inner - c).min(rest.len());
         let (folds, after) = std::mem::take(&mut rest).split_at_mut(n);
         let group = &data[i * len * inner + c..(i + 1) * len * inner];
-        fits &= if folds.len() == inner { step_rows::<T, R>(folds, group, true) } else { columns_by::<T, R>(folds, group, inner, true) };
+        fits &= if folds.len() == inner { step_rows::<T, R>(folds, group, true, streamed) } else { columns_by::<T, R>(folds, group, inner, true, streamed) };
         (rest, k) = (after, k + folds.len());
     }
     fits
@@ -1319,17 +1304,17 @@ fn step_row<T: Copy, R: Reduction<T>>(totals: &mut [R::Total], row: &[T], first:
 
 /// Steps `totals` by every row of `rows`, which hold `totals.len()` items each, and gives whether every fold fits. Where `first` is true, the first row starts each fold, as in [`step_row`]. Narrow rows fold a block of whole rows at a time, into one running total for each item of the block. Each column's running totals then merge.
 #[inline(always)]
-fn step_rows<T: Copy, R: Reduction<T>>(totals: &mut [R::Total], rows: &[T], first: bool) -> bool {
+fn step_rows<T: Copy, R: Reduction<T>>(totals: &mut [R::Total], rows: &[T], first: bool, streamed: bool) -> bool {
     match crate::slice::running(size_of::<R::Total>()) {
-        8 => rows_by::<T, R, 8>(totals, rows, first), 16 => rows_by::<T, R, 16>(totals, rows, first), _ => rows_by::<T, R, 32>(totals, rows, first)
+        8 => rows_by::<T, R, 8>(totals, rows, first, streamed), 16 => rows_by::<T, R, 16>(totals, rows, first, streamed), _ => rows_by::<T, R, 32>(totals, rows, first, streamed)
     }
 }
 
 /// `step_rows` with up to `N` running totals. Rows wider than `N` fold as [`columns_by`] folds them. Too few rows to fill two blocks, and lanes of fewer than 4 rows, step one row at a time. Merging the columns of so few blocks cost more than the steps it saved, 13 instructions an item for the lanes of 2 rows that 2×2 pooling folds. A block is `N` items where `inner` divides `N`, and three quarters of `N` for rows of 3.
 #[inline(always)]
-fn rows_by<T: Copy, R: Reduction<T>, const N: usize>(totals: &mut [R::Total], rows: &[T], first: bool) -> bool {
+fn rows_by<T: Copy, R: Reduction<T>, const N: usize>(totals: &mut [R::Total], rows: &[T], first: bool, streamed: bool) -> bool {
     let inner = totals.len();
-    if inner > N { return columns_by::<T, R>(totals, rows, inner, first); }
+    if inner > N { return columns_by::<T, R>(totals, rows, inner, first, streamed); }
     if rows.len() < 2 * N || rows.len() < 4 * inner {
         return rows.chunks_exact(inner).enumerate().fold(true, |fits, (j, row)| fits & step_row::<T, R>(totals, row, first && j == 0));
     }
@@ -1341,16 +1326,18 @@ fn rows_by<T: Copy, R: Reduction<T>, const N: usize>(totals: &mut [R::Total], ro
 
 /// The bytes of totals that [`columns_by`] steps in a block. They stay in the first-level cache while each row's items stream past. Blocks of 64 KB folded arrays of 64 to 256 very wide rows 20 to 25% faster than blocks of 16 KB on an M5 Max.
 const COLUMN_BYTES: usize = 64 << 10;
+/// The bytes of an array past which [`columns_by`] steps one row at a time: such an array streams from memory, where one stream of rows reads faster than four interleaved ones. On an M5 Max, one thread's `+⌿` of 1,000 f64 columns took 17% less time one row at a time at 64 MB and 6% less at 48 MB, and 5 to 41% more at 32 MB and below. On 4 threads, which share memory's bandwidth, both orders took the same time from 48 to 128 MB (31 October 2026).
+const STREAMED_BYTES: usize = 40 << 20;
 
-/// Steps `totals` by every row of `rows`, as [`step_rows`] does, where `totals` are the folds of the first `totals.len()` columns of rows of `inner` items. `rows` starts at the first of those columns, and its last row may stop after them, as where [`lanes`] folds part of a group's columns. `step_rows` folds rows wider than `slice::running`'s count of running totals this way. Each block of [`COLUMN_BYTES`] of `totals` steps by its columns of four rows at a time, so each row's items are read in the order they lie in memory. Four rows at a time took 5 to 35% less time than one. Strips of 32 columns, each folded down every row in registers, read their items a row apart, and on arrays larger than the cache took about 4 to 6 times as long as a fold along the last axis (27 October 2026).
-fn columns_by<T: Copy, R: Reduction<T>>(totals: &mut [R::Total], rows: &[T], inner: usize, first: bool) -> bool {
+/// Steps `totals` by every row of `rows`, as [`step_rows`] does, where `totals` are the folds of the first `totals.len()` columns of rows of `inner` items. `rows` starts at the first of those columns, and its last row may stop after them, as where [`lanes`] folds part of a group's columns. `step_rows` folds rows wider than `slice::running`'s count of running totals this way. Each block of [`COLUMN_BYTES`] of `totals` steps by its columns of four rows at a time, so each row's items are read in the order they lie in memory. Where `streamed` is true, for an array past [`STREAMED_BYTES`], each block steps one row at a time. Strips of 32 columns, each folded down every row in registers, read their items a row apart, and on arrays larger than the cache took about 4 to 6 times as long as a fold along the last axis (27 October 2026).
+fn columns_by<T: Copy, R: Reduction<T>>(totals: &mut [R::Total], rows: &[T], inner: usize, first: bool, streamed: bool) -> bool {
     let (len, width) = (rows.len().div_ceil(inner), (COLUMN_BYTES / size_of::<R::Total>()).max(1));
     totals.chunks_mut(width).enumerate().fold(true, |mut fits, (b, block)| {
         let (at, w) = (b * width, block.len());
         let row = |j: usize| &rows[j * inner + at..j * inner + at + w];
         let mut j = usize::from(first && len > 0);
         if j == 1 { fits &= step_row::<T, R>(block, row(0), true); }
-        while j + 4 <= len {
+        while !streamed && j + 4 <= len {
             fits &= steps_of4::<T, R>(block, [row(j), row(j + 1), row(j + 2), row(j + 3)]);
             j += 4;
         }
@@ -1396,7 +1383,7 @@ fn blocks_by<T: Copy, R: Reduction<T>, const N: usize>(totals: &mut [R::Total], 
 }
 
 /// Folds `block`, the items from position `start` on of an array of shape `[outer, len, inner]` held row by row, into `totals`, the folds by `R` of the array's lanes along its middle axis so far, which start at `R::unit()`. Gives whether every fold still fits. Along the last axis, a lane's items are consecutive. Whole lanes fold as `fold_rows` folds them, and the pieces of a lane that a block boundary splits fold by `slice` and join by `merge`. Along any other axis, runs of whole rows fold as [`step_rows`] folds them, and a row that a block boundary splits steps item by item.
-pub fn fold_into<T: Copy, R: Reduction<T>>(totals: &mut [R::Total], [_, len, inner]: [usize; 3], start: usize, block: &[T]) -> bool {
+pub fn fold_into<T: Copy, R: Reduction<T>>(totals: &mut [R::Total], [outer, len, inner]: [usize; 3], start: usize, block: &[T]) -> bool {
     let (mut rest, mut fits) = (block, true);
     if rest.is_empty() { return true; }
     if inner == 1 {
@@ -1419,13 +1406,13 @@ pub fn fold_into<T: Copy, R: Reduction<T>>(totals: &mut [R::Total], [_, len, inn
             (totals[i + count], fits) = (s, fits & f);
         }
     } else {
-        let row = start / inner;
+        let (row, streamed) = (start / inner, outer * len * inner * size_of::<T>() > STREAMED_BYTES);
         let (mut i, mut j, mut k) = (row / len, row % len, start % inner);
         while !rest.is_empty() {
             let rows = if k == 0 { (len - j).min(rest.len() / inner) } else { 0 };
             if rows > 0 {
                 let (whole, after) = rest.split_at(rows * inner);
-                fits &= step_rows::<T, R>(&mut totals[i * inner..(i + 1) * inner], whole, j == 0);
+                fits &= step_rows::<T, R>(&mut totals[i * inner..(i + 1) * inner], whole, j == 0, streamed);
                 (rest, j) = (after, j + rows);
             } else {
                 let (piece, after) = rest.split_at((inner - k).min(rest.len()));
@@ -1477,16 +1464,17 @@ fn rows_side_by_side<T: Copy, R: Reduction<T>>(data: &[T], columns: usize, out: 
 
 /// Appends the running folds by `R` along the middle axis of `data`, an array of shape `[outer, len, inner]` held row by row, to `out`, in the same layout. Each lane's first fold combines `start` where it is given. Gives whether every fold fits. A lane of consecutive items scans by `scan`. Along any other axis, each row's folds step the row before's by `checked`.
 pub fn scan_along<T: Copy, R: Reduction<T>>(data: &[T], dims: [usize; 3], start: Option<R::Total>, out: &mut Vec<R::Total>) -> bool {
-    rows_scan(data, dims, out, |lane, o| R::scan(lane, start, o), |x| start.map_or_else(|| R::one(x), |s| R::checked(s, x)), R::checked)
+    rows_scan(data, dims, out, |lane, o| R::scan(lane, start, o), |_, x| start.map_or_else(|| R::one(x), |s| R::checked(s, x)), R::checked)
 }
 
 /// Appends the ordered left scan by `k` of each lane of `[outer, len, inner]`, each result read as the item type through [`Source`](crate::buffer::Source). Without a seed, the first item is unchanged. A step that fails keeps the result that `k`'s slice form writes, such as a wrapped integer. Gives whether every step succeeded.
 #[inline]
-pub fn left_scan<K: crate::Binary<T, Out: crate::buffer::Source<T>>, T: Copy>(k: &K, data: &[T], dims: [usize; 3], seed: Option<T>, out: &mut Vec<T>) -> bool {
-    let step = |a: T, b: T| { let (v, fine) = k.judged(a, b); (crate::buffer::Source::<T>::read(v), fine) };
-    let first = |x| seed.map_or((x, true), |s| step(s, x));
+pub fn left_scan<T: Copy>(
+    data: &[T], dims: [usize; 3], seed: Option<&[T]>, out: &mut Vec<T>, step: impl Fn(T, T) -> (T, bool) + Copy,
+) -> bool {
+    let first = |i, x| seed.map_or((x, true), |s| step(s[if s.len() == 1 { 0 } else { i }], x));
     rows_scan(data, dims, out, |lane, out| {
-        let (total, ok) = first(lane[0]);
+        let (total, ok) = first(0, lane[0]);
         out.push(total);
         checked_scan(&lane[1..], total, out, step) & ok
     }, first, step)
@@ -1613,7 +1601,7 @@ fn differences<T: Copy, S: Copy>(
         grouped(rest, Some(total), o, negated, add, |t| t, reorders);
         true
     };
-    rows_scan(data, dims, out, lane, |x| (start.map_or_else(|| read(x), |s| add(s, negated(x))), true), |t, x| (add(t, negated(x)), true));
+    rows_scan(data, dims, out, lane, |_, x| (start.map_or_else(|| read(x), |s| add(s, negated(x))), true), |t, x| (add(t, negated(x)), true));
 }
 
 /// The running differences of items that negate and add as they are, such as floats and complex numbers, through [`differences`].
@@ -1965,7 +1953,7 @@ fn side_by_side<const B: usize, T: Copy, S: Copy>(
 /// Appends the running results along the middle axis of `data`, an array of shape `[outer, len, inner]` held row by row, to `out`, in the same layout, and gives whether every one fits. A lane of at least [`SHORT_LANE`] consecutive items runs through `lane`. Shorter lanes run [`LANES`] side by side, and lanes along any other axis run a row at a time: `first` gives each lane's first item or row, and `step` steps each from the one before. `first` and `step` go to `side_by_side` by value, for the reason that [`differences`] gives.
 #[inline(always)]
 fn rows_scan<T: Copy, S: Copy>(
-    data: &[T], [_, len, inner]: [usize; 3], out: &mut Vec<S>, lane: impl Fn(&[T], &mut Vec<S>) -> bool, first: impl Fn(T) -> (S, bool) + Copy,
+    data: &[T], [_, len, inner]: [usize; 3], out: &mut Vec<S>, lane: impl Fn(&[T], &mut Vec<S>) -> bool, first: impl Fn(usize, T) -> (S, bool) + Copy,
     step: impl Fn(S, T) -> (S, bool) + Copy) -> bool {
     if data.is_empty() { return true; }
     if inner == 1 && len >= SHORT_LANE { return data.chunks(len).fold(true, |fits, l| lane(l, out) & fits); }
@@ -1974,9 +1962,9 @@ fn rows_scan<T: Copy, S: Copy>(
             let whole = data.len() / (LANES * len) * (LANES * len);
             let (groups, rest) = slots.split_at_mut(whole);
             // SAFETY: `side_by_side` gives each position of the data it runs on, which holds as many items as the slots written here.
-            side_by_side::<LANES, _, _>(&data[..whole], len, first, step, |at, s| {
+            side_by_side::<LANES, _, _>(&data[..whole], len, |x| first(0, x), step, |at, s| {
                 unsafe { groups.get_unchecked_mut(at) }.write(s);
-            }, |_, _| {}) & side_by_side::<1, _, _>(&data[whole..], len, first, step, |at, s| {
+            }, |_, _| {}) & side_by_side::<1, _, _>(&data[whole..], len, |x| first(0, x), step, |at, s| {
                 unsafe { rest.get_unchecked_mut(at) }.write(s);
             }, |_, _| {})
         });
@@ -1988,7 +1976,7 @@ fn rows_scan<T: Copy, S: Copy>(
         while at < data.len() {
             let (row, outs) = (&data[at..at + inner], &mut slots[at..at + inner]);
             for k in 0..inner {
-                let (t, f) = first(row[k]);
+                let (t, f) = first(k, row[k]);
                 outs[k].write(t);
                 fits &= f;
             }
@@ -2065,7 +2053,7 @@ impl Logical {
         rows_scan(data, dims, out, |l, o| {
             self.scan(l, start, o);
             true
-        }, |x| (self.first(start, x), true), |r, x| (self.apply(r, x), true));
+        }, |_, x| (self.first(start, x), true), |r, x| (self.apply(r, x), true));
     }
 
     /// Whether [`Logical::fold`] folds lanes of shape `dims`, `[outer, len, inner]`: lanes of more than `SHORT_FOLD` consecutive items. A kernel compiled for the function folds other lanes faster, row by row or item by item.
@@ -2188,3 +2176,284 @@ fn restarts(start: usize, len: usize, first: usize, fixed: &[bool], next: &std::
     next.set(i);
     (places, values)
 }
+
+/// A reduction by name: the tag by which a function object's row names the reduction it folds by (`facts::Facts::fold`, `facts::Facts::truth`), and by which a frontend's block stages and compiled code fold. `with_reduce!` gives its type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Reduce { Sum, Product, Max, Min, And, Or, Xor, Xnor }
+
+impl Reduce {
+    /// Whether a block stage folds items of `item` by this reduction a block at a time: floats by a sum, a product, a maximum or a minimum; integers by a maximum or a minimum, and by a sum where its sums are exact (`exact`), as a sum whose range lies within the items' type is; Booleans by a sum (a count), a minimum, a maximum, an exclusive or or its negation.
+    pub fn stage(self, item: crate::buffer::DType, exact: bool) -> bool {
+        use crate::buffer::{DType, FloatWidth};
+        match item {
+            DType::Float(FloatWidth::F32 | FloatWidth::F64) => matches!(self, Self::Sum | Self::Product | Self::Max | Self::Min),
+            DType::Integer(_) => matches!(self, Self::Max | Self::Min) || exact && self == Self::Sum,
+            DType::Boolean => matches!(self, Self::Sum | Self::Min | Self::Max | Self::Xor | Self::Xnor),
+            _ => false,
+        }
+    }
+
+    /// Whether a stage's fold by this reduction of items of `items` takes a seed of type `seed` into a result of type `result`, merging the seed into each total at the end: floats with a float seed, where the result keeps the items' width; integers with an integer or Boolean seed by a maximum or a minimum, or by a sum into a result of the items' type; and a count of Booleans with an integer or Boolean seed. A sum of integers into a wider integer folds after the stage, because compiled code sums integers at the items' width.
+    pub fn seeds(self, items: crate::buffer::DType, seed: crate::buffer::DType, result: crate::buffer::DType) -> bool {
+        use crate::buffer::DType;
+        match (items, seed, result) {
+            (DType::Float(a), DType::Float(_), DType::Float(b)) => a == b,
+            (DType::Integer(_), DType::Boolean | DType::Integer(_), DType::Integer(_)) => match self { Self::Max | Self::Min => true, Self::Sum => items == result, _ => false },
+            (DType::Boolean, DType::Boolean | DType::Integer(_), DType::Integer(_)) => self == Self::Sum,
+            _ => false,
+        }
+    }
+
+    /// The value from which a fold of floats by this reduction starts, which a NaN item leaves as it is: a maximum's and a minimum's identity. `None` for the others, whose folds start from their first item.
+    pub fn float_start(self) -> Option<f64> {
+        match self { Self::Max => Some(<Max as Reduction<f64>>::identity()), Self::Min => Some(<Min as Reduction<f64>>::identity()), _ => None }
+    }
+
+    /// Whether compiled code folds by this reduction: a sum, a product, a maximum or a minimum.
+    pub fn compiles(self) -> bool { matches!(self, Self::Sum | Self::Product | Self::Max | Self::Min) }
+}
+
+/// Runs `$body` with the type `$t` standing for the reduction that `$r` (a [`Reduce`]) names.
+#[macro_export]
+macro_rules! with_reduce {
+    ($r:expr, |$t:ident| $body:expr) => {
+        match $r {
+            $crate::reduce::Reduce::Sum => { type $t = $crate::reduce::Sum; $body }
+            $crate::reduce::Reduce::Product => { type $t = $crate::reduce::Product; $body }
+            $crate::reduce::Reduce::Max => { type $t = $crate::reduce::Max; $body }
+            $crate::reduce::Reduce::Min => { type $t = $crate::reduce::Min; $body }
+            $crate::reduce::Reduce::And => { type $t = $crate::reduce::And; $body }
+            $crate::reduce::Reduce::Or => { type $t = $crate::reduce::Or; $body }
+            $crate::reduce::Reduce::Xor => { type $t = $crate::reduce::Xor; $body }
+            $crate::reduce::Reduce::Xnor => { type $t = $crate::reduce::Xnor; $body }
+        }
+    };
+}
+
+macro_rules! native_reduction {
+    (@at $r:ty, $t:ty, |$R:ident, $T:ident| $body:expr) => {{ type $R = $r; type $T = $t; $body }};
+    ($kind:expr, $dtype:expr, $checked:expr, |$R:ident, $T:ident| $body:expr) => {{
+        use crate::buffer::{DType, Width};
+        use crate::reduce::Reduce;
+        match ($dtype, $kind) {
+            (DType::Boolean, Reduce::Sum) => native_reduction!(@at crate::reduce::SumAs<i64>, bool, |$R, $T| $body),
+            (DType::Boolean, Reduce::Product | Reduce::And | Reduce::Min) => native_reduction!(@at crate::reduce::And, bool, |$R, $T| $body),
+            (DType::Boolean, Reduce::Or | Reduce::Max) => native_reduction!(@at crate::reduce::Or, bool, |$R, $T| $body),
+            (DType::Boolean, Reduce::Xor) => native_reduction!(@at crate::reduce::Xor, bool, |$R, $T| $body),
+            (DType::Boolean, Reduce::Xnor) => native_reduction!(@at crate::reduce::Xnor, bool, |$R, $T| $body),
+            (DType::Integer(w), Reduce::Sum) if !$checked => with_width!(w, I => native_reduction!(@at crate::Wrapped<crate::reduce::Sum>, I, |$R, $T| $body)),
+            (DType::Integer(w), Reduce::Sum) => with_width!(w, I => native_reduction!(@at crate::reduce::Sum, I, |$R, $T| $body)),
+            (DType::Integer(w), Reduce::Product) if !$checked => with_width!(w, I => native_reduction!(@at crate::Wrapped<crate::reduce::Product>, I, |$R, $T| $body)),
+            (DType::Integer(w), Reduce::Product) => with_width!(w, I => native_reduction!(@at crate::reduce::Product, I, |$R, $T| $body)),
+            (DType::Integer(w), Reduce::Max) => with_width!(w, I => native_reduction!(@at crate::reduce::Max, I, |$R, $T| $body)),
+            (DType::Integer(w), Reduce::Min) => with_width!(w, I => native_reduction!(@at crate::reduce::Min, I, |$R, $T| $body)),
+            (DType::Integer(w), Reduce::And) => with_width!(w, I => native_reduction!(@at crate::reduce::And, I, |$R, $T| $body)),
+            (DType::Integer(w), Reduce::Or) => with_width!(w, I => native_reduction!(@at crate::reduce::Or, I, |$R, $T| $body)),
+            (DType::Integer(w), Reduce::Xor) => with_width!(w, I => native_reduction!(@at crate::reduce::Xor, I, |$R, $T| $body)),
+            (DType::Integer(w), Reduce::Xnor) => with_width!(w, I => native_reduction!(@at crate::reduce::Xnor, I, |$R, $T| $body)),
+            (DType::Float(w), Reduce::Sum) => with_float_width!(w, F => native_reduction!(@at crate::reduce::Sum, F, |$R, $T| $body)),
+            (DType::Float(w), Reduce::Product) => with_float_width!(w, F => native_reduction!(@at crate::reduce::Product, F, |$R, $T| $body)),
+            (DType::Float(w), Reduce::Max) => with_float_width!(w, F => native_reduction!(@at crate::reduce::Max, F, |$R, $T| $body)),
+            (DType::Float(w), Reduce::Min) => with_float_width!(w, F => native_reduction!(@at crate::reduce::Min, F, |$R, $T| $body)),
+            (DType::Complex(w), Reduce::Sum) => with_complex_width!(w, C => native_reduction!(@at crate::reduce::Sum, C, |$R, $T| $body)),
+            (DType::Complex(w), Reduce::Product) => with_complex_width!(w, C => native_reduction!(@at crate::reduce::Product, C, |$R, $T| $body)),
+            _ => None,
+        }
+    }};
+}
+pub(crate) use native_reduction;
+
+impl Reduce {
+    pub fn total_dtype(self, variant: crate::facts::Variant) -> Option<crate::buffer::DType> {
+        native_reduction!(self, variant.dtype, variant.checked && !variant.wrapping, |R, T| Some(<<R as Reduction<T>>::Total as Element>::DTYPE))
+    }
+    pub fn run_pieces(
+        self, variant: crate::facts::Variant, dims: [usize; 3], seed: crate::operation::Seed<'_>,
+        pieces: &crate::operation::Pieces<'_>, output: &mut crate::buffer::Buffer,
+    ) -> Result<(), Error> {
+        native_reduction!(self, variant.dtype, variant.checked && !variant.wrapping, |R, T| Some(native_pieces::<T, R>(dims, seed, variant.checked, pieces, output)))
+            .unwrap_or_else(|| Err(Error::new(Kind::Domain, "reduction does not support this dtype")))
+    }
+}
+
+impl Reduce {
+    pub fn run_read(
+        self, variant: crate::facts::Variant, shape: &[usize], axis: usize, seed: crate::operation::Seed<'_>,
+        input: crate::agreement::Read<'_>, output: &mut crate::buffer::Buffer,
+    ) -> Result<(), Error> {
+        native_reduction!(self, variant.dtype, variant.checked && !variant.wrapping, |R, T| Some(native_read::<T, R>(shape, axis, seed, variant.checked, input, output)))
+            .unwrap_or_else(|| Err(Error::new(Kind::Domain, "reduction does not support this dtype")))
+    }
+}
+
+fn native_read<T, R>(
+    shape: &[usize], axis: usize, seed: crate::operation::Seed<'_>, checked: bool, input: crate::agreement::Read<'_>, output: &mut crate::buffer::Buffer,
+) -> Result<(), Error>
+where T: crate::buffer::Cast, R: Reduction<T>, R::Total: crate::buffer::Cast {
+    let dims = Lanes::new(shape, axis)?.dims();
+    if let Some((view, mapping)) = input.positional(shape) && let Some(data) = T::of(view) {
+        return crate::error::checked(|| {
+            let source = crate::structure::walked_source(&mapping.tables(shape), shape, data.len());
+            let slide = match fold_route(&mapping, shape, source.as_deref(), false, &[axis]) {
+                FoldRoute::Slide(s) => {
+                    let data = &data[s.region.clone()];
+                    let folded = match s.dims[..] {
+                        [outer, len, inner] if s.every[0] == 1 => Some(sliding::<T, R>(data, [outer, len, inner], s.widths[0])),
+                        [outer, len, inner] => { crate::events::taken(crate::events::Route::SlidingFold, data.len()); Some(along::<T, R>(data, [outer, len, inner])) },
+                        [a, b, c, d, e] => sliding_2d::<T, R>(data, [a, b, c, d, e], [s.widths[0], s.widths[1]], [s.every[0], s.every[1]]),
+                        _ => unreachable!("a slide folds one axis or two"),
+                    };
+                    folded.map(|(totals, fits)| (totals, fits, Some(s.tables)))
+                },
+                _ => None,
+            };
+            let (mut totals, fits, order) = slide.unwrap_or_else(|| along_mapped::<T, R>(data, &mapping, shape, axis));
+            if checked && !fits { return Err(Error::new(Kind::Overflow, "integer fold overflowed")); }
+            if let Some(order) = order && !Steps::in_order(&order) {
+                let mut placed = Vec::with_capacity(totals.len());
+                crate::gather::walk(&mut placed, &totals, 0, &order, R::unit(), crate::gather::Same);
+                totals = placed;
+            }
+            seed_fold::<T, R>(&mut totals, seed, checked)?;
+            *output = R::Total::buffer(totals);
+            Ok(())
+        });
+    }
+    let pieces = |range: Range<usize>, emit: &mut dyn FnMut(usize, crate::operation::Piece<'_>)| {
+        let mut scratch = crate::buffer::Buffer::with_capacity(T::DTYPE, 0);
+        let start = range.start;
+        let view = input.part_view(range, T::DTYPE, checked, &mut scratch)?;
+        emit(start, crate::operation::Piece::Items(view));
+        Ok(())
+    };
+    native_pieces::<T, R>(dims, seed, checked, &pieces, output)
+}
+
+fn native_pieces<T, R>(
+    dims: [usize; 3], seed: crate::operation::Seed<'_>, checked: bool, pieces: &crate::operation::Pieces<'_>, output: &mut crate::buffer::Buffer,
+) -> Result<(), Error>
+where T: crate::buffer::Cast, R: Reduction<T>, R::Total: crate::buffer::Cast {
+    let [outer, len, inner] = dims;
+    let mut totals = vec![if len == 0 { R::unit() } else { R::identity() }; outer * inner];
+    crate::error::checked(|| {
+        let fits = fold_pieces::<T, R>(&mut totals, dims, &|range, emit| {
+            let result = pieces(range, &mut |start, piece| match piece {
+                crate::operation::Piece::Items(view) => match T::of(view) {
+                    Some(items) => emit(start, Part::Items(items)),
+                    None => crate::error::record(Error::new(Kind::Domain, "fold piece has the wrong dtype")),
+                },
+                crate::operation::Piece::Total(total) => match total.value::<R::Total>() {
+                    Ok(value) => emit(start, Part::Total(total.items, value)), Err(error) => crate::error::record(error),
+                },
+            });
+            if let Err(error) = result { crate::error::record(error); }
+        });
+        if checked && !fits { crate::error::record(Error::new(Kind::Overflow, "integer fold overflowed")); }
+        seed_fold::<T, R>(&mut totals, seed, checked)?;
+        *output = R::Total::buffer(totals);
+        Ok(())
+    })
+}
+
+fn seed_fold<T, R: Reduction<T>>(totals: &mut [R::Total], seed: crate::operation::Seed<'_>, checked: bool) -> Result<(), Error>
+where R::Total: crate::buffer::Cast {
+    if let crate::operation::Seed::Initial(read) | crate::operation::Seed::Tail(read) = seed {
+        let mut scratch = Vec::new();
+        let one = read.plan.len() == 1;
+        let values = read.part::<R::Total>(0..if one { 1 } else { totals.len() }, checked, &mut scratch)?;
+        for (i, total) in totals.iter_mut().enumerate() {
+            let value = values.nth(if one { 0 } else { i });
+            let (result, fits) = if matches!(seed, crate::operation::Seed::Initial(_)) { R::merge(value, *total) } else { R::merge(*total, value) };
+            *total = result;
+            if checked && !fits { crate::error::record(Error::new(Kind::Overflow, "integer fold overflowed")); }
+        }
+    }
+    Ok(())
+}
+
+impl Reduce {
+    pub fn run_scan(
+        self, variant: crate::facts::Variant, dims: [usize; 3], seed: crate::operation::Seed<'_>, direction: crate::operation::Direction,
+        input: crate::agreement::Read<'_>, output: &mut crate::buffer::Buffer,
+    ) -> Result<(), Error> {
+        native_reduction!(self, variant.dtype, variant.checked && !variant.wrapping, |R, T| Some(native_scan::<T, R>(dims, seed, direction, variant.checked, input, output)))
+            .unwrap_or_else(|| Err(Error::new(Kind::Domain, "scan does not support this dtype")))
+    }
+}
+
+fn native_scan<T, R>(
+    dims: [usize; 3], seed: crate::operation::Seed<'_>, direction: crate::operation::Direction, checked: bool,
+    input: crate::agreement::Read<'_>, output: &mut crate::buffer::Buffer,
+) -> Result<(), Error>
+where T: crate::buffer::Cast, R: Reduction<T>, R::Total: crate::buffer::Cast {
+    scan_read::<T, R::Total>(dims, seed, direction, checked, input, output, |items, dims, seed, out| {
+        let start = |i| seed.map(|s| s[if s.len() == 1 { 0 } else { i }]);
+        let fits = rows_scan(items, dims, out, |lane, out| R::scan(lane, start(0), out),
+            |i, x| start(i).map_or_else(|| R::one(x), |s| R::checked(s, x)), R::checked);
+        if checked && !fits { Err(Error::new(Kind::Overflow, "integer scan overflowed")) } else { Ok(()) }
+    })
+}
+
+pub(crate) fn scan_read<T: crate::buffer::Cast, S: crate::buffer::Cast>(
+    dims: [usize; 3], seed: crate::operation::Seed<'_>, direction: crate::operation::Direction, checked: bool,
+    input: crate::agreement::Read<'_>, output: &mut crate::buffer::Buffer,
+    run: impl Fn(&[T], [usize; 3], Option<&[S]>, &mut Vec<S>) -> Result<(), Error>,
+) -> Result<(), Error> {
+    use crate::{agreement::{Read, Mapping, Missing}, operation::{Seed, Direction}};
+    let [outer, len, inner] = dims;
+    let reversed = matches!(direction, Direction::Right).then(|| input.plan.remapped(Mapping::from(vec![
+        Steps::along(outer, len * inner), Steps::Stride { start: len.saturating_sub(1) * inner, len, step: -(inner as isize) }, Steps::along(inner, 1),
+    ]), outer * len * inner, Missing::Invalid));
+    let input = Read { plan: reversed.as_ref().unwrap_or(input.plan), ..input };
+    let (mut values, mut scratch, mut seed_scratch) = (Vec::with_capacity(outer * len * inner), Vec::new(), Vec::new());
+    if inner == 0 { *output = S::buffer(values); return Ok(()); }
+    for cell in 0..outer {
+        let mut carry = match seed {
+            Seed::Identity => None,
+            Seed::Initial(read) | Seed::Tail(read) => {
+                let one = read.plan.len() == 1;
+                let arg = read.part::<S>(if one { 0..1 } else { cell * inner..(cell + 1) * inner }, checked, &mut seed_scratch)?;
+                Some((0..inner).map(|i| arg.nth(if one { 0 } else { i })).collect::<Vec<_>>())
+            },
+        };
+        let rows = (CHUNK / inner).max(1);
+        for row in (0..len).step_by(rows) {
+            let n = rows.min(len - row);
+            let at = (cell * len + row) * inner;
+            match input.part::<T>(at..at + n * inner, checked, &mut scratch)? {
+                Arg::Many(items) => run(items, [1, n, inner], carry.as_deref(), &mut values)?,
+                Arg::One(value) => { scratch.clear(); scratch.resize(n * inner, value); run(&scratch, [1, n, inner], carry.as_deref(), &mut values)?; },
+            }
+            let carry = carry.get_or_insert_with(Vec::new);
+            carry.clear();
+            carry.extend_from_slice(&values[values.len() - inner..]);
+        }
+    }
+    if reversed.is_some() { reverse_rows(&mut values, dims); }
+    *output = S::buffer(values);
+    Ok(())
+}
+
+pub(crate) fn reverse_rows<T>(values: &mut [T], [outer, len, inner]: [usize; 3]) {
+    if len < 2 || inner == 0 { return; }
+    for cell in values[..outer * len * inner].chunks_exact_mut(len * inner) {
+        for row in 0..len / 2 { for column in 0..inner { cell.swap(row * inner + column, (len - row - 1) * inner + column); } }
+    }
+}
+
+macro_rules! wrapped_products {
+    ($($t:ty),+) => {$(
+        impl Reduction<$t> for crate::Wrapped<Product> {
+            type Total = i64;
+            fn unit() -> i64 { 1 }
+            fn step(total: i64, x: $t) -> i64 { total.wrapping_mul(x.into()) }
+            fn merge(x: i64, y: i64) -> (i64, bool) { (x.wrapping_mul(y), true) }
+            fn slice(x: &[$t]) -> (i64, bool) { (folded(x, 1i64, |total, x| total.wrapping_mul(x.into()), i64::wrapping_mul), true) }
+            fn scan(x: &[$t], start: Option<i64>, out: &mut Vec<i64>) -> bool {
+                grouped(x, start, out, |x| x.into(), i64::wrapping_mul, |x| x, true);
+                true
+            }
+        }
+    )+};
+}
+wrapped_products!(u8, i16, i32, i64);

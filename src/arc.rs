@@ -91,3 +91,13 @@ pub(crate) fn real_angle<R: Native>(x: R) -> R {
     let (hi, lo) = half_pi::<R>();
     if x.is_nan() { x.abs() } else if x.is_sign_negative() { (hi + hi) - (R::zero() - (lo + lo)) } else { R::zero() }
 }
+
+/// The real part of asin x, or of its principal value at a complex z, as a function object: asin x for x from -1 to 1, and asin of the nearer of -1 and 1 beyond. The real part of `1○⁻¹`.
+#[derive(Clone, Copy, Debug)]
+pub struct RealAsin;
+forms!(#[inline] RealAsin at real: |_, [x]| crate::slice::Total(asin::<_, { crate::FUSED }>(if x > 1.0 { 1.0 } else if x < -1.0 { -1.0 } else { x })));
+
+/// The real part of acos x, or of its principal value at a complex z, as a function object: acos x for x from -1 to 1, and acos of the nearer of -1 and 1 beyond. The real part of `2○⁻¹`.
+#[derive(Clone, Copy, Debug)]
+pub struct RealAcos;
+forms!(#[inline] RealAcos at real: |_, [x]| crate::slice::Total(acos::<_, { crate::FUSED }>(if x > 1.0 { 1.0 } else if x < -1.0 { -1.0 } else { x })));

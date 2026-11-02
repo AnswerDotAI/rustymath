@@ -8,7 +8,9 @@ repository = "https://github.com/AnswerDotAI/rustymath"
 
 [lib]
 test = false
+doctest = false
 
 [dependencies]
 rustymath.workspace = true
-pyo3.workspace = true
+pyo3 = { workspace = true, features = ["num-bigint"] }
+num-rational = ">=0.4.2, <1"

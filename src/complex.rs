@@ -5,7 +5,7 @@
 //! `exp` and the powers that compute through it give an exact direction at the float nearest a whole number of quarter turns. e^(iπ/2) is then exactly i, where the exponential of that float has a real part of about 6e-17. These results lie outside the error bound.
 use crate::{
     Abs, Acos, Acosh, Angle, Arg, Asin, Asinh, Atan, Atan2, Atanh, Binary, Binom, Cos, Cosh, Exp, Factorial, Gamma, Hypot, Lgamma, Ln, Log1p, Logb,
-    MathishLogb, Pow, Sign, Sin, Sinh, Sqrt, Sqrt1mx2, Sqrt1px2, Sqrtx2m1, Tan, Tanh, Unary,
+    MathishLogb, Pow, RealAcos, RealAcosh, RealAsin, RealAtanh, RealLn, RealPow, RealSqrt, RealSqrt1mx2, RealSqrtm1mx2, RealSqrtx2m1, Sign, Sin, Sinh, Sqrt, Sqrt1mx2, Sqrt1px2, Sqrtx2m1, Tan, Tanh, Unary,
 };
 use crate::{Native, arc, exp as e, float::ln2, hyperbolic, ln as l, pow as p, special, trig};
 use num_complex::Complex;
@@ -182,6 +182,12 @@ pub(crate) fn pow<R: Native, const FUSED: bool>(z: Complex<R>, w: Complex<R>) ->
     if unit { c(R::one(), R::zero()) } else if zero { c(R::zero(), R::zero()) } else if real { c(r, R::zero()) } else { general }
 }
 
+pub(crate) fn nth_root<R: Native, const FUSED: bool>(n: Complex<R>, y: Complex<R>) -> Complex<R> {
+    if n == c(R::zero(), R::zero()) || !n.is_finite() { return c(R::nan(), R::nan()); }
+    if n == c(R::narrow(2.0), R::zero()) { sqrt::<R, FUSED>(y) }
+    else { pow::<R, FUSED>(y, divide(c(R::one(), R::zero()), n)) }
+}
+
 /// sinh z = sinh x cos y + i cosh x sin y. A real z gives a real result and an imaginary z an imaginary one, even where cosh x overflows or cos y is NaN.
 #[inline]
 pub(crate) fn sinh<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R> {
@@ -268,6 +274,12 @@ pub(crate) fn sqrt1px2<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R
 #[inline]
 pub(crate) fn sqrtx2m1<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R> { let (a, b) = shifted_roots::<R, FUSED>(z); balanced(a * b, z.re, z.im) }
 
+pub(crate) fn sqrtm1mx2<R: Native, const FUSED: bool>(z: Complex<R>, inverse: bool) -> Complex<R> {
+    let r = if z.im == R::zero() { c(R::zero(), crate::sqrts::sqrt1px2::<R, FUSED>(z.re)) }
+        else { sqrt::<R, FUSED>(-c(R::one(), R::zero()) - z * z) };
+    if inverse { -r } else { r }
+}
+
 /// asin z, by Kahan's formula: with a = √(1 - z) and b = √(1 + z), Re asin z = atan(x / Re(ab)) and Im asin z = asinh(Im(conj(a) b)).
 #[inline]
 pub(crate) fn asin<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R> {
@@ -318,16 +330,6 @@ fn atanh_huge<R: Native>() -> R { R::narrow(if R::WIDE { 1e150 } else { 1e18 }) 
 #[inline]
 pub(crate) fn atan<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R> { unturned(atanh::<R, FUSED>(turned(z))) }
 
-/// (sin πx, cos πx), exact at whole and half x. x = n/2 + r with n whole and |r| up to ¼, and n mod 4 picks the quadrant.
-#[inline]
-fn sincospi<R: Native, const FUSED: bool>(x: R) -> (R, R) {
-    let n = (x + x).round();
-    let a = (x - n * R::narrow(0.5)) * pi::<R>();
-    let (s, k) = (trig::sin::<R, FUSED>(a), trig::cos::<R, FUSED>(a));
-    let q = n - R::narrow(4.0) * (n * R::narrow(0.25)).floor();
-    if q == R::zero() { (s, k) } else if q == R::one() { (k, -s) } else if q == R::narrow(2.0) { (-s, -k) } else { (-k, s) }
-}
-
 /// Whether z is a pole of Γ: a whole number from 0 down.
 #[inline(always)]
 fn pole<R: Native>(z: Complex<R>) -> bool { (z.im == R::zero()) & (z.re <= R::zero()) & (z.re == z.re.trunc()) }
@@ -368,7 +370,7 @@ fn shifted<R: Native, const FUSED: bool>(w: Complex<R>) -> Complex<R> {
 #[inline]
 fn reflected<R: Native, const FUSED: bool>(u: Complex<R>) -> Complex<R> {
     let (x, y) = (u.re, u.im);
-    let (s, k) = sincospi::<R, FUSED>(x + x);
+    let (s, k) = crate::recipe::sincospi(&crate::recipe::Floats, x + x);
     let m = e::exp::<R, FUSED>(R::narrow(-2.0) * pi::<R>() * y);
     let t = ln1p::<R, FUSED>(c(-(m * k), -(m * s)));
     c((R::narrow(1.8378770664093453) - pi::<R>() * y) - t.re, pi::<R>() * (x - R::narrow(0.5)) - t.im)
@@ -720,3 +722,16 @@ forms!(#[inline] MathishLogb at Complex<f32>, Complex<f64>: |_, [b, z]| {
 forms!(Binom at Complex<f32>, Complex<f64>: |_, [n, k]| binom::<_, { crate::FUSED }>(n, k));
 forms!(Abs at Complex<f32> => f32, Complex<f64> => f64: |_, [z]| crate::slice::Total(p::hypot::<_, { crate::FUSED }>(z.re, z.im)));
 forms!(Angle at Complex<f32> => f32, Complex<f64> => f64: |_, [z]| crate::slice::Total(arc::atan2::<_, { crate::FUSED }>(z.im, z.re)));
+forms!(RealSqrt at Complex<f32> => f32, Complex<f64> => f64: |_, [z]| crate::slice::Total(sqrt::<_, { crate::FUSED }>(z).re));
+forms!(RealLn at Complex<f32> => f32, Complex<f64> => f64: |_, [z]| crate::slice::Total(ln::<_, { crate::FUSED }>(z).re));
+forms!(RealPow at Complex<f32> => f32, Complex<f64> => f64: |_, [z, w]| crate::slice::Total(pow::<_, { crate::FUSED }>(z, w).re));
+forms!(RealSqrt1mx2 at Complex<f32> => f32, Complex<f64> => f64: |_, [z]| crate::slice::Total(sqrt1mx2::<_, { crate::FUSED }>(z).re));
+forms!(RealSqrtx2m1 at Complex<f32> => f32, Complex<f64> => f64: |_, [z]| crate::slice::Total(sqrtx2m1::<_, { crate::FUSED }>(z).re));
+forms!(RealAsin at Complex<f32> => f32, Complex<f64> => f64: |_, [z]| crate::slice::Total(asin::<_, { crate::FUSED }>(z).re));
+forms!(RealAcos at Complex<f32> => f32, Complex<f64> => f64: |_, [z]| crate::slice::Total(acos::<_, { crate::FUSED }>(z).re));
+forms!(RealAcosh at Complex<f32> => f32, Complex<f64> => f64: |_, [z]| crate::slice::Total(acosh::<_, { crate::FUSED }>(z).re));
+forms!(RealAtanh at Complex<f32> => f32, Complex<f64> => f64: |_, [z]| crate::slice::Total(atanh::<_, { crate::FUSED }>(z).re));
+forms!(RealSqrtm1mx2 at Complex<f32> => f32, Complex<f64> => f64: |k, [z]| crate::slice::Total({
+    let r = sqrt::<_, { crate::FUSED }>(c(-1.0, 0.0) - z * z).re;
+    if k.0 { -r } else { r }
+}));

@@ -52,26 +52,6 @@ pub trait KernelItem: Copy + Send + Sync {
     fn has_nan(self) -> bool;
 }
 
-/// A function object of `N` arguments at item type `E`: its scalar and slice forms, which [`Unary`], [`Binary`] and [`Ternary`] call through blanket implementations. rustymath's own impls, which `forms!` writes, compile inside rustymath and never inline into a caller. A call can split its slice across threads.
-///
-/// # Safety
-/// `slice` must initialize every slot in `out[..n]` before returning, even when it returns `false`.
-pub unsafe trait Forms<E: KernelItem, const N: usize>: Sync {
-    type Out: KernelItem;
-    fn scalar(&self, x: [E; N]) -> Self::Out;
-    /// The scalar form's result and whether it succeeded, as `slice` judges each item: a failed result is what `slice` writes in its slot.
-    fn judged_scalar(&self, x: [E; N]) -> (Self::Out, bool);
-    /// `judged_scalar`'s result where it succeeded.
-    #[inline]
-    fn checked_scalar(&self, x: [E; N]) -> Option<Self::Out> { let (r, ok) = self.judged_scalar(x); ok.then_some(r) }
-    /// Whether no item fails: `checked_scalar` always gives `Some`, and `slice` always gives true.
-    const TOTAL: bool;
-    /// Whether a failed item's slot holds its result wrapped to the output type, as integer arithmetic's does.
-    const WRAPS: bool;
-    /// Whether `slice` runs `judged_scalar` in a loop, and the scalar forms inline into a caller in another crate.
-    const INLINE: bool;
-    fn slice(&self, x: [Arg<'_, E>; N], n: usize, out: &mut [MaybeUninit<Self::Out>]) -> bool;
-}
 
 macro_rules! nan_items { ($($t:ty),+) => {$( impl KernelItem for $t { const NAN: bool = true; #[inline(always)] fn has_nan(self) -> bool { self.is_nan() } } )+} }
 nan_items!(f32, f64, half::f16, Complex<f32>, Complex<f64>);
@@ -81,7 +61,7 @@ exact_items!(u8, i16, i32, i64, bool, char, std::cmp::Ordering);
 /// The results of a function object of `N` items of type `T`: their type, whether any can fail, and how a failed result is written. [`Unary`], [`Binary`] and [`Ternary`] each require it, so code that takes a function object of any arity reads these through one bound.
 pub trait Results<T, const N: usize> {
     /// The type of each result.
-    type Out;
+    type Out: KernelItem;
     /// Whether no result fails: `checked` always gives `Some`, and `many` and `many_into` always give true. A total float function gives NaN from arguments that aren't NaN only where NaN is its value, as [`Subtract`](crate::Subtract) gives for ∞ - ∞ and [`Sin`](crate::Sin) for ±∞.
     const TOTAL: bool;
     /// Whether a failed result is written wrapped to its type, as integer arithmetic writes one. A caller that takes integers as wrapping, as NumPy does, keeps it.
@@ -90,64 +70,37 @@ pub trait Results<T, const N: usize> {
     const INLINE: bool;
 }
 
-/// Defines each arity's public trait, with a blanket impl at each item type that reaches the forms `forms!` writes. The types pass through `@concrete` one at a time, so that the argument names don't repeat inside the types' repetition.
+/// Native scalar and slice interfaces. The slice body initializes every output slot even when an item fails.
 macro_rules! arities {
     ($($(#[$doc:meta])* $name:ident<$n:literal>($($x:ident),+);)+) => {$(
         $(#[$doc])*
-        pub trait $name<T>: Results<T, $n> {
-            /// The function of one item of each argument.
+        ///
+        /// # Safety
+        /// The slice body initializes every slot in its output before returning.
+        pub unsafe trait $name<T>: Results<T, $n> + Sync {
             fn one(&self, $($x: T),+) -> Self::Out;
-            /// Appends `one` for each of `n` results to `out`, and gives whether every result succeeded. A `Many` argument has at least `n` items, and a `One` argument pairs its item with every result. A float or complex result fails where it is NaN and no argument is, because rustymath gives NaN for an argument outside a function's domain. An integer result fails where it doesn't fit its type.
-            fn many(&self, $($x: Arg<'_, T>,)+ n: usize, out: &mut Vec<Self::Out>) -> bool;
-            /// `many`, writing the `n` results after the items already written to `out`, on this thread.
-            fn many_into(&self, $($x: Arg<'_, T>,)+ n: usize, out: &mut crate::parallel::Slots<'_, Self::Out>) -> bool;
-            /// `many_into`, with each result turned into a `C` by `convert`, which also says whether the conversion succeeded. The slice form writes a block of up to [`CHUNK`] results at a time into a buffer on the stack, and `convert` reads the block while it's in the cache, so the conversion costs no pass through memory of its own. One loop that runs the scalar form and `convert` together measured about 8% slower for `⌊` to `i64`, with the same instructions: the cost is the conversion's instructions, and the buffer stays in L1.
-            fn many_converted<C>(&self, $($x: Arg<'_, T>,)+ n: usize, out: &mut crate::parallel::Slots<'_, C>, convert: impl Fn(Self::Out) -> (C, bool)) -> bool;
-            /// `one`, or `None` where the item fails, as `many` reports.
-            fn checked(&self, $($x: T),+) -> Option<Self::Out>;
-            /// `one` with whether it succeeded, as `many` judges it: a failed result is what `many` writes in its slot, such as an integer wrapped to its type.
             fn judged(&self, $($x: T),+) -> (Self::Out, bool);
-        }
-        crate::element_types!((arities) @types $name, $n, ($($x),+));
-    )+};
-    (@types $name:ident, $n:literal, $args:tt [$($dtype:ident: $d:tt $e:ty),+]) => {$(
-        arities!(@impl $name, $n, $args, $e);
-    )+};
-    (@impl $name:ident, $n:literal, ($($x:ident),+), $e:ty) => {
-        impl<K: Forms<$e, $n>> Results<$e, $n> for K {
-            type Out = <K as Forms<$e, $n>>::Out;
-            const TOTAL: bool = <K as Forms<$e, $n>>::TOTAL;
-            const WRAPS: bool = <K as Forms<$e, $n>>::WRAPS;
-            const INLINE: bool = <K as Forms<$e, $n>>::INLINE;
-        }
-        impl<K: Forms<$e, $n>> $name<$e> for K {
+            fn slice(&self, args: [Arg<'_, T>; $n], n: usize, out: &mut [MaybeUninit<Self::Out>]) -> bool;
             #[inline]
-            fn one(&self, $($x: $e),+) -> Self::Out { self.scalar([$($x),+]) }
-            #[inline]
-            fn many(&self, $($x: Arg<'_, $e>,)+ n: usize, out: &mut Vec<Self::Out>) -> bool {
-                crate::slice::appended(out, n, |slots| crate::parallel::split(slots, crate::slice::CHUNK, &|start, slots| {
+            fn checked(&self, $($x: T),+) -> Option<Self::Out> { let (r, ok) = self.judged($($x),+); ok.then_some(r) }
+            fn many(&self, $($x: Arg<'_, T>,)+ n: usize, out: &mut Vec<Self::Out>) -> bool where T: Copy + Sync {
+                appended(out, n, |slots| crate::parallel::split(slots, CHUNK, &|start, slots| {
                     crate::parallel::in_chunks(start, slots, |at, part| self.slice([$($x.part(at, part.len())),+], part.len(), part))
                 }))
             }
-            #[inline]
-            fn many_into(&self, $($x: Arg<'_, $e>,)+ n: usize, out: &mut crate::parallel::Slots<'_, Self::Out>) -> bool {
+            fn many_into(&self, $($x: Arg<'_, T>,)+ n: usize, out: &mut crate::parallel::Slots<'_, Self::Out>) -> bool where T: Copy {
                 out.fill(n, |slots| crate::parallel::in_chunks(0, slots, |at, part| self.slice([$($x.part(at, part.len())),+], part.len(), part)))
             }
-            #[inline]
-            fn many_converted<C>(&self, $($x: Arg<'_, $e>,)+ n: usize, out: &mut crate::parallel::Slots<'_, C>, convert: impl Fn(Self::Out) -> (C, bool)) -> bool {
+            fn many_converted<C>(&self, $($x: Arg<'_, T>,)+ n: usize, out: &mut crate::parallel::Slots<'_, C>, convert: impl Fn(Self::Out) -> (C, bool)) -> bool where T: Copy {
                 out.fill(n, |slots| crate::parallel::in_chunks(0, slots, |at, part| {
-                    let mut buf = [const { MaybeUninit::uninit() }; crate::slice::CHUNK];
+                    let mut buf = [const { MaybeUninit::uninit() }; CHUNK];
                     let (n, buf) = (part.len(), &mut buf[..part.len()]);
                     let ok = self.slice([$($x.part(at, n)),+], n, buf);
                     pairs_into(Arg::Many(written(buf)), Arg::One(()), n, part, |r, ()| convert(r)) & ok
                 }))
             }
-            #[inline]
-            fn checked(&self, $($x: $e),+) -> Option<Self::Out> { self.checked_scalar([$($x),+]) }
-            #[inline]
-            fn judged(&self, $($x: $e),+) -> (Self::Out, bool) { self.judged_scalar([$($x),+]) }
         }
-    };
+    )+};
 }
 
 arities! {
@@ -163,35 +116,43 @@ arities! {
 #[derive(Clone, Copy, Debug)]
 pub struct Flipped<K>(pub K);
 
-unsafe impl<E: KernelItem, K: Forms<E, 2>> Forms<E, 2> for Flipped<K> {
+impl<T, K: Results<T, 2>> Results<T, 2> for Flipped<K> {
     type Out = K::Out;
     const TOTAL: bool = K::TOTAL;
     const WRAPS: bool = K::WRAPS;
     const INLINE: bool = K::INLINE;
-    #[inline]
-    fn scalar(&self, [x, y]: [E; 2]) -> K::Out { self.0.scalar([y, x]) }
-    #[inline]
-    fn judged_scalar(&self, [x, y]: [E; 2]) -> (K::Out, bool) { self.0.judged_scalar([y, x]) }
-    #[inline]
-    fn slice(&self, [x, y]: [Arg<'_, E>; 2], n: usize, out: &mut [MaybeUninit<K::Out>]) -> bool { self.0.slice([y, x], n, out) }
+}
+unsafe impl<T, K: Binary<T>> Binary<T> for Flipped<K> {
+    fn one(&self, x: T, y: T) -> K::Out { self.0.one(y, x) }
+    fn judged(&self, x: T, y: T) -> (K::Out, bool) { self.0.judged(y, x) }
+    fn slice(&self, [x, y]: [Arg<'_, T>; 2], n: usize, out: &mut [MaybeUninit<K::Out>]) -> bool { self.0.slice([y, x], n, out) }
 }
 
 /// `K` with no result failing. Each result is `K`'s, wrapped to its type, as static kinds and NumPy keep integer results. LLVM removes `K`'s test of whether a result fits, because the loop never reads it. The adapter suits an object whose scalar form is its whole computation, as integer arithmetic's is.
 #[derive(Clone, Copy, Debug)]
 pub struct Wrapped<K>(pub K);
 
-unsafe impl<E: KernelItem, K: Forms<E, N>, const N: usize> Forms<E, N> for Wrapped<K> {
+impl<T, K: Results<T, N>, const N: usize> Results<T, N> for Wrapped<K> {
     type Out = K::Out;
     const TOTAL: bool = true;
     const WRAPS: bool = false;
     const INLINE: bool = K::INLINE;
-    #[inline]
-    fn scalar(&self, x: [E; N]) -> K::Out { self.0.scalar(x) }
-    #[inline]
-    fn judged_scalar(&self, x: [E; N]) -> (K::Out, bool) { (self.0.scalar(x), true) }
-    #[inline]
-    fn slice(&self, x: [Arg<'_, E>; N], n: usize, out: &mut [MaybeUninit<K::Out>]) -> bool { each(x, n, out, #[inline(always)] |x| Total(self.0.scalar(x))) }
 }
+macro_rules! wrapped {
+    ($arity:ident, $n:literal, $($x:ident),+) => {
+        unsafe impl<T: KernelItem, K: $arity<T>> $arity<T> for Wrapped<K> {
+            fn one(&self, $($x: T),+) -> K::Out { self.0.one($($x),+) }
+            fn judged(&self, $($x: T),+) -> (K::Out, bool) { (self.0.one($($x),+), true) }
+            fn slice(&self, x: [Arg<'_, T>; $n], n: usize, out: &mut [MaybeUninit<K::Out>]) -> bool {
+                each(x, n, out, #[inline(always)] |[$($x),+]| Total(self.0.one($($x),+)))
+            }
+        }
+    };
+}
+wrapped!(Unary, 1, x);
+wrapped!(Binary, 2, x, y);
+wrapped!(Ternary, 3, x, y, z);
+
 
 /// Whether `r`, the result for arguments `args`, keeps the rule that a NaN result needs a NaN argument.
 #[inline(always)]
@@ -267,7 +228,7 @@ fn items<E: Copy, const N: usize>(x: &[Arg<'_, E>; N], i: usize) -> [E; N] { std
 
 /// Writes `f` for each of `n` results into `out`, for arguments `x`, and gives whether `f` said `true` for every result. One and two arguments run through [`pairs_into`], and three through `triples_into`, whose loops vectorize.
 #[inline(always)]
-fn mapped<E: Copy, O, const N: usize>(x: &[Arg<'_, E>; N], n: usize, out: &mut [MaybeUninit<O>], f: impl Fn([E; N]) -> (O, bool)) -> bool {
+pub(crate) fn mapped<E: Copy, O, const N: usize>(x: &[Arg<'_, E>; N], n: usize, out: &mut [MaybeUninit<O>], f: impl Fn([E; N]) -> (O, bool)) -> bool {
     match x.as_slice() {
         &[a] => pairs_into(a, Arg::One(()), n, out, #[inline(always)] |a, ()| f([a; N])),
         &[a, b] => pairs_into(a, b, n, out, #[inline(always)] |a, b| f(std::array::from_fn(|k| if k == 0 { a } else { b }))),
@@ -342,7 +303,7 @@ macro_rules! each {
     };
 }
 
-/// Writes a function object's forms, compiled inside rustymath. The list names the item types, such as `Complex<f32>` or `i64`. `real` stands for `f32` and `f64`, and also writes an `f16` form, which runs the `f32` form and narrows its outputs. `=> T` makes the output type `T` in place of the item type: for each listed type, or after `real` for every float type. The object is the first argument of the item body, and its items the bracketed ones. The body gives an output, an `Option` of one, or a [`Total`] output, as [`Outcome`] says. A `many` body replaces the default slice form, which runs the item body through [`each!`]. Its arguments are the object, the bracketed `Arg`s, the number of results, and the slots it writes them into. Attributes before the object, such as `#[inline]`, go on its scalar forms, `scalar` and `judged_scalar`, so that a caller in another crate can inline a small form into its own loop over items. `#[inline]` with no `many` body makes the object [`INLINE`](Results::INLINE).
+/// Writes a function object's forms, compiled inside rustymath. The list names the item types, such as `Complex<f32>` or `i64`. `real` stands for `f32` and `f64`, and also writes an `f16` form, which runs the `f32` form and narrows its outputs. `=> T` makes the output type `T` in place of the item type: for each listed type, or after `real` for every float type. The object is the first argument of the item body, and its items the bracketed ones. The body gives an output, an `Option` of one, or a [`Total`] output, as [`Outcome`] says. A `many` body replaces the default slice form, which runs the item body through [`each!`]. Its arguments are the object, the bracketed `Arg`s, the number of results, and the slots it writes them into. Attributes before the object, such as `#[inline]`, go on its scalar forms, `one` and `judged`, so that a caller in another crate can inline a small form into its own loop over items. `#[inline]` with no `many` body makes the object [`INLINE`](Results::INLINE).
 ///
 /// A function object is a concrete type, never a generic one, so that its forms compile here. Settings that choose a loop, such as whether a tolerance is 0, are read once per call inside `many`, which then runs `each!`.
 ///
@@ -370,19 +331,30 @@ macro_rules! forms {
         forms!(@concrete $attrs, $object, $e, forms!(@out $e $(, $o)?), $k, $args, $body, $many);
         $(forms!(@types $attrs, $object, $k, $args, $body, $many, [$($rest)+]);)?
     };
-    (@concrete [$(#[$($m:tt)+])*], $object:ty, $e:ty, $o:ty, $k:pat_param, [$($x:ident),+], $body:expr, $many:tt) => {
-        unsafe impl crate::slice::Forms<$e, { forms!(@n $($x),+) }> for $object {
+    (@concrete $attrs:tt, $object:ty, $e:ty, $o:ty, $k:pat_param, [$x:ident], $body:expr, $many:tt) => {
+        forms!(@impl $attrs, $object, Unary, 1, $e, $o, $k, [$x], $body, $many);
+    };
+    (@concrete $attrs:tt, $object:ty, $e:ty, $o:ty, $k:pat_param, [$x:ident, $y:ident], $body:expr, $many:tt) => {
+        forms!(@impl $attrs, $object, Binary, 2, $e, $o, $k, [$x, $y], $body, $many);
+    };
+    (@concrete $attrs:tt, $object:ty, $e:ty, $o:ty, $k:pat_param, [$x:ident, $y:ident, $z:ident], $body:expr, $many:tt) => {
+        forms!(@impl $attrs, $object, Ternary, 3, $e, $o, $k, [$x, $y, $z], $body, $many);
+    };
+    (@impl [$(#[$($m:tt)+])*], $object:ty, $arity:ident, $arity_n:literal, $e:ty, $o:ty, $k:pat_param, [$($x:ident),+], $body:expr, $many:tt) => {
+        impl crate::slice::Results<$e, $arity_n> for $object {
             type Out = $o;
+            const TOTAL: bool = crate::slice::total::<Self, $e, $o, _, $arity_n>(|$k, [$($x),+]| $body);
+            const WRAPS: bool = crate::slice::wraps::<Self, $e, $o, _, $arity_n>(|$k, [$($x),+]| $body);
+            const INLINE: bool = forms!(@inline [$(#[$($m)+])*] $many);
+        }
+        unsafe impl crate::slice::$arity<$e> for $object {
             $(#[$($m)+])*
-            fn scalar(&self, [$($x),+]: [$e; forms!(@n $($x),+)]) -> $o {
+            fn one(&self, $($x: $e),+) -> $o {
                 let $k = self;
                 crate::slice::Outcome::<$o>::value($body)
             }
-            const TOTAL: bool = crate::slice::total::<Self, $e, $o, _, { forms!(@n $($x),+) }>(|$k, [$($x),+]| $body);
-            const WRAPS: bool = crate::slice::wraps::<Self, $e, $o, _, { forms!(@n $($x),+) }>(|$k, [$($x),+]| $body);
-            const INLINE: bool = forms!(@inline [$(#[$($m)+])*] $many);
             $(#[$($m)+])*
-            fn judged_scalar(&self, [$($x),+]: [$e; forms!(@n $($x),+)]) -> ($o, bool) {
+            fn judged(&self, $($x: $e),+) -> ($o, bool) {
                 let $k = self;
                 crate::slice::Outcome::<$o>::judged($body, [$($x),+])
             }
@@ -401,23 +373,26 @@ macro_rules! forms {
             $many
         }
     };
-    (@half [$(#[$($m:tt)+])*], $object:ty, $o:ty, $narrow:expr, [$($x:ident),+]) => {
-        unsafe impl crate::slice::Forms<half::f16, { forms!(@n $($x),+) }> for $object {
+    (@half $attrs:tt, $object:ty, $o:ty, $narrow:expr, [$x:ident]) => { forms!(@half_impl $attrs, $object, Unary, 1, $o, $narrow, [$x]); };
+    (@half $attrs:tt, $object:ty, $o:ty, $narrow:expr, [$x:ident, $y:ident]) => { forms!(@half_impl $attrs, $object, Binary, 2, $o, $narrow, [$x, $y]); };
+    (@half $attrs:tt, $object:ty, $o:ty, $narrow:expr, [$x:ident, $y:ident, $z:ident]) => { forms!(@half_impl $attrs, $object, Ternary, 3, $o, $narrow, [$x, $y, $z]); };
+    (@half_impl [$(#[$($m:tt)+])*], $object:ty, $arity:ident, $arity_n:literal, $o:ty, $narrow:expr, [$($x:ident),+]) => {
+        impl crate::slice::Results<half::f16, $arity_n> for $object {
             type Out = $o;
-            $(#[$($m)+])*
-            fn scalar(&self, x: [half::f16; forms!(@n $($x),+)]) -> $o {
-                ($narrow)(crate::slice::Forms::<f32, { forms!(@n $($x),+) }>::scalar(self, x.map(half::f16::to_f32)))
-            }
-            const TOTAL: bool = <Self as crate::slice::Forms<f32, { forms!(@n $($x),+) }>>::TOTAL;
-            const WRAPS: bool = <Self as crate::slice::Forms<f32, { forms!(@n $($x),+) }>>::WRAPS;
+            const TOTAL: bool = <Self as crate::slice::Results<f32, $arity_n>>::TOTAL;
+            const WRAPS: bool = <Self as crate::slice::Results<f32, $arity_n>>::WRAPS;
             const INLINE: bool = false;
+        }
+        unsafe impl crate::slice::$arity<half::f16> for $object {
             $(#[$($m)+])*
-            fn judged_scalar(&self, x: [half::f16; forms!(@n $($x),+)]) -> ($o, bool) {
-                let (r, ok) = crate::slice::Forms::<f32, { forms!(@n $($x),+) }>::judged_scalar(self, x.map(half::f16::to_f32));
+            fn one(&self, $($x: half::f16),+) -> $o { ($narrow)(crate::slice::$arity::<f32>::one(self, $($x.to_f32()),+)) }
+            $(#[$($m)+])*
+            fn judged(&self, $($x: half::f16),+) -> ($o, bool) {
+                let (r, ok) = crate::slice::$arity::<f32>::judged(self, $($x.to_f32()),+);
                 (($narrow)(r), ok)
             }
-            fn slice(&self, x: [crate::Arg<'_, half::f16>; forms!(@n $($x),+)], n: usize, out: &mut [std::mem::MaybeUninit<$o>]) -> bool {
-                crate::slice::working(x, n, out, |x, m, o| crate::slice::Forms::<f32, { forms!(@n $($x),+) }>::slice(self, x, m, o), $narrow)
+            fn slice(&self, x: [crate::Arg<'_, half::f16>; $arity_n], n: usize, out: &mut [std::mem::MaybeUninit<$o>]) -> bool {
+                crate::slice::working(x, n, out, |x, m, o| crate::slice::$arity::<f32>::slice(self, x, m, o), $narrow)
             }
         }
     };
@@ -551,15 +526,19 @@ pub(crate) fn written<B>(out: &mut [MaybeUninit<B>]) -> &mut [B] {
 
 /// Writes `f` for each of `n` results into `out`, for arguments `x`, for a function `f` with a fast form that holds for all but rare items. `fast` computes every item with no branch, and gives `None` for the rare items. The items run in two passes. The first writes NaN for each rare item and judges each result alone, as [`each`] does. The second runs only if a result is NaN. It recomputes each NaN item with `f` and judges it by its arguments too. A rare item costs one more scan of at most one `CHUNK`, the most that `parallel::in_chunks` hands a slice form. Slice forms call it through [`two_pass!`].
 #[inline(always)]
-pub(crate) fn two_pass<R: crate::Float, const N: usize>(
-    x: [Arg<'_, R>; N], n: usize, out: &mut [MaybeUninit<R>], fast: impl Fn([R; N]) -> Option<R>, f: impl Fn([R; N]) -> R) -> bool {
+pub(crate) fn two_pass<R, O, const N: usize>(
+    x: [Arg<'_, R>; N], n: usize, out: &mut [MaybeUninit<O>], fast: impl Fn([R; N]) -> Option<R>, f: impl Fn([R; N]) -> R,
+) -> bool where R: crate::Float + crate::buffer::Source<O>, O: crate::Float {
     let out = &mut out[..n];
-    let first = mapped(&x, n, out, #[inline(always)] |a| { let r = fast(a).unwrap_or(R::nan()); (r, !r.is_nan()) });
+    let first = mapped(&x, n, out, #[inline(always)] |a| {
+        let r = <R as crate::buffer::Source<O>>::read(fast(a).unwrap_or(R::nan()));
+        (r, !r.is_nan())
+    });
     if first { return true; }
     let mut ok = true;
     for (i, r) in written(out).iter_mut().enumerate().filter(|(_, r)| r.is_nan()) {
         let a = items(&x, i);
-        *r = f(a);
+        *r = <R as crate::buffer::Source<O>>::read(f(a));
         ok &= kept(*r, a);
     }
     ok
@@ -613,9 +592,15 @@ macro_rules! split {
 pub(crate) fn working<F: Float, O: Copy, P, const N: usize>(
     x: [Arg<'_, F>; N], n: usize, out: &mut [MaybeUninit<P>], f: impl Fn([Arg<'_, F::Working>; N], usize, &mut [MaybeUninit<O>]) -> bool,
     narrow: impl Fn(O) -> P) -> bool {
-    let (mut bufs, mut rs) = ([(); N].map(|()| Vec::new()), Vec::new());
+    let mut bufs = [(); N].map(|()| Vec::new());
     let mut next = bufs.each_mut().into_iter();
-    let ok = appended(&mut rs, n, |o| f(x.map(|a| a.converted(0, n, next.next().unwrap(), F::working)), n, o));
-    pairs_into(Arg::Many(&rs), Arg::One(()), n, &mut out[..n], |r, ()| (narrow(r), true));
+    buffered(n, out, |o| f(x.map(|a| a.converted(0, n, next.next().unwrap(), F::working)), n, o), narrow)
+}
+
+/// `f`, a slice form writing `n` outputs of type `O`, run into a buffer, with `each` turning each output into the `P` that `out` takes. It gives `f`'s result.
+pub(crate) fn buffered<O: Copy, P>(n: usize, out: &mut [MaybeUninit<P>], f: impl FnOnce(&mut [MaybeUninit<O>]) -> bool, each: impl Fn(O) -> P) -> bool {
+    let mut rs = Vec::new();
+    let ok = appended(&mut rs, n, f);
+    pairs_into(Arg::Many(&rs), Arg::One(()), n, &mut out[..n], |r, ()| (each(r), true));
     ok
 }

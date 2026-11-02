@@ -64,9 +64,9 @@ reduce::sum	1	1
 # 0.5 copies, for one read per item.
 reduce::max	1	1
 # 1 copies, for one read and one write per item; the scan runs in vector steps.
-reduce::cumsum	2	2
+reduce::Sum::scan	2	2
 # 1 copies, for one read and one write per item; the scan runs in vector steps.
-reduce::cummax	2	2
+reduce::Max::scan	2	2
 # 2.75 copies, for a read and a write (1) and 7 FMAs (1.75). It was 3.75 while `evaluate` worked in place, which its callers paid for with a copy of the input.
 polynomial::evaluate	5.5	5.5
 # 132 copies, for 530 vector ops: a double-word Lanczos sum and quotient, double-word ln of the exponent, exp_plus, sinpi for the reflection.
@@ -233,9 +233,9 @@ reduce::sum	1	1
 # 0.5 copies, for one read per item.
 reduce::max	1	1
 # 1 copies, for one read and one write per item; the scan runs in vector steps. It costs 2.81 copies on CI on 22 October 2026, more than twice that, so its Linux budget is unchanged until the cost is studied.
-reduce::cumsum	2	6.3
+reduce::Sum::scan	2	6.3
 # 1 copies, for one read and one write per item; the scan runs in vector steps.
-reduce::cummax	2	2
+reduce::Max::scan	2	2
 # 3.75 copies, for the negate (1), a read and write in place (1), 7 FMAs (1.75).
 polynomial::evaluate	5.5	5.5
 # 75 copies, for 150 ops in f64 at half the lanes: a plain Lanczos sum, ln, exp, sinpi.

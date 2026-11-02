@@ -1,7 +1,7 @@
 //! How fast each function object's slice form runs on 65,536 inputs. The slice form is the code that callers such as basedpl and the Python package run. `speed.txt` gives each function a budget at f64 and at f32, in copies of the same number of items: the most time it may take, as a multiple of the time to copy those items. Each copy's time is this machine's stored copy time, or one measured once at the start, as `timing::copy_time` gives it. A row whose footprint, `N` items of its type and the most bytes it holds at once, passes one core's cache adds that footprint and the time of a copy of it, measured beside the row, to its line, as `timing::footprint` describes. A loop that stops vectorizing takes several times as long and goes over budget. Where the standard library has the function, its time item by item is measured too, for the comparison table in `src/lib.md`, but sets no limit. The rows `Pow.one` and `Root.one` time the scalar forms pair by pair, as a caller with one value at a time runs them. The inner products multiply 256×256 matrices, whose results hold the same number of items. The decompositions factor 256×256 real matrices and 128×128 complex ones, and `lstsq` solves a 4096×16 real one. Sorts, partitions, medians and variances run along the rows of a 256×256 matrix. One sort runs along two lanes of 32,768. A weighted average reduces the first and last axes of a 16×64×64 array. Each of these counts copies of as many items as its matrix holds. A row over its budget fails only if it stays over after each pause in `timing::RETRY_PAUSES`, when every row is measured again. Each retry prints the row's earlier and new costs. The test fails listing every cost still over its budget after the last retry, as its width, name, cost and budget, in the form that `basedpl.bpltests.logged_costs` reads. It fails on budgets only on the CPU they were set for, as `timing::checks_budgets` decides. On any other CPU, it writes what `RUSTYMATH_COSTS` writes, then each cost still over its budget, marked `over`, and fails on none. With `RUSTYMATH_COSTS` set, as in `RUSTYMATH_COSTS=1 cargo test --test speed`, the test writes that table, then every cost in that form, straight to stderr. The test harness captures `println!` output from a passing test, but not these lines. CI's `Test` and `Speed` workflows set it. The test holds the machine's timing lock while it runs, as `rustymath::timing::exclusive` describes. Array guards time f32 differences on length-2 lanes and on one long vector, and a compact broadcast repeating each input 64 times. Safe i32-to-i64 widening counts i64 copies. These rows use only the demonstrated dtypes. Like `bpl` and rustymath's Python extension, this test registers the memory guard as its global allocator. Each row then allocates as a caller's process does, including the guard's request for huge pages on large blocks on Linux.
 use rand::seq::SliceRandom;
 use rustymath::timing::RUNS;
-use rustymath::*;
+use rustymath::{reduce::Reduction, *};
 use std::{collections::HashMap, hint::black_box, io::Write, marker::PhantomData, ops::Neg};
 
 #[global_allocator]
@@ -167,8 +167,8 @@ fn reductions(units: &Units<f64, f32>) -> [Compared; 4] {
         compare(units, "reduce::max", || fold(b64, &|k| reduce::max(black_box(set(&x64, k)))),
             || fold(b64, &|k| black_box(set(&x64, k)).iter().copied().fold(f64::NEG_INFINITY, f64::max)),
             || fold(b32, &|k| f64::from(reduce::max(black_box(set(&x32, k))))),
-            || fold(b32, &|k| f64::from(black_box(set(&x32, k)).iter().copied().fold(f32::NEG_INFINITY, f32::max)))), compare(units, "reduce::cumsum", || {
-                time_appended(N, &[b64], |k, out| { reduce::cumsum(set(&x64, k), None, out); })
+            || fold(b32, &|k| f64::from(black_box(set(&x32, k)).iter().copied().fold(f32::NEG_INFINITY, f32::max)))), compare(units, "reduce::Sum::scan", || {
+                time_appended(N, &[b64], |k, out| { reduce::Sum::scan(set(&x64, k), None, out); })
             }, || {
                 fastest(N, &[b64], |k| {
                     s64.clear();
@@ -176,20 +176,20 @@ fn reductions(units: &Units<f64, f32>) -> [Compared; 4] {
                     black_box(&s64);
                 })
             }, || {
-                time_appended(N, &[b32], |k, out| { reduce::cumsum(set(&x32, k), None, out); })
+                time_appended(N, &[b32], |k, out| { reduce::Sum::scan(set(&x32, k), None, out); })
             }, || {
                 fastest(N, &[b32], |k| {
                     s32.clear();
                     scan32(black_box(set(&x32, k)), &mut s32);
                     black_box(&s32);
                 })
-            }), compare(units, "reduce::cummax", || time_appended(N, &[b64], |k, out| reduce::cummax(set(&x64, k), None, out)), || {
+            }), compare(units, "reduce::Max::scan", || time_appended(N, &[b64], |k, out| { reduce::Max::scan(set(&x64, k), None, out); }), || {
                 fastest(N, &[b64], |k| {
                     s64.clear();
                     max64(black_box(set(&x64, k)), &mut s64);
                     black_box(&s64);
                 })
-            }, || time_appended(N, &[b32], |k, out| reduce::cummax(set(&x32, k), None, out)), || {
+            }, || time_appended(N, &[b32], |k, out| { reduce::Max::scan(set(&x32, k), None, out); }), || {
                 fastest(N, &[b32], |k| {
                     s32.clear();
                     max32(black_box(set(&x32, k)), &mut s32);

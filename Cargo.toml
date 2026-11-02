@@ -27,6 +27,7 @@ repository = "https://github.com/AnswerDotAI/rustymath"
 [lib]
 name = "rustymath"
 test = false
+doctest = false
 
 [features]
 default = ["native"]
@@ -43,7 +44,7 @@ num-complex = ">=0.4.6, <1"
 num-integer = ">=0.1.46, <1"
 num-rational = ">=0.4.2, <1"
 num-traits = ">=0.2.19, <1"
-rand = { version = ">=0.10.2, <1", default-features = false, features = ["alloc"] }
+rand = { version = ">=0.10.2, <1", default-features = false, features = ["alloc", "chacha"] }
 strength_reduce = ">=0.2.4, <1"
 
 # The browser build has no threads. There `parallel` runs its pieces in turn on the calling thread.

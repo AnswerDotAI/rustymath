@@ -31,14 +31,12 @@ fn unique<'py>(py: Python<'py>, ar: &Bound<'py, PyAny>, mode: bool) -> PyResult<
     let view = items.view();
     let t = comparison(mode && mathish_at(Some(view.dtype())));
     let classes = released(py, || search::view_classes(view, t)).ok_or_else(|| missing("unique", view.dtype()))?.map_err(py_err)?;
-    let numbered = search::numbered(&classes);
-    let counts = numbered.counts();
-    let Numbered { firsts, numbers } = numbered;
+    let Numbered { firsts, numbers, counts } = search::numbered(&classes);
     let firsts: Vec<i64> = firsts.into_iter().map(|p| p as i64).collect();
     let n = firsts.len();
     let values = Core::new(Layout::from([n].as_slice()), Buffer::gathered(view, &firsts)).map_err(py_err)?;
     Ok([
-        give(py, values, false)?, give(py, core(firsts, &[n])?, false)?, give(py, vector(numbers.into_iter().map(|k| k as usize))?, false)?,
+        give(py, values, false)?, give(py, core(firsts, &[n])?, false)?, give(py, vector(rustymath::with_ints!(numbers.view(), |n| n.iter().map(|&k| i64::from(k) as usize).collect::<Vec<_>>()))?, false)?,
         give(py, vector(counts)?, false)?,
     ])
 }

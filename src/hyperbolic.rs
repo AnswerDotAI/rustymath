@@ -3,23 +3,29 @@ use crate::{exp::{exp_times, expm1_fast, expm1_times}, float::Native, ln::ln_par
 
 /// sinh |x| = h(1 + 1/(2h + 1)), with h = (e^|x| - 1)/2. The halving joins `expm1`'s scaling, so sinh stays finite where e^|x| would overflow. Where h is ∞, 1/(2h + 1) is 0, and the result is ∞.
 #[inline]
-pub(crate) fn sinh<R: Native, const FUSED: bool>(x: R) -> R {
-    let h = expm1_times::<R, FUSED>(x.abs(), -R::one());
-    (h * (R::one() + R::one() / (h + h + R::one()))).copysign(x)
+pub(crate) fn sinh<R: Native, const FUSED: bool>(x: R) -> R { sinh_formula(&crate::recipe::NativeOps::<FUSED>::DEFAULT, x) }
+#[inline]
+pub(crate) fn cosh<R: Native, const FUSED: bool>(x: R) -> R { cosh_formula(&crate::recipe::NativeOps::<FUSED>::DEFAULT, x) }
+#[inline]
+pub(crate) fn tanh<R: Native, const FUSED: bool>(x: R) -> R { tanh_formula(&crate::recipe::NativeOps::<FUSED>::DEFAULT, x) }
+
+pub(crate) fn sinh_formula<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, x: O::V) -> O::V {
+    let one = o.number(F::one());
+    let h = crate::exp::minus_one_formula(o, o.magnitude(x), o.negate(one));
+    let result = o.multiply(h, o.add(one, o.divide(one, o.add(o.add(h, h), one))));
+    o.select(o.less(x, o.number(F::zero())), o.negate(result), result)
 }
-
-/// cosh x = E + 1/(4E), with E = e^|x|/2, which stays finite where e^|x| would overflow.
-#[inline]
-pub(crate) fn cosh<R: Native, const FUSED: bool>(x: R) -> R { let e = exp_times::<R, FUSED>(x.abs(), -R::one()); e + R::narrow(0.25) / e }
-
-/// tanh |x| = e/(e + 2), with e = e^(2|x|) - 1. Beyond 20 at f64 and 9 at f32, tanh rounds to 1. Stopping |x| there keeps 2|x| within `expm1_fast`'s range, where e needs none of `expm1`'s guards.
-#[inline]
-pub(crate) fn tanh<R: Native, const FUSED: bool>(x: R) -> R {
-    let top = R::narrow(if R::WIDE { 20.0 } else { 9.0 });
-    let a = x.abs();
-    let a = if a > top { top } else { a };
-    let e = expm1_fast::<R, FUSED>(a + a);
-    (e / (e + R::narrow(2.0))).copysign(x)
+pub(crate) fn cosh_formula<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, x: O::V) -> O::V {
+    let e = crate::exp::scaled_formula(o, o.magnitude(x), o.number(-F::one()));
+    o.add(e, o.divide(o.number(F::narrow(0.25)), e))
+}
+pub(crate) fn tanh_formula<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, x: O::V) -> O::V {
+    let top = o.number(F::narrow(if o.width() == crate::buffer::FloatWidth::F64 { 20.0 } else { 9.0 }));
+    let a = o.magnitude(x);
+    let a = o.select(o.less(top, a), top, a);
+    let e = crate::exp::minus_one_formula(o, o.add(a, a), o.number(F::zero()));
+    let result = o.divide(e, o.add(e, o.number(F::narrow(2.0))));
+    o.select(o.less(x, o.number(F::zero())), o.negate(result), result)
 }
 
 /// Beyond this magnitude, `asinh` and `acosh` take v = x in place of x + √(x² ± 1), which rounds to 2x and may overflow, and add 1 to e. x² hasn't yet overflowed below it at either width.
@@ -64,3 +70,13 @@ pub(crate) fn atanh<R: Native, const FUSED: bool>(x: R) -> R {
     let y = ln_of::<R, FUSED>((R::one() + a) / (R::one() - a), false, (a, R::one())) * R::narrow(0.5);
     (if a <= R::one() { y } else { R::nan() }).copysign(x)
 }
+
+/// The real part of acosh x, or of its principal value at a complex z, as a function object: acosh |x| for |x| at least 1, and 0 between -1 and 1. The real part of `6○⁻¹`.
+#[derive(Clone, Copy, Debug)]
+pub struct RealAcosh;
+forms!(#[inline] RealAcosh at real: |_, [x]| crate::slice::Total(acosh::<_, { crate::FUSED }>(if x.abs() < 1.0 { 1.0 } else { x.abs() })));
+
+/// The real part of atanh x, or of its principal value at a complex z, as a function object: atanh x for x between -1 and 1, and atanh (1 ÷ x) beyond, which is ½ ln |(1 + x) ÷ (1 - x)|. The real part of `7○⁻¹`.
+#[derive(Clone, Copy, Debug)]
+pub struct RealAtanh;
+forms!(#[inline] RealAtanh at real: |_, [x]| crate::slice::Total(atanh::<_, { crate::FUSED }>(if x.abs() > 1.0 { 1.0 / x } else { x })));

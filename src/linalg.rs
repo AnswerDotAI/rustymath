@@ -6,7 +6,7 @@
 //!
 //! The private module `factor` holds decompositions of real and complex matrices, whose blocked updates run on these loops. This module re-exports its public items, and [`Scalar`], the trait of the item types they take. [`transpose_into`] transposes a matrix through 8×8 tiles.
 use crate::{
-    Float, agreement::{Frames, Mapping, expanded_items}, buffer::{Buffer, DType, Element, FloatWidth, Source, View, Width, read_all}, convert, error::Error,
+    Float, agreement::{Frames, Mapping, Walked, expanded_items}, buffer::{Buffer, DType, Element, FloatWidth, Source, View, Width, read_all}, convert, error::Error,
     float::{FUSED, sealed::Core}, parallel, slice
 };
 use num_complex::Complex;
@@ -165,30 +165,94 @@ pub struct PlusEqual;
 #[derive(Default)]
 pub struct PlusNotEqual;
 
-/// One of the pairs above, for code that chooses a pair at run time, as a frontend does from its own names for functions. [`Product::run`] is where each pair finds its kernel for a dtype.
+/// A native inner-product pair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Product { PlusTimes, MaxPlus, MinPlus, OrAnd, AndOr, PlusEqual, PlusNotEqual }
 
 impl Product {
-    /// The pair's products of the cells of `x` and `y`, which share a dtype and pair as `frames` says, each of sizes `[n, k, m]`, with whether every product fits, as [`Kernels::product`](crate::operation::Kernels::product) gives them. `None` where the pair has no kernel for their dtype, and an error where an interrupt stopped them. A count computes at `i64` or at a float, and reads characters as their code points. An `i16` or `i32` count could overflow, and the `i64` kernel counts at those widths only where that's safe.
-    pub fn run(self, xy: [View<'_>; 2], frames: &Frames, size: [usize; 3]) -> Option<Result<(Buffer, bool), Error>> {
-        const COUNTS: [DType; 3] = [DType::Integer(Width::I64), DType::Float(FloatWidth::F32), DType::Float(FloatWidth::F64)];
-        match self {
-            Self::PlusTimes => crate::kernels!(Product PlusTimes).product(&PlusTimes, xy, frames, size),
-            Self::MaxPlus => crate::kernels!(Product MaxPlus).product(&MaxPlus, xy, frames, size),
-            Self::MinPlus => crate::kernels!(Product MinPlus).product(&MinPlus, xy, frames, size),
-            Self::OrAnd => crate::kernels!(Product OrAnd).product(&OrAnd, xy, frames, size),
-            Self::AndOr => crate::kernels!(Product AndOr).product(&AndOr, xy, frames, size),
-            Self::PlusEqual => crate::kernels!(Product PlusEqual).only(&COUNTS).product(&PlusEqual, xy.map(crate::characters::as_codes), frames, size),
-            Self::PlusNotEqual => crate::kernels!(Product PlusNotEqual).only(&COUNTS).product(&PlusNotEqual, xy.map(crate::characters::as_codes), frames, size),
-        }
-    }
-    /// The products of [`run`](Self::run) with wrapping steps: `+.×` on `u8`, `i16` or `i32` items gives each result's exact sum of products wrapped to 32 bits, at `i32`, as static kinds and fixed widths keep integer results (`Wrapped<PlusTimes>`). `None` for any other pair or dtype, which `run` then takes.
-    pub fn run_wrapped(self, xy: [View<'_>; 2], frames: &Frames, size: [usize; 3]) -> Option<Result<(Buffer, bool), Error>> {
-        match self { Self::PlusTimes => crate::kernels!(Product crate::Wrapped<PlusTimes>).product(&crate::Wrapped(PlusTimes), xy, frames, size), _ => None }
-    }
-    /// Whether the pair's kernel compares items exactly, as the counts `+.=` and `+.≠` do. A frontend sends approximate items that compare within a tolerance to another route.
     pub fn compares_exactly(self) -> bool { matches!(self, Self::PlusEqual | Self::PlusNotEqual) }
+}
+
+/// Layout and reads of an inner product. Contracted axes follow output axes in `iteration`.
+#[derive(Clone, Debug)]
+pub struct ProductPlan {
+    pub layout: crate::layout::Layout,
+    pub iteration: crate::layout::Layout,
+    pub mappings: [Mapping; 2],
+    pub contracted: usize,
+    pub matrix: Option<MatrixProduct>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MatrixProduct { pub frame_rank: usize, pub row_rank: usize, pub size: [usize; 3]
+}
+
+impl ProductPlan {
+    pub fn dot([left, right]: [&crate::layout::Layout; 2]) -> Result<Self, Error> {
+        let rank = left.shape().len();
+        if rank == 0 || right.shape().is_empty() { return Err(Error::new(crate::error::Kind::Rank, "an inner product needs vectors or matrices")); }
+        Self::paired([left, right], &[(rank - 1, 0)], None)
+    }
+    pub fn matrices([left, right]: [&crate::layout::Layout; 2]) -> Result<Self, Error> {
+        use crate::agreement::Agreement;
+        let [lr, rr] = [left, right].map(|l| l.shape().len());
+        if lr == 0 || rr == 0 { return Err(Error::new(crate::error::Kind::Rank, "a matrix product needs vectors or matrices")); }
+        let [lc, rc] = [lr.min(2), rr.min(2)];
+        let [lf, rf] = [left.axes(0..lr - lc), right.axes(0..rr - rc)];
+        let [mut xa, mut ya] = Agreement::axis_pairs(&lf, &rf);
+        let first = xa.iter().chain(&ya).max().map_or(0, |a| a + 1);
+        if lc == 2 { xa.push(first); }
+        if rc == 2 { ya.push(first + usize::from(lc == 2)); }
+        Self::paired([left, right], &[(lr - 1, rr - rc)], Some([xa, ya]))
+    }
+    /// Contracts `pairs`; optional destinations pair the remaining axes, in each input's axis order. Without destinations, remaining axes concatenate left then right.
+    pub fn paired(inputs @ [left, right]: [&crate::layout::Layout; 2], pairs: &[(usize, usize)], destinations: Option<[Vec<usize>; 2]>) -> Result<Self, Error> {
+        use crate::{agreement::Agreement, error::Kind, layout::{element_count, generated_len}};
+        let contracted: [Vec<usize>; 2] = [pairs.iter().map(|p| p.0).collect(), pairs.iter().map(|p| p.1).collect()];
+        for (input, axes) in inputs.iter().zip(&contracted) {
+            if axes.iter().enumerate().any(|(i, a)| *a >= input.shape().len() || axes[..i].contains(a)) {
+                return Err(Error::new(Kind::Rank, "contracted axes must be distinct axes of their inputs"));
+            }
+        }
+        for &(a, b) in pairs {
+            let (x, y) = (left.shape()[a], right.shape()[b]);
+            if x != y { return Err(Error::new(Kind::Length, format!("an inner product needs matching contracted lengths, not {x} and {y}"))); }
+            Mapping::contract(left, a, right, b).map_err(|_| Error::new(Kind::Length, "an inner product needs the same keys on its contracted axes"))?;
+        }
+        let free: [Vec<usize>; 2] = std::array::from_fn(|i| (0..inputs[i].shape().len()).filter(|a| !contracted[i].contains(a)).collect());
+        let free_layouts = std::array::from_fn::<_, 2, _>(|i| inputs[i].axes(free[i].iter().copied()));
+        let total = free[0].len() + free[1].len();
+        let destinations = destinations.unwrap_or_else(|| [(0..free[0].len()).collect(), (free[0].len()..total).collect()]);
+        for (axes, positions) in free.iter().zip(&destinations) {
+            if axes.len() != positions.len() || positions.iter().enumerate().any(|(i, p)| *p >= total || positions[..i].contains(p)) {
+                return Err(Error::new(Kind::Rank, "free axes need distinct output destinations"));
+            }
+        }
+        let agreement = Agreement::mapped(&free_layouts[0], &free_layouts[1], &destinations[0], &destinations[1], false)?;
+        if agreement.left.fills() || agreement.right.fills() { return Err(Error::new(Kind::Length, "keyed frames need a cell that an argument lacks")); }
+        let layout = agreement.layout;
+        generated_len(layout.shape())?;
+        let first = layout.shape().len();
+        let iteration = layout.concat(&left.axes(contracted[0].iter().copied()));
+        let items = element_count(iteration.shape())?;
+        let mappings = std::array::from_fn(|i| {
+            let mut axes = vec![0; inputs[i].shape().len()];
+            for (&a, &p) in free[i].iter().zip(&destinations[i]) { axes[a] = p; }
+            for (p, &a) in contracted[i].iter().enumerate() { axes[a] = first + p; }
+            Mapping::new(inputs[i], &axes, &iteration, items)
+        });
+        let mut owners = vec![0u8; first];
+        for (side, axes) in destinations.iter().enumerate() { for &axis in axes { owners[axis] |= 1 << side; } }
+        let frame_rank = owners.iter().take_while(|&&owner| owner == 3).count();
+        let row_rank = owners[frame_rank..].iter().take_while(|&&owner| owner == 1).count();
+        let matrix = if owners[frame_rank + row_rank..].iter().all(|&owner| owner == 2) {
+            let sizes = [
+                &iteration.shape()[frame_rank..frame_rank + row_rank], &iteration.shape()[first..], &iteration.shape()[frame_rank + row_rank..first],
+            ].map(|shape| element_count(shape).ok());
+            match sizes { [Some(m), Some(k), Some(n)] => Some(MatrixProduct { frame_rank, row_rank, size: [m, k, n] }), _ => None }
+        } else { None };
+        Ok(Self { layout, iteration, mappings, contracted: pairs.len(), matrix })
+    }
 }
 
 /// The scalar operations of a pair at item type `T`.
@@ -637,7 +701,7 @@ pub(crate) enum Op { Normal, Transpose, Adjoint, Conjugate }
 pub enum Orientation { Normal, Transpose }
 /// A row-major matrix whose items `mapping` reads from `data`, as [`expanded_items`] lays an argument over a frame. [`Inner::inner_mapped`] takes its operands this way. A matrix held in order has `Mapping::Linear(1)`.
 #[derive(Clone, Copy)]
-pub struct Mapped<'a, T> { pub data: &'a [T], pub mapping: &'a Mapping }
+pub struct Mapped<'a, T> { pub data: &'a [T], pub mapping: &'a Walked<'a> }
 
 impl<'a, T: Element> Mapped<'a, T> {
     /// The matrix in orientation `o`, with no copy, where the mapping reads its stored matrix at positive strides, one of them 1: row by row, or column by column as a transpose. `None` for any other mapping.
@@ -832,7 +896,7 @@ const COLUMN_RUN: usize = 64;
 /// `+.×` of `a` and a vector `b`, where each row of `a` starts one item after the row before it in storage, as the windows of a vector or a single-channel image do. Each column of `a` is then a run of storage, which [`scaled_runs`] reads where it lies and scales by its item of `b`. `a` is never gathered. `None` for a chosen fill, or where it doesn't split into entries for its rows and entries for its columns, or where its rows aren't adjacent in runs of at least [`COLUMN_RUN`]. The loop reads a fill as 0, the item type's own fill.
 fn by_columns<T: Tiled + Element>(a: Mapped<'_, T>, b: Mapped<'_, T>, oa: Orientation, [m, k]: [usize; 2]) -> Option<Vec<T>> {
     use crate::gather::Steps;
-    let (Mapping::Steps { base, steps }, None) = (a.mapping, a.mapping.chosen()) else { return None };
+    let (Mapping::Steps { base, steps }, None) = (&**a.mapping, a.mapping.chosen()) else { return None };
     if m * k == 0 { return None; }
     // The entries of the stored matrix's leading axis come first, and give its first `lead` items.
     let lead = if oa == Orientation::Normal { m } else { k };

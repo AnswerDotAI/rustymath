@@ -316,7 +316,9 @@ pub fn retried<T>(mut failures: Vec<T>, mut retime: impl FnMut(Vec<T>, f64) -> V
 #[cfg(not(target_arch = "wasm32"))]
 mod lock {
     use crate::parallel::set_threads;
-    use std::{fs::{File, TryLockError}, io, time::{Duration, Instant}};
+    use std::{cell::RefCell, fs::{File, TryLockError}, io, sync::{Arc, Weak}, time::{Duration, Instant}};
+
+    thread_local! { static HELD: RefCell<(bool, Weak<File>)> = const { RefCell::new((true, Weak::new())) }; }
 
     /// The file whose lock keeps timings apart from builds and test runs.
     pub const LOCK: &str = "/tmp/aai-ws-timing.lock";
@@ -324,9 +326,9 @@ mod lock {
     /// The file that a timing holds exclusively while it waits for `LOCK` and while it holds it. A shared hold locks it for a moment first, so it waits behind any timing.
     pub const GATE: &str = "/tmp/aai-ws-timing.gate";
 
-    /// A hold on the timing lock, released when dropped. The operating system also releases it when its process ends, even by a crash. An exclusive hold runs every call on its calling thread alone until it's dropped, because speed budgets are for one thread.
+    /// A hold on the timing lock, released when dropped. Shared holds acquired by one thread share a file until the last is dropped. Any nesting involving exclusive fails. The operating system also releases holds when their process ends, even by a crash. An exclusive hold runs every call on its calling thread alone until it's dropped, because speed budgets are for one thread.
     pub struct Hold {
-        _file: File,
+        _file: Arc<File>,
         /// `GATE`, which an exclusive hold keeps until it's dropped.
         _gate: Option<File>,
         /// The thread setting that an exclusive hold replaced, to restore when dropped.
@@ -338,39 +340,41 @@ mod lock {
     /// Takes the timing lock exclusively, for a timing. It waits up to 5 minutes for builds, test runs and other timings, then fails. From the start of its wait it holds `GATE`, so no build or test run starts meanwhile. After waiting 30 seconds it prints, once, the other processes that have the lock's file open. On macOS it also sets the calling thread's QoS class to user-interactive. macOS then favours the performance cores for that thread. QoS isn't CPU affinity.
     pub fn exclusive() -> io::Result<Hold> { hold(false) }
 
-    /// Takes the timing lock shared, for a build or a test run. It waits behind any timing that holds `GATE` or the lock, for up to 5 minutes, then goes ahead without the lock.
+    /// Takes the timing lock shared, for a build or a test run. It waits behind any timing that holds `GATE` or the lock, for up to 5 minutes, then fails. A nested shared hold acquired by the same thread reuses its file.
     pub fn shared() -> io::Result<Hold> { hold(true) }
 
     fn hold(shared: bool) -> io::Result<Hold> {
+        if let Some((was_shared, file)) = HELD.with(|h| { let h = h.borrow(); h.1.upgrade().map(|f| (h.0, f)) }) {
+            if shared && was_shared { return Ok(Hold { _file: file, _gate: None, threads: None }); }
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "timing locks can only nest shared inside shared"));
+        }
         #[cfg(target_vendor = "apple")]
         if !shared {
             unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
         }
         let open = |path: &str| File::options().create(true).append(true).open(path).map_err(|e| io::Error::new(e.kind(), format!("{path}: {e}")));
         let (gate, file) = (open(GATE)?, open(LOCK)?);
-        let mut wait = Wait { start: Instant::now(), shared, waiting: false, reported: false, late: false };
+        let mut wait = Wait { start: Instant::now(), shared, waiting: false, reported: false };
         wait.take(&gate, GATE)?;
         wait.take(&file, LOCK)?;
+        let file = Arc::new(file);
+        HELD.with(|h| *h.borrow_mut() = (shared, Arc::downgrade(&file)));
         Ok(Hold { _file: file, _gate: (!shared).then_some(gate), threads: (!shared).then(|| set_threads(1)) })
     }
 
     /// One hold's wait for `GATE` and then `LOCK`, against one deadline of 5 minutes.
-    struct Wait { start: Instant, shared: bool, waiting: bool, reported: bool, late: bool }
+    struct Wait { start: Instant, shared: bool, waiting: bool, reported: bool }
 
     impl Wait {
-        /// Locks `file`, which is the file at `path`, as the hold needs it, waiting while others hold it. After 5 minutes a shared hold goes ahead without it, and an exclusive hold fails.
+        /// Locks `file`, which is the file at `path`, as the hold needs it, waiting up to 5 minutes before failing.
         fn take(&mut self, file: &File, path: &str) -> io::Result<()> {
             let others = if self.shared { "a timing" } else { "a build or another timing" };
             loop {
-                if self.late { return Ok(()); }
                 match if self.shared { file.try_lock_shared() } else { file.try_lock() } {
                     Ok(()) => return Ok(()), Err(TryLockError::WouldBlock) => {} Err(TryLockError::Error(e)) => return Err(io::Error::new(e.kind(), format!("{path}: {e}")))
                 }
                 if self.start.elapsed() > Duration::from_secs(300) {
-                    if !self.shared { return Err(io::Error::new(io::ErrorKind::TimedOut, format!("{others} has held {LOCK} for 5 minutes"))); }
-                    eprintln!("going ahead although {others} still holds {LOCK}");
-                    self.late = true;
-                    return Ok(());
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, format!("{others} has held {LOCK} for 5 minutes")));
                 }
                 if !self.waiting { eprintln!("waiting for {others} to release {LOCK}"); }
                 if !self.shared && !self.reported && self.start.elapsed() > Duration::from_secs(30) {

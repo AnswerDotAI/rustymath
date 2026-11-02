@@ -10,6 +10,17 @@ use std::{borrow::Cow, sync::Arc};
 #[derive(Clone, Debug)]
 pub struct Plan { pub layout: Layout, pub steps: Vec<Steps> }
 
+
+/// A count that an argument gives, such as a take's or a diagonal's offset: its sign and magnitude.
+#[derive(Clone, Copy, Debug)]
+pub struct Count { pub negative: bool, pub magnitude: usize }
+
+impl Count {
+    /// The count `n`. A magnitude past `usize` saturates.
+    pub fn of(n: i64) -> Self { Count { negative: n < 0, magnitude: usize::try_from(n.unsigned_abs()).unwrap_or(usize::MAX) } }
+}
+
+
 /// Written index parts, before the selected axes and their lengths are known.
 #[derive(Clone, Debug, PartialEq)]
 pub enum IndexPart<T> { Axis(T), All, NewAxis, Rest }
@@ -91,17 +102,41 @@ pub fn addressed_parts(
     Ok(routed)
 }
 
-/// Plans a selection by written parts on `layout`, as `⌷` and the Python frontends read brackets. `claims` give each part's axis name and width, as for `addressed_parts`, and `explicit` its axes. `decode(i, axis)` gives the selector of written part `i` at source `axis`, with whether it reads one position. Axes that no part reaches stay whole, and a part wider than one axis reads its axes as one. Also gives whether the selection reads one item: one position on every source axis, in order. `broadcast` pairs index arrays as `select` does. `err` converts this module's errors to the caller's.
+/// Plans a selection by written parts on `layout`, as `⌷` and the Python frontends read brackets. `claims` give each part's axis name and width, as for `addressed_parts`, and `explicit` its axes. `decode(i, axis)` gives the selector of written part `i` at source `axis`, with whether it reads one position. Axes that no part reaches stay whole, and a part wider than one axis reads its axes as one. Also gives whether the selection reads one item: one position on every source axis, in order. `broadcast` pairs index arrays as `select` does. `writes` plans a write, whose positions can repeat a key. `err` converts this module's errors to the caller's.
 pub fn plan_parts<E>(
-    layout: &Layout, claims: &[IndexPart<(Option<&str>, usize)>], explicit: Option<&[usize]>, broadcast: bool,
-    mut decode: impl FnMut(usize, usize) -> Result<(Selector, bool), E>, err: impl Fn(Error) -> E) -> Result<(Plan, bool), E> {
+    layout: &Layout, claims: &[IndexPart<(Option<&str>, usize)>], explicit: Option<&[usize]>, broadcast: bool, writes: bool,
+    decode: impl FnMut(usize, usize) -> Result<(Selector, bool), E>, err: impl Fn(Error) -> E) -> Result<(Plan, bool), E> {
+    let r = routes(layout, claims, explicit, decode, &err)?;
+    Ok((plan_routes(layout, &r, broadcast, writes).map_err(&err)?, r.one))
+}
+
+/// The layout of the selection that `plan_parts` plans, and whether it reads one item, where `decode` can give an index array by its layout alone (`Selector::Shaped`), as a planner that knows a value's description but not its positions gives it. `writes` plans a write, as for `plan_parts`.
+pub fn plan_layout<E>(
+    layout: &Layout, claims: &[IndexPart<(Option<&str>, usize)>], explicit: Option<&[usize]>, broadcast: bool, writes: bool,
+    decode: impl FnMut(usize, usize) -> Result<(Selector, bool), E>, err: impl Fn(Error) -> E) -> Result<(Layout, bool), E> {
+    let r = routes(layout, claims, explicit, decode, &err)?;
+    Ok((routed(layout, &r, broadcast, Planning { writes, layouts: true }).map_err(&err)?.layout, r.one))
+}
+
+/// What a plan is for: a write, whose index arrays can repeat a key (`writes`), and a layout alone, whose index arrays can be known by their layouts (`layouts`, `plan_layout`).
+#[derive(Clone, Copy)]
+struct Planning { writes: bool, layouts: bool }
+
+/// The selectors of a selection by written parts (`routes`): one for each axis of the layout that `sources` regroups the source into, with the source axes that each reads, and whether the selection reads one item, one position on every source axis in order.
+#[derive(Clone, Debug)]
+pub struct Routes { pub selectors: Vec<Selector>, pub sources: Vec<Vec<usize>>, pub one: bool }
+
+/// The routes of a selection by written parts on `layout`, as `plan_parts` takes them. `claims` give each part's axis name and width, as for `addressed_parts`, and `explicit` its axes. `decode(i, axis)` gives the selector of written part `i` at source `axis`, with whether it reads one position. Axes that no part reaches stay whole (`Selector::All`), and a part wider than one axis reads its axes as one.
+pub fn routes<E>(
+    layout: &Layout, claims: &[IndexPart<(Option<&str>, usize)>], explicit: Option<&[usize]>,
+    mut decode: impl FnMut(usize, usize) -> Result<(Selector, bool), E>, err: impl Fn(Error) -> E) -> Result<Routes, E> {
     let shape = layout.shape();
     let (mut one, mut next, mut sources, mut selectors) = (claims.iter().any(|p| matches!(p, IndexPart::Axis(_))), 0, Vec::<Vec<usize>>::new(), Vec::new());
     for (axis, part) in addressed_parts(layout, claims, explicit).map_err(&err)? {
         one &= next == axis;
         for a in next..axis {
             sources.push(vec![a]);
-            selectors.push(Selector::all(shape[a]));
+            selectors.push(Selector::All);
         }
         next = axis;
         let (selector, width, single) = match part {
@@ -115,7 +150,7 @@ pub fn plan_parts<E>(
                 let (selector, single) = decode(i, axis)?;
                 (selector, width, single)
             }
-            _ => (Selector::all(shape[axis]), 1, false),
+            _ => (Selector::All, 1, false),
         };
         one &= single;
         sources.push((axis..axis + width).collect());
@@ -124,32 +159,71 @@ pub fn plan_parts<E>(
     }
     one &= next == shape.len();
     sources.extend((next..shape.len()).map(|a| vec![a]));
-    let merged;
-    let layout = if sources.len() == shape.len() { layout } else {
-        merged = regrouped(layout, sources.iter().map(|s| s.iter().map(|&a| shape[a]).product()).collect(), &sources, &[]).map_err(&err)?;
-        &merged
-    };
-    Ok((select(layout, selectors, broadcast).map_err(&err)?, one))
+    Ok(Routes { selectors, sources, one })
 }
 
-/// One independent axis selector. Positions are zero-based and already normalized; a range can walk backwards. An index array replaces its axis by the axes of its layout. Its positions, a [`Table`], lie within the axis or are `Steps::FILL`, which reads the caller's fill. The code that builds an index array checks its positions, as `index_positions` and `index_table` do. `NewAxis` inserts a length-one axis without consuming an input axis.
+/// The plan of the selection that `routes` gives on `layout`, as `plan_parts` plans it: `writes` plans a write, whose positions can repeat a key.
+pub fn plan_routes(layout: &Layout, routes: &Routes, broadcast: bool, writes: bool) -> Result<Plan, Error> { routed(layout, routes, broadcast, Planning { writes, layouts: false }) }
+
+pub fn bound_routes(layout: &Layout, routes: &Routes, indices: &[View<'_>], broadcast: bool, checked: bool) -> Result<Plan, Error> {
+    let grouped = route_layout(layout, routes)?;
+    let mut routes = routes.clone();
+    let (mut source, mut input) = (0, 0);
+    for selector in &mut routes.selectors {
+        if matches!(selector, Selector::NewAxis) { continue; }
+        let size: usize = routes.sources[source].iter().map(|&a| layout.shape()[a]).product();
+        source += 1;
+        if let Selector::Shaped { layout: within } = selector {
+            let view = *indices.get(input).ok_or_else(|| Error::new(Kind::Length, "missing index array"))?;
+            input += 1;
+            let positions = positions_mode(view, size, checked)?;
+            *selector = Selector::Indices { layout: within.clone(), positions: Table::new(positions) };
+        } else if !checked {
+            match selector {
+                Selector::At(position) if *position >= size => {
+                    *selector = Selector::Indices { layout: Layout::EMPTY, positions: Table::new(vec![Steps::FILL]) };
+                },
+                Selector::Range { start, len, step } if *len > 0 && !(*start < size
+                    && start.checked_add_signed(step.saturating_mul((*len - 1) as isize)).is_some_and(|p| p < size)) => {
+                    let positions: Vec<_> = (0..*len).map(|i| start.checked_add_signed(step.saturating_mul(i as isize)).filter(|&p| p < size).unwrap_or(Steps::FILL)).collect();
+                    let within = grouped.select(source - 1, positions.iter().map(|&p| (p != Steps::FILL).then_some(p)))?.axes(source - 1..source);
+                    *selector = Selector::Indices { layout: within, positions: Table::new(positions) };
+                },
+                _ => {},
+            }
+        }
+    }
+    if input != indices.len() { return Err(Error::new(Kind::Length, "extra index arrays")); }
+    plan_routes(layout, &routes, broadcast, false)
+}
+
+/// The plan of the selection that `routes` gives on `layout`, for `planning`.
+fn routed(layout: &Layout, routes: &Routes, broadcast: bool, planning: Planning) -> Result<Plan, Error> {
+    planned(&route_layout(layout, routes)?, routes.selectors.clone(), broadcast, planning)
+}
+
+fn route_layout<'a>(layout: &'a Layout, routes: &Routes) -> Result<Cow<'a, Layout>, Error> {
+    let shape = layout.shape();
+    if routes.sources.len() == shape.len() { return Ok(Cow::Borrowed(layout)); }
+    regrouped(layout, routes.sources.iter().map(|s| s.iter().map(|&a| shape[a]).product()).collect(), &routes.sources, &[]).map(Cow::Owned)
+}
+
+/// One independent axis selector. Positions are zero-based and already normalized; a range can walk backwards. `All` keeps the whole axis, whatever its length. An index array replaces its axis by the axes of its layout. Its positions, a [`Table`], lie within the axis or are `Steps::FILL`, which reads the caller's fill. The code that builds an index array checks its positions, as `index_positions` and `index_table` do. `Shaped` is an index array known by its layout alone, whose positions arrive when the selection runs: only `plan_layout` takes it. `NewAxis` inserts a length-one axis without consuming an input axis.
 #[derive(Clone, Debug)]
-pub enum Selector { At(usize), Range { start: usize, len: usize, step: isize }, Indices { layout: Layout, positions: Table }, NewAxis }
-
-impl Selector {
-    /// The whole of an axis of length `len`.
-    pub fn all(len: usize) -> Self { Selector::Range { start: 0, len, step: 1 } }
-}
+pub enum Selector { At(usize), Range { start: usize, len: usize, step: isize }, All, Indices { layout: Layout, positions: Table }, Shaped { layout: Layout }, NewAxis }
 
 /// Selects with one selector for each leading axis of `layout`, in order, keeping the axes that no selector mentions. A single position removes its axis, and a range keeps it in place. An index array's axes replace its axis. An unnamed vector keeps the axis's name and the keys at the positions it selects, as a named vector without keys of its own keeps those keys, and an unnamed index array of another rank has plain axes. Index arrays pair, as arguments pair in arithmetic: all of them with `broadcast`, as `.[]` reads them, and otherwise those that share an axis name, as `⌷` reads them. Paired index arrays put their axes where the first of them was. A range pairs with an index array that has its axis's name. Positions that step evenly along each axis read as strides (`strided`), whether one index array gives them or paired arrays sum to them. One index array whose positions read a stretch of its axis past the ends, as edge modes and positions that count back from the end give them, reads as one padded or rotated entry.
-pub fn select(layout: &Layout, selectors: Vec<Selector>, broadcast: bool) -> Result<Plan, Error> {
+pub fn select(layout: &Layout, selectors: Vec<Selector>, broadcast: bool) -> Result<Plan, Error> { planned(layout, selectors, broadcast, Planning { writes: false, layouts: false }) }
+
+/// `select`'s plan under `planning`: for a write, an index array's positions can repeat a key, and for a layout alone, an index array can be known by its layout (`Part::of`).
+fn planned(layout: &Layout, selectors: Vec<Selector>, broadcast: bool, planning: Planning) -> Result<Plan, Error> {
     let (shape, stride) = (layout.shape(), strides(layout.shape()));
     let mut parts = Vec::with_capacity(shape.len());
     let mut axis = 0;
     for selector in selectors {
         if matches!(selector, Selector::NewAxis) { parts.push(Part::new(Steps::along(1, 0), Layout::from([1]), 0, 1)); continue; }
         if axis == shape.len() { return Err(Error::new(Kind::Index, "too many axis selectors")); }
-        parts.push(Part::of(selector, layout, axis, stride[axis])?);
+        parts.push(Part::of(selector, layout, axis, stride[axis], planning)?);
         axis += 1;
     }
     parts.extend((axis..shape.len()).map(|a| Part::new(Steps::along(shape[a], 1), layout.axes(a..a + 1), stride[a], shape[a])));
@@ -193,13 +267,14 @@ struct Part { steps: Steps, axes: Layout, stride: usize, size: usize, array: boo
 impl Part {
     fn new(steps: Steps, axes: Layout, stride: usize, size: usize) -> Self { Part { steps, axes, stride, size, array: false, alone: None } }
 
-    /// The part that `selector` reads along `axis` of `layout`, whose items lie `stride` apart.
-    fn of(selector: Selector, layout: &Layout, axis: usize, stride: usize) -> Result<Self, Error> {
+    /// The part that `selector` reads along `axis` of `layout`, whose items lie `stride` apart, under `planning`: a write's index array can repeat a key, and an index array known by its layout alone (`Selector::Shaped`) plans only a layout.
+    fn of(selector: Selector, layout: &Layout, axis: usize, stride: usize, planning: Planning) -> Result<Self, Error> {
         let size = layout.shape()[axis];
         let outside = || Error::new(Kind::Index, "axis selector is outside its axis");
         match selector {
             Selector::At(i) if i < size => Ok(Part::new(Steps::Stride { start: i, len: 1, step: 0 }, Layout::EMPTY, stride, size)),
             Selector::At(_) => Err(outside()),
+            Selector::All => Self::of(Selector::Range { start: 0, len: size, step: 1 }, layout, axis, stride, planning),
             Selector::Range { start, len, step } => {
                 if len > 0 && !(start < size && start.checked_add_signed(step.saturating_mul((len - 1) as isize)).is_some_and(|i| i < size)) {
                     return Err(outside());
@@ -211,18 +286,31 @@ impl Part {
             Selector::Indices { layout: within, positions } => {
                 if generated_len(within.shape())? != positions.len() { return Err(Error::new(Kind::Length, "index array shape doesn't fit its positions")); }
                 let steps = Steps::Table(positions);
-                // Check selected keys even when the result drops them, as BPL selection does.
-                let selected = layout.select(axis, steps.offsets())?;
-                let alone = match within.shape().len() {
-                    1 if !within.has_names() => Some(selected.axes(axis..axis + 1)),
-                    1 if within.keys(0).is_none() => Some(within.clone().with_keys(vec![selected.keys(axis).cloned()])?),
-                    _ if !within.has_names() => Some(Layout::from(within.shape().to_vec())), _ => None
-                };
-                Ok(Part { steps, axes: within, stride, size, array: true, alone })
+                // A read checks the selected keys even where the result drops them, as BPL selection does. A write can repeat a key (`Layout::written`).
+                let selected = if planning.writes { layout.written(axis, steps.offsets())? } else { layout.select(axis, steps.offsets())? };
+                Ok(Part { steps, alone: alone(&within, &selected, axis)?, axes: within, stride, size, array: true })
+            }
+            Selector::Shaped { layout: within } => {
+                if !planning.layouts { return Err(Error::new(Kind::Domain, "an index array known by its layout alone plans only a layout")); }
+                // The keys that an index array selects depend on its positions.
+                if layout.keys(axis).is_some() { return Err(Error::new(Kind::Index, "an index array known by its layout alone, along an axis with keys")); }
+                let len = generated_len(within.shape())?;
+                let selected = layout.select(axis, std::iter::repeat_n(None, len))?;
+                // These steps read no positions: a layout plan gives only its layout.
+                Ok(Part { steps: Steps::Stride { start: 0, len, step: 0 }, alone: alone(&within, &selected, axis)?, axes: within, stride, size, array: true })
             }
             Selector::NewAxis => unreachable!("a new axis reads no positions"),
         }
     }
+}
+
+/// The axes that an index array laid out as `within` takes where it pairs with nothing, from `selected`, the layout whose `axis` holds the positions that it reads: a vector without names takes that axis, a named vector without keys takes its keys, and an index array of another rank without names has plain axes. `None` keeps `within`.
+fn alone(within: &Layout, selected: &Layout, axis: usize) -> Result<Option<Layout>, Error> {
+    Ok(match within.shape().len() {
+        1 if !within.has_names() => Some(selected.axes(axis..axis + 1)),
+        1 if within.keys(0).is_none() => Some(within.clone().with_keys(vec![selected.keys(axis).cloned()])?),
+        _ if !within.has_names() => Some(Layout::from(within.shape().to_vec())), _ => None
+    })
 }
 
 /// The axes that paired index arrays agree on, with the entries that read them pushed onto `steps`, one for each run of those axes: the fewest consecutive axes that hold all the axes of each array in the run. An array alone in its run reads through its own positions, as an array that pairs with nothing does. Where every array in a run steps evenly through its positions (`Steps::even`), and the run's axes have no keys, the run reads as one `Stride` for each of its axes, whose step is the sum of each array's step along that axis times the array's stride, and no table is built. Otherwise the arrays add their scaled positions into one table, where a fill in any of them makes a fill. An array that lies along the whole run adds its positions in chunks, and one that broadcasts along it adds them in the runs that a walk through its mapping reaches. The table reads as strides where its offsets are affine (`strided`).
@@ -337,7 +425,7 @@ pub fn addressed(layout: &Layout, selectors: &[(Option<&str>, usize)]) -> Result
 
 /// [`select`] with `selector` on `axis` and every other axis whole. A `NewAxis` goes in before `axis`.
 pub fn select_axis(layout: &Layout, axis: usize, selector: Selector) -> Result<Plan, Error> {
-    let selectors: Vec<_> = layout.shape().iter().take(axis).map(|&len| Selector::all(len)).chain([selector]).collect();
+    let selectors: Vec<_> = layout.shape().iter().take(axis).map(|_| Selector::All).chain([selector]).collect();
     select(layout, selectors, false)
 }
 
@@ -390,6 +478,18 @@ pub(crate) fn counted_back(i: i64, size: usize) -> usize { (i + (size as i64 & (
 
 /// The positions that index values give along an axis of length `size`: integers as `index_positions` reads them, and floats as `filled_positions` does. Other items are a Domain error.
 pub fn positions(view: View<'_>, size: usize) -> Result<Vec<usize>, Error> { index_view!(view, |ix| index_positions(ix, size), |x| filled_positions(x, size)) }
+
+/// Logical index positions; unchecked invalid numbers read the fill position.
+pub fn positions_mode(view: View<'_>, size: usize, checked: bool) -> Result<Vec<usize>, Error> {
+    if checked { return positions(view, size); }
+    if !matches!(view.dtype(), crate::buffer::DType::Boolean | crate::buffer::DType::Integer(_) | crate::buffer::DType::Float(_)) {
+        return Err(Error::new(Kind::Domain, "indices must be real numbers"));
+    }
+    Ok(crate::gather::with_index_values!(view, |values| values.iter().map(|&v| {
+        let p = counted_back(v.position(), size);
+        if v.whole() && p < size { p } else { Steps::FILL }
+    }).collect()))
+}
 
 /// The message of the Domain error for an index value that isn't a whole number.
 pub const NOT_WHOLE: &str = "index must be a whole number";
@@ -522,7 +622,7 @@ fn replicated(layout: &Layout, axis: usize, counts: &[i64], inverse: bool) -> Re
     let lanes = Lanes::new(layout.shape(), axis)?;
     let single = counts.len() == 1;
     let count = |j: usize| counts[if single { 0 } else { j }];
-    let size = |n: i64| usize::try_from(n.unsigned_abs()).unwrap_or(usize::MAX);
+    let size = |n: i64| Count::of(n).magnitude;
     let len = match (inverse, single) {
         (false, true) => lanes.len,
         (false, false) if lanes.len == 1 || counts.len() == lanes.len => counts.len(),
@@ -558,42 +658,97 @@ fn replicated(layout: &Layout, axis: usize, counts: &[i64], inverse: bool) -> Re
     Ok(Plan { layout: result, steps: vec![rows, Steps::table(table), Steps::along(lanes.inner, 1)] })
 }
 
-/// Pads every axis by `(before, after)` positions. Each position past an end reads by `edge`: the item type's fill, or a position on the axis. Existing axis keys remain on their positions. Padding a keyed axis by another mode than `Edge::Fill` repeats keyed positions, which is an error. An axis that pads by nothing keeps a plain walk.
-pub fn pad(layout: &Layout, widths: &[(usize, usize)], edge: Edge) -> Result<Plan, Error> {
-    if widths.len() != layout.shape().len() { return Err(Error::new(Kind::Rank, "padding needs one pair for each axis")); }
-    let stride = strides(layout.shape());
-    let mut result = layout.clone();
-    let mut steps = Vec::new();
-    for (axis, (&size, &(before, after))) in layout.shape().iter().zip(widths).enumerate() {
-        if before == 0 && after == 0 { steps.push(Steps::along(size, stride[axis])); continue; }
-        let len = size.checked_add(before).and_then(|n| n.checked_add(after)).ok_or_else(|| Error::new(Kind::Limit, "padding length overflow"))?;
-        let positions = Steps::padded(-(before as i128), len, size, 1, edge);
-        result = result.select(axis, positions.offsets())?;
-        steps.push(Steps::padded(-(before as i128), len, size, stride[axis], edge));
-    }
-    generated_len(result.shape())?;
-    Ok(Plan { layout: result, steps })
+/// The lengths of `shape` with `widths` added before and after each axis.
+pub fn padded(shape: &[usize], widths: &[(usize, usize)]) -> Result<Vec<usize>, Error> {
+    if widths.len() != shape.len() { return Err(Error::new(Kind::Rank, "padding needs one pair for each axis")); }
+    Ok(shape.iter().zip(widths).map(|(&len, &(before, after))| len.saturating_add(before).saturating_add(after)).collect())
 }
 
-/// Takes `count` items along `axis` for each `(axis, count)` in `counts`, or drops them when `take` is false. A negative count works from the end. A take past an end reads fill there. A later count for the same axis replaces an earlier one.
-pub fn take(layout: &Layout, counts: &[(usize, i64)], take: bool) -> Result<Plan, Error> {
-    let old = layout.shape();
-    if counts.len() > old.len() { return Err(Error::new(Kind::Rank, "counts exceed argument rank")); }
-    let (mut shape, mut starts, mut taken) = (old.to_vec(), vec![0i128; old.len()], vec![false; old.len()]);
-    for &(axis, count) in counts {
-        let Some(&size) = old.get(axis) else { return Err(Error::new(Kind::Domain, "axis is outside array rank")) };
-        let n = usize::try_from(count.unsigned_abs()).unwrap_or(usize::MAX);
-        shape[axis] = if take { n } else { size.saturating_sub(n) };
-        starts[axis] = if take && count < 0 { size as i128 - n as i128 } else if !take && count > 0 { n.min(size) as i128 } else { 0 };
-        taken[axis] = true;
-    }
-    generated_len(&shape)?;
-    let positions = |a: usize, stride: usize| Steps::clipped(starts[a], shape[a], old[a], stride);
-    let stride = strides(old);
-    let mut result = layout.clone();
-    for a in (0..old.len()).filter(|&a| taken[a]) { result = result.select(a, positions(a, 1).offsets())?; }
-    Ok(Plan { layout: result, steps: (0..old.len()).map(|a| positions(a, stride[a])).collect() })
+/// The steps that pad each source axis under its edge mode.
+pub fn pad_steps(shape: &[usize], widths: &[(usize, usize)], edge: Edge) -> Result<Vec<Steps>, Error> {
+    let lengths = padded(shape, widths)?;
+    let stride = strides(shape);
+    Ok((0..shape.len()).map(|a| Steps::padded(-(widths[a].0 as i128), lengths[a], shape[a], stride[a], edge)).collect())
 }
+
+/// Pads every axis by `(before, after)` positions, to the lengths that `padded` gives. Each position past an end reads by `edge`: the item type's fill, or a position on the axis. Existing axis keys remain on their positions. Padding a keyed axis by another mode than `Edge::Fill` repeats keyed positions, which is an error. An axis that pads by nothing keeps a plain walk.
+pub fn pad(layout: &Layout, widths: &[(usize, usize)], edge: Edge) -> Result<Plan, Error> {
+    let shape = padded(layout.shape(), widths)?;
+    generated_len(&shape)?;
+    let mut result = layout.clone();
+    for (axis, ((&size, &len), &(before, _))) in layout.shape().iter().zip(&shape).zip(widths).enumerate() {
+        if len != size { result = result.select(axis, Steps::padded(-(before as i128), len, size, 1, edge).offsets())?; }
+    }
+    Ok(Plan { layout: result, steps: pad_steps(layout.shape(), widths, edge)? })
+}
+
+/// The lengths of `shape` after taking or dropping `counts`, each along its axis: a take keeps `|k|` positions, and a drop keeps `max(0, n-|k|)`. A later count for the same axis replaces an earlier one.
+pub fn taken(shape: &[usize], counts: &[(usize, Count)], take: bool) -> Result<Vec<usize>, Error> {
+    if counts.len() > shape.len() { return Err(Error::new(Kind::Rank, "counts exceed argument rank")); }
+    let mut lengths = shape.to_vec();
+    for &(axis, count) in counts {
+        let Some(&len) = shape.get(axis) else { return Err(Error::new(Kind::Domain, "axis is outside array rank")) };
+        lengths[axis] = if take { count.magnitude } else { len.saturating_sub(count.magnitude) };
+    }
+    Ok(lengths)
+}
+
+/// Where each axis of `shape` starts after taking or dropping `counts`: negative where a take pads before the axis.
+fn take_starts(shape: &[usize], counts: &[(usize, Count)], take: bool) -> Vec<i128> {
+    let mut starts = vec![0; shape.len()];
+    for &(axis, Count { negative, magnitude: n }) in counts {
+        let size = shape[axis];
+        starts[axis] = match (take, negative) {
+            (true, true) => size as i128 - n as i128,
+            (false, false) => n.min(size) as i128,
+            _ => 0,
+        };
+    }
+    starts
+}
+
+/// The steps that read `counts` taken from `shape`, or dropped where `take` is false, one entry for each axis (`take`).
+pub fn take_steps(shape: &[usize], counts: &[(usize, Count)], take: bool) -> Result<Vec<Steps>, Error> {
+    let lengths = taken(shape, counts, take)?;
+    let (starts, stride) = (take_starts(shape, counts, take), strides(shape));
+    Ok((0..shape.len()).map(|a| Steps::padded(starts[a], lengths[a], shape[a], stride[a], Edge::Fill)).collect())
+}
+
+/// Takes `count` items along `axis` for each `(axis, count)` in `counts`, at the lengths that `taken` gives, or drops them when `take` is false. A negative count works from the end. A take past an end reads fill there. A later count for the same axis replaces an earlier one.
+pub fn take(layout: &Layout, counts: &[(usize, Count)], take: bool) -> Result<Plan, Error> {
+    let old = layout.shape();
+    let shape = taken(old, counts, take)?;
+    generated_len(&shape)?;
+    let starts = take_starts(old, counts, take);
+    let mut result = layout.clone();
+    for a in (0..old.len()).filter(|&a| counts.iter().any(|&(axis, _)| axis == a)) {
+        result = result.select(a, Steps::padded(starts[a], shape[a], old[a], 1, Edge::Fill).offsets())?;
+    }
+    Ok(Plan { layout: result, steps: take_steps(old, counts, take)? })
+}
+
+/// The lengths of `shape` rotated along `axis`, which are its own. `frame`, the shape of counts that give one count for each lane, must match `shape` without `axis`, which is one of its axes.
+pub fn rotated<'a>(shape: &'a [usize], axis: usize, frame: Option<&[usize]>) -> Result<&'a [usize], Error> {
+    if axis >= shape.len() { return Err(Error::new(Kind::Rank, "rotation axis is outside array rank")); }
+    let others = || shape[..axis].iter().chain(&shape[axis + 1..]);
+    if frame.is_some_and(|f| !f.iter().eq(others())) { return Err(Error::new(Kind::Length, "rotation counts must match the axis frame")); }
+    Ok(shape)
+}
+
+/// The steps that rotate an axis by its count, or reverse it when no count is given.
+pub fn rotate_steps(shape: &[usize], axis: usize, count: Option<Count>) -> Vec<Steps> {
+    let stride = strides(shape);
+    (0..shape.len()).map(|a| match count {
+        _ if a != axis => Steps::along(shape[a], stride[a]),
+        None => Steps::Stride { start: shape[a].saturating_sub(1) * stride[a], len: shape[a], step: -(stride[a] as isize) },
+        Some(c) => {
+            let n = shape[a];
+            let r = if n == 0 { 0 } else { c.magnitude % n };
+            Steps::rotated(if c.negative && r != 0 { n - r } else { r }, n, stride[a])
+        },
+    }).collect()
+}
+
 
 /// Rotates the items along `axis`, or reverses them when `counts` is `None`. `counts` gives the counts' shape and items: one count for every lane, or one for each lane in the shape of `layout` without `axis`. A lane starts at position `count` of the axis, counted modulo its length. Keys on the axis move with their items when every lane rotates alike, and are dropped otherwise.
 pub fn rotate(layout: &Layout, axis: usize, counts: Option<(&[usize], &[i64])>) -> Result<Plan, Error> {
@@ -604,9 +759,7 @@ pub fn rotate(layout: &Layout, axis: usize, counts: Option<(&[usize], &[i64])>) 
     let count = match counts {
         None => None,
         Some((frame, ns)) => {
-            if ns.len() != 1 && !frame.iter().eq(shape[..axis].iter().chain(&shape[axis + 1..])) {
-                return Err(Error::new(Kind::Length, "rotation counts must match the axis frame"));
-            }
+            rotated(shape, axis, (ns.len() != 1).then_some(frame))?;
             if len != 0 && (ns.is_empty() || ns.iter().any(|&n| shift(n) != shift(ns[0]))) {
                 // Each lane has its own count, so the offsets don't separate by axis, and the axis loses its keys.
                 let offsets =
@@ -617,10 +770,7 @@ pub fn rotate(layout: &Layout, axis: usize, counts: Option<(&[usize], &[i64])>) 
         }
     };
     let source = |j: usize| match count { None => len - 1 - j, Some(s) => (j + s) % len };
-    let along = match count {
-        None => Steps::Stride { start: len.saturating_sub(1) * inner, len, step: -(inner as isize) }, Some(shift) => Steps::rotated(shift, len, inner)
-    };
-    Ok(Plan { layout: layout.select(axis, (0..len).map(|j| Some(source(j))))?, steps: vec![Steps::along(outer, len * inner), along, Steps::along(inner, 1)] })
+    Ok(Plan { layout: layout.select(axis, (0..len).map(|j| Some(source(j))))?, steps: rotate_steps(shape, axis, count.map(|s| Count { negative: false, magnitude: s })) })
 }
 
 /// One axis of windows: windows of `size` items, each `step` items after the last. A padded axis has a window centred on every `step`th position, and reads past its ends by its edge mode.
@@ -630,81 +780,104 @@ pub struct WindowAxis { pub size: usize, pub step: usize, pub edge: Option<Edge>
 impl WindowAxis {
     /// Whether the axis pads, with a window centred on its positions.
     pub fn padded(&self) -> bool { self.edge.is_some() }
-    /// Whether an axis of length `len` can hold this window. A padded size must be less than twice the length of an axis that isn't empty.
-    pub fn fits(&self, len: usize) -> bool { !self.padded() || len == 0 || self.size / 2 < len }
-    /// The number of windows along an axis of length `len` that `fits`.
-    pub fn count(&self, len: usize) -> usize {
-        if self.padded() { len.saturating_sub(usize::from(self.size.is_multiple_of(2))).div_ceil(self.step) }
-        else if len < self.size { 0 }
-        else { (len - self.size) / self.step + 1 }
-    }
+}
+
+impl WindowAxis {
     /// Where window `i` starts along the axis. It's negative when padding comes before the first item.
     pub fn start(&self, i: usize) -> isize { (i * self.step) as isize - if self.padded() { ((self.size - 1) / 2) as isize } else { 0 } }
 }
 
-/// Windows over the leading axes of an array of one shape: a `WindowAxis` for each, the frame that counts the windows along each, and the shape of one window.
+/// The lengths of the windows of `shape` that `axes` give along its leading axes: the number of windows along each of those axes, then a window's lengths. Along an axis of length `n`, `⌊(n-size)÷step⌋+1` windows fit, or none where `size` is longer. A padded window is centred on each position, which gives `⌈(n-[size even])÷step⌉` windows. Its size must be less than twice the length of an axis that isn't empty.
+pub fn windowed(shape: &[usize], axes: &[WindowAxis]) -> Result<Vec<usize>, Error> {
+    if axes.len() > shape.len() { return Err(Error::new(Kind::Rank, "window specification has more axes than its argument")); }
+    let mut lengths = Vec::with_capacity(axes.len() + shape.len());
+    for (w, &n) in axes.iter().zip(shape) {
+        lengths.push(match w.padded() {
+            false if n < w.size => 0,
+            false => (n - w.size) / w.step + 1,
+            true if n == 0 || w.size / 2 < n => n.saturating_sub(usize::from(w.size.is_multiple_of(2))).div_ceil(w.step),
+            true => return Err(Error::new(Kind::Domain, "padded window is too large for the argument")),
+        });
+    }
+    lengths.extend(axes.iter().map(|w| w.size));
+    lengths.extend_from_slice(&shape[axes.len()..]);
+    Ok(lengths)
+}
+
+/// The windows' frame steps followed by the steps within each window.
+pub fn window_steps(lengths: &[usize], axes: &[WindowAxis], source: &[usize]) -> Vec<Steps> {
+    let stride = strides(source);
+    let frame = axes.iter().enumerate().map(|(a, w)| Steps::along(lengths[a], w.step * stride[a]));
+    frame.chain(lengths[axes.len()..].iter().zip(&stride).map(|(&len, &stride)| Steps::along(len, stride))).collect()
+}
+
+/// Pads the positions that windows read, or returns None when no axis pads or there are no windows.
+pub fn window_padding_steps(shape: &[usize], axes: &[WindowAxis], lengths: &[usize]) -> Option<Vec<Steps>> {
+    if !axes.iter().any(WindowAxis::padded) || lengths.contains(&0) { return None; }
+    let stride = strides(shape);
+    Some((0..shape.len()).map(|a| {
+        let Some(w) = axes.get(a) else { return Steps::along(shape[a], stride[a]) };
+        let before = if w.padded() { (w.size - 1) / 2 } else { 0 };
+        let len = (lengths[a] - 1) * w.step + w.size;
+        Steps::padded(-(before as i128), len, shape[a], stride[a], w.edge.unwrap_or(Edge::Fill))
+    }).collect())
+}
+
+
+/// Windows over the leading axes of an array of one shape: a `WindowAxis` for each, and the lengths that `windowed` gives, the frame that counts the windows along each axis followed by the shape of one window.
 #[derive(Clone, Debug)]
-pub struct Windows { shape: Vec<usize>, stride: Vec<usize>, axes: Vec<WindowAxis>, frame: Vec<usize>, cell: Vec<usize> }
+pub struct Windows { shape: Vec<usize>, axes: Vec<WindowAxis>, lengths: Vec<usize> }
 
 impl Windows {
-    /// The windows of `sizes` and `moves` over the leading axes of `shape`. A size's magnitude is the window's size, and `edge` gives the edge mode of each size's axis, or `None` for an axis that doesn't pad. An axis with no move moves by 1.
-    pub fn new(sizes: &[i64], moves: &[i64], edge: impl Fn(i64) -> Option<Edge>, shape: &[usize]) -> Result<Self, Error> {
-        if sizes.len() > shape.len() { return Err(Error::new(Kind::Rank, "window specification has more axes than its argument")); }
+    /// The windows of `sizes` and `moves` over the leading axes of `shape`. Each size is a `Count`: its magnitude is the window's size, and `edge` gives the edge mode of its axis from it, or `None` for an axis that doesn't pad. An axis with no move moves by 1.
+    pub fn new(sizes: &[i64], moves: &[i64], edge: impl Fn(Count) -> Option<Edge>, shape: &[usize]) -> Result<Self, Error> {
         if moves.len() > sizes.len() { return Err(Error::new(Kind::Length, "window specification has more movements than sizes")); }
-        let axes = sizes.iter().zip(shape).enumerate().map(|(a, (&size, &len))| {
+        let axes = sizes.iter().enumerate().map(|(a, &size)| {
             let step = match moves.get(a) {
-                None => 1, Some(&m) if m > 0 => usize::try_from(m).unwrap_or(usize::MAX),
+                None => 1, Some(&m) if m > 0 => Count::of(m).magnitude,
                 Some(_) => return Err(Error::new(Kind::Domain, "window movements must be positive"))
             };
-            let axis = WindowAxis { size: usize::try_from(size.unsigned_abs()).unwrap_or(usize::MAX), step, edge: edge(size) };
+            let size = Count::of(size);
+            let axis = WindowAxis { size: size.magnitude, step, edge: edge(size) };
             if axis.padded() && axis.size == 0 { return Err(Error::new(Kind::Domain, "padded window sizes must be positive")); }
-            if axis.fits(len) { Ok(axis) } else { Err(Error::new(Kind::Domain, "padded window is too large for the argument")) }
+            Ok(axis)
         }).collect::<Result<Vec<_>, _>>()?;
-        let frame = axes.iter().zip(shape).map(|(w, &n)| w.count(n)).collect();
-        let cell = axes.iter().map(|w| w.size).chain(shape[axes.len()..].iter().copied()).collect();
-        Ok(Self { shape: shape.to_vec(), stride: strides(shape), axes, frame, cell })
+        let lengths = windowed(shape, &axes)?;
+        Ok(Self { shape: shape.to_vec(), axes, lengths })
     }
     /// The number of windows along each windowed axis.
-    pub fn frame(&self) -> &[usize] { &self.frame }
+    pub fn frame(&self) -> &[usize] { &self.lengths[..self.axes.len()] }
     /// The shape of one window: the windows' sizes, then the argument's remaining axes.
-    pub fn cell(&self) -> &[usize] { &self.cell }
+    pub fn cell(&self) -> &[usize] { &self.lengths[self.axes.len()..] }
     /// The keys of the frame's axes. A padded axis keeps the key of the position each window centres on, and an unpadded axis has none.
     fn frame_keys(&self, layout: &Layout) -> Result<Vec<Option<Arc<Keys>>>, Error> {
         self.axes.iter().enumerate().map(|(a, w)| match layout.keys(a) {
-            Some(k) if w.padded() => k.select((0..self.frame[a]).map(|i| Some(i * w.step))).map(Some), _ => Ok(None)
+            Some(k) if w.padded() => k.select((0..self.lengths[a]).map(|i| Some(i * w.step))).map(Some), _ => Ok(None)
         }).collect()
     }
     /// The keys of one window's axes: none on a windowed axis, so that every window has one layout, and `layout`'s own on the others.
     fn cell_keys(&self, layout: &Layout) -> Vec<Option<Arc<Keys>>> {
-        (0..self.cell.len()).map(|a| if a < self.axes.len() { None } else { layout.keys(a).cloned() }).collect()
+        (0..self.cell().len()).map(|a| if a < self.axes.len() { None } else { layout.keys(a).cloned() }).collect()
     }
-    /// The plan that pads each padded axis by its edge mode, or `None` when no axis pads or there are no windows. Each padded axis of the result holds only the positions its windows read, and the result's unpadded windows are the padded windows of the argument.
+    /// The plan that pads each padded axis by its edge mode, or `None` when no axis pads or there are no windows (`window_padding_steps`). Each padded axis of the result holds only the positions its windows read, and the result's unpadded windows are the padded windows of the argument.
     pub fn padding(&self) -> Option<Plan> {
-        if !self.axes.iter().any(WindowAxis::padded) || self.frame.contains(&0) || self.cell.contains(&0) { return None; }
-        let steps: Vec<_> = (0..self.shape.len()).map(|a| {
-            let (n, stride) = (self.shape[a], self.stride[a]);
-            let Some(w) = self.axes.get(a) else { return Steps::along(n, stride) };
-            Steps::padded(w.start(0) as i128, (self.frame[a] - 1) * w.step + w.size, n, stride, w.edge.unwrap_or(Edge::Fill))
-        }).collect();
+        let steps = window_padding_steps(&self.shape, &self.axes, &self.lengths)?;
         let padded: Vec<_> = steps.iter().map(Steps::len).collect();
         Some(Plan { layout: padded.into(), steps })
     }
     /// The plan of every window over `layout`, which has the windows' shape: the frame's axes, then each window's axes. The windows read an array of shape `source`: `layout`'s shape, or the shape of `padding`'s result. The frame's axes have the keys that `frame_keys` gives, and each window's the keys that `cell_keys` gives.
     pub fn plan(&self, layout: &Layout, source: &[usize]) -> Result<Plan, Error> {
         let n = self.axes.len();
-        let shape = [self.frame.as_slice(), &self.cell].concat();
-        generated_len(&shape)?;
-        generated_len(&self.cell)?;
-        let stride = strides(source);
-        let frame = (0..n).map(|a| Steps::Stride { start: 0, len: self.frame[a], step: (self.axes[a].step * stride[a]) as isize });
-        let steps = frame.chain(self.cell.iter().zip(&stride).map(|(&len, &stride)| Steps::along(len, stride))).collect();
+        generated_len(&self.lengths)?;
+        generated_len(self.cell())?;
+        let steps = window_steps(&self.lengths, &self.axes, source);
         let keys = self.frame_keys(layout)?.into_iter().chain(self.cell_keys(layout)).collect();
-        let names = (0..n).chain(0..self.cell.len()).map(|a| layout.name(a).cloned()).collect();
-        Ok(Plan { layout: Layout::from(shape).with_keys(keys)?.inherit_names(names), steps })
+        let names = (0..n).chain(0..self.cell().len()).map(|a| layout.name(a).cloned()).collect();
+        Ok(Plan { layout: Layout::from(self.lengths.clone()).with_keys(keys)?.inherit_names(names), steps })
     }
 }
 
-/// How a copy walks its source: one entry for each axis of the copy, the source axis that each entry walks, and the offset of the positions on source axes that no entry walks. Axes that walk one source axis together read windows, as [`Windows::plan`] lays them out. Every reader of windows from `Steps` classifies them here: [`Walk::read`] gives what the axes along one source axis read, and [`Walk::windows`] gives the windows that `plan` laid out.
+/// How a copy walks its source: one entry for each axis of the copy, the source axis that each entry walks, and the offset of the positions on source axes that no entry walks. Axes that walk one source axis together read windows, as [`Windows::plan`] lays them out. Every reader of windows from `Steps` classifies them here: [`Walk::read`] gives what the axes along one source axis read.
 #[derive(Clone, Debug)]
 pub struct Walk {
     /// The offset of the positions on source axes that no entry walks.
@@ -749,24 +922,6 @@ impl Walk {
         }
         (first + last < n).then_some((first, read))
     }
-    /// The positions that the entries walking source axis `a`, of `n` items, read, where each one moves by 1 (`read`).
-    pub fn range(&self, a: usize, n: usize) -> Option<std::ops::Range<usize>> {
-        let (first, read) = self.read(a, n)?;
-        read.iter().all(|&[_, moves]| moves == 1).then(|| first..first + 1 + read.iter().map(|&[len, _]| len - 1).sum::<usize>())
-    }
-    /// The windows of a copy from `source`, laid out as [`Windows::plan`] lays them out without padding: frame axes, then window axes, then the source's other axes whole. Along each of the source's first axes, the frames start at 0 and move by a whole number of positions, and each frame is a window of consecutive positions. Gives each such axis's number of frames, window size and move. `None` for any other copy.
-    pub fn windows(&self, source: &[usize]) -> Option<Vec<[usize; 3]>> {
-        let s = self.steps.len().checked_sub(source.len())?;
-        if self.base != 0 || s == 0 || 2 * s > self.steps.len() { return None; }
-        if (s..source.len())
-            .any(|a| !matches!(self.steps[s + a], Steps::Stride { start: 0, len, step } if len == source[a] && step == self.strides[a] as isize)) {
-                return None;
-            }
-        (0..s).map(|a| {
-            if self.along[a] != Some(a) || self.along[s + a] != Some(a) { return None; }
-            match self.read(a, source[a])? { (0, read) => match read[..] { [[n, moves], [w, 1]] => Some([n, w, moves]), _ => None }, _ => None }
-        }).collect()
-    }
 }
 
 /// A fold along one or two axes of a copy whose axes walk windows of its source, run as sliding folds over the source's rows without building the windows ([`crate::reduce::sliding`] and [`crate::reduce::sliding_2d`]). [`Walk`] classifies the copy. Each folded axis is a window's axis that moves one position at a time along its source axis. The copy's other axes along that source axis move by 1, where the windows slide, or by whole windows, where they tile it, as pooling's do. basedpl folds its pending copies of windows this way, and the Python API its views of windows.
@@ -782,8 +937,6 @@ pub struct Slide {
     pub widths: Vec<usize>,
     /// The positions between the starts of each fold's windows, in the order of `dims`: 1 where they slide, and the width where they tile.
     pub every: Vec<usize>,
-    /// The shape of the folds' results: the source's shape, with each folded source axis holding one item for each start of its windows.
-    pub folded: Vec<usize>,
     /// The tables through which the copy without its folded axes reads the folds' results.
     pub tables: Vec<Steps>,
 }
@@ -819,8 +972,9 @@ impl Slide {
             }
             [[q1, lo1, len1, ..], [q2, lo2, len2, ..]] => {
                 let whole = lo1 == 0 && lo2 == 0 && len1 == source[q1] && len2 == source[q2];
+                if q1 == q2 || !whole { return None; }
                 let dims = vec![count(0..q1), source[q1], count(q1 + 1..q2), source[q2], count(q2 + 1..source.len())];
-                if q1 == q2 || !whole || dims[4] < 2 { return None; }
+                if dims[4] < 2 { return None; }
                 (0..count(0..source.len()), dims)
             }
             _ => return None,
@@ -838,7 +992,7 @@ impl Slide {
             }
             None => Steps::Stride { start: 0, len: shape[r], step: 0 },
         }).collect();
-        Some(Self { region, dims, widths: lanes.iter().map(|l| l[4]).collect(), every: lanes.iter().map(|l| l[3]).collect(), folded, tables, walk })
+        Some(Self { region, dims, widths: lanes.iter().map(|l| l[4]).collect(), every: lanes.iter().map(|l| l[3]).collect(), tables, walk })
     }
 }
 
@@ -856,18 +1010,33 @@ pub fn walked_source(tables: &[Steps], shape: &[usize], len: usize) -> Option<Ve
     Some(std::iter::once(len / largest).chain(units.windows(2).rev().map(|w| w[1] / w[0])).collect())
 }
 
-/// Sends axis `i` of `layout` to result axis `axes[i]`. Axes sent to the same result axis select their diagonal, at the shortest of their lengths. Every result axis from 0 to the largest destination needs a source. A result axis keeps the keys and name its source axes agree on.
-pub fn transpose(layout: &Layout, axes: &[usize]) -> Result<Plan, Error> {
-    let source = layout.shape();
+/// The lengths of `shape` transposed by `axes`, which sends axis `i` to result axis `axes[i]`. Axes sent to the same result axis select their diagonal, at the shortest of their lengths. Every result axis from 0 to the largest destination needs a source.
+pub fn transposed(shape: &[usize], axes: &[usize]) -> Result<Vec<usize>, Error> {
     let rank = axes.iter().max().map_or(0, |n| n + 1);
     if (0..rank).any(|r| !axes.contains(&r)) { return Err(Error::new(Kind::Rank, "transpose axes must be consecutive from 0")); }
-    if axes.len() != source.len() { return Err(Error::new(Kind::Length, "transpose needs one destination for each axis")); }
-    let mut shape = vec![usize::MAX; rank];
-    for (&axis, &len) in axes.iter().zip(source) { shape[axis] = shape[axis].min(len); }
-    let sources: Vec<Vec<_>> = (0..rank).map(|a| (0..axes.len()).filter(|&i| axes[i] == a).collect()).collect();
-    let mut stride = vec![0; rank];
-    for (&axis, step) in axes.iter().zip(strides(source)) { stride[axis] += step; }
-    let steps = shape.iter().zip(&stride).map(|(&len, &stride)| Steps::along(len, stride)).collect();
+    if axes.len() != shape.len() { return Err(Error::new(Kind::Length, "transpose needs one destination for each axis")); }
+    let (mut lengths, mut seen) = (vec![0usize; rank], 0u128);
+    for (&axis, &len) in axes.iter().zip(shape) {
+        lengths[axis] = if seen >> axis & 1 == 1 { lengths[axis].min(len) } else { len };
+        seen |= 1 << axis;
+    }
+    Ok(lengths)
+}
+
+/// The steps that read `shape` transposed by `axes`, one entry for each result axis (`transpose`).
+pub fn transpose_steps(shape: &[usize], axes: &[usize]) -> Result<Vec<Steps>, Error> {
+    let lengths = transposed(shape, axes)?;
+    let mut stride = vec![0usize; lengths.len()];
+    for (&axis, step) in axes.iter().zip(strides(shape)) { stride[axis] = stride[axis].saturating_add(step); }
+    Ok(lengths.iter().zip(&stride).map(|(&len, &stride)| Steps::along(len, stride)).collect())
+}
+
+/// Sends axis `i` of `layout` to result axis `axes[i]`, at the lengths that `transposed` gives. A result axis keeps the keys and name its source axes agree on.
+pub fn transpose(layout: &Layout, axes: &[usize]) -> Result<Plan, Error> {
+    let source = layout.shape();
+    let shape = transposed(source, axes)?;
+    let sources: Vec<Vec<_>> = (0..shape.len()).map(|a| (0..axes.len()).filter(|&i| axes[i] == a).collect()).collect();
+    let steps = transpose_steps(source, axes)?;
     Ok(Plan { layout: regrouped(layout, shape, &sources, &[])?, steps })
 }
 
@@ -904,20 +1073,26 @@ pub fn regrouped(layout: &Layout, shape: Vec<usize>, sources: &[Vec<usize>], nam
     Layout::from(shape).with_keys(keys)?.with_names(names)
 }
 
-/// The layout of `left` and `right` joined along `axis`. They must have the same rank, and the same lengths on their other axes. The joined axis has both sides' keys, with no key where a side has none, and each other axis has either side's keys. A name survives where both sides agree.
-pub fn catenate(left: &Layout, right: &Layout, axis: usize) -> Result<Layout, Error> {
-    let rank = left.shape().len();
-    if right.shape().len() != rank { return Err(Error::new(Kind::Rank, "catenate ranks differ")); }
+/// The lengths of `left` and `right` joined along `axis`: their lengths along it added. They must have the same rank, and the same lengths on their other axes.
+pub fn catenated(left: &[usize], right: &[usize], axis: usize) -> Result<Vec<usize>, Error> {
+    let rank = left.len();
+    if right.len() != rank { return Err(Error::new(Kind::Rank, "catenate ranks differ")); }
     if axis >= rank { return Err(Error::new(Kind::Domain, "catenate axis is outside result rank")); }
-    if (0..rank).any(|a| a != axis && left.shape()[a] != right.shape()[a]) { return Err(Error::new(Kind::Length, "catenate frames differ")); }
+    if (0..rank).any(|a| a != axis && left[a] != right[a]) { return Err(Error::new(Kind::Length, "catenate frames differ")); }
+    let mut shape = left.to_vec();
+    shape[axis] = left[axis].saturating_add(right[axis]);
+    Ok(shape)
+}
+
+/// The layout of `left` and `right` joined along `axis`, with the lengths that `catenated` gives. The joined axis has both sides' keys, with no key where a side has none, and each other axis has either side's keys. A name survives where both sides agree.
+pub fn catenate(left: &Layout, right: &Layout, axis: usize) -> Result<Layout, Error> {
+    let shape = catenated(left.shape(), right.shape(), axis)?;
+    generated_len(&shape)?;
     let names = |k: Option<&Arc<Keys>>, n: usize| k.map_or_else(|| vec![None; n], |k| k.names().to_vec());
-    let keys = (0..rank).map(|a| match (left.keys(a), right.keys(a)) {
+    let keys = (0..shape.len()).map(|a| match (left.keys(a), right.keys(a)) {
         (x, y) if a != axis => Ok(x.or(y).cloned()), (None, None) => Ok(None),
         (x, y) => Keys::partial([names(x, left.shape()[a]), names(y, right.shape()[a])].concat()).map(Some)
     }).collect::<Result<_, Error>>()?;
-    let mut shape = left.shape().to_vec();
-    shape[axis] = shape[axis].checked_add(right.shape()[axis]).ok_or_else(|| Error::new(Kind::Limit, "catenate axis overflow"))?;
-    generated_len(&shape)?;
-    let names = (0..rank).map(|a| agreed([left.name(a), right.name(a)])).collect();
+    let names = (0..shape.len()).map(|a| agreed([left.name(a), right.name(a)])).collect();
     Ok(Layout::from(shape).with_keys(keys)?.inherit_names(names))
 }

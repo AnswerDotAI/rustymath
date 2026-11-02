@@ -2,7 +2,7 @@
 use crate::{array::{Array, core, give}, convert::{self, Arg, released}, functions::{Axes, Axis}};
 use pyo3::{exceptions::{PyIndexError, PyTypeError, PyValueError}, prelude::*, types::PyTuple};
 use rustymath::{
-    array::{Array as Core, ArrayView}, buffer::{Buffer, DType, Element, Fill}, error::Error, layout::{Layout, element_count, generated_len, position},
+    array::Array as Core, buffer::{Buffer, DType, Element}, error::Error, layout::{Layout, element_count, generated_len, position},
     structure::{self, Edge, Edged, Plan, Selector}
 };
 use rustymath_buffer::py_err;
@@ -12,11 +12,12 @@ fn at(n: i64, size: usize) -> PyResult<usize> {
     position(n, size).ok_or_else(|| PyIndexError::new_err(format!("position {n} is outside an axis of length {size}")))
 }
 fn array_selector(layout: &Layout, axis: usize, obj: &Bound<'_, PyAny>) -> PyResult<(Selector, bool)> {
-    indexed(layout, axis, convert::one(obj)?.into_core()?.compact())
+    indexed(layout, axis, convert::one(obj)?.into_core()?)
 }
 /// The selector that the compact index values `indices` make on `axis` of `layout`.
 fn indexed(layout: &Layout, axis: usize, indices: Core) -> PyResult<(Selector, bool)> {
-    rustymath_buffer::selection::array_selector(layout, axis, indices.layout().clone(), Arc::new(indices))
+    let (index_layout, indices) = indices.into_compact();
+    rustymath_buffer::selection::array_selector(layout, axis, index_layout, Arc::new(indices))
 }
 fn selector(layout: &Layout, axis: usize, obj: &Bound<'_, PyAny>) -> PyResult<Selector> {
     rustymath_buffer::selection::selector(layout, axis, obj, || array_selector(layout, axis, obj)).map(|(s, _)| s)
@@ -26,9 +27,9 @@ fn mode_named(name: &str) -> PyResult<Edge> {
     Edge::named(name)
         .ok_or_else(|| PyValueError::new_err(format!("unknown mode {name:?}, which must be one of {}", Edge::MODES.map(|(n, _)| format!("{n:?}")).join(", "))))
 }
-/// `fill`, a Python value, as a fill of `x`'s dtype. It must be one item that keeps its value at that dtype (`Fill::new`).
-fn fill_of(x: &Arg, fill: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Arc<Fill>>> {
-    fill.map(|f| Fill::new(convert::one(f)?.row_major()?.view(), x.view().dtype()).map(Arc::new).map_err(py_err)).transpose()
+/// A chosen fill is one compact scalar source at the argument's dtype.
+fn fill_of(fill: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Arc<Buffer>>> {
+    fill.map(|f| convert::one(f)?.into_core().map(|c| Arc::new(c.into_compact().1))).transpose()
 }
 /// The selector that `indices` make on `axis` of `layout` under `edge`: each index reads the position that `edge` gives it on the axis, or the fill where it gives none (`Edge::positions`).
 fn edged(layout: &Layout, axis: usize, indices: &Bound<'_, PyAny>, edge: Edge) -> PyResult<Selector> {
@@ -37,8 +38,8 @@ fn edged(layout: &Layout, axis: usize, indices: &Bound<'_, PyAny>, edge: Edge) -
     let buffer = match positions { Edged::Positions(p) => i64::buffer(p.into_iter().map(|p| p as i64).collect()), Edged::Floats(f) => f64::buffer(f) };
     Ok(indexed(layout, axis, Core::new(indices.layout().clone(), buffer).map_err(py_err)?)?.0)
 }
-pub fn selection(layout: &Layout, index: &Bound<'_, PyAny>) -> PyResult<Plan> {
-    rustymath_buffer::selection::selection(layout, index, |p| {
+pub fn selection(layout: &Layout, index: &Bound<'_, PyAny>, writes: bool) -> PyResult<Plan> {
+    rustymath_buffer::selection::selection(layout, index, writes, |p| {
         if let Ok(a) = p.cast::<Array>() { return Ok(structure::sole_name(a.borrow().core().layout()).map(str::to_owned)); }
         Ok(if p.hasattr("__rustymath_array__")? {
             rustymath_buffer::read_array(p)?.and_then(|(_, layout)| structure::sole_name(&layout).map(str::to_owned))
@@ -127,7 +128,7 @@ pub fn squeeze(py: Python<'_>, x: &Bound<'_, PyAny>, axis: Option<Axes>) -> PyRe
         Some(Axes::Many(axes)) => axes.iter().map(|a| a.of(&layout)).collect::<PyResult<Vec<_>>>()?
     };
     if axes.iter().any(|&a| layout.shape()[a] != 1) { return Err(PyValueError::new_err("squeeze axes must have length one")); }
-    let selectors = layout.shape().iter().enumerate().map(|(a, &n)| if axes.contains(&a) { Selector::At(0) } else { Selector::all(n) }).collect::<Vec<_>>();
+    let selectors = layout.shape().iter().enumerate().map(|(a, _)| if axes.contains(&a) { Selector::At(0) } else { Selector::All }).collect::<Vec<_>>();
     planned(py, x, |layout| structure::select(layout, selectors, false))
 }
 
@@ -140,7 +141,7 @@ pub fn take(
     let (layout, axis) = along(&x, axis)?;
     let selector = if mode == "raise" { selector(&layout, axis, indices)? } else { edged(&layout, axis, indices, mode_named(mode)?)? };
     let plan = structure::select_axis(&layout, axis, selector).map_err(py_err)?;
-    Ok(Array::new(x.selected(py, plan, fill_of(&x, fill)?)?))
+    Ok(Array::new(x.selected(py, plan, fill_of(fill)?)?))
 }
 
 #[pyfunction]
@@ -166,7 +167,7 @@ pub fn flip(py: Python<'_>, x: &Bound<'_, PyAny>, axis: Option<Axis>) -> PyResul
     let layout = x.view().layout();
     let selected = axis.map(|a| a.of(&layout)).transpose()?;
     let selectors: Vec<_> = layout.shape().iter().enumerate()
-        .map(|(a, &n)| if selected.is_none_or(|s| s == a) { Selector::Range { start: n.saturating_sub(1), len: n, step: -1 } } else { Selector::all(n) })
+        .map(|(a, &n)| if selected.is_none_or(|s| s == a) { Selector::Range { start: n.saturating_sub(1), len: n, step: -1 } } else { Selector::All })
         .collect();
     planned(py, x, |layout| structure::select(layout, selectors, false))
 }
@@ -180,7 +181,7 @@ pub fn concatenate(py: Python<'_>, arrays: Vec<Bound<'_, PyAny>>, axis: Option<A
     let first = call.args.first().ok_or_else(|| PyValueError::new_err("concatenate needs at least one array"))?;
     let at = axis.map(|a| a.of(&first.layout())).transpose()?;
     let layouts: Vec<_> = call.args.iter().map(|a| if at.is_some() { a.layout() } else { Layout::from([a.view().len()]) }).collect();
-    let pairs: Vec<_> = layouts.iter().zip(&call.args).map(|(l, a)| ArrayView::new(l, a.view().storage(), a.view().mapping())).collect();
+    let pairs: Vec<_> = layouts.iter().zip(&call.args).map(|(l, a)| a.view().with_layout(l).map_err(py_err)).collect::<PyResult<_>>()?;
     Ok(Array::new(released(py, || Core::concatenate(&pairs, at.unwrap_or(0))).map_err(py_err)?))
 }
 
@@ -194,7 +195,7 @@ pub fn stack(py: Python<'_>, arrays: Vec<Bound<'_, PyAny>>, axis: i64) -> PyResu
     let at = at(axis, first.layout().shape().len() + 1)?;
     let layouts =
         call.args.iter().map(|a| structure::select_axis(&a.layout(), at, Selector::NewAxis).map(|p| p.layout).map_err(py_err)).collect::<PyResult<Vec<_>>>()?;
-    let pairs: Vec<_> = layouts.iter().zip(&call.args).map(|(l, a)| ArrayView::new(l, a.view().storage(), a.view().mapping())).collect();
+    let pairs: Vec<_> = layouts.iter().zip(&call.args).map(|(l, a)| a.view().with_layout(l).map_err(py_err)).collect::<PyResult<_>>()?;
     Ok(Array::new(released(py, || Core::concatenate(&pairs, at)).map_err(py_err)?))
 }
 
@@ -242,7 +243,7 @@ pub fn pad(py: Python<'_>, x: &Bound<'_, PyAny>, pad_width: &Bound<'_, PyAny>, m
     else if let Ok(pair) = pad_width.extract::<(usize, usize)>() { vec![pair; rank] }
     else { pad_width.extract::<Vec<(usize, usize)>>()? };
     let plan = structure::pad(&x.layout(), &widths, mode_named(mode)?).map_err(py_err)?;
-    Ok(Array::new(x.selected(py, plan, fill_of(&x, fill)?)?))
+    Ok(Array::new(x.selected(py, plan, fill_of(fill)?)?))
 }
 
 /// One count, or one count for each axis, as `windows` takes its sizes and steps.
@@ -262,14 +263,14 @@ pub fn windows(py: Python<'_>, x: &Bound<'_, PyAny>, size: Counts, step: Counts,
     if sizes.iter().any(|&n| n < 0) { return Err(PyValueError::new_err("window sizes must be nonnegative")); }
     let mode = mode.map(mode_named).transpose()?;
     let x = convert::one(x)?;
-    let fill = fill_of(&x, fill)?;
+    let fill = fill_of(fill)?;
     let source = x.into_core()?;
     let windows = structure::Windows::new(&sizes, &step.counts(sizes.len()), |_| mode, source.layout().shape()).map_err(py_err)?;
     released(py, || match windows.padding() {
         None => source.selected(windows.plan(source.layout(), source.layout().shape())?, None),
         Some(padding) => {
             let plan = windows.plan(source.layout(), padding.layout.shape())?;
-            source.selected(padding, fill)?.compact().selected(plan, None)
+            source.selected(padding, fill)?.selected(plan, None)
         }
     }).map(Array::new).map_err(py_err)
 }

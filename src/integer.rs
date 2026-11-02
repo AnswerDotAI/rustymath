@@ -272,3 +272,11 @@ exactly! {
 forms!(Floor at u8, i16, i32, i64, bool: |_, [x]| x);
 forms!(Ceil at u8, i16, i32, i64, bool: |_, [x]| x);
 forms!(Abs at bool: |_, [x]| x);
+
+pub(crate) fn native_power(variant: crate::facts::Variant, x: i64, y: i64) -> Option<i64> {
+    let (value, exact) = wrapped_power(x, y);
+    if y < 0 && !exact { return None; }
+    let fits = exact && match variant.dtype { crate::buffer::DType::Integer(width) => width.holds(value), _ => true };
+    if variant.checked && !variant.wrapping && !fits { (crate::error::Kind::Overflow.reporter())(); }
+    Some(value)
+}

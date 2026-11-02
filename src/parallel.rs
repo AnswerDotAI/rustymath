@@ -277,7 +277,10 @@ mod pool {
     /// Runs `f` on each of `count` pieces across the pool of `threads` threads, and gives whether every call said `true`.
     pub(super) fn run(threads: usize, count: usize, f: &(dyn Fn(usize) -> bool + Sync)) -> bool {
         use rayon::prelude::*;
-        get(threads).install(|| (0..count).into_par_iter().map(f).reduce(|| true, |a, b| a & b))
+        let error = crate::error::ErrorSlot::current();
+        get(threads).install(|| (0..count).into_par_iter().map(|item| {
+            match &error { Some(slot) => slot.within(|| f(item)), None => f(item) }
+        }).reduce(|| true, |a, b| a & b))
     }
 }
 

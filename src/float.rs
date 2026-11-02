@@ -185,13 +185,10 @@ macro_rules! native {
             fn mla<const FUSED: bool>(self, b: $t, c: $t) -> $t { if FUSED { self.mul_add(b, c) } else { self * b + c } }
             // The low bits of `z` hold n. Adding the bias to them and shifting them into the exponent field gives 2^n. Integer adds and shifts vectorize on every target, where a conversion from a float to a 64-bit integer doesn't on x86-64.
             #[inline]
-            fn pow2(z: $t) -> $t { $t::from_bits(z.to_bits().wrapping_add($bias) << $mantissa) }
-            // e comes from the exponent field of `self÷0.75`, converted through `from_low`.
+            fn pow2(z: $t) -> $t { crate::recipe::pow2(&crate::recipe::Floats, z) }
             #[inline]
             fn split(self) -> ($t, $t) {
-                let exponent = ((self * (1.0 / 0.75)).to_bits() >> $mantissa) & (2 * $bias + 1);
-                let m = $t::from_bits(self.to_bits().wrapping_sub(exponent.wrapping_sub($bias) << $mantissa));
-                (m, Self::from_low(exponent, $bias as $t))
+                crate::recipe::split(&crate::recipe::Floats, self)
             }
             // Subtracting the smallest normal float's top bits wraps zero and the subnormals around to the top, where negative floats' top bits already lie. Only positive normal floats then lie below infinity's top bits less the same amount.
             #[inline(always)]
@@ -252,31 +249,23 @@ impl Float for half::f16 {
 /// The polynomial with coefficients `c`, highest degree first, at `x`, by Horner's rule. The coefficients convert to `R` when the compiler inlines the call.
 #[inline]
 pub(crate) fn horner<R: Native, const FUSED: bool, const N: usize>(x: R, c: [f64; N]) -> R {
-    let mut y = R::narrow(c[0]);
-    for &k in &c[1..] { y = y.mla::<FUSED>(x, R::narrow(k)); }
-    y
+    crate::recipe::horner(&crate::recipe::NativeOps::<FUSED>::DEFAULT, x, &c)
 }
 
 /// ln 2, split into a part whose product with any whole number up to 2^11 at f64 or 2^8 at f32 is exact, and the rest. That covers every exponent of a float and every n that `exp` reduces by.
 #[inline]
 pub(crate) fn ln2<R: Native>() -> (R, R) {
-    let (hi, lo) = if R::WIDE { (0.69314718055966295651160180568695068359375, 0.28235290563031577122588448175013436025525412068e-12) }
-    else { (0.693145751953125, 1.428606765330187e-06) };
-    (R::narrow(hi), R::narrow(lo))
+    crate::recipe::ln2(&crate::recipe::Floats)
 }
 
 /// y × 2^n, for a whole n, in two factors. The first multiplication is exact, so a result below the normal floats rounds once, in the second.
 #[inline]
 pub(crate) fn pow2_times<R: Native, const FUSED: bool>(y: R, n: R) -> R {
-    let half = n.mla::<FUSED>(R::narrow(0.5), R::SHIFT);
-    y * R::pow2(half) * R::pow2(n - (half - R::SHIFT) + R::SHIFT)
+    crate::recipe::ldexp(&crate::recipe::NativeOps::<FUSED>::DEFAULT, y, n)
 }
 
 /// (m, e) with x = m × 2^e, m from 0.75 to 1.5 and e whole, for a positive x, subnormals included. A subnormal x scales up by 2^64 first, so that its bits split as a normal float's do.
 #[inline]
 pub(crate) fn split_positive<R: Native>(x: R) -> (R, R) {
-    // The scale is chosen before the one product. Choosing between x and its scaled value made LLVM split both and choose between their parts, a second split for every item.
-    let k = if x < R::min_positive_value() { R::narrow(64.0) } else { R::zero() };
-    let (m, e) = (x * R::pow2(R::SHIFT + k)).split();
-    (m, e - k)
+    crate::recipe::frexp(&crate::recipe::Floats, x)
 }

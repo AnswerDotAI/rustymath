@@ -1,5 +1,21 @@
 pub mod support;
 
+#[cfg(not(target_arch = "wasm32"))]
+mod timing {
+    #[test]
+    fn hold_modes_and_lifetimes() {
+        use rustymath::timing::{exclusive, shared};
+        use std::io::ErrorKind::InvalidInput;
+        let first = shared().unwrap();
+        let last = shared().unwrap();
+        drop(first);
+        assert_eq!(exclusive().err().unwrap().kind(), InvalidInput);
+        drop(last);
+        let _timing = exclusive().unwrap();
+        for result in [shared(), exclusive()] { assert_eq!(result.err().unwrap().kind(), InvalidInput); }
+    }
+}
+
 mod arith {
     use rustymath::{Abs, Add, Binary, Multiply, Sign, Subtract, Unary};
 
@@ -57,7 +73,6 @@ mod convert {
 }
 
 mod distribution {
-    use crate::support::seeded;
     use rustymath::distribution::*;
     use rustymath::{Arg, Unary};
 
@@ -99,10 +114,10 @@ mod distribution {
     #[test]
     fn samples_follow_cdfs() {
         const N: usize = 20_000;
-        let mut rng = seeded(1);
+        let key = rustymath::random::Key::seeded(1);
         let mut out = vec![0.0; N];
-        for d in cases() {
-            d.samples(&mut rng, &mut out);
+        for (c, d) in cases().into_iter().enumerate() {
+            d.samples(&mut rustymath::random::Items::new(key.stream(c as u64), d.words()), &mut out);
             for p in [0.1, 0.5, 0.9] {
                 let x = d.quantile(p);
                 let c = d.cdf(x);
@@ -111,7 +126,7 @@ mod distribution {
             }
         }
         let mut one = [0.0; 1];
-        Distribution::poisson(0.0).unwrap().samples(&mut rng, &mut one);
+        Distribution::poisson(0.0).unwrap().samples(&mut rustymath::random::Items::new(key.stream(99), 1), &mut one);
         assert_eq!(one[0], 0.0);
     }
 
@@ -488,11 +503,11 @@ mod operation {
     use rustymath::{kernels, reduce};
     #[test]
     fn kernels_follow_forms() {
-        let (b, i16, i64, f16, f32, f64, c64) = (DType::Boolean, DType::Integer(Width::I16), DType::Integer(Width::I64), DType::Float(FloatWidth::F16),
+        let (b, i16, i32, i64, f16, f32, f64, c64) = (DType::Boolean, DType::Integer(Width::I16), DType::Integer(Width::I32), DType::Integer(Width::I64), DType::Float(FloatWidth::F16),
             DType::Float(FloatWidth::F32), DType::Float(FloatWidth::F64), DType::Complex(ComplexWidth::F32));
         // `Exp` has real and complex forms, so Booleans and integers compute in the narrowest float that holds them exactly, but at least `f32`, and characters have no kernel.
         let exp = kernels!(Unary rustymath::Exp);
-        assert_eq!([b, i16, i64, f16, f32, c64].map(|d| exp.computes(d)), [Some(f32), Some(f32), Some(f64), Some(f16), Some(f32), Some(c64)]);
+        assert_eq!([b, i16, i32, i64, f16, f32, c64].map(|d| exp.computes(d)), [Some(f32), Some(f32), Some(f64), Some(f64), Some(f16), Some(f32), Some(c64)]);
         assert_eq!(exp.computes(DType::Character), None);
         // `Add` has integer forms, so Booleans compute as `i64`.
         assert_eq!(kernels!(Binary rustymath::Add).computes(b), Some(i64));
@@ -503,6 +518,7 @@ mod operation {
         assert_eq!([b, DType::Character].map(|d| equal.computes(d)), [Some(b), None]);
         // A sum of a narrow integer type has its own fold, whose totals are `i64`.
         let sum = kernels!(Fold reduce::Sum);
+        assert_eq!(sum.computes(b), Some(i64));
         let (totals, ok) = sum.run(&reduce::Sum, Buffer::Integers(rustymath::buffer::IntBuf::I16(vec![1, 2, 3, 4])).view(), [2, 2, 1], None).unwrap();
         assert!(ok && matches!(totals, Buffer::Integers(rustymath::buffer::IntBuf::I64(ref t)) if *t == [3, 7]));
         // An integer argument to `Exp` casts to `f64`, and broadcasting pairs a scalar with every item.
@@ -1048,44 +1064,89 @@ mod polynomial {
 }
 
 mod random {
-    use crate::support::seeded;
     use rustymath::Arg;
     use rustymath::random::*;
 
     #[test]
     fn rolls_and_deals() {
-        let mut rng = seeded(1);
+        let key = Key::seeded(1);
         let mut out = vec![9];
-        roll(Arg::One(6), 60_000, &mut rng, &mut out);
+        roll(Arg::One(6), 60_000, &mut Items::new(key.stream(0), 1), &mut out);
         assert_eq!(out[0], 9);
         let counts = (0..6).map(|k| out[1..].iter().filter(|&&r| r == k).count());
         assert!(counts.into_iter().all(|c| (9_000..11_000).contains(&c)));
         let bounds: Vec<u64> = (1..=1000).collect();
         let mut rolls = Vec::new();
-        roll(Arg::Many(&bounds), 1000, &mut rng, &mut rolls);
+        roll(Arg::Many(&bounds), 1000, &mut Items::new(key.stream(1), 1), &mut rolls);
         assert!(rolls.iter().zip(&bounds).all(|(r, b)| r < b));
         let mut dealt = Vec::new();
-        deal(50, 60, &mut rng, &mut dealt);
+        deal(50, 60, key.stream(2), &mut dealt);
         dealt.sort_unstable();
         dealt.dedup();
         assert!(dealt.len() == 50 && dealt.iter().all(|&d| d < 60));
     }
 
-    // A seed gives the numbers that `rand`'s `Uniform` gives for each bound, from one bound or one for each draw, also for bounds near 2⁶³, where about half the draws reject a word.
+    // Each draw is the number that `rand`'s `Uniform` gives for its bound from its item's words, from one bound or one for each draw, also for bounds near 2⁶³, where about half the items reject their packed word and read their regions.
     #[test]
     fn rolls_match_rand() {
         use rand::distr::{Distribution, Uniform};
         let mixed: Vec<u64> = (0..2000).map(|k| if k % 7 == 0 { (1 << 63) + 1 } else { k + 1 }).collect();
-        for b in [1, 6, 1 << 63, (1 << 63) + 1, u64::MAX] {
-            let (mut ours, mut theirs) = (seeded(2), seeded(2));
-            let ones = vec![b; 2000];
+        let rolled = |number: u64, bounds: Arg<'_, u64>| {
             let mut out = Vec::new();
-            roll(Arg::One(b), 2000, &mut ours, &mut out);
-            roll(Arg::Many(&ones), 2000, &mut ours, &mut out);
-            roll(Arg::Many(&mixed), 2000, &mut ours, &mut out);
-            out.push(below(b, &mut ours));
-            let bounds = [&ones[..], &ones, &mixed, &[b]].concat();
-            assert_eq!(out, bounds.iter().map(|&b| Uniform::new(0, b).unwrap().sample(&mut theirs)).collect::<Vec<_>>());
+            roll(bounds, 2000, &mut Items::new(Key::seeded(2).stream(number), 1), &mut out);
+            out
+        };
+        let theirs = |number: u64, bounds: &[u64]| {
+            let mut items = Items::new(Key::seeded(2).stream(number), 1);
+            bounds.iter().map(|&b| Uniform::new(0, b).unwrap().sample(&mut items.item())).collect::<Vec<_>>()
+        };
+        for b in [1, 6, 1 << 63, (1 << 63) + 1, u64::MAX] {
+            let ones = vec![b; 2000];
+            assert_eq!(rolled(0, Arg::One(b)), theirs(0, &ones));
+            assert_eq!(rolled(1, Arg::Many(&ones)), theirs(1, &ones));
+            assert_eq!(rolled(2, Arg::Many(&mixed)), theirs(2, &mixed));
+            assert_eq!(below(b, &mut Items::new(Key::seeded(2).stream(0), 1).item()), theirs(0, &ones)[0]);
         }
+    }
+}
+
+mod circle_real_parts {
+    use num_complex::Complex64;
+    use rustymath::{
+        Asinh, Atan, Cos, Cosh, Forms, RealAcos, RealAcosh, RealAsin, RealAtanh, RealPart, RealSqrt1mx2, RealSqrtm1mx2, RealSqrtx2m1, Sin, Sinh, Sqrt1px2, Tan, Tanh, Unary,
+        derivative::{Partials, Slope},
+    };
+
+    /// `k`, the real part of a code of `○`, at real arguments inside and outside its real domain: the real part of its complex form there, and a slope that matches a central difference away from ±1.
+    fn check<K: Unary<f64, Out = f64> + Unary<Complex64, Out = f64> + Partials<1> + Copy + Sync>(k: K, name: &str) {
+        for x in [-3.0, -1.5, -0.5, 0.0, 0.3, 0.9, 1.5, 4.0] {
+            let (real, complex) = (Unary::<f64>::one(&k, x), Unary::<Complex64>::one(&k, Complex64::new(x, 0.0)));
+            assert!((real - complex).abs() <= 1e-14 * real.abs().max(1.0), "{name}({x}): {real} against the complex form's {complex}");
+            let h = 1e-6;
+            let difference = (Unary::<f64>::one(&k, x + h) - Unary::<f64>::one(&k, x - h)) / (2.0 * h);
+            let slope = Forms::<f64, 2>::scalar(&Slope(k), [x, real]);
+            assert!((slope - difference).abs() <= 1e-6 * difference.abs().max(1.0), "{name}'s slope at {x}: {slope} against {difference}");
+        }
+    }
+
+    #[test]
+    fn real_parts() {
+        check(RealSqrt1mx2, "RealSqrt1mx2");
+        check(RealSqrtx2m1, "RealSqrtx2m1");
+        check(RealAsin, "RealAsin");
+        check(RealAcos, "RealAcos");
+        check(RealAcosh, "RealAcosh");
+        check(RealAtanh, "RealAtanh");
+        check(RealSqrtm1mx2(false), "RealSqrtm1mx2(false)");
+        check(RealSqrtm1mx2(true), "RealSqrtm1mx2(true)");
+        check(RealPart(Sin), "RealPart(Sin)");
+        check(RealPart(Cos), "RealPart(Cos)");
+        check(RealPart(Tan), "RealPart(Tan)");
+        check(RealPart(Sqrt1px2), "RealPart(Sqrt1px2)");
+        check(RealPart(Sinh), "RealPart(Sinh)");
+        check(RealPart(Cosh), "RealPart(Cosh)");
+        check(RealPart(Tanh), "RealPart(Tanh)");
+        check(RealPart(Atan), "RealPart(Atan)");
+        check(RealPart(Asinh), "RealPart(Asinh)");
     }
 }

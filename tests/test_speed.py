@@ -5,6 +5,13 @@ import numpy as np, pytest, rustymath as rm
 
 N, RUNS = 65_536, 5
 
+@pytest.mark.skipif(os.name == 'nt', reason='Python timing coordination requires Unix flock')
+def test_timing_lock_protocol():
+    "Rust's timing hold excludes Python readers of the same lock file."
+    import fcntl
+    from fastws.timelock import LOCK
+    with rm.timing(), open(LOCK, 'a') as f, pytest.raises(BlockingIOError): fcntl.flock(f, fcntl.LOCK_SH | fcntl.LOCK_NB)
+
 def arrays():
     "The arrays that the cases name. Each case's main input holds `N` items."
     rng = np.random.default_rng(0)

@@ -59,7 +59,7 @@ forms!(#[inline] Subtract at Complex<f32>, Complex<f64>: |_, [x, y]| Total(x - y
 forms!(#[inline] Multiply at Complex<f32>, Complex<f64>: |_, [x, y]| Total(x * y));
 forms!(#[inline] Divide at real: |_, [x, y]| Total(x / y));
 forms!(#[inline] Divide at Complex<f32>, Complex<f64>: |_, [x, y]| Total(crate::divide(x, y)));
-forms!(#[inline] MathishDivide at real: |_, [x, y]| Total(mathish_divide(x, y)));
+forms!(#[inline] MathishDivide at real: |k, [x, y]| Total(crate::facts::formula_at(k, [x, y])));
 forms!(#[inline] MathishDivide at Complex<f32>, Complex<f64>: |_, [x, y]| Total(if both_zero(x, y) { x } else { crate::divide(x, y) }));
 
 /// -x. A float or complex result never fails. An integer result fails where it doesn't fit its type, as the negation of a signed type's least value or of an unsigned byte other than 0 doesn't, and holds the result wrapped to the type.
@@ -77,38 +77,30 @@ pub struct WholeDivide;
 forms!(#[inline] Negate at real: |_, [x]| Total(-x));
 forms!(#[inline] Negate at Complex<f32>, Complex<f64>: |_, [x]| Total(-x));
 forms!(#[inline] Negate at u8, i16, i32, i64: |_, [x]| { let (r, overflowed) = x.overflowing_neg(); (r, !overflowed) });
-forms!(#[inline] Reciprocal at real: |_, [x]| Total(reciprocal(x)));
+forms!(#[inline] Reciprocal at real: |k, [x]| Total(crate::facts::formula_at(k, [x])));
 forms!(#[inline] Reciprocal at Complex<f32>, Complex<f64>: |_, [x]| Total(crate::divide(Complex::new(1.0, 0.0), x)));
 forms!(#[inline] Reciprocal at u8, i16, i32, i64: |_, [x]| (x.checked_mul(x) == Some(1)).then_some(x));
-forms!(#[inline] PiTimes at real: |_, [x]| Total(pi_times(x)));
-forms!(#[inline] PiTimes at real: |_, [x, y]| Total(pi_ratio(x, y)));
+forms!(#[inline] PiTimes at real: |k, [x]| Total(crate::facts::formula_at(k, [x])));
+forms!(#[inline] PiTimes at real: |k, [x, y]| Total(crate::facts::formula_at(k, [x, y])));
 forms!(#[inline] PiTimes at Complex<f32>: |_, [x]| Total(x * std::f32::consts::PI));
 forms!(#[inline] PiTimes at Complex<f64>: |_, [x]| Total(x * std::f64::consts::PI));
 forms!(#[inline] PiTimes at Complex<f32>: |_, [x, y]| Total(crate::divide(x, y) * std::f32::consts::PI));
 forms!(#[inline] PiTimes at Complex<f64>: |_, [x, y]| Total(crate::divide(x, y) * std::f64::consts::PI));
 forms!(#[inline] WholeDivide at u8, i16, i32, i64: |_, [x, y]| if x.checked_rem(y) == Some(0) { x.checked_div(y) } else { None });
 
-/// `recipe`'s formulas on one float, which the kernels above compute.
-#[inline(always)]
-fn reciprocal<F: crate::Float>(x: F) -> F { crate::recipe::reciprocal::<F, _>(&crate::recipe::Floats, x) }
-#[inline(always)]
-fn pi_times<F: crate::Float>(x: F) -> F { crate::recipe::pi_times::<F, _>(&crate::recipe::Floats, x) }
-#[inline(always)]
-fn pi_ratio<F: crate::Float>(x: F, y: F) -> F { crate::recipe::pi_ratio::<F, _>(&crate::recipe::Floats, x, y) }
-#[inline(always)]
-fn mathish_divide<F: crate::Float>(x: F, y: F) -> F { crate::recipe::mathish_divide::<F, _>(&crate::recipe::Floats, x, y) }
-
 /// Applies the Boolean function whose truth table is `table`, indexed by `2*x+y`, to every bit of `x` and `y`, the leading sign bits included. It computes the table's algebraic normal form, `a0 ^ (a1 & x) ^ (a2 & y) ^ (a3 & x & y)`, with each coefficient spread to every bit, so every table runs the same code. A `match` on the table would put 16 paths into each loop that inlines it. It takes any integer type, exact ones included.
 #[inline]
 pub fn bitwise<T>(table: u8, x: T, y: T) -> T where
     T: Clone + std::ops::BitAnd<Output = T> + std::ops::BitOr<Output = T> + std::ops::BitXor<Output = T> + std::ops::Not<Output = T> {
-    let ones = x.clone() | !x.clone();
-    let zero = ones.clone() ^ ones.clone();
+    bitwise_with(table, x.clone(), y, x.clone() | !x, |a, b| a & b, |a, b| a ^ b)
+}
+
+pub(crate) fn bitwise_with<T: Clone>(table: u8, x: T, y: T, ones: T, and: impl Fn(T, T) -> T, xor: impl Fn(T, T) -> T) -> T {
+    let zero = xor(ones.clone(), ones.clone());
     let spread = |bit: u8| if bit & 1 == 1 { ones.clone() } else { zero.clone() };
     let entry = |i: u8| table >> i;
-    // `x`'s coefficient is the parity of entries 0 and 2, `y`'s of entries 0 and 1, and `x & y`'s of all four.
     let (a0, a1, a2, a3) = (spread(entry(0)), spread(entry(0) ^ entry(2)), spread(entry(0) ^ entry(1)), spread(entry(0) ^ entry(1) ^ entry(2) ^ entry(3)));
-    a0 ^ (x & (a1 ^ (y.clone() & a3))) ^ (y & a2)
+    xor(xor(a0, and(x, xor(a1, and(y.clone(), a3)))), and(y, a2))
 }
 
 /// [`bitwise`] with the truth table it holds, as a function object. One argument is the second, with 0 as the first. Booleans and the signed types hold every result, because each leading sign bit takes the same entry of the table. An unsigned byte computes at `i64`, where its leading zeros can become ones, and fails where the result doesn't fit.
@@ -140,7 +132,8 @@ forms!(#[inline] Nand at u8 => bool, i16 => bool, i32 => bool, i64 => bool: |_, 
 forms!(#[inline] Nor at u8 => bool, i16 => bool, i32 => bool, i64 => bool: |_, [x, y]| truth(x).zip(truth(y)).map(|(x, y)| !(x | y)));
 
 /// An integer type's arithmetic. Each operation that can overflow gives its result wrapped to the type, and whether that is the exact result, so that a caller with exact integers can take another path. The tests have no branch, so a loop of them vectorizes. The one exception is a 64-bit product, because no vector instruction gives its 128-bit result. [`Add`], [`Subtract`], [`Multiply`], [`Abs`](crate::Abs) and [`Sign`](crate::Sign) run these on slices.
-pub(crate) trait Overflowing: Copy + Sealed {
+pub trait Overflowing: crate::buffer::Cast + Ord + Into<i64> + Sealed {
+    fn low(x: i64) -> Self;
     /// x + y.
     fn plus(self, y: Self) -> (Self, bool);
     /// x - y.
@@ -165,6 +158,7 @@ macro_rules! wide_product {
 macro_rules! signed {
     ($($t:ty: |$x:ident, $y:ident| $times:expr),+) => {$(
         impl Overflowing for $t {
+            fn low(x: i64) -> Self { x as $t }
             #[inline(always)]
             fn plus(self, y: Self) -> (Self, bool) { let s = self.wrapping_add(y); (s, ((self ^ s) & (y ^ s)) >= 0) }
             #[inline(always)]
@@ -186,6 +180,7 @@ signed!(
 macro_rules! unsigned {
     ($($t:ty: |$x:ident, $y:ident| $times:expr),+) => {$(
         impl Overflowing for $t {
+            fn low(x: i64) -> Self { x as $t }
             #[inline(always)]
             fn plus(self, y: Self) -> (Self, bool) { let s = self.wrapping_add(y); (s, s >= self) }
             #[inline(always)]

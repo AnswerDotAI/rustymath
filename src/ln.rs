@@ -15,14 +15,13 @@ const POLY_NARROW: [f64; 5] = [0.24145279203110395, 0.28502925464850143, 0.40000
 /// ln((1+s)/(1-s)), for |s| up to 0.2, with f64's polynomial if `fine` and f32's otherwise.
 #[inline]
 fn series<R: Native, const FUSED: bool>(s: R, fine: bool) -> R {
-    let s2 = s * s;
-    if fine { (s * s2).mla::<FUSED>(horner::<R, FUSED, 7>(s2, POLY_64), s + s) } else { s * horner::<R, FUSED, 4>(s2, POLY_32) }
+    series_with(&crate::recipe::NativeOps::<FUSED>::DEFAULT, s, fine)
 }
 
 /// The logarithm e·hi + (e·lo + k·ln((1+s)/(1-s))), to the base whose logarithm of 2 is (hi, lo) and of e is k, with f64's polynomial if `fine` and f32's otherwise.
 #[inline]
 fn based<R: Native, const FUSED: bool>(s: R, e: R, (hi, lo): (R, R), k: R, fine: bool) -> R {
-    e.mla::<FUSED>(hi, series::<R, FUSED>(s, fine).mla::<FUSED>(k, e * lo))
+    based_with(&crate::recipe::NativeOps::<FUSED>::DEFAULT, s, e, (hi, lo), k, fine)
 }
 
 /// e ln 2 + ln((1+s)/(1-s)): the natural logarithm of m × 2^e, for s = (m-1)/(m+1) or a more accurate form of it.
@@ -39,15 +38,12 @@ fn usual<R: Native>(x: R) -> bool { x.positive_normal() }
 
 /// The logarithm of m × 2^e, split as `(m, e)`, to the base that `(base, k)` gives, as `based` takes them, with none of `log`'s special values.
 #[inline(always)]
-fn log_of<R: Native, const FUSED: bool>((m, e): (R, R), (base, k): ((R, R), R)) -> R { based::<R, FUSED>((m - R::one()) / (m + R::one()), e, base, k, R::WIDE) }
+fn log_of<R: Native, const FUSED: bool>((m, e): (R, R), (base, k): ((R, R), R)) -> R { of_with(&crate::recipe::NativeOps::<FUSED>::DEFAULT, (m, e), (base, k)) }
 
 /// The logarithm of x to the base that `to` gives, as `log_of` takes it, with its special values: -∞ at 0, ∞ at ∞, and NaN for a negative x or NaN.
 #[inline]
 fn log<R: Native, const FUSED: bool>(x: R, to: ((R, R), R)) -> R {
-    let y = log_of::<R, FUSED>(split_positive(x), to);
-    let y = if x == R::infinity() { x } else { y };
-    let y = if x == R::zero() { R::neg_infinity() } else { y };
-    if x >= R::zero() { y } else { R::nan() }
+    log_with(&crate::recipe::NativeOps::<FUSED>::DEFAULT, x, to)
 }
 
 #[inline]
@@ -156,14 +152,7 @@ fn log1p_of<R: Native, const FUSED: bool>(x: R, u: R, split: (R, R)) -> R { log_
 
 /// ln(1 + x), computed as ln u + c/u. Since u + c = 1 + x exactly, ln(1 + x) = ln u + ln(1 + c/u). With |c/u| at most 2^-53, ln(1 + c/u) lies within 2^-106 of c/u. Where |x| is below 2^-53, u rounds to 1 and the result c equals x.
 #[inline]
-pub(crate) fn log1p<R: Native, const FUSED: bool>(x: R) -> R {
-    let u = x + R::one();
-    let y = log1p_of::<R, FUSED>(x, u, split_positive(u));
-    // -0 must give -0, which the sum turns into 0.
-    let y = if (x == R::infinity()) | (x == R::zero()) { x } else { y };
-    let y = if u == R::zero() { R::neg_infinity() } else { y };
-    if u >= R::zero() { y } else { R::nan() }
-}
+pub(crate) fn log1p<R: Native, const FUSED: bool>(x: R) -> R { log1p_formula(&crate::recipe::NativeOps::<FUSED>::DEFAULT, x) }
 
 /// `log1p` for an x that `usual1p` accepts.
 #[inline(always)]
@@ -181,6 +170,16 @@ usual_object!(/// [`log10`](crate::log10) as a function object.
     Log10: log10, usual => #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), base10()));
 usual_object!(/// [`log1p`](crate::log1p) as a function object.
     Log1p: log1p, usual1p => log1p_usual::<_, { crate::FUSED }>);
+usual_object!(/// ln|x|, the real part of ln x, as a function object. `complex.rs` attaches ln|z| for a complex z, the real part of its ln.
+    RealLn: real_ln, usual_magnitude => #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.abs().split(), natural()); total);
+
+/// ln|x|, which is -∞ at 0.
+#[inline]
+pub(crate) fn real_ln<R: Native, const FUSED: bool>(x: R) -> R { ln::<R, FUSED>(x.abs()) }
+
+/// Whether `real_ln` needs none of `ln`'s special values at x: |x| is positive, normal and finite.
+#[inline(always)]
+fn usual_magnitude<R: Native>(x: R) -> bool { usual(x.abs()) }
 
 /// ln 2 as a double word.
 const LN2: (f64, f64) = (0.693147180559945286226764, 2.319046813846299558417771e-17);
@@ -206,4 +205,52 @@ pub(crate) fn ln_double<const FUSED: bool>(x: f64) -> Double<f64> {
     let l = Double::new(LN2.0, LN2.1).mul_float::<FUSED>(e).add(ln_m);
     let l = if x.is_nan() | (x == f64::INFINITY) { Double::new(x, 0.0) } else { l };
     if x == 0.0 { Double::new(f64::NEG_INFINITY, 0.0) } else { l }
+}
+
+#[inline(always)]
+fn series_with<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, s: O::V, fine: bool) -> O::V {
+    let s2 = o.multiply(s, s);
+    if fine { o.multiply_add(o.multiply(s, s2), crate::recipe::horner(o, s2, &POLY_64), o.add(s, s)) }
+    else { o.multiply(s, crate::recipe::horner(o, s2, &POLY_32)) }
+}
+
+#[inline(always)]
+fn based_with<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(
+    o: &O, s: O::V, e: O::V, (hi, lo): (O::V, O::V), k: O::V, fine: bool,
+) -> O::V {
+    o.multiply_add(e, hi, o.multiply_add(series_with(o, s, fine), k, o.multiply(e, lo)))
+}
+
+#[inline(always)]
+fn of_with<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(
+    o: &O, (m, e): (O::V, O::V), (base, k): ((O::V, O::V), O::V),
+) -> O::V {
+    let one = o.number(F::one());
+    based_with(o, o.divide(o.subtract(m, one), o.add(m, one)), e, base, k, o.width() == crate::buffer::FloatWidth::F64)
+}
+
+#[inline(always)]
+fn log_with<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(
+    o: &O, x: O::V, to: ((O::V, O::V), O::V),
+) -> O::V {
+    let y = of_with(o, crate::recipe::frexp(o, x), to);
+    let zero = o.number(F::zero());
+    let y = o.select(o.equal(x, o.number(F::infinity())), x, y);
+    let y = o.select(o.equal(x, zero), o.number(F::neg_infinity()), y);
+    o.select(o.less_equal(zero, x), y, o.number(F::nan()))
+}
+
+#[inline(always)]
+pub(crate) fn formula<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, x: O::V) -> O::V {
+    log_with(o, x, (crate::recipe::ln2(o), o.number(F::one())))
+}
+
+pub(crate) fn log1p_formula<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, x: O::V) -> O::V {
+    let (zero, one) = (o.number(F::zero()), o.number(F::one()));
+    let u = o.add(x, one);
+    let correction = o.divide(o.subtract(x, o.subtract(u, one)), u);
+    let y = o.add(of_with(o, crate::recipe::frexp(o, u), (crate::recipe::ln2(o), one)), correction);
+    let y = o.select(o.or(o.equal(x, o.number(F::infinity())), o.equal(x, zero)), x, y);
+    let y = o.select(o.equal(u, zero), o.number(F::neg_infinity()), y);
+    o.select(o.less_equal(zero, u), y, o.number(F::nan()))
 }

@@ -3,7 +3,7 @@
 //! `index_of`, `classes` and `firsts` index the first position of each key. `index_of` passes over `x` once for each item of `y` when `y` has at most `SCANNED` items. The index is a table when the keys span at most twice the slice's length, or 1024, and a hash map otherwise. `numbered` numbers the classes in order of first position, with each one's size. `grouped_keys` numbers them the same way from a table of keys, with each one's positions, `numbered_keys` with each item's number, and `class_counts` gives only their sizes. `counts` counts the items with each key in such a table. `sort_rows` sorts keys that span such a table by counting them. It sorts other keys with an LSD radix sort that skips any byte that is the same in every key. `view_sort_along`, `view_partition_along` and `view_quantiles_along` work on each item's `SortKey`, which reads back to the item exactly. A sort counts, sorts a float lane through a bitonic network on vectors, or sorts the keys by comparison or by the same radix sort. With several threads, the radix sort splits each pass of more than `RADIX_PIECE` keys across them, and `index_of` splits its lookups.
 use crate::hashing::{HashMap, HashMapExt};
 use crate::{
-    Float, Native, agreement::Mapping, array::ArrayView, buffer::{Buffer, DType, Element, Floats, View}, error::{Error, Kind}, interrupt::check,
+    Float, Native, agreement::Mapping, array::ArrayView, buffer::{Buffer, DType, Element, Floats, IntBuf, View, Width}, error::{Error, Kind}, interrupt::check,
     layout::{Layout, count}, tolerant::{self, Tolerance}
 };
 use hashbrown::hash_map::Entry;
@@ -119,11 +119,24 @@ sort_keys!(i16 => u16, |x: i16| x as u16 ^ 1 << 15, |k: u16| (k ^ 1 << 15) as i1
 /// The number of items of `y` up to which `index_of` and `tolerant::index_of` pass over `x` once for each, in place of building an index.
 pub const SCANNED: usize = 16;
 
+/// The items in each block that [`first`] tests in one loop with no exit.
+const FIRST_BLOCK: usize = 64;
+
+/// The position of the first item of `x` for which `hit` holds. Each whole block of [`FIRST_BLOCK`] items is tested in one loop of fixed length with no exit, which vectorizes, and only a block with a hit is searched again for its first; the items past the last whole block are tested one at a time. `index_of` and `tolerant::index_of` scan for at most [`SCANNED`] needles through it.
+#[inline(always)]
+pub(crate) fn first<T: Copy>(x: &[T], hit: impl Fn(T) -> bool) -> Option<usize> {
+    let (blocks, rest) = x.as_chunks::<FIRST_BLOCK>();
+    for (b, block) in blocks.iter().enumerate() {
+        if block.iter().fold(false, |any, &h| any | hit(h)) { return block.iter().position(|&h| hit(h)).map(|p| b * FIRST_BLOCK + p); }
+    }
+    rest.iter().position(|&h| hit(h)).map(|p| blocks.len() * FIRST_BLOCK + p)
+}
+
 /// For each item of `y`, the first position of its key in `x`, or the length of `x` when it has none. A slice here holds at most `u32::MAX` items, so positions are `u32`s.
 #[inline(never)]
 pub fn index_of<K: Key>(x: &[K], y: &[K]) -> Vec<u32> {
     let miss = x.len() as u32;
-    if y.len() <= SCANNED { return y.iter().map(|n| x.iter().position(|h| h == n).map_or(miss, |p| p as u32)).collect(); }
+    if y.len() <= SCANNED { return y.iter().map(|&n| first(x, |h| h == n).map_or(miss, |p| p as u32)).collect(); }
     let Some((min, mut table)) = table(x, u32::MAX) else { return first_matches(x, y) };
     let first = write_first(x, min, &mut table, None, |_, _| ());
     // `move` keeps `min`, `first` and `miss` in registers. Captured by reference, they would load again for every item.
@@ -201,28 +214,48 @@ pub fn counts_into<K: Key>(x: &[K], min: i64, counts: &mut [usize]) {
     for (g, count) in counts.iter_mut().enumerate() { *count = (0..4).map(|p| parts[p * n + g]).sum() }
 }
 
-/// The classes that `classes` gives, numbered from 0 in order of their first positions.
-#[derive(Clone, Debug, PartialEq)]
+/// The classes that `classes` gives, numbered from 0 in order of their first positions, with the number of items in each.
+#[derive(Clone, Debug)]
 pub struct Numbered {
     /// The first position of each class, in ascending order.
     pub firsts: Vec<usize>,
-    /// Each item's class number.
-    pub numbers: Vec<u32>,
+    /// Each item's class number, at the narrowest width that holds every class number (`Width::below`).
+    pub numbers: IntBuf,
+    /// The number of items in each class.
+    pub counts: Vec<usize>,
 }
 
 impl Numbered {
-    /// Folds each class of `data` by `R`, starting from `R`'s exact identity, and whether every fold fits. With few classes, a class's items lie close together, and each step of its total waits on the last through memory. So with at most `R::SPLIT` classes, each class folds into four totals, one for each position modulo 4, which the end merges in turn. A float sum then adds its items in another order.
-    #[inline]
-    pub fn fold<T: Copy, R: crate::reduce::Reduction<T>>(&self, data: &[T]) -> (Vec<R::Total>, bool) {
-        if self.firsts.len() <= R::SPLIT { self.folded::<T, R, 4>(data) } else { self.folded::<T, R, 1>(data) }
+    /// The classes with the positions of each (`Grouped`), from one pass over the class numbers.
+    pub fn grouped(self) -> Grouped {
+        let Numbered { firsts, numbers, .. } = self;
+        with_ints!(numbers.view(), |numbers| grouped_classes(numbers, firsts, class))
+    }
+}
+
+/// Each item's class number below `count`, at any integer width: classes that a fold totals, or a scan runs, each on its own (`Grouping`).
+#[derive(Clone, Copy, Debug)]
+pub struct ClassNumbers<'a, N> {
+    /// The number of classes.
+    pub count: usize,
+    /// Each item's class number.
+    pub numbers: &'a [N],
+}
+
+impl<N: Key> ClassNumbers<'_, N> {
+    /// The number of items in each class.
+    pub fn counts(self) -> Vec<usize> {
+        let mut counts = vec![0; self.count];
+        counts_into(self.numbers, 0, &mut counts);
+        counts
     }
 
-    /// [`Self::fold`] with `PARTS` totals for each class, each taking the items at one position modulo `PARTS`. A constant `PARTS` of 1 leaves one total for each class and no merge.
+    /// [`Grouping::fold`] with `PARTS` totals for each class, each taking the items at one position modulo `PARTS`. A constant `PARTS` of 1 leaves one total for each class and no merge.
     #[inline]
-    fn folded<T: Copy, R: crate::reduce::Reduction<T>, const PARTS: usize>(&self, data: &[T]) -> (Vec<R::Total>, bool) {
-        let (mut totals, mut fits) = (vec![R::identity(); self.firsts.len() * PARTS], true);
+    fn folded<T: Copy, R: crate::reduce::Reduction<T>, const PARTS: usize>(self, data: &[T]) -> (Vec<R::Total>, bool) {
+        let (mut totals, mut fits) = (vec![R::identity(); self.count * PARTS], true);
         for (k, (&c, &x)) in self.numbers.iter().zip(data).enumerate() {
-            let i = c as usize * PARTS + k % PARTS;
+            let i = class(c) * PARTS + k % PARTS;
             let ok;
             (totals[i], ok) = R::checked(totals[i], x);
             fits &= ok;
@@ -231,28 +264,81 @@ impl Numbered {
         let merged = totals.chunks_exact(PARTS).map(|t| t[1..].iter().fold(t[0], |a, &b| { let (m, ok) = R::merge(a, b); fits &= ok; m })).collect();
         (merged, fits)
     }
-
-    /// The number of items in each class.
-    pub fn counts(&self) -> Vec<usize> {
-        let mut counts = vec![0; self.firsts.len()];
-        for &k in &self.numbers { counts[k as usize] += 1; }
-        counts
-    }
 }
 
-/// Numbers the classes in `classes`, which gives each item the first position of its class, as `classes` and `tolerant::classes` do.
-pub fn numbered(classes: &[u32]) -> Numbered {
-    let mut number = vec![0u32; classes.len()];
-    let (mut firsts, mut numbers) = (Vec::new(), Vec::with_capacity(classes.len()));
-    for (i, c) in classes.iter().map(|&c| c as usize).enumerate() {
-        if c == i {
-            number[i] = firsts.len() as u32;
-            firsts.push(i);
+/// The class that class number `k` names.
+#[inline]
+fn class<N: Key>(k: N) -> usize { k.key() as usize }
+
+/// A grouping of a vector's items that a fold totals, or a scan runs, each on its own: classes by number (`ClassNumbers`), or ranges of positions (`Ranges`), as a segmented array's items are ranges of its leaf.
+pub trait Grouping {
+    /// The number of groups.
+    fn len(&self) -> usize;
+    /// Folds each group of `data` by `R`, and whether every fold fits.
+    fn fold<T: Copy, R: crate::reduce::Reduction<T>>(&self, data: &[T]) -> (Vec<R::Total>, bool);
+    /// Scans each group of `data` by `R`: every item's running total within its group, the groups one after another in group order, each in its items' order, and whether every total fits.
+    fn scan<T: Copy, R: crate::reduce::Reduction<T>>(&self, data: &[T]) -> (Vec<R::Total>, bool);
+}
+
+impl<N: Key> Grouping for ClassNumbers<'_, N> {
+    fn len(&self) -> usize { self.count }
+    /// Each class's fold from `R`'s exact identity. With few classes, a class's items lie close together, and each step of its total waits on the last through memory. So with at most `R::SPLIT` classes, each class folds into four totals, one for each position modulo 4, which the end merges in turn. A float sum then adds its items in another order.
+    #[inline]
+    fn fold<T: Copy, R: crate::reduce::Reduction<T>>(&self, data: &[T]) -> (Vec<R::Total>, bool) {
+        if self.count <= R::SPLIT { self.folded::<T, R, 4>(data) } else { self.folded::<T, R, 1>(data) }
+    }
+    fn scan<T: Copy, R: crate::reduce::Reduction<T>>(&self, data: &[T]) -> (Vec<R::Total>, bool) {
+        let mut at = crate::layout::exclusive_sums(self.counts());
+        let (mut running, mut totals, mut fits) = (vec![R::identity(); self.count], vec![R::identity(); data.len()], true);
+        for (&k, &x) in self.numbers.iter().zip(data) {
+            let k = class(k);
+            let (t, ok) = R::checked(running[k], x);
+            fits &= ok;
+            (running[k], totals[at[k]]) = (t, t);
+            at[k] += 1;
         }
-        numbers.push(number[c]);
+        (totals, fits)
     }
-    Numbered { firsts, numbers }
 }
+
+/// One range of positions for each group, in any order, as each one's start and length: a segmented array's vector items as their entries in its leaf. Each range folds by `Reduction::slice` and scans by `Reduction::scan`. An empty range folds to `R::unit()`.
+#[derive(Clone, Copy, Debug)]
+pub struct Ranges<'a> {
+    /// Where each range starts.
+    pub starts: &'a [usize],
+    /// How many positions each range holds.
+    pub lens: &'a [usize],
+}
+
+impl Grouping for Ranges<'_> {
+    fn len(&self) -> usize { self.starts.len() }
+    fn fold<T: Copy, R: crate::reduce::Reduction<T>>(&self, data: &[T]) -> (Vec<R::Total>, bool) {
+        let mut fits = true;
+        let totals = self.starts.iter().zip(self.lens).map(|(&s, &n)| { let (t, ok) = R::slice(&data[s..s + n]); fits &= ok; t }).collect();
+        (totals, fits)
+    }
+    fn scan<T: Copy, R: crate::reduce::Reduction<T>>(&self, data: &[T]) -> (Vec<R::Total>, bool) {
+        let mut totals = Vec::with_capacity(self.lens.iter().sum());
+        let fits = self.starts.iter().zip(self.lens).fold(true, |fits, (&s, &n)| R::scan(&data[s..s + n], None, &mut totals) & fits);
+        (totals, fits)
+    }
+}
+
+/// Numbers the classes in `classes`, which gives each item the first position of its class, as `classes` and `tolerant::classes` do, and counts each class.
+pub fn numbered(classes: &[u32]) -> Numbered {
+    let (mut number, mut firsts) = (vec![0u32; classes.len()], Vec::new());
+    for (i, &c) in classes.iter().enumerate() { if c as usize == i { number[i] = firsts.len() as u32; firsts.push(i); } }
+    let mut counts = vec![0; firsts.len()];
+    let numbers = with_width!(Width::below(firsts.len()), T => int_buf(classes.iter().map(|&c| {
+        let k = number[c as usize];
+        counts[k as usize] += 1;
+        num_traits::AsPrimitive::<T>::as_(k)
+    }).collect::<Vec<T>>()));
+    Numbered { firsts, numbers, counts }
+}
+
+/// `items` as an integer buffer.
+fn int_buf<T: Element>(items: Vec<T>) -> IntBuf { match T::buffer(items) { Buffer::Integers(b) => b, _ => unreachable!("integer items make an integer buffer") } }
 
 /// Whether `offsets` are dense enough to use a table over the `size` positions they fall below.
 pub fn dense_offsets(offsets: &[usize], size: usize) -> bool { size <= 8 * offsets.len() }
@@ -320,7 +406,7 @@ pub fn view_find(pattern: View<'_>, pattern_shape: &[usize], target: View<'_>, s
 /// The number of items in each class of `x`, in order of the classes' first positions, as `numbered` counts them. Keys that span a table take `counts`, then a pass for first positions that stops once it has found every key `x` holds, with nothing written for each item.
 #[inline(never)]
 pub fn class_counts<K: Key>(x: &[K]) -> Vec<usize> {
-    let Some((min, counts)) = counts(x) else { return numbered(&classes(x)).counts() };
+    let Some((min, counts)) = counts(x) else { return numbered(&classes(x)).counts };
     let mut first = vec![u32::MAX; counts.len()];
     first_positions(x, min, &mut first, Some(counts.iter().filter(|&&c| c > 0).count())).into_iter().map(|f| counts[x[f].key().wrapping_sub(min) as usize])
         .collect()
@@ -435,6 +521,70 @@ pub fn first_classes<T: Copy, K: Eq + Hash>(x: &[T], key: impl Fn(T) -> K) -> Ve
     x.iter().enumerate().map(|(i, &v)| *first.entry(key(v)).or_insert(i as u32)).collect()
 }
 
+/// A cell compared exactly: an atom, which has no shape, or an array of compact Booleans, integers or characters, with its shape. Two cells are equal when their shapes and items are equal. Booleans and integers of any width compare as numbers, and characters only with characters. A hash leaves out the shape, which equality compares. Cells order as BPL grades them: an atom before an array, arrays by rank, then item by item with numbers before characters ([`crate::characters::order_of_kinds`]), then by length and shape.
+#[derive(Clone, Copy)]
+pub struct Exact<'a> { shape: Option<&'a [usize]>, items: View<'a> }
+
+impl<'a> Exact<'a> {
+    /// The cell of `items` under `shape`, or `None` for items that aren't Booleans, integers or characters.
+    pub fn new(shape: Option<&'a [usize]>, items: View<'a>) -> Option<Self> {
+        matches!(items, View::Booleans(_) | View::Integers(_) | View::Characters(_)).then_some(Self { shape, items })
+    }
+
+    /// Item `i`: whether it's a character, and its key.
+    fn item(self, i: usize) -> (bool, i64) {
+        match self.items {
+            View::Characters(x) => (true, x[i].key()),
+            View::Booleans(x) => (false, x[i].key()),
+            View::Integers(x) => (false, x.get(i)),
+            View::Floats(_) | View::Complexes(_) => unreachable!("an exact cell holds no floats"),
+        }
+    }
+}
+
+impl PartialEq for Exact<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        // For keys as short as most strings, a `memcmp` call, which slice equality makes, costs more than comparing item by item.
+        fn equal<T: PartialEq>(x: &[T], y: &[T]) -> bool { x.len() == y.len() && x.iter().zip(y).all(|(a, b)| a == b) }
+        let shapes = match (self.shape, other.shape) { (Some(x), Some(y)) => equal(x, y), (x, y) => x.is_none() && y.is_none() };
+        shapes && match (self.items, other.items) {
+            (View::Characters(x), View::Characters(y)) => equal(x, y), (x, y) => view_matches(x, y, Tolerance::EXACT) == Some(true)
+        }
+    }
+}
+
+impl Eq for Exact<'_> {}
+
+impl Hash for Exact<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self.items {
+            View::Characters(x) => crate::characters::codes(x).hash(state),
+            View::Booleans(x) => { for &b in x { state.write_i64(b.into()) } }
+            View::Integers(x) => with_ints!(x, |x| for &i in x { state.write_i64(i.into()) }),
+            View::Floats(_) | View::Complexes(_) => unreachable!("an exact cell holds no floats"),
+        }
+    }
+}
+
+impl Ord for Exact<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let (x, y) = match (self.shape, other.shape) {
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (x, y) => (x.unwrap_or_default(), y.unwrap_or_default()),
+        };
+        if x.len() != y.len() { return x.len().cmp(&y.len()); }
+        for i in 0..self.items.len().min(other.items.len()) {
+            let ((xc, xk), (yc, yk)) = (self.item(i), other.item(i));
+            let order = crate::characters::order_of_kinds(xc, yc).then(xk.cmp(&yk));
+            if order.is_ne() { return order; }
+        }
+        self.items.len().cmp(&other.items.len()).then_with(|| x.cmp(y))
+    }
+}
+
+impl PartialOrd for Exact<'_> { fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) } }
+
 /// Whether each position of `classes` is its own class, which makes its item the first with its key.
 pub(crate) fn first_mask(classes: &[u32]) -> Vec<bool> { classes.iter().enumerate().map(|(i, &c)| c as usize == i).collect() }
 
@@ -462,9 +612,6 @@ impl Groups {
         })
     }
 
-    /// The buffers that hold the positions, with no copy: each group's own where every group has one, or else the one buffer that holds every group in turn.
-    pub fn into_buffers(self) -> Vec<Vec<u32>> { if self.buffers.len() == self.sizes.len() { self.buffers } else { vec![self.into_positions()] } }
-
     /// Every position, group by group, in one buffer. Groups that share a buffer hand it over.
     pub fn into_positions(mut self) -> Vec<u32> { if self.buffers.len() == 1 { return self.buffers.pop().expect("one buffer"); } self.buffers.concat() }
 }
@@ -476,11 +623,6 @@ pub struct Grouped {
     pub firsts: Vec<usize>,
     /// The positions of each class.
     pub groups: Groups,
-}
-
-impl Grouped {
-    /// The classes that `groups` numbers, giving each item's class, whose first positions are `firsts`.
-    pub fn new(firsts: Vec<usize>, groups: &[u32]) -> Grouped { grouped_classes(groups, firsts, |g| g as usize) }
 }
 
 /// The classes of `x` numbered from 0 in order of first position, as a table from each key's offset from `min` to its class number, with `min` and each class's first position, or `None` when its keys span too many values for a table. The table entry of each key takes its first position, then its class number, so no pass gives each item its first position.
@@ -502,18 +644,23 @@ pub fn grouped_keys<K: Key>(x: &[K]) -> Option<Grouped> {
     else { grouped_classes(x, firsts, move |k| table[k.key().wrapping_sub(min) as usize] as usize) })
 }
 
-/// The classes of `x` as [`Numbered`] gives them, numbered as `grouped_keys` numbers them, or `None` when its keys span too many values for a table. A fold of each class reads these numbers in one pass, where each class's positions would take a pass to build and a gather to read. A pass that numbers each key as it first meets it, in place of `numbered_table`, measured slower: it stores to a table entry for every item, and repeated keys then wait on those stores.
+/// The classes of `x` as [`Numbered`] gives them, numbered as `grouped_keys` numbers them, or `None` when its keys span too many values for a table. A fold of each class reads these numbers in one pass, where each class's positions would take a pass to build and a gather to read. A pass that numbers each key as it first meets it, in place of `numbered_table`, measured slower: it stores to a table entry for every item, and repeated keys then wait on those stores. Each class's count comes from one count of the class numbers (`ClassNumbers::counts`).
 #[inline(never)]
 pub fn numbered_keys<K: Key>(x: &[K]) -> Option<Numbered> {
     let (min, table, firsts) = numbered_table(x)?;
-    let (at, mut numbers) = (move |k: K| k.key().wrapping_sub(min) as usize, Vec::new());
-    if let [lower, _] = table[..] {
-        crate::pairs(crate::Arg::Many(x), crate::Arg::One(()), x.len(), &mut numbers, |k, ()| ((at(k) ^ lower as usize) as u32, true));
-    } else {
-        let table = &table[..];
-        crate::pairs(crate::Arg::Many(x), crate::Arg::One(()), x.len(), &mut numbers, |k, ()| (table[at(k)], true));
-    }
-    Some(Numbered { firsts, numbers })
+    let (at, table) = (move |k: K| k.key().wrapping_sub(min) as usize, &table[..]);
+    let numbers = with_width!(Width::below(firsts.len()), T => {
+        let mut numbers: Vec<T> = Vec::new();
+        // With two keys, each item's class is its offset from the lower key, flipped when the higher key comes first.
+        if let [lower, _] = *table {
+            crate::pairs(crate::Arg::Many(x), crate::Arg::One(()), x.len(), &mut numbers, |k, ()| (num_traits::AsPrimitive::<T>::as_(at(k) ^ lower as usize), true));
+        } else {
+            crate::pairs(crate::Arg::Many(x), crate::Arg::One(()), x.len(), &mut numbers, |k, ()| (num_traits::AsPrimitive::<T>::as_(table[at(k)]), true));
+        }
+        int_buf(numbers)
+    });
+    let counts = with_ints!(numbers.view(), |numbers| ClassNumbers { count: firsts.len(), numbers }.counts());
+    Some(Numbered { firsts, numbers, counts })
 }
 
 /// The positions of `items` grouped by the group that `group` gives each item, keeping their order within each group, with the number in each of the `n` groups. `grouped` is the version for groups given as numbers.
@@ -875,16 +1022,13 @@ pub fn view_firsts(x: View<'_>, t: Tolerance) -> Option<Result<Vec<bool>, Error>
 /// The size of each class of `x`, in order of first position, as [`view_classes`] matches them. Booleans, integers and characters that span a table count from it, as [`class_counts`] does. `None` for complex numbers.
 pub fn view_class_counts(x: View<'_>, t: Tolerance) -> Option<Result<Vec<usize>, Error>> {
     if let Some(counts) = keys_of!(x, |x| class_counts(x)) { return Some(Ok(counts)); }
-    Some(view_classes(x, t)?.map(|classes| numbered(&classes).counts()))
+    Some(view_classes(x, t)?.map(|classes| numbered(&classes).counts))
 }
 
 /// The classes of `x`, as [`view_classes`] matches them, numbered in order of first position, with the positions of each. Booleans, integers and characters that span a table group straight from it, as [`grouped_keys`] does. `None` for complex numbers.
 pub fn view_grouped(x: View<'_>, t: Tolerance) -> Option<Result<Grouped, Error>> {
     if let Some(Some(grouped)) = keys_of!(x, |x| grouped_keys(x)) { return Some(Ok(grouped)); }
-    Some(view_classes(x, t)?.map(|classes| {
-        let Numbered { firsts, numbers, .. } = numbered(&classes);
-        Grouped::new(firsts, &numbers)
-    }))
+    Some(view_classes(x, t)?.map(|classes| numbered(&classes).grouped()))
 }
 
 /// The classes of `x`, as [`view_classes`] matches them, numbered in order of first position, with each item's class number. Booleans, integers and characters that span a table number straight from it, as [`numbered_keys`] does. `None` for complex numbers.
@@ -951,7 +1095,7 @@ pub fn view_member(x: &Layout, xs: View<'_>, query: &Layout, ys: View<'_>, t: To
     let haystack = ArrayView::compact(x, xs).cast(dtype)?;
     let axes: Vec<usize> = (0..cell.shape().len()).collect();
     let mapping = Mapping::new(query, &axes, &cell, ys.len());
-    let needle = ArrayView::new(&cell, ys, &mapping).cast(dtype)?;
+    let needle = ArrayView::compact(query, ys).remapped(mapping, cell.count()).cast(dtype)?;
     view_contains(haystack.view(), needle.view(), x.shape()[0], t).ok_or_else(|| Error::new(Kind::Domain, "membership can't compare these kinds"))?
 }
 
@@ -1278,16 +1422,6 @@ pub fn select<T>(x: &mut [T], ranks: &[usize], compare: impl Fn(&T, &T) -> Order
         within(after, &ranks[middle + 1..], base + rank + 1, compare);
     }
     within(x, ranks, 0, compare);
-}
-
-/// A copy with `rank` at its sorted position. Other items are partitioned around it, not sorted. `None` for complex numbers.
-pub fn view_partition(x: View<'_>, rank: usize) -> Option<Buffer> {
-    fn partition<T: Element, K: Ord>(x: &[T], rank: usize, key: impl Fn(T) -> K + Copy) -> Buffer {
-        let mut out = x.to_vec();
-        select(&mut out, &[rank], |a, b| key(*a).cmp(&key(*b)));
-        T::buffer(out)
-    }
-    ordered_view!(x, |x, key| partition(x, rank, key))
 }
 
 /// Positions partitioned around `rank`. Equal values need not keep their original order.

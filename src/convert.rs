@@ -4,6 +4,42 @@ use crate::float::{Float, sealed::{Core, Sealed}};
 /// An integer type that [`int`] and [`float`] convert: `i8`, `i16`, `i32`, `i64`, `u8`, `u16` or `u32`.
 pub trait Int: Copy + Sealed + sealed::Ways {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ConversionKind { Cast, Truncate, Bits }
+
+/// Resolved kinds include the working float width even when the other kind is a word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Conversion { pub input: crate::buffer::DType, pub output: crate::buffer::DType, pub kind: ConversionKind }
+impl Conversion {
+    pub fn map(self, input: crate::agreement::Read<'_>, range: std::ops::Range<usize>, checked: bool, output: &mut crate::buffer::Buffer) -> Result<(), crate::error::Error> {
+        use crate::buffer::{Buffer, DType, FloatWidth, Floats, Element};
+        use crate::error::{Error, Kind};
+        if self.kind == ConversionKind::Cast { return input.read_into(range, self.output, checked, output); }
+        let mut scratch = Buffer::with_capacity(self.input, 0);
+        let values = input.part_view(range, self.input, checked, &mut scratch)?;
+        *output = match (self.kind, values, self.output) {
+            (ConversionKind::Truncate, crate::buffer::View::Floats(values), DType::Integer(width)) => {
+                with_width!(width, I => I::buffer(with_floats!(values, |values| values.iter().map(|&x| saturated::<I, _>(x)).collect())))
+            }
+            (ConversionKind::Bits, crate::buffer::View::Floats(Floats::F32(values)), DType::Integer(crate::buffer::Width::I64)) => {
+                Buffer::Integers(crate::buffer::IntBuf::I64(values.iter().map(|x| i64::from(x.to_bits())).collect()))
+            }
+            (ConversionKind::Bits, crate::buffer::View::Floats(Floats::F64(values)), DType::Integer(crate::buffer::Width::I64)) => {
+                Buffer::Integers(crate::buffer::IntBuf::I64(values.iter().map(|x| x.to_bits() as i64).collect()))
+            }
+            (ConversionKind::Bits, crate::buffer::View::Integers(values), DType::Float(FloatWidth::F32)) => {
+                Buffer::Floats(crate::buffer::FloatBuf::F32((0..values.len()).map(|i| f32::from_bits(values.get(i) as u32)).collect()))
+            }
+            (ConversionKind::Bits, crate::buffer::View::Integers(values), DType::Float(FloatWidth::F64)) => {
+                Buffer::Floats(crate::buffer::FloatBuf::F64((0..values.len()).map(|i| f64::from_bits(values.get(i) as u64)).collect()))
+            }
+            (ConversionKind::Truncate, _, _) if self.input.is_integral() && self.output.is_integral() => Buffer::cast_results(values, self.output, false)?,
+            _ => return Err(Error::new(Kind::Domain, "unsupported resolved conversion")),
+        };
+        Ok(())
+    }
+}
+
 pub(crate) mod sealed {
     /// One integer type's conversions from and to `f32` and `f64`, which [`int`](super::int), [`saturated`](super::saturated) and [`float`](super::float) pick by the float type.
     pub trait Ways: Copy {

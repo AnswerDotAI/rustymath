@@ -75,19 +75,19 @@ pub fn parts<'py>(index: &Bound<'py, PyAny>) -> PyResult<Vec<IndexPart<Bound<'py
     }).collect()
 }
 
-/// Decodes brackets once for reads and assignment. Named selectors address their axis through `structure::addressed`.
+/// Decodes brackets once, for a read or, where `writes`, an assignment, whose positions can repeat a key. Named selectors address their axis through `structure::addressed`.
 pub fn selection(
-    layout: &Layout, index: &Bound<'_, PyAny>, name: impl FnMut(&Bound<'_, PyAny>) -> PyResult<Option<String>>,
+    layout: &Layout, index: &Bound<'_, PyAny>, writes: bool, name: impl FnMut(&Bound<'_, PyAny>) -> PyResult<Option<String>>,
     array: impl FnMut(&Layout, usize, &Bound<'_, PyAny>) -> PyResult<(Selector, bool)>) -> PyResult<(Plan, bool)> {
-    select_parts(layout, parts(index)?, name, array)
+    select_parts(layout, parts(index)?, writes, name, array)
 }
 
 pub fn select_parts(
-    layout: &Layout, written: Vec<IndexPart<Bound<'_, PyAny>>>, mut name: impl FnMut(&Bound<'_, PyAny>) -> PyResult<Option<String>>,
+    layout: &Layout, written: Vec<IndexPart<Bound<'_, PyAny>>>, writes: bool, mut name: impl FnMut(&Bound<'_, PyAny>) -> PyResult<Option<String>>,
     mut array: impl FnMut(&Layout, usize, &Bound<'_, PyAny>) -> PyResult<(Selector, bool)>) -> PyResult<(Plan, bool)> {
     let names = written.iter().map(|p| p.axis().map_or(Ok(None), &mut name)).collect::<PyResult<Vec<_>>>()?;
     let claims: Vec<_> = written.iter().zip(&names).map(|(p, n)| p.as_ref().map(|_| (n.as_deref(), 1))).collect();
-    structure::plan_parts(layout, &claims, None, true, |i, axis| {
+    structure::plan_parts(layout, &claims, None, true, writes, |i, axis| {
         let IndexPart::Axis(p) = &written[i] else { unreachable!("an axis refers to its written payload") };
         selector(layout, axis, p, || array(layout, axis, p))
     }, py_err)
