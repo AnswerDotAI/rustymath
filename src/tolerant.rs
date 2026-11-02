@@ -86,7 +86,14 @@ pub trait Tolerant: Copy + Send + Sync {
     }
     /// The whole number nearest `y`, and whether `y` equals it within this tolerance.
     #[inline]
-    fn nearest_whole<F: Float>(self, y: F) -> (F, bool) { let n = nearest(y); (n, (y - n).abs() <= F::narrow(self.value()) * larger(y.abs(), n.abs())) }
+    fn nearest_whole<F: Float>(self, y: F) -> (F, bool) { self.nearest_whole_in(&Floats, y) }
+    #[inline]
+    fn nearest_whole_in<F: Float, O: recipe::Ops<F> + ?Sized>(self, o: &O, y: O::V) -> (O::V, O::B) {
+        let below = o.floor(y);
+        let n = o.select(o.less(o.number(F::narrow(0.5)), o.subtract(y, below)), o.add(below, o.number(F::one())), below);
+        let scale = o.multiply(o.number(F::narrow(self.value())), o.larger(o.magnitude(y), o.magnitude(n)));
+        (n, o.less_equal(o.magnitude(o.subtract(y, n)), scale))
+    }
     /// The whole number equal to `y`, when there is one.
     #[inline]
     fn whole<F: Float>(self, y: F) -> Option<F> { let (n, equal) = self.nearest_whole(y); equal.then_some(n) }
@@ -173,13 +180,9 @@ fn fixed_gcd(x: f64, y: f64, (mx, sx): (u64, u32), (my, sy): (u64, u32), t: f64)
     })
 }
 
-/// The larger of `a` and `b`. A NaN argument makes the caller's comparison false, whichever one this returns. wasm SIMD has an instruction for this choice. It has none for `max`, which must return the number beside a NaN.
-#[inline(always)]
-fn larger<F: Float>(a: F, b: F) -> F { if a > b { a } else { b } }
-
 /// The whole number nearest to `y`, with a tie going down. It's built on `floor`, an instruction on every target. In wasm, `round` is a library call, and a call in a loop stops it vectorizing.
 #[inline(always)]
-fn nearest<F: Float>(y: F) -> F { let f = y.floor(); if y - f > F::narrow(0.5) { f + F::one() } else { f } }
+fn nearest<F: Float>(y: F) -> F { Tolerance::EXACT.nearest_whole(y).0 }
 
 /// Exact comparison, as a tolerance of 0 gives, through plain IEEE comparisons and `floor`.
 #[derive(Clone, Copy, Debug)]

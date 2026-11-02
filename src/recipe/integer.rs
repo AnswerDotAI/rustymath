@@ -52,7 +52,7 @@ impl<T: Overflowing> Ops<f64> for IntegerOps<T> {
     fn binary(&self, op: Binary, x: T, y: T) -> T {
         match op {
             Binary::Add => x.plus(y).0, Binary::Subtract => x.minus(y).0, Binary::Multiply => x.times(y).0,
-            Binary::Divide => T::low(Into::<i64>::into(x).checked_div(Into::<i64>::into(y)).unwrap_or(0)), Binary::Larger => x.max(y), Binary::Smaller => x.min(y),
+            Binary::Divide => T::low(if Into::<i64>::into(y) == 0 { 0 } else { Into::<i64>::into(x).wrapping_div(Into::<i64>::into(y)) }), Binary::Larger => x.max(y), Binary::Smaller => x.min(y),
             Binary::BitAnd => T::low(Into::<i64>::into(x) & Into::<i64>::into(y)), _ => unreachable!("non-integer instruction in an integer formula"),
         }
     }

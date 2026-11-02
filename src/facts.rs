@@ -167,6 +167,8 @@ pub trait Formula<const N: usize>: Clone + Send + Sync + 'static {
     fn exact(&self, _args: [&num_rational::BigRational; N]) -> Result<Option<num_rational::BigRational>, crate::error::Error> { Ok(None) }
     fn has_exact(&self) -> bool { false }
     fn range(&self, _args: [Range; N]) -> Range { Range::ANY }
+    fn integer_domain(&self, _args: [Range; N]) -> bool { true }
+    fn typed_domain(&self, _types: [DType; N]) -> bool { false }
     /// A box containing args on which graph-numeric results do not raise a data error.
     fn domain(&self, _args: [Range; N]) -> Option<[Range; N]> { None }
     fn has_domain(&self) -> bool { false }
@@ -312,7 +314,7 @@ macro_rules! objects {
         }
     };
     ($n:tt: $($object:ty {
-        $(range $args:pat => $range:expr;)? $(domain $targs:pat => $domain:expr;)? $(identity $identity:expr;)? $(fold $fold:ident;)? $(truth $truth:ident;)? $(table $table:expr;)?
+        $(range $args:pat => $range:expr;)? $(domain $targs:pat => $domain:expr;)? $(integer_domain $iargs:pat => $integer_domain:expr;)? $(typed_domain $kargs:pat => $typed_domain:expr;)? $(identity $identity:expr;)? $(fold $fold:ident;)? $(truth $truth:ident;)? $(table $table:expr;)?
         $(output $output:ident;)? $(characters $rule:ident;)? $(tolerance |$tolk:pat_param| $tolerance:expr;)? $(same |$sx:pat_param| $same:expr;)? $(formula |$k:pat_param, $o:tt, $fargs:tt| $formula:expr;)? $(test |$tk:pat_param, $to:tt, $targs2:tt| $test:expr;)?
         $(slope |$so:tt, $sx1:tt, $sr:tt| $slope:expr;)? $(slopes |$s2o:tt, $s2x:tt, $s2y:tt, $s2r:tt| [$dx:expr, $dy:expr];)? $(shared $shared:ident;)?
         $(repair $repair:expr;)?
@@ -332,6 +334,8 @@ macro_rules! objects {
             $(objects!(@test_output $test);)?
             $(fn range(&self, $args: [Range; $n]) -> Range { $range })?
             $(fn domain(&self, $targs: [Range; $n]) -> Option<[Range; $n]> { $domain } fn has_domain(&self) -> bool { true })?
+            $(fn integer_domain(&self, $iargs: [Range; $n]) -> bool { $integer_domain })?
+            $(fn typed_domain(&self, $kargs: [DType; $n]) -> bool { $typed_domain })?
             $(fn identity(&self) -> [Option<f64>; $n] { $identity })?
             $(fn fold(&self) -> Option<crate::reduce::Reduce> { Some(crate::reduce::Reduce::$fold) })?
             $(fn truth(&self) -> Option<crate::reduce::Reduce> { Some(crate::reduce::Reduce::$truth) })?
@@ -547,6 +551,8 @@ objects!(2:
     // A whole exponent that every item shares gives a real power of any base, which the kernel computes through its whole-exponent loop (`WholePow`).
     crate::Pow {
         range [x, y] => powered(x, y); domain [x, y] => if whole(y) { Some([x, y]) } else { inside([x, y], [Range::NONNEGATIVE, Range::ANY]) };
+        integer_domain [_, y] => y.lo >= 0.0;
+        typed_domain [_, y] => y.is_integral();
         identity [None, Some(1.0)]; formula |_, o, [x, y]| if o.integral() { constant_power(o, x, y) } else { Some(crate::pow::formula(o, x, y)) }; shared power;
         native_integer |_, o, [x, y]| crate::integer::native_power(o.variant, x.into(), y.into()).map(I::low);
         native_complex |_, _, [x, y]| Some(crate::complex::pow::<F, { crate::FUSED }>(x, y)); exact |_, [x, y]| crate::exact::power(x, y); checks nan;
@@ -588,14 +594,18 @@ objects!(2:
         }; checks nan;
     }
     crate::tolerant::FloorDivide {
-        formula |k, o, [x, y]| Some(crate::with_tolerance!(k.0, |t| t.floor_in(o, o.divide(x, y))));
-        native_integer |_, o, [x, y]| crate::integer::floor_quotient(x.into(), y.into()).map(|x| o.result(x));
+        formula |k, o, [x, y]| Some(if o.integral() { crate::recipe::integer_floor_divide(o, x, y) }
+            else { crate::with_tolerance!(k.0, |t| t.floor_in(o, o.divide(x, y))) });
+        integers arithmetic;
         exact |_, [x, y]| crate::exact::floor_divide(x, y, false);
+        valid |_, v, o, [x, y], _| integer_division_valid(v, o, x, y, false);
     }
     crate::tolerant::MathishFloorDivide {
-        formula |k, o, [x, y]| Some(crate::with_tolerance!(k.0, |t| t.floor_in(o, crate::recipe::mathish_divide(o, x, y))));
-        native_integer |_, o, [x, y]| if x.into() == 0 && y.into() == 0 { Some(x) } else { crate::integer::floor_quotient(x.into(), y.into()).map(|x| o.result(x)) };
+        formula |k, o, [x, y]| Some(if o.integral() { crate::recipe::integer_floor_divide(o, x, y) }
+            else { crate::with_tolerance!(k.0, |t| t.floor_in(o, crate::recipe::mathish_divide(o, x, y))) });
+        integers arithmetic;
         exact |_, [x, y]| crate::exact::floor_divide(x, y, true);
+        valid |_, v, o, [x, y], _| integer_division_valid(v, o, x, y, true);
     }
     crate::tolerant::Gcd { identity [Some(0.0), Some(0.0)]; native_integer |_, o, [x, y]| crate::integer::gcd(x.into(), y.into()).map(|x| o.result(x)); exact |_, [x, y]| Ok(Some(crate::exact::gcd(x, y))); }
     crate::tolerant::Lcm { identity [Some(1.0), Some(1.0)]; native_integer |_, o, [x, y]| crate::integer::lcm(x.into(), y.into()).map(|x| o.result(x)); exact |_, [x, y]| Ok(Some(crate::exact::lcm(x, y))); }
@@ -694,6 +704,8 @@ impl<K: Formula<2>> Formula<2> for Flipped<K> {
     fn result_dtype(&self, input: DType) -> DType { self.0.result_dtype(input) }
     fn range(&self, [x, y]: [Range; 2]) -> Range { self.0.range([y, x]) }
     fn domain(&self, [x, y]: [Range; 2]) -> Option<[Range; 2]> { self.0.domain([y, x]).map(|[y, x]| [x, y]) }
+    fn integer_domain(&self, [x, y]: [Range; 2]) -> bool { self.0.integer_domain([y, x]) }
+    fn typed_domain(&self, [x, y]: [DType; 2]) -> bool { self.0.typed_domain([y, x]) }
     fn has_domain(&self) -> bool { self.0.has_domain() }
     fn identity(&self) -> [Option<f64>; 2] { let [x, y] = self.0.identity(); [y, x] }
     fn integer_formula(&self) -> bool { self.0.integer_formula() }
@@ -783,4 +795,11 @@ fn truth_valid<F: crate::Float, O: Ops<F> + ?Sized, const N: usize>(variant: Var
         });
         (crate::error::Kind::Domain, valid)
     })
+}
+
+fn integer_division_valid<F: crate::Float, O: Ops<F> + ?Sized>(variant: Variant, o: &O, x: O::V, y: O::V, mathish: bool) -> Option<(crate::error::Kind, O::B)> {
+    if !variant.checked || !o.integral() { return None; }
+    let zero = o.number(F::zero());
+    let nonzero = o.not(o.equal(y, zero));
+    Some((crate::error::Kind::Domain, if mathish { o.or(nonzero, o.equal(x, zero)) } else { nonzero }))
 }

@@ -1080,7 +1080,7 @@ mod random {
         roll(Arg::Many(&bounds), 1000, &mut Items::new(key.stream(1), 1), &mut rolls);
         assert!(rolls.iter().zip(&bounds).all(|(r, b)| r < b));
         let mut dealt = Vec::new();
-        deal(50, 60, key.stream(2), &mut dealt);
+        deal(50, 60, &mut key.stream(2).at(0), &mut dealt);
         dealt.sort_unstable();
         dealt.dedup();
         assert!(dealt.len() == 50 && dealt.iter().all(|&d| d < 60));

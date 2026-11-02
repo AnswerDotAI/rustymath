@@ -123,14 +123,14 @@ impl Divisor {
     #[inline]
     pub fn residue(self, y: i64) -> i64 { let r = (y.unsigned_abs() % self.magnitude) as i64; floored(if y < 0 { -r } else { r }, self.x) }
 
-    /// The floored quotient ⌊y/x⌋ and the residue of y modulo x. `None` where the quotient isn't an `i64`: `i64::MIN` divided by -1.
+    /// The floored quotient and residue. The quotient wraps at the signed machine limit.
     #[inline]
     pub fn div_mod(self, y: i64) -> Option<(i64, i64)> {
         let (q, r) = StrengthReducedU64::div_rem(y.unsigned_abs(), self.magnitude);
         let q = if (y < 0) != (self.x < 0) { -(q as i128) } else { q as i128 };
         let r0 = if y < 0 { -(r as i64) } else { r as i64 };
         let r = floored(r0, self.x);
-        Some((i64::try_from(q - i128::from(r != r0)).ok()?, r))
+        Some(((q - i128::from(r != r0)) as i64, r))
     }
 }
 

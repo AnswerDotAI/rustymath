@@ -120,6 +120,52 @@ pub trait Ops<F: Float> {
     }
 }
 
+/// Conservative range interpretation of the shared predicates.
+pub(crate) struct RangeOps(pub crate::buffer::DType);
+impl RangeOps {
+    fn compare(op: Cmp, x: crate::facts::Range, y: crate::facts::Range) -> Option<bool> {
+        if x.is_empty() || y.is_empty() { return None; }
+        match op {
+            Cmp::Less if x.hi < y.lo => Some(true), Cmp::Less if x.lo >= y.hi => Some(false),
+            Cmp::LessEqual if x.hi <= y.lo => Some(true), Cmp::LessEqual if x.lo > y.hi => Some(false),
+            Cmp::Equal if x.constant().is_some() && x == y => Some(true), Cmp::Equal if x.hi < y.lo || y.hi < x.lo => Some(false),
+            _ => None,
+        }
+    }
+    fn selected(test: Option<bool>, x: crate::facts::Range, y: crate::facts::Range) -> crate::facts::Range {
+        match test { Some(true) => x, Some(false) => y, None => x.join(y) }
+    }
+}
+impl<F: Float> Ops<F> for RangeOps {
+    type V = crate::facts::Range; type B = Option<bool>; type I = crate::facts::Range; type W = crate::facts::Range;
+    fn width(&self) -> crate::buffer::FloatWidth { crate::operation::numpy_float(self.0) }
+    fn fused(&self) -> bool { crate::FUSED }
+    fn integral(&self) -> bool { self.0.is_integral() }
+    fn widen(&self, _: Self::V) -> Self::W { crate::facts::Range::ANY }
+    fn wide_number(&self, x: f64) -> Self::W { crate::facts::Range::of(Some(x)) }
+    fn wide_multiply_add(&self, _: Self::W, _: Self::W, _: Self::W) -> Self::W { crate::facts::Range::ANY }
+    fn narrow(&self, _: Self::W) -> Self::V { crate::facts::Range::ANY }
+    fn integer(&self, x: i64) -> Self::I { crate::facts::Range::of((x.unsigned_abs() <= 1 << 53).then_some(x as f64)) }
+    fn integer_op(&self, _: Integer, _: Self::I, _: Self::I) -> Self::I { crate::facts::Range::ANY }
+    fn integer_compare(&self, op: Cmp, x: Self::I, y: Self::I) -> Self::B { Self::compare(op, x, y) }
+    fn integer_select(&self, test: Self::B, x: Self::I, y: Self::I) -> Self::I { Self::selected(test, x, y) }
+    fn to_integer(&self, _: Self::V) -> Self::I { crate::facts::Range::ANY }
+    fn from_integer(&self, _: Self::I) -> Self::V { crate::facts::Range::ANY }
+    fn to_bits(&self, _: Self::V) -> Self::I { crate::facts::Range::ANY }
+    fn from_bits(&self, _: Self::I) -> Self::V { crate::facts::Range::ANY }
+    fn number(&self, x: F) -> Self::V { crate::facts::Range::of(Some(x.wide())) }
+    fn constant(&self, x: Self::V) -> Option<F> { x.constant().map(F::narrow) }
+    fn unary(&self, op: Unary, x: Self::V) -> Self::V { if op == Unary::Magnitude { x.magnitude() } else { crate::facts::Range::ANY } }
+    fn binary(&self, _: Binary, _: Self::V, _: Self::V) -> Self::V { crate::facts::Range::ANY }
+    fn compare(&self, op: Cmp, x: Self::V, y: Self::V) -> Self::B { Self::compare(op, x, y) }
+    fn multiply_add(&self, _: Self::V, _: Self::V, _: Self::V) -> Self::V { crate::facts::Range::ANY }
+    fn overflow(&self, _: Binary, _: Self::V, _: Self::V) -> Self::B { None }
+    fn and(&self, x: Self::B, y: Self::B) -> Self::B { match (x, y) { (Some(false), _) | (_, Some(false)) => Some(false), (Some(true), Some(true)) => Some(true), _ => None } }
+    fn or(&self, x: Self::B, y: Self::B) -> Self::B { match (x, y) { (Some(true), _) | (_, Some(true)) => Some(true), (Some(false), Some(false)) => Some(false), _ => None } }
+    fn not(&self, x: Self::B) -> Self::B { x.map(|x| !x) }
+    fn select(&self, test: Self::B, x: Self::V, y: Self::V) -> Self::V { Self::selected(test, x, y) }
+}
+
 /// Scalar instantiation of the same formulae used by slice kernels and graph lowering.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NativeOps<const FUSED: bool> { pub tolerance: Option<f64> }
@@ -264,6 +310,14 @@ pub fn floor<F: Float, O: Ops<F> + ?Sized>(o: &O, t: O::V, y: O::V) -> O::V {
     let raise = o.smaller(raise, most);
     let raised = o.add(y, raise);
     o.floor(raised)
+}
+
+pub(crate) fn integer_floor_divide<F: Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, y: O::V) -> O::V {
+    let q = o.divide(x, y);
+    let r = o.subtract(x, o.multiply(q, y));
+    let zero = o.number(F::zero());
+    let lower = o.or(o.and(o.less(r, zero), o.less(zero, y)), o.and(o.less(zero, r), o.less(y, zero)));
+    o.subtract(q, o.one_where(lower))
 }
 
 /// The exact floor of `y`. Adding 0 turns IEEE's `-0` into `0`.

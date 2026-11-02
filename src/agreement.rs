@@ -20,9 +20,9 @@ pub enum Mapping {
     Steps { base: usize, steps: Vec<Steps> },
 }
 
-/// What an unmapped position reads. A chosen fill is an ordinary numbered input.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Missing { Default, Input(usize), Invalid }
+/// What an unmapped position reads. Input plans use the output position; Scalar broadcasts one source item.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Missing { Default, Input(ReadPlan), Scalar(usize), Invalid }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadAt { Input { source: usize, position: usize }, Index(i64), Default, Invalid }
@@ -46,12 +46,14 @@ pub struct ReadPlan { route: Arc<ReadRoute>, items: usize }
 
 impl ReadPlan {
     pub fn input(source: usize, items: usize) -> Self { Self { route: Arc::new(ReadRoute::Input(source)), items } }
+    pub fn fill(items: usize) -> Self { Self { route: Arc::new(ReadRoute::Default), items } }
     pub fn index(base: i64, step: i64, items: usize) -> Self { Self { route: Arc::new(ReadRoute::Index { base, step }), items } }
-    fn fallback(missing: Missing) -> Self {
+    fn fallback(missing: Missing, items: usize) -> Self {
         match missing {
-            Missing::Input(source) => Self::input(source, 1),
-            Missing::Default => Self { route: Arc::new(ReadRoute::Default), items: 1 },
-            Missing::Invalid => Self { route: Arc::new(ReadRoute::Invalid), items: 1 },
+            Missing::Input(plan) => plan,
+            Missing::Scalar(source) => Self::input(source, 1).remapped(Mapping::Single, items, Missing::Invalid),
+            Missing::Default => Self::fill(items),
+            Missing::Invalid => Self { route: Arc::new(ReadRoute::Invalid), items },
         }
     }
     pub fn copy(source: usize, source_items: usize, map: Mapping, items: usize, missing: Missing) -> Self {
@@ -79,9 +81,9 @@ impl ReadPlan {
             ReadRoute::Default => ReadAt::Default,
             ReadRoute::Invalid => ReadAt::Invalid,
             ReadRoute::Map { input, map, missing } => {
-                if input.is_empty() { return missing.at(0); }
+                if input.is_empty() { return missing.at(item); }
                 match map.get(item).filter(|&position| position < input.len()) {
-                    Some(position) => input.at(position), None => missing.at(0),
+                    Some(position) => input.at(position), None => missing.at(item),
                 }
             }
             ReadRoute::Join(parts) => {
@@ -91,9 +93,12 @@ impl ReadPlan {
             }
         }
     }
+    pub fn mapped(input: ReadPlan, map: Mapping, missing: ReadPlan, items: usize) -> Self {
+        if map == Mapping::Linear(1) && items == input.items { return input; }
+        Self { route: Arc::new(ReadRoute::Map { input, map, missing }), items }
+    }
     pub fn remapped(&self, map: Mapping, items: usize, missing: Missing) -> Self {
-        if map == Mapping::Linear(1) && items == self.items { return self.clone(); }
-        Self { route: Arc::new(ReadRoute::Map { input: self.clone(), map, missing: Self::fallback(missing) }), items }
+        Self::mapped(self.clone(), map, Self::fallback(missing, items), items)
     }
     pub fn try_for_each_source<E>(&self, visit: &mut impl FnMut(usize, usize) -> Result<(), E>) -> Result<(), E> {
         match self.route() {
@@ -117,6 +122,49 @@ impl ReadPlan {
             ReadRoute::Index { .. } | ReadRoute::Default | ReadRoute::Invalid => return Ok(self.clone()),
         };
         Ok(Self { route: Arc::new(route), items: self.items })
+    }
+    /// Applies this cell's read to `frames` cells. `bind` supplies each source in frame-major order.
+    pub fn framed(&self, frames: usize, bind: &mut impl FnMut(usize, usize) -> Result<Self, Error>) -> Result<Self, Error> {
+        if frames == 0 { return Ok(Self::fill(0)); }
+        Ok(self.interleaved(frames, bind)?.transposed(self.items, frames))
+    }
+    fn transposed(&self, rows: usize, columns: usize) -> Self {
+        self.remapped(Mapping::from(vec![Steps::along(columns, 1), Steps::along(rows, columns)]), self.items, Missing::Invalid)
+    }
+    fn interleaved(&self, frames: usize, bind: &mut impl FnMut(usize, usize) -> Result<Self, Error>) -> Result<Self, Error> {
+        let items = self.items.checked_mul(frames).ok_or_else(|| Error::new(Kind::Length, "framed read is too large"))?;
+        let route = match self.route() {
+            ReadRoute::Input(source) => {
+                let bound = bind(*source, self.items)?;
+                if bound.len() != items { return Err(Error::new(Kind::Length, "framed source changed its cell size")); }
+                return Ok(bound.transposed(frames, self.items));
+            }
+            ReadRoute::Map { input, map, missing } => {
+                if input.is_empty() || matches!(map, Mapping::Linear(0) | Mapping::Tiled(0)) { return missing.interleaved(frames, bind); }
+                // Keeping frames innermost preserves the cell's bounds check and concatenation order.
+                let (base, steps) = if let Mapping::Steps { base, steps } = map { (*base, Cow::Borrowed(&**steps)) }
+                else {
+                    let shape = match *map {
+                        Mapping::Linear(period) | Mapping::Tiled(period) if period > 1 && period < self.items => vec![self.items.div_ceil(period), period],
+                        _ => vec![self.items],
+                    };
+                    let (base, steps) = map.entries(&shape).expect("simple mappings have rectangular walks");
+                    (base, Cow::Owned(steps))
+                };
+                let mut steps: Vec<_> = steps.iter().cloned().map(|step| step.scaled(frames)).collect();
+                steps.push(Steps::along(frames, 1));
+                ReadRoute::Map {
+                    input: input.interleaved(frames, bind)?,
+                    map: Mapping::Steps { base: base * frames, steps: steps.into() },
+                    missing: missing.interleaved(frames, bind)?,
+                }
+            }
+            ReadRoute::Join(parts) => return Self::joined(parts.iter().map(|part| part.plan.interleaved(frames, bind)).collect::<Result<Vec<_>, _>>()?),
+            ReadRoute::Index { .. } => return Ok(self.remapped(Mapping::Linear(frames), items, Missing::Invalid)),
+            ReadRoute::Default => ReadRoute::Default,
+            ReadRoute::Invalid => ReadRoute::Invalid,
+        };
+        Ok(Self { route: Arc::new(route), items })
     }
     pub fn contiguous(&self, range: Range<usize>) -> Option<(usize, Range<usize>)> {
         let (source, start, stride) = self.run(&range)?;
@@ -147,6 +195,30 @@ impl ReadPlan {
         let (source, map) = self.positional(shape)?;
         let (base, strides) = map.affine(shape)?;
         Some((source, base, strides))
+    }
+    /// The inverse read where this plan visits every item of one source once by affine axes.
+    pub fn inverse(&self, source: usize, shape: &[usize], items: usize) -> Option<Mapping> {
+        if self.items != items { return None; }
+        let (found, map) = self.positional(shape)?;
+        if found != source { return None; }
+        if items == 0 { return Some(Mapping::Linear(1)); }
+        let (base, forward) = map.affine(shape)?;
+        let mut axes: Vec<_> = (0..shape.len()).filter(|&axis| shape[axis] > 1).collect();
+        axes.sort_unstable_by_key(|&axis| forward[axis].unsigned_abs());
+        let (mut covered, mut first) = (1usize, base as i128);
+        for &axis in &axes {
+            if forward[axis].unsigned_abs() != covered { return None; }
+            covered = covered.checked_mul(shape[axis])?;
+            if forward[axis] < 0 { first += forward[axis] as i128 * (shape[axis] - 1) as i128; }
+        }
+        if covered != items || first != 0 { return None; }
+        let strides = crate::layout::strides(shape);
+        let steps = axes.into_iter().rev().map(|axis| {
+            let stride = isize::try_from(strides[axis]).ok()?;
+            let reverse = forward[axis] < 0;
+            Some(Steps::Stride { start: if reverse { (shape[axis] - 1) * strides[axis] } else { 0 }, len: shape[axis], step: if reverse { -stride } else { stride } })
+        }).collect::<Option<Vec<_>>>()?;
+        Some(Mapping::from(steps))
     }
     /// Exact source windows for one bounded read block. Invalid producer positions remain errors.
     pub fn source_ranges(&self, range: Range<usize>) -> Result<Vec<(usize, Range<usize>)>, Error> {

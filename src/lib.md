@@ -36,22 +36,17 @@ let mut squares = Vec::new();
 Pow.many(Arg::Many(&[1.5, 2.0, 3.0]), Arg::One(2.0), 3, &mut squares); // squares: [2.25, 4.0, 9.0]
 ```
 
-[`kernels!`](https://docs.rs/rustymath/latest/rustymath/macro.kernels.html) gives an object's kernels as function pointers, one at each dtype where the object has a form, for code that chooses a dtype at run time. Its documentation gives the forms it takes. `Kernels::computes` gives the dtype that an argument computes in. `Kernels::unary`, `binary`, `ternary`, `run` and `product` cast an argument there and run the kernel. `run` executes the accumulation selected by the `Fold`, `Scan`, `RightFold` or `LeftScan` probe:
+`facts::Formula` holds an object's numerical and kind rules. `Formula::resolve` selects a working dtype and returns an `operation::Kernel` for callers choosing dtypes at run time. Its `map`, `fold_read`, `fold_pieces` and `scan` methods consume shared `agreement::Read` plans. `Kernel::real`, `complex` and `exact` evaluate scalar arguments through the same object.
 
 ```rust
-use rustymath::buffer::{DType, FloatWidth, Width};
-use rustymath::tolerant::{Equal, Tolerance};
-use rustymath::{kernels, reduce::Sum, Exp};
+use rustymath::{Exp, facts::{Formula, Variant}, buffer::{DType, FloatWidth, Width}};
 
-let exp = kernels!(Unary Exp);
-assert_eq!(exp.computes(DType::Integer(Width::I32)), Some(DType::Float(FloatWidth::F64)));
-let equal = kernels!(Binary of Equal(Tolerance::new(1e-14).unwrap()));
-assert!(equal.at(DType::Float(FloatWidth::F64)).is_some());
-let sum = kernels!(Fold Sum);
-assert_eq!(sum.computes(DType::Boolean), Some(DType::Integer(Width::I64)));
+let double = DType::Float(FloatWidth::F64);
+let exp = Exp.resolve(Variant::checked(double), [DType::Integer(Width::I32)]).unwrap();
+assert_eq!(exp.variant.dtype, double);
 ```
 
-Use the slice forms of `Sin`, `Cos` and `Tan` for arrays. They reduce each item by multiples of π with a few multiply-adds, then give the rare items beyond 2^23 at f64, or 2^20 at f32, an exact reduction in integer arithmetic. The free `sin` takes a branch for those items. That branch stops a loop that calls it from vectorizing.
+`Sin`, `Cos` and `Tan` use short reduction and polynomials for their common range. An object's repair predicate marks arguments beyond 2^23 at f64 or 2^20 at f32. Its native slice driver applies the object's scalar repair routine to those items before returning the results. `Kernel::ranged` omits repair when the same predicate is proved false over the supplied ranges.
 
 `atan2(y, x)` and its object `Atan2` give the angle of the point (x, y), from -π to π. `y` comes first, as in `f64::atan2`.
 
@@ -98,7 +93,7 @@ Equal(Tolerance::DEFAULT).many(Arg::Many(&[0.3, 0.1 + 0.2, 0.31]), Arg::One(0.3)
 
 The special functions `gamma`, `lgamma`, `digamma`, `erf`, `erfc`, their inverses, `binom` with its slopes `binom_dn` and `binom_dk`, the incomplete gamma and beta functions and Lambert W have free functions and objects at the crate root, as the elementary functions do.
 
-`Add`, `Subtract` and `Multiply` are objects at the crate root, for every float, complex and integer type. Their integer forms, and `Abs`'s, fail where a result doesn't fit its type. A caller that keeps integers exact, as basedpl does, takes another path for those results.
+`Add`, `Subtract` and `Multiply` are objects at the crate root, for every float, complex and integer type. Their integer forms, and `Abs`'s, report where a result doesn't fit its type. `Kernel` applies its explicit `Variant` checking and wrapping policy. Unbounded rational callers use `Formula::exact` through `Kernel::exact`.
 
 ## Accuracy and speed
 
@@ -141,4 +136,4 @@ An `f16` computes in `f32` and rounds once. Special values, such as infinities, 
 
 Where the target has a fused multiply-add instruction, as on AArch64 and on x86-64 with FMA, the functions use it. Elsewhere, as in wasm, they multiply and add separately, because a call to a software `fma` would stop the loop vectorizing. `FUSED` says which the target uses. The modules `fused` and `unfused` hold every function again, with the choice made. A loop compiled with FMA for itself, such as an AVX2 version chosen when your program runs, calls `fused`. The 4-ulp bound holds either way.
 
-At f64, `pow` and `root` compute ln |x| and its product with y as double words, through Arm Optimized Routines' tables. The result stays within 4 ulps even where y ln |x| nears the overflow threshold. A power or root whose exact result is a float, such as 15^4 or ∛27, comes out exactly. Their scalar forms take one branch for special values, as Arm's scalar `pow` does. Their slice forms compute every item the fast way, then redo only the rare items with special values. At `f32` and `f16`, `pow` and `root` compute in `f64` and round once. There the free `pow` and `root` have no branch. A loop that calls them vectorizes.
+General positive powers and roots use the shared `Exp` and `Ln` formulas, as exp(y·ln(x)) and exp(ln(x)/n). Cheap constant powers, square roots and cube roots use their specialized formulas. Constant integer powers and the cube-root correction retain their exact cases. The common formulas preserve the zero, negative-base and parity cases through the object's normal numerical rules.

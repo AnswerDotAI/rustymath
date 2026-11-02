@@ -20,8 +20,8 @@ pub enum Seed<'a> { Identity, Initial(crate::agreement::Read<'a>), Tail(crate::a
 pub enum Positions<'a> { Indices(crate::agreement::Read<'a>, DType), Route(&'a crate::agreement::ReadPlan, usize) }
 
 impl Positions<'_> {
-    fn len(self) -> usize { match self { Self::Indices(read, _) => read.plan.len(), Self::Route(plan, _) => plan.len() } }
-    fn chunk(self, range: std::ops::Range<usize>, size: usize, checked: bool, scratch: &mut Buffer) -> Result<Vec<usize>, Error> {
+    pub fn len(self) -> usize { match self { Self::Indices(read, _) => read.plan.len(), Self::Route(plan, _) => plan.len() } }
+    pub fn chunk(self, range: std::ops::Range<usize>, size: usize, checked: bool, scratch: &mut Buffer) -> Result<Vec<usize>, Error> {
         use crate::{agreement::ReadAt, gather::Steps};
         match self {
             Self::Indices(read, dtype) => crate::structure::positions_mode(read.part_view(range, dtype, checked, scratch)?, size, checked),
@@ -82,6 +82,8 @@ pub struct Kernel {
     pub variant: crate::facts::Variant,
     result: DType,
     boolean_inputs: bool,
+    typed_domain: bool,
+    repair: bool, raising: bool,
     characters: Option<crate::characters::Policy>,
     definition: std::sync::Arc<dyn Application>,
 }
@@ -95,14 +97,16 @@ impl std::fmt::Debug for Kernel {
 trait Application: Send + Sync {
     fn exact(&self, args: &[num_rational::BigRational]) -> Result<Option<num_rational::BigRational>, Error>;
     fn has_exact(&self) -> bool;
-    fn real(&self, variant: crate::facts::Variant, args: &[f64], settings: Settings) -> Result<f64, Error>;
+    fn real(&self, variant: crate::facts::Variant, args: &[f64], settings: Settings, repair: bool) -> Result<f64, Error>;
     fn complex(&self, variant: crate::facts::Variant, args: &[num_complex::Complex64], settings: Settings) -> Result<num_complex::Complex64, Error>;
     fn arity(&self) -> usize;
     fn integer_formula(&self) -> bool;
+    fn may_raise(&self, variant: crate::facts::Variant, ranges: &[crate::facts::Range]) -> bool;
     fn formula(&self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>, x: &[crate::facts::Slot]) -> Option<crate::facts::Slot>;
     fn test(&self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>, x: &[crate::facts::Slot]) -> Option<crate::facts::Slot>;
     fn repair_predicate(&self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>, x: &[crate::facts::Slot]) -> Option<crate::facts::Slot>;
     fn repair_routine(&self) -> Option<crate::facts::Repair>;
+    fn needs_repair(&self, variant: crate::facts::Variant, ranges: &[crate::facts::Range]) -> Option<bool>;
     fn validity(&self, variant: crate::facts::Variant, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>, x: &[crate::facts::Slot], result: crate::facts::Slot) -> Option<(Kind, crate::facts::Slot)>;
     fn partials(&self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>, x: &[crate::facts::Slot], result: crate::facts::Slot, needed: &[bool], output: &mut [Option<crate::facts::Slot>]);
     fn range(&self, x: &[crate::facts::Range]) -> crate::facts::Range;
@@ -111,7 +115,7 @@ trait Application: Send + Sync {
     fn fold(&self) -> Option<crate::reduce::Reduce>;
     fn truth_table(&self) -> Option<u8>;
     fn product(&self, variant: crate::facts::Variant, fold: Option<crate::reduce::Reduce>, boolean_inputs: bool, wanted: Option<DType>, settings: Settings) -> Option<NativeProduct>;
-    fn map(&self, variant: crate::facts::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, output: &mut Buffer) -> Result<(), Error>;
+    fn map(&self, variant: crate::facts::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, repair: bool, output: &mut Buffer) -> Result<(), Error>;
     fn fold_pieces(&self, variant: crate::facts::Variant, dims: [usize; 3], seed: Seed<'_>, direction: Direction, settings: Settings, pieces: &Pieces<'_>, output: &mut Buffer) -> Result<(), Error>;
     fn fold_read(&self, variant: crate::facts::Variant, shape: &[usize], axis: usize, seed: Seed<'_>, direction: Direction, settings: Settings, input: crate::agreement::Read<'_>, output: &mut Buffer) -> Result<(), Error>;
     fn at(&self, variant: crate::facts::Variant, values: crate::agreement::Read<'_>, ids: Positions<'_>, checked: bool, settings: Settings, output: &mut Buffer) -> Result<(), Error>;
@@ -126,13 +130,13 @@ impl<K: crate::facts::Formula<N>, const N: usize> Application for Definition<K, 
         self.object.exact(std::array::from_fn(|i| &args[i]))
     }
     fn has_exact(&self) -> bool { self.object.has_exact() }
-    fn real(&self, variant: crate::facts::Variant, args: &[f64], settings: Settings) -> Result<f64, Error> {
+    fn real(&self, variant: crate::facts::Variant, args: &[f64], settings: Settings, repair: bool) -> Result<f64, Error> {
         let x: [f64; N] = args.try_into().map_err(|_| Error::new(Kind::Length, "scalar operand count changed"))?;
         let ops = crate::recipe::NativeOps::<{ crate::FUSED }> { tolerance: settings.tolerance };
         match variant.dtype {
-            DType::Float(FloatWidth::F64) => scalar_result(real_value(&self.object, variant, &ops, x, true)),
+            DType::Float(FloatWidth::F64) => scalar_result(real_value(&self.object, variant, &ops, x, repair)),
             DType::Float(width) => {
-                let value = scalar_result(real_value(&self.object, variant, &ops, x.map(|x| x as f32), true))?;
+                let value = scalar_result(real_value(&self.object, variant, &ops, x.map(|x| x as f32), repair))?;
                 Ok(if width == FloatWidth::F16 { half::f16::from_f32(value).to_f64() } else { f64::from(value) })
             }
             _ => Err(Error::new(Kind::Domain, "a real scalar call needs a floating computing dtype")),
@@ -152,6 +156,12 @@ impl<K: crate::facts::Formula<N>, const N: usize> Application for Definition<K, 
     }
     fn arity(&self) -> usize { N }
     fn integer_formula(&self) -> bool { self.object.integer_formula() }
+    fn may_raise(&self, variant: crate::facts::Variant, ranges: &[crate::facts::Range]) -> bool {
+        if matches!(variant.dtype, DType::Complex(_)) || variant.dtype.is_integral() && !self.object.integer_formula() { return true; }
+        let Ok(args) = ranges.try_into() else { return true; };
+        self.object.emit_valid::<f64, _>(variant, &crate::recipe::RangeOps(variant.dtype), args, self.object.range(args))
+            .is_some_and(|(_, valid)| valid != Some(true))
+    }
     fn formula(&self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>, x: &[crate::facts::Slot]) -> Option<crate::facts::Slot> {
         self.object.emit(ops, x.try_into().ok()?)
     }
@@ -162,6 +172,9 @@ impl<K: crate::facts::Formula<N>, const N: usize> Application for Definition<K, 
         self.object.emit_repair(ops, x.try_into().ok()?)
     }
     fn repair_routine(&self) -> Option<crate::facts::Repair> { crate::facts::Formula::repair_routine(&self.object) }
+    fn needs_repair(&self, variant: crate::facts::Variant, ranges: &[crate::facts::Range]) -> Option<bool> {
+        self.object.emit_repair::<f64, _>(&crate::recipe::RangeOps(variant.dtype), ranges.try_into().ok()?)?
+    }
     fn validity(&self, variant: crate::facts::Variant, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>, x: &[crate::facts::Slot], result: crate::facts::Slot) -> Option<(Kind, crate::facts::Slot)> {
         self.object.emit_valid(variant, ops, x.try_into().ok()?, result)
     }
@@ -172,13 +185,13 @@ impl<K: crate::facts::Formula<N>, const N: usize> Application for Definition<K, 
     fn range(&self, x: &[crate::facts::Range]) -> crate::facts::Range {
         x.try_into().map_or(crate::facts::Range::ANY, |x| self.object.range(x))
     }
-    fn domain(&self, x: &[crate::facts::Range]) -> bool { x.try_into().is_ok_and(|x| self.object.domain(x).is_some()) }
+    fn domain(&self, x: &[crate::facts::Range]) -> bool { x.try_into().is_ok_and(|x| !self.object.has_domain() || self.object.domain(x).is_some()) }
     fn identity(&self) -> Option<f64> { self.object.identity().last().copied().flatten() }
     fn fold(&self) -> Option<crate::reduce::Reduce> { self.object.fold() }
     fn truth_table(&self) -> Option<u8> { self.object.truth_table() }
     fn product(&self, variant: crate::facts::Variant, fold: Option<crate::reduce::Reduce>, boolean_inputs: bool, wanted: Option<DType>, settings: Settings) -> Option<NativeProduct> { product_for::<K, N>(&self.object, variant, fold, boolean_inputs, wanted, settings) }
-    fn map(&self, variant: crate::facts::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, output: &mut Buffer) -> Result<(), Error> {
-        map_formula::<K, N>(&self.object, variant, inputs, range, settings, output)
+    fn map(&self, variant: crate::facts::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, repair: bool, output: &mut Buffer) -> Result<(), Error> {
+        map_formula::<K, N>(&self.object, variant, inputs, range, settings, repair, output)
     }
     fn fold_pieces(&self, variant: crate::facts::Variant, dims: [usize; 3], seed: Seed<'_>, direction: Direction, settings: Settings, pieces: &Pieces<'_>, output: &mut Buffer) -> Result<(), Error> {
         fold_formula::<K, N>(&self.object, variant, dims, seed, direction, settings, pieces, output)
@@ -240,7 +253,10 @@ impl Kernel {
     pub fn integer(op: crate::recipe::Integer, variant: crate::facts::Variant) -> Option<Self> { crate::facts::Formula::kernel(&crate::facts::IntegerOperation(op), variant) }
     pub fn integer_compare(op: crate::recipe::Cmp, variant: crate::facts::Variant) -> Option<Self> { crate::facts::Formula::kernel(&crate::facts::IntegerComparison(op), variant) }
     pub fn new<K: crate::facts::Formula<N>, const N: usize>(object: K, variant: crate::facts::Variant) -> Self {
-        Self { result: object.result_dtype(variant.dtype), characters: None, boolean_inputs: variant.dtype == DType::Boolean, variant, definition: std::sync::Arc::new(Definition::<K, N> { object }) }
+        let (result, typed_domain) = (object.result_dtype(variant.dtype), object.typed_domain([variant.dtype; N]));
+        let definition: std::sync::Arc<dyn Application> = std::sync::Arc::new(Definition::<K, N> { object });
+        let raising = definition.may_raise(variant, &[crate::facts::Range::ANY; N]);
+        Self { repair: true, raising, typed_domain, result, characters: None, boolean_inputs: variant.dtype == DType::Boolean, variant, definition }
     }
     pub fn resolve<K: crate::facts::Formula<N>, const N: usize>(object: K, mut variant: crate::facts::Variant, types: [DType; N]) -> Result<Self, Error> {
         use crate::characters::{Policy, ByKinds};
@@ -262,14 +278,18 @@ impl Kernel {
                 object.result_dtype(variant.dtype)
             }
         };
-        Ok(Self { result, characters, boolean_inputs: types.iter().all(|&d| d == DType::Boolean), variant, definition: std::sync::Arc::new(Definition::<K, N> { object }) })
+        let typed_domain = object.typed_domain(types);
+        let mut kernel = Self::new(object, variant);
+        kernel.result = result; kernel.characters = characters;
+        kernel.typed_domain = typed_domain; kernel.boolean_inputs = types.iter().all(|&d| d == DType::Boolean);
+        Ok(kernel)
     }
     pub fn arity(&self) -> usize { self.definition.arity() }
     pub fn result_dtype(&self) -> DType { self.result }
     pub fn character_policy(&self) -> Option<crate::characters::Policy> { self.characters }
     pub fn exact(&self, args: &[num_rational::BigRational]) -> Result<Option<num_rational::BigRational>, Error> { self.definition.exact(args) }
     pub fn has_exact(&self) -> bool { self.definition.has_exact() }
-    pub fn real(&self, args: &[f64], settings: Settings) -> Result<f64, Error> { self.definition.real(self.variant, args, settings) }
+    pub fn real(&self, args: &[f64], settings: Settings) -> Result<f64, Error> { self.definition.real(self.variant, args, settings, self.repair) }
     pub fn complex(&self, args: &[num_complex::Complex64], settings: Settings) -> Result<num_complex::Complex64, Error> {
         let value = self.definition.complex(self.variant, args, settings)?;
         Ok(if matches!(self.result, DType::Complex(_)) { value } else { num_complex::Complex64::new(value.re, 0.0) })
@@ -284,15 +304,25 @@ impl Kernel {
     pub fn repair_predicate(&self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>, x: &[crate::facts::Slot]) -> Option<crate::facts::Slot> {
         self.definition.repair_predicate(ops, x)
     }
-    pub fn repair_routine(&self) -> Option<crate::facts::Repair> { self.definition.repair_routine() }
+    pub fn repair_routine(&self) -> Option<crate::facts::Repair> { if self.repair { self.definition.repair_routine() } else { None } }
+    pub fn ranged(mut self, ranges: &[crate::facts::Range]) -> Self {
+        self.repair = self.definition.needs_repair(self.variant, ranges) != Some(false);
+        self.raising = self.definition.may_raise(self.variant, ranges);
+        self
+    }
+    /// Whether checked execution can record a numeric data error.
+    pub fn may_raise(&self) -> bool {
+        self.variant.checked && (self.result == DType::Character || self.raising)
+    }
     pub fn validity(&self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>, x: &[crate::facts::Slot], result: crate::facts::Slot) -> Option<(Kind, crate::facts::Slot)> {
+        if !self.may_raise() { return None; }
         self.definition.validity(self.variant, ops, x, result)
     }
     pub fn partials(&self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>, x: &[crate::facts::Slot], result: crate::facts::Slot, needed: &[bool], output: &mut [Option<crate::facts::Slot>]) {
         self.definition.partials(ops, x, result, needed, output)
     }
     pub fn range(&self, x: &[crate::facts::Range]) -> crate::facts::Range { self.definition.range(x) }
-    pub fn domain(&self, x: &[crate::facts::Range]) -> bool { self.definition.domain(x) }
+    pub fn domain(&self, x: &[crate::facts::Range]) -> bool { self.typed_domain || self.definition.domain(x) }
     pub fn identity(&self) -> Option<f64> { self.definition.identity() }
     pub fn fold(&self) -> Option<crate::reduce::Reduce> { self.definition.fold() }
     pub fn truth_table(&self) -> Option<u8> { self.definition.truth_table() }
@@ -311,8 +341,8 @@ impl Kernel {
                 let side = usize::from(side == ByKinds::Right);
                 inputs[side].read_into(range, self.result, self.variant.checked, output)?;
             }
-            Some(Policy::Codes { .. }) => with_codes(inputs, |inputs| self.definition.map(self.variant, inputs, range, settings, output))?,
-            None => self.definition.map(self.variant, inputs, range, settings, output)?,
+            Some(Policy::Codes { .. }) => with_codes(inputs, |inputs| self.definition.map(self.variant, inputs, range, settings, self.repair, output))?,
+            None => self.definition.map(self.variant, inputs, range, settings, self.repair, output)?,
         }
         finish(output, wanted, self.variant.checked)
     }
@@ -342,25 +372,38 @@ impl Kernel {
     }
 }
 
-pub fn choose(inputs: [crate::agreement::Read<'_>; 3], dtype: DType, checked: bool, output: &mut Buffer) -> Result<(), Error> {
-    let len = inputs.iter().map(|r| r.plan.len()).find(|&n| n != 1).unwrap_or(1);
-    if inputs.iter().any(|r| r.plan.len() != 1 && r.plan.len() != len) { return Err(Error::new(Kind::Length, "selection operands have different lengths")); }
-    if output.dtype() != dtype { *output = Buffer::with_capacity(dtype, len); }
-    with_dtype!(dtype, T => choose_typed::<T>(inputs, len, checked, T::vec_mut(output).expect("selection output dtype")))
+pub fn choose(
+    selector: (crate::agreement::Read<'_>, DType), choices: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>,
+    dtype: DType, checked: bool, output: &mut Buffer,
+) -> Result<(), Error> {
+    let reads = || std::iter::once(selector.0).chain(choices.iter().copied());
+    let len = reads().map(|read| read.plan.len()).find(|&n| n != 1).unwrap_or(1);
+    if reads().any(|read| read.plan.len() != 1 && read.plan.len() != len) { return Err(Error::new(Kind::Length, "selection operands have different lengths")); }
+    if range.start > range.end || (len != 1 && range.end > len) { return Err(Error::new(Kind::Length, "selection range exceeds its operands")); }
+    if output.dtype() != dtype { *output = Buffer::with_capacity(dtype, range.len()); }
+    with_dtype!(dtype, T => choose_typed::<T>(selector, choices, range, checked, T::vec_mut(output).expect("selection output dtype")))
 }
 
-fn choose_typed<T: crate::buffer::Cast>(inputs: [crate::agreement::Read<'_>; 3], len: usize, checked: bool, output: &mut Vec<T>) -> Result<(), Error> {
-    output.clear();
+fn choose_typed<T: crate::buffer::Cast>(
+    selector: (crate::agreement::Read<'_>, DType), choices: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, checked: bool, output: &mut Vec<T>,
+) -> Result<(), Error> {
+    output.clear(); let start = range.start;
     crate::error::checked(|| {
-        crate::parallel::extended(output, len, crate::CHUNK, &|range, slots| {
-            let mut mask = Vec::new();
-            let (mut left, mut right) = (Vec::new(), Vec::new());
-            let part = |i: usize| if inputs[i].plan.len() == 1 { 0..1 } else { range.clone() };
-            let args = inputs[0].part::<bool>(part(0), checked, &mut mask)
-                .and_then(|m| inputs[1].part::<T>(part(1), checked, &mut left).map(|x| (m, x)))
-                .and_then(|(m, x)| inputs[2].part::<T>(part(2), checked, &mut right).map(|y| (m, x, y)));
-            match args {
-                Ok((m, x, y)) => slots.fill(range.len(), |out| crate::slice::triples_into(m, x, y, out.len(), out, |m, x, y| (if m { x } else { y }, true))),
+        crate::parallel::extended(output, range.len(), crate::CHUNK, &|range, slots| {
+            let part = |read: crate::agreement::Read<'_>| if read.plan.len() == 1 { 0..1 } else { start + range.start..start + range.end };
+            let mut indices = Buffer::with_capacity(selector.1, 0);
+            let positions = Positions::Indices(selector.0, selector.1).chunk(part(selector.0), choices.len(), checked, &mut indices);
+            let mut storage: Vec<Vec<T>> = choices.iter().map(|_| Vec::new()).collect();
+            let args = choices.iter().zip(&mut storage).map(|(read, scratch)| read.part::<T>(part(*read), checked, scratch)).collect::<Result<Vec<_>, _>>();
+            match positions.and_then(|positions| args.map(|args| (positions, args))) {
+                Ok((positions, args)) => slots.fill(range.len(), |out| {
+                    for (i, slot) in out.iter_mut().enumerate() {
+                        let position = positions[if positions.len() == 1 { 0 } else { i }];
+                        let value = match args.get(position) { Some(Arg::One(value)) => *value, Some(Arg::Many(values)) => values[if values.len() == 1 { 0 } else { i }], None => T::FILL };
+                        slot.write(value);
+                    }
+                    true
+                }),
                 Err(error) => { crate::error::record(error); slots.fill(range.len(), |out| { for slot in out { slot.write(T::FILL); } false }) }
             }
         });
@@ -444,7 +487,7 @@ where P::Out: crate::buffer::Cast {
     use crate::agreement::{Mapping, Missing, Read, Walked};
     use crate::gather::Steps;
     use crate::linalg::{Mapped, Orientation};
-    let Some(matrix) = &plan.matrix else { return Ok(false); };
+    let Some(matrix) = plan.matrix_for(inputs) else { return Ok(false); };
     let [m, k, n] = matrix.size;
     if !variant.wrapping && matches!(P::Out::DTYPE, DType::Integer(w) if k > i64::MAX as usize || !w.holds(k as i64)) { return Ok(false); }
     let frames = crate::layout::count(&plan.layout.shape()[..matrix.frame_rank]);
@@ -475,30 +518,34 @@ where P::Out: crate::buffer::Cast {
     Ok(true)
 }
 
+pub fn gather_plan(
+    layout: &crate::layout::Layout, routes: &crate::structure::Routes, indices: &[(crate::agreement::Read<'_>, DType)],
+    broadcast: bool, checked: bool, filled: bool,
+) -> Result<crate::agreement::ReadPlan, Error> {
+    use crate::agreement::{Mapping, Missing, ReadPlan};
+    let mut scratch: Vec<_> = indices.iter().map(|(_, dtype)| Buffer::with_capacity(*dtype, 0)).collect();
+    let views = indices.iter().zip(&mut scratch).map(|((read, dtype), scratch)| read.part_view(0..read.plan.len(), *dtype, checked, scratch))
+        .collect::<Result<Vec<_>, _>>()?;
+    let plan = crate::structure::bound_routes(layout, routes, &views, broadcast, checked)?;
+    Ok(ReadPlan::copy(0, layout.count(), Mapping::from(plan.steps), plan.layout.count(), if filled { Missing::Scalar(1) } else { Missing::Default }))
+}
 pub fn gather(
     source: crate::agreement::Read<'_>, layout: &crate::layout::Layout, routes: &crate::structure::Routes,
     indices: &[(crate::agreement::Read<'_>, DType)], broadcast: bool, checked: bool,
     fill: Option<crate::agreement::Read<'_>>, output: &mut Buffer,
 ) -> Result<(), Error> {
-    use crate::agreement::{Binding, Mapping, Missing, Read};
+    use crate::agreement::{Binding, Read, ReadPlan};
     if source.plan.len() != layout.count() { return Err(Error::new(Kind::Length, "gather source does not fit its layout")); }
-    let mut scratch: Vec<_> = indices.iter().map(|(_, dtype)| Buffer::with_capacity(*dtype, 0)).collect();
-    let views = indices.iter().zip(&mut scratch).map(|((read, dtype), scratch)| read.part_view(0..read.plan.len(), *dtype, checked, scratch))
-        .collect::<Result<Vec<_>, _>>()?;
-    let plan = crate::structure::bound_routes(layout, routes, &views, broadcast, checked)?;
+    let plan = gather_plan(layout, routes, indices, broadcast, checked, fill.is_some())?;
     let mut sources = source.sources.to_vec();
     let mut prototype = Buffer::with_capacity(output.dtype(), 1);
-    let missing = match fill {
-        None => Missing::Default,
-        Some(fill) => {
-            if fill.plan.len() != 1 { return Err(Error::new(Kind::Length, "gather fill must be scalar")); }
-            fill.read_into(0..1, output.dtype(), checked, &mut prototype)?;
-            let index = sources.len();
-            sources.push(Binding::full(prototype.view()));
-            Missing::Input(index)
-        },
-    };
-    let read = source.plan.remapped(Mapping::from(plan.steps), plan.layout.count(), missing);
+    let fill_source = sources.len();
+    if let Some(fill) = fill {
+        if fill.plan.len() != 1 { return Err(Error::new(Kind::Length, "gather fill must be scalar")); }
+        fill.read_into(0..1, output.dtype(), checked, &mut prototype)?;
+        sources.push(Binding::full(prototype.view()));
+    }
+    let read = plan.compose_inputs::<Error>(&mut |which, _| Ok(if which == 0 { source.plan.clone() } else { ReadPlan::input(fill_source, 1) }))?;
     Read { sources: &sources, plan: &read }.read_into(0..read.len(), output.dtype(), checked, output)
 }
 
@@ -606,7 +653,7 @@ fn at_formula<K: crate::facts::Formula<N>, const N: usize>(
 }
 
 fn map_formula<K: crate::facts::Formula<N>, const N: usize>(
-    object: &K, variant: crate::facts::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, output: &mut Buffer,
+    object: &K, variant: crate::facts::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, repair: bool, output: &mut Buffer,
 ) -> Result<(), Error> {
     if inputs.len() != N { return Err(Error::new(Kind::Length, "kernel operand count changed")); }
     if let Some(slices) = object.native_slices() {
@@ -622,9 +669,9 @@ fn map_formula<K: crate::facts::Formula<N>, const N: usize>(
         };
     }
     match variant.dtype {
-        DType::Float(FloatWidth::F16) => map_real::<K, f32, half::f16, N>(object, variant, inputs, range, settings, output),
-        DType::Float(FloatWidth::F32) => map_real::<K, f32, f32, N>(object, variant, inputs, range, settings, output),
-        DType::Float(FloatWidth::F64) => map_real::<K, f64, f64, N>(object, variant, inputs, range, settings, output),
+        DType::Float(FloatWidth::F16) => map_real::<K, f32, half::f16, N>(object, variant, inputs, range, settings, repair, output),
+        DType::Float(FloatWidth::F32) => map_real::<K, f32, f32, N>(object, variant, inputs, range, settings, repair, output),
+        DType::Float(FloatWidth::F64) => map_real::<K, f64, f64, N>(object, variant, inputs, range, settings, repair, output),
         DType::Boolean => map_integer::<K, u8, N>(object, variant, inputs, range, output),
         DType::Integer(width) => with_width!(width, I => map_integer::<K, I, N>(object, variant, inputs, range, output)),
         DType::Complex(crate::buffer::ComplexWidth::F32) => map_complex::<K, f32, N>(object, variant, inputs, range, settings, output),
@@ -664,17 +711,17 @@ fn scalar_result<T>((value, error): (T, Option<Kind>)) -> Result<T, Error> {
     match error { Some(kind) => Err(Error::new(kind, "numerical argument is outside the function's domain")), None => Ok(value) }
 }
 fn map_real<K, F, Dst, const N: usize>(
-    object: &K, variant: crate::facts::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, output: &mut Buffer,
+    object: &K, variant: crate::facts::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, repair: bool, output: &mut Buffer,
 ) -> Result<(), Error>
 where K: crate::facts::Formula<N>, F: crate::float::Native + crate::buffer::Cast + Source<Dst>, Dst: Element + crate::Float {
     let ops = crate::recipe::NativeOps::<{ crate::FUSED }> { tolerance: settings.tolerance };
     if object.boolean() {
         return map_values::<F, bool, N>(inputs, range, variant.checked, output, &|x| {
-            (object.emit_test(&ops, x).expect("a Boolean object has a test body"), None)
+            let (value, error) = real_value(object, variant, &ops, x, false); (value != F::zero(), error)
         });
     }
     let body = |x| object.real(&ops, x).expect("a resolved object has a real body");
-    if let Some(repair) = crate::facts::Formula::repair_routine(object) {
+    if repair && let Some(repair) = crate::facts::Formula::repair_routine(object) {
         return map_blocks::<F, Dst, N>(inputs, range, variant.checked, output, &|args, n, out| {
             let needs = |x| object.emit_repair(&ops, x).unwrap_or(false);
             let ok = crate::slice::two_pass(args, n, out, |x| (!needs(x)).then(|| body(x)), |x| if needs(x) { repair.apply(x[0]) } else { body(x) });

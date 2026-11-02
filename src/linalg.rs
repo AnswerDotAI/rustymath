@@ -186,24 +186,59 @@ pub struct ProductPlan {
 #[derive(Clone, Copy, Debug)]
 pub struct MatrixProduct { pub frame_rank: usize, pub row_rank: usize, pub size: [usize; 3]
 }
+impl MatrixProduct {
+    fn of(shape: &[usize], owners: &[u8]) -> Option<Self> {
+        let frame_rank = owners.iter().take_while(|&&owner| owner == 3).count();
+        let row_rank = owners[frame_rank..].iter().take_while(|&&owner| owner == 1).count();
+        if !owners[frame_rank + row_rank..].iter().all(|&owner| owner == 2) { return None; }
+        let sizes = [&shape[frame_rank..frame_rank + row_rank], &shape[owners.len()..], &shape[frame_rank + row_rank..owners.len()]]
+            .map(|shape| crate::layout::element_count(shape).ok());
+        match sizes { [Some(m), Some(k), Some(n)] => Some(Self { frame_rank, row_rank, size: [m, k, n] }), _ => None }
+    }
+}
 
 impl ProductPlan {
+    pub fn folded(iteration: crate::layout::Layout, mappings: [Mapping; 2], contracted: usize) -> Result<Self, Error> {
+        let rank = iteration.shape().len();
+        if contracted > rank { return Err(Error::new(crate::error::Kind::Rank, "too many contracted axes")); }
+        let layout = iteration.axes(0..rank - contracted);
+        Ok(Self { layout, iteration, mappings, contracted, matrix: None })
+    }
+
+    pub fn matrix_for(&self, inputs: [crate::agreement::Read<'_>; 2]) -> Option<MatrixProduct> {
+        if self.matrix.is_some() { return self.matrix; }
+        let shape = self.iteration.shape();
+        let mut owners = vec![0; shape.len() - self.contracted];
+        for (side, input) in inputs.iter().enumerate() {
+            let plan = input.plan.remapped(self.mappings[side].clone(), self.iteration.count(), crate::agreement::Missing::Invalid);
+            let (_, map) = crate::agreement::Read { sources: input.sources, plan: &plan }.positional(shape)?;
+            let (_, steps) = map.affine(shape)?;
+            for (axis, owner) in owners.iter_mut().enumerate() { if steps[axis] != 0 { *owner |= 1 << side; } }
+        }
+        for owner in &mut owners { if *owner == 0 { *owner = 3; } }
+        MatrixProduct::of(shape, &owners)
+    }
     pub fn dot([left, right]: [&crate::layout::Layout; 2]) -> Result<Self, Error> {
         let rank = left.shape().len();
         if rank == 0 || right.shape().is_empty() { return Err(Error::new(crate::error::Kind::Rank, "an inner product needs vectors or matrices")); }
         Self::paired([left, right], &[(rank - 1, 0)], None)
     }
-    pub fn matrices([left, right]: [&crate::layout::Layout; 2]) -> Result<Self, Error> {
+    pub fn matrices(inputs: [&crate::layout::Layout; 2], frame: usize) -> Result<Self, Error> {
+        let (contracted, destinations) = Self::matrix_axes(inputs, frame)?;
+        Self::paired(inputs, &[contracted], Some(destinations))
+    }
+    /// The contracted pair and the destinations of each input's remaining axes, in source order.
+    pub fn matrix_axes([left, right]: [&crate::layout::Layout; 2], frame: usize) -> Result<((usize, usize), [Vec<usize>; 2]), Error> {
         use crate::agreement::Agreement;
         let [lr, rr] = [left, right].map(|l| l.shape().len());
-        if lr == 0 || rr == 0 { return Err(Error::new(crate::error::Kind::Rank, "a matrix product needs vectors or matrices")); }
-        let [lc, rc] = [lr.min(2), rr.min(2)];
+        if lr <= frame || rr <= frame { return Err(Error::new(crate::error::Kind::Rank, "a matrix product needs vector or matrix cells")); }
+        let [lc, rc] = [(lr - frame).min(2), (rr - frame).min(2)];
         let [lf, rf] = [left.axes(0..lr - lc), right.axes(0..rr - rc)];
         let [mut xa, mut ya] = Agreement::axis_pairs(&lf, &rf);
         let first = xa.iter().chain(&ya).max().map_or(0, |a| a + 1);
         if lc == 2 { xa.push(first); }
         if rc == 2 { ya.push(first + usize::from(lc == 2)); }
-        Self::paired([left, right], &[(lr - 1, rr - rc)], Some([xa, ya]))
+        Ok(((lr - 1, rr - rc), [xa, ya]))
     }
     /// Contracts `pairs`; optional destinations pair the remaining axes, in each input's axis order. Without destinations, remaining axes concatenate left then right.
     pub fn paired(inputs @ [left, right]: [&crate::layout::Layout; 2], pairs: &[(usize, usize)], destinations: Option<[Vec<usize>; 2]>) -> Result<Self, Error> {
@@ -243,14 +278,7 @@ impl ProductPlan {
         });
         let mut owners = vec![0u8; first];
         for (side, axes) in destinations.iter().enumerate() { for &axis in axes { owners[axis] |= 1 << side; } }
-        let frame_rank = owners.iter().take_while(|&&owner| owner == 3).count();
-        let row_rank = owners[frame_rank..].iter().take_while(|&&owner| owner == 1).count();
-        let matrix = if owners[frame_rank + row_rank..].iter().all(|&owner| owner == 2) {
-            let sizes = [
-                &iteration.shape()[frame_rank..frame_rank + row_rank], &iteration.shape()[first..], &iteration.shape()[frame_rank + row_rank..first],
-            ].map(|shape| element_count(shape).ok());
-            match sizes { [Some(m), Some(k), Some(n)] => Some(MatrixProduct { frame_rank, row_rank, size: [m, k, n] }), _ => None }
-        } else { None };
+        let matrix = MatrixProduct::of(iteration.shape(), &owners);
         Ok(Self { layout, iteration, mappings, contracted: pairs.len(), matrix })
     }
 }

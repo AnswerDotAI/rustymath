@@ -37,7 +37,7 @@ impl<'a> ArrayView<'a> {
         let missing = if self.dtype() == DType::Character {
             let source = sources.len();
             sources.push(Binding::full(View::Characters(&[' '])));
-            Missing::Input(source)
+            Missing::Scalar(source)
         } else { Missing::Default };
         Self { layout: self.layout, sources, plan: self.plan.remapped(mapping, items, missing) }
     }
@@ -117,7 +117,7 @@ impl Array {
             None if self.dtype() == DType::Character => Some(Arc::new(Buffer::Characters(vec![' ']))),
             None => None,
         };
-        let missing = fill.map_or(Missing::Default, |fill| { let source = sources.len(); sources.push(fill); Missing::Input(source) });
+        let missing = fill.map_or(Missing::Default, |fill| { let source = sources.len(); sources.push(fill); Missing::Scalar(source) });
         Ok(Self { layout: plan.layout, sources: sources.into(), plan: self.plan.remapped(Mapping::from(plan.steps), n, missing) })
     }
     pub fn reshape(&self, layout: Layout) -> Result<Self, Error> {
@@ -129,7 +129,7 @@ impl Array {
         let fill = fill.map(|f| Buffer::kept(f.view(), source.dtype())).transpose()?;
         if fill.as_ref().is_some_and(|f| f.len() != 1) { return Err(Error::new(Kind::Length, "a fill must contain one item")); }
         let mut sources = vec![Binding::full(source)];
-        let missing = if let Some(fill) = &fill { sources.push(Binding::full(fill.view())); Missing::Input(1) } else { Missing::Default };
+        let missing = if let Some(fill) = &fill { sources.push(Binding::full(fill.view())); Missing::Scalar(1) } else { Missing::Default };
         let n = element_count(plan.layout.shape())?;
         let read = ReadPlan::copy(0, source.len(), Mapping::from(plan.steps.clone()), n, missing);
         let mut buffer = Buffer::with_capacity(source.dtype(), n);
@@ -168,7 +168,7 @@ impl Array {
         let y = y.remapped(pair.right, pair.len).remapped(whole.left, whole.len);
         let condition = condition.remapped(whole.right, whole.len);
         let mut buffer = Buffer::with_capacity(x.dtype(), whole.len);
-        crate::operation::choose([condition.read(), x.read(), y.read()], x.dtype(), true, &mut buffer)?;
+        crate::operation::choose((condition.read(), DType::Boolean), &[y.read(), x.read()], 0..whole.len, x.dtype(), true, &mut buffer)?;
         Self::new(whole.layout, buffer)
     }
     pub fn broadcasted(source: ArrayView<'_>, shape: &[usize]) -> Result<Self, Error> {

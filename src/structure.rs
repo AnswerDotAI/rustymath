@@ -115,7 +115,7 @@ pub fn plan_layout<E>(
     layout: &Layout, claims: &[IndexPart<(Option<&str>, usize)>], explicit: Option<&[usize]>, broadcast: bool, writes: bool,
     decode: impl FnMut(usize, usize) -> Result<(Selector, bool), E>, err: impl Fn(Error) -> E) -> Result<(Layout, bool), E> {
     let r = routes(layout, claims, explicit, decode, &err)?;
-    Ok((routed(layout, &r, broadcast, Planning { writes, layouts: true }).map_err(&err)?.layout, r.one))
+    Ok((layout_routes(layout, &r, broadcast, writes).map_err(&err)?, r.one))
 }
 
 /// What a plan is for: a write, whose index arrays can repeat a key (`writes`), and a layout alone, whose index arrays can be known by their layouts (`layouts`, `plan_layout`).
@@ -164,6 +164,10 @@ pub fn routes<E>(
 
 /// The plan of the selection that `routes` gives on `layout`, as `plan_parts` plans it: `writes` plans a write, whose positions can repeat a key.
 pub fn plan_routes(layout: &Layout, routes: &Routes, broadcast: bool, writes: bool) -> Result<Plan, Error> { routed(layout, routes, broadcast, Planning { writes, layouts: false }) }
+
+pub fn layout_routes(layout: &Layout, routes: &Routes, broadcast: bool, writes: bool) -> Result<Layout, Error> {
+    Ok(routed(layout, routes, broadcast, Planning { writes, layouts: true })?.layout)
+}
 
 pub fn bound_routes(layout: &Layout, routes: &Routes, indices: &[View<'_>], broadcast: bool, checked: bool) -> Result<Plan, Error> {
     let grouped = route_layout(layout, routes)?;
@@ -474,7 +478,18 @@ fn outside(position: impl std::fmt::Display, size: usize) -> Error {
 
 /// Position `i` on an axis of length `size`, where a negative `i` counts back from the end. Adding `size` to a negative position without a branch keeps a loop over positions vectorised. A position outside the axis is then at least `size`.
 #[inline(always)]
-pub(crate) fn counted_back(i: i64, size: usize) -> usize { (i + (size as i64 & (i >> 63))) as usize }
+pub fn position_recipe<F: Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, value: O::I, size: i64) -> (O::I, O::B) {
+    use crate::recipe::{Cmp, Integer};
+    let (zero, limit) = (o.integer(0), o.integer(size));
+    let negative = o.integer_compare(Cmp::Less, value, zero);
+    let position = o.integer_op(Integer::Add, value, o.integer_select(negative, limit, zero));
+    let valid = o.and(o.not(o.integer_compare(Cmp::Less, position, zero)), o.integer_compare(Cmp::Less, position, limit));
+    (position, valid)
+}
+pub(crate) fn counted_back(i: i64, size: usize) -> usize {
+    let ops = crate::recipe::IntegerOps::<i64>::new(crate::facts::Variant::checked(crate::buffer::DType::Integer(crate::buffer::Width::I64)));
+    position_recipe::<f64, _>(&ops, i, size as i64).0 as usize
+}
 
 /// The positions that index values give along an axis of length `size`: integers as `index_positions` reads them, and floats as `filled_positions` does. Other items are a Domain error.
 pub fn positions(view: View<'_>, size: usize) -> Result<Vec<usize>, Error> { index_view!(view, |ix| index_positions(ix, size), |x| filled_positions(x, size)) }

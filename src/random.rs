@@ -38,7 +38,7 @@ pub struct Stream { pub key: Key, pub number: u64 }
 
 impl Stream {
     /// The stream's generator from block `block` on. A block holds 8 words.
-    pub(crate) fn at(self, block: u64) -> ChaCha8Rng {
+    pub fn at(self, block: u64) -> ChaCha8Rng {
         let mut rng = ChaCha8Rng::from_seed(self.key.0);
         rng.set_stream(self.number);
         if block != 0 { rng.set_block_pos(block); }
@@ -55,8 +55,9 @@ impl Counter {
     pub fn seeded(seed: u64) -> Self { Self { key: Key::seeded(seed), count: 0 } }
     /// The stream that the next draw call reads, counting the call.
     pub fn next(&mut self) -> Stream {
-        self.count += 1;
-        self.key.stream(self.count - 1)
+        let stream = self.key.stream(self.count);
+        self.count = self.count.wrapping_add(1);
+        stream
     }
 }
 
@@ -190,10 +191,10 @@ pub fn units(n: usize, items: &mut Items, out: &mut Vec<f64>) {
     for x in &mut out[start..] { *x = unit(x.to_bits()); }
 }
 
-/// Appends `n` distinct integers below `total` to `out`, in random order: every choice of them, in every order, is equally likely. `n` must be at most `total`. A deal is one item, and reads `stream` from its start.
-pub fn deal(n: u64, total: u64, stream: Stream, out: &mut Vec<u64>) {
+/// Appends `n` distinct integers below `total` to `out`, in random order. Every choice and order is equally likely. `n` must be at most `total`.
+pub fn deal<R: Rng + ?Sized>(n: u64, total: u64, rng: &mut R, out: &mut Vec<u64>) {
     assert!(n <= total, "a deal can't take more items than its total");
-    out.extend(rand::seq::index::sample(&mut stream.at(0), total as usize, n as usize).into_iter().map(|i| i as u64));
+    out.extend(rand::seq::index::sample(rng, total as usize, n as usize).into_iter().map(|i| i as u64));
 }
 
 /// SplitMix64's step: the golden ratio's increment.

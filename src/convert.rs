@@ -5,19 +5,40 @@ use crate::float::{Float, sealed::{Core, Sealed}};
 pub trait Int: Copy + Sealed + sealed::Ways {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ConversionKind { Cast, Truncate, Bits }
+pub enum ConversionKind { Cast, Truncate, Bits, Keep }
 
 /// Resolved kinds include the working float width even when the other kind is a word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Conversion { pub input: crate::buffer::DType, pub output: crate::buffer::DType, pub kind: ConversionKind }
 impl Conversion {
+    pub fn validity<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(self, o: &O, x: O::V) -> Option<(crate::error::Kind, O::B)> {
+        use crate::buffer::{DType, Width};
+        if self.kind != ConversionKind::Cast { return None; }
+        let valid = match self.output {
+            DType::Boolean => o.or(o.equal(x, o.number(F::zero())), o.equal(x, o.number(F::one()))),
+            DType::Integer(width) if matches!(self.input, DType::Float(_)) => {
+                let upper = if width == Width::U8 { 256.0 } else { 2f64.powi((8 * self.output.bytes() - 1) as i32) };
+                let lower = if width == Width::U8 { 0.0 } else { -upper };
+                let x = if width == Width::I64 { x } else { o.from_integer(o.to_integer(x)) };
+                o.and(o.less_equal(o.number(F::narrow(lower)), x), o.less(x, o.number(F::narrow(upper))))
+            }
+            _ => return None,
+        };
+        Some((crate::error::Kind::Overflow, valid))
+    }
+    pub fn may_raise(self, checked: bool) -> bool {
+        self.kind == ConversionKind::Keep || checked && (self.output == crate::buffer::DType::Character
+            || self.validity::<f64, _>(&crate::recipe::RangeOps(self.input), crate::facts::Range::of_dtype(self.input)).is_some_and(|(_, valid)| valid != Some(true)))
+    }
     pub fn map(self, input: crate::agreement::Read<'_>, range: std::ops::Range<usize>, checked: bool, output: &mut crate::buffer::Buffer) -> Result<(), crate::error::Error> {
         use crate::buffer::{Buffer, DType, FloatWidth, Floats, Element};
         use crate::error::{Error, Kind};
-        if self.kind == ConversionKind::Cast { return input.read_into(range, self.output, checked, output); }
+        if self.kind == ConversionKind::Cast && !matches!((self.input, self.output), (DType::Integer(_), DType::Integer(_))) { return input.read_into(range, self.output, checked, output); }
         let mut scratch = Buffer::with_capacity(self.input, 0);
         let values = input.part_view(range, self.input, checked, &mut scratch)?;
         *output = match (self.kind, values, self.output) {
+            (ConversionKind::Cast, _, _) => Buffer::cast_results(values, self.output, checked)?,
+            (ConversionKind::Keep, _, _) => Buffer::kept(values, self.output)?,
             (ConversionKind::Truncate, crate::buffer::View::Floats(values), DType::Integer(width)) => {
                 with_width!(width, I => I::buffer(with_floats!(values, |values| values.iter().map(|&x| saturated::<I, _>(x)).collect())))
             }

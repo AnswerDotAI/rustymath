@@ -283,7 +283,7 @@ pub fn product<'py>(
 /// [`product`] of two arrays that share one dtype, as a core array.
 pub fn inner(f: NativeFunction<'_>, g: NativeFunction<'_>, [left, right]: [ArrayView<'_>; 2], name: &str) -> PyResult<Core> {
     let named = |e: Error| py_err(Error::new(e.kind, format!("{name}: {}", e.message)));
-    let plan = linalg::ProductPlan::matrices([left.layout(), right.layout()]).map_err(named)?;
+    let plan = linalg::ProductPlan::matrices([left.layout(), right.layout()], 0).map_err(named)?;
     let dtype = left.dtype();
     let compute = match dtype { DType::Integer(_) => I64, DType::Float(FloatWidth::F16) => DType::Float(FloatWidth::F32), d => d };
     let map = (native_binary(g.0)?.kernel)(compute, g.1)?;

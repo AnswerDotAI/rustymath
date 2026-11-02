@@ -24,7 +24,7 @@ impl Generator {
             let mut positions = Vec::with_capacity(n);
             if n != 0 {
                 if replace { rustymath::random::roll(Arg::One(total as u64), n, &mut Items::new(self.0.next(), 1), &mut positions); }
-                else { rustymath::random::deal(n as u64, total as u64, self.0.next(), &mut positions); }
+                else { rustymath::random::deal(n as u64, total as u64, &mut self.0.next().at(0), &mut positions); }
             }
             positions
         }))
