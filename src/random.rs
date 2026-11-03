@@ -1,4 +1,4 @@
-//! Random numbers from counter streams: floats between 0 and 1, rolls, each uniform below its own bound, deals, distinct integers below a total, and the words that distributions' samplers read. A [`Key`] and a stream number pick one ChaCha8 stream for each draw call, so a generator's state is its key and the count of its draw calls. Item k of a call reads its first `w` words, the words of one attempt of its law, packed at word k × w of the call's stream. A law that rejects reads its further words from item k's own region of the stream ([`Items`]). A map's draw call reads each cell's items as a call of its own on a stream that the cell's place picks, except item 0, whose words the map's cells pack in one stream that they share ([`Items::cells`]). No item's draws depend on another's: a call's items can be drawn in any order or on any thread, and an item reads the same words whichever route draws it.
+//! Random sampling from counter streams. Each call reads one ChaCha8 stream selected by a key and stream number. Item `k` reads its first `w` words at position `k*w`, and rejection sampling uses that item's separate region. Floats, rolls and distribution samplers share this word addressing.
 use crate::Arg;
 use rand::{Rng, SeedableRng, rngs::ChaCha8Rng};
 use std::convert::Infallible;
@@ -12,24 +12,6 @@ impl Key {
     pub fn seeded(seed: u64) -> Self { Self(ChaCha8Rng::seed_from_u64(seed).get_seed()) }
     /// The stream that draw call `number` reads.
     pub fn stream(self, number: u64) -> Stream { Stream { key: self, number } }
-    /// The stream that `parts` pick under this key, as JAX's `fold_in` folds data into a key: SplitMix64's step takes the count of parts, then each part in turn. The top bit is set, so a folded stream is never one that a [`Counter`] counts.
-    pub fn folded(self, parts: &[u64]) -> Stream {
-        let (&last, prefix) = parts.split_last().expect("a folded stream has a part");
-        self.folding(prefix).stream(last)
-    }
-    /// The streams that `prefix` followed by one more part picks, as [`Key::folded`] picks them, with `prefix` folded once.
-    pub fn folding(self, prefix: &[u64]) -> Fold {
-        Fold { key: self, hash: prefix.iter().fold(finalized((prefix.len() as u64 + 1).wrapping_add(GOLDEN)), |h, &p| finalized((h ^ p).wrapping_add(GOLDEN))) }
-    }
-}
-
-/// A key with a prefix of parts folded in ([`Key::folding`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Fold { key: Key, hash: u64 }
-
-impl Fold {
-    /// The stream that the prefix followed by `last` picks.
-    pub fn stream(self, last: u64) -> Stream { self.key.stream(finalized((self.hash ^ last).wrapping_add(GOLDEN)) | 1 << 63) }
 }
 
 /// The stream that one draw call reads: a key and a stream number under it.
@@ -64,73 +46,35 @@ impl Counter {
 /// The block where items' regions start, and each region's length in blocks. Packed words fill blocks from 0. Above 2⁶³, 2²³ blocks of 8 words give each of up to 2⁴⁰ items 2²⁶ further words.
 const REGIONS: u64 = 1 << 63;
 const REGION_BLOCKS: u64 = 1 << 23;
-/// The place whose stream a map's cells share for their first items ([`Items::cells`]), which no cell has.
-const SHARED: u64 = u64::MAX;
 
-/// The words of one draw call's items, item by item. Item k reads its first `w` words, the words of one attempt of the call's law, at word k × w of the call's stream. It reads any further words from its own region, from block 2⁶³ + k × 2²³ on. A map's draw call reads its cells' items as [`Items::cells`] says.
-pub struct Items { stream: Stream, packed: ChaCha8Rng, w: usize, next: u64, cells: Option<Cells> }
-
-/// A map's draw call over cells of `n` items each, from place `first` on ([`Items::cells`]): the fold that picks each cell's own stream and the stream that the cells share, and the own stream's generator for the cell whose later items were read last.
-struct Cells { fold: Fold, first: u64, n: u64, cell: Option<(u64, ChaCha8Rng)> }
+/// The words of one draw call's items, item by item. Item k reads its first `w` words, the words of one attempt of the call's law, at word k × w of the call's stream. It reads any further words from its own region, from block 2⁶³ + k × 2²³ on.
+pub struct Items { stream: Stream, packed: ChaCha8Rng, w: usize, next: u64 }
 
 impl Items {
     /// The items of the call that reads `stream`, with `w` packed words each.
-    pub fn new(stream: Stream, w: usize) -> Self { Self { stream, packed: stream.at(0), w, next: 0, cells: None } }
-    /// The items of a map's draw call, cell after cell, for cells of `n` items with `w` packed words each, at places `first`, `first` + 1 and on in the frame of the innermost map. Cell p's items are those of a call of its own on `fold.stream(p)`, except that item 0 reads its packed words at word p × w of `fold.stream(SHARED)`, which the cells share. Cells that draw one item each then read one stream in order, and a cell reads the same words whether it's drawn with others or alone ([`Items::cell`]).
-    pub fn cells(fold: Fold, first: u64, n: usize, w: usize) -> Self {
-        let (shared, word) = (fold.stream(SHARED), first * w as u64);
-        let mut packed = shared.at(word / 8);
-        for _ in 0..word % 8 { packed.next_u64(); }
-        Self { stream: shared, packed, w, next: 0, cells: Some(Cells { fold, first, n: (n as u64).max(1), cell: None }) }
-    }
-    /// The items of a map's cell at place `place`, drawn alone, as [`Items::cells`] reads them.
-    pub fn cell(fold: Fold, place: u64, w: usize) -> Self { Self::cells(fold, place, usize::MAX, w) }
+    pub fn new(stream: Stream, w: usize) -> Self { Self { stream, packed: stream.at(0), w, next: 0 } }
     /// The next item's words.
     pub fn item(&mut self) -> Item<'_> {
         let k = self.next;
         self.next += 1;
         Item { left: self.w, k, region: None, items: self }
     }
-    /// The next packed word of item `k`: from `packed`, except for a later item of a map's cell, which reads the cell's own stream.
-    fn word(&mut self, k: u64) -> u64 {
-        let w = self.w;
-        let Some(cells) = &mut self.cells else { return self.packed.next_u64() };
-        let (c, j) = (k / cells.n, k % cells.n);
-        if j == 0 { return self.packed.next_u64(); }
-        match &mut cells.cell {
-            Some((at, own)) if *at == c => own.next_u64(),
-            cell => {
-                // Item 0's packed words lie in the shared stream, so the cell's own stream leaves its first `w` unread.
-                let mut own = cells.fold.stream(cells.first + c).at(0);
-                for _ in 0..w { own.next_u64(); }
-                let word = own.next_u64();
-                *cell = Some((c, own));
-                word
-            }
-        }
-    }
     /// The packed words of the next `n` items, in order, for a kernel whose items read only their packed words unless they reject. A rejection reads its item's region (`region`).
     fn words(&mut self, n: usize) -> impl Iterator<Item = u64> + '_ {
-        let (first, w) = (self.next, self.w as u64);
+        let w = self.w;
         self.next += n as u64;
-        // A call's own items, and items of cells that draw one each, read only `packed`. `fill` would read the same words, but `rand`'s block generators copy each 4-byte word through a call to `memmove`, which costs several times as much.
-        let packed_only = self.cells.as_ref().is_none_or(|cells| cells.n == 1);
-        (0..n as u64 * w).map(move |i| if packed_only { self.packed.next_u64() } else { self.word(first + i / w) })
+        // rand block fills copy each 4-byte word through memmove.
+        (0..n * w).map(move |_| self.packed.next_u64())
     }
-    /// Item `k`'s region, which in a map's call is the region of its place in its cell's own stream.
-    fn region(&self, k: u64) -> ChaCha8Rng {
-        match &self.cells {
-            None => self.stream.at(REGIONS + k * REGION_BLOCKS),
-            Some(cells) => cells.fold.stream(cells.first + k / cells.n).at(REGIONS + k % cells.n * REGION_BLOCKS),
-        }
-    }
+    /// Item `k`'s rejection region.
+    fn region(&self, k: u64) -> ChaCha8Rng { self.stream.at(REGIONS + k * REGION_BLOCKS) }
 }
 
 /// One item's words: its packed ones, then its region's ([`Items`]). Dropping it skips the packed words it didn't read, so that the next item reads its own.
 pub struct Item<'a> { items: &'a mut Items, left: usize, k: u64, region: Option<Box<ChaCha8Rng>> }
 
 impl Drop for Item<'_> {
-    fn drop(&mut self) { for _ in 0..self.left { self.items.word(self.k); } }
+    fn drop(&mut self) { for _ in 0..self.left { self.items.packed.next_u64(); } }
 }
 
 impl rand::TryRng for Item<'_> {
@@ -139,7 +83,7 @@ impl rand::TryRng for Item<'_> {
     fn try_next_u64(&mut self) -> Result<u64, Infallible> {
         if self.left > 0 {
             self.left -= 1;
-            return Ok(self.items.word(self.k));
+            return Ok(self.items.packed.next_u64());
         }
         let (items, k) = (&*self.items, self.k);
         Ok(self.region.get_or_insert_with(|| Box::new(items.region(k))).next_u64())
@@ -195,15 +139,5 @@ pub fn units(n: usize, items: &mut Items, out: &mut Vec<f64>) {
 pub fn deal<R: Rng + ?Sized>(n: u64, total: u64, rng: &mut R, out: &mut Vec<u64>) {
     assert!(n <= total, "a deal can't take more items than its total");
     out.extend(rand::seq::index::sample(rng, total as usize, n as usize).into_iter().map(|i| i as u64));
-}
-
-/// SplitMix64's step: the golden ratio's increment.
-const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
-
-/// SplitMix64's output for its state `z`.
-fn finalized(z: u64) -> u64 {
-    let z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    let z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
 }
 

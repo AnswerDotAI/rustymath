@@ -5,8 +5,9 @@ use crate::float::sealed::Core;
 use crate::recipe::Ops;
 use crate::reduce::{Maximum, Minimum, Reduce};
 use crate::Flipped;
-use crate::tolerant::Tolerant;
+use crate::tolerant::{Tolerance, Tolerant, TolerantComplex, lcm_from_gcd};
 use std::f64::consts::PI;
+use num_complex::Complex;
 use num_traits::{One, Signed, Zero};
 
 /// The values other than NaN that the items of an argument or a result can take: each lies from `lo` to `hi`. ¯0 and +0 count as one value, because the sign of a zero isn't promised and can differ by route. Any range can also hold NaN. A rule's range is sound where it holds every result that the object's kernels give, within their accuracy.
@@ -505,8 +506,8 @@ objects!(1:
         native_real |_, _, [x]| Some(crate::special::gamma::<F, { crate::FUSED }>(x)); checks nan;
     }
     crate::Sign { formula |_, o, [x]| Some(crate::recipe::sign(o, x)); integers arithmetic; native_complex |_, _, [x]| Some(crate::complex::sign::<F, { crate::FUSED }>(x)); exact |_, [x]| Ok(Some(x.signum())); }
-    crate::tolerant::Floor { formula |k, o, [x]| Some(crate::with_tolerance!(k.0, |t| t.floor_in(o, x))); integers formula; native_complex |k, o, [x]| Some(crate::tolerant::TolerantComplex::complex_floor(o.tolerance.and_then(crate::tolerant::Tolerance::new).unwrap_or(k.0), x)); exact |_, [x]| Ok(Some(x.floor())); }
-    crate::tolerant::Ceil { formula |k, o, [x]| Some(crate::with_tolerance!(k.0, |t| t.ceil_in(o, x))); integers formula; native_complex |k, o, [x]| Some(crate::tolerant::TolerantComplex::complex_ceil(o.tolerance.and_then(crate::tolerant::Tolerance::new).unwrap_or(k.0), x)); exact |_, [x]| Ok(Some(x.ceil())); }
+    crate::tolerant::Floor { formula |k, o, [x]| Some(crate::with_tolerance!(k.0, |t| t.floor_in(o, x))); integers formula; native_complex |k, o, [x]| Some(crate::tolerant::TolerantComplex::complex_floor(native_tolerance(o.tolerance, k.0), x)); exact |_, [x]| Ok(Some(x.floor())); }
+    crate::tolerant::Ceil { formula |k, o, [x]| Some(crate::with_tolerance!(k.0, |t| t.ceil_in(o, x))); integers formula; native_complex |k, o, [x]| Some(crate::tolerant::TolerantComplex::complex_ceil(native_tolerance(o.tolerance, k.0), x)); exact |_, [x]| Ok(Some(x.ceil())); }
     crate::Not { test |_, o, [x]| Some(o.equal(x, o.number(F::zero()))); integers only; valid |_, v, o, x, _| truth_valid(v, o, x); }
     crate::Cis { output complex; native_complex |_, _, [x]| Some(crate::complex::exp::<F, { crate::FUSED }>(num_complex::Complex::new(-x.im, x.re))); }
     crate::LambertW { native_complex |_, _, [x]| Some(crate::lambert::complex(x)); native_real |_, _, [x]| Some(crate::lambert::lambertw::<F, { crate::FUSED }>(x)); checks nan; }
@@ -573,9 +574,9 @@ objects!(2:
             o.negate(o.multiply(o.one_where(o.not(at_zero)), o.divide(o.subtract(y, r), o.add(x, o.one_where(at_zero)))))
         }, o.number(F::one())];
         native_integer |_, _, [x, y]| Some(I::low(crate::integer::residue(x.into(), y.into())));
-        native_complex |k, o, [x, y]| Some(crate::tolerant::TolerantComplex::complex_residue(o.tolerance.and_then(crate::tolerant::Tolerance::new).unwrap_or(k.0), x, y));
+        native_complex |k, o, [x, y]| Some(crate::tolerant::TolerantComplex::complex_residue(native_tolerance(o.tolerance, k.0), x, y));
         native_real |k, o, [x, y]| {
-            let t = o.tolerance.and_then(crate::tolerant::Tolerance::new).unwrap_or(k.0);
+            let t = native_tolerance(o.tolerance, k.0);
             Some(if t.is_exact() { crate::tolerant::exact_residue(x, y) } else { crate::tolerant::Tolerant::residue(t, x, y) })
         };
         exact |_, [x, y]| Ok(Some(crate::exact::residue(x, y)));
@@ -607,8 +608,20 @@ objects!(2:
         exact |_, [x, y]| crate::exact::floor_divide(x, y, true);
         valid |_, v, o, [x, y], _| integer_division_valid(v, o, x, y, true);
     }
-    crate::tolerant::Gcd { identity [Some(0.0), Some(0.0)]; native_integer |_, o, [x, y]| crate::integer::gcd(x.into(), y.into()).map(|x| o.result(x)); exact |_, [x, y]| Ok(Some(crate::exact::gcd(x, y))); }
-    crate::tolerant::Lcm { identity [Some(1.0), Some(1.0)]; native_integer |_, o, [x, y]| crate::integer::lcm(x.into(), y.into()).map(|x| o.result(x)); exact |_, [x, y]| Ok(Some(crate::exact::lcm(x, y))); }
+    crate::tolerant::Gcd {
+        identity [Some(0.0), Some(0.0)]; tolerance |k| k.0.value();
+        native_integer |_, o, [x, y]| crate::integer::gcd(x.into(), y.into()).map(|x| o.result(x));
+        native_complex |k, o, [x, y]| Some(native_tolerance(o.tolerance, k.0).complex_gcd(x, y));
+        native_real |k, o, [x, y]| Some(native_tolerance(o.tolerance, k.0).gcd(x, y));
+        exact |_, [x, y]| Ok(Some(crate::exact::gcd(x, y))); checks nan;
+    }
+    crate::tolerant::Lcm {
+        identity [Some(1.0), Some(1.0)]; tolerance |k| k.0.value();
+        native_integer |_, o, [x, y]| crate::integer::lcm(x.into(), y.into()).map(|x| o.result(x));
+        native_complex |k, o, [x, y]| Some(lcm_from_gcd(x, y, native_tolerance(o.tolerance, k.0).complex_gcd(x, y)));
+        native_real |k, o, [x, y]| Some(lcm_from_gcd(x, y, native_tolerance(o.tolerance, k.0).gcd(x, y)));
+        exact |_, [x, y]| Ok(Some(crate::exact::lcm(x, y))); checks nan;
+    }
     crate::Nand { table 7; test |_, o, [x, y]| Some(o.not(o.and(o.equal(x, o.number(F::one())), o.equal(y, o.number(F::one()))))); integers only; valid |_, v, o, x, _| truth_valid(v, o, x); }
     crate::Nor { table 1; test |_, o, [x, y]| Some(o.and(o.equal(x, o.number(F::zero())), o.equal(y, o.number(F::zero())))); integers only; valid |_, v, o, x, _| truth_valid(v, o, x); }
     crate::BitAnd { fold And; table 8; formula |_, o, [x, y]| Some(o.from_bits(o.integer_op(crate::recipe::Integer::And, o.to_bits(x), o.to_bits(y)))); integers only; }
@@ -621,8 +634,18 @@ objects!(2:
     }
     crate::reduce::Xor { fold Xor; table 6; test |_, o, [x, y]| Some(o.not(o.equal(x, y))); integers only; valid |_, v, o, x, _| truth_valid(v, o, x); }
     crate::reduce::Xnor { fold Xnor; table 9; test |_, o, [x, y]| Some(o.equal(x, y)); integers only; valid |_, v, o, x, _| truth_valid(v, o, x); }
-    crate::tolerant::Equal { identity [Some(1.0), Some(1.0)]; table 9; characters Ordered; tolerance |k| k.0.value(); test |k, o, [x, y]| Some(tested(*k, k.0, o, x, y)); integers formula; exact |_, [x, y]| Ok(Some(crate::exact::boolean(x == y))); }
-    crate::tolerant::NotEqual { identity [Some(0.0), Some(0.0)]; table 6; characters Ordered; tolerance |k| k.0.value(); test |k, o, [x, y]| Some(tested(*k, k.0, o, x, y)); integers formula; exact |_, [x, y]| Ok(Some(crate::exact::boolean(x != y))); }
+    crate::tolerant::Equal {
+        identity [Some(1.0), Some(1.0)]; table 9; characters Ordered; tolerance |k| k.0.value();
+        test |k, o, [x, y]| Some(tested(*k, k.0, o, x, y)); integers formula;
+        native_complex |k, o, [x, y]| Some(if native_tolerance(o.tolerance, k.0).complex_equal(x, y) { Complex::one() } else { Complex::zero() });
+        exact |_, [x, y]| Ok(Some(crate::exact::boolean(x == y)));
+    }
+    crate::tolerant::NotEqual {
+        identity [Some(0.0), Some(0.0)]; table 6; characters Ordered; tolerance |k| k.0.value();
+        test |k, o, [x, y]| Some(tested(*k, k.0, o, x, y)); integers formula;
+        native_complex |k, o, [x, y]| Some(if !native_tolerance(o.tolerance, k.0).complex_equal(x, y) { Complex::one() } else { Complex::zero() });
+        exact |_, [x, y]| Ok(Some(crate::exact::boolean(x != y)));
+    }
     crate::tolerant::Less { identity [Some(0.0), None]; table 2; characters Ordered; test |k, o, [x, y]| Some(tested(*k, k.0, o, x, y)); integers formula; exact |_, [x, y]| Ok(Some(crate::exact::boolean(x < y))); }
     crate::tolerant::LessEqual { identity [Some(1.0), None]; table 11; characters Ordered; test |k, o, [x, y]| Some(tested(*k, k.0, o, x, y)); integers formula; exact |_, [x, y]| Ok(Some(crate::exact::boolean(x <= y))); }
     crate::tolerant::Greater { identity [None, Some(0.0)]; table 4; characters Ordered; test |k, o, [x, y]| Some(tested(*k, k.0, o, x, y)); integers formula; exact |_, [x, y]| Ok(Some(crate::exact::boolean(x > y))); }
@@ -659,6 +682,9 @@ fn masked<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, x: O::V, y:
     let mask = crate::integer::mask(d as i64).filter(|_| d.fract() == 0.0)?;
     Some(o.bit_and(y, o.number(F::narrow(mask as f64))))
 }
+
+#[inline]
+fn native_tolerance(value: Option<f64>, fallback: Tolerance) -> Tolerance { value.and_then(Tolerance::new).unwrap_or(fallback) }
 
 /// Comparison `k`'s truth value through `o`, as its kernel computes it: against a number that one argument holds (`Ops::constant`), through the range of floats equal to that number at tolerance `t` (`tolerant::against_steps`), and otherwise step by step (`tolerant::Stepped`).
 fn tested<K, F, O>(k: K, t: crate::tolerant::Tolerance, o: &O, x: O::V, y: O::V) -> O::B

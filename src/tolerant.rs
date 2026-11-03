@@ -649,14 +649,11 @@ tolerant!(Gcd at Complex<f32>, Complex<f64>: |t, [x, y]| t.complex_gcd(x, y));
 /// The least common multiple x y / gcd(x, y), with the sign of x y, at the tolerance it holds, as a function object. Where the gcd is 0, so is the result. Its `i64` form is [`integer::lcm`](crate::integer::lcm).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Lcm(pub Tolerance);
-tolerant!(Lcm at real: |t, [x, y]| {
-    let g = t.gcd(x, y);
-    if g == 0.0 { g } else { x / g * y }
-});
-tolerant!(Lcm at Complex<f32>, Complex<f64>: |t, [x, y]| {
-    let g = t.complex_gcd(x, y);
-    if g == Complex::new(0.0, 0.0) { g } else { x / g * y }
-});
+tolerant!(Lcm at real: |t, [x, y]| lcm_from_gcd(x, y, t.gcd(x, y)));
+tolerant!(Lcm at Complex<f32>, Complex<f64>: |t, [x, y]| lcm_from_gcd(x, y, t.complex_gcd(x, y)));
+
+#[inline]
+pub(crate) fn lcm_from_gcd<T: Copy + num_traits::Num>(x: T, y: T, g: T) -> T { if g.is_zero() { g } else { x / g * y } }
 
 /// The units of `BETWEEN_CHECKS` needles that each thread looks up in one round of `index_of`. A round much shorter than this leaves too little for the other threads after `parallel::split` times its first unit: with 1 unit each, `v⍳w` on a million floats took as long on 4 threads as on one.
 const ROUND_UNITS: usize = 16;
