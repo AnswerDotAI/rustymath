@@ -80,7 +80,9 @@ pub fn correlate<T: Element, P: Inner<T>>(pair: &P, x: &[T], kernel: &[T], c: &C
     };
     let read = |plan: &Plan| Mapping::Steps { base: 0, steps: plan.steps.clone().into() };
     let (windows, reversed) = (read(&c.windows), read(&c.kernel));
-    pair.inner_mapped(Mapped { data: &padded, mapping: &Walked::from(&windows) }, Mapped { data: kernel, mapping: &Walked::from(&reversed) }, [Orientation::Normal; 2], c.size)
+    pair.inner_mapped(
+        Mapped { data: &padded, mapping: &Walked::from(&windows) }, Mapped { data: kernel, mapping: &Walked::from(&reversed) }, [Orientation::Normal; 2], c.size
+    )
 }
 
 /// Each frame of `frames` added back where its window read: the transpose of the windows of `w` items that move `step` items at a time along an axis of `len` positions. `frames` has shape `[outer, n, mid, w, inner]`, with `n` frames along its second axis and each window along its fourth. Between them lie `mid` positions of other axes, which the result puts before the windows' axis: its shape is `[outer, mid, len, inner]`. Items that several windows read add up, and positions that no window read are 0. `len` must be at least `(n - 1) × step + w` where `n` isn't 0.

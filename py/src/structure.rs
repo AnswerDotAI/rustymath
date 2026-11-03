@@ -11,9 +11,7 @@ use std::sync::Arc;
 fn at(n: i64, size: usize) -> PyResult<usize> {
     position(n, size).ok_or_else(|| PyIndexError::new_err(format!("position {n} is outside an axis of length {size}")))
 }
-fn array_selector(layout: &Layout, axis: usize, obj: &Bound<'_, PyAny>) -> PyResult<(Selector, bool)> {
-    indexed(layout, axis, convert::one(obj)?.into_core()?)
-}
+fn array_selector(layout: &Layout, axis: usize, obj: &Bound<'_, PyAny>) -> PyResult<(Selector, bool)> { indexed(layout, axis, convert::one(obj)?.into_core()?) }
 /// The selector that the compact index values `indices` make on `axis` of `layout`.
 fn indexed(layout: &Layout, axis: usize, indices: Core) -> PyResult<(Selector, bool)> {
     let (index_layout, indices) = indices.into_compact();

@@ -152,9 +152,7 @@ pub trait Outputs: Sized {
     /// Pointers to the outputs' items.
     fn shared(&mut self) -> Self::Shared;
     /// Cell `i`'s part of each output. SAFETY: `i` must be below the outputs' number of cells, and no other caller may hold cell `i`'s part at the same time.
-    unsafe fn cell<'a>(shared: &'a Self::Shared, per: Self::Per, i: usize) -> Self::Cell<'a>
-    where
-        Self: 'a;
+    unsafe fn cell<'a>(shared: &'a Self::Shared, per: Self::Per, i: usize) -> Self::Cell<'a> where Self: 'a;
 }
 
 macro_rules! outputs {
@@ -278,9 +276,9 @@ mod pool {
     pub(super) fn run(threads: usize, count: usize, f: &(dyn Fn(usize) -> bool + Sync)) -> bool {
         use rayon::prelude::*;
         let error = crate::error::ErrorSlot::current();
-        get(threads).install(|| (0..count).into_par_iter().map(|item| {
-            match &error { Some(slot) => slot.within(|| f(item)), None => f(item) }
-        }).reduce(|| true, |a, b| a & b))
+        get(threads).install(|| {
+            (0..count).into_par_iter().map(|item| match &error { Some(slot) => slot.within(|| f(item)), None => f(item) }).reduce(|| true, |a, b| a & b)
+        })
     }
 }
 

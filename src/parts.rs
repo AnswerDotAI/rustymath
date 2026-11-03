@@ -123,4 +123,3 @@ forms!(Choose at Complex32, Complex64: |_, [x, y, m]| Total(if m.re != 0.0 { x }
 forms!(Choose at u8, i16, i32, i64: |_, [x, y, m]| if m != 0 { x } else { y });
 forms!(Choose at bool: |_, [x, y, m]| (m & x) | (!m & y));
 forms!(Choose at char: |_, [x, y, m]| if m == '\u{1}' { x } else { y });
-

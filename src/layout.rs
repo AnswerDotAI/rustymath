@@ -40,7 +40,11 @@ pub fn strides(shape: &[usize]) -> Vec<usize> {
 /// The offsets of parts of `sizes` laid end to end, each the sum of the sizes before it.
 pub fn exclusive_sums(sizes: impl IntoIterator<Item = usize>) -> Vec<usize> {
     let mut at = 0;
-    sizes.into_iter().map(|n| { let start = at; at += n; start }).collect()
+    sizes.into_iter().map(|n| {
+        let start = at;
+        at += n;
+        start
+    }).collect()
 }
 
 /// Each axis's coordinate of flat position `flat`, from the last axis to the first. `flat` must be within the shape.
@@ -273,7 +277,6 @@ impl Keys {
 /// The Domain error for a key that appears twice on one axis.
 fn duplicate(key: &str) -> Error { Error::new(Kind::Domain, format!("duplicate key: {}", shown(key))) }
 
-
 /// An array's shape, with optional keys and a name for each axis. A layout with no keys or names holds no `Meta`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Layout { shape: Shape, meta: Option<Box<Meta>> }
@@ -397,7 +400,9 @@ impl Layout {
     pub fn merged(&self, axes: std::ops::Range<usize>, len: usize) -> Self {
         let shape = Shape::spliced([&self.shape[..axes.start], &[len], &self.shape[axes.end..]]);
         if self.plain() { return Self::from(shape); }
-        let source = |a: usize| match a.cmp(&axes.start) { std::cmp::Ordering::Less => Some(a), std::cmp::Ordering::Equal => None, std::cmp::Ordering::Greater => Some(a - 1 + axes.len()) };
+        let source = |a: usize| match a.cmp(&axes.start) {
+            std::cmp::Ordering::Less => Some(a), std::cmp::Ordering::Equal => None, std::cmp::Ordering::Greater => Some(a - 1 + axes.len())
+        };
         let keys = (0..shape.len()).map(|a| source(a).and_then(|s| self.keys(s).cloned())).collect();
         let names = (0..shape.len()).map(|a| source(a).and_then(|s| self.name(s).cloned())).collect();
         Self::from(shape).with_keys(keys).unwrap().inherit_names(names)

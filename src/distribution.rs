@@ -1,7 +1,7 @@
 //! Probability distributions. Each has a density, a cumulative distribution, a quantile function and a sampler. The first three are also function objects, `Pdf`, `Cdf` and `Quantile`, which hold the distribution. Their slice forms choose the distribution's formulas once, outside the loop, so the loops of the closed-form distributions vectorize. Their one-item forms run the slice forms on one item. An item of a slice form fails where its result is NaN and its argument isn't, as for a quantile of p outside 0 to 1. A discrete distribution's density is its mass at a whole x, and its quantile function and sampler give whole numbers.
 use crate::{
-    Arg, Atan, Erfc, Erfcinv, Float, Ln, Log1p, Pow, Root, Tan, Unary, betainc, betaincinv, cos, erfcinv, exp, expm1, gammainc, gammaincc, gammaincinv, lgamma,
-    facts::formula_at, ln, log1p, pow, random::Items, sin, slice::{CHUNK, kept, written}
+    Arg, Atan, Erfc, Erfcinv, Float, Ln, Log1p, Pow, Root, Tan, Unary, betainc, betaincinv, cos, erfcinv, exp, expm1, facts::formula_at,
+    gammainc, gammaincc, gammaincinv, lgamma, ln, log1p, pow, random::Items, sin, slice::{CHUNK, kept, written}
 };
 use rand::{Rng, distr::{Distribution as _, Open01, StandardUniform}};
 use std::{f64::consts::{FRAC_1_SQRT_2, PI, SQRT_2, TAU}, mem::MaybeUninit};
@@ -76,11 +76,8 @@ trait Formulas {
         each!([x], n, out, |[x]| cdf(x))
     }
     #[inline(always)]
-    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Erfcinv: Unary<F, Out = F>,
-        Log1p: Unary<F, Out = F>, Ln: Unary<F, Out = F> {
-        let q = self.quantile_map();
-        each!([p], n, out, |[p]| q(p))
-    }
+    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Erfcinv: Unary<F, Out = F>, Log1p: Unary<F, Out = F>,
+        Ln: Unary<F, Out = F> { let q = self.quantile_map(); each!([p], n, out, |[p]| q(p)) }
 }
 
 /// `Formulas`' `f64` methods for a law whose generic methods hold its formulas: each runs its slice form on one item.
@@ -191,9 +188,7 @@ fn composed<F: Float>(
 fn through<F: Float, G: Unary<F, Out = F>>(g: G) -> impl Fn(&mut [F], &mut [MaybeUninit<F>]) { move |a, v| { g.slice([Arg::Many(a)], a.len(), v); } }
 
 /// The values of the shared `Pow` formula, each argument of a block raised to `k`, for [`composed`].
-fn raised<F: Float>(k: F) -> impl Fn(&mut [F], &mut [MaybeUninit<F>]) {
-    move |a, v| { each!([Arg::Many(a)], a.len(), v, |[x]| formula_at(&Pow, [x, k])); }
-}
+fn raised<F: Float>(k: F) -> impl Fn(&mut [F], &mut [MaybeUninit<F>]) { move |a, v| { each!([Arg::Many(a)], a.len(), v, |[x]| formula_at(&Pow, [x, k])); } }
 
 impl Distribution {
     /// The density at x, or for a discrete distribution the probability of x.
@@ -469,7 +464,9 @@ impl Formulas for Cauchy {
             (F::narrow(self.location), F::narrow(self.scale), F::narrow(PI), F::narrow(0.25), F::narrow(0.75), F::narrow(0.5));
         composed(p, n, out, move |p| {
             pi * if p < low { p } else if p > high { F::one() - p } else { p - half }
-        }, |a, v| { each!([Arg::Many(a)], a.len(), v, |[x]| formula_at(&Tan, [x])); }, move |p, t| {
+        }, |a, v| {
+            each!([Arg::Many(a)], a.len(), v, |[x]| formula_at(&Tan, [x]));
+        }, move |p, t| {
             let (num, den) = if p < low { (-scale, t) } else if p > high { (scale, t) } else { (scale * t, F::one()) };
             location + num / den
         })
@@ -702,8 +699,7 @@ impl Formulas for Weibull {
     }
     /// scale·(-log1p(-p))^(1/shape), from `Log1p` slice form and the shared `Root` formula. `Root` takes shape itself as its degree, where `Pow` would need 1/shape rounded.
     #[inline(always)]
-    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Log1p: Unary<F, Out = F>
-    {
+    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Log1p: Unary<F, Out = F> {
         let (degree, scale) = (F::narrow(self.shape), F::narrow(self.scale));
         composed(p, n, out, |p| -p, move |a, v| {
             Log1p.slice([Arg::Many(a)], a.len(), v);
@@ -768,8 +764,7 @@ impl Formulas for Binomial {
         let (n, p) = (self.n, self.p);
         if p == 0.0 { 0.0 } else if p == 1.0 { n } else { least(q, normal_guess(n * p, (n * p * (1.0 - p)).sqrt(), q), n, |k| self.cdf(k)) }
     }
-    /// Inversion when the smaller of np and n(1-p) is below 10, and Hörmann's BTRD method otherwise. Both draw with p up to 1/2 and reflect.
-    /// Inversion reads one uniform draw and BTRD two.
+    /// Inversion when the smaller of np and n(1-p) is below 10, and Hörmann's BTRD method otherwise. Both draw with p up to 1/2 and reflect. Inversion reads one uniform draw and BTRD two.
     fn words(&self) -> usize { if self.n * self.p.min(1.0 - self.p) < 10.0 { 1 } else { 2 } }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 {
         let flip = self.p > 0.5;

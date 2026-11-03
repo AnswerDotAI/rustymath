@@ -1,11 +1,9 @@
 //! Integer instantiation of the shared arithmetic formulas.
-use super::{Ops, Unary, Binary, Cmp, Integer, Overflowing};
+use super::{Binary, Cmp, Integer, Ops, Overflowing, Unary};
 use crate::buffer::FloatWidth;
 
 pub struct IntegerOps<T> { pub variant: crate::facts::Variant, item: std::marker::PhantomData<T> }
-impl<T> IntegerOps<T> {
-    pub fn new(variant: crate::facts::Variant) -> Self { Self { variant, item: std::marker::PhantomData } }
-}
+impl<T> IntegerOps<T> { pub fn new(variant: crate::facts::Variant) -> Self { Self { variant, item: std::marker::PhantomData } } }
 impl<T: Overflowing> IntegerOps<T> {
     pub fn result(&self, value: i64) -> T {
         if self.variant.checked && !self.variant.wrapping && matches!(self.variant.dtype, crate::buffer::DType::Integer(w) if !w.holds(value)) {
@@ -30,7 +28,9 @@ impl<T: Overflowing> Ops<f64> for IntegerOps<T> {
     fn integer_op(&self, op: Integer, x: u64, y: u64) -> u64 {
         match op {
             Integer::Add => x.wrapping_add(y), Integer::Subtract => x.wrapping_sub(y), Integer::And => x & y, Integer::Or => x | y, Integer::Xor => x ^ y,
-            Integer::ShiftLeft => x.wrapping_shl(y as u32), Integer::ShiftRight => (x & (u64::MAX >> (64 - 8 * self.variant.dtype.bytes()))).wrapping_shr(y as u32), Integer::SignedShiftRight => (x as i64).wrapping_shr(y as u32) as u64,
+            Integer::ShiftLeft => x.wrapping_shl(y as u32),
+            Integer::ShiftRight => (x & (u64::MAX >> (64 - 8 * self.variant.dtype.bytes()))).wrapping_shr(y as u32),
+            Integer::SignedShiftRight => (x as i64).wrapping_shr(y as u32) as u64
         }
     }
     fn integer_compare(&self, op: Cmp, x: u64, y: u64) -> bool {
@@ -45,15 +45,16 @@ impl<T: Overflowing> Ops<f64> for IntegerOps<T> {
     fn unary(&self, op: Unary, x: T) -> T {
         match op {
             Unary::Negate => T::low(0).minus(x).0, Unary::Magnitude => x.magnitude().0, Unary::Floor => x,
-            Unary::Sqrt => { let x = Into::<i64>::into(x); T::low(if x >= 0 { x.isqrt() } else { 0 }) }, Unary::Not => T::low(1).minus(x).0,
-            _ => unreachable!("non-integer instruction in an integer formula"),
+            Unary::Sqrt => { let x = Into::<i64>::into(x); T::low(if x >= 0 { x.isqrt() } else { 0 }) } Unary::Not => T::low(1).minus(x).0,
+            _ => unreachable!("non-integer instruction in an integer formula")
         }
     }
     fn binary(&self, op: Binary, x: T, y: T) -> T {
         match op {
             Binary::Add => x.plus(y).0, Binary::Subtract => x.minus(y).0, Binary::Multiply => x.times(y).0,
-            Binary::Divide => T::low(if Into::<i64>::into(y) == 0 { 0 } else { Into::<i64>::into(x).wrapping_div(Into::<i64>::into(y)) }), Binary::Larger => x.max(y), Binary::Smaller => x.min(y),
-            Binary::BitAnd => T::low(Into::<i64>::into(x) & Into::<i64>::into(y)), _ => unreachable!("non-integer instruction in an integer formula"),
+            Binary::Divide => T::low(if Into::<i64>::into(y) == 0 { 0 } else { Into::<i64>::into(x).wrapping_div(Into::<i64>::into(y)) }),
+            Binary::Larger => x.max(y), Binary::Smaller => x.min(y), Binary::BitAnd => T::low(Into::<i64>::into(x) & Into::<i64>::into(y)),
+            _ => unreachable!("non-integer instruction in an integer formula")
         }
     }
     fn overflow(&self, op: Binary, x: T, y: T) -> bool {

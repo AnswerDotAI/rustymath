@@ -261,7 +261,13 @@ impl<N: Key> ClassNumbers<'_, N> {
             fits &= ok;
         }
         if PARTS == 1 { return (totals, fits); }
-        let merged = totals.chunks_exact(PARTS).map(|t| t[1..].iter().fold(t[0], |a, &b| { let (m, ok) = R::merge(a, b); fits &= ok; m })).collect();
+        let merged = totals.chunks_exact(PARTS).map(|t| {
+            t[1..].iter().fold(t[0], |a, &b| {
+                let (m, ok) = R::merge(a, b);
+                fits &= ok;
+                m
+            })
+        }).collect();
         (merged, fits)
     }
 }
@@ -314,7 +320,11 @@ impl Grouping for Ranges<'_> {
     fn len(&self) -> usize { self.starts.len() }
     fn fold<T: Copy, R: crate::reduce::Reduction<T>>(&self, data: &[T]) -> (Vec<R::Total>, bool) {
         let mut fits = true;
-        let totals = self.starts.iter().zip(self.lens).map(|(&s, &n)| { let (t, ok) = R::slice(&data[s..s + n]); fits &= ok; t }).collect();
+        let totals = self.starts.iter().zip(self.lens).map(|(&s, &n)| {
+            let (t, ok) = R::slice(&data[s..s + n]);
+            fits &= ok;
+            t
+        }).collect();
         (totals, fits)
     }
     fn scan<T: Copy, R: crate::reduce::Reduction<T>>(&self, data: &[T]) -> (Vec<R::Total>, bool) {
@@ -327,7 +337,12 @@ impl Grouping for Ranges<'_> {
 /// Numbers the classes in `classes`, which gives each item the first position of its class, as `classes` and `tolerant::classes` do, and counts each class.
 pub fn numbered(classes: &[u32]) -> Numbered {
     let (mut number, mut firsts) = (vec![0u32; classes.len()], Vec::new());
-    for (i, &c) in classes.iter().enumerate() { if c as usize == i { number[i] = firsts.len() as u32; firsts.push(i); } }
+    for (i, &c) in classes.iter().enumerate() {
+        if c as usize == i {
+            number[i] = firsts.len() as u32;
+            firsts.push(i);
+        }
+    }
     let mut counts = vec![0; firsts.len()];
     let numbers = with_width!(Width::below(firsts.len()), T => int_buf(classes.iter().map(|&c| {
         let k = number[c as usize];
@@ -338,7 +353,9 @@ pub fn numbered(classes: &[u32]) -> Numbered {
 }
 
 /// `items` as an integer buffer.
-fn int_buf<T: Element>(items: Vec<T>) -> IntBuf { match T::buffer(items) { Buffer::Integers(b) => b, _ => unreachable!("integer items make an integer buffer") } }
+fn int_buf<T: Element>(items: Vec<T>) -> IntBuf {
+    match T::buffer(items) { Buffer::Integers(b) => b, _ => unreachable!("integer items make an integer buffer") }
+}
 
 /// Whether `offsets` are dense enough to use a table over the `size` positions they fall below.
 pub fn dense_offsets(offsets: &[usize], size: usize) -> bool { size <= 8 * offsets.len() }
@@ -534,10 +551,8 @@ impl<'a> Exact<'a> {
     /// Item `i`: whether it's a character, and its key.
     fn item(self, i: usize) -> (bool, i64) {
         match self.items {
-            View::Characters(x) => (true, x[i].key()),
-            View::Booleans(x) => (false, x[i].key()),
-            View::Integers(x) => (false, x.get(i)),
-            View::Floats(_) | View::Complexes(_) => unreachable!("an exact cell holds no floats"),
+            View::Characters(x) => (true, x[i].key()), View::Booleans(x) => (false, x[i].key()), View::Integers(x) => (false, x.get(i)),
+            View::Floats(_) | View::Complexes(_) => unreachable!("an exact cell holds no floats")
         }
     }
 }
@@ -560,7 +575,9 @@ impl Hash for Exact<'_> {
         match self.items {
             View::Characters(x) => crate::characters::codes(x).hash(state),
             View::Booleans(x) => { for &b in x { state.write_i64(b.into()) } }
-            View::Integers(x) => with_ints!(x, |x| for &i in x { state.write_i64(i.into()) }),
+            View::Integers(x) => with_ints!(x, |x| for &i in x {
+                state.write_i64(i.into())
+            }),
             View::Floats(_) | View::Complexes(_) => unreachable!("an exact cell holds no floats"),
         }
     }
@@ -569,9 +586,7 @@ impl Hash for Exact<'_> {
 impl Ord for Exact<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
         let (x, y) = match (self.shape, other.shape) {
-            (None, Some(_)) => return Ordering::Less,
-            (Some(_), None) => return Ordering::Greater,
-            (x, y) => (x.unwrap_or_default(), y.unwrap_or_default()),
+            (None, Some(_)) => return Ordering::Less, (Some(_), None) => return Ordering::Greater, (x, y) => (x.unwrap_or_default(), y.unwrap_or_default())
         };
         if x.len() != y.len() { return x.len().cmp(&y.len()); }
         for i in 0..self.items.len().min(other.items.len()) {
@@ -867,10 +882,7 @@ fn radix_pieces<K: RadixKey, P: Copy + Send + Sync>(keys: &mut [K], payload: &mu
     let size = n.div_ceil(count);
     let piece = move |p: usize| p * size..n.min((p + 1) * size);
     let mut every = vec![[[0u32; 256]; 8]; count];
-    pieces_of(&mut every, 1, usize::MAX, &|p, c| {
-        c[0] = byte_counts(&keys[piece(p)]);
-        true
-    });
+    pieces_of(&mut every, 1, usize::MAX, &|p, c| { c[0] = byte_counts(&keys[piece(p)]); true });
     let (mut from, mut to, mut passes) = ((keys, payload), spare, 0);
     for b in 0..K::BYTES {
         let total = (0..256).map(|d| every.iter().map(|c| c[b][d] as usize).sum::<usize>());

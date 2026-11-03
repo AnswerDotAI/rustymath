@@ -70,7 +70,9 @@ mod forms {
 
     fn check<F: Float + buffer::Element + Debug, K: facts::Formula<A>, const A: usize>(k: &K, name: &str, args: [Arg<'_, F>; A], n: usize) {
         let kernel = k.resolve(facts::Variant { checked: false, ..facts::Variant::checked(F::DTYPE) }, [F::DTYPE; A]).unwrap();
-        let views = args.each_ref().map(|a| F::view(match a { Arg::One(v) => std::slice::from_ref(v), Arg::Many(s) => s }));
+        let views = args.each_ref().map(|a| {
+            F::view(match a { Arg::One(v) => std::slice::from_ref(v), Arg::Many(s) => s })
+        });
         let mut out = F::buffer(vec![]);
         crate::support::map(&kernel, views, n, &mut out).unwrap();
         let out = F::vec(out).unwrap();
@@ -99,7 +101,15 @@ mod forms {
     fn ternary<F: Float + buffer::Element + Debug, K: facts::Formula<3>>(k: K, name: &str) {
         let items = items::<F>();
         let (mut xs, mut ys, mut zs) = (Vec::new(), Vec::new(), Vec::new());
-        for &x in &items { for &y in &items { for &z in &items { xs.push(x); ys.push(y); zs.push(z); } } }
+        for &x in &items {
+            for &y in &items {
+                for &z in &items {
+                    xs.push(x);
+                    ys.push(y);
+                    zs.push(z);
+                }
+            }
+        }
         check(&k, name, [Arg::Many(&xs), Arg::Many(&ys), Arg::Many(&zs)], xs.len());
         for &v in &items {
             check(&k, name, [Arg::One(v), Arg::Many(&items), Arg::Many(&items)], items.len());
@@ -385,10 +395,16 @@ mod reductions {
             assert!(scan_along::<i64, Sum>(&x, shape, Some(10), &mut out));
             assert_eq!(out, want, "{shape:?}");
             let mut ordered = Vec::new();
-            assert!(left_scan(&x, shape, Some(&[10]), &mut ordered, |a: i64, b| { let (v, overflow) = a.overflowing_add(b); (v, !overflow) }));
+            assert!(left_scan(&x, shape, Some(&[10]), &mut ordered, |a: i64, b| {
+                let (v, overflow) = a.overflowing_add(b);
+                (v, !overflow)
+            }));
             assert_eq!(ordered, want, "{shape:?}");
             ordered.clear();
-            assert!(left_scan(&x, shape, None, &mut ordered, |a: i64, b| { let (v, overflow) = a.overflowing_sub(b); (v, !overflow) }));
+            assert!(left_scan(&x, shape, None, &mut ordered, |a: i64, b| {
+                let (v, overflow) = a.overflowing_sub(b);
+                (v, !overflow)
+            }));
             let mut running = Vec::new();
             difference_scan_along(&x, shape, None, &mut running);
             assert_eq!(running, ordered, "{shape:?}");
@@ -406,7 +422,9 @@ mod reductions {
             assert_eq!(differences, want, "{shape:?}");
             for seed in [None, Some(10)] {
                 ordered.clear();
-                assert!(left_scan(&x, shape, seed.as_ref().map(std::slice::from_ref), &mut ordered, |a, b| (i64::from(Less(Tolerance::EXACT).one(a, b)), true)));
+                assert!(left_scan(&x, shape, seed.as_ref().map(std::slice::from_ref), &mut ordered, |a, b| (
+                    i64::from(Less(Tolerance::EXACT).one(a, b)), true
+                )));
                 let starts = seed.map(|s| x.chunks((len * inner).max(1)).flat_map(|lane| lane[..inner].iter().map(move |&v| s < v)).collect::<Vec<_>>());
                 let (bits, ok) =
                     comparison_scan(&x, shape, starts.as_deref(), 0, 1, &|t, xs, out| Less(Tolerance::EXACT).many(t, Arg::Many(xs), xs.len(), out));
@@ -488,8 +506,14 @@ mod reductions {
         assert!(!along::<i64, Sum>(&[i64::MAX, 1], [1, 2, 1]).1);
         assert!(!along::<i64, Sum>(&[i64::MAX, 0, 1, 0], [1, 2, 2]).1);
         assert!(!scan_along::<i64, Sum>(&[i64::MAX, 0, 1, 0], [1, 2, 2], None, &mut Vec::new()));
-        assert!(!left_scan(&[i64::MAX, 1], [1, 2, 1], None, &mut Vec::new(), |a: i64, b| { let (v, overflow) = a.overflowing_add(b); (v, !overflow) }));
-        assert!(!left_scan(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i64::MAX, 1], [8, 2, 1], None, &mut Vec::new(), |a: i64, b| { let (v, overflow) = a.overflowing_add(b); (v, !overflow) }));
+        assert!(!left_scan(&[i64::MAX, 1], [1, 2, 1], None, &mut Vec::new(), |a: i64, b| {
+            let (v, overflow) = a.overflowing_add(b);
+            (v, !overflow)
+        }));
+        assert!(!left_scan(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i64::MAX, 1], [8, 2, 1], None, &mut Vec::new(), |a: i64, b| {
+            let (v, overflow) = a.overflowing_add(b);
+            (v, !overflow)
+        }));
     }
 
     /// Each window's fold matches the same reduction of that window's items alone, for windows folded directly, across the blocks of a long lane and by van Herk-Gil-Werman, a last block cut short, a window as wide as its lane, and windows down rows. A float maximum skips each NaN item, as `Max::step` does. Each window's pick is its first row that gives its maximum or minimum, and so is each whole lane's pick and each running pick. A sum that wraps reports it.
@@ -1313,4 +1337,3 @@ mod gather {
         assert!(Steps::rereads(&[along(8, 1), along(3, 1)], &[10]) && !Steps::rereads(&[along(10, 1)], &[10]));
     }
 }
-

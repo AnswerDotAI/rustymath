@@ -52,7 +52,6 @@ pub trait KernelItem: Copy + Send + Sync {
     fn has_nan(self) -> bool;
 }
 
-
 macro_rules! nan_items { ($($t:ty),+) => {$( impl KernelItem for $t { const NAN: bool = true; #[inline(always)] fn has_nan(self) -> bool { self.is_nan() } } )+} }
 nan_items!(f32, f64, half::f16, Complex<f32>, Complex<f64>);
 macro_rules! exact_items { ($($t:ty),+) => {$( impl KernelItem for $t { const NAN: bool = false; #[inline(always)] fn has_nan(self) -> bool { false } } )+} }
@@ -152,7 +151,6 @@ macro_rules! wrapped {
 wrapped!(Unary, 1, x);
 wrapped!(Binary, 2, x, y);
 wrapped!(Ternary, 3, x, y, z);
-
 
 /// Whether `r`, the result for arguments `args`, keeps the rule that a NaN result needs a NaN argument.
 #[inline(always)]
@@ -527,8 +525,8 @@ pub(crate) fn written<B>(out: &mut [MaybeUninit<B>]) -> &mut [B] {
 /// Writes `f` for each of `n` results into `out`, for arguments `x`, for a function `f` with a fast form that holds for all but rare items. `fast` computes every item with no branch, and gives `None` for the rare items. The items run in two passes. The first writes NaN for each rare item and judges each result alone, as [`each`] does. The second runs only if a result is NaN. It recomputes each NaN item with `f` and judges it by its arguments too. A rare item costs one more scan of at most one `CHUNK`, the most that `parallel::in_chunks` hands a slice form. Slice forms call it through [`two_pass!`].
 #[inline(always)]
 pub(crate) fn two_pass<R, O, const N: usize>(
-    x: [Arg<'_, R>; N], n: usize, out: &mut [MaybeUninit<O>], fast: impl Fn([R; N]) -> Option<R>, f: impl Fn([R; N]) -> R,
-) -> bool where R: crate::Float + crate::buffer::Source<O>, O: crate::Float {
+    x: [Arg<'_, R>; N], n: usize, out: &mut [MaybeUninit<O>], fast: impl Fn([R; N]) -> Option<R>, f: impl Fn([R; N]) -> R) -> bool where
+    R: crate::Float + crate::buffer::Source<O>, O: crate::Float {
     let out = &mut out[..n];
     let first = mapped(&x, n, out, #[inline(always)] |a| {
         let r = <R as crate::buffer::Source<O>>::read(fast(a).unwrap_or(R::nan()));

@@ -5,9 +5,9 @@
 //! `exp` and the powers that compute through it give an exact direction at the float nearest a whole number of quarter turns. e^(iπ/2) is then exactly i, where the exponential of that float has a real part of about 6e-17. These results lie outside the error bound.
 use crate::{
     Abs, Acos, Acosh, Angle, Arg, Asin, Asinh, Atan, Atan2, Atanh, Binary, Binom, Cos, Cosh, Exp, Factorial, Gamma, Hypot, Lgamma, Ln, Log1p, Logb,
-    MathishLogb, Pow, RealAcos, RealAcosh, RealAsin, RealAtanh, RealLn, RealPow, RealSqrt, RealSqrt1mx2, RealSqrtm1mx2, RealSqrtx2m1, Sign, Sin, Sinh, Sqrt, Sqrt1mx2, Sqrt1px2, Sqrtx2m1, Tan, Tanh, Unary,
+    MathishLogb, Native, Pow, RealAcos, RealAcosh, RealAsin, RealAtanh, RealLn, RealPow, RealSqrt, RealSqrt1mx2, RealSqrtm1mx2, RealSqrtx2m1, Sign, Sin, Sinh,
+    Sqrt, Sqrt1mx2, Sqrt1px2, Sqrtx2m1, Tan, Tanh, Unary, arc, exp as e, float::ln2, hyperbolic, ln as l, pow as p, special, trig,
 };
-use crate::{Native, arc, exp as e, float::ln2, hyperbolic, ln as l, pow as p, special, trig};
 use num_complex::Complex;
 use std::mem::MaybeUninit;
 
@@ -184,8 +184,7 @@ pub(crate) fn pow<R: Native, const FUSED: bool>(z: Complex<R>, w: Complex<R>) ->
 
 pub(crate) fn nth_root<R: Native, const FUSED: bool>(n: Complex<R>, y: Complex<R>) -> Complex<R> {
     if n == c(R::zero(), R::zero()) || !finite(n) { return c(R::nan(), R::nan()); }
-    if n == c(R::narrow(2.0), R::zero()) { sqrt::<R, FUSED>(y) }
-    else { pow::<R, FUSED>(y, divide(c(R::one(), R::zero()), n)) }
+    if n == c(R::narrow(2.0), R::zero()) { sqrt::<R, FUSED>(y) } else { pow::<R, FUSED>(y, divide(c(R::one(), R::zero()), n)) }
 }
 
 /// sinh z = sinh x cos y + i cosh x sin y. A real z gives a real result and an imaginary z an imaginary one, even where cosh x overflows or cos y is NaN.
@@ -275,8 +274,7 @@ pub(crate) fn sqrt1px2<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R
 pub(crate) fn sqrtx2m1<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R> { let (a, b) = shifted_roots::<R, FUSED>(z); balanced(a * b, z.re, z.im) }
 
 pub(crate) fn sqrtm1mx2<R: Native, const FUSED: bool>(z: Complex<R>, inverse: bool) -> Complex<R> {
-    let r = if z.im == R::zero() { c(R::zero(), crate::sqrts::sqrt1px2::<R, FUSED>(z.re)) }
-        else { sqrt::<R, FUSED>(-c(R::one(), R::zero()) - z * z) };
+    let r = if z.im == R::zero() { c(R::zero(), crate::sqrts::sqrt1px2::<R, FUSED>(z.re)) } else { sqrt::<R, FUSED>(-c(R::one(), R::zero()) - z * z) };
     if inverse { -r } else { r }
 }
 

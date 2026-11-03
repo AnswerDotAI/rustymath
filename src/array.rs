@@ -80,9 +80,7 @@ impl Array {
     pub fn dtype(&self) -> DType { self.sources[0].dtype() }
     pub fn len(&self) -> usize { self.plan.len() }
     pub fn is_empty(&self) -> bool { self.plan.is_empty() }
-    fn is_compact(&self) -> bool {
-        self.sources.len() == 1 && self.sources[0].len() == self.len() && matches!(self.plan.route(), ReadRoute::Input(0))
-    }
+    fn is_compact(&self) -> bool { self.sources.len() == 1 && self.sources[0].len() == self.len() && matches!(self.plan.route(), ReadRoute::Input(0)) }
     fn detach(&mut self) {
         if self.is_compact() { return; }
         let items = self.view().cast(self.dtype()).expect("an array reads at its own dtype");
@@ -95,16 +93,16 @@ impl Array {
         self.detach();
         let dtype = self.dtype();
         let buffer = match Arc::get_mut(&mut self.sources).and_then(|sources| Arc::get_mut(&mut sources[0])) {
-            Some(source) => std::mem::replace(source, Buffer::with_capacity(dtype, 0)),
-            None => (*self.sources[0]).clone(),
+            Some(source) => std::mem::replace(source, Buffer::with_capacity(dtype, 0)), None => (*self.sources[0]).clone()
         };
         (self.layout, buffer)
     }
-    pub fn compact(&self) -> Self { let mut out = self.clone(); out.detach(); out }
-    pub fn make_mut(&mut self) -> &mut Buffer {
-        self.detach();
-        Arc::make_mut(&mut Arc::make_mut(&mut self.sources)[0])
+    pub fn compact(&self) -> Self {
+        let mut out = self.clone();
+        out.detach();
+        out
     }
+    pub fn make_mut(&mut self) -> &mut Buffer { self.detach(); Arc::make_mut(&mut Arc::make_mut(&mut self.sources)[0]) }
     /// Every selection remains a view, including tables and padding. A chosen fill is one more scalar source.
     pub fn selected(&self, plan: crate::structure::Plan, fill: Option<Arc<Buffer>>) -> Result<Self, Error> {
         let n = element_count(plan.layout.shape())?;
@@ -117,7 +115,11 @@ impl Array {
             None if self.dtype() == DType::Character => Some(Arc::new(Buffer::Characters(vec![' ']))),
             None => None,
         };
-        let missing = fill.map_or(Missing::Default, |fill| { let source = sources.len(); sources.push(fill); Missing::Scalar(source) });
+        let missing = fill.map_or(Missing::Default, |fill| {
+            let source = sources.len();
+            sources.push(fill);
+            Missing::Scalar(source)
+        });
         Ok(Self { layout: plan.layout, sources: sources.into(), plan: self.plan.remapped(Mapping::from(plan.steps), n, missing) })
     }
     pub fn reshape(&self, layout: Layout) -> Result<Self, Error> {

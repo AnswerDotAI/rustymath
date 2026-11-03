@@ -14,8 +14,10 @@ mod products {
 
     #[test]
     fn native_inner_pairs_keep_right_folds_and_bounded_terms() {
-        use rustymath::{agreement::{Binding, Missing, Read, ReadPlan}, buffer::{Buffer, Element, View}, error::{self, Error},
-            facts::{Formula, Variant}, operation::{Direction, Kernel, Seed, Settings}, tolerant::{Equal, Greater, Tolerance}};
+        use rustymath::{
+            agreement::{Binding, Missing, Read, ReadPlan}, buffer::{Buffer, Element, View}, error::{self, Error}, facts::{Formula, Variant},
+            operation::{Direction, Kernel, Seed, Settings}, tolerant::{Equal, Greater, Tolerance}
+        };
         fn fold(kernel: &Kernel, data: View<'_>, dims: [usize; 3], tail: Option<View<'_>>) -> Result<Buffer, Error> {
             let mut sources = vec![Binding::full(data)];
             if let Some(tail) = tail { sources.push(Binding::full(tail)); }
@@ -32,16 +34,20 @@ mod products {
                 let dtype = a.dtype().common(b.dtype()).unwrap();
                 let gk = g.resolve(Variant::checked(dtype), [a.dtype(), b.dtype()]).unwrap();
                 let fk = f.resolve(Variant::checked(gk.result_dtype()), [gk.result_dtype(); 2]).unwrap();
-                inner_with(a, b, $size, |x, y, agreement| {
-                    assert!(agreement.len <= rustymath::CHUNK);
-                    let sources = [Binding::full(x), Binding::full(y)];
-                    let plans = [ReadPlan::input(0, x.len()).remapped(agreement.left.clone(), agreement.len, Missing::Default),
-                        ReadPlan::input(1, y.len()).remapped(agreement.right.clone(), agreement.len, Missing::Default)];
-                    let reads = plans.each_ref().map(|plan| Read { sources: &sources, plan });
-                    let mut out = Buffer::with_capacity(gk.result_dtype(), agreement.len);
-                    error::checked(|| gk.map(&reads, 0..agreement.len, Settings::default(), &mut out))?;
-                    Ok(out)
-                }, |x, dims, tail| fold(&fk, x, dims, tail))
+                inner_with(
+                    a, b, $size, |x, y, agreement| {
+                        assert!(agreement.len <= rustymath::CHUNK);
+                        let sources = [Binding::full(x), Binding::full(y)];
+                        let plans = [
+                            ReadPlan::input(0, x.len()).remapped(agreement.left.clone(), agreement.len, Missing::Default),
+                            ReadPlan::input(1, y.len()).remapped(agreement.right.clone(), agreement.len, Missing::Default),
+                        ];
+                        let reads = plans.each_ref().map(|plan| Read { sources: &sources, plan });
+                        let mut out = Buffer::with_capacity(gk.result_dtype(), agreement.len);
+                        error::checked(|| gk.map(&reads, 0..agreement.len, Settings::default(), &mut out))?;
+                        Ok(out)
+                    }, |x, dims, tail| fold(&fk, x, dims, tail),
+                )
             }};
         }
         let [m, k, n] = [2, rustymath::CHUNK + 3, 3];
@@ -101,10 +107,21 @@ mod products {
             let (from_at, padded_rows) = (read([(0, m, 1), (0, k, mi)]), read([(0, k, ni + 2), (0, n, 1)]));
             let (backwards, stored_t) = (read([((m - 1) * k, m, -ki), (k - 1, k, -1)]), read([(0, k, 1), (0, m, ki)]));
             let normal = [Orientation::Normal; 2];
-            assert_eq!(p.inner_mapped(Mapped { data: &at, mapping: &Walked::from(&from_at) }, Mapped { data: &padded, mapping: &Walked::from(&padded_rows) }, normal, [m, k, n]), expected);
-            assert_eq!(p.inner_mapped(Mapped { data: &reversed, mapping: &Walked::from(&backwards) }, Mapped { data: b, mapping: &Walked::from(&held) }, normal, [m, k, n]), expected);
             assert_eq!(
-                p.inner_mapped(Mapped { data: a, mapping: &Walked::from(&stored_t) }, Mapped { data: &bt, mapping: &Walked::from(&held) }, [Orientation::Transpose; 2], [m, k, n]), expected
+                p.inner_mapped(
+                    Mapped { data: &at, mapping: &Walked::from(&from_at) }, Mapped { data: &padded, mapping: &Walked::from(&padded_rows) }, normal, [m, k, n]
+                ), expected
+            );
+            assert_eq!(
+                p.inner_mapped(
+                    Mapped { data: &reversed, mapping: &Walked::from(&backwards) }, Mapped { data: b, mapping: &Walked::from(&held) }, normal, [m, k, n]
+                ), expected
+            );
+            assert_eq!(
+                p.inner_mapped(
+                    Mapped { data: a, mapping: &Walked::from(&stored_t) }, Mapped { data: &bt, mapping: &Walked::from(&held) }, [Orientation::Transpose; 2],
+                    [m, k, n]
+                ), expected
             );
         }
         for [m, k, n] in [[5, 7, 9], [1, 11, 37], [37, 11, 1]] {
@@ -126,7 +143,8 @@ mod products {
             let a = if o == Orientation::Normal { stored } else { transpose(&stored, k, m) };
             let b: Vec<f64> = (0..k).map(|i| (i * 5 % 13) as f64 - 6.0).collect();
             let got = PlusTimes.inner_mapped(
-                Mapped { data, mapping: &Walked::from(&mapping) }, Mapped { data: &b, mapping: &Walked::from(&Mapping::Linear(1)) }, [o, Orientation::Normal], [m, k, 1]);
+                Mapped { data, mapping: &Walked::from(&mapping) }, Mapped { data: &b, mapping: &Walked::from(&Mapping::Linear(1)) }, [o, Orientation::Normal],
+                [m, k, 1]);
             assert_eq!(got, PlusTimes.inner(&a, &b, [m, k, 1]));
         };
         let x: Vec<f64> = (0..300).map(|i| (i * 7 % 17) as f64 - 8.0).collect();

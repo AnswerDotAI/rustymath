@@ -68,10 +68,7 @@ impl<A: GlobalAlloc + 'static> Guard<A> {
     fn reserve(&self, bytes: usize) -> bool {
         let limit = limit();
         let held = HELD.fetch_add(bytes, Relaxed).saturating_add(bytes);
-        if held <= limit {
-            PEAK.fetch_max(held, Relaxed);
-            return true;
-        }
+        if held <= limit { PEAK.fetch_max(held, Relaxed); return true; }
         HELD.fetch_sub(bytes, Relaxed);
         let _ =
             writeln!(std::io::stderr(), "memory guard: refused {} MiB, which would take large allocations past the limit of {} MiB", bytes >> 20, limit >> 20);

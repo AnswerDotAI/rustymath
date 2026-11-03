@@ -2,7 +2,6 @@
 use crate::recipe::Ops;
 use crate::{Exponent, Float};
 
-
 /// The slopes of ψ⁽ⁿ⁾(x), with its whole order n first: ψ⁽ⁿ⁺¹⁾(x) in x, and none in n.
 #[inline(always)]
 pub(crate) fn polygamma_slopes<F: Float, O: Ops<F> + ?Sized>(o: &O, [n, x]: [O::V; 2], _: O::V, [_, nx]: [bool; 2]) -> [Option<O::V>; 2] {
@@ -14,8 +13,7 @@ pub(crate) fn polygamma_slopes<F: Float, O: Ops<F> + ?Sized>(o: &O, [n, x]: [O::
 pub(crate) fn gammainc_slopes<F: Float, O: Ops<F> + ?Sized>(o: &O, [a, x]: [O::V; 2], _: O::V, [_, nx]: [bool; 2]) -> [Option<O::V>; 2] {
     let one = o.number(F::one());
     let power = || match o.constant(a) {
-        Some(c) if c == F::one() => o.number(F::zero()),
-        _ => o.multiply(o.subtract(a, one), o.ln(o.add(x, o.one_where(o.equal(a, one))))),
+        Some(c) if c == F::one() => o.number(F::zero()), _ => o.multiply(o.subtract(a, one), o.ln(o.add(x, o.one_where(o.equal(a, one)))))
     };
     [None, nx.then(|| o.exp(o.subtract(o.subtract(power(), x), o.lgamma(a))))]
 }
@@ -66,7 +64,9 @@ fn power_slope<F: Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, y: O::V, r: O::V, h
     match o.constant(y).map(|c| (c, c - F::one())) {
         Some((c, _)) if c == F::one() => one,
         Some((c, _)) if c == F::zero() => zero,
-        Some((_, k)) if match Exponent::of(k.wide()) { Exponent::General => false, Exponent::Halves { .. } => halves, Exponent::Whole { .. } => true } => o.multiply(y, o.power(k, x)),
+        Some((_, k))
+            if match Exponent::of(k.wide()) { Exponent::General => false, Exponent::Halves { .. } => halves, Exponent::Whole { .. } => true } =>
+        { o.multiply(y, o.power(k, x)) }
         route => {
             let at_zero = o.equal(x, zero);
             let stand_in = |v, m| o.add(v, o.one_where(m));
@@ -95,15 +95,16 @@ pub(crate) fn power<F: Float, O: Ops<F> + ?Sized>(o: &O, [x, y]: [O::V; 2], r: O
 #[inline(always)]
 pub(crate) fn real_power<F: Float, O: Ops<F> + ?Sized>(o: &O, [x, y]: [O::V; 2], r: O::V, [nx, ny]: [bool; 2]) -> [Option<O::V>; 2] {
     let zero = o.number(F::zero());
-    [nx.then(|| power_slope(o, x, y, r, false)), ny.then(|| {
-        let ln = o.ln(o.select(o.equal(x, zero), o.number(F::one()), o.magnitude(x)));
-        // The select's cases are atoms, so its mask, built from x, needs no layout of y's.
-        let below = o.select(o.less(x, zero), o.number(F::narrow(core::f64::consts::PI)), zero);
-        o.subtract(o.multiply(r, ln), o.multiply(below, o.multiply(o.exp(o.multiply(y, ln)), crate::recipe::sincospi(o, y).0)))
-    })]
+    [
+        nx.then(|| power_slope(o, x, y, r, false)), ny.then(|| {
+            let ln = o.ln(o.select(o.equal(x, zero), o.number(F::one()), o.magnitude(x)));
+            // The select's cases are atoms, so its mask, built from x, needs no layout of y's.
+            let below = o.select(o.less(x, zero), o.number(F::narrow(core::f64::consts::PI)), zero);
+            o.subtract(o.multiply(r, ln), o.multiply(below, o.multiply(o.exp(o.multiply(y, ln)), crate::recipe::sincospi(o, y).0)))
+        }),
+    ]
 }
 
 /// `K`'s partial derivative in its argument `SIDE`, as a function object at `f32` and `f64`: of `K`'s argument and result where `K` takes one argument, and of its two arguments and its result where it takes two. Each item runs `K`'s recipe on floats ([`Floats`]), which see no constant. A slope that is NaN where no argument is, such as `Pow`'s in `y` at an infinite `x` and a negative `y`, is its value, as [`Subtract`](crate::Subtract) gives NaN for ∞ - ∞. A slope in an argument that has none, such as `Polygamma`'s in its order, is NaN.
 #[derive(Clone, Copy, Debug)]
 pub struct Slope<K, const SIDE: usize = 0>(pub K);
-

@@ -199,8 +199,7 @@ pub struct Held { pub column: usize, pub cost: f64, pub cause: Cause, pub estima
 pub fn hold(text: &str, holds: &mut Vec<Held>) -> Result<bool, String> {
     let (cause, rest) = match text.split_once(' ') {
         Some((keyword, rest)) if keyword == Cause::Gap.name() => (Cause::Gap, rest),
-        Some((keyword, rest)) if keyword == Cause::Busy.name() => (Cause::Busy, rest),
-        _ => return Ok(false),
+        Some((keyword, rest)) if keyword == Cause::Busy.name() => (Cause::Busy, rest), _ => return Ok(false)
     };
     let fail = || format!("{text:?} should be a column, the cost it's held at, any more columns and costs, then a colon and the reason");
     let (columns, _) = rest.split_once(':').filter(|(_, reason)| !reason.trim().is_empty()).ok_or_else(fail)?;
@@ -241,10 +240,7 @@ impl Budget {
 /// The budget as a speed test's line gives it: `16`, or with the hold and the rule budget, `32 held from 16` or `5.4 busy from 2.5`.
 impl std::fmt::Display for Budget {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self.cause {
-            None => write!(f, "{}", self.value),
-            Some(cause) => write!(f, "{} {} from {}", self.value, cause.name(), self.rule),
-        }
+        match self.cause { None => write!(f, "{}", self.value), Some(cause) => write!(f, "{} {} from {}", self.value, cause.name(), self.rule) }
     }
 }
 
@@ -260,12 +256,15 @@ pub fn cases(text: &str) -> Result<Vec<Listed<'_>>, String> {
         start += whole.len();
         if line.starts_with('#') { hold(line.strip_prefix("# ").unwrap_or_default(), &mut holds)?; continue; }
         if line.is_empty() { continue; }
-        let named = line.strip_prefix('[').and_then(|l| l.split_once(']')).filter(|(name, rest)| !name.contains(' ') && (rest.is_empty() || rest.starts_with(' ')));
+        let named =
+            line.strip_prefix('[').and_then(|l| l.split_once(']')).filter(|(name, rest)| !name.contains(' ') && (rest.is_empty() || rest.starts_with(' ')));
         if let Some((name, _)) = named { section = Some(name); continue; }
         let section = section.ok_or_else(|| format!("{line:?} comes before the first section"))?;
         let mut fields = line.split('\t');
         let (code, budgets): (&str, Vec<&str>) = (fields.next().unwrap_or_default(), fields.collect());
-        if budgets.iter().any(|b| b.parse::<f64>().map_or(true, |b| !b.is_finite() || b < 0.0)) { return Err(format!("{line:?} has a budget that isn't a number")); }
+        if budgets.iter().any(|b| b.parse::<f64>().map_or(true, |b| !b.is_finite() || b < 0.0)) {
+            return Err(format!("{line:?} has a budget that isn't a number"));
+        }
         cases.push(Listed { section, code, budgets, holds: std::mem::take(&mut holds), span });
     }
     if holds.is_empty() { Ok(cases) } else { Err("a held or busy line ends the file, with no case after it".into()) }
@@ -274,8 +273,7 @@ pub fn cases(text: &str) -> Result<Vec<Listed<'_>>, String> {
 /// Each case of `text`, a budget file, as its section, its code and its budget in `column`, as [`Budget::of`] gives it, or with `None` for every case where `column` is `None`. A case with no budget in `column` is an error.
 pub fn budgeted(text: &str, column: Option<usize>) -> Result<Vec<(&str, &str, Option<Budget>)>, String> {
     cases(text)?.into_iter().map(|c| match (column, Budget::of(c.section, &c.budgets, &c.holds, column)) {
-        (Some(i), None) => Err(format!("{} {} has no {} budget", c.section, c.code, COLUMNS[i])),
-        (_, budget) => Ok((c.section, c.code, budget)),
+        (Some(i), None) => Err(format!("{} {} has no {} budget", c.section, c.code, COLUMNS[i])), (_, budget) => Ok((c.section, c.code, budget))
     }).collect()
 }
 
@@ -283,10 +281,7 @@ pub fn budgeted(text: &str, column: Option<usize>) -> Result<Vec<(&str, &str, Op
 pub const RETRY_PAUSES: [f64; 3] = [0.1, 1.0, 10.0];
 
 /// Keeps the calling thread busy for 0.1 s by reading the clock, so that a timing after a pause runs at the core's full speed. An idle core runs slower until it has been busy for a while. A timing's `RUNS` calls of a small case finish within microseconds, before the core speeds up: on the development Mac, cases of 65,536 items that cost 0.74-0.84 copies cost 2.28-3.06 straight after a 10 s pause (30 October 2026). [`retried`] calls it after each pause, and the Python and browser speed tests call it after theirs.
-pub fn warm() {
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_millis(100) {}
-}
+pub fn warm() { let start = Instant::now(); while start.elapsed() < Duration::from_millis(100) {} }
 
 /// Which of a budget file's two native budgets this machine's speed tests compare costs with: 0, for macOS on Apple silicon, where matrix products run on Accelerate, or 1, for Linux on x86-64, as CI's runner is. Other machines, such as Linux on Arm, have no budgets: their speed tests report costs without comparing them. [`checks_budgets`] says whether a cost over its budget fails.
 pub const NATIVE_COLUMN: Option<usize> = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
@@ -371,7 +366,8 @@ mod lock {
             let others = if self.shared { "a timing" } else { "a build or another timing" };
             loop {
                 match if self.shared { file.try_lock_shared() } else { file.try_lock() } {
-                    Ok(()) => return Ok(()), Err(TryLockError::WouldBlock) => {} Err(TryLockError::Error(e)) => return Err(io::Error::new(e.kind(), format!("{path}: {e}")))
+                    Ok(()) => return Ok(()), Err(TryLockError::WouldBlock) => {}
+                    Err(TryLockError::Error(e)) => return Err(io::Error::new(e.kind(), format!("{path}: {e}")))
                 }
                 if self.start.elapsed() > Duration::from_secs(300) {
                     return Err(io::Error::new(io::ErrorKind::TimedOut, format!("{others} has held {LOCK} for 5 minutes")));

@@ -12,8 +12,7 @@ use rustymath_buffer::py_err;
 pub struct Distribution(pub(crate) dist::Distribution);
 
 /// The common sampler for fresh-seed distribution calls and persistent generators: one draw call, which reads `stream`.
-pub(crate) fn sampled<'py>(
-    py: Python<'py>, distribution: dist::Distribution, stream: Stream, size: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn sampled<'py>(py: Python<'py>, distribution: dist::Distribution, stream: Stream, size: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
     let mut items = Items::new(stream, distribution.words());
     let Some(size) = size else {
         let mut one = [0.0];

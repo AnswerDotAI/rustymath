@@ -6,8 +6,8 @@
 //!
 //! The private module `factor` holds decompositions of real and complex matrices, whose blocked updates run on these loops. This module re-exports its public items, and [`Scalar`], the trait of the item types they take. [`transpose_into`] transposes a matrix through 8×8 tiles.
 use crate::{
-    Float, agreement::{Mapping, Walked, expanded_items}, buffer::{Element, Source, read_all}, convert, error::Error,
-    float::{FUSED, sealed::Core}, parallel, slice
+    Float, agreement::{Mapping, Walked, expanded_items}, buffer::{Element, Source, read_all}, convert, error::Error, float::{FUSED, sealed::Core},
+    parallel, slice
 };
 use num_complex::Complex;
 use num_traits::{One, Zero};
@@ -169,23 +169,17 @@ pub struct PlusNotEqual;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Product { PlusTimes, MaxPlus, MinPlus, OrAnd, AndOr, PlusEqual, PlusNotEqual }
 
-impl Product {
-    pub fn compares_exactly(self) -> bool { matches!(self, Self::PlusEqual | Self::PlusNotEqual) }
-}
+impl Product { pub fn compares_exactly(self) -> bool { matches!(self, Self::PlusEqual | Self::PlusNotEqual) } }
 
 /// Layout and reads of an inner product. Contracted axes follow output axes in `iteration`.
 #[derive(Clone, Debug)]
 pub struct ProductPlan {
-    pub layout: crate::layout::Layout,
-    pub iteration: crate::layout::Layout,
-    pub mappings: [Mapping; 2],
-    pub contracted: usize,
-    pub matrix: Option<MatrixProduct>,
+    pub layout: crate::layout::Layout, pub iteration: crate::layout::Layout, pub mappings: [Mapping; 2], pub contracted: usize,
+    pub matrix: Option<MatrixProduct>
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct MatrixProduct { pub frame_rank: usize, pub row_rank: usize, pub size: [usize; 3]
-}
+pub struct MatrixProduct { pub frame_rank: usize, pub row_rank: usize, pub size: [usize; 3] }
 impl MatrixProduct {
     fn of(shape: &[usize], owners: &[u8]) -> Option<Self> {
         let frame_rank = owners.iter().take_while(|&&owner| owner == 3).count();
@@ -251,7 +245,9 @@ impl ProductPlan {
         }
         for &(a, b) in pairs {
             let (x, y) = (left.shape()[a], right.shape()[b]);
-            if x != y { return Err(Error::new(Kind::Length, format!("an inner product needs matching contracted lengths, not {x} and {y}"))); }
+            if x != y {
+                return Err(Error::new(Kind::Length, format!("an inner product needs matching contracted lengths, not {x} and {y}")));
+            }
             Mapping::contract(left, a, right, b).map_err(|_| Error::new(Kind::Length, "an inner product needs the same keys on its contracted axes"))?;
         }
         let free: [Vec<usize>; 2] = std::array::from_fn(|i| (0..inputs[i].shape().len()).filter(|a| !contracted[i].contains(a)).collect());
@@ -1021,10 +1017,7 @@ fn narrow_sums<T: Tiled>(out: &mut [T], data: &[T], ld: usize, w: &[T]) {
     let mut acc = [[T::zero(); NARROW]; 4];
     let (quads, rest) = w[..whole].as_chunks::<4>();
     for (q, ws) in quads.iter().enumerate() {
-        for s in 0..4 {
-            let a = &data[(4 * q + s) * ld..][..NARROW];
-            for t in 0..NARROW { acc[s][t] = a[t].mul_acc(ws[s], acc[s][t]) }
-        }
+        for s in 0..4 { let a = &data[(4 * q + s) * ld..][..NARROW]; for t in 0..NARROW { acc[s][t] = a[t].mul_acc(ws[s], acc[s][t]) } }
     }
     for (p, &wp) in rest.iter().enumerate() {
         let a = &data[(4 * quads.len() + p) * ld..][..NARROW];
@@ -1109,7 +1102,8 @@ fn by_vector<T: Tiled>(c: &mut [T], ldc: usize, a: Matrix<'_, T>, alpha: T, b: M
     let flip = T::COMPLEX && conj != matches!(vector.op, Op::Adjoint | Op::Conjugate);
     let stride = if vector.op.transposed() { vector.ld } else { 1 };
     let x: Cow<'_, [T]> = if stride == 1 && !flip { Cow::Borrowed(&vector.data[..k]) }
-        else { (0..k).map(|p| if flip { vector.data[p * stride].conj() } else { vector.data[p * stride] }).collect() };
+    else { (0..k).map(|p| if flip { vector.data[p * stride].conj() }
+    else { vector.data[p * stride] }).collect() };
     let (data, ld, unit) = (matrix.data, matrix.ld, (VECTOR_WORK / k).max(1).next_multiple_of(4));
     let (one, start) = (alpha == T::one(), beta == T::zero());
     let direct = step == 1 && one && start && !conj;
@@ -1136,7 +1130,10 @@ fn by_vector<T: Tiled>(c: &mut [T], ldc: usize, a: Matrix<'_, T>, alpha: T, b: M
             }
         }
     } else {
-        let dots = match k { 1 => narrow_dots::<T, 1>, 2 => narrow_dots::<T, 2>, 3 => narrow_dots::<T, 3>, 4 => narrow_dots::<T, 4>, 5 => narrow_dots::<T, 5>, 6 => narrow_dots::<T, 6>, 7 => narrow_dots::<T, 7>, 8 => narrow_dots::<T, 8>, _ => dots::<T> };
+        let dots = match k {
+            1 => narrow_dots::<T, 1>, 2 => narrow_dots::<T, 2>, 3 => narrow_dots::<T, 3>, 4 => narrow_dots::<T, 4>, 5 => narrow_dots::<T, 5>,
+            6 => narrow_dots::<T, 6>, 7 => narrow_dots::<T, 7>, 8 => narrow_dots::<T, 8>, _ => dots::<T>
+        };
         parallel::split(y, unit, &|first, part| { dots(part, data, ld, first, &x); true });
     }
     if direct { return true; }
@@ -1480,9 +1477,15 @@ fn product<T: Copy + Default + Send + Sync, P: Pair<T>, const MR: usize, const N
                                     let at = |r: usize| (ic - i0 + ir + r) * ldc + jc + jr;
                                     let mut t = [[P::UNIT; NR]; MR];
                                     // A whole row moves as one run of `NR` items, which compiles to vector moves. Item by item, each move compiles to a scalar load, a store and a bounds check.
-                                    if load { for r in 0..rows { if cols == NR { t[r].copy_from_slice(&band[at(r)..][..NR]) } else { for s in 0..cols { t[r][s] = band[at(r) + s] } } } }
+                                    if load {
+                                        for r in 0..rows {
+                                            if cols == NR { t[r].copy_from_slice(&band[at(r)..][..NR]) } else { for s in 0..cols { t[r][s] = band[at(r) + s] } }
+                                        }
+                                    }
                                     kernel(&ap[ir * kc..(ir + MR) * kc], bj, &mut t, !load);
-                                    for r in 0..rows { if cols == NR { band[at(r)..][..NR].copy_from_slice(&t[r]) } else { for s in 0..cols { band[at(r) + s] = t[r][s] } } }
+                                    for r in 0..rows {
+                                        if cols == NR { band[at(r)..][..NR].copy_from_slice(&t[r]) } else { for s in 0..cols { band[at(r) + s] = t[r][s] } }
+                                    }
                                 }
                             }
                         }

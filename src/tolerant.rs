@@ -340,7 +340,7 @@ impl Band {
     pub fn range(self, lo: f64, hi: f64) -> crate::facts::Range {
         let (lo, hi) = match self {
             Band::Inside => (lo, hi), Band::Outside => (f64::NEG_INFINITY, f64::INFINITY), Band::Below => (f64::NEG_INFINITY, lo),
-            Band::NotAbove => (f64::NEG_INFINITY, hi), Band::Above => (hi, f64::INFINITY), Band::NotBelow => (lo, f64::INFINITY),
+            Band::NotAbove => (f64::NEG_INFINITY, hi), Band::Above => (hi, f64::INFINITY), Band::NotBelow => (lo, f64::INFINITY)
         };
         crate::facts::Range { lo, hi }
     }
@@ -348,7 +348,7 @@ impl Band {
     fn complement(self) -> Self {
         match self {
             Band::Inside => Band::Outside, Band::Outside => Band::Inside, Band::Below => Band::NotBelow, Band::NotBelow => Band::Below,
-            Band::NotAbove => Band::Above, Band::Above => Band::NotAbove,
+            Band::NotAbove => Band::Above, Band::Above => Band::NotAbove
         }
     }
 }
@@ -543,10 +543,7 @@ impl Stepped for Equal {
 
 impl Stepped for NotEqual {
     #[inline(always)]
-    fn steps<F: Float, O: recipe::Ops<F> + ?Sized>(self, o: &O, x: O::V, y: O::V) -> O::B {
-        let equal = Equal(self.0).steps(o, x, y);
-        o.not(equal)
-    }
+    fn steps<F: Float, O: recipe::Ops<F> + ?Sized>(self, o: &O, x: O::V, y: O::V) -> O::B { let equal = Equal(self.0).steps(o, x, y); o.not(equal) }
 }
 
 impl Stepped for Less {

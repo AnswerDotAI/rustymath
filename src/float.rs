@@ -260,18 +260,12 @@ pub(crate) fn horner<R: Native, const FUSED: bool, const N: usize>(x: R, c: [f64
 
 /// ln 2, split into a part whose product with any whole number up to 2^11 at f64 or 2^8 at f32 is exact, and the rest. That covers every exponent of a float and every n that `exp` reduces by.
 #[inline]
-pub(crate) fn ln2<R: Native>() -> (R, R) {
-    crate::recipe::ln2(&crate::recipe::Floats)
-}
+pub(crate) fn ln2<R: Native>() -> (R, R) { crate::recipe::ln2(&crate::recipe::Floats) }
 
 /// y × 2^n, for a whole n, in two factors. The first multiplication is exact, so a result below the normal floats rounds once, in the second.
 #[inline]
-pub(crate) fn pow2_times<R: Native, const FUSED: bool>(y: R, n: R) -> R {
-    crate::recipe::ldexp(&crate::recipe::NativeOps::<FUSED>::DEFAULT, y, n)
-}
+pub(crate) fn pow2_times<R: Native, const FUSED: bool>(y: R, n: R) -> R { crate::recipe::ldexp(&crate::recipe::NativeOps::<FUSED>::DEFAULT, y, n) }
 
 /// (m, e) with x = m × 2^e, m from 0.75 to 1.5 and e whole, for a positive x, subnormals included. A subnormal x scales up by 2^64 first, so that its bits split as a normal float's do.
 #[inline]
-pub(crate) fn split_positive<R: Native>(x: R) -> (R, R) {
-    crate::recipe::frexp(&crate::recipe::Floats, x)
-}
+pub(crate) fn split_positive<R: Native>(x: R) -> (R, R) { crate::recipe::frexp(&crate::recipe::Floats, x) }

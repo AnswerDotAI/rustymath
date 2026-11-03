@@ -1,13 +1,21 @@
 //! Formulas that rustymath's kernels compute and basedpl's JIT compiles, each written once over the operations it uses (`Ops`): tolerant closeness, comparison (each item, or through the range of floats equal to one number), floor, ceiling and the residue; Mathish division, sign, the reciprocal and `π`'s two forms; and the powers that `Exponent` routes off the general route, with the square root they take for halves. `Floats` runs a recipe on floats, as the kernels do. A compiler's `Ops` records the same operations as steps, so both routes round alike, step for step.
 use crate::{Exponent, Float, float::sealed::Core, tolerant::Band};
 mod integer;
-pub use integer::IntegerOps;
 pub use crate::arith::Overflowing;
+pub use integer::IntegerOps;
 
 /// An elementwise operation of one value that a recipe uses, named by id: an `Ops` implementor computes each in one match (`Ops::unary`).
 #[derive(Clone, Copy, Debug, PartialEq, Hash, Eq)]
 pub enum Unary {
-    Negate, Magnitude, Sqrt, Floor, Ln, Sin, Cos, Sinh, Cosh,
+    Negate,
+    Magnitude,
+    Sqrt,
+    Floor,
+    Ln,
+    Sin,
+    Cos,
+    Sinh,
+    Cosh,
     /// √(1 - x²).
     Sqrt1mx2,
     /// √(1 + x²).
@@ -25,7 +33,10 @@ pub enum Unary {
 /// An elementwise operation of two values that a recipe uses, named by id (`Ops::binary`).
 #[derive(Clone, Copy, Debug, PartialEq, Hash, Eq)]
 pub enum Binary {
-    Add, Subtract, Multiply, Divide,
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
     /// `x` where `x > y`, otherwise `y`: `y` where either is NaN.
     Larger,
     /// `x` where `x < y`, otherwise `y`: `y` where either is NaN.
@@ -126,10 +137,9 @@ impl RangeOps {
     fn compare(op: Cmp, x: crate::facts::Range, y: crate::facts::Range) -> Option<bool> {
         if x.is_empty() || y.is_empty() { return None; }
         match op {
-            Cmp::Less if x.hi < y.lo => Some(true), Cmp::Less if x.lo >= y.hi => Some(false),
-            Cmp::LessEqual if x.hi <= y.lo => Some(true), Cmp::LessEqual if x.lo > y.hi => Some(false),
-            Cmp::Equal if x.constant().is_some() && x == y => Some(true), Cmp::Equal if x.hi < y.lo || y.hi < x.lo => Some(false),
-            _ => None,
+            Cmp::Less if x.hi < y.lo => Some(true), Cmp::Less if x.lo >= y.hi => Some(false), Cmp::LessEqual if x.hi <= y.lo => Some(true),
+            Cmp::LessEqual if x.lo > y.hi => Some(false), Cmp::Equal if x.constant().is_some() && x == y => Some(true),
+            Cmp::Equal if x.hi < y.lo || y.hi < x.lo => Some(false), _ => None
         }
     }
     fn selected(test: Option<bool>, x: crate::facts::Range, y: crate::facts::Range) -> crate::facts::Range {
@@ -137,7 +147,10 @@ impl RangeOps {
     }
 }
 impl<F: Float> Ops<F> for RangeOps {
-    type V = crate::facts::Range; type B = Option<bool>; type I = crate::facts::Range; type W = crate::facts::Range;
+    type V = crate::facts::Range;
+    type B = Option<bool>;
+    type I = crate::facts::Range;
+    type W = crate::facts::Range;
     fn width(&self) -> crate::buffer::FloatWidth { crate::operation::numpy_float(self.0) }
     fn fused(&self) -> bool { crate::FUSED }
     fn integral(&self) -> bool { self.0.is_integral() }
@@ -160,8 +173,12 @@ impl<F: Float> Ops<F> for RangeOps {
     fn compare(&self, op: Cmp, x: Self::V, y: Self::V) -> Self::B { Self::compare(op, x, y) }
     fn multiply_add(&self, _: Self::V, _: Self::V, _: Self::V) -> Self::V { crate::facts::Range::ANY }
     fn overflow(&self, _: Binary, _: Self::V, _: Self::V) -> Self::B { None }
-    fn and(&self, x: Self::B, y: Self::B) -> Self::B { match (x, y) { (Some(false), _) | (_, Some(false)) => Some(false), (Some(true), Some(true)) => Some(true), _ => None } }
-    fn or(&self, x: Self::B, y: Self::B) -> Self::B { match (x, y) { (Some(true), _) | (_, Some(true)) => Some(true), (Some(false), Some(false)) => Some(false), _ => None } }
+    fn and(&self, x: Self::B, y: Self::B) -> Self::B {
+        match (x, y) { (Some(false), _) | (_, Some(false)) => Some(false), (Some(true), Some(true)) => Some(true), _ => None }
+    }
+    fn or(&self, x: Self::B, y: Self::B) -> Self::B {
+        match (x, y) { (Some(true), _) | (_, Some(true)) => Some(true), (Some(false), Some(false)) => Some(false), _ => None }
+    }
     fn not(&self, x: Self::B) -> Self::B { x.map(|x| !x) }
     fn select(&self, test: Self::B, x: Self::V, y: Self::V) -> Self::V { Self::selected(test, x, y) }
 }
@@ -190,17 +207,15 @@ impl<F: Float, const FUSED: bool> Ops<F> for NativeOps<FUSED> {
     #[inline(always)]
     fn narrow(&self, x: f64) -> F { F::narrow(x) }
     #[inline(always)]
-    fn width(&self) -> crate::buffer::FloatWidth {
-        if F::Working::WIDE { crate::buffer::FloatWidth::F64 } else { crate::buffer::FloatWidth::F32 }
-    }
+    fn width(&self) -> crate::buffer::FloatWidth { if F::Working::WIDE { crate::buffer::FloatWidth::F64 } else { crate::buffer::FloatWidth::F32 } }
     #[inline(always)]
     fn integer(&self, x: i64) -> u64 { x as u64 }
     #[inline(always)]
     fn integer_op(&self, op: Integer, x: u64, y: u64) -> u64 {
         match op {
-            Integer::Add => x.wrapping_add(y), Integer::Subtract => x.wrapping_sub(y),
-            Integer::And => x & y, Integer::Or => x | y, Integer::Xor => x ^ y,
-            Integer::ShiftLeft => x.wrapping_shl(y as u32), Integer::ShiftRight => x.wrapping_shr(y as u32), Integer::SignedShiftRight => (x as i64).wrapping_shr(y as u32) as u64,
+            Integer::Add => x.wrapping_add(y), Integer::Subtract => x.wrapping_sub(y), Integer::And => x & y, Integer::Or => x | y, Integer::Xor => x ^ y,
+            Integer::ShiftLeft => x.wrapping_shl(y as u32), Integer::ShiftRight => x.wrapping_shr(y as u32),
+            Integer::SignedShiftRight => (x as i64).wrapping_shr(y as u32) as u64
         }
     }
     #[inline(always)]
@@ -214,31 +229,27 @@ impl<F: Float, const FUSED: bool> Ops<F> for NativeOps<FUSED> {
     #[inline(always)]
     fn from_integer(&self, x: u64) -> F { F::narrow((x as i64) as f64) }
     #[inline(always)]
-    fn to_bits(&self, x: F) -> u64 {
-        if F::Working::WIDE { x.wide().to_bits() } else { (x.wide() as f32).to_bits() as u64 }
-    }
+    fn to_bits(&self, x: F) -> u64 { if F::Working::WIDE { x.wide().to_bits() } else { (x.wide() as f32).to_bits() as u64 } }
     #[inline(always)]
-    fn from_bits(&self, x: u64) -> F {
-        F::narrow(if F::Working::WIDE { f64::from_bits(x) } else { f32::from_bits(x as u32) as f64 })
-    }
+    fn from_bits(&self, x: u64) -> F { F::narrow(if F::Working::WIDE { f64::from_bits(x) } else { f32::from_bits(x as u32) as f64 }) }
     #[inline(always)]
     fn number(&self, x: F) -> F { x }
     #[inline(always)]
     fn unary(&self, op: Unary, x: F) -> F {
         match op {
-            Unary::Negate => -x, Unary::Magnitude => x.abs(), Unary::Sqrt => x.sqrt(), Unary::Floor => x.floor(),
-            Unary::Ln => crate::ln(x), Unary::Sin => crate::sin(x), Unary::Cos => crate::cos(x), Unary::Sinh => crate::sinh(x), Unary::Cosh => crate::cosh(x),
-            Unary::Sqrt1mx2 => crate::sqrt1mx2(x), Unary::Sqrt1px2 => crate::sqrt1px2(x), Unary::Digamma => crate::digamma(x), Unary::Exp => crate::exp(x), Unary::Lgamma => crate::lgamma(x),
-            Unary::Not => F::one() - x,
+            Unary::Negate => -x, Unary::Magnitude => x.abs(), Unary::Sqrt => x.sqrt(), Unary::Floor => x.floor(), Unary::Ln => crate::ln(x),
+            Unary::Sin => crate::sin(x), Unary::Cos => crate::cos(x), Unary::Sinh => crate::sinh(x), Unary::Cosh => crate::cosh(x),
+            Unary::Sqrt1mx2 => crate::sqrt1mx2(x), Unary::Sqrt1px2 => crate::sqrt1px2(x), Unary::Digamma => crate::digamma(x), Unary::Exp => crate::exp(x),
+            Unary::Lgamma => crate::lgamma(x), Unary::Not => F::one() - x
         }
     }
     #[inline(always)]
     fn binary(&self, op: Binary, x: F, y: F) -> F {
         match op {
-            Binary::Add => x + y, Binary::Subtract => x - y, Binary::Multiply => x * y, Binary::Divide => x / y,
-            Binary::Larger => if x > y { x } else { y }, Binary::Smaller => if x < y { x } else { y },
-            Binary::Binom => crate::binom(x, y), Binary::BinomDn => crate::binom_dn(x, y), Binary::BinomDk => crate::binom_dk(x, y), Binary::Polygamma => crate::polygamma(x, y),
-            Binary::BitAnd => unreachable!("floats take no bitwise and: a recipe asks for one only where `Ops::integral` holds"),
+            Binary::Add => x + y, Binary::Subtract => x - y, Binary::Multiply => x * y, Binary::Divide => x / y, Binary::Larger => { if x > y { x } else { y } }
+            Binary::Smaller => { if x < y { x } else { y } } Binary::Binom => crate::binom(x, y), Binary::BinomDn => crate::binom_dn(x, y),
+            Binary::BinomDk => crate::binom_dk(x, y), Binary::Polygamma => crate::polygamma(x, y),
+            Binary::BitAnd => unreachable!("floats take no bitwise and: a recipe asks for one only where `Ops::integral` holds")
         }
     }
     #[inline(always)]
@@ -412,24 +423,15 @@ pub fn in_band<F: Float, O: Ops<F> + ?Sized>(o: &O, band: Band, lo: O::V, hi: O:
 
 /// `1 ÷ x`.
 #[inline(always)]
-pub fn reciprocal<F: Float, O: Ops<F> + ?Sized>(o: &O, x: O::V) -> O::V {
-    let one = o.number(F::one());
-    o.divide(one, x)
-}
+pub fn reciprocal<F: Float, O: Ops<F> + ?Sized>(o: &O, x: O::V) -> O::V { let one = o.number(F::one()); o.divide(one, x) }
 
 /// `π × x`, with π at `F`'s width.
 #[inline(always)]
-pub fn pi_times<F: Float, O: Ops<F> + ?Sized>(o: &O, x: O::V) -> O::V {
-    let pi = o.number(F::narrow(std::f64::consts::PI));
-    o.multiply(x, pi)
-}
+pub fn pi_times<F: Float, O: Ops<F> + ?Sized>(o: &O, x: O::V) -> O::V { let pi = o.number(F::narrow(std::f64::consts::PI)); o.multiply(x, pi) }
 
 /// `π × (x ÷ y)`, an angle of `x` over `y` turns of half a circle.
 #[inline(always)]
-pub fn pi_ratio<F: Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, y: O::V) -> O::V {
-    let ratio = o.divide(x, y);
-    pi_times(o, ratio)
-}
+pub fn pi_ratio<F: Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, y: O::V) -> O::V { let ratio = o.divide(x, y); pi_times(o, ratio) }
 
 /// `x ÷ y`, or `x` where both are zero, as Mathish division gives `0÷0`.
 #[inline(always)]
@@ -455,8 +457,7 @@ pub fn power<F: Float, O: Ops<F> + ?Sized>(o: &O, e: Exponent, x: O::V) -> Optio
     match e {
         Exponent::Whole { m, negative } if !o.integral() && m > crate::pow::MULTIPLIED => Some(whole(o, m, negative, x)),
         Exponent::Whole { m, negative } => Some(multiplied(o, m, negative, x)),
-        Exponent::Halves { m, negative } => Some(multiplied(o, m, negative, root2(o, x))),
-        Exponent::General => None,
+        Exponent::Halves { m, negative } => Some(multiplied(o, m, negative, root2(o, x))), Exponent::General => None
     }
 }
 
@@ -519,10 +520,8 @@ fn times<F: Float, O: Ops<F> + ?Sized>(o: &O, (h, l): Word<O::V>, by: Option<O::
     let squares = i + by.is_none() as u32;
     let fold = error.take().map(|e| o.multiply(e, o.number(F::narrow(m as f64 / (1u64 << squares) as f64))));
     let l = match (l, fold) {
-        (None, None) => return (o.multiply(h, y), None),
-        (Some(l), None) => l,
-        (None, Some(c)) => o.multiply(h, c),
-        (Some(l), Some(c)) => o.multiply_add(h, c, l),
+        (None, None) => return (o.multiply(h, y), None), (Some(l), None) => l, (None, Some(c)) => o.multiply(h, c),
+        (Some(l), Some(c)) => o.multiply_add(h, c, l)
     };
     let k = o.multiply(twice(o), l);
     // k is infinite or NaN only where h is, or where h·y overflows. h·y alone is the power there.

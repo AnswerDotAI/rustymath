@@ -1,13 +1,13 @@
 //! Reductions and scans over a contiguous slice: sums, products, maximums and minimums, and their running versions. Each compiles inside rustymath once for each item type. A float sum or product may combine the items in any order, which lets its loop vectorize, so its last bits can differ from a sum taken item by item. Beside NaN, a float maximum or minimum gives NaN or the greatest or least of the items that aren't NaN, and never any other number. Which of the two it gives can depend on the target and the loop. An empty slice gives -∞ or ∞. `f16` items compute in `f32`. Their sum or product is an `f32` total. An integer sum or product computes at `i64`, or at `u64` for `u64` items. Where it doesn't fit, it wraps, and reports that it doesn't fit, as the running versions do.
+use crate::error::{Error, Kind};
 pub use crate::slice::running;
 use crate::{
-    Arg, Float, Native, agreement::{Mapping, Read, Walked, expanded_items}, arith::Overflowing, buffer::{Buffer, Element, View}, float::sealed::{Core, Folds}, gather::Steps,
-    facts::Variant, layout::Lanes, linalg::Scalar, operation::{Positions, at_typed}, parallel, slice::{CHUNK, appended, written}
+    Arg, Float, Native, agreement::{Mapping, Read, Walked, expanded_items}, arith::Overflowing, buffer::{Buffer, Element, View}, facts::Variant,
+    float::sealed::{Core, Folds}, gather::Steps, layout::Lanes, linalg::Scalar, operation::{Positions, at_typed}, parallel, slice::{CHUNK, appended, written}
 };
 use half::f16;
 use num_complex::Complex;
 use std::ops::Range;
-use crate::error::{Error, Kind};
 
 /// The sum of `x`, 0 for an empty slice, and whether it fits. An integer sum that doesn't fit wraps.
 #[inline]
@@ -845,7 +845,8 @@ pub fn along_mapped<T: Element, R: Reduction<T>>(data: &[T], mapping: &Mapping, 
     if let Some(block) = mapping.block(shape) {
         crate::events::taken(crate::events::Route::InPlace, positions);
         let (dims, order) = block.fold(Some(axis));
-        let (totals, fits) = along::<T, R>(&data[block.range.clone()], dims); return (totals, fits, order);
+        let (totals, fits) = along::<T, R>(&data[block.range.clone()], dims);
+        return (totals, fits, order);
     }
     let dims = Lanes::new(shape, axis).expect("the folded axis is within the shape").dims();
     let mut totals = vec![R::unit(); dims[0] * dims[2]];
@@ -1150,8 +1151,7 @@ pub fn view_picks(x: View<'_>, dims: [usize; 3], of: Picks, max: bool) -> Option
 /// Folds each lane of `[outer, len, inner]` from the right by `k`: `x0 k (x1 k (...))`. A `tail` supplies the already-folded items to the right of each lane, in the input type. Otherwise each lane needs at least two items. Each running result reads as the next step's right argument through [`Source`](crate::buffer::Source), as a Boolean comparison result reads as 0 or 1. A step that fails keeps the result that `k`'s slice form writes, such as a wrapped integer. Gives whether every step succeeded.
 #[inline]
 pub fn right_fold<T: Copy, O: Copy + crate::buffer::Source<T>>(
-    data: &[T], [outer, len, inner]: [usize; 3], tail: Option<&[T]>, combine: impl Fn(T, T) -> (O, bool),
-) -> (Vec<O>, bool) {
+    data: &[T], [outer, len, inner]: [usize; 3], tail: Option<&[T]>, combine: impl Fn(T, T) -> (O, bool)) -> (Vec<O>, bool) {
     assert_eq!(data.len(), outer * len * inner, "the data must fill its dimensions");
     assert!(inner == 0 || if tail.is_some() { len > 0 } else { len >= 2 }, "a right fold needs two items or a tail");
     if let Some(tail) = tail { assert_eq!(tail.len(), outer * inner, "one tail per lane"); }
@@ -1306,7 +1306,8 @@ fn step_row<T: Copy, R: Reduction<T>>(totals: &mut [R::Total], row: &[T], first:
 #[inline(always)]
 fn step_rows<T: Copy, R: Reduction<T>>(totals: &mut [R::Total], rows: &[T], first: bool, streamed: bool) -> bool {
     match crate::slice::running(size_of::<R::Total>()) {
-        8 => rows_by::<T, R, 8>(totals, rows, first, streamed), 16 => rows_by::<T, R, 16>(totals, rows, first, streamed), _ => rows_by::<T, R, 32>(totals, rows, first, streamed)
+        8 => rows_by::<T, R, 8>(totals, rows, first, streamed), 16 => rows_by::<T, R, 16>(totals, rows, first, streamed),
+        _ => rows_by::<T, R, 32>(totals, rows, first, streamed)
     }
 }
 
@@ -1469,9 +1470,7 @@ pub fn scan_along<T: Copy, R: Reduction<T>>(data: &[T], dims: [usize; 3], start:
 
 /// Appends the ordered left scan by `k` of each lane of `[outer, len, inner]`, each result read as the item type through [`Source`](crate::buffer::Source). Without a seed, the first item is unchanged. A step that fails keeps the result that `k`'s slice form writes, such as a wrapped integer. Gives whether every step succeeded.
 #[inline]
-pub fn left_scan<T: Copy>(
-    data: &[T], dims: [usize; 3], seed: Option<&[T]>, out: &mut Vec<T>, step: impl Fn(T, T) -> (T, bool) + Copy,
-) -> bool {
+pub fn left_scan<T: Copy>(data: &[T], dims: [usize; 3], seed: Option<&[T]>, out: &mut Vec<T>, step: impl Fn(T, T) -> (T, bool) + Copy) -> bool {
     let first = |i, x| seed.map_or((x, true), |s| step(s[if s.len() == 1 { 0 } else { i }], x));
     rows_scan(data, dims, out, |lane, out| {
         let (total, ok) = first(0, lane[0]);
@@ -1739,7 +1738,12 @@ fn alternated<A: Copy, S: Copy + std::ops::Sub<Output = S>>(x: &[A], unit: S, ad
 /// The running folds of `x` by `R`, each item taken in turn by `checked` from `start` or `R`'s identity, appended to `out`, and whether every one fits.
 fn checked_steps<T: Copy, R: Reduction<T>>(x: &[T], start: Option<R::Total>, out: &mut Vec<R::Total>) -> bool {
     let (mut total, mut fits) = (start.unwrap_or_else(R::identity), true);
-    out.extend(x.iter().map(|&v| { let ok; (total, ok) = R::checked(total, v); fits &= ok; total }));
+    out.extend(x.iter().map(|&v| {
+        let ok;
+        (total, ok) = R::checked(total, v);
+        fits &= ok;
+        total
+    }));
     fits
 }
 
@@ -1886,7 +1890,8 @@ impl<F: Native> Inverse<F> for ScaledProduct {
     fn alternating(x: &[F]) -> (Scaled<F>, bool) {
         // The quotient of plain floats vectorizes, so it goes first. One that leaves the normal floats runs again with its exponent apart.
         let (q, fits) = quotient(x, F::one(), |a, b| a / b, F::algebraic_mul, F::abs, F::is_finite);
-        let t = if fits { Scaled::of(q, F::zero(), true) } else { pairwise(x, <Self as Reduction<F>>::unit(), |s, a, b| s.times(a / b), Scaled::joined, Scaled::times) };
+        let t = if fits { Scaled::of(q, F::zero(), true) }
+        else { pairwise(x, <Self as Reduction<F>>::unit(), |s, a, b| s.times(a / b), Scaled::joined, Scaled::times) };
         (t, t.normal)
     }
 }
@@ -2188,8 +2193,7 @@ impl Reduce {
         match item {
             DType::Float(FloatWidth::F32 | FloatWidth::F64) => matches!(self, Self::Sum | Self::Product | Self::Max | Self::Min),
             DType::Integer(_) => matches!(self, Self::Max | Self::Min) || exact && self == Self::Sum,
-            DType::Boolean => matches!(self, Self::Sum | Self::Min | Self::Max | Self::Xor | Self::Xnor),
-            _ => false,
+            DType::Boolean => matches!(self, Self::Sum | Self::Min | Self::Max | Self::Xor | Self::Xnor), _ => false
         }
     }
 
@@ -2198,7 +2202,9 @@ impl Reduce {
         use crate::buffer::DType;
         match (items, seed, result) {
             (DType::Float(a), DType::Float(_), DType::Float(b)) => a == b,
-            (DType::Integer(_), DType::Boolean | DType::Integer(_), DType::Integer(_)) => match self { Self::Max | Self::Min => true, Self::Sum => items == result, _ => false },
+            (DType::Integer(_), DType::Boolean | DType::Integer(_), DType::Integer(_)) => match self {
+                Self::Max | Self::Min => true, Self::Sum => items == result, _ => false
+            },
             (DType::Boolean, DType::Boolean | DType::Integer(_), DType::Integer(_)) => self == Self::Sum,
             _ => false,
         }
@@ -2268,28 +2274,27 @@ impl Reduce {
         native_reduction!(self, variant.dtype, variant.checked && !variant.wrapping, |R, T| Some(<<R as Reduction<T>>::Total as Element>::DTYPE))
     }
     pub fn run_pieces(
-        self, variant: crate::facts::Variant, dims: [usize; 3], seed: crate::operation::Seed<'_>,
-        pieces: &crate::operation::Pieces<'_>, output: &mut crate::buffer::Buffer,
-    ) -> Result<(), Error> {
-        native_reduction!(self, variant.dtype, variant.checked && !variant.wrapping, |R, T| Some(native_pieces::<T, R>(dims, seed, variant.checked, pieces, output)))
-            .unwrap_or_else(|| Err(Error::new(Kind::Domain, "reduction does not support this dtype")))
+        self, variant: crate::facts::Variant, dims: [usize; 3], seed: crate::operation::Seed<'_>, pieces: &crate::operation::Pieces<'_>,
+        output: &mut crate::buffer::Buffer) -> Result<(), Error> {
+        native_reduction!(self, variant.dtype, variant.checked && !variant.wrapping, |R, T| Some(native_pieces::<T, R>(
+            dims, seed, variant.checked, pieces, output
+        ))).unwrap_or_else(|| Err(Error::new(Kind::Domain, "reduction does not support this dtype")))
     }
 }
 
 impl Reduce {
     pub fn run_read(
-        self, variant: crate::facts::Variant, shape: &[usize], axis: usize, seed: crate::operation::Seed<'_>,
-        input: crate::agreement::Read<'_>, output: &mut crate::buffer::Buffer,
-    ) -> Result<(), Error> {
-        native_reduction!(self, variant.dtype, variant.checked && !variant.wrapping, |R, T| Some(native_read::<T, R>(shape, axis, seed, variant.checked, input, output)))
-            .unwrap_or_else(|| Err(Error::new(Kind::Domain, "reduction does not support this dtype")))
+        self, variant: crate::facts::Variant, shape: &[usize], axis: usize, seed: crate::operation::Seed<'_>, input: crate::agreement::Read<'_>,
+        output: &mut crate::buffer::Buffer) -> Result<(), Error> {
+        native_reduction!(self, variant.dtype, variant.checked && !variant.wrapping, |R, T| Some(native_read::<T, R>(
+            shape, axis, seed, variant.checked, input, output
+        ))).unwrap_or_else(|| Err(Error::new(Kind::Domain, "reduction does not support this dtype")))
     }
 }
 
 fn native_read<T, R>(
-    shape: &[usize], axis: usize, seed: crate::operation::Seed<'_>, checked: bool, input: crate::agreement::Read<'_>, output: &mut crate::buffer::Buffer,
-) -> Result<(), Error>
-where T: crate::buffer::Cast, R: Reduction<T>, R::Total: crate::buffer::Cast {
+    shape: &[usize], axis: usize, seed: crate::operation::Seed<'_>, checked: bool, input: crate::agreement::Read<'_>, output: &mut crate::buffer::Buffer
+) -> Result<(), Error> where T: crate::buffer::Cast, R: Reduction<T>, R::Total: crate::buffer::Cast {
     let dims = Lanes::new(shape, axis)?.dims();
     if let Some((view, mapping)) = input.positional(shape) && let Some(data) = T::of(view) {
         return crate::error::checked(|| {
@@ -2299,12 +2304,15 @@ where T: crate::buffer::Cast, R: Reduction<T>, R::Total: crate::buffer::Cast {
                     let data = &data[s.region.clone()];
                     let folded = match s.dims[..] {
                         [outer, len, inner] if s.every[0] == 1 => Some(sliding::<T, R>(data, [outer, len, inner], s.widths[0])),
-                        [outer, len, inner] => { crate::events::taken(crate::events::Route::SlidingFold, data.len()); Some(along::<T, R>(data, [outer, len, inner])) },
+                        [outer, len, inner] => {
+                            crate::events::taken(crate::events::Route::SlidingFold, data.len());
+                            Some(along::<T, R>(data, [outer, len, inner]))
+                        }
                         [a, b, c, d, e] => sliding_2d::<T, R>(data, [a, b, c, d, e], [s.widths[0], s.widths[1]], [s.every[0], s.every[1]]),
                         _ => unreachable!("a slide folds one axis or two"),
                     };
                     folded.map(|(totals, fits)| (totals, fits, Some(s.tables)))
-                },
+                }
                 _ => None,
             };
             let (mut totals, fits, order) = slide.unwrap_or_else(|| along_mapped::<T, R>(data, &mapping, shape, axis));
@@ -2330,9 +2338,8 @@ where T: crate::buffer::Cast, R: Reduction<T>, R::Total: crate::buffer::Cast {
 }
 
 fn native_pieces<T, R>(
-    dims: [usize; 3], seed: crate::operation::Seed<'_>, checked: bool, pieces: &crate::operation::Pieces<'_>, output: &mut crate::buffer::Buffer,
-) -> Result<(), Error>
-where T: crate::buffer::Cast, R: Reduction<T>, R::Total: crate::buffer::Cast {
+    dims: [usize; 3], seed: crate::operation::Seed<'_>, checked: bool, pieces: &crate::operation::Pieces<'_>, output: &mut crate::buffer::Buffer
+) -> Result<(), Error> where T: crate::buffer::Cast, R: Reduction<T>, R::Total: crate::buffer::Cast {
     let [outer, len, inner] = dims;
     let mut totals = vec![if len == 0 { R::unit() } else { R::identity() }; outer * inner];
     crate::error::checked(|| {
@@ -2346,7 +2353,7 @@ where T: crate::buffer::Cast, R: Reduction<T>, R::Total: crate::buffer::Cast {
                     },
                 },
                 crate::operation::Piece::Total(total) => match total.value::<R::Total>() {
-                    Ok(value) => emit(start, Part::Total(total.items, value)), Err(error) => crate::error::record(error),
+                    Ok(value) => emit(start, Part::Total(total.items, value)), Err(error) => crate::error::record(error)
                 },
             });
             if let Err(error) = result { crate::error::record(error); }
@@ -2358,8 +2365,8 @@ where T: crate::buffer::Cast, R: Reduction<T>, R::Total: crate::buffer::Cast {
     })
 }
 
-fn seed_fold<T, R: Reduction<T>>(totals: &mut [R::Total], seed: crate::operation::Seed<'_>, checked: bool) -> Result<(), Error>
-where R::Total: crate::buffer::Cast {
+fn seed_fold<T, R: Reduction<T>>(totals: &mut [R::Total], seed: crate::operation::Seed<'_>, checked: bool) -> Result<(), Error> where
+    R::Total: crate::buffer::Cast {
     if let crate::operation::Seed::Initial(read) | crate::operation::Seed::Tail(read) = seed {
         let mut scratch = Vec::new();
         let one = read.plan.len() == 1;
@@ -2377,47 +2384,47 @@ where R::Total: crate::buffer::Cast {
 impl Reduce {
     pub fn run_scan(
         self, variant: crate::facts::Variant, dims: [usize; 3], seed: crate::operation::Seed<'_>, direction: crate::operation::Direction,
-        input: crate::agreement::Read<'_>, output: &mut crate::buffer::Buffer,
-    ) -> Result<(), Error> {
-        native_reduction!(self, variant.dtype, variant.checked && !variant.wrapping, |R, T| Some(native_scan::<T, R>(dims, seed, direction, variant.checked, input, output)))
-            .unwrap_or_else(|| Err(Error::new(Kind::Domain, "scan does not support this dtype")))
+        input: crate::agreement::Read<'_>, output: &mut crate::buffer::Buffer) -> Result<(), Error> {
+        native_reduction!(self, variant.dtype, variant.checked && !variant.wrapping, |R, T| Some(native_scan::<T, R>(
+            dims, seed, direction, variant.checked, input, output
+        ))).unwrap_or_else(|| Err(Error::new(Kind::Domain, "scan does not support this dtype")))
     }
-    pub(crate) fn run_at(
-        self, variant: Variant, values: Read<'_>, ids: Positions<'_>, checked: bool, output: &mut Buffer,
-    ) -> Option<Result<(), Error>> {
+    pub(crate) fn run_at(self, variant: Variant, values: Read<'_>, ids: Positions<'_>, checked: bool, output: &mut Buffer) -> Option<Result<(), Error>> {
         native_reduction!(self, variant.dtype, variant.checked && !variant.wrapping, |R, T| {
             type S = <R as Reduction<T>>::Total;
-            (S::DTYPE == output.dtype()).then(|| at_typed::<S>(values, ids, checked, Some(|x, y| {
-                let (value, ok) = <R as Reduction<T>>::chain(x, y);
-                (value, (!ok && variant.checked && !variant.wrapping).then_some(Kind::Overflow))
-            }), output))
+            (S::DTYPE == output.dtype()).then(|| {
+                at_typed::<S>(
+                    values, ids, checked, Some(|x, y| {
+                        let (value, ok) = <R as Reduction<T>>::chain(x, y);
+                        (value, (!ok && variant.checked && !variant.wrapping).then_some(Kind::Overflow))
+                    }), output,
+                )
+            })
         })
     }
 }
 
 fn native_scan<T, R>(
-    dims: [usize; 3], seed: crate::operation::Seed<'_>, direction: crate::operation::Direction, checked: bool,
-    input: crate::agreement::Read<'_>, output: &mut crate::buffer::Buffer,
-) -> Result<(), Error>
-where T: crate::buffer::Cast, R: Reduction<T>, R::Total: crate::buffer::Cast {
+    dims: [usize; 3], seed: crate::operation::Seed<'_>, direction: crate::operation::Direction, checked: bool, input: crate::agreement::Read<'_>,
+    output: &mut crate::buffer::Buffer) -> Result<(), Error> where T: crate::buffer::Cast, R: Reduction<T>, R::Total: crate::buffer::Cast {
     scan_read::<T, R::Total>(dims, seed, direction, checked, input, output, |items, dims, seed, out| {
         let start = |i| seed.map(|s| s[if s.len() == 1 { 0 } else { i }]);
-        let fits = rows_scan(items, dims, out, |lane, out| R::scan(lane, start(0), out),
-            |i, x| start(i).map_or_else(|| R::one(x), |s| R::checked(s, x)), R::checked);
+        let fits =
+            rows_scan(items, dims, out, |lane, out| R::scan(lane, start(0), out), |i, x| start(i).map_or_else(|| R::one(x), |s| R::checked(s, x)), R::checked);
         if checked && !fits { Err(Error::new(Kind::Overflow, "integer scan overflowed")) } else { Ok(()) }
     })
 }
 
 pub(crate) fn scan_read<T: crate::buffer::Cast, S: crate::buffer::Cast>(
-    dims: [usize; 3], seed: crate::operation::Seed<'_>, direction: crate::operation::Direction, checked: bool,
-    input: crate::agreement::Read<'_>, output: &mut crate::buffer::Buffer,
-    run: impl Fn(&[T], [usize; 3], Option<&[S]>, &mut Vec<S>) -> Result<(), Error>,
-) -> Result<(), Error> {
-    use crate::{agreement::{Read, Mapping, Missing}, operation::{Seed, Direction}};
+    dims: [usize; 3], seed: crate::operation::Seed<'_>, direction: crate::operation::Direction, checked: bool, input: crate::agreement::Read<'_>,
+    output: &mut crate::buffer::Buffer, run: impl Fn(&[T], [usize; 3], Option<&[S]>, &mut Vec<S>) -> Result<(), Error>) -> Result<(), Error> {
+    use crate::{agreement::{Mapping, Missing, Read}, operation::{Direction, Seed}};
     let [outer, len, inner] = dims;
-    let reversed = matches!(direction, Direction::Right).then(|| input.plan.remapped(Mapping::from(vec![
-        Steps::along(outer, len * inner), Steps::Stride { start: len.saturating_sub(1) * inner, len, step: -(inner as isize) }, Steps::along(inner, 1),
-    ]), outer * len * inner, Missing::Invalid));
+    let reversed = matches!(direction, Direction::Right).then(|| {
+        input.plan.remapped(Mapping::from(vec![
+            Steps::along(outer, len * inner), Steps::Stride { start: len.saturating_sub(1) * inner, len, step: -(inner as isize) }, Steps::along(inner, 1),
+        ]), outer * len * inner, Missing::Invalid)
+    });
     let input = Read { plan: reversed.as_ref().unwrap_or(input.plan), ..input };
     let (mut values, mut scratch, mut seed_scratch) = (Vec::with_capacity(outer * len * inner), Vec::new(), Vec::new());
     if inner == 0 { *output = S::buffer(values); return Ok(()); }
@@ -2428,7 +2435,7 @@ pub(crate) fn scan_read<T: crate::buffer::Cast, S: crate::buffer::Cast>(
                 let one = read.plan.len() == 1;
                 let arg = read.part::<S>(if one { 0..1 } else { cell * inner..(cell + 1) * inner }, checked, &mut seed_scratch)?;
                 Some((0..inner).map(|i| arg.nth(if one { 0 } else { i })).collect::<Vec<_>>())
-            },
+            }
         };
         let rows = (CHUNK / inner).max(1);
         for row in (0..len).step_by(rows) {
@@ -2436,7 +2443,11 @@ pub(crate) fn scan_read<T: crate::buffer::Cast, S: crate::buffer::Cast>(
             let at = (cell * len + row) * inner;
             match input.part::<T>(at..at + n * inner, checked, &mut scratch)? {
                 Arg::Many(items) => run(items, [1, n, inner], carry.as_deref(), &mut values)?,
-                Arg::One(value) => { scratch.clear(); scratch.resize(n * inner, value); run(&scratch, [1, n, inner], carry.as_deref(), &mut values)?; },
+                Arg::One(value) => {
+                    scratch.clear();
+                    scratch.resize(n * inner, value);
+                    run(&scratch, [1, n, inner], carry.as_deref(), &mut values)?;
+                }
             }
             let carry = carry.get_or_insert_with(Vec::new);
             carry.clear();

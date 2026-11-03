@@ -12,8 +12,8 @@ pub mod characters;
 mod complex;
 pub mod convert;
 pub mod create;
-pub mod derivative;
 mod dd;
+pub mod derivative;
 pub mod distribution;
 pub mod error;
 pub mod events;
@@ -54,13 +54,13 @@ mod trig;
 #[cfg(accelerate)]
 mod vforce;
 
+pub use arc::{RealAcos, RealAsin};
 pub use arith::{
     Add, BitAnd, BitNot, BitOr, BitXor, Bitwise, Divide, LeftShift, MathishDivide, Multiply, Nand, Negate, Nor, Not, PiTimes, Reciprocal, RightShift, Subtract,
     WholeDivide, bitwise,
 };
 pub use complex::{Cis, divide};
 pub use exp::{Exp, Expm1};
-pub use arc::{RealAcos, RealAsin};
 pub use float::{FUSED, Float, Native};
 pub use hyperbolic::{RealAcosh, RealAtanh};
 pub use ln::{Ln, Log1p, Log2, Log10, Logb, MathishLogb, RealLn};

@@ -496,9 +496,10 @@ mod number_theory {
 }
 
 mod operation {
-    use rustymath::{agreement::{Agreement, Binding, Mapping, Missing, Read, ReadPlan}, array::{Array, ArrayView},
-        buffer::{Buffer, DType, Element, Width}, error::{self, Error, ErrorSlot}, facts::{Formula, Variant}, gather::Steps,
-        layout::Layout, operation::{Direction, Kernel, Seed, Settings}};
+    use rustymath::{
+        agreement::{Agreement, Binding, Mapping, Missing, Read, ReadPlan}, array::{Array, ArrayView}, buffer::{Buffer, DType, Element, Width},
+        error::{self, Error, ErrorSlot}, facts::{Formula, Variant}, gather::Steps, layout::Layout, operation::{Direction, Kernel, Seed, Settings}
+    };
 
     fn view<'a>(layout: &'a Layout, data: rustymath::buffer::View<'a>, mapping: &Mapping) -> ArrayView<'a> {
         ArrayView::new(layout, vec![Binding::full(data)], ReadPlan::input(0, data.len()).remapped(mapping.clone(), layout.count(), Missing::Default)).unwrap()
@@ -594,7 +595,10 @@ mod operation {
         let compact = || ArrayView::compact(&shape, f64::view(&data));
         assert_eq!(f64::vec(apply(&add, [x, compact()]).unwrap()).unwrap(), [0., 4., 3., 7., 6., 10.]);
         let clip = rustymath::Clip.resolve(Variant::checked(f64::DTYPE), [f64::DTYPE; 3]).unwrap();
-        let args = [view(&shape, f64::view(&data), &transpose), ArrayView::compact(&Layout::EMPTY, f64::view(&[1.])), ArrayView::compact(&Layout::EMPTY, f64::view(&[4.]))];
+        let args = [
+            view(&shape, f64::view(&data), &transpose), ArrayView::compact(&Layout::EMPTY, f64::view(&[1.])),
+            ArrayView::compact(&Layout::EMPTY, f64::view(&[4.])),
+        ];
         assert_eq!(f64::vec(apply(&clip, args).unwrap()).unwrap(), [1., 3., 1., 4., 2., 4.]);
         let row = Layout::from([3]);
         let positions = Mapping::Steps { base: 0, steps: vec![Steps::table(vec![5, 0, 3])].into() };
@@ -1133,8 +1137,8 @@ mod random {
 mod circle_real_parts {
     use num_complex::Complex64;
     use rustymath::{
-        Asinh, Atan, Cos, Cosh, RealAcos, RealAcosh, RealAsin, RealAtanh, RealSqrt1mx2, RealSqrtm1mx2, RealSqrtx2m1, Sin, Sinh, Sqrt1px2, Tan, Tanh,
-        facts::{Formula, formula_at}, recipe::NativeOps, FUSED,
+        Asinh, Atan, Cos, Cosh, FUSED, RealAcos, RealAcosh, RealAsin, RealAtanh, RealSqrt1mx2, RealSqrtm1mx2, RealSqrtx2m1, Sin, Sinh, Sqrt1px2, Tan, Tanh,
+        facts::{Formula, formula_at}, recipe::NativeOps
     };
 
     /// `k`, the real part of a code of `○`, at real arguments inside and outside its real domain: the real part of its complex form there, and a slope that matches a central difference away from ±1.

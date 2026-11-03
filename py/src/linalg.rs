@@ -294,7 +294,8 @@ pub fn inner(f: NativeFunction<'_>, g: NativeFunction<'_>, [left, right]: [Array
     let wrapping = map.variant.wrapping;
     map.variant.wrapping = false;
     let native = map.product_dtype(&fold, dtype);
-    if native.is_some() { fold.variant.wrapping = false; } else { map.variant.wrapping = wrapping; }
+    if native.is_some() { fold.variant.wrapping = false; }
+    else { map.variant.wrapping = wrapping; }
     let total = native.unwrap_or_else(|| fold.fold_dtype(map.result_dtype(), len, None));
     let store = match total { DType::Integer(_) => I64, DType::Float(_) if dtype == DType::Float(FloatWidth::F16) => dtype, d => d };
     let mut output = Buffer::with_capacity(store, plan.layout.count());

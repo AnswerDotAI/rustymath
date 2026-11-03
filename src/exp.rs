@@ -26,21 +26,15 @@ pub(crate) fn clamp<R: Native>(x: R, l: R) -> R { if x < -l { -l } else if x > l
 
 /// n and r with x = n ln 2 + r, n whole and |r| at most about ln 2 / 2, for |x| up to `limit`.
 #[inline]
-fn reduce<R: Native, const FUSED: bool>(x: R) -> (R, R) {
-    reduce_with(&crate::recipe::NativeOps::<FUSED>::DEFAULT, x)
-}
+fn reduce<R: Native, const FUSED: bool>(x: R) -> (R, R) { reduce_with(&crate::recipe::NativeOps::<FUSED>::DEFAULT, x) }
 
 /// e^r = 1 + r h(r), for |r| up to about ln 2 / 2.
 #[inline(always)]
-fn exp_reduced<R: Native, const FUSED: bool>(r: R) -> R {
-    reduced_with(&crate::recipe::NativeOps::<FUSED>::DEFAULT, r)
-}
+fn exp_reduced<R: Native, const FUSED: bool>(r: R) -> R { reduced_with(&crate::recipe::NativeOps::<FUSED>::DEFAULT, r) }
 
 /// e^(x + lo) × 2^k, for a lo far below x and a whole k. lo joins the reduced argument, except where `clamp` changes x and the result is 0 or ∞ whatever lo is. Scaling by 2^k inside keeps e^x/2 finite where e^x would overflow. A caller passes -0 for a part it lacks. The compiler drops such a part, because adding -0 changes no value.
 #[inline]
-fn exp_parts<R: Native, const FUSED: bool>(x: R, lo: R, k: R) -> R {
-    parts_with(&crate::recipe::NativeOps::<FUSED>::DEFAULT, x, lo, k)
-}
+fn exp_parts<R: Native, const FUSED: bool>(x: R, lo: R, k: R) -> R { parts_with(&crate::recipe::NativeOps::<FUSED>::DEFAULT, x, lo, k) }
 
 #[inline]
 pub(crate) fn exp<R: Native, const FUSED: bool>(x: R) -> R { exp_parts::<R, FUSED>(x, R::neg_zero(), R::neg_zero()) }
@@ -69,9 +63,7 @@ pub(crate) fn expm1<R: Native, const FUSED: bool>(x: R) -> R { expm1_times::<R, 
 
 /// e^x - 1 from x's reduction, 2^n (r h) + (2^n - 1), with s = 2^n. For |x| below about ln 2 / 2, n is 0 and the result is r h, which keeps its relative accuracy down to the smallest x.
 #[inline(always)]
-fn expm1_reduced<R: Native, const FUSED: bool>(r: R, s: R) -> R {
-    minus_one_with(&crate::recipe::NativeOps::<FUSED>::DEFAULT, r, s)
-}
+fn expm1_reduced<R: Native, const FUSED: bool>(r: R, s: R) -> R { minus_one_with(&crate::recipe::NativeOps::<FUSED>::DEFAULT, r, s) }
 
 /// e^x - 1 for an x that `usual` accepts, with no clamp and one power of two. `tanh` calls it for every x, because it keeps its argument within that range.
 #[inline(always)]
@@ -82,9 +74,7 @@ usual_object!(/// [`expm1`](crate::expm1) as a function object, with `Exp`'s blo
 
 /// (e^x - 1) × 2^k, for a whole k. Below -40 at f64 and -18 at f32, e^x - 1 rounds to -1. n can exceed the greatest exponent by one while the result is still finite, so 2^n splits into 2^m and 2^(n-m), with m no greater than that exponent.
 #[inline]
-pub(crate) fn expm1_times<R: Native, const FUSED: bool>(x: R, k: R) -> R {
-    minus_one_formula(&crate::recipe::NativeOps::<FUSED>::DEFAULT, x, k)
-}
+pub(crate) fn expm1_times<R: Native, const FUSED: bool>(x: R, k: R) -> R { minus_one_formula(&crate::recipe::NativeOps::<FUSED>::DEFAULT, x, k) }
 
 /// e^(hi + lo) for any double word. It renormalizes the word first, because `exp_parts` needs `lo` far below `hi`.
 #[inline]

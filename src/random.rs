@@ -73,18 +73,13 @@ impl Items {
 /// One item's words: its packed ones, then its region's ([`Items`]). Dropping it skips the packed words it didn't read, so that the next item reads its own.
 pub struct Item<'a> { items: &'a mut Items, left: usize, k: u64, region: Option<Box<ChaCha8Rng>> }
 
-impl Drop for Item<'_> {
-    fn drop(&mut self) { for _ in 0..self.left { self.items.packed.next_u64(); } }
-}
+impl Drop for Item<'_> { fn drop(&mut self) { for _ in 0..self.left { self.items.packed.next_u64(); } } }
 
 impl rand::TryRng for Item<'_> {
     type Error = Infallible;
     fn try_next_u32(&mut self) -> Result<u32, Infallible> { self.try_next_u64().map(|w| (w >> 32) as u32) }
     fn try_next_u64(&mut self) -> Result<u64, Infallible> {
-        if self.left > 0 {
-            self.left -= 1;
-            return Ok(self.items.packed.next_u64());
-        }
+        if self.left > 0 { self.left -= 1; return Ok(self.items.packed.next_u64()); }
         let (items, k) = (&*self.items, self.k);
         Ok(self.region.get_or_insert_with(|| Box::new(items.region(k))).next_u64())
     }
@@ -140,4 +135,3 @@ pub fn deal<R: Rng + ?Sized>(n: u64, total: u64, rng: &mut R, out: &mut Vec<u64>
     assert!(n <= total, "a deal can't take more items than its total");
     out.extend(rand::seq::index::sample(rng, total as usize, n as usize).into_iter().map(|i| i as u64));
 }
-

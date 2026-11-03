@@ -67,16 +67,11 @@ fn worst<A: Input, T: Measured>(n: u64, input: impl Fn(u64) -> A, f: impl Fn(A) 
     (0..n).map(|i| { let x = input(i); (error(x, f(x), reference(x)), x) }).max_by_key(|&(e, _)| e).unwrap()
 }
 
-fn power_scale(result: f64) -> f64 {
-    if !result.is_finite() || result == 0.0 { 1.0 } else { 1.0 + 4.0 * result.abs().ln().abs() }
-}
-fn scaled_error(error: u64, scale: f64) -> u64 {
-    if scale == 0.0 { 0 } else if error == u64::MAX { error } else { (error as f64 / scale).ceil() as u64 }
-}
+fn power_scale(result: f64) -> f64 { if !result.is_finite() || result == 0.0 { 1.0 } else { 1.0 + 4.0 * result.abs().ln().abs() } }
+fn scaled_error(error: u64, scale: f64) -> u64 { if scale == 0.0 { 0 } else if error == u64::MAX { error } else { (error as f64 / scale).ceil() as u64 } }
 
 fn worst_scaled<A: Input, T: Measured + Into<f64>>(
-    n: u64, input: impl Fn(u64) -> A, f: impl Fn(A) -> T, reference: impl Fn(A) -> T, scale: impl Fn(f64) -> f64,
-) -> (u64, A) {
+    n: u64, input: impl Fn(u64) -> A, f: impl Fn(A) -> T, reference: impl Fn(A) -> T, scale: impl Fn(f64) -> f64) -> (u64, A) {
     let mut raw = 0;
     let worst = (0..n).map(|i| {
         let x = input(i);
@@ -204,7 +199,8 @@ fn binary(
     let pair32 = |i: u64| { let r = random(i); (f32::from_bits(r as u32), f32::from_bits((r >> 32) as u32)) };
     for (wide, narrow, how) in variants {
         check(&format!("f32 {name} at scattered pairs, {how}"), worst_scaled(1 << 16, pair32, narrow, narrow_libm, scale));
-        check_libm(&format!("f64 {name} at scattered pairs, {how}"), worst_scaled(SAMPLES, |i| (scattered(2 * i), scattered(2 * i + 1)), wide, wide_libm, scale));
+        check_libm(
+            &format!("f64 {name} at scattered pairs, {how}"), worst_scaled(SAMPLES, |i| (scattered(2 * i), scattered(2 * i + 1)), wide, wide_libm, scale));
         for &(xs, ys) in ranges {
             let pair = |i: u64| (uniform(2 * i, xs), uniform(2 * i + 1, ys));
             check_libm(&format!("f64 {name} in {xs:?} by {ys:?}, {how}"), worst_scaled(SAMPLES, pair, wide, wide_libm, scale));
@@ -540,7 +536,9 @@ fn polygamma_and_beta_accuracy() {
     ] {
         let cases: Vec<((f64, f64), f64)> = vectors(MPMATH, name);
         within(&format!("f64 {name}"), bound, scaled(cases.iter().copied(), |(a, x)| wide(a, x), f64::EPSILON, 1e-300));
-        check(&format!("f32 {name}"), scaled(cases.iter().map(|&(x, y)| (x, y as f32 as f64)), |(a, x): (f64, f64)| narrow(a as f32, x as f32).into(), f32::EPSILON.into(), 1e-30));
+        check(
+            &format!("f32 {name}"),
+            scaled(cases.iter().map(|&(x, y)| (x, y as f32 as f64)), |(a, x): (f64, f64)| narrow(a as f32, x as f32).into(), f32::EPSILON.into(), 1e-30));
     }
 }
 
@@ -804,7 +802,7 @@ mod lambert {
 }
 
 mod pow {
-    use rustymath::{facts::formula_at, Pow};
+    use rustymath::{Pow, facts::formula_at};
 
     /// Special values through the free function and shared formula.
     #[test]

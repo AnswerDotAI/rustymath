@@ -54,17 +54,12 @@ impl std::error::Error for Error {}
 pub struct ErrorSlot(std::sync::Arc<Errors>);
 
 #[derive(Default)]
-struct Errors {
-    count: std::sync::atomic::AtomicU64,
-    first: std::sync::Mutex<Option<Error>>,
-}
+struct Errors { count: std::sync::atomic::AtomicU64, first: std::sync::Mutex<Option<Error>> }
 
 thread_local! { static ACTIVE: std::cell::RefCell<Option<ErrorSlot>> = const { std::cell::RefCell::new(None) }; }
 
 struct Restore(Option<ErrorSlot>);
-impl Drop for Restore {
-    fn drop(&mut self) { ACTIVE.with(|active| active.replace(self.0.take())); }
-}
+impl Drop for Restore { fn drop(&mut self) { ACTIVE.with(|active| active.replace(self.0.take())); } }
 
 impl ErrorSlot {
     pub fn new() -> Self { Self::default() }
@@ -73,10 +68,7 @@ impl ErrorSlot {
     pub fn take(&self) -> Option<Error> { self.0.first.lock().unwrap().take() }
     /// Captured by the parallel runtime before it starts workers.
     pub fn current() -> Option<Self> { ACTIVE.with(|active| active.borrow().clone()) }
-    pub fn within<R>(&self, run: impl FnOnce() -> R) -> R {
-        let _restore = Restore(ACTIVE.with(|active| active.replace(Some(self.clone()))));
-        run()
-    }
+    pub fn within<R>(&self, run: impl FnOnce() -> R) -> R { let _restore = Restore(ACTIVE.with(|active| active.replace(Some(self.clone())))); run() }
 }
 
 /// Record in the active read's slot; standalone scalar maths has no slot.

@@ -27,13 +27,18 @@ impl Conversion {
         Some((crate::error::Kind::Overflow, valid))
     }
     pub fn may_raise(self, checked: bool) -> bool {
-        self.kind == ConversionKind::Keep || checked && (self.output == crate::buffer::DType::Character
-            || self.validity::<f64, _>(&crate::recipe::RangeOps(self.input), crate::facts::Range::of_dtype(self.input)).is_some_and(|(_, valid)| valid != Some(true)))
+        self.kind == ConversionKind::Keep || checked && (self.output == crate::buffer::DType::Character || self
+                        .validity::<f64, _>(&crate::recipe::RangeOps(self.input), crate::facts::Range::of_dtype(self.input))
+                        .is_some_and(|(_, valid)| valid != Some(true)))
     }
-    pub fn map(self, input: crate::agreement::Read<'_>, range: std::ops::Range<usize>, checked: bool, output: &mut crate::buffer::Buffer) -> Result<(), crate::error::Error> {
-        use crate::buffer::{Buffer, DType, FloatWidth, Floats, Element};
+    pub fn map(
+        self, input: crate::agreement::Read<'_>, range: std::ops::Range<usize>, checked: bool, output: &mut crate::buffer::Buffer
+    ) -> Result<(), crate::error::Error> {
+        use crate::buffer::{Buffer, DType, Element, FloatWidth, Floats};
         use crate::error::{Error, Kind};
-        if self.kind == ConversionKind::Cast && !matches!((self.input, self.output), (DType::Integer(_), DType::Integer(_))) { return input.read_into(range, self.output, checked, output); }
+        if self.kind == ConversionKind::Cast && !matches!((self.input, self.output), (DType::Integer(_), DType::Integer(_))) {
+            return input.read_into(range, self.output, checked, output);
+        }
         let mut scratch = Buffer::with_capacity(self.input, 0);
         let values = input.part_view(range, self.input, checked, &mut scratch)?;
         *output = match (self.kind, values, self.output) {

@@ -31,7 +31,9 @@ impl Explanation {
             let record = PyDict::new(py);
             record.set_item("kind", event.name())?;
             for ((name, _), field) in events::TABLES[event.table()].1.iter().zip(event.fields()) {
-                match field { Field::Text(t) => record.set_item(name, t)?, Field::Count(n) => record.set_item(name, n)?, Field::Truth(t) => record.set_item(name, t)? }
+                match field {
+                    Field::Text(t) => record.set_item(name, t)?, Field::Count(n) => record.set_item(name, n)?, Field::Truth(t) => record.set_item(name, t)?
+                }
             }
             Ok(record.unbind())
         }).collect()
@@ -47,7 +49,4 @@ impl Explanation {
 #[pyfunction]
 fn explain() -> Explanation { Explanation { store: Arc::default(), run: None } }
 
-pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<Explanation>()?;
-    m.add_function(wrap_pyfunction!(explain, m)?)
-}
+pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> { m.add_class::<Explanation>()?; m.add_function(wrap_pyfunction!(explain, m)?) }

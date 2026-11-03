@@ -445,9 +445,7 @@ impl Buffer {
         }
     }
     /// Reserve room for `additional` items after the current length.
-    pub fn reserve(&mut self, additional: usize) {
-        with_dtype!(self.dtype(), T => T::vec_mut(self).expect("the buffer has its dtype").reserve(additional))
-    }
+    pub fn reserve(&mut self, additional: usize) { with_dtype!(self.dtype(), T => T::vec_mut(self).expect("the buffer has its dtype").reserve(additional)) }
     /// The address of the first item, for writing through, as an exported buffer may.
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         match self {
@@ -644,7 +642,6 @@ pub fn read_all<A: Element, S: Source<A>>(items: &[S]) -> Vec<A> {
     out
 }
 
-
 /// Gathers source items in blocks, then converts each block contiguously.
 pub(crate) fn read_as<A: Element, S: Source<A>>(items: &[S], mapping: &crate::agreement::Mapping, n: usize) -> Vec<A> {
     if matches!(mapping, crate::agreement::Mapping::Linear(1)) { return read_all(&items[..n]); }
@@ -667,8 +664,10 @@ fn integer(view: View<'_>, i: usize) -> Result<i64, Error> {
         View::Booleans(v) => return Ok(v[i].into()), View::Integers(v) => return Ok(v.get(i)), View::Floats(v) => v.get(i),
         View::Complexes(v) => real_part(v.get(i))?, View::Characters(_) => unreachable!("cast refuses characters first")
     };
-    let cast = crate::convert::Conversion { input: DType::Float(FloatWidth::F64), output: DType::Integer(Width::I64), kind: crate::convert::ConversionKind::Cast };
-    if cast.validity::<f64, _>(&crate::recipe::NativeOps::<{ crate::FUSED }>::DEFAULT, x).is_some_and(|(_, valid)| valid) { Ok(x as i64) } else { Err(overflow(x)) }
+    let cast =
+        crate::convert::Conversion { input: DType::Float(FloatWidth::F64), output: DType::Integer(Width::I64), kind: crate::convert::ConversionKind::Cast };
+    if cast.validity::<f64, _>(&crate::recipe::NativeOps::<{ crate::FUSED }>::DEFAULT, x).is_some_and(|(_, valid)| valid) { Ok(x as i64) }
+    else { Err(overflow(x)) }
 }
 
 /// Item `i` of a numeric `view` as a Boolean. Only exactly 0 and 1 convert, and anything else gives an Overflow error.
@@ -678,7 +677,8 @@ fn boolean(view: View<'_>, i: usize) -> Result<bool, Error> {
         View::Floats(v) => v.get(i), View::Complexes(v) => real_part(v.get(i))?, View::Characters(_) => unreachable!("cast refuses characters first")
     };
     let cast = crate::convert::Conversion { input: DType::Float(FloatWidth::F64), output: DType::Boolean, kind: crate::convert::ConversionKind::Cast };
-    if cast.validity::<f64, _>(&crate::recipe::NativeOps::<{ crate::FUSED }>::DEFAULT, x).is_some_and(|(_, valid)| valid) { Ok(x != 0.0) } else { Err(overflow(x)) }
+    if cast.validity::<f64, _>(&crate::recipe::NativeOps::<{ crate::FUSED }>::DEFAULT, x).is_some_and(|(_, valid)| valid) { Ok(x != 0.0) }
+    else { Err(overflow(x)) }
 }
 
 /// Convert one stored item using the destination dtype's checked conversion.
@@ -688,14 +688,11 @@ fn numeric(view: View<'_>) -> Result<(), Error> {
 }
 fn real(view: View<'_>, item: usize) -> Result<f64, Error> {
     Ok(match view {
-        View::Booleans(v) => u8::from(v[item]).into(), View::Integers(v) => Source::<f64>::read(v.get(item)),
-        View::Floats(v) => v.get(item), View::Complexes(v) => real_part(v.get(item))?,
-        View::Characters(_) => return Err(Error::new(Kind::Domain, "characters convert only to characters")),
+        View::Booleans(v) => u8::from(v[item]).into(), View::Integers(v) => Source::<f64>::read(v.get(item)), View::Floats(v) => v.get(item),
+        View::Complexes(v) => real_part(v.get(item))?, View::Characters(_) => return Err(Error::new(Kind::Domain, "characters convert only to characters"))
     })
 }
-impl Cast for bool {
-    fn cast(view: View<'_>, item: usize) -> Result<Self, Error> { numeric(view)?; boolean(view, item) }
-}
+impl Cast for bool { fn cast(view: View<'_>, item: usize) -> Result<Self, Error> { numeric(view)?; boolean(view, item) } }
 impl Cast for char {
     fn cast(view: View<'_>, item: usize) -> Result<Self, Error> {
         match view { View::Characters(v) => Ok(v[item]), _ => Err(Error::new(Kind::Domain, "characters convert only to characters")) }
@@ -777,10 +774,8 @@ impl Buffer {
     pub fn cast_mapped(view: View<'_>, mapping: &crate::agreement::Mapping, n: usize, dtype: DType) -> Result<Self, Error> {
         use crate::agreement::{Binding, Missing, Read, ReadPlan};
         let mut sources = vec![Binding::full(view)];
-        let missing = if view.dtype() == DType::Character {
-            sources.push(Binding::full(View::Characters(&[' '])));
-            Missing::Scalar(1)
-        } else { Missing::Default };
+        let missing = if view.dtype() == DType::Character { sources.push(Binding::full(View::Characters(&[' ']))); Missing::Scalar(1) }
+        else { Missing::Default };
         let plan = ReadPlan::copy(0, view.len(), mapping.clone(), n, missing);
         let mut output = Self::with_capacity(dtype, n);
         Read { sources: &sources, plan: &plan }.read_into(0..n, dtype, true, &mut output)?;
@@ -801,7 +796,9 @@ impl Buffer {
             (_, DType::Character) if view.dtype().is_integral() => {
                 let items = (0..view.len()).map(|i| {
                     let value = integer(view, i).ok().and_then(|x| u32::try_from(x).ok()).and_then(char::from_u32);
-                    match value { Some(value) => Ok(value), None if checked => Err(Error::new(Kind::Domain, "result is not a Unicode character")), None => Ok(' ') }
+                    match value {
+                        Some(value) => Ok(value), None if checked => Err(Error::new(Kind::Domain, "result is not a Unicode character")), None => Ok(' ')
+                    }
                 }).collect::<Result<Vec<_>, _>>()?;
                 Ok(Self::Characters(items))
             }

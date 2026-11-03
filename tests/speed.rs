@@ -173,13 +173,17 @@ fn reductions(units: &Units<f64, f32>) -> [Compared; 4] {
                     scan32(black_box(set(&x32, k)), &mut s32);
                     black_box(&s32);
                 })
-            }), compare(units, "reduce::Max::scan", || time_appended(N, &[b64], |k, out| { reduce::Max::scan(set(&x64, k), None, out); }), || {
+            }), compare(units, "reduce::Max::scan", || {
+                time_appended(N, &[b64], |k, out| { reduce::Max::scan(set(&x64, k), None, out); })
+            }, || {
                 fastest(N, &[b64], |k| {
                     s64.clear();
                     max64(black_box(set(&x64, k)), &mut s64);
                     black_box(&s64);
                 })
-            }, || time_appended(N, &[b32], |k, out| { reduce::Max::scan(set(&x32, k), None, out); }), || {
+            }, || {
+                time_appended(N, &[b32], |k, out| { reduce::Max::scan(set(&x32, k), None, out); })
+            }, || {
                 fastest(N, &[b32], |k| {
                     s32.clear();
                     max32(black_box(set(&x32, k)), &mut s32);
@@ -445,7 +449,8 @@ fn decompositions(units: &Units<f64, f32>, complex_units: &Units<num_complex::Co
 
 /// This machine's budget of each function at each item type, keyed by `(type, name)`, from `text`, a budget file whose sections are item types, as `timing::budgeted` gives it for the column that `timing::NATIVE_COLUMN` picks. A machine with no column has `None` for each.
 fn budgets(text: &str) -> HashMap<(&str, &str), Option<timing::Budget>> {
-    timing::budgeted(text, timing::NATIVE_COLUMN).expect("speed.txt is a budget file with this machine's budgets").into_iter().map(|(s, c, b)| ((s, c), b)).collect()
+    timing::budgeted(text, timing::NATIVE_COLUMN).expect("speed.txt is a budget file with this machine's budgets").into_iter().map(|(s, c, b)| ((s, c), b))
+        .collect()
 }
 
 /// A budget is the expected cost times its multiplier, rounded up, and a `held` or `busy` line raises one column's budget to the budget for the cost it gives, or to twice a cost marked as an estimate. Only a gap's hold goes stale, once a cost is within 90% of the rule budget.
@@ -458,7 +463,9 @@ fn budgets_follow_the_rule_and_holds() {
     let budget = |i: usize, column| timing::Budget::of(cases[i].section, &cases[i].budgets, &cases[i].holds, Some(column)).unwrap();
     assert_eq!([budget(0, 0), budget(0, 1), budget(1, 0), budget(2, 1)].map(|b| b.to_string()), ["4", "32 held from 4", "5.4 busy from 4", "120 held from 4"]);
     assert!(budget(0, 1).stale(3.6) && !budget(0, 1).stale(3.7) && !budget(1, 0).stale(1.0));
-    for bad in ["# held linux: no cost", "# held linux 15.6", "# held linux 1 linux 2: twice"] { assert!(timing::cases(&format!("[f64]\n{bad}\nExp\t4\t4\n")).is_err(), "{bad}"); }
+    for bad in ["# held linux: no cost", "# held linux 15.6", "# held linux 1 linux 2: twice"] {
+        assert!(timing::cases(&format!("[f64]\n{bad}\nExp\t4\t4\n")).is_err(), "{bad}");
+    }
 }
 
 /// Every row's comparison with the standard library, where there is one, and every row's cost in copies, as `(width, name, cost)`.

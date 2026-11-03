@@ -75,4 +75,8 @@ impl Budget {
 #[pyfunction]
 fn timing() -> Timing { Timing(None) }
 
-pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> { m.add_class::<Timing>()?; m.add_class::<Budget>()?; m.add_function(wrap_pyfunction!(timing, m)?) }
+pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<Timing>()?;
+    m.add_class::<Budget>()?;
+    m.add_function(wrap_pyfunction!(timing, m)?)
+}

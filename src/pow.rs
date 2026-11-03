@@ -9,17 +9,18 @@ pub(crate) fn parity<R: Native>(y: R) -> (bool, bool) {
 }
 
 pub(crate) fn formula<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, y: O::V) -> O::V {
-    if let Some(k) = o.constant(y) {
-        if let Some(result) = crate::recipe::power(o, Exponent::of(k.wide()), x) { return result; }
-    }
+    if let Some(k) = o.constant(y) { if let Some(result) = crate::recipe::power(o, Exponent::of(k.wide()), x) { return result; } }
     general(o, x, y, false)
 }
 
 pub(crate) fn root_formula<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, n: O::V, y: O::V) -> O::V {
     if let Some(n) = o.constant(n) {
         let result = match n.wide().abs() {
-            1.0 => Some(y), 2.0 => Some(root2(o, y)), 3.0 => Some(cbrt_formula(o, y)),
-            4.0 => Some(root2(o, root2(o, y))), 8.0 => Some(root2(o, root2(o, root2(o, y)))),
+            1.0 => Some(y),
+            2.0 => Some(root2(o, y)),
+            3.0 => Some(cbrt_formula(o, y)),
+            4.0 => Some(root2(o, root2(o, y))),
+            8.0 => Some(root2(o, root2(o, root2(o, y)))),
             0.5 => {
                 let x = if n < F::zero() { o.reciprocal(y) } else { y };
                 return o.select(o.less(y, o.number(F::zero())), o.number(F::nan()), o.multiply(x, x));
@@ -121,8 +122,8 @@ pub(crate) fn cbrt_formula<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, x: O::V) 
     use crate::{buffer::FloatWidth, recipe::Integer};
     let c = |x| o.number(F::narrow(x));
     let wide = o.width() == FloatWidth::F64;
-    let (mantissa, bits, least, up, down) = if wide { (52, 64, f64::MIN_POSITIVE, 18014398509481984.0, 3.814697265625e-6) }
-        else { (23, 32, f32::MIN_POSITIVE as f64, 16777216.0, 0.00390625) };
+    let (mantissa, bits, least, up, down) =
+        if wide { (52, 64, f64::MIN_POSITIVE, 18014398509481984.0, 3.814697265625e-6) } else { (23, 32, f32::MIN_POSITIVE as f64, 16777216.0, 0.00390625) };
     let a = o.magnitude(x);
     let sub = o.less(a, c(least));
     let b = o.select(sub, o.multiply(a, c(up)), a);
@@ -131,9 +132,7 @@ pub(crate) fn cbrt_formula<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, x: O::V) 
     let rounded = o.to_bits(o.add(t, c((1u64 << mantissa) as f64)));
     let rounded = o.integer_op(Integer::And, rounded, o.integer((1i64 << mantissa) - 1));
     let mut z = o.from_bits(o.integer_op(Integer::ShiftLeft, rounded, o.integer(bits - mantissa)));
-    for _ in 0..if wide { 3 } else { 2 } {
-        z = o.multiply(z, o.multiply_add(o.multiply(o.multiply(b, z), o.multiply(z, z)), c(-1.0 / 3.0), c(4.0 / 3.0)));
-    }
+    for _ in 0..if wide { 3 } else { 2 } { z = o.multiply(z, o.multiply_add(o.multiply(o.multiply(b, z), o.multiply(z, z)), c(-1.0 / 3.0), c(4.0 / 3.0))); }
     let y = o.multiply(o.multiply(b, z), z);
     let e = if o.fused() { o.multiply_add(y, z, c(-1.0)) } else {
         let mask = o.integer(!((1i64 << ((mantissa + 2) / 2)) - 1));

@@ -14,9 +14,7 @@ const POLY_NARROW: [f64; 5] = [0.24145279203110395, 0.28502925464850143, 0.40000
 
 /// ln((1+s)/(1-s)), for |s| up to 0.2, with f64's polynomial if `fine` and f32's otherwise.
 #[inline]
-fn series<R: Native, const FUSED: bool>(s: R, fine: bool) -> R {
-    series_with(&crate::recipe::NativeOps::<FUSED>::DEFAULT, s, fine)
-}
+fn series<R: Native, const FUSED: bool>(s: R, fine: bool) -> R { series_with(&crate::recipe::NativeOps::<FUSED>::DEFAULT, s, fine) }
 
 /// The logarithm e·hi + (e·lo + k·ln((1+s)/(1-s))), to the base whose logarithm of 2 is (hi, lo) and of e is k, with f64's polynomial if `fine` and f32's otherwise.
 #[inline]
@@ -42,9 +40,7 @@ fn log_of<R: Native, const FUSED: bool>((m, e): (R, R), (base, k): ((R, R), R)) 
 
 /// The logarithm of x to the base that `to` gives, as `log_of` takes it, with its special values: -∞ at 0, ∞ at ∞, and NaN for a negative x or NaN.
 #[inline]
-fn log<R: Native, const FUSED: bool>(x: R, to: ((R, R), R)) -> R {
-    log_with(&crate::recipe::NativeOps::<FUSED>::DEFAULT, x, to)
-}
+fn log<R: Native, const FUSED: bool>(x: R, to: ((R, R), R)) -> R { log_with(&crate::recipe::NativeOps::<FUSED>::DEFAULT, x, to) }
 
 #[inline]
 pub(crate) fn ln<R: Native, const FUSED: bool>(x: R) -> R { log::<R, FUSED>(x, natural()) }
@@ -72,12 +68,15 @@ pub(crate) fn ln_split<const FUSED: bool>(x: f64) -> Double<f64> {
 
 /// The logarithm of 2 to base 2, as `based` takes it, and the logarithm of e to base 2.
 #[inline(always)]
-pub(crate) fn base2<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O) -> ((O::V, O::V), O::V) { ((o.number(F::one()), o.number(F::zero())), o.number(F::narrow(LOG2_E))) }
+pub(crate) fn base2<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O) -> ((O::V, O::V), O::V) {
+    ((o.number(F::one()), o.number(F::zero())), o.number(F::narrow(LOG2_E)))
+}
 
 /// The logarithm of 2 to base 10, as `based` takes it, split as `ln2` splits ln 2, and the logarithm of e to base 10. At f32 the split has its own high part. The f64 high part, rounded to f32, would make e times it inexact.
 #[inline(always)]
 pub(crate) fn base10<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O) -> ((O::V, O::V), O::V) {
-    let (hi, lo) = if o.width() == crate::buffer::FloatWidth::F64 { (0.30102999566361177, 3.694239077158931e-13) } else { (0.30103302001953125, -3.024355464731343e-6) };
+    let (hi, lo) =
+        if o.width() == crate::buffer::FloatWidth::F64 { (0.30102999566361177, 3.694239077158931e-13) } else { (0.30103302001953125, -3.024355464731343e-6) };
     ((o.number(F::narrow(hi)), o.number(F::narrow(lo))), o.number(F::narrow(LOG10_E)))
 }
 
@@ -215,24 +214,18 @@ fn series_with<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, s: O::
 }
 
 #[inline(always)]
-fn based_with<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(
-    o: &O, s: O::V, e: O::V, (hi, lo): (O::V, O::V), k: O::V, fine: bool,
-) -> O::V {
+fn based_with<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, s: O::V, e: O::V, (hi, lo): (O::V, O::V), k: O::V, fine: bool) -> O::V {
     o.multiply_add(e, hi, o.multiply_add(series_with(o, s, fine), k, o.multiply(e, lo)))
 }
 
 #[inline(always)]
-fn of_with<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(
-    o: &O, (m, e): (O::V, O::V), (base, k): ((O::V, O::V), O::V),
-) -> O::V {
+fn of_with<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, (m, e): (O::V, O::V), (base, k): ((O::V, O::V), O::V)) -> O::V {
     let one = o.number(F::one());
     based_with(o, o.divide(o.subtract(m, one), o.add(m, one)), e, base, k, o.width() == crate::buffer::FloatWidth::F64)
 }
 
 #[inline(always)]
-pub(crate) fn log_with<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(
-    o: &O, x: O::V, to: ((O::V, O::V), O::V),
-) -> O::V {
+pub(crate) fn log_with<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, x: O::V, to: ((O::V, O::V), O::V)) -> O::V {
     let y = of_with(o, crate::recipe::frexp(o, x), to);
     let zero = o.number(F::zero());
     let y = o.select(o.equal(x, o.number(F::infinity())), x, y);

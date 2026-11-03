@@ -30,11 +30,14 @@ pub fn threads_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-pub fn map<const N: usize>(kernel: &rustymath::operation::Kernel, args: [rustymath::buffer::View<'_>; N], n: usize, out: &mut rustymath::buffer::Buffer) -> Result<(), rustymath::error::Error> {
+pub fn map<const N: usize>(
+    kernel: &rustymath::operation::Kernel, args: [rustymath::buffer::View<'_>; N], n: usize, out: &mut rustymath::buffer::Buffer
+) -> Result<(), rustymath::error::Error> {
     use rustymath::agreement::{Binding, Mapping, Missing, Read, ReadPlan};
     let sources = args.map(Binding::full);
-    let plans: [_; N] = std::array::from_fn(|i| ReadPlan::input(i, args[i].len())
-        .remapped(if args[i].len() == 1 { Mapping::Single } else { Mapping::Linear(1) }, n, Missing::Default));
+    let plans: [_; N] = std::array::from_fn(|i| {
+        ReadPlan::input(i, args[i].len()).remapped(if args[i].len() == 1 { Mapping::Single } else { Mapping::Linear(1) }, n, Missing::Default)
+    });
     let reads = plans.each_ref().map(|plan| Read { sources: &sources, plan });
     kernel.map(&reads, 0..n, rustymath::operation::Settings::default(), out)
 }

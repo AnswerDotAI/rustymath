@@ -1062,9 +1062,9 @@ impl Steps {
                 let Some(offsets) = t.listed() else { return t.stride() };
                 let &[first, second, ..] = offsets else { return None };
                 let step = second.wrapping_sub(first) as isize;
-                (first != Self::FILL && offsets.windows(2).all(|p| p[1] != Self::FILL && p[1].wrapping_sub(p[0]) as isize == step))
-                    .then_some(Self::Stride { start: first, len: offsets.len(), step })
-            },
+                (first != Self::FILL && offsets.windows(2).all(|p| p[1] != Self::FILL && p[1].wrapping_sub(p[0]) as isize == step)).then_some(Self::Stride {
+                    start: first, len: offsets.len(), step })
+            }
             _ => None,
         }
     }
@@ -1194,17 +1194,15 @@ impl Steps {
         let (_, merged) = Self::simplify(0, outer);
         let mut lens = Vec::with_capacity(shape.len());
         for e in &merged {
-            if let Self::Stride { len, step, .. } = **e && let Some(a) = (0..shape.len()).find(|&a| shape[a] > 1 && strides[a] as isize == step) && len > shape[a] {
-                let (mut first, mut n) = (a + 1, 1);
-                while first > 0 && n < len {
-                    first -= 1;
-                    n *= shape[first];
+            if let Self::Stride { len, step, .. } = **e && let Some(a) = (0..shape.len()).find(|&a| shape[a] > 1 && strides[a] as isize == step)
+                && len > shape[a] {
+                    let (mut first, mut n) = (a + 1, 1);
+                    while first > 0 && n < len {
+                        first -= 1;
+                        n *= shape[first];
+                    }
+                    if n == len { lens.extend_from_slice(&shape[first..=a]); continue; }
                 }
-                if n == len {
-                    lens.extend_from_slice(&shape[first..=a]);
-                    continue;
-                }
-            }
             lens.push(e.len());
         }
         lens
@@ -1212,11 +1210,11 @@ impl Steps {
     /// `outer`'s reads of an array of `shape`, composed with `inner`, which maps the positions along each axis of `shape` to offsets from `base`, with the new base. Walking the result reads what walking `inner` and then `outer` reads. Where an entry of `outer` walks several whole axes of `shape`, as a reshape of a view reads them, the walk splits it into one entry for each of those axes (`by_axes`), and the result holds one entry for each. `None` where `outer`'s entries don't each walk one axis of `shape` even so ([`Walk::new`]), where two entries walk one axis that `inner` doesn't map by a `Stride`, or where an entry reads part of an axis that `inner` rotates or clips. Callers then force the copy that `inner` describes, in one walk.
     pub fn through(outer: &[Self], shape: &[usize], mut base: usize, inner: &[Self]) -> Option<(usize, Vec<Self>)> {
         let lens: Vec<usize> = outer.iter().map(Self::len).collect();
-        let Walk { base: at, steps: outer, along: axes, strides } = Walk::new(outer, &lens, shape).or_else(|| Walk::new(outer, &Self::by_axes(outer, shape), shape))?;
+        let Walk { base: at, steps: outer, along: axes, strides } =
+            Walk::new(outer, &lens, shape).or_else(|| Walk::new(outer, &Self::by_axes(outer, shape), shape))?;
         let mut walks = vec![0usize; shape.len()];
         for &a in axes.iter().flatten() { walks[a] += 1; }
-        // Where two entries walk an axis that `inner` pads (windows over padding, padding over padding, padding over a reversed axis), callers store the padded copy: about 2.1 million items in a forward 3×3 "same" convolution and in the conv gradient speed case, 264,196 in a fold of centred 3×3 windows over a 512×512 grid. A coupled fill-edge form would read through instead, as tinygrad's masked views and XLA's padded windows do: an item's position along a source axis is the sum of the positions of the entries that walk it, and one fill edge checks that sum against the axis's valid range. It would cost about 170 to 290 lines in the walkers, for a gain, unmeasured, of about one stored copy per padded window read.
-        // Checked before any `read_through`, so that a composition that fails builds no table.
+        // Where two entries walk an axis that `inner` pads (windows over padding, padding over padding, padding over a reversed axis), callers store the padded copy: about 2.1 million items in a forward 3×3 "same" convolution and in the conv gradient speed case, 264,196 in a fold of centred 3×3 windows over a 512×512 grid. A coupled fill-edge form would read through instead, as tinygrad's masked views and XLA's padded windows do: an item's position along a source axis is the sum of the positions of the entries that walk it, and one fill edge checks that sum against the axis's valid range. It would cost about 170 to 290 lines in the walkers, for a gain, unmeasured, of about one stored copy per padded window read. Checked before any `read_through`, so that a composition that fails builds no table.
         if walks.iter().zip(inner).any(|(&w, r)| w > 1 && !matches!(r, Self::Stride { .. })) { return None; }
         // The share of a `Stride`'s offset at position 0 that each entry along its axis takes. The first entry takes all of it. Along an axis that `inner` reads backwards, each later entry starts at its own far end instead, so that its own offsets stay at or above 0, and the first gives that up.
         let (mut first, mut taken) = (vec![None; shape.len()], vec![0; outer.len()]);
