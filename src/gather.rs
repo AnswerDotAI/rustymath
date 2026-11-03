@@ -597,10 +597,11 @@ pub enum Steps {
 }
 
 /// Index values that a table reads as positions along an axis, converting each one as it reads it, so that the values aren't first copied into a list of offsets. [`Table::indices`] takes them.
-pub trait IndexSource: std::fmt::Debug + Send + Sync {
+pub trait IndexSource: Send + Sync {
     /// The index values, as Booleans, integers, or floats that are whole numbers.
     fn view(&self) -> View<'_>;
 }
+impl IndexSource for crate::buffer::Buffer { fn view(&self) -> View<'_> { self.view() } }
 
 /// A value that names a position along an axis: a Boolean, an integer, or a float that is a whole number.
 pub trait IndexValue: Copy {
@@ -643,8 +644,16 @@ index_values!(i8, i16, i32, i64, u8, u16, u32; crate::half::f16, f32, f64);
 pub struct Table { all: Positions, start: usize, len: usize }
 
 /// Where a table's offsets come from: a list, or index values along an axis of `size` positions, each counted back from the end where it's negative, and multiplied by `scale`. `even` holds the first position and the step between positions, where the values give evenly spaced positions.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum Positions { Listed(Arc<Vec<usize>>), Indices { values: Arc<dyn IndexSource>, size: usize, scale: usize, even: Option<(usize, isize)> } }
+impl std::fmt::Debug for Positions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Listed(offsets) => f.debug_tuple("Listed").field(offsets).finish(),
+            Self::Indices { size, scale, even, .. } => f.debug_struct("Indices").field("size", size).field("scale", scale).field("even", even).finish(),
+        }
+    }
+}
 
 /// The most offsets that [`Table::chunks`] converts from index values at a time, into a buffer on the stack.
 const TABLE_CHUNK: usize = 256;

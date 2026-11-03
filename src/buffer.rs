@@ -10,7 +10,7 @@ macro_rules! buffers {
         pub enum $owned { $($variant(Vec<$t>)),+ }
         #[derive(Clone, Copy, Debug)]
         pub enum $view<'a> { $($variant(&'a [$t])),+ }
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub enum $tag { $($variant),+ }
         impl $owned {
             pub fn with_capacity(tag: $tag, capacity: usize) -> Self { match tag { $($tag::$variant => Self::$variant(Vec::with_capacity(capacity))),+ } }
@@ -261,7 +261,7 @@ impl ComplexBuf {
 }
 
 /// The element type of a compact buffer. Numbers widen from Boolean through the integer widths to the float widths to the complex widths.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DType { Boolean, Integer(Width), Float(FloatWidth), Complex(ComplexWidth), Character }
 
 impl DType {

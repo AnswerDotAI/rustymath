@@ -14,19 +14,34 @@ mod products {
 
     #[test]
     fn native_inner_pairs_keep_right_folds_and_bounded_terms() {
-        use rustymath::{buffer::Element, kernels, tolerant::{Equal, Greater, Tolerance}};
+        use rustymath::{agreement::{Binding, Missing, Read, ReadPlan}, buffer::{Buffer, Element, View}, error::{self, Error},
+            facts::{Formula, Variant}, operation::{Direction, Kernel, Seed, Settings}, tolerant::{Equal, Greater, Tolerance}};
+        fn fold(kernel: &Kernel, data: View<'_>, dims: [usize; 3], tail: Option<View<'_>>) -> Result<Buffer, Error> {
+            let mut sources = vec![Binding::full(data)];
+            if let Some(tail) = tail { sources.push(Binding::full(tail)); }
+            let plan = ReadPlan::input(0, data.len());
+            let tail_plan = ReadPlan::input(1, tail.map_or(0, View::len));
+            let seed = if tail.is_some() { Seed::Tail(Read { sources: &sources, plan: &tail_plan }) } else { Seed::Identity };
+            let mut out = Buffer::with_capacity(kernel.result_dtype(), dims[0] * dims[2]);
+            error::checked(|| kernel.fold_read(&dims, 1, seed, Direction::Right, Settings::default(), Read { sources: &sources, plan: &plan }, &mut out))?;
+            Ok(out)
+        }
         macro_rules! inner {
             ($f:expr, $g:expr, $a:expr, $b:expr, $size:expr) => {{
-                let (f, g) = ($f, $g);
-                let (fk, gk) = (kernels!(RightFold of f), kernels!(Binary of g));
-                let checked = |(buffer, ok)| if ok { Ok(buffer) } else { Err(()) };
-                inner_with($a, $b, $size,
-                    |x, y, agreement| {
-                        use rustymath::{array::ArrayView, layout::Layout};
-                        assert!(agreement.len <= rustymath::CHUNK);
-                        checked(gk.binary(&g, ArrayView::compact(&Layout::from([x.len()]), x), ArrayView::compact(&Layout::from([y.len()]), y), agreement).unwrap())
-                    }, |x, dims, tail| checked(fk.run(&f, x, dims, tail).unwrap()),
-                )
+                let (f, g, a, b) = ($f, $g, $a, $b);
+                let dtype = a.dtype().common(b.dtype()).unwrap();
+                let gk = g.resolve(Variant::checked(dtype), [a.dtype(), b.dtype()]).unwrap();
+                let fk = f.resolve(Variant::checked(gk.result_dtype()), [gk.result_dtype(); 2]).unwrap();
+                inner_with(a, b, $size, |x, y, agreement| {
+                    assert!(agreement.len <= rustymath::CHUNK);
+                    let sources = [Binding::full(x), Binding::full(y)];
+                    let plans = [ReadPlan::input(0, x.len()).remapped(agreement.left.clone(), agreement.len, Missing::Default),
+                        ReadPlan::input(1, y.len()).remapped(agreement.right.clone(), agreement.len, Missing::Default)];
+                    let reads = plans.each_ref().map(|plan| Read { sources: &sources, plan });
+                    let mut out = Buffer::with_capacity(gk.result_dtype(), agreement.len);
+                    error::checked(|| gk.map(&reads, 0..agreement.len, Settings::default(), &mut out))?;
+                    Ok(out)
+                }, |x, dims, tail| fold(&fk, x, dims, tail))
             }};
         }
         let [m, k, n] = [2, rustymath::CHUNK + 3, 3];
@@ -54,10 +69,9 @@ mod products {
         assert!(inner!(rustymath::Pow, rustymath::Add, f64::view(&[-1., 0.5]), f64::view(&[0., 2., 0., 1.5]), [1, 2, 2]).is_err());
         assert!(inner!(rustymath::Add, rustymath::Multiply, i64::view(&[i64::MAX, 1]), i64::view(&[2, 2]), [1, 2, 1]).is_err());
         assert!(inner!(rustymath::Add, rustymath::Multiply, i64::view(&[]), i64::view(&[2, 2]), [0, 2, 1]).unwrap().is_empty());
-        let sum = kernels!(Fold rustymath::reduce::Sum);
-        let (out, ok) = sum.run(&rustymath::reduce::Sum, bool::view(&[true, false]), [1, 2, 1], Some(i64::view(&[7]))).unwrap();
-        assert!(ok && i64::of(out.view()).unwrap() == [8]);
-        assert!(!sum.run(&rustymath::reduce::Sum, i64::view(&[i64::MAX]), [1, 1, 1], Some(i64::view(&[1]))).unwrap().1);
+        let sum = rustymath::Add.resolve(Variant::checked(i64::DTYPE), [i64::DTYPE; 2]).unwrap();
+        assert_eq!(i64::vec(fold(&sum, bool::view(&[true, false]), [1, 2, 1], Some(i64::view(&[7]))).unwrap()).unwrap(), [8]);
+        assert!(fold(&sum, i64::view(&[i64::MAX]), [1, 1, 1], Some(i64::view(&[1]))).is_err());
     }
 
     /// An inner product taken in order, item by item.

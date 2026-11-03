@@ -72,20 +72,20 @@ pub(crate) fn ln_split<const FUSED: bool>(x: f64) -> Double<f64> {
 
 /// The logarithm of 2 to base 2, as `based` takes it, and the logarithm of e to base 2.
 #[inline(always)]
-fn base2<R: Native>() -> ((R, R), R) { ((R::one(), R::zero()), R::narrow(LOG2_E)) }
+pub(crate) fn base2<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O) -> ((O::V, O::V), O::V) { ((o.number(F::one()), o.number(F::zero())), o.number(F::narrow(LOG2_E))) }
 
 /// The logarithm of 2 to base 10, as `based` takes it, split as `ln2` splits ln 2, and the logarithm of e to base 10. At f32 the split has its own high part. The f64 high part, rounded to f32, would make e times it inexact.
 #[inline(always)]
-fn base10<R: Native>() -> ((R, R), R) {
-    let (hi, lo) = if R::WIDE { (0.30102999566361177, 3.694239077158931e-13) } else { (0.30103302001953125, -3.024355464731343e-6) };
-    ((R::narrow(hi), R::narrow(lo)), R::narrow(LOG10_E))
+pub(crate) fn base10<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O) -> ((O::V, O::V), O::V) {
+    let (hi, lo) = if o.width() == crate::buffer::FloatWidth::F64 { (0.30102999566361177, 3.694239077158931e-13) } else { (0.30103302001953125, -3.024355464731343e-6) };
+    ((o.number(F::narrow(hi)), o.number(F::narrow(lo))), o.number(F::narrow(LOG10_E)))
 }
 
 #[inline]
-pub(crate) fn log2<R: Native, const FUSED: bool>(x: R) -> R { log::<R, FUSED>(x, base2()) }
+pub(crate) fn log2<R: Native, const FUSED: bool>(x: R) -> R { log::<R, FUSED>(x, base2(&crate::recipe::Floats)) }
 
 #[inline]
-pub(crate) fn log10<R: Native, const FUSED: bool>(x: R) -> R { log::<R, FUSED>(x, base10()) }
+pub(crate) fn log10<R: Native, const FUSED: bool>(x: R) -> R { log::<R, FUSED>(x, base10(&crate::recipe::Floats)) }
 
 /// Base 2's value, base 10's or every other base's, chosen for base b with selects, not branches.
 #[inline(always)]
@@ -95,7 +95,7 @@ fn by_base<R: Native, T>(b: R, [two, ten, other]: [T; 3]) -> T { if b == R::narr
 #[inline(always)]
 fn for_base<R: Native, const FUSED: bool>(b: R) -> (((R, R), R), R) {
     let lb = ln::<R, FUSED>(b);
-    (by_base(b, [base2(), base10(), natural()]), by_base(b, [R::one(), R::one(), lb]))
+    (by_base(b, [base2(&crate::recipe::Floats), base10(&crate::recipe::Floats), natural()]), by_base(b, [R::one(), R::one(), lb]))
 }
 
 /// The logarithm of x to base b. Base 2 gives `log2` and base 10 gives `log10`, which are exact at powers of their base. Any other base gives ln x / ln b. It is always inlined. Out of line, its call would stop a caller's loop vectorizing.
@@ -165,9 +165,9 @@ fn usual1p<R: Native>(x: R) -> bool { usual(x + R::one()) & (x != R::zero()) }
 usual_object!(/// [`ln`](crate::ln) as a function object.
     Ln: ln, usual => #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), natural()));
 usual_object!(/// [`log2`](crate::log2) as a function object.
-    Log2: log2, usual => #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), base2()));
+    Log2: log2, usual => #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), base2(&crate::recipe::Floats)));
 usual_object!(/// [`log10`](crate::log10) as a function object.
-    Log10: log10, usual => #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), base10()));
+    Log10: log10, usual => #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), base10(&crate::recipe::Floats)));
 usual_object!(/// [`log1p`](crate::log1p) as a function object.
     Log1p: log1p, usual1p => log1p_usual::<_, { crate::FUSED }>);
 usual_object!(/// ln|x|, the real part of ln x, as a function object. `complex.rs` attaches ln|z| for a complex z, the real part of its ln.
@@ -230,7 +230,7 @@ fn of_with<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(
 }
 
 #[inline(always)]
-fn log_with<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(
+pub(crate) fn log_with<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(
     o: &O, x: O::V, to: ((O::V, O::V), O::V),
 ) -> O::V {
     let y = of_with(o, crate::recipe::frexp(o, x), to);

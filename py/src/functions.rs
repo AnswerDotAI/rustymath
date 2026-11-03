@@ -12,7 +12,7 @@ use rustymath::layout::{Lanes, Layout, position};
 use rustymath::linalg::Scalar;
 use rustymath::stats;
 use rustymath::tolerant::{Ceil, Equal, Floor, FloorDivide, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, MathishFloorDivide, NotEqual, Residue, Tolerance};
-use rustymath::{Flipped, Wrapped, reduce, with_ints};
+use rustymath::{Flipped, reduce, with_ints};
 use rustymath_buffer::py_err;
 
 /// The error for a function with no kernel for `dtype`.
@@ -66,7 +66,7 @@ pub(crate) fn select<K: rustymath::facts::Formula<N>, const N: usize>(
     function: &str, object: K, dtype: DType, types: [DType; N], mathish: bool, only: Option<&[DType]>,
 ) -> PyResult<rustymath::operation::Kernel> {
     let dtype = if only.is_some() { computes(function, &object, dtype, only)? } else { dtype };
-    object.resolve(rustymath::facts::Variant { dtype, checked: true, mathish, wrapping: false }, types).map_err(py_err)
+    object.resolve(rustymath::facts::Variant { dtype, checked: true, mathish, wrapping: true }, types).map_err(py_err)
 }
 fn call_dtype(call: &Call) -> DType {
     if call.args.iter().any(|x| x.view().dtype() == DType::Character) { DType::Character } else { call.args[0].view().dtype() }
@@ -107,10 +107,11 @@ fn totals<K: rustymath::facts::Formula<2>>(
         let view = out.as_ref().map_or_else(|| x.clone(), Core::view);
         let layout = view.layout();
         let next = axis.map_or(Layout::EMPTY, |a| layout.axes((0..layout.shape().len()).filter(|&i| i != a)));
-        let dims = axis.map_or(Ok([1, view.len(), 1]), |a| Lanes::new(layout.shape(), a).map(|l| l.dims())).map_err(py_err)?;
+        let flat = [view.len()];
+        let shape = axis.map_or(flat.as_slice(), |_| layout.shape());
         let kernel = select(function, object.clone(), view.dtype(), [view.dtype(); 2], false, only)?;
         let mut buffer = Buffer::with_capacity(kernel.total_dtype().unwrap_or(kernel.result_dtype()), next.count());
-        kernel.fold_read(dims, rustymath::operation::Seed::Identity, rustymath::operation::Direction::Right,
+        kernel.fold_read(shape, axis.unwrap_or(0), rustymath::operation::Seed::Identity, rustymath::operation::Direction::Right,
             rustymath::operation::Settings::default(), view.read(), &mut buffer).map_err(py_err)?;
         out = Some(Core::new(next, buffer).map_err(py_err)?);
     }
@@ -120,7 +121,8 @@ fn fold<'py, K: rustymath::facts::Formula<2>>(
     py: Python<'py>, function: &str, object: &K, x: &Bound<'py, PyAny>, axis: Option<Axes>, only: Option<&[DType]>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let x = one(x)?;
-    let core = match released(py, || totals(function, object, x.view(), axis.as_ref(), only))? { Some(core) => core, None => x.into_core()? };
+    let view = x.view();
+    let core = match released(py, || totals(function, object, view, axis.as_ref(), only))? { Some(core) => core, None => x.into_core()? };
     let scalar = core.layout().shape().is_empty();
     give(py, core, scalar)
 }
@@ -187,7 +189,7 @@ macro_rules! functions {
         pub(crate) fn $name<'py>(py: Python<'py>, $($x: &Bound<'py, PyAny>,)+) -> PyResult<Bound<'py, PyAny>> {
             let call = functions!(@convert [$($x),+])?;
             let dtype = call_dtype(&call);
-            let types: [DType; { functions!(@arity [$($x),+]) }] = std::array::from_fn(|i| call.args[i].view().dtype());
+            let types: [DType; { functions!(@arity [$($x),+]) }] = ::std::array::from_fn(|i| call.args[i].view().dtype());
             let mode = functions!(@mode [$($x),+], [$($ct)?], $on, $k, dtype, None$(.or(Some($only)))?);
             functions!(@object [$($ct)?], [$($mathish)?], mode, $k, |k| {
                 let kernel = select::<_, { functions!(@arity [$($x),+]) }>(stringify!($name), k, dtype, types, mode, None$(.or(Some($only)))?)?;
@@ -333,7 +335,7 @@ functions! {
     #[doc = rustymath::function_doc!(atanh)]
     arctanh(x) = rustymath::Atanh;
     /// |x|, a real number for a complex x. The magnitude of a signed integer type's least value wraps to that value, as NumPy's does.
-    absolute(x) = Wrapped(rustymath::Abs);
+    absolute(x) = rustymath::Abs;
     /// -1, 0 or 1 for a real x, and x/|x| for a complex x.
     sign(x) = rustymath::Sign;
     /// The angle of x from the positive real axis, from -π to π.
@@ -369,11 +371,11 @@ functions! {
     #[doc = rustymath::function_doc!(erfcinv)]
     erfcinv(q) = rustymath::Erfcinv;
     /// x + y. A character plus an integer, on either side, is a character. An integer result that doesn't fit its dtype wraps, as NumPy's does.
-    add(x, y) = Wrapped(rustymath::Add);
+    add(x, y) = rustymath::Add;
     /// x - y. A character minus an integer is a character, and a character minus a character is an integer. An integer result that doesn't fit its dtype wraps, as NumPy's does.
-    subtract(x, y) = Wrapped(rustymath::Subtract);
+    subtract(x, y) = rustymath::Subtract;
     /// x × y. An integer result that doesn't fit its dtype wraps, as NumPy's does.
-    multiply(x, y) = Wrapped(rustymath::Multiply);
+    multiply(x, y) = rustymath::Multiply;
     /// x / y. Integers compute as floats. Mathish mode defines zero divided by zero as zero for float64 and complex128.
     divide(x, y) = rustymath::Divide => rustymath::MathishDivide;
     /// x^y. An integer power that doesn't fit its dtype wraps, as NumPy's does. A negative integer y beside an x other than 1 or -1 raises ValueError.
@@ -467,9 +469,9 @@ macro_rules! reductions {
 
 reductions! {
     /// The sum of x over `axis`: every axis for None, or one axis, by position or name, or a tuple of them. Integers and Booleans sum as int64, and float16 as float32. An integer sum that doesn't fit int64 wraps.
-    sum = Fold Wrapped(rustymath::Add);
+    sum = Fold rustymath::Add;
     /// The product of x over `axis`, which `sum` describes. Integers and Booleans multiply as int64, and float16 as float32. An integer product that doesn't fit int64 wraps.
-    prod = Fold Wrapped(rustymath::Multiply);
+    prod = Fold rustymath::Multiply;
     /// The largest item of x over `axis`, which `sum` describes. An empty lane gives the dtype's least value. Beside NaN, a lane gives NaN or its greatest other item, depending on the processor and the lane's length.
     max = Fold reduce::Maximum;
     /// The smallest item of x over `axis`, which `sum` describes. An empty lane gives the dtype's greatest value. Beside NaN, a lane gives NaN or its least other item, depending on the processor and the lane's length.
@@ -479,9 +481,9 @@ reductions! {
     /// Whether any Boolean of x over `axis` is true, with `axis` as `sum` describes.
     any = Fold reduce::Maximum, only &[DType::Boolean];
     /// The running sums of x along `axis`, by position or name, or along the flattened x for None. Integers and Booleans sum as int64, and float16 as float32. An integer sum that doesn't fit int64 wraps.
-    cumsum = Scan Wrapped(rustymath::Add);
+    cumsum = Scan rustymath::Add;
     /// The running products of x along `axis`, as `cumsum` takes it. Integers and Booleans multiply as int64, and float16 as float32. An integer product that doesn't fit int64 wraps.
-    cumprod = Scan Wrapped(rustymath::Multiply);
+    cumprod = Scan rustymath::Multiply;
 }
 
 /// The smallest and largest items of `x` over `axis`, as `sum` takes it.
@@ -581,7 +583,7 @@ fn _sliding<'py>(py: Python<'py>, function: NativeFunction<'_>, x: &Bound<'py, P
     let input = view.remapped(rustymath::agreement::Mapping::from(plan.steps), plan.layout.count());
     let dims = [lanes.outer * (lanes.len + 1 - width), width, lanes.inner];
     let mut buffer = Buffer::with_capacity(kernel.total_dtype().unwrap_or(kernel.result_dtype()), layout.count());
-    released(py, || kernel.fold_read(dims, rustymath::operation::Seed::Identity, rustymath::operation::Direction::Right,
+    released(py, || kernel.fold_read(&dims, 1, rustymath::operation::Seed::Identity, rustymath::operation::Direction::Right,
         rustymath::operation::Settings::default(), input.read(), &mut buffer)).map_err(py_err)?;
     give_items(py, layout, buffer, false)
 }

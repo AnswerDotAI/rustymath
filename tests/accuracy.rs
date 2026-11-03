@@ -121,11 +121,11 @@ fn at32(cases: &[(f64, f64)]) -> Vec<(f32, f32)> {
 type Variant<W, N> = (W, N, &'static str);
 /// The function at f64 and f32 with `mla` fused, and the same unfused.
 type Variants<W, N> = [Variant<W, N>; 2];
-/// `Pow`'s and `Root`'s scalar forms, which take fast paths of their own, as a variant beside the free functions' `fused` and `unfused`.
+/// Shared `Pow` and `Root` formulas beside the fused and unfused free functions.
 const POW_ONE: Variant<fn((f64, f64)) -> f64, fn((f32, f32)) -> f32> =
-    (|(x, y)| rustymath::Binary::one(&rustymath::Pow, x, y), |(x, y)| rustymath::Binary::one(&rustymath::Pow, x, y), "object");
+    (|(x, y)| rustymath::facts::formula_at(&rustymath::Pow, [x, y]), |(x, y)| rustymath::facts::formula_at(&rustymath::Pow, [x, y]), "object");
 const ROOT_ONE: Variant<fn((f64, f64)) -> f64, fn((f32, f32)) -> f32> =
-    (|(n, y)| rustymath::Binary::one(&rustymath::Root, n, y), |(n, y)| rustymath::Binary::one(&rustymath::Root, n, y), "object");
+    (|(n, y)| rustymath::facts::formula_at(&rustymath::Root, [n, y]), |(n, y)| rustymath::facts::formula_at(&rustymath::Root, [n, y]), "object");
 macro_rules! variants {
     ($f:ident) => {
         [
@@ -776,15 +776,15 @@ mod lambert {
 }
 
 mod pow {
-    use rustymath::{Binary, Pow};
+    use rustymath::{facts::formula_at, Pow};
 
-    /// IEEE 754's special values for `pow`, through the free function and through `Pow`'s scalar form, which has its own fast path.
+    /// Special values through the free function and shared formula.
     #[test]
     fn special_values() {
-        for p in [rustymath::pow::<f64> as fn(f64, f64) -> f64, |x, y| Pow.one(x, y)] {
+        for p in [rustymath::pow::<f64> as fn(f64, f64) -> f64, |x, y| formula_at(&Pow, [x, y])] {
             assert_eq!((p(f64::NAN, 0.0), p(1.0, f64::NAN), p(-2.0, 3.0), p(0.0, -1.0)), (1.0, 1.0, -8.0, f64::INFINITY));
             assert!(p(-2.0, 0.5).is_nan() && (p(2.0, 0.5) - std::f64::consts::SQRT_2).abs() < 1e-15);
         }
-        assert!(rustymath::pow(-2.0f32, 3.0) == -8.0 && Pow.one(-2.0f32, 0.5).is_nan());
+        assert!(rustymath::pow(-2.0f32, 3.0) == -8.0 && formula_at(&Pow, [-2.0f32, 0.5]).is_nan());
     }
 }

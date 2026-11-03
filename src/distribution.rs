@@ -1,7 +1,7 @@
 //! Probability distributions. Each has a density, a cumulative distribution, a quantile function and a sampler. The first three are also function objects, `Pdf`, `Cdf` and `Quantile`, which hold the distribution. Their slice forms choose the distribution's formulas once, outside the loop, so the loops of the closed-form distributions vectorize. Their one-item forms run the slice forms on one item. An item of a slice form fails where its result is NaN and its argument isn't, as for a quantile of p outside 0 to 1. A discrete distribution's density is its mass at a whole x, and its quantile function and sampler give whole numbers.
 use crate::{
-    Arg, Atan, Erfc, Erfcinv, Float, Ln, Log1p, Pow, Root, Tan, Unary, Binary, betainc, betaincinv, cos, erfcinv, exp, expm1, gammainc, gammaincc, gammaincinv, lgamma,
-    ln, log1p, pow, random::Items, sin, slice::{CHUNK, kept, written}
+    Arg, Atan, Erfc, Erfcinv, Float, Ln, Log1p, Pow, Root, Tan, Unary, betainc, betaincinv, cos, erfcinv, exp, expm1, gammainc, gammaincc, gammaincinv, lgamma,
+    facts::formula_at, ln, log1p, pow, random::Items, sin, slice::{CHUNK, kept, written}
 };
 use rand::{Rng, distr::{Distribution as _, Open01, StandardUniform}};
 use std::{f64::consts::{FRAC_1_SQRT_2, PI, SQRT_2, TAU}, mem::MaybeUninit};
@@ -66,16 +66,18 @@ trait Formulas {
     #[inline(always)]
     fn quantile_map<F: Float>(&self) -> impl Fn(F) -> F + Copy { move |p| narrowed(p, |p| self.quantile(p)) }
     #[inline(always)]
-    fn pdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Ln: Unary<F, Out = F>, Pow: Binary<F, Out = F> {
+    fn pdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Ln: Unary<F, Out = F> {
         let pdf = self.pdf_map();
         each!([x], n, out, |[x]| pdf(x))
     }
     #[inline(always)]
-    fn cdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Erfc: Unary<F, Out = F>, Atan: Unary<F, Out = F>,
-        Pow: Binary<F, Out = F> { let cdf = self.cdf_map(); each!([x], n, out, |[x]| cdf(x)) }
+    fn cdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Erfc: Unary<F, Out = F>, Atan: Unary<F, Out = F> {
+        let cdf = self.cdf_map();
+        each!([x], n, out, |[x]| cdf(x))
+    }
     #[inline(always)]
     fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Erfcinv: Unary<F, Out = F>,
-        Log1p: Unary<F, Out = F>, Tan: Unary<F, Out = F>, Ln: Unary<F, Out = F>, Root: Binary<F, Out = F> {
+        Log1p: Unary<F, Out = F>, Ln: Unary<F, Out = F> {
         let q = self.quantile_map();
         each!([p], n, out, |[p]| q(p))
     }
@@ -108,17 +110,17 @@ fn one_item<F: Float>(many: impl FnOnce(&mut [MaybeUninit<F>]) -> bool) -> F {
 #[inline(always)]
 fn narrowed<F: Float>(x: F, f: impl Fn(f64) -> f64) -> F { F::narrow(f(x.wide())) }
 
-/// [`Distribution::pdf`] as a function object. The log-normal distribution's slice form takes ln from [`Ln`]'s slice form, which vectorizes where a loop of whole densities doesn't. The Weibull distribution's takes its power from [`Pow`]'s.
+/// [`Distribution::pdf`] as a function object. The log-normal distribution's slice form takes ln from [`Ln`]'s slice form, which vectorizes where a loop of whole densities doesn't. The Weibull distribution uses the shared [`Pow`] formula.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Pdf(pub Distribution);
 forms!(Pdf at real: |k, [x]| one_item(|out| k.slice([Arg::One(x)], 1, out)), many |k, [x], n, out| each_law!(&k.0 .0, d => d.pdf_many(x, n, out)));
 
-/// [`Distribution::cdf`] as a function object. The normal and log-normal distributions' slice forms take erfc from [`Erfc`]'s slice form, which computes only the formulas that each block of arguments needs. The Cauchy distribution's takes atan from [`Atan`]'s, and the Weibull distribution's takes its power from [`Pow`]'s.
+/// [`Distribution::cdf`] as a function object. The normal and log-normal distributions' slice forms take erfc from [`Erfc`]'s slice form, which computes only the formulas that each block of arguments needs. The Cauchy distribution's takes atan from [`Atan`]'s, and the Weibull distribution uses the shared [`Pow`] formula.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cdf(pub Distribution);
 forms!(Cdf at real: |k, [x]| one_item(|out| k.slice([Arg::One(x)], 1, out)), many |k, [x], n, out| each_law!(&k.0 .0, d => d.cdf_many(x, n, out)));
 
-/// [`Distribution::quantile`] as a function object, through [`quantiles`]. The normal and log-normal distributions' slice forms take erfcinv(2p) from [`Erfcinv`]'s slice form, whose loops don't branch on each item's region. The exponential, Cauchy, Laplace, logistic and Weibull distributions' take their logarithms, tangent or root from the slice forms of [`Log1p`], [`Ln`], [`Tan`] and [`Root`].
+/// [`Distribution::quantile`] as a function object, through [`quantiles`]. The normal and log-normal distributions' slice forms take erfcinv(2p) from [`Erfcinv`]'s slice form, whose loops don't branch on each item's region. Logarithms use [`Log1p`] and [`Ln`] slice forms; tangent and root use the shared [`Tan`] and [`Root`] formulas.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Quantile(pub Distribution);
 forms!(Quantile at real: |k, [p]| one_item(|out| k.slice([Arg::One(p)], 1, out)), many |k, [p], n, out| quantiles(p, n, out, |p, n, out| each_law!(&k.0 .0, d => d.quantile_many(p, n, out))));
@@ -188,9 +190,9 @@ fn composed<F: Float>(
 /// The values of `g`'s slice form at a block's arguments, for [`composed`].
 fn through<F: Float, G: Unary<F, Out = F>>(g: G) -> impl Fn(&mut [F], &mut [MaybeUninit<F>]) { move |a, v| { g.slice([Arg::Many(a)], a.len(), v); } }
 
-/// The values of `Pow`'s slice form, each argument of a block raised to `k`, for [`composed`].
-fn raised<F: Float>(k: F) -> impl Fn(&mut [F], &mut [MaybeUninit<F>]) where Pow: Binary<F, Out = F> {
-    move |a, v| { Pow.slice([Arg::Many(a), Arg::One(k)], a.len(), v); }
+/// The values of the shared `Pow` formula, each argument of a block raised to `k`, for [`composed`].
+fn raised<F: Float>(k: F) -> impl Fn(&mut [F], &mut [MaybeUninit<F>]) {
+    move |a, v| { each!([Arg::Many(a)], a.len(), v, |[x]| formula_at(&Pow, [x, k])); }
 }
 
 impl Distribution {
@@ -460,14 +462,14 @@ impl Formulas for Cauchy {
             if z.abs() <= F::one() { half + a } else if z < F::zero() { a } else { F::one() + a }
         })
     }
-    /// The tangent, from `Tan`'s slice form, is of π·a, where a is p below p = 1/4, 1 - p above 3/4, and p - 1/2 between, so its argument stays within ±π/4. Near 0 and 1 the quantile is location ∓ scale/tan(π·a), which keeps p's digits there.
+    /// The tangent, from the shared `Tan` formula, is of π·a, where a is p below p = 1/4, 1 - p above 3/4, and p - 1/2 between, so its argument stays within ±π/4. Near 0 and 1 the quantile is location ∓ scale/tan(π·a), which keeps p's digits there.
     #[inline(always)]
-    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Tan: Unary<F, Out = F> {
+    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool {
         let (location, scale, pi, low, high, half) =
             (F::narrow(self.location), F::narrow(self.scale), F::narrow(PI), F::narrow(0.25), F::narrow(0.75), F::narrow(0.5));
         composed(p, n, out, move |p| {
             pi * if p < low { p } else if p > high { F::one() - p } else { p - half }
-        }, through(Tan), move |p, t| {
+        }, |a, v| { each!([Arg::Many(a)], a.len(), v, |[x]| formula_at(&Tan, [x])); }, move |p, t| {
             let (num, den) = if p < low { (-scale, t) } else if p > high { (scale, t) } else { (scale * t, F::one()) };
             location + num / den
         })
@@ -679,9 +681,9 @@ struct Weibull { shape: f64, scale: f64 }
 
 impl Formulas for Weibull {
     through_slices!();
-    /// shape/scale·z^(shape-1)·e^(-z^shape) for z = x/scale. `Pow`'s slice form gives z^(shape-1), from a base of 1 for a negative x. The density is 0 where e^(-z^shape) underflows, even where z^(shape-1) overflows, and for a negative or infinite x.
+    /// shape/scale·z^(shape-1)·e^(-z^shape) for z = x/scale. The shared `Pow` formula gives z^(shape-1), from a base of 1 for a negative x. The density is 0 where e^(-z^shape) underflows, even where z^(shape-1) overflows, and for a negative or infinite x.
     #[inline(always)]
-    fn pdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Pow: Binary<F, Out = F> {
+    fn pdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool {
         let (rscale, height) = (F::narrow(self.scale.recip()), F::narrow(self.shape / self.scale));
         composed(x, n, out, move |x| if x < F::zero() { F::one() } else { x * rscale }, raised(F::narrow(self.shape - 1.0)), move |x, w| {
             let e = exp(-times(x * rscale, w));
@@ -689,24 +691,24 @@ impl Formulas for Weibull {
             if x < F::zero() || x.is_infinite() { F::zero() } else { d }
         })
     }
-    /// 1 - e^(-z^shape) for z = x/scale. `Pow`'s slice form gives z^shape, from a base of 1 for a nonpositive x, whose cdf is 0.
+    /// 1 - e^(-z^shape) for z = x/scale. The shared `Pow` formula gives z^shape, from a base of 1 for a nonpositive x, whose cdf is 0.
     #[inline(always)]
-    fn cdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Pow: Binary<F, Out = F> {
+    fn cdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool {
         let rscale = F::narrow(self.scale.recip());
         composed(x, n, out, move |x| if x <= F::zero() { F::one() } else { x * rscale }, raised(F::narrow(self.shape)), |x, w| {
             let c = -expm1(-w);
             if x <= F::zero() { F::zero() } else { c }
         })
     }
-    /// scale·(-log1p(-p))^(1/shape), from `Log1p`'s slice form and then `Root`'s. `Root` takes shape itself as its degree, where `Pow` would need 1/shape rounded.
+    /// scale·(-log1p(-p))^(1/shape), from `Log1p` slice form and the shared `Root` formula. `Root` takes shape itself as its degree, where `Pow` would need 1/shape rounded.
     #[inline(always)]
-    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Log1p: Unary<F, Out = F>, Root: Binary<F, Out = F>
+    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Log1p: Unary<F, Out = F>
     {
         let (degree, scale) = (F::narrow(self.shape), F::narrow(self.scale));
         composed(p, n, out, |p| -p, move |a, v| {
             Log1p.slice([Arg::Many(a)], a.len(), v);
             for (x, &l) in a.iter_mut().zip(written(v).iter()) { *x = -l; }
-            Root.slice([Arg::One(degree), Arg::Many(a)], a.len(), v);
+            each!([Arg::Many(a)], a.len(), v, |[x]| formula_at(&Root, [degree, x]));
         }, move |_, w| scale * w)
     }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { self.scale * pow(-ln(open(rng)), 1.0 / self.shape) }

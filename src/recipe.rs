@@ -1,5 +1,5 @@
 //! Formulas that rustymath's kernels compute and basedpl's JIT compiles, each written once over the operations it uses (`Ops`): tolerant closeness, comparison (each item, or through the range of floats equal to one number), floor, ceiling and the residue; Mathish division, sign, the reciprocal and `π`'s two forms; and the powers that `Exponent` routes off the general route, with the square root they take for halves. `Floats` runs a recipe on floats, as the kernels do. A compiler's `Ops` records the same operations as steps, so both routes round alike, step for step.
-use crate::{Exponent, FUSED, Float, float::sealed::Core, tolerant::Band};
+use crate::{Exponent, Float, float::sealed::Core, tolerant::Band};
 mod integer;
 pub use integer::IntegerOps;
 pub use crate::arith::Overflowing;

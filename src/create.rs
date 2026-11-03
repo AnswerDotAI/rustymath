@@ -85,6 +85,6 @@ pub fn linspace(start: f64, stop: f64, n: usize, endpoint: bool) -> Result<Vec<f
 pub fn logspace(start: f64, stop: f64, n: usize, endpoint: bool, base: f64) -> Result<Vec<f64>, Error> {
     let exponents = linspace(start, stop, n, endpoint)?;
     let mut out = Vec::with_capacity(n);
-    crate::Binary::many(&crate::Pow, crate::Arg::One(base), crate::Arg::Many(&exponents), n, &mut out);
+    crate::pairs(crate::Arg::One(base), crate::Arg::Many(&exponents), n, &mut out, |x, y| (crate::facts::formula_at(&crate::Pow, [x, y]), true));
     Ok(out)
 }

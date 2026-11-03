@@ -4,7 +4,7 @@ use crate::buffer::{Buffer, DType, Element, Items, View};
 use crate::error::{Error, Kind};
 use crate::gather::Steps;
 use crate::layout::{Keys, Lanes, Layout, element_count};
-use crate::operation::{Kernel, Settings};
+use crate::operation::{Kernel, Positions, Settings, WriteRoot};
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -201,9 +201,9 @@ impl Array {
         if agreement.layout.shape() != plan.layout.shape() { return Err(Error::new(Kind::Length, "assignment must fit the selected layout")); }
         let root = self.view();
         let source = source.view().remapped(agreement.right, agreement.len);
-        let positions = ReadPlan::index(0, 1, self.len()).remapped(Mapping::from(plan.steps.clone()), agreement.len, Missing::Invalid);
+        let positions = ReadPlan::input(0, self.len()).remapped(Mapping::from(plan.steps.clone()), agreement.len, Missing::Invalid);
         let mut buffer = Buffer::with_capacity(self.dtype(), self.len());
-        crate::operation::at(combine, root.read(), source.read(), Read { sources: &[], plan: &positions }, true, Settings::default(), &mut buffer)?;
+        crate::operation::at(combine, WriteRoot::Read(root.read()), source.read(), Positions::Route(&positions, 0), true, Settings::default(), &mut buffer)?;
         Ok(buffer)
     }
     /// Writes a broadcast source into a selection. Checks finish before replacing the array's storage.

@@ -203,7 +203,7 @@ pub fn bound_routes(layout: &Layout, routes: &Routes, indices: &[View<'_>], broa
 
 /// The plan of the selection that `routes` gives on `layout`, for `planning`.
 fn routed(layout: &Layout, routes: &Routes, broadcast: bool, planning: Planning) -> Result<Plan, Error> {
-    planned(&route_layout(layout, routes)?, routes.selectors.clone(), broadcast, planning)
+    planned(route_layout(layout, routes)?.as_ref(), routes.selectors.clone(), broadcast, planning)
 }
 
 fn route_layout<'a>(layout: &'a Layout, routes: &Routes) -> Result<Cow<'a, Layout>, Error> {
@@ -374,7 +374,7 @@ fn joined(parts: &[Part], group: &[usize], broadcast: bool, steps: &mut Vec<Step
                     for (t, &o) in table[j0..].iter_mut().zip(offsets) { add(t, Some(o).filter(|&o| o != Steps::FILL)) }
                 }),
                 (map, _) => {
-                    let (base, tables, _) = map.to_walk(lens);
+                    let (base, tables) = map.to_walk(lens);
                     Writes::Walk { base, steps: &tables }.runs_while(&mut |k, reads| {
                         for (t, &j) in table[k..].iter_mut().zip(reads) { add(t, (j != Steps::FILL).then(|| own.get(j)).flatten()) }
                         true
@@ -488,7 +488,7 @@ pub fn position_recipe<F: Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, value
 }
 pub(crate) fn counted_back(i: i64, size: usize) -> usize {
     let ops = crate::recipe::IntegerOps::<i64>::new(crate::facts::Variant::checked(crate::buffer::DType::Integer(crate::buffer::Width::I64)));
-    position_recipe::<f64, _>(&ops, i, size as i64).0 as usize
+    position_recipe::<f64, _>(&ops, i as u64, size as i64).0 as usize
 }
 
 /// The positions that index values give along an axis of length `size`: integers as `index_positions` reads them, and floats as `filled_positions` does. Other items are a Domain error.

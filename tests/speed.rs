@@ -57,25 +57,15 @@ fn time<A: Copy, T: Copy + Default>(x: &[A], f: impl Fn(A) -> T) -> f64 {
     })
 }
 
-/// The time per item of `k`'s slice form on the inputs in `x`.
-fn time_unary<F, K: Unary<F>>(x: &[F], k: &K) -> f64 {
-    let n = x.len() / RUNS;
-    time_appended(n, &[bytes(x)], |r, out| { k.many(Arg::Many(black_box(set(x, r))), n, out); })
-}
-
-/// The time per item of `k`'s slice form on the pairs of inputs in `x` and `y`.
-fn time_binary<F: Copy, K: Binary<F>>(x: &[F], y: &[F], k: &K) -> f64 {
-    let n = x.len() / RUNS;
-    time_appended(n, &[bytes(x), bytes(y)], |r, out| {
-        k.many(Arg::Many(black_box(set(x, r))), Arg::Many(set(y, r)), n, out);
-    })
-}
-
-/// The time per item of `k`'s slice form on the triples of inputs in `x`, `y` and `z`.
-fn time_ternary<F: Copy, K: Ternary<F>>(x: &[F], y: &[F], z: &[F], k: &K) -> f64 {
-    let n = x.len() / RUNS;
-    time_appended(n, &[bytes(x), bytes(y), bytes(z)], |r, out| {
-        k.many(Arg::Many(black_box(set(x, r))), Arg::Many(set(y, r)), Arg::Many(set(z, r)), n, out);
+fn time_map<F: buffer::Element, K: facts::Formula<A>, const A: usize>(args: [&[F]; A], k: &K) -> f64 {
+    let n = args[0].len() / RUNS;
+    let kernel = k.resolve(facts::Variant::checked(F::DTYPE), [F::DTYPE; A]).unwrap();
+    let mut out = buffer::Buffer::with_capacity(kernel.result_dtype(), n);
+    let inputs = args.map(bytes);
+    fastest(n, &inputs, |r| {
+        out.clear();
+        support::map(&kernel, args.map(|x| F::view(black_box(set(x, r)))), n, &mut out).unwrap();
+        black_box(&mut out);
     })
 }
 
@@ -113,7 +103,7 @@ macro_rules! unary {
     ($units:expr; $($object:ident vs $std:ident on $lo:literal to $hi:literal;)+) => {
         [$({
             let (x64, x32) = widths($lo, $hi, GOLDEN, N);
-            compare($units, stringify!($object), || time_unary(&x64, &$object), || time(&x64, f64::$std), || time_unary(&x32, &$object), || time(&x32, f32::$std))
+            compare($units, stringify!($object), || time_map([&x64], &$object), || time(&x64, f64::$std), || time_map([&x32], &$object), || time(&x32, f32::$std))
         }),+]
     };
 }
@@ -128,12 +118,12 @@ fn time_pairs<F: Copy, T: Copy + Default>(x: &[F], y: &[F], f: impl Fn(F, F) -> 
 }
 
 /// The times of its slice form and of a reference version pair by pair, on pairs from the ranges `xs` and `ys`, at f64 and then f32. With `one`, it times `k`'s scalar form pair by pair in place of its slice form.
-fn binary<K: Binary<f64, Out = f64> + Binary<f32, Out = f32>>(
+fn binary<K: facts::Formula<2>>(
     units: &Units<f64, f32>, name: &'static str, k: K, one: bool, (xs, ys): ((f64, f64), (f64, f64)), std64: impl Fn(f64, f64) -> f64,
     std32: impl Fn(f32, f32) -> f32) -> Compared {
     let ((x64, x32), (y64, y32)) = (widths(xs.0, xs.1, GOLDEN, N), widths(ys.0, ys.1, SILVER, N));
-    let ours64 = || if one { time_pairs(&x64, &y64, |a, b| k.one(a, b)) } else { time_binary(&x64, &y64, &k) };
-    let ours32 = || if one { time_pairs(&x32, &y32, |a, b| k.one(a, b)) } else { time_binary(&x32, &y32, &k) };
+    let ours64 = || if one { time_pairs(&x64, &y64, |a, b| facts::formula_at(&k, [a, b])) } else { time_map([&x64, &y64], &k) };
+    let ours32 = || if one { time_pairs(&x32, &y32, |a, b| facts::formula_at(&k, [a, b])) } else { time_map([&x32, &y32], &k) };
     compare(units, name, ours64, || time_pairs(&x64, &y64, std64), ours32, || time_pairs(&x32, &y32, std32))
 }
 
@@ -226,21 +216,21 @@ fn special(units: &Units<f64, f32>) -> [Costed; 11] {
     macro_rules! unary_copies {
         ($k:expr, $lo:literal to $hi:literal) => {{
             let (x64, x32) = widths($lo, $hi, GOLDEN, many);
-            units.costs(|| time_unary(&x64, &$k), || time_unary(&x32, &$k))
+            units.costs(|| time_map([&x64], &$k), || time_map([&x32], &$k))
         }};
     }
     macro_rules! binary_copies {
         ($k:expr, $xs:expr, $ys:expr) => {{
             let (xs, ys): ((f64, f64), (f64, f64)) = ($xs, $ys);
             let ((x64, x32), (y64, y32)) = (widths(xs.0, xs.1, GOLDEN, few), widths(ys.0, ys.1, SILVER, few));
-            units.costs(|| time_binary(&x64, &y64, &$k), || time_binary(&x32, &y32, &$k))
+            units.costs(|| time_map([&x64, &y64], &$k), || time_map([&x32, &y32], &$k))
         }};
     }
     macro_rules! ternary_copies {
         ($k:expr, $zs:expr) => {{
             let zs: (f64, f64) = $zs;
             let ((x64, x32), (y64, y32), (z64, z32)) = (widths(0.5, 20.0, GOLDEN, few), widths(0.5, 20.0, SILVER, few), widths(zs.0, zs.1, BRONZE, few));
-            units.costs(|| time_ternary(&x64, &y64, &z64, &$k), || time_ternary(&x32, &y32, &z32, &$k))
+            units.costs(|| time_map([&x64, &y64, &z64], &$k), || time_map([&x32, &y32, &z32], &$k))
         }};
     }
     [
@@ -259,8 +249,8 @@ fn selections(units: &Units<f64, f32>) -> [Costed; 2] {
     let (m64, m32) = widths(0.0, 1.0, BRONZE, N);
     let (m64, m32): (Vec<f64>, Vec<f32>) = (m64.iter().map(|m| m.round()).collect(), m32.iter().map(|m| m.round()).collect());
     [
-        ("Clip", units.costs(|| time_ternary(&x64, &lo64, &hi64, &Clip), || time_ternary(&x32, &lo32, &hi32, &Clip))),
-        ("Choose", units.costs(|| time_ternary(&x64, &y64, &m64, &Choose), || time_ternary(&x32, &y32, &m32, &Choose))),
+        ("Clip", units.costs(|| time_map([&x64, &lo64, &hi64], &Clip), || time_map([&x32, &lo32, &hi32], &Clip))),
+        ("Choose", units.costs(|| time_map([&x64, &y64, &m64], &Choose), || time_map([&x32, &y32, &m32], &Choose))),
     ]
 }
 
@@ -276,7 +266,7 @@ fn complex(units: &Units<num_complex::Complex<f64>, num_complex::Complex<f32>>) 
     macro_rules! unary_copies {
         ($k:expr, $re:expr, $im:expr) => {{
             let (z64, z32) = zs($re, $im, GOLDEN);
-            units.costs(|| time_unary(&z64, &$k), || time_unary(&z32, &$k))
+            units.costs(|| time_map([&z64], &$k), || time_map([&z32], &$k))
         }};
     }
     let square = (-2.0, 2.0);
@@ -289,7 +279,7 @@ fn complex(units: &Units<num_complex::Complex<f64>, num_complex::Complex<f32>>) 
         ("complex Atanh", unary_copies!(Atanh, square, square)), ("complex Lgamma", unary_copies!(Lgamma, (0.1, 20.0), (-10.0, 10.0))),
         ("complex Gamma", unary_copies!(Gamma, (0.1, 20.0), (-10.0, 10.0))), ("complex Abs", unary_copies!(Abs, square, square)),
         ("complex Sqrt1mx2", unary_copies!(Sqrt1mx2, square, square)),
-        ("complex Pow", units.costs(|| time_binary(&z64, &w64, &Pow), || time_binary(&z32, &w32, &Pow))),
+        ("complex Pow", units.costs(|| time_map([&z64, &w64], &Pow), || time_map([&z32, &w32], &Pow))),
     ]
 }
 

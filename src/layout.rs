@@ -143,6 +143,7 @@ impl PartialEq for Shape {
     #[inline]
     fn eq(&self, other: &Self) -> bool { **self == **other }
 }
+impl Eq for Shape {}
 impl fmt::Debug for Shape { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Debug::fmt(&**self, f) } }
 impl From<&[usize]> for Shape {
     #[inline]
@@ -274,11 +275,11 @@ fn duplicate(key: &str) -> Error { Error::new(Kind::Domain, format!("duplicate k
 
 
 /// An array's shape, with optional keys and a name for each axis. A layout with no keys or names holds no `Meta`.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Layout { shape: Shape, meta: Option<Box<Meta>> }
 
 /// The keys and names of a layout's axes. An empty list means none on any axis.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Meta { keys: Vec<Option<Arc<Keys>>>, names: Vec<Option<Arc<str>>> }
 
 impl<S: Into<Shape>> From<S> for Layout {

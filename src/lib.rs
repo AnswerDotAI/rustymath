@@ -2,11 +2,11 @@
 #![doc = include_str!("lib.md")]
 #[macro_use]
 mod slice;
-pub mod agreement;
 mod arc;
 mod arith;
 #[macro_use]
 pub mod buffer;
+pub mod agreement;
 pub mod array;
 pub mod characters;
 mod complex;

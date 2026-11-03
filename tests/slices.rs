@@ -68,77 +68,43 @@ mod forms {
         wide.iter().flat_map(|&x| [x, -x]).map(F::narrow).collect()
     }
 
-    /// `k.many` against `k.one` for every pairing of `One` and `Many` among `items`. It must append after what `out` holds, and say whether every item succeeded, as `checked` does item by item. Where `K` isn't total, the verdict follows the NaN rule: an item fails exactly where it gives NaN from arguments that aren't NaN. A function whose `TOTAL` is true must succeed on every item, including where NaN is its value, as sin ∞ is.
-    fn binary<F: Float + Debug, K: Binary<F, Out = F>>(k: K, name: &str) {
+    fn check<F: Float + buffer::Element + Debug, K: facts::Formula<A>, const A: usize>(k: &K, name: &str, args: [Arg<'_, F>; A], n: usize) {
+        let kernel = k.resolve(facts::Variant { checked: false, ..facts::Variant::checked(F::DTYPE) }, [F::DTYPE; A]).unwrap();
+        let views = args.each_ref().map(|a| F::view(match a { Arg::One(v) => std::slice::from_ref(v), Arg::Many(s) => s }));
+        let mut out = F::buffer(vec![F::one()]);
+        crate::support::map(&kernel, views, n, &mut out).unwrap();
+        let out = F::vec(out).unwrap();
+        assert_eq!((out.len(), out[0]), (n + 1, F::one()), "{name}");
+        for i in 0..n {
+            let x = args.map(|a| match a { Arg::One(v) => v, Arg::Many(s) => s[i] });
+            assert!(same(out[i + 1], facts::formula_at(k, x)), "{name}{x:?}");
+        }
+    }
+
+    fn binary<F: Float + buffer::Element + Debug, K: facts::Formula<2>>(k: K, name: &str) {
         let items = items::<F>();
-        let check = |x: Arg<'_, F>, y: Arg<'_, F>, n: usize| {
-            let at = |a: Arg<'_, F>, i| match a { Arg::One(v) => v, Arg::Many(s) => s[i] };
-            let mut out = vec![F::one()];
-            let ok = k.many(x, y, n, &mut out);
-            assert_eq!((out.len(), out[0]), (n + 1, F::one()), "{name}");
-            for i in 0..n { assert!(same(out[i + 1], k.one(at(x, i), at(y, i))), "{name}({:?}, {:?})", at(x, i), at(y, i)) }
-            assert_eq!(ok, (0..n).all(|i| k.checked(at(x, i), at(y, i)).is_some()), "{name}");
-            if !K::TOTAL {
-                assert_eq!(ok, (0..n).all(|i| !out[i + 1].is_nan() || [at(x, i), at(y, i)].iter().any(|v| v.is_nan())), "{name} breaks the NaN rule")
-            }
-            assert!(ok || !K::TOTAL, "{name} is total but fails");
-        };
         let (xs, ys): (Vec<F>, Vec<F>) = items.iter().flat_map(|&x| items.iter().map(move |&y| (x, y))).unzip();
-        check(Arg::Many(&xs), Arg::Many(&ys), xs.len());
+        check(&k, name, [Arg::Many(&xs), Arg::Many(&ys)], xs.len());
         for &v in &items {
-            check(Arg::One(v), Arg::Many(&items), items.len());
-            check(Arg::Many(&items), Arg::One(v), items.len());
+            check(&k, name, [Arg::One(v), Arg::Many(&items)], items.len());
+            check(&k, name, [Arg::Many(&items), Arg::One(v)], items.len());
         }
     }
 
-    /// `k.many` against `k.one` for each of `items`, and for each item as `Arg::One`, as for `binary`.
-    fn unary<F: Float + Debug, K: Unary<F, Out = F>>(k: K, name: &str, items: &[F]) {
-        let check = |x: Arg<'_, F>, n: usize| {
-            let at = |i| match x { Arg::One(v) => v, Arg::Many(s) => s[i] };
-            let mut out = vec![F::one()];
-            let ok = k.many(x, n, &mut out);
-            assert_eq!((out.len(), out[0]), (n + 1, F::one()), "{name}");
-            for i in 0..n { assert!(same(out[i + 1], k.one(at(i))), "{name}({:?})", at(i)) }
-            assert_eq!(ok, (0..n).all(|i| k.checked(at(i)).is_some()), "{name}");
-            if !K::TOTAL { assert_eq!(ok, (0..n).all(|i| !out[i + 1].is_nan() || at(i).is_nan()), "{name} breaks the NaN rule") }
-            assert!(ok || !K::TOTAL, "{name} is total but fails");
-        };
-        check(Arg::Many(items), items.len());
-        for &v in items { check(Arg::One(v), 3) }
+    fn unary<F: Float + buffer::Element + Debug, K: facts::Formula<1>>(k: K, name: &str, items: &[F]) {
+        check(&k, name, [Arg::Many(items)], items.len());
+        for &v in items { check(&k, name, [Arg::One(v)], 3) }
     }
 
-    /// `k.many` against `k.one` for every triple of `items`, as `Many` arguments and with each argument in turn as `One`, as for `binary`.
-    fn ternary<F: Float + Debug, K: Ternary<F, Out = F>>(k: K, name: &str) {
+    fn ternary<F: Float + buffer::Element + Debug, K: facts::Formula<3>>(k: K, name: &str) {
         let items = items::<F>();
-        let at = |a: Arg<'_, F>, i| match a { Arg::One(v) => v, Arg::Many(s) => s[i] };
-        let check = |[x, y, z]: [Arg<'_, F>; 3], n: usize| {
-            let mut out = vec![F::one()];
-            let ok = k.many(x, y, z, n, &mut out);
-            assert_eq!((out.len(), out[0]), (n + 1, F::one()), "{name}");
-            for i in 0..n {
-                assert!(same(out[i + 1], k.one(at(x, i), at(y, i), at(z, i))), "{name}({:?}, {:?}, {:?})", at(x, i), at(y, i), at(z, i))
-            }
-            assert_eq!(ok, (0..n).all(|i| k.checked(at(x, i), at(y, i), at(z, i)).is_some()), "{name}");
-            if !K::TOTAL {
-                assert_eq!(ok, (0..n).all(|i| !out[i + 1].is_nan() || [at(x, i), at(y, i), at(z, i)].iter().any(|v| v.is_nan())), "{name} breaks the NaN rule")
-            }
-            assert!(ok || !K::TOTAL, "{name} is total but fails");
-        };
         let (mut xs, mut ys, mut zs) = (Vec::new(), Vec::new(), Vec::new());
-        for &x in &items {
-            for &y in &items {
-                for &z in &items {
-                    xs.push(x);
-                    ys.push(y);
-                    zs.push(z);
-                }
-            }
-        }
-        check([Arg::Many(&xs), Arg::Many(&ys), Arg::Many(&zs)], xs.len());
+        for &x in &items { for &y in &items { for &z in &items { xs.push(x); ys.push(y); zs.push(z); } } }
+        check(&k, name, [Arg::Many(&xs), Arg::Many(&ys), Arg::Many(&zs)], xs.len());
         for &v in &items {
-            check([Arg::One(v), Arg::Many(&items), Arg::Many(&items)], items.len());
-            check([Arg::Many(&items), Arg::One(v), Arg::Many(&items)], items.len());
-            check([Arg::Many(&items), Arg::Many(&items), Arg::One(v)], items.len());
+            check(&k, name, [Arg::One(v), Arg::Many(&items), Arg::Many(&items)], items.len());
+            check(&k, name, [Arg::Many(&items), Arg::One(v), Arg::Many(&items)], items.len());
+            check(&k, name, [Arg::Many(&items), Arg::Many(&items), Arg::One(v)], items.len());
         }
     }
 
@@ -203,10 +169,6 @@ mod forms {
             assert!(x.iter().zip(&out).all(|(&v, &r)| same(r, Logb.one(b, v))), "Logb at base {b}");
             assert_eq!(ok, x.iter().all(|&v| Logb.checked(b, v).is_some()), "Logb at base {b}");
         }
-        assert!(
-            <Exp as Results<f64, 1>>::TOTAL && <Maximum as Results<f32, 2>>::TOTAL && !<Pow as Results<f64, 2>>::TOTAL && !<Sqrt as Results<f16, 1>>::TOTAL
-        );
-        assert!(<Add as Results<i64, 2>>::WRAPS && <Pow as Results<u8, 2>>::WRAPS && !<Add as Results<f64, 2>>::WRAPS && !<Binom as Results<i64, 2>>::WRAPS);
     }
 
     /// An output type other than the item type, at each float type, f16 included, and at concrete complex types. A `bool` output is never NaN, so it never fails.
@@ -231,7 +193,7 @@ mod reductions {
     use half::f16;
     use num_complex::Complex;
     use rustymath::reduce::*;
-    use rustymath::{Add, Arg, Binary, Subtract, tolerant::{Less, Tolerance}};
+    use rustymath::{Arg, Binary, tolerant::{Less, Tolerance}};
 
     /// Each reduction and scan against the same taken item by item, in order: sums and running sums of `sums`, and the product of `prods`. Their items keep every sum and product exact at every width, so any grouping gives the same result.
     fn exact<T: Copy + PartialEq + std::fmt::Debug, S: Copy + PartialEq + std::fmt::Debug>(
@@ -423,10 +385,10 @@ mod reductions {
             assert!(scan_along::<i64, Sum>(&x, shape, Some(10), &mut out));
             assert_eq!(out, want, "{shape:?}");
             let mut ordered = Vec::new();
-            assert!(left_scan(&Add, &x, shape, Some(10), &mut ordered));
+            assert!(left_scan(&x, shape, Some(&[10]), &mut ordered, |a: i64, b| { let (v, overflow) = a.overflowing_add(b); (v, !overflow) }));
             assert_eq!(ordered, want, "{shape:?}");
             ordered.clear();
-            assert!(left_scan(&Subtract, &x, shape, None, &mut ordered));
+            assert!(left_scan(&x, shape, None, &mut ordered, |a: i64, b| { let (v, overflow) = a.overflowing_sub(b); (v, !overflow) }));
             let mut running = Vec::new();
             difference_scan_along(&x, shape, None, &mut running);
             assert_eq!(running, ordered, "{shape:?}");
@@ -444,7 +406,7 @@ mod reductions {
             assert_eq!(differences, want, "{shape:?}");
             for seed in [None, Some(10)] {
                 ordered.clear();
-                assert!(left_scan(&Less(Tolerance::EXACT), &x, shape, seed, &mut ordered));
+                assert!(left_scan(&x, shape, seed.as_ref().map(std::slice::from_ref), &mut ordered, |a, b| (i64::from(Less(Tolerance::EXACT).one(a, b)), true)));
                 let starts = seed.map(|s| x.chunks((len * inner).max(1)).flat_map(|lane| lane[..inner].iter().map(move |&v| s < v)).collect::<Vec<_>>());
                 let (bits, ok) =
                     comparison_scan(&x, shape, starts.as_deref(), 0, 1, &|t, xs, out| Less(Tolerance::EXACT).many(t, Arg::Many(xs), xs.len(), out));
@@ -526,8 +488,8 @@ mod reductions {
         assert!(!along::<i64, Sum>(&[i64::MAX, 1], [1, 2, 1]).1);
         assert!(!along::<i64, Sum>(&[i64::MAX, 0, 1, 0], [1, 2, 2]).1);
         assert!(!scan_along::<i64, Sum>(&[i64::MAX, 0, 1, 0], [1, 2, 2], None, &mut Vec::new()));
-        assert!(!left_scan(&Add, &[i64::MAX, 1], [1, 2, 1], None, &mut Vec::new()));
-        assert!(!left_scan(&Add, &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i64::MAX, 1], [8, 2, 1], None, &mut Vec::new()));
+        assert!(!left_scan(&[i64::MAX, 1], [1, 2, 1], None, &mut Vec::new(), |a: i64, b| { let (v, overflow) = a.overflowing_add(b); (v, !overflow) }));
+        assert!(!left_scan(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i64::MAX, 1], [8, 2, 1], None, &mut Vec::new(), |a: i64, b| { let (v, overflow) = a.overflowing_add(b); (v, !overflow) }));
     }
 
     /// Each window's fold matches the same reduction of that window's items alone, for windows folded directly, across the blocks of a long lane and by van Herk-Gil-Werman, a last block cut short, a window as wide as its lane, and windows down rows. A float maximum skips each NaN item, as `Max::step` does. Each window's pick is its first row that gives its maximum or minimum, and so is each whole lane's pick and each running pick. A sum that wraps reports it.
@@ -1014,7 +976,7 @@ mod tolerant {
     fn against_one<F: Float + std::fmt::Debug>(t: Tolerance, items: &[f64]) where Equal: Binary<F, Out = bool>, NotEqual: Binary<F, Out = bool>,
         Less: Binary<F, Out = bool>, LessEqual: Binary<F, Out = bool>, Greater: Binary<F, Out = bool>, GreaterEqual: Binary<F, Out = bool>,
         Matches: Binary<F, Out = bool> {
-        fn check<F: Copy + std::fmt::Debug, K: Binary<F, Out = bool> + std::fmt::Debug>(k: K, x: &[F]) {
+        fn check<F: Copy + Sync + std::fmt::Debug, K: Binary<F, Out = bool> + std::fmt::Debug>(k: K, x: &[F]) {
             for &c in x {
                 let (mut left, mut right) = (Vec::new(), Vec::new());
                 assert!(k.many(Arg::Many(x), Arg::One(c), x.len(), &mut left) & k.many(Arg::One(c), Arg::Many(x), x.len(), &mut right));
@@ -1216,17 +1178,16 @@ mod gather {
             }
         }
     }
-    /// A copy's cotangent goes back to its source through `Transpose`'s reads, which add up to what a scatter-add of each item at its offset gives: windows whose frames move by 1 to 4 positions from several starts, windows whose positions move by 2, and windows along two axes.
+    /// Overlapping window writes accumulate every contribution at its source position.
     #[test]
-    fn transposed_windows_read_back_as_a_scatter_adds() {
-        use rustymath::structure::{Back, Transpose};
+    fn window_writes_accumulate() {
+        use rustymath::gather::Writes;
         let check = |source: &[usize], shape: &[usize], tables: Vec<Steps>| {
             let u: Vec<i64> = (1..=shape.iter().product::<usize>() as i64).collect();
             let mut scattered = vec![0; source.iter().product()];
             for (i, &x) in u.iter().enumerate() { scattered[Steps::reach(0, &tables, i).expect("windows read no fill")] += x; }
-            let Back::Reads(reads) = Transpose::new(&tables, shape, source).back else { panic!("{tables:?} scatter-adds") };
             let mut summed = vec![0; scattered.len()];
-            for r in &reads { for (sum, x) in summed.iter_mut().zip(read(&u, 0, r)) { if x != -1 { *sum += x; } } }
+            assert!(Writes::Walk { base: 0, steps: &tables }.fold::<rustymath::reduce::Sum, i64>(&mut summed, rustymath::Arg::Many(&u)));
             assert_eq!(summed, scattered, "{tables:?}");
         };
         for (s, start) in [(1, 0), (1, 2), (2, 0), (2, 1), (3, 0), (3, 2), (4, 1)] {
@@ -1353,47 +1314,3 @@ mod gather {
     }
 }
 
-mod templates {
-    use rustymath::{gather::Steps, layout::Layout, structure::{self, Bounded, Count, Edge, Lengths, Traced, WindowAxis, Windows, evaluate}};
-
-    type Build = fn(&Bounded, &[Traced]) -> Vec<Steps<Traced>>;
-    type Plan = fn(&[usize]) -> Vec<Steps>;
-
-    fn count(o: &Bounded, n: i64) -> Count<Traced> { Count { negative: n < 0, magnitude: o.number(n.unsigned_abs() as usize) } }
-    fn layout(shape: &[usize]) -> Layout { Layout::from(shape.to_vec()) }
-    fn windows(shape: &[usize], edge: Option<Edge>) -> Windows { Windows::new(&[3], &[], |_| edge, shape).unwrap() }
-    fn axes(o: &Bounded, edge: Option<Edge>) -> [WindowAxis<Traced>; 1] { [WindowAxis { size: o.number(3), step: o.number(1), edge }] }
-
-    /// Each builder's template, made where the first axis has traced length 6, fills at every length of that length's bucket to the steps that the builder gives at that length.
-    #[test]
-    fn templates_fill_to_each_lengths_plan() {
-        let cases: [(&str, Build, Plan); 11] = [
-            ("take ¯2", |o, s| structure::take_steps(o, s, &[(0, count(o, -2))], true).unwrap(), |s| structure::take(&layout(s), &[(0, Count::of(-2))], true).unwrap().steps),
-            ("take 9", |o, s| structure::take_steps(o, s, &[(0, count(o, 9))], true).unwrap(), |s| structure::take(&layout(s), &[(0, Count::of(9))], true).unwrap().steps),
-            ("drop 1", |o, s| structure::take_steps(o, s, &[(0, count(o, 1))], false).unwrap(), |s| structure::take(&layout(s), &[(0, Count::of(1))], false).unwrap().steps),
-            ("rotate 2", |o, s| structure::rotate_steps(o, s, 0, Some(count(o, 2))), |s| structure::rotate(&layout(s), 0, Some((&[][..], &[2][..]))).unwrap().steps),
-            ("reverse", |o, s| structure::rotate_steps(o, s, 0, None), |s| structure::rotate(&layout(s), 0, None).unwrap().steps),
-            ("rotate ¯1 on axis 1", |o, s| structure::rotate_steps(o, s, 1, Some(count(o, -1))), |s| structure::rotate(&layout(s), 1, Some((&[][..], &[-1][..]))).unwrap().steps),
-            ("pad, fill", |o, s| structure::pad_steps(o, s, &[(o.number(1), o.number(2)), (o.number(0), o.number(0))], Edge::Fill).unwrap(),
-                |s| structure::pad(&layout(s), &[(1, 2), (0, 0)], Edge::Fill).unwrap().steps),
-            ("pad, clamp", |o, s| structure::pad_steps(o, s, &[(o.number(1), o.number(2)), (o.number(0), o.number(0))], Edge::Clamp).unwrap(),
-                |s| structure::pad(&layout(s), &[(1, 2), (0, 0)], Edge::Clamp).unwrap().steps),
-            ("transpose", |o, s| structure::transpose_steps(o, s, &[1, 0]).unwrap(), |s| structure::transpose(&layout(s), &[1, 0]).unwrap().steps),
-            ("windows", |o, s| { let a = axes(o, None); structure::window_steps(o, &structure::windowed(o, s, &a).unwrap(), &a, s) },
-                |s| { let w = windows(s, None); w.plan(&layout(&[w.frame(), w.cell()].concat()), s).unwrap().steps }),
-            ("padded windows' padding", |o, s| { let a = axes(o, Some(Edge::Fill)); structure::window_padding_steps(o, s, &a, &structure::windowed(o, s, &a).unwrap()).unwrap() },
-                |s| windows(s, Some(Edge::Fill)).padding().unwrap().steps),
-        ];
-        for (name, build, plan) in cases {
-            let table = Bounded::new(1);
-            let shape = [Traced { len: 6, entry: Some(0) }, table.number(3)];
-            let template = build(&table, &shape);
-            let formulas = table.into_formulas();
-            for n in 5..=8 {
-                let mut extents = Vec::new();
-                evaluate(&formulas, [n], &mut extents).unwrap_or_else(|| panic!("{name}: length {n} answers a traced decision otherwise"));
-                assert_eq!(template.iter().map(|s| s.at(&extents)).collect::<Vec<_>>(), plan(&[n, 3]), "{name} at length {n}");
-            }
-        }
-    }
-}

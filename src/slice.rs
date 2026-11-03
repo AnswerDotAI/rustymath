@@ -544,15 +544,6 @@ pub(crate) fn two_pass<R, O, const N: usize>(
     ok
 }
 
-/// [`two_pass`] with both item bodies marked `#[inline(always)]`, as [`each!`] marks its body.
-macro_rules! two_pass {
-    ($x:expr, $n:expr, $out:expr, |$fa:pat_param| $fast:expr, |$sa:pat_param| $f:expr $(,)?) => {
-        crate::slice::two_pass(
-            $x, $n, $out, #[inline(always)] |$fa| $fast, #[inline(always)] |$sa| $f,
-        )
-    };
-}
-
 /// Writes `f` for each of `n` results into `out`, for complex arguments `x`, through real slice forms. The items split into a slice of real parts and a slice of imaginary parts for each argument, with a `One` argument repeated. `fast` computes the results' real and imaginary parts from those slices, through real slice forms, and appends them. Each result that `rare` picks, from its arguments and its fast value, then takes `f`, the scalar function, which handles what the fast formula doesn't, such as tiny or infinite parts. The results succeed as [`each`] judges them. Slice forms call it through [`split!`].
 pub(crate) fn split<R: crate::Native, const N: usize>(
     x: [Arg<'_, Complex<R>>; N], n: usize, out: &mut [MaybeUninit<Complex<R>>], fast: impl Fn([(&[R], &[R]); N], &mut Vec<R>, &mut Vec<R>),

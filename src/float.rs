@@ -21,6 +21,8 @@ pub trait Float: num_traits::Float + sealed::Sealed + crate::slice::KernelItem {
     fn next_up(self) -> Self;
     /// The greatest float of this type below `self`, as `f64::next_down` gives it.
     fn next_down(self) -> Self;
+    /// Rounds to the nearest whole number, with ties to even.
+    fn round_ties_even(self) -> Self;
     /// The unsigned type, of this float's width, that `order_key` gives.
     type OrderKey: RadixKey + Key;
     /// A key whose unsigned order is the order of `total_cmp`, after `¯0` becomes `0` and every NaN becomes one NaN. So `¯0` and `0` share a key, NaN's key follows every other, and two floats match exactly when their keys are equal.
@@ -158,6 +160,8 @@ macro_rules! native {
             fn next_up(self) -> $t { $t::next_up(self) }
             #[inline]
             fn next_down(self) -> $t { $t::next_down(self) }
+            #[inline]
+            fn round_ties_even(self) -> Self { $t::round_ties_even(self) }
             order_key!($bits);
         }
         impl Native for $t {
@@ -243,6 +247,8 @@ impl Float for half::f16 {
     }
     #[inline]
     fn next_down(self) -> Self { -(-self).next_up() }
+    #[inline]
+    fn round_ties_even(self) -> Self { half::f16::from_f32(self.to_f32().round_ties_even()) }
     order_key!(u16);
 }
 

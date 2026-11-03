@@ -21,7 +21,7 @@ pub enum Mapping {
 }
 
 /// What an unmapped position reads. Input plans use the output position; Scalar broadcasts one source item.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Missing { Default, Input(ReadPlan), Scalar(usize), Invalid }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -397,7 +397,7 @@ impl Read<'_> {
     pub fn read_into(&self, range: Range<usize>, dtype: crate::buffer::DType, checked: bool, output: &mut crate::buffer::Buffer) -> Result<(), Error> {
         self.range(&range)?;
         if output.dtype() != dtype { *output = crate::buffer::Buffer::with_capacity(dtype, range.len()); }
-        crate::with_dtype!(dtype, T => {
+        with_dtype!(dtype, T => {
             let items = T::vec_mut(output).expect("output has the selected dtype");
             if let Some((view, stride)) = self.storage_run(&range, dtype) {
                 let source = T::of(view).expect("a typed read selected its dtype");

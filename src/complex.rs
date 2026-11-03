@@ -183,7 +183,7 @@ pub(crate) fn pow<R: Native, const FUSED: bool>(z: Complex<R>, w: Complex<R>) ->
 }
 
 pub(crate) fn nth_root<R: Native, const FUSED: bool>(n: Complex<R>, y: Complex<R>) -> Complex<R> {
-    if n == c(R::zero(), R::zero()) || !n.is_finite() { return c(R::nan(), R::nan()); }
+    if n == c(R::zero(), R::zero()) || !finite(n) { return c(R::nan(), R::nan()); }
     if n == c(R::narrow(2.0), R::zero()) { sqrt::<R, FUSED>(y) }
     else { pow::<R, FUSED>(y, divide(c(R::one(), R::zero()), n)) }
 }

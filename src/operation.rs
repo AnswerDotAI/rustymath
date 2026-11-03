@@ -245,7 +245,7 @@ impl Kernel {
         macro_rules! kernel { ($object:expr) => { crate::facts::Formula::kernel(&$object, variant) }; }
         match op {
             Add => kernel!(crate::Add), Subtract => kernel!(crate::Subtract), Multiply => kernel!(crate::Multiply), Divide => kernel!(crate::Divide),
-            Larger => kernel!(crate::Maximum), Smaller => kernel!(crate::Minimum), Binom => kernel!(crate::Binom),
+            Larger => kernel!(crate::reduce::Maximum), Smaller => kernel!(crate::reduce::Minimum), Binom => kernel!(crate::Binom),
             BinomDn => kernel!(crate::BinomDn), BinomDk => kernel!(crate::BinomDk), Polygamma => kernel!(crate::Polygamma), BitAnd => kernel!(crate::BitAnd),
         }
     }
@@ -657,7 +657,7 @@ fn map_formula<K: crate::facts::Formula<N>, const N: usize>(
 ) -> Result<(), Error> {
     if inputs.len() != N { return Err(Error::new(Kind::Length, "kernel operand count changed")); }
     if let Some(slices) = object.native_slices() {
-        let valid = |ok| if variant.checked && !ok { Err(Kind::Domain) } else { Ok(()) };
+        let valid = |ok: bool| if variant.checked && !ok { Err(Kind::Domain) } else { Ok(()) };
         return match variant.dtype {
             DType::Float(FloatWidth::F64) => map_blocks::<f64, f64, N>(inputs, range, variant.checked, output,
                 &|args, n, out| valid((slices.double)(object, args, n, out))),
