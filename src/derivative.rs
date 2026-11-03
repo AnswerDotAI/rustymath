@@ -59,7 +59,7 @@ pub(crate) fn binom_dk_slopes<F: Float, O: Ops<F> + ?Sized>(o: &O, [n, k]: [O::V
 ///
 /// At x = 0 every route gives the slope's limit from above, as JAX does: 0 for a y above 1, 1 for a y of 1, ∞ for a y between 0 and 1, 0 for a y of 0 and -∞ for a y below 0.
 #[inline(always)]
-fn power_slope<F: Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, y: O::V, r: O::V, halves: bool) -> O::V {
+pub fn power_slope<F: Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, y: O::V, r: O::V, halves: bool) -> O::V {
     let (zero, one) = (o.number(F::zero()), o.number(F::one()));
     match o.constant(y).map(|c| (c, c - F::one())) {
         Some((c, _)) if c == F::one() => one,
@@ -84,11 +84,19 @@ fn power_slope<F: Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, y: O::V, r: O::V, h
     }
 }
 
+/// `y x^(y-1)` as a smooth expression, avoiding `0 * 0^-1` where both arguments are zero.
+#[inline(always)]
+pub fn reduced_power_slope<F: Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, y: O::V) -> O::V {
+    let (zero, one) = (o.number(F::zero()), o.number(F::one()));
+    let base = o.select(o.and(o.equal(x, zero), o.equal(y, zero)), one, x);
+    o.multiply(y, o.real_power(base, o.subtract(y, one)))
+}
+
 /// The slopes of x^y: in x as `power_slope` gives it, and in y r ln x, which is 0 where x isn't positive, where x stands in as 1.
 #[inline(always)]
 pub(crate) fn power<F: Float, O: Ops<F> + ?Sized>(o: &O, [x, y]: [O::V; 2], r: O::V, [nx, ny]: [bool; 2]) -> [Option<O::V>; 2] {
     let zero = o.number(F::zero());
-    [nx.then(|| power_slope(o, x, y, r, true)), ny.then(|| o.multiply(r, o.ln(o.larger(x, o.one_where(o.less_equal(x, zero))))))]
+    [nx.then(|| o.power_slope(x, y, r, true)), ny.then(|| o.multiply(r, o.ln(o.larger(x, o.one_where(o.less_equal(x, zero))))))]
 }
 
 /// The slopes of the real part of the principal x^y (`RealPow`): in x as `power_slope` gives it, and in y the real part of x^y ln x, with ln x = ln|x| + iπ below 0: r ln|x| - π |x|^y sin πy. ln|x| is 0 at x = 0, as `power`'s is where x isn't positive.
@@ -96,7 +104,7 @@ pub(crate) fn power<F: Float, O: Ops<F> + ?Sized>(o: &O, [x, y]: [O::V; 2], r: O
 pub(crate) fn real_power<F: Float, O: Ops<F> + ?Sized>(o: &O, [x, y]: [O::V; 2], r: O::V, [nx, ny]: [bool; 2]) -> [Option<O::V>; 2] {
     let zero = o.number(F::zero());
     [
-        nx.then(|| power_slope(o, x, y, r, false)), ny.then(|| {
+        nx.then(|| o.power_slope(x, y, r, false)), ny.then(|| {
             let ln = o.ln(o.select(o.equal(x, zero), o.number(F::one()), o.magnitude(x)));
             // The select's cases are atoms, so its mask, built from x, needs no layout of y's.
             let below = o.select(o.less(x, zero), o.number(F::narrow(core::f64::consts::PI)), zero);

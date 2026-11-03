@@ -3,7 +3,7 @@ use crate::error::{Error, Kind};
 pub use crate::slice::running;
 use crate::{
     Arg, Float, Native, agreement::{Mapping, Read, Walked, expanded_items}, arith::Overflowing, buffer::{Buffer, Element, View}, facts::Variant,
-    float::sealed::{Core, Folds}, gather::Steps, layout::Lanes, linalg::Scalar, operation::{Positions, at_typed}, parallel, slice::{CHUNK, appended, written}
+    float::sealed::{Core, Folds}, gather::Steps, layout::Lanes, linalg::Scalar, parallel, slice::{CHUNK, appended, written}
 };
 use half::f16;
 use num_complex::Complex;
@@ -2388,19 +2388,6 @@ impl Reduce {
         native_reduction!(self, variant.dtype, variant.checked && !variant.wrapping, |R, T| Some(native_scan::<T, R>(
             dims, seed, direction, variant.checked, input, output
         ))).unwrap_or_else(|| Err(Error::new(Kind::Domain, "scan does not support this dtype")))
-    }
-    pub(crate) fn run_at(self, variant: Variant, values: Read<'_>, ids: Positions<'_>, checked: bool, output: &mut Buffer) -> Option<Result<(), Error>> {
-        native_reduction!(self, variant.dtype, variant.checked && !variant.wrapping, |R, T| {
-            type S = <R as Reduction<T>>::Total;
-            (S::DTYPE == output.dtype()).then(|| {
-                at_typed::<S>(
-                    values, ids, checked, Some(|x, y| {
-                        let (value, ok) = <R as Reduction<T>>::chain(x, y);
-                        (value, (!ok && variant.checked && !variant.wrapping).then_some(Kind::Overflow))
-                    }), output,
-                )
-            })
-        })
     }
 }
 

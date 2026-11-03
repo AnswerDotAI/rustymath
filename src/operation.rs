@@ -3,6 +3,7 @@
 //! [`DType::computes_in`] promotes unsupported Boolean and integer inputs to i64, then to the NumPy float width. Unsupported character arithmetic is a domain error.
 use crate::buffer::{Buffer, DType, Element, FloatWidth, Source, View, Width};
 use crate::error::{Error, Kind};
+use crate::reduce::native_reduction;
 use crate::slice::Arg;
 
 /// Numeric settings rebound for each execution, outside item loops.
@@ -136,7 +137,8 @@ trait Application: Send + Sync {
         &self, variant: crate::facts::Variant, shape: &[usize], axis: usize, seed: Seed<'_>, direction: Direction, settings: Settings,
         input: crate::agreement::Read<'_>, output: &mut Buffer) -> Result<(), Error>;
     fn at(
-        &self, variant: crate::facts::Variant, values: crate::agreement::Read<'_>, ids: Positions<'_>, checked: bool, settings: Settings, output: &mut Buffer
+        &self, variant: crate::facts::Variant, root: WriteRoot<'_>, values: crate::agreement::Read<'_>, ids: Positions<'_>, checked: bool, codes: bool,
+        settings: Settings, output: &mut Buffer
     ) -> Result<(), Error>;
     fn scan(
         &self, variant: crate::facts::Variant, dims: [usize; 3], seed: Seed<'_>, direction: Direction, settings: Settings, input: crate::agreement::Read<'_>,
@@ -228,8 +230,9 @@ impl<K: crate::facts::Formula<N>, const N: usize> Application for Definition<K, 
         fold_read_formula::<K, N>(&self.object, variant, shape, axis, seed, direction, settings, input, output)
     }
     fn at(
-        &self, variant: crate::facts::Variant, values: crate::agreement::Read<'_>, ids: Positions<'_>, checked: bool, settings: Settings, output: &mut Buffer
-    ) -> Result<(), Error> { at_formula(&self.object, variant, values, ids, checked, settings, output) }
+        &self, variant: crate::facts::Variant, root: WriteRoot<'_>, values: crate::agreement::Read<'_>, ids: Positions<'_>, checked: bool, codes: bool,
+        settings: Settings, output: &mut Buffer
+    ) -> Result<(), Error> { at_formula(&self.object, variant, root, values, ids, checked, codes, settings, output) }
     fn scan(
         &self, variant: crate::facts::Variant, dims: [usize; 3], seed: Seed<'_>, direction: Direction, settings: Settings, input: crate::agreement::Read<'_>,
         output: &mut Buffer) -> Result<(), Error> { scan_formula(&self.object, variant, dims, seed, direction, settings, input, output) }
@@ -634,11 +637,13 @@ pub fn at(
         for start in (0..n).step_by(crate::CHUNK) { ids.chunk(start..n.min(start + crate::CHUNK), len, checked, &mut scratch)?; }
     }
     let codes = combine.is_some_and(|kernel| matches!(kernel.characters, Some(crate::characters::Policy::Codes { .. })));
-    root.initialize(combine.map_or(wanted, |kernel| kernel.variant.dtype), checked, codes, output)?;
     match combine {
-        None => with_dtype!(wanted, T => at_typed::<T>(values, ids, checked, None::<fn(T, T) -> (T, Option<Kind>)>, output))?,
-        Some(kernel) if codes => with_codes(&[values], None, |inputs| kernel.definition.at(kernel.variant, inputs[0], ids, checked, settings, output))?,
-        Some(kernel) => kernel.definition.at(kernel.variant, values, ids, checked, settings, output)?,
+        None => {
+            root.initialize(wanted, checked, false, output)?;
+            with_dtype!(wanted, T => at_typed::<T>(values, ids, checked, None::<fn(T, T) -> (T, Option<Kind>)>, output))?;
+        },
+        Some(kernel) if codes => with_codes(&[values], None, |inputs| kernel.definition.at(kernel.variant, root, inputs[0], ids, checked, true, settings, output))?,
+        Some(kernel) => kernel.definition.at(kernel.variant, root, values, ids, checked, false, settings, output)?,
     }
     finish(output, wanted, checked)
 }
@@ -723,16 +728,16 @@ macro_rules! with_binary_body {
             },
             DType::Float(FloatWidth::F16 | FloatWidth::F32) => {
                 type $T = f32;
-                let $apply = |x, y| real_value(object, variant, &ops, std::array::from_fn(|i| if i == 0 { x } else { y }), true);
+                let $apply = |x: $T, y: $T| real_value(object, variant, &ops, std::array::from_fn(|i| if i == 0 { x } else { y }), true);
                 $body
             },
             DType::Float(FloatWidth::F64) => {
                 type $T = f64;
-                let $apply = |x, y| real_value(object, variant, &ops, std::array::from_fn(|i| if i == 0 { x } else { y }), true);
+                let $apply = |x: $T, y: $T| real_value(object, variant, &ops, std::array::from_fn(|i| if i == 0 { x } else { y }), true);
                 $body
             },
             DType::Complex(w) => with_complex_width!(w, $T => {
-                let $apply = |x, y| complex_value(object, variant, &ops, std::array::from_fn(|i| if i == 0 { x } else { y }));
+                let $apply = |x: $T, y: $T| complex_value(object, variant, &ops, std::array::from_fn(|i| if i == 0 { x } else { y }));
                 $body
             }),
             DType::Character => Err(Error::new(Kind::Domain, "a numerical body needs code-point inputs for characters")),
@@ -741,11 +746,28 @@ macro_rules! with_binary_body {
 }
 
 fn at_formula<K: crate::facts::Formula<N>, const N: usize>(
-    object: &K, variant: crate::facts::Variant, values: crate::agreement::Read<'_>, ids: Positions<'_>, checked: bool, settings: Settings, output: &mut Buffer
+    object: &K, variant: crate::facts::Variant, root: WriteRoot<'_>, values: crate::agreement::Read<'_>, ids: Positions<'_>, checked: bool, codes: bool,
+    settings: Settings, output: &mut Buffer
 ) -> Result<(), Error> {
     if N != 2 { return Err(Error::new(Kind::Length, "a modified write needs a binary function")); }
-    if let Some(result) = object.fold().and_then(|r| r.run_at(variant, values, ids, checked, output)) { return result; }
-    with_binary_body!(object, variant, settings, |T, apply| at_typed::<T>(values, ids, checked, Some(apply), output))
+    let working = with_binary_body!(object, variant, settings, |T, _apply| Ok(T::DTYPE))?;
+    if let Some(fold) = object.fold() {
+        native_reduction!(fold, variant.dtype, variant.checked && !variant.wrapping, |R, T| {
+            type S = <R as crate::reduce::Reduction<T>>::Total;
+            if S::DTYPE == variant.dtype || S::DTYPE == working {
+                root.initialize(S::DTYPE, checked, codes, output)?;
+                return at_typed::<S>(values, ids, checked, Some(|x, y| {
+                    let (value, ok) = <R as crate::reduce::Reduction<T>>::chain(x, y);
+                    (value, (!ok && variant.checked && !variant.wrapping).then_some(Kind::Overflow))
+                }), output);
+            }
+            None::<()>
+        });
+    }
+    with_binary_body!(object, variant, settings, |T, apply| {
+        root.initialize(T::DTYPE, checked, codes, output)?;
+        at_typed::<T>(values, ids, checked, Some(apply), output)
+    })
 }
 
 fn map_formula<K: crate::facts::Formula<N>, const N: usize>(

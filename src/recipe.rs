@@ -124,6 +124,12 @@ pub trait Ops<F: Float> {
     /// `x` raised to `k`, a constant that `Exponent::of` routes off the general route, as [`power`] gives it.
     #[inline(always)]
     fn power(&self, k: F, x: Self::V) -> Self::V { power(self, Exponent::of(k.wide()), x).expect("an exponent off the general route") }
+    /// The real part of `x^y` through the existing power formula.
+    #[inline(always)]
+    fn real_power(&self, x: Self::V, y: Self::V) -> Self::V { crate::pow::real_formula(self, x, y) }
+    /// The partial in `x` of `x^y = r`; `halves` permits constant half-integer powers.
+    #[inline(always)]
+    fn power_slope(&self, x: Self::V, y: Self::V, r: Self::V, halves: bool) -> Self::V { crate::derivative::power_slope(self, x, y, r, halves) }
     named! {
         unary: negate Negate, magnitude Magnitude, sqrt Sqrt, floor Floor, ln Ln, sin Sin, cos Cos, sinh Sinh, cosh Cosh, sqrt1mx2 Sqrt1mx2, sqrt1px2 Sqrt1px2, digamma Digamma, exp Exp, lgamma Lgamma, complement Not;
         binary: add Add, subtract Subtract, multiply Multiply, divide Divide, larger Larger, smaller Smaller, binom Binom, binom_dn BinomDn, binom_dk BinomDk, polygamma Polygamma, bit_and BitAnd;
