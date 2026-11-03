@@ -780,6 +780,7 @@ impl Agreement {
         Self::mapped(left, right, &(0..nx).collect::<Vec<_>>(), &(nx..nx + right.shape().len()).collect::<Vec<_>>(), false)
     }
     pub fn mapped(left: &Layout, right: &Layout, xa: &[usize], ya: &[usize], left_keys: bool) -> Result<Self, Error> {
+        if xa.len() != left.shape().len() || ya.len() != right.shape().len() { return Err(Error::new(Kind::Length, "axis maps must match input ranks")); }
         let mut shape = vec![1; xa.iter().chain(ya).max().map_or(0, |a| a + 1)];
         let mut keys = vec![None; shape.len()];
         let mut names = vec![None; shape.len()];

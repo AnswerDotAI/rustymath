@@ -3,6 +3,7 @@
 //! [`DType::computes_in`] promotes unsupported Boolean and integer inputs to i64, then to the NumPy float width. Unsupported character arithmetic is a domain error.
 use crate::buffer::{Buffer, DType, Element, FloatWidth, Source, View, Width};
 use crate::error::{Error, Kind};
+use crate::facts::Range;
 use crate::reduce::native_reduction;
 use crate::slice::Arg;
 
@@ -319,8 +320,9 @@ impl Kernel {
         let result = match characters {
             Some(Policy::Codes { computing, result }) => { variant.dtype = computing; result }
             Some(Policy::Kinds(kind)) => {
-                variant.dtype = DType::Integer(Width::I32);
-                match kind { ByKinds::Truth(_) => DType::Boolean, ByKinds::Left => types[0], ByKinds::Right => types[1] }
+                let result = match kind { ByKinds::Truth(_) => DType::Boolean, ByKinds::Left => types[0], ByKinds::Right => types[1] };
+                variant.dtype = if matches!(kind, ByKinds::Truth(_)) || result == DType::Character { DType::Integer(Width::I32) } else { result };
+                result
             }
             None => {
                 variant.dtype =
@@ -346,15 +348,26 @@ impl Kernel {
         let value = self.definition.complex(self.variant, args, settings)?;
         Ok(if matches!(self.result, DType::Complex(_)) { value } else { num_complex::Complex64::new(value.re, 0.0) })
     }
+    fn kind_result<T: Copy>(&self, x: &[T], truth: impl FnOnce(bool) -> T) -> Option<T> {
+        use crate::characters::{ByKinds, Policy};
+        Some(match self.characters? {
+            Policy::Kinds(ByKinds::Truth(value)) => truth(value), Policy::Kinds(ByKinds::Left) => x[0], Policy::Kinds(ByKinds::Right) => x[1],
+            _ => return None,
+        })
+    }
     pub fn formula(
         &self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>,
         x: &[crate::facts::Slot]) -> Option<crate::facts::Slot> {
+        if let Some(result) = self.kind_result(x, |value| ops.equal(ops.number(0.0), ops.number(u8::from(!value) as f64))) { return Some(result); }
         if self.variant.dtype.is_integral() && self.variant.checked && !self.variant.wrapping && !self.definition.integer_formula() { return None; }
         self.definition.formula(ops, x)
     }
     pub fn test(
         &self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>,
-        x: &[crate::facts::Slot]) -> Option<crate::facts::Slot> { self.definition.test(ops, x) }
+        x: &[crate::facts::Slot]) -> Option<crate::facts::Slot> {
+        if matches!(self.characters, Some(crate::characters::Policy::Kinds(_))) { return self.formula(ops, x); }
+        self.definition.test(ops, x)
+    }
     pub fn repair_predicate(
         &self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>,
         x: &[crate::facts::Slot]) -> Option<crate::facts::Slot> { self.definition.repair_predicate(ops, x) }
@@ -375,24 +388,42 @@ impl Kernel {
     pub fn partials(
         &self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>,
         x: &[crate::facts::Slot], result: crate::facts::Slot, needed: &[bool], output: &mut [Option<crate::facts::Slot>]) {
+        if let Some(side) = self.kind_result(&[Some(0), Some(1)], |_| None) {
+            for (i, (&needed, output)) in needed.iter().zip(output).enumerate() {
+                *output = needed.then(|| ops.number(u8::from(side == Some(i)) as f64));
+            }
+            return;
+        }
         self.definition.partials(ops, x, result, needed, output)
     }
-    pub fn range(&self, x: &[crate::facts::Range]) -> crate::facts::Range { self.definition.range(x) }
+    pub fn range(&self, x: &[crate::facts::Range]) -> crate::facts::Range {
+        self.kind_result(x, |value| Range::of(Some(u8::from(value) as f64))).unwrap_or_else(|| self.definition.range(x))
+    }
     pub fn domain(&self, x: &[crate::facts::Range]) -> bool { self.typed_domain || self.definition.domain(x) }
     pub fn identity(&self) -> Option<f64> { self.definition.identity() }
     pub fn fold(&self) -> Option<crate::reduce::Reduce> { self.definition.fold() }
+    /// Bounds every partial result, using a finite count only for associative reductions.
+    pub fn fold_range(&self, items: Range, seed: Option<Range>, len: usize) -> Range {
+        Range::folded(items, seed, self.fold().map(|_| len), |args| self.range(&args))
+    }
     pub fn truth_table(&self) -> Option<u8> { self.definition.truth_table() }
     pub fn total_dtype(&self) -> Option<DType> { self.fold()?.total_dtype(self.variant) }
     pub fn fold_dtype(&self, input: DType, len: usize, seed: Option<DType>) -> DType {
-        self.total_dtype().unwrap_or_else(|| match (len, seed) { (0, Some(seed)) => seed, (1, None) => input, _ => self.result })
+        self.total_dtype().unwrap_or_else(|| match (len, seed) { (0, Some(seed)) => seed, (1, None) if input != DType::Boolean => input, _ => self.result })
     }
     pub fn scan_dtype(&self) -> DType {
         let carry = match self.variant.dtype { DType::Float(FloatWidth::F16) => DType::Float(FloatWidth::F32), dtype => dtype };
         self.total_dtype().unwrap_or_else(|| carry.common(self.result).unwrap_or(self.result))
     }
     pub fn product_dtype(&self, fold: &Kernel, input: DType) -> Option<DType> {
-        self.definition.product(crate::facts::Variant { dtype: input, ..self.variant }, fold.fold(), input == DType::Boolean, None, Settings::default())
+        self.native_product(crate::facts::Variant { dtype: input, ..self.variant }, fold, input == DType::Boolean, None, Settings::default())
             .map(|p| p.result)
+    }
+    fn native_product(
+        &self, variant: crate::facts::Variant, fold: &Kernel, boolean_inputs: bool, wanted: Option<DType>, settings: Settings
+    ) -> Option<NativeProduct> {
+        if matches!(self.characters, Some(crate::characters::Policy::Kinds(_))) { return None; }
+        self.definition.product(variant, fold.fold(), boolean_inputs, wanted, settings)
     }
     pub fn map(&self, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, output: &mut Buffer) -> Result<(), Error> {
         use crate::characters::{ByKinds, Policy};
@@ -492,7 +523,7 @@ pub fn product(
 ) -> Result<(), Error> {
     use crate::agreement::{Missing, Read};
     let dtype = output.dtype();
-    if let Some(native) = map.definition.product(map.variant, fold.fold(), map.boolean_inputs, Some(dtype), settings) {
+    if let Some(native) = map.native_product(map.variant, fold, map.boolean_inputs, Some(dtype), settings) {
         if (native.run)(map.variant, inputs, plan, output)? {
             return finish(output, dtype, (map.variant.checked || fold.variant.checked) && !map.variant.wrapping);
         }
