@@ -63,10 +63,12 @@ fn computes<K: rustymath::facts::Formula<N>, const N: usize>(function: &str, obj
     }.ok_or_else(|| missing(function, dtype))
 }
 pub(crate) fn select<K: rustymath::facts::Formula<N>, const N: usize>(
-    function: &str, object: K, dtype: DType, types: [DType; N], mathish: bool, only: Option<&[DType]>,
+    function: &str, object: K, dtype: DType, types: [DType; N], mathish: bool, wrapping: bool, only: Option<&[DType]>,
 ) -> PyResult<rustymath::operation::Kernel> {
     let dtype = if only.is_some() { computes(function, &object, dtype, only)? } else { dtype };
-    object.resolve(rustymath::facts::Variant { dtype, checked: true, mathish, wrapping: true }, types).map_err(py_err)
+    let mut kernel = object.resolve(rustymath::facts::Variant { dtype, checked: true, mathish, wrapping }, types).map_err(py_err)?;
+    kernel.variant.checked = kernel.variant.dtype.is_integral();
+    Ok(kernel)
 }
 fn call_dtype(call: &Call) -> DType {
     if call.args.iter().any(|x| x.view().dtype() == DType::Character) { DType::Character } else { call.args[0].view().dtype() }
@@ -109,8 +111,8 @@ fn totals<K: rustymath::facts::Formula<2>>(
         let next = axis.map_or(Layout::EMPTY, |a| layout.axes((0..layout.shape().len()).filter(|&i| i != a)));
         let flat = [view.len()];
         let shape = axis.map_or(flat.as_slice(), |_| layout.shape());
-        let kernel = select(function, object.clone(), view.dtype(), [view.dtype(); 2], false, only)?;
-        let mut buffer = Buffer::with_capacity(kernel.total_dtype().unwrap_or(kernel.result_dtype()), next.count());
+        let kernel = select(function, object.clone(), view.dtype(), [view.dtype(); 2], false, true, only)?;
+        let mut buffer = Buffer::with_capacity(kernel.fold_dtype(view.dtype(), shape[axis.unwrap_or(0)], None), next.count());
         kernel.fold_read(shape, axis.unwrap_or(0), rustymath::operation::Seed::Identity, rustymath::operation::Direction::Right,
             rustymath::operation::Settings::default(), view.read(), &mut buffer).map_err(py_err)?;
         out = Some(Core::new(next, buffer).map_err(py_err)?);
@@ -138,8 +140,8 @@ fn scan<'py, K: rustymath::facts::Formula<2>>(
     let x = one(x)?;
     let view = x.view();
     let (dims, layout, _) = along_axis(x.layout(), view.len(), axis)?;
-    let kernel = select(function, object, view.dtype(), [view.dtype(); 2], false, only)?;
-    let mut buffer = Buffer::with_capacity(kernel.total_dtype().unwrap_or(kernel.result_dtype()), view.len());
+    let kernel = select(function, object, view.dtype(), [view.dtype(); 2], false, true, only)?;
+    let mut buffer = Buffer::with_capacity(kernel.scan_dtype(), view.len());
     released(py, || kernel.scan(dims, rustymath::operation::Seed::Identity, rustymath::operation::Direction::Left,
         rustymath::operation::Settings::default(), view.read(), &mut buffer)).map_err(py_err)?;
     give_items(py, layout, buffer, false)
@@ -155,14 +157,14 @@ pub(crate) fn native_binary(name: &str) -> PyResult<&'static NativeBinary> {
 
 /// Public names and signatures select objects; formulas, validity, reductions and partials stay in rustymath.
 macro_rules! functions {
-    ($($(#[doc = $($doc:tt)+])+ $name:ident($($x:ident),+ $(; $ct:ident)?) = $k:expr $(=> $mathish:expr)? $(, only $only:expr)?;)+) => {
-        $(functions!(@define false; $(#[doc = $($doc)+])+ $name($($x),+ $(; $ct)?) = $k $(=> $mathish)? $(, only $only)?);)+
+    ($($(#[doc = $($doc:tt)+])+ $name:ident($($x:ident),+ $(; $ct:ident)?) = $k:expr $(=> $mathish:expr)? $(, only $only:expr)? $(, wrapping $wrapping:expr)?;)+) => {
+        $(functions!(@define false; $(#[doc = $($doc)+])+ $name($($x),+ $(; $ct)?) = $k $(=> $mathish)? $(, only $only)? $(, wrapping $wrapping)?);)+
         pub(crate) mod mathish {
             use super::*;
-            $(functions!(@affected [$($ct)?], [$($mathish)?]; $(#[doc = $($doc)+])+ $name($($x),+ $(; $ct)?) = $k $(=> $mathish)? $(, only $only)?);)+
+            $(functions!(@affected [$($ct)?], [$($mathish)?]; $(#[doc = $($doc)+])+ $name($($x),+ $(; $ct)?) = $k $(=> $mathish)? $(, only $only)? $(, wrapping $wrapping)?);)+
         }
         static NATIVE_BINARIES: &[Option<(&str, NativeBinary)>] = &[
-            $(functions!(@native $name, [$($x),+], [$($ct)?], [$($mathish)?], $k $(, only $only)?)),+
+            $(functions!(@native $name, [$($x),+], [$($ct)?], [$($mathish)?], $k $(, only $only)? $(, wrapping $wrapping)?)),+
         ];
         static NATIVE_SLOPES: &[(&str, Slopes)] = &[
             $((stringify!($name), functions!(@slopes $name, [$($x),+], [$($ct)?], [$($mathish)?], $k $(, only $only)?))),+
@@ -182,7 +184,7 @@ macro_rules! functions {
     (@affected $ct:tt, $mathish:tt; $($rest:tt)*) => { functions!(@define true; $($rest)*); };
     (@add [], []; $m:ident, $f:path) => {};
     (@add $ct:tt, $mathish:tt; $m:ident, $f:path) => { $m.add_function(wrap_pyfunction!($f, $m)?)?; };
-    (@define $on:expr; $(#[doc = $($doc:tt)+])+ $name:ident($($x:ident),+ $(; $ct:ident)?) = $k:expr $(=> $mathish:expr)? $(, only $only:expr)?) => {
+    (@define $on:expr; $(#[doc = $($doc:tt)+])+ $name:ident($($x:ident),+ $(; $ct:ident)?) = $k:expr $(=> $mathish:expr)? $(, only $only:expr)? $(, wrapping $wrapping:expr)?) => {
         $(#[doc = $($doc)+])+
         #[pyfunction]
         #[pyo3(signature = ($($x),+))]
@@ -192,16 +194,16 @@ macro_rules! functions {
             let types: [DType; { functions!(@arity [$($x),+]) }] = ::std::array::from_fn(|i| call.args[i].view().dtype());
             let mode = functions!(@mode [$($x),+], [$($ct)?], $on, $k, dtype, None$(.or(Some($only)))?);
             functions!(@object [$($ct)?], [$($mathish)?], mode, $k, |k| {
-                let kernel = select::<_, { functions!(@arity [$($x),+]) }>(stringify!($name), k, dtype, types, mode, None$(.or(Some($only)))?)?;
+                let kernel = select::<_, { functions!(@arity [$($x),+]) }>(stringify!($name), k, dtype, types, mode, false$(|| $wrapping)?, None$(.or(Some($only)))?)?;
                 apply(py, &kernel, &call)
             })
         }
     };
-    (@native $name:ident, [$x:ident, $y:ident], [$($ct:ident)?], [$($mathish:expr)?], $k:expr $(, only $only:expr)?) => {
+    (@native $name:ident, [$x:ident, $y:ident], [$($ct:ident)?], [$($mathish:expr)?], $k:expr $(, only $only:expr)? $(, wrapping $wrapping:expr)?) => {
         Some((stringify!($name), NativeBinary { kernel: |dtype, on| {
             let mode = functions!(@mode [$x, $y], [$($ct)?], on, $k, dtype, None$(.or(Some($only)))?);
             functions!(@object [$($ct)?], [$($mathish)?], mode, $k, |k| {
-                select::<_, 2>(stringify!($name), k, dtype, [dtype; 2], mode, None$(.or(Some($only)))?)
+                select::<_, 2>(stringify!($name), k, dtype, [dtype; 2], mode, false$(|| $wrapping)?, None$(.or(Some($only)))?)
             })
         } }))
     };
@@ -211,7 +213,7 @@ macro_rules! functions {
             let [x] = args else { return Err(PyValueError::new_err(concat!(stringify!($name), " takes one argument"))) };
             functions!(@object [$($ct)?], [$($mathish)?], on, $k, |k| {
                 let call = convert(&[x, r])?;
-                let kernel = select::<_, 2>(stringify!($name), rustymath::derivative::Slope(k), call_dtype(&call), [call_dtype(&call); 2], on, None$(.or(Some($only)))?)?;
+                let kernel = select::<_, 2>(stringify!($name), rustymath::derivative::Slope(k), call_dtype(&call), [call_dtype(&call); 2], on, false, None$(.or(Some($only)))?)?;
                 Ok(vec![apply(py, &kernel, &call)?])
             })
         }
@@ -222,8 +224,8 @@ macro_rules! functions {
             functions!(@object [$($ct)?], [$($mathish)?], on, $k, |k| {
                 let call = convert(&[x, y, r])?;
                 let dtype = call_dtype(&call);
-                let kernels = [select::<_, 3>(stringify!($name), rustymath::derivative::Slope::<_, 0>(k.clone()), dtype, [dtype; 3], on, None$(.or(Some($only)))?)?,
-                    select::<_, 3>(stringify!($name), rustymath::derivative::Slope::<_, 1>(k), dtype, [dtype; 3], on, None$(.or(Some($only)))?)?];
+                let kernels = [select::<_, 3>(stringify!($name), rustymath::derivative::Slope::<_, 0>(k.clone()), dtype, [dtype; 3], on, false, None$(.or(Some($only)))?)?,
+                    select::<_, 3>(stringify!($name), rustymath::derivative::Slope::<_, 1>(k), dtype, [dtype; 3], on, false, None$(.or(Some($only)))?)?];
                 kernels.iter().map(|kernel| apply(py, kernel, &call)).collect()
             })
         }
@@ -335,7 +337,7 @@ functions! {
     #[doc = rustymath::function_doc!(atanh)]
     arctanh(x) = rustymath::Atanh;
     /// |x|, a real number for a complex x. The magnitude of a signed integer type's least value wraps to that value, as NumPy's does.
-    absolute(x) = rustymath::Abs;
+    absolute(x) = rustymath::Abs, wrapping true;
     /// -1, 0 or 1 for a real x, and x/|x| for a complex x.
     sign(x) = rustymath::Sign;
     /// The angle of x from the positive real axis, from -π to π.
@@ -371,15 +373,15 @@ functions! {
     #[doc = rustymath::function_doc!(erfcinv)]
     erfcinv(q) = rustymath::Erfcinv;
     /// x + y. A character plus an integer, on either side, is a character. An integer result that doesn't fit its dtype wraps, as NumPy's does.
-    add(x, y) = rustymath::Add;
+    add(x, y) = rustymath::Add, wrapping true;
     /// x - y. A character minus an integer is a character, and a character minus a character is an integer. An integer result that doesn't fit its dtype wraps, as NumPy's does.
-    subtract(x, y) = rustymath::Subtract;
+    subtract(x, y) = rustymath::Subtract, wrapping true;
     /// x × y. An integer result that doesn't fit its dtype wraps, as NumPy's does.
-    multiply(x, y) = rustymath::Multiply;
+    multiply(x, y) = rustymath::Multiply, wrapping true;
     /// x / y. Integers compute as floats. Mathish mode defines zero divided by zero as zero for float64 and complex128.
     divide(x, y) = rustymath::Divide => rustymath::MathishDivide;
     /// x^y. An integer power that doesn't fit its dtype wraps, as NumPy's does. A negative integer y beside an x other than 1 or -1 raises ValueError.
-    power(x, y) = rustymath::WrappingPow;
+    power(x, y) = rustymath::Pow, wrapping true;
     #[doc = rustymath::function_doc!(root)]
     root(n, y) = rustymath::Root;
     #[doc = rustymath::function_doc!(hypot)]
@@ -547,7 +549,7 @@ fn _accumulate<'py>(
     let (function, mode) = function;
     let kernel = (native_binary(function)?.kernel)(view.dtype(), mode)?;
     let seed = start.as_ref().map_or(rustymath::operation::Seed::Identity, |s| rustymath::operation::Seed::Initial(s.read()));
-    let mut buffer = Buffer::with_capacity(kernel.total_dtype().unwrap_or(kernel.result_dtype()), view.len());
+    let mut buffer = Buffer::with_capacity(kernel.scan_dtype(), view.len());
     released(py, || kernel.scan(dims, seed, rustymath::operation::Direction::Left, rustymath::operation::Settings::default(),
         view.read(), &mut buffer)).map_err(py_err)?;
     give_items(py, layout, buffer, false)
@@ -582,7 +584,7 @@ fn _sliding<'py>(py: Python<'py>, function: NativeFunction<'_>, x: &Bound<'py, P
     let plan = windows.plan(&flat, flat.shape()).map_err(py_err)?;
     let input = view.remapped(rustymath::agreement::Mapping::from(plan.steps), plan.layout.count());
     let dims = [lanes.outer * (lanes.len + 1 - width), width, lanes.inner];
-    let mut buffer = Buffer::with_capacity(kernel.total_dtype().unwrap_or(kernel.result_dtype()), layout.count());
+    let mut buffer = Buffer::with_capacity(kernel.fold_dtype(view.dtype(), width, None), layout.count());
     released(py, || kernel.fold_read(&dims, 1, rustymath::operation::Seed::Identity, rustymath::operation::Direction::Right,
         rustymath::operation::Settings::default(), input.read(), &mut buffer)).map_err(py_err)?;
     give_items(py, layout, buffer, false)
@@ -763,7 +765,7 @@ pub(crate) fn histogram<'py>(
 #[pyo3(signature = (x, decimals=0))]
 pub(crate) fn round<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, decimals: i32) -> PyResult<Bound<'py, PyAny>> {
     let call = convert(&[x])?;
-    let kernel = select::<_, 1>("round", rustymath::Round::new(decimals), call_dtype(&call), [call_dtype(&call); 1], false, None)?;
+    let kernel = select::<_, 1>("round", rustymath::Round::new(decimals), call_dtype(&call), [call_dtype(&call); 1], false, false, None)?;
     apply(py, &kernel, &call)
 }
 

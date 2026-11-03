@@ -1,5 +1,5 @@
 //! Powers and roots use the shared Exp/Ln bodies, except cheap constant powers and square/cube roots. Constant integer powers retain their exact cases. General power error grows with the rounding error in y·ln|x|; it is not uniformly bounded in ulps as |y·ln|x|| grows.
-use crate::{float::Native, recipe::Ops};
+use crate::{buffer::FloatWidth, float::Native, recipe::{Cmp, Integer, Ops, root2}};
 
 #[inline]
 pub(crate) fn parity<R: Native>(y: R) -> (bool, bool) {
@@ -17,12 +17,21 @@ pub(crate) fn formula<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, y: O:
 
 pub(crate) fn root_formula<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, n: O::V, y: O::V) -> O::V {
     if let Some(n) = o.constant(n) {
-        if n == F::narrow(2.0) { return crate::recipe::root2(o, y); }
-        if n == F::narrow(3.0) { return cbrt_formula(o, y); }
+        let result = match n.wide().abs() {
+            1.0 => Some(y), 2.0 => Some(root2(o, y)), 3.0 => Some(cbrt_formula(o, y)),
+            4.0 => Some(root2(o, root2(o, y))), 8.0 => Some(root2(o, root2(o, root2(o, y)))),
+            0.5 => {
+                let x = if n < F::zero() { o.reciprocal(y) } else { y };
+                return o.select(o.less(y, o.number(F::zero())), o.number(F::nan()), o.multiply(x, x));
+            }
+            _ => None,
+        };
+        if let Some(result) = result { return if n < F::zero() { o.reciprocal(result) } else { result }; }
     }
     general(o, y, n, true)
 }
 
+// A more accurate compensated implementation is in a1b7044cd3416194bf5dc423f197280c6933c9b9:src/pow.rs and src/table.rs; it can replace this formula if greater accuracy is needed.
 fn general<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, y: O::V, root: bool) -> O::V {
     let (zero, one, half) = (o.number(F::zero()), o.number(F::one()), o.number(F::narrow(0.5)));
     let a = o.magnitude(x);
@@ -32,11 +41,12 @@ fn general<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, y: O::V, root: b
     let whole = o.equal(o.floor(y), y);
     let h = o.multiply(y, half);
     let odd = o.and(whole, o.not(o.equal(o.floor(h), h)));
-    let negative = o.less(x, zero);
-    let r = o.select(o.and(negative, odd), o.negate(r), r);
+    let sign = o.integer(if o.width() == FloatWidth::F64 { i64::MIN } else { 1 << 31 });
+    let negative = o.not(o.integer_compare(Cmp::Equal, o.integer_op(Integer::And, o.to_bits(x), sign), o.integer(0)));
     let r = if root { r } else { o.select(o.or(o.equal(y, zero), o.equal(a, one)), one, r) };
+    let r = o.select(o.and(negative, odd), o.negate(r), r);
     let exists = if root { odd } else { whole };
-    let bad_base = o.and(o.and(negative, o.less(a, o.number(F::infinity()))), o.not(exists));
+    let bad_base = o.and(o.and(o.less(x, zero), o.less(a, o.number(F::infinity()))), o.not(exists));
     let bad = if root { o.or(bad_base, o.or(o.equal(y, zero), o.not(o.less(o.magnitude(y), o.number(F::infinity()))))) } else { bad_base };
     o.select(bad, o.number(F::nan()), r)
 }

@@ -130,7 +130,7 @@ impl Divisor {
         let q = if (y < 0) != (self.x < 0) { -(q as i128) } else { q as i128 };
         let r0 = if y < 0 { -(r as i64) } else { r as i64 };
         let r = floored(r0, self.x);
-        Some(((q - i128::from(r != r0)) as i64, r))
+        Some((i64::try_from(q - i128::from(r != r0)).ok()?, r))
     }
 }
 

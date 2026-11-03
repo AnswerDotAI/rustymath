@@ -201,7 +201,7 @@ impl Array {
         if agreement.layout.shape() != plan.layout.shape() { return Err(Error::new(Kind::Length, "assignment must fit the selected layout")); }
         let root = self.view();
         let source = source.view().remapped(agreement.right, agreement.len);
-        let positions = ReadPlan::input(0, self.len()).remapped(Mapping::from(plan.steps.clone()), agreement.len, Missing::Invalid);
+        let positions = ReadPlan::input(0, self.len()).remapped(Mapping::from(plan.steps.clone()), agreement.len, Missing::Default);
         let mut buffer = Buffer::with_capacity(self.dtype(), self.len());
         crate::operation::at(combine, WriteRoot::Read(root.read()), source.read(), Positions::Route(&positions, 0), true, Settings::default(), &mut buffer)?;
         Ok(buffer)

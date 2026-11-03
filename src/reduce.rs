@@ -1,8 +1,8 @@
 //! Reductions and scans over a contiguous slice: sums, products, maximums and minimums, and their running versions. Each compiles inside rustymath once for each item type. A float sum or product may combine the items in any order, which lets its loop vectorize, so its last bits can differ from a sum taken item by item. Beside NaN, a float maximum or minimum gives NaN or the greatest or least of the items that aren't NaN, and never any other number. Which of the two it gives can depend on the target and the loop. An empty slice gives -∞ or ∞. `f16` items compute in `f32`. Their sum or product is an `f32` total. An integer sum or product computes at `i64`, or at `u64` for `u64` items. Where it doesn't fit, it wraps, and reports that it doesn't fit, as the running versions do.
 pub use crate::slice::running;
 use crate::{
-    Arg, Float, Native, agreement::{Mapping, Walked, expanded_items}, arith::Overflowing, buffer::{Element, View}, float::sealed::{Core, Folds}, gather::Steps,
-    layout::Lanes, linalg::Scalar, parallel, slice::{CHUNK, appended, written}
+    Arg, Float, Native, agreement::{Mapping, Read, Walked, expanded_items}, arith::Overflowing, buffer::{Buffer, Element, View}, float::sealed::{Core, Folds}, gather::Steps,
+    facts::Variant, layout::Lanes, linalg::Scalar, operation::{Positions, at_typed}, parallel, slice::{CHUNK, appended, written}
 };
 use half::f16;
 use num_complex::Complex;
@@ -2340,7 +2340,10 @@ where T: crate::buffer::Cast, R: Reduction<T>, R::Total: crate::buffer::Cast {
             let result = pieces(range, &mut |start, piece| match piece {
                 crate::operation::Piece::Items(view) => match T::of(view) {
                     Some(items) => emit(start, Part::Items(items)),
-                    None => crate::error::record(Error::new(Kind::Domain, "fold piece has the wrong dtype")),
+                    None => match crate::buffer::Buffer::cast_results(view, T::DTYPE, checked) {
+                        Ok(values) => emit(start, Part::Items(T::of(values.view()).expect("converted fold piece has its requested dtype"))),
+                        Err(error) => crate::error::record(error),
+                    },
                 },
                 crate::operation::Piece::Total(total) => match total.value::<R::Total>() {
                     Ok(value) => emit(start, Part::Total(total.items, value)), Err(error) => crate::error::record(error),
@@ -2378,6 +2381,17 @@ impl Reduce {
     ) -> Result<(), Error> {
         native_reduction!(self, variant.dtype, variant.checked && !variant.wrapping, |R, T| Some(native_scan::<T, R>(dims, seed, direction, variant.checked, input, output)))
             .unwrap_or_else(|| Err(Error::new(Kind::Domain, "scan does not support this dtype")))
+    }
+    pub(crate) fn run_at(
+        self, variant: Variant, values: Read<'_>, ids: Positions<'_>, checked: bool, output: &mut Buffer,
+    ) -> Option<Result<(), Error>> {
+        native_reduction!(self, variant.dtype, variant.checked && !variant.wrapping, |R, T| {
+            type S = <R as Reduction<T>>::Total;
+            (S::DTYPE == output.dtype()).then(|| at_typed::<S>(values, ids, checked, Some(|x, y| {
+                let (value, ok) = <R as Reduction<T>>::chain(x, y);
+                (value, (!ok && variant.checked && !variant.wrapping).then_some(Kind::Overflow))
+            }), output))
+        })
     }
 }
 

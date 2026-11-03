@@ -4,7 +4,7 @@
 use pyo3::prelude::*;
 use rustymath::array::{Array as Core, ArrayView};
 use rustymath::buffer::{Buffer, DType, FloatWidth, Width};
-use rustymath::error::Error;
+use rustymath::error::{Error, Kind};
 use rustymath::linalg::{self, Stacked};
 use rustymath::operation::numpy_float;
 use rustymath_buffer::py_err;
@@ -286,9 +286,16 @@ pub fn inner(f: NativeFunction<'_>, g: NativeFunction<'_>, [left, right]: [Array
     let plan = linalg::ProductPlan::matrices([left.layout(), right.layout()], 0).map_err(named)?;
     let dtype = left.dtype();
     let compute = match dtype { DType::Integer(_) => I64, DType::Float(FloatWidth::F16) => DType::Float(FloatWidth::F32), d => d };
-    let map = (native_binary(g.0)?.kernel)(compute, g.1)?;
-    let fold = (native_binary(f.0)?.kernel)(map.result_dtype(), f.1)?;
-    let total = fold.total_dtype().unwrap_or(fold.result_dtype());
+    let mut map = (native_binary(g.0)?.kernel)(compute, g.1)?;
+    let mut fold = (native_binary(f.0)?.kernel)(map.result_dtype(), f.1)?;
+    let shape = plan.iteration.shape();
+    let len = rustymath::layout::count(&shape[shape.len() - plan.contracted..]);
+    if len == 0 && fold.fold().is_none() { return Err(named(Error::new(Kind::Length, "no identity for an empty contraction"))); }
+    let wrapping = map.variant.wrapping;
+    map.variant.wrapping = false;
+    let native = map.product_dtype(&fold, dtype);
+    if native.is_some() { fold.variant.wrapping = false; } else { map.variant.wrapping = wrapping; }
+    let total = native.unwrap_or_else(|| fold.fold_dtype(map.result_dtype(), len, None));
     let store = match total { DType::Integer(_) => I64, DType::Float(_) if dtype == DType::Float(FloatWidth::F16) => dtype, d => d };
     let mut output = Buffer::with_capacity(store, plan.layout.count());
     rustymath::operation::product(&map, &fold, [left.read(), right.read()], &plan, Default::default(), &mut output).map_err(named)?;

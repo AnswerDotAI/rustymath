@@ -71,13 +71,13 @@ mod forms {
     fn check<F: Float + buffer::Element + Debug, K: facts::Formula<A>, const A: usize>(k: &K, name: &str, args: [Arg<'_, F>; A], n: usize) {
         let kernel = k.resolve(facts::Variant { checked: false, ..facts::Variant::checked(F::DTYPE) }, [F::DTYPE; A]).unwrap();
         let views = args.each_ref().map(|a| F::view(match a { Arg::One(v) => std::slice::from_ref(v), Arg::Many(s) => s }));
-        let mut out = F::buffer(vec![F::one()]);
+        let mut out = F::buffer(vec![]);
         crate::support::map(&kernel, views, n, &mut out).unwrap();
         let out = F::vec(out).unwrap();
-        assert_eq!((out.len(), out[0]), (n + 1, F::one()), "{name}");
+        assert_eq!(out.len(), n, "{name}");
         for i in 0..n {
             let x = args.map(|a| match a { Arg::One(v) => v, Arg::Many(s) => s[i] });
-            assert!(same(out[i + 1], facts::formula_at(k, x)), "{name}{x:?}");
+            assert!(same(out[i], facts::formula_at(k, x)), "{name}{x:?}");
         }
     }
 

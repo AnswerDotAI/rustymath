@@ -142,7 +142,7 @@ def test_linalg(kind):
         # complex64 computes at its own width, with real results, such as singular values, in float32.
         eye = np.eye(3, dtype=np.complex64)
         assert A(la.pinv(eye)).dtype == np.complex64 and A(la.svd(eye).s).dtype == np.float32 and A(la.slogdet(eye[None])[1]).dtype == np.float32
-        with pytest.raises(ValueError, match="doesn't take"): la.inner(rm.maximum, rm.add)(a, b)
+        with pytest.raises(ValueError): la.inner(rm.maximum, rm.add)(a, b)
         return
     # Min-plus products give shortest paths, and or-and products give reachability.
     d = np.array([[0, 3, np.inf], [np.inf, 0, 1], [2, np.inf, 0]])

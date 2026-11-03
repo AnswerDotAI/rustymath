@@ -258,12 +258,14 @@ impl Variant {
 
 pub use crate::operation::Kernel;
 
-/// `k`'s results on floats through its formula (`Formula::emit`), for an object whose real form is that formula and gives every result.
+/// `k`'s scalar real result, including repairs, computed at the argument's working precision.
 #[inline(always)]
 pub fn formula_at<K: Formula<N>, F: crate::Float, const N: usize>(k: &K, x: [F; N]) -> F {
-    let o = crate::recipe::Floats;
-    if k.emit_repair(&o, x) == Some(true) { return k.repair_routine().expect("a repair predicate has its routine").apply(x[0]); }
-    k.emit::<F, crate::recipe::Floats>(&o, x).expect("a formula that gives every result")
+    let o = crate::recipe::NativeOps::<{ crate::FUSED }>::DEFAULT;
+    let x = x.map(F::working);
+    let result = if k.emit_repair(&o, x) == Some(true) { k.repair_routine().expect("a repair predicate has its routine").apply(x[0]) }
+        else { k.real(&o, x).expect("a real body that gives every result") };
+    F::from_working(result)
 }
 
 /// `x` to the power `y`, where `y` is one number (`Ops::constant`) whose `Exponent` route isn't the general one, through `recipe::power`, as `Pow`'s and `WholePow`'s kernels compute a constant exponent.
@@ -305,11 +307,11 @@ macro_rules! objects {
     (@checks nan) => { fn fails_nan(&self) -> bool { true } };
     (@only bits) => { true };
     (@boolean bits) => { false };
+    (@boolean arithmetic) => { false };
     (@boolean $kind:ident) => { true };
     (@integers $n:tt, bits) => { objects!(@integers $n, formula); };
     (@only formula) => { false };
     (@only arithmetic) => { false };
-    (@boolean arithmetic) => { false };
     (@integers $n:tt, arithmetic) => { objects!(@integers $n, formula); };
     (@only only) => { true };
     (@integers $n:tt, only) => { objects!(@integers $n, formula); };
@@ -403,12 +405,12 @@ impl Formula<2> for IntegerComparison {
 pub(crate) struct Complement;
 objects!(1:
     Complement { formula |_, o, [x]| Some(o.subtract(o.number(F::one()), x)); integers formula; exact |_, [x]| Ok(Some(num_rational::BigRational::one() - x)); valid |_, v, o, [x], _| arithmetic_valid(v, o, crate::recipe::Binary::Subtract, o.number(F::one()), x); }
-    crate::Abs { range [x] => x.magnitude(); output real; formula |_, o, [x]| Some(o.magnitude(x)); slope |o, x, _| o.sign(x); integers arithmetic; native_complex |_, _, [x]| Some(num_complex::Complex::new(crate::complex::modulus::<F, { crate::FUSED }>(x.re, x.im), F::zero())); exact |_, [x]| Ok(Some(x.abs())); valid |_, v, o, [x], _| negation_valid(v, o, x, true); }
+    crate::Abs { range [x] => x.magnitude(); output real; formula |_, o, [x]| Some(o.magnitude(x)); slope |o, x, _| o.sign(x); integers formula; native_complex |_, _, [x]| Some(num_complex::Complex::new(crate::complex::modulus::<F, { crate::FUSED }>(x.re, x.im), F::zero())); exact |_, [x]| Ok(Some(x.abs())); valid |_, v, o, [x], _| negation_valid(v, o, x, true); }
     crate::Negate { range [x] => Range { lo: -x.hi, hi: -x.lo }; formula |_, o, [x]| Some(o.negate(x)); slope |o, _, _| o.number(-F::one()); integers arithmetic; native_complex |_, _, [x]| Some(-x); exact |_, [x]| Ok(Some(-x)); valid |_, v, o, [x], _| negation_valid(v, o, x, false); }
     crate::Conj { range [x] => x; characters Identity; formula |_, _, [x]| Some(x); slope |o, _, _| o.number(F::one()); integers formula; native_complex |_, _, [x]| Some(x.conj()); exact |_, [x]| Ok(Some(x.clone())); }
     crate::Real { range [x] => x; output real; formula |_, _, [x]| Some(x); slope |o, _, _| o.number(F::one()); integers formula; native_complex |_, _, [x]| Some(num_complex::Complex::new(x.re, F::zero())); exact |_, [x]| Ok(Some(x.clone())); }
-    crate::Imag { range _ => exact(0.0, 0.0); output real; formula |_, o, [_]| Some(o.number(F::zero())); integers formula; native_complex |_, _, [x]| Some(num_complex::Complex::new(x.im, F::zero())); exact |_, [_]| Ok(Some(num_rational::BigRational::zero())); }
-    crate::Angle { range _ => exact(-PI, PI); output real; native_complex |_, _, [x]| Some(num_complex::Complex::new(crate::arc::atan2::<F, { crate::FUSED }>(x.im, x.re), F::zero())); native_real |_, _, [x]| Some(crate::arc::real_angle(x)); }
+    crate::Imag { range _ => exact(0.0, 0.0); output real; formula |_, o, [_]| Some(o.number(F::zero())); slope |o, _, _| o.number(F::zero()); integers formula; native_complex |_, _, [x]| Some(num_complex::Complex::new(x.im, F::zero())); exact |_, [_]| Ok(Some(num_rational::BigRational::zero())); }
+    crate::Angle { range _ => exact(-PI, PI); output real; slope |o, _, _| o.number(F::zero()); native_complex |_, _, [x]| Some(num_complex::Complex::new(crate::arc::atan2::<F, { crate::FUSED }>(x.im, x.re), F::zero())); native_real |_, _, [x]| Some(crate::arc::real_angle(x)); }
     crate::Isnan { test |_, o, [x]| Some(o.not(o.equal(x, x))); integers formula; native_complex |_, _, [x]| Some(num_complex::Complex::new(if x.re.is_nan() || x.im.is_nan() { F::one() } else { F::zero() }, F::zero())); }
     crate::Isfinite { test |_, o, [x]| Some(if o.integral() { o.equal(x, x) } else { o.equal(o.subtract(x, x), o.number(F::zero())) }); integers formula; native_complex |_, _, [x]| Some(num_complex::Complex::new(if x.re.is_finite() && x.im.is_finite() { F::one() } else { F::zero() }, F::zero())); }
     crate::Isinf { test |_, o, [x]| Some(if o.integral() { o.not(o.equal(x, x)) } else { o.equal(o.magnitude(x), o.number(F::infinity())) }); integers formula; native_complex |_, _, [x]| Some(num_complex::Complex::new(if x.re.is_infinite() || x.im.is_infinite() { F::one() } else { F::zero() }, F::zero())); }
@@ -515,9 +517,9 @@ objects!(1:
         native_complex |_, _, [x]| Some(crate::complex::gamma::<F, { crate::FUSED }>(x));
         native_real |_, _, [x]| Some(crate::special::gamma::<F, { crate::FUSED }>(x)); checks nan;
     }
-    crate::Sign { formula |_, o, [x]| Some(crate::recipe::sign(o, x)); integers arithmetic; native_complex |_, _, [x]| Some(crate::complex::sign::<F, { crate::FUSED }>(x)); exact |_, [x]| Ok(Some(x.signum())); }
-    crate::tolerant::Floor { formula |k, o, [x]| Some(crate::with_tolerance!(k.0, |t| t.floor_in(o, x))); integers formula; native_complex |k, o, [x]| Some(crate::tolerant::TolerantComplex::complex_floor(native_tolerance(o.tolerance, k.0), x)); exact |_, [x]| Ok(Some(x.floor())); }
-    crate::tolerant::Ceil { formula |k, o, [x]| Some(crate::with_tolerance!(k.0, |t| t.ceil_in(o, x))); integers formula; native_complex |k, o, [x]| Some(crate::tolerant::TolerantComplex::complex_ceil(native_tolerance(o.tolerance, k.0), x)); exact |_, [x]| Ok(Some(x.ceil())); }
+    crate::Sign { formula |_, o, [x]| Some(crate::recipe::sign(o, x)); slope |o, _, _| o.number(F::zero()); integers arithmetic; native_complex |_, _, [x]| Some(crate::complex::sign::<F, { crate::FUSED }>(x)); exact |_, [x]| Ok(Some(x.signum())); }
+    crate::tolerant::Floor { formula |k, o, [x]| Some(crate::with_tolerance!(k.0, |t| t.floor_in(o, x))); slope |o, _, _| o.number(F::zero()); integers formula; native_complex |k, o, [x]| Some(crate::tolerant::TolerantComplex::complex_floor(native_tolerance(o.tolerance, k.0), x)); exact |_, [x]| Ok(Some(x.floor())); }
+    crate::tolerant::Ceil { formula |k, o, [x]| Some(crate::with_tolerance!(k.0, |t| t.ceil_in(o, x))); slope |o, _, _| o.number(F::zero()); integers formula; native_complex |k, o, [x]| Some(crate::tolerant::TolerantComplex::complex_ceil(native_tolerance(o.tolerance, k.0), x)); exact |_, [x]| Ok(Some(x.ceil())); }
     crate::Not { test |_, o, [x]| Some(o.equal(x, o.number(F::zero()))); integers only; valid |_, v, o, x, _| truth_valid(v, o, x); }
     crate::Cis { output complex; native_complex |_, _, [x]| Some(crate::complex::exp::<F, { crate::FUSED }>(num_complex::Complex::new(-x.im, x.re))); }
     crate::LambertW { native_complex |_, _, [x]| Some(crate::lambert::complex(x)); native_real |_, _, [x]| Some(crate::lambert::lambertw::<F, { crate::FUSED }>(x)); checks nan; }
@@ -596,7 +598,15 @@ objects!(2:
     // C(n, k), with n first.
     crate::Binom {
         slopes |o, n, k, _| [o.binom_dn(n, k), o.binom_dk(n, k)];
-        native_integer |_, o, [n, k]| crate::integer::binom(n.into(), k.into()).map(|x| o.result(x));
+        native_integer |_, o, [n, k]| {
+            let (n, k) = (n.into(), k.into());
+            if k < 0 { return None; }
+            let value = crate::integer::binom(n, k).unwrap_or_else(|| {
+                if o.variant.checked { (crate::error::Kind::Overflow.reporter())(); }
+                0
+            });
+            Some(o.result(value))
+        };
         native_complex |_, _, [n, k]| Some(crate::complex::binom::<F, { crate::FUSED }>(n, k));
         native_real |_, _, [n, k]| Some(crate::special::binom::<F, { crate::FUSED }>(n, k));
         exact |_, [n, k]| {
@@ -608,6 +618,7 @@ objects!(2:
     crate::tolerant::FloorDivide {
         formula |k, o, [x, y]| Some(if o.integral() { crate::recipe::integer_floor_divide(o, x, y) }
             else { crate::with_tolerance!(k.0, |t| t.floor_in(o, o.divide(x, y))) });
+        slopes |o, _, _, _| [o.number(F::zero()), o.number(F::zero())];
         integers arithmetic;
         exact |_, [x, y]| crate::exact::floor_divide(x, y, false);
         valid |_, v, o, [x, y], _| integer_division_valid(v, o, x, y, false);
@@ -615,6 +626,7 @@ objects!(2:
     crate::tolerant::MathishFloorDivide {
         formula |k, o, [x, y]| Some(if o.integral() { crate::recipe::integer_floor_divide(o, x, y) }
             else { crate::with_tolerance!(k.0, |t| t.floor_in(o, crate::recipe::mathish_divide(o, x, y))) });
+        slopes |o, _, _, _| [o.number(F::zero()), o.number(F::zero())];
         integers arithmetic;
         exact |_, [x, y]| crate::exact::floor_divide(x, y, true);
         valid |_, v, o, [x, y], _| integer_division_valid(v, o, x, y, true);

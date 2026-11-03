@@ -33,7 +33,7 @@ impl Distribution {
     fn pdf<'py>(&self, py: Python<'py>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let call = convert(&[x])?;
         let dtype = call.args[0].view().dtype();
-        let kernel = select("pdf", dist::Pdf(self.0), dtype, [dtype], false, None)?;
+        let kernel = select("pdf", dist::Pdf(self.0), dtype, [dtype], false, false, None)?;
         apply(py, &kernel, &call)
     }
 
@@ -41,7 +41,7 @@ impl Distribution {
     fn cdf<'py>(&self, py: Python<'py>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let call = convert(&[x])?;
         let dtype = call.args[0].view().dtype();
-        let kernel = select("cdf", dist::Cdf(self.0), dtype, [dtype], false, None)?;
+        let kernel = select("cdf", dist::Cdf(self.0), dtype, [dtype], false, false, None)?;
         apply(py, &kernel, &call)
     }
 
@@ -49,7 +49,7 @@ impl Distribution {
     fn quantile<'py>(&self, py: Python<'py>, p: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let call = convert(&[p])?;
         let dtype = call.args[0].view().dtype();
-        let kernel = select("quantile", dist::Quantile(self.0), dtype, [dtype], false, None)?;
+        let kernel = select("quantile", dist::Quantile(self.0), dtype, [dtype], false, false, None)?;
         apply(py, &kernel, &call)
     }
 

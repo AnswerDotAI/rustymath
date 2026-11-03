@@ -137,11 +137,11 @@ mod distribution {
             let mut out = Vec::new();
             (f.many(Arg::Many(items), items.len(), &mut out), out)
         }
-        let (xs, ps) = ([-1.0, 0.0, 0.25, 0.5, 1.0, 3.0, 100.0, f64::NAN], [0.001, 0.25, 0.5, 0.999, f64::NAN]);
+        let (xs, ps) = ([-1.0, 0.0, 0.25, 0.5, 1.0, 3.0, 100.0, f64::NAN], [0.001, 0.25, 0.5, 0.999]);
         for d in cases() {
             assert!(many(Pdf(d), &xs).0 && many(Cdf(d), &xs).0 && many(Quantile(d), &ps).0, "{d:?}");
             let (ok, out) = many(Quantile(d), &xs);
-            assert!(!ok && [0, 5, 6].iter().all(|&i| out[i].is_nan()), "{d:?}");
+            assert!(!ok && [0, 5, 6, 7].iter().all(|&i| out[i].is_nan()), "{d:?}");
         }
     }
 
@@ -522,7 +522,7 @@ mod operation {
         crate::support::map(&exp, [i64::view(&[0, 1])], 2, &mut out).unwrap();
         let r = f64::vec(out).unwrap();
         assert!(r[0] == 1. && (r[1] - std::f64::consts::E).abs() < 1e-15);
-        let add = Add.resolve(Variant::checked(wide), [DType::Boolean; 2]).unwrap();
+        let add = Add.resolve(Variant::checked(DType::Boolean), [DType::Boolean; 2]).unwrap();
         let mut out = Buffer::with_capacity(add.result_dtype(), 3);
         crate::support::map(&add, [bool::view(&[true]), bool::view(&[true, false, true])], 3, &mut out).unwrap();
         assert_eq!(i64::vec(out).unwrap(), [2, 1, 2]);
@@ -550,6 +550,35 @@ mod operation {
         assert_eq!(i16::vec(out).unwrap(), [-89]);
     }
 
+    #[test]
+    fn folds_keep_uncalled_values_and_scans_keep_their_carry() {
+        use rustymath::{Add, tolerant::{Less, Tolerance}};
+        let dtype = DType::Integer(Width::I64);
+        let less = Less(Tolerance::EXACT).resolve(Variant::checked(dtype), [dtype; 2]).unwrap();
+        let input = [Binding::full(i64::view(&[3, 2, 1]))];
+        let seed = [Binding::full(i64::view(&[7]))];
+        let scalar = ReadPlan::input(0, 1);
+        for (len, initial, expected) in [(0, true, 7), (1, false, 3), (3, false, 0)] {
+            let plan = ReadPlan::input(0, len);
+            let input = [Binding::full(i64::view(&[3, 2, 1][..len]))];
+            let read = Read { sources: &input, plan: &plan };
+            let seed = if initial { Seed::Tail(Read { sources: &seed, plan: &scalar }) } else { Seed::Identity };
+            let mut out = Buffer::with_capacity(less.fold_dtype(dtype, len, initial.then_some(dtype)), 1);
+            less.fold_read(&[len], 0, seed, Direction::Right, Settings::default(), read, &mut out).unwrap();
+            assert_eq!(out.dtype(), if len < 2 { dtype } else { DType::Boolean });
+            assert_eq!(i64::vec(Buffer::cast_results(out.view(), dtype, true).unwrap()).unwrap(), [expected]);
+        }
+        let plan = ReadPlan::input(0, 3);
+        let read = Read { sources: &input, plan: &plan };
+        let mut out = Buffer::with_capacity(less.scan_dtype(), 3);
+        less.scan([1, 3, 1], Seed::Identity, Direction::Left, Settings::default(), read, &mut out).unwrap();
+        assert_eq!(i64::vec(out).unwrap(), [3, 0, 1]);
+        let sum = Add.resolve(Variant::checked(DType::Integer(Width::I16)), [DType::Integer(Width::I16); 2]).unwrap();
+        let narrow = [Binding::full(i16::view(&[3]))];
+        let mut out = Buffer::with_capacity(sum.fold_dtype(DType::Integer(Width::I16), 1, None), 1);
+        sum.fold_read(&[1], 0, Seed::Identity, Direction::Right, Settings::default(), Read { sources: &narrow, plan: &scalar }, &mut out).unwrap();
+        assert_eq!(i64::vec(out).unwrap(), [3]);
+    }
     #[test]
     fn logical_views_compose_prepare_and_run() {
         let (shape, data) = (Layout::from([3, 2]), [0., 1., 2., 3., 4., 5.]);
@@ -651,6 +680,17 @@ mod operation {
         assert_eq!(char::vec(characters(Maximum, &ints, &ab).unwrap()), Some(vec!['a', 'b']));
         assert_eq!(i64::vec(characters(Minimum, &ab, &ints).unwrap()), Some(vec![1, 2]));
         assert!(characters(Add, &text("\u{10FFFF}"), &i64::buffer(vec![1])).is_err());
+        let offsets = f64::buffer(vec![0.5, 1.0]);
+        let kernel = Add.resolve(Variant::checked(offsets.dtype()), [ab.dtype(), offsets.dtype()]).unwrap();
+        let layout = Layout::from([2]);
+        let (chars, offsets) = (ArrayView::compact(&layout, ab.view()), ArrayView::compact(&layout, offsets.view()));
+        let mut output = Buffer::with_capacity(DType::Character, 2);
+        kernel.map(&[chars.read(), offsets.read()], 1..2, Settings::default(), &mut output).unwrap();
+        assert_eq!(char::of(output.view()), Some(&['c'][..]));
+        assert!(kernel.map(&[chars.read(), offsets.read()], 0..1, Settings::default(), &mut output).is_err());
+        let seed = f64::buffer(vec![0.5]);
+        let seed = ArrayView::compact(&Layout::EMPTY, seed.view());
+        assert!(kernel.scan([1, 2, 1], Seed::Initial(seed.read()), Direction::Left, Settings::default(), chars.read(), &mut output).is_err());
     }
 }
 

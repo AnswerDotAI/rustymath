@@ -41,7 +41,7 @@ impl WriteRoot<'_> {
     fn len(&self) -> usize { match self { Self::Read(read) => read.plan.len(), Self::Owned(buffer) => buffer.len() } }
     fn initialize(self, dtype: DType, checked: bool, codes: bool, output: &mut Buffer) -> Result<(), Error> {
         match self {
-            Self::Read(read) if codes => with_codes(&[read], |reads| reads[0].read_into(0..read.plan.len(), dtype, checked, output)),
+            Self::Read(read) if codes => with_codes(&[read], None, |reads| reads[0].read_into(0..read.plan.len(), dtype, checked, output)),
             Self::Read(read) => read.read_into(0..read.plan.len(), dtype, checked, output),
             Self::Owned(buffer) if buffer.dtype() == dtype => { *output = buffer; Ok(()) }
             Self::Owned(buffer) => {
@@ -327,6 +327,13 @@ impl Kernel {
     pub fn fold(&self) -> Option<crate::reduce::Reduce> { self.definition.fold() }
     pub fn truth_table(&self) -> Option<u8> { self.definition.truth_table() }
     pub fn total_dtype(&self) -> Option<DType> { self.fold()?.total_dtype(self.variant) }
+    pub fn fold_dtype(&self, input: DType, len: usize, seed: Option<DType>) -> DType {
+        self.total_dtype().unwrap_or_else(|| match (len, seed) { (0, Some(seed)) => seed, (1, None) => input, _ => self.result })
+    }
+    pub fn scan_dtype(&self) -> DType {
+        let carry = match self.variant.dtype { DType::Float(FloatWidth::F16) => DType::Float(FloatWidth::F32), dtype => dtype };
+        self.total_dtype().unwrap_or_else(|| carry.common(self.result).unwrap_or(self.result))
+    }
     pub fn product_dtype(&self, fold: &Kernel, input: DType) -> Option<DType> {
         self.definition.product(crate::facts::Variant { dtype: input, ..self.variant }, fold.fold(), input == DType::Boolean, None, Settings::default()).map(|p| p.result)
     }
@@ -341,7 +348,7 @@ impl Kernel {
                 let side = usize::from(side == ByKinds::Right);
                 inputs[side].read_into(range, self.result, self.variant.checked, output)?;
             }
-            Some(Policy::Codes { .. }) => with_codes(inputs, |inputs| self.definition.map(self.variant, inputs, range, settings, self.repair, output))?,
+            Some(Policy::Codes { .. }) => with_codes(inputs, Some(range.clone()), |inputs| self.definition.map(self.variant, inputs, range, settings, self.repair, output))?,
             None => self.definition.map(self.variant, inputs, range, settings, self.repair, output)?,
         }
         finish(output, wanted, self.variant.checked)
@@ -563,28 +570,47 @@ pub fn at(
     root.initialize(combine.map_or(wanted, |kernel| kernel.variant.dtype), checked, codes, output)?;
     match combine {
         None => with_dtype!(wanted, T => at_typed::<T>(values, ids, checked, None::<fn(T, T) -> (T, Option<Kind>)>, output))?,
-        Some(kernel) if codes => with_codes(&[values], |inputs| kernel.definition.at(kernel.variant, inputs[0], ids, checked, settings, output))?,
+        Some(kernel) if codes => with_codes(&[values], None, |inputs| kernel.definition.at(kernel.variant, inputs[0], ids, checked, settings, output))?,
         Some(kernel) => kernel.definition.at(kernel.variant, values, ids, checked, settings, output)?,
     }
     finish(output, wanted, checked)
 }
 
-fn with_code_inputs<R>(inputs: &[crate::agreement::Read<'_>], seed: Seed<'_>, call: impl FnOnce(&[crate::agreement::Read<'_>], Seed<'_>) -> R) -> R {
+fn with_code_inputs<R>(inputs: &[crate::agreement::Read<'_>], seed: Seed<'_>, call: impl FnOnce(&[crate::agreement::Read<'_>], Seed<'_>) -> Result<R, Error>) -> Result<R, Error> {
     let mut all = inputs.to_vec();
     match seed { Seed::Initial(r) | Seed::Tail(r) => all.push(r), Seed::Identity => {} }
-    with_codes(&all, |projected| {
+    with_codes(&all, None, |projected| {
         let seed = match seed { Seed::Initial(_) => Seed::Initial(projected[inputs.len()]), Seed::Tail(_) => Seed::Tail(projected[inputs.len()]), Seed::Identity => Seed::Identity };
         call(&projected[..inputs.len()], seed)
     })
 }
 
-fn with_codes<R>(inputs: &[crate::agreement::Read<'_>], call: impl FnOnce(&[crate::agreement::Read<'_>]) -> R) -> R {
+fn with_codes<R>(
+    inputs: &[crate::agreement::Read<'_>], range: Option<std::ops::Range<usize>>,
+    call: impl FnOnce(&[crate::agreement::Read<'_>]) -> Result<R, Error>,
+) -> Result<R, Error> {
+    use crate::{agreement::{Binding, Read, ReadPlan}, convert::{Conversion, ConversionKind}};
     let sources: Vec<Vec<_>> = inputs.iter().map(|r| r.sources.iter().map(|s| s.as_codes()).collect()).collect();
-    let projected: Vec<_> = inputs.iter().zip(&sources).map(|(r, sources)| crate::agreement::Read { sources, plan: r.plan }).collect();
+    let mut projected: Vec<_> = inputs.iter().zip(&sources).map(|(r, sources)| Read { sources, plan: r.plan }).collect();
+    if projected.iter().all(|r| r.sources.iter().all(|s| !matches!(s.view.dtype(), DType::Float(_)))) { return call(&projected); }
+    let converted = projected.iter().map(|read| {
+        if !read.sources.iter().any(|s| matches!(s.view.dtype(), DType::Float(_))) { return Ok(None); }
+        let range = range.clone().unwrap_or(0..read.plan.len());
+        let mut buffer = Buffer::with_capacity(DType::Integer(Width::I64), range.len());
+        Conversion { input: DType::Float(FloatWidth::F64), output: buffer.dtype(), kind: ConversionKind::Keep }
+            .map(*read, range.clone(), true, &mut buffer)?;
+        Ok(Some((range.start, buffer)))
+    }).collect::<Result<Vec<_>, Error>>()?;
+    let bindings = converted.iter().zip(inputs).map(|(buffer, read)| buffer.as_ref()
+        .map(|(start, b)| Binding::window(b.view(), *start, read.plan.len())).transpose()).collect::<Result<Vec<_>, _>>()?;
+    let plans: Vec<_> = inputs.iter().map(|r| ReadPlan::input(0, r.plan.len())).collect();
+    for (i, binding) in bindings.iter().enumerate() {
+        if let Some(binding) = binding { projected[i] = Read { sources: std::slice::from_ref(binding), plan: &plans[i] }; }
+    }
     call(&projected)
 }
 
-fn at_typed<T: crate::buffer::Cast>(
+pub(crate) fn at_typed<T: crate::buffer::Cast>(
     values: crate::agreement::Read<'_>, ids: Positions<'_>, checked: bool,
     apply: Option<impl Fn(T, T) -> (T, Option<Kind>)>, output: &mut Buffer,
 ) -> Result<(), Error> {
@@ -649,6 +675,7 @@ fn at_formula<K: crate::facts::Formula<N>, const N: usize>(
     ids: Positions<'_>, checked: bool, settings: Settings, output: &mut Buffer,
 ) -> Result<(), Error> {
     if N != 2 { return Err(Error::new(Kind::Length, "a modified write needs a binary function")); }
+    if let Some(result) = object.fold().and_then(|r| r.run_at(variant, values, ids, checked, output)) { return result; }
     with_binary_body!(object, variant, settings, |T, apply| at_typed::<T>(values, ids, checked, Some(apply), output))
 }
 
@@ -656,6 +683,8 @@ fn map_formula<K: crate::facts::Formula<N>, const N: usize>(
     object: &K, variant: crate::facts::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, repair: bool, output: &mut Buffer,
 ) -> Result<(), Error> {
     if inputs.len() != N { return Err(Error::new(Kind::Length, "kernel operand count changed")); }
+    crate::events::taken(crate::events::Route::VectorKernel, range.len());
+    if inputs.iter().any(|r| r.plan.contiguous(range.clone()).is_none()) { crate::events::taken(crate::events::Route::MappedKernel, range.len()); }
     if let Some(slices) = object.native_slices() {
         let valid = |ok: bool| if variant.checked && !ok { Err(Kind::Domain) } else { Ok(()) };
         return match variant.dtype {
