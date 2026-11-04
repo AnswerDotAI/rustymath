@@ -67,7 +67,7 @@ pub use ln::{Ln, Log1p, Log2, Log10, Logb, MathishLogb, RealLn};
 pub use parts::{Abs, Angle, Choose, Clip, Conj, Imag, Isfinite, Isinf, Isnan, Real, Rint, Round, Scale, Sign, Trunc};
 pub use pow::{Exponent, Pow, RealPow, Root, WholePow, WrappingPow};
 pub use slice::{Arg, Binary, CHUNK, Flipped, KernelItem, Results, Ternary, Unary, Wrapped, choose, pairs};
-pub use special::{Erfc, Erfcinv, Erfinv};
+pub use special::{BetaincAt, Erfc, Erfcinv, Erfinv};
 pub use sqrts::{RealSqrt, RealSqrt1mx2, RealSqrtm1mx2, RealSqrtx2m1, Sqrt};
 pub use trig::{Cos, Sin, Tan};
 /// The crates whose types compact buffers hold, which the exported width macros name.

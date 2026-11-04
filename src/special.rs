@@ -967,6 +967,10 @@ fn beta_fraction(a: f64, b: f64, x: f64) -> f64 {
     h
 }
 
+/// The regularized incomplete beta CDF with shape parameters a and b fixed.
+#[derive(Clone, Copy, Debug)]
+pub struct BetaincAt(pub f64, pub f64);
+
 /// ln B(a, b) = ln Γ(a) + ln Γ(b) - ln Γ(a + b).
 fn lbeta<const FUSED: bool>(a: f64, b: f64) -> f64 { lgamma64::<FUSED>(a) + lgamma64::<FUSED>(b) - lgamma64::<FUSED>(a + b) }
 

@@ -1,9 +1,9 @@
 //! Shared function definitions for numerical frontends and graph planners. Each [`Formula`] row owns its kind and character policies, numerical body, validity and repair predicates, ranges, identities, partial derivatives and exact cases. [`Kernel`](crate::operation::Kernel) erases the arity for execution. [`facts!`](crate::facts) lists typed product pairs and Python names.
-use crate::Flipped;
+use crate::{Betainc, BetaincAt, FUSED, Flipped, Float, Native};
 use crate::buffer::{DType, FloatWidth, View};
 use crate::float::sealed::Core;
 use crate::pow::parity;
-use crate::recipe::Ops;
+use crate::recipe::{NativeOps, Ops};
 use crate::reduce::{Maximum, Minimum, Reduce};
 use crate::tolerant::{Tolerance, Tolerant, TolerantComplex, lcm_from_gcd};
 use num_complex::Complex;
@@ -690,6 +690,22 @@ objects!(3:
         native_real |_, _, [a, b, p]| Some(crate::special::betaincinv::<F, { crate::FUSED }>(a, b, p)); checks nan;
     }
 );
+
+impl Formula<1> for BetaincAt {
+    fn supports(&self, dtype: DType) -> bool { Betainc.supports(dtype) }
+    fn range(&self, [x]: [Range; 1]) -> Range { Betainc.range([Range::of(Some(self.0)), Range::of(Some(self.1)), x]) }
+    fn real<F: Native>(&self, o: &NativeOps<{ FUSED }>, [x]: [F; 1]) -> Option<F> { Betainc.real(o, [F::narrow(self.0), F::narrow(self.1), x]) }
+    fn emit_partials<F: Float, O: Ops<F> + ?Sized>(&self, o: &O, [x]: [O::V; 1], _: O::V, [need]: [bool; 1]) -> [Option<O::V>; 1] {
+        [need.then(|| {
+            let (a, b, one) = (self.0, self.1, o.number(F::one()));
+            let n = |v: f64| o.number(F::narrow(v));
+            let mut e = o.negate(o.subtract(o.add(o.lgamma(n(a)), o.lgamma(n(b))), o.lgamma(n(a + b))));
+            if a != 1.0 { e = o.add(e, o.multiply(n(a - 1.0), o.ln(x))); }
+            if b != 1.0 { e = o.add(e, o.multiply(n(b - 1.0), o.ln(o.subtract(one, x)))); }
+            o.exp(e)
+        })]
+    }
+}
 
 /// Whether `y` is one whole number, as a constant whole exponent is.
 fn whole(y: Range) -> bool { y.constant().is_some_and(|k| k.fract() == 0.0) }
