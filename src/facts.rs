@@ -693,7 +693,7 @@ objects!(3:
 
 impl BetaincAt {
     fn parameters(&self, width: FloatWidth) -> [f64; 2] {
-        crate::with_float_width!(width, T => [self.0, self.1].map(|x| <T as Float>::Working::narrow(x).wide()))
+        with_float_width!(width, T => [self.0, self.1].map(|x| <T as Float>::Working::narrow(x).wide()))
     }
 }
 
