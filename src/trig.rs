@@ -1,5 +1,5 @@
 //! Shared short trigonometric reductions and polynomials, with scalar repairs for rare large arguments. Polynomial sources: Arm Optimized Routines; see THIRD-PARTY.md.
-use crate::{Float, buffer::FloatWidth, facts::Repair, float::{Native, sealed::Core}, recipe::{Cmp, Integer, Ops}};
+use crate::{Float, buffer::FloatWidth, facts::Repair, float::Native, recipe::{Cmp, Integer, Ops}};
 use std::f64::consts::FRAC_1_PI;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -35,6 +35,9 @@ pub struct Cos;
 #[derive(Clone, Copy, Debug)]
 pub struct Tan;
 
+forms!(Sin at real: |_, [x]| sin::<_, { crate::FUSED }>(x));
+forms!(Cos at real: |_, [x]| cos::<_, { crate::FUSED }>(x));
+forms!(Tan at real: |_, [x]| tan::<_, { crate::FUSED }>(x));
 #[inline]
 fn scalar<R: Native, const FUSED: bool>(x: R, kind: Kind) -> R {
     let o = crate::recipe::NativeOps::<FUSED>::DEFAULT;

@@ -97,10 +97,6 @@ pub struct WholePow;
 #[derive(Clone, Copy, Debug)]
 pub struct RealPow;
 
-/// The real part of the principal xʸ: xʸ at and above 0, and |x|ʸ cos πy below 0. cos πy is exact where y is whole or a half (`recipe::sincospi`).
-#[inline(always)]
-pub(crate) fn real_pow<R: Native, const FUSED: bool>(x: R, y: R) -> R { real_formula(&crate::recipe::NativeOps::<FUSED>::DEFAULT, x, y) }
-
 pub(crate) fn real_formula<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, y: O::V) -> O::V {
     let r = formula(o, o.magnitude(x), y);
     let real = o.multiply(r, crate::recipe::sincospi(o, y).1);

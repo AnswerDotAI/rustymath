@@ -642,14 +642,6 @@ pub fn read_all<A: Element, S: Source<A>>(items: &[S]) -> Vec<A> {
     out
 }
 
-/// Gathers source items in blocks, then converts each block contiguously.
-pub(crate) fn read_as<A: Element, S: Source<A>>(items: &[S], mapping: &crate::agreement::Mapping, n: usize) -> Vec<A> {
-    if matches!(mapping, crate::agreement::Mapping::Linear(1)) { return read_all(&items[..n]); }
-    let mut out = Vec::with_capacity(n);
-    crate::agreement::block(items, mapping, n, &mut out, |x, n, slots| slots.pairs(x, crate::Arg::One(()), n, |x, ()| (x.read(), true)));
-    out
-}
-
 /// An Overflow error for a value `x` that doesn't fit the dtype it converts to.
 fn overflow(x: impl std::fmt::Display) -> Error { Error::new(Kind::Overflow, format!("{x} doesn't fit the dtype it converts to")) }
 

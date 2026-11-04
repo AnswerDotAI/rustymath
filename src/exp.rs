@@ -1,5 +1,5 @@
 //! e^x and e^x - 1. The f64 reduction and the form of the final step come from SLEEF's `xexp`, and the f32 polynomial of `exp` and the f32 split of ln 2 from Arm Optimized Routines' AdvSIMD `expf`. The other polynomials are minimax fits. See `THIRD-PARTY.md`.
-use crate::{dd::Double, float::{Native, horner, ln2, pow2_times, sealed::Core}};
+use crate::{dd::Double, float::{Native, horner, sealed::Core}};
 
 /// The coefficients of h(r) = (e^r - 1)/r, highest degree first, for |r| up to about ln 2 / 2. `exp` needs h only to within its error in e^r = 1 + r h, which shrinks with r.
 const EXP_64: [f64; 10] = [
@@ -15,10 +15,6 @@ const H_64: [f64; 11] = [
     0.008333333333397829, 0.041666666666573905, 0.16666666666666563, 0.5000000000000006, 1.0,
 ];
 const H_32: [f64; 6] = [0.0013888871762901545, 0.00836906861513853, 0.041667137295007706, 0.16666506230831146, 0.4999999701976776, 1.0];
-
-/// The magnitude beyond which e^x is 0 or ∞ at every width this crate computes in. Each half of n stays within the exponents of normal floats.
-#[inline]
-pub(crate) fn limit<R: Native>() -> R { R::narrow(if R::WIDE { 1100.0 } else { 150.0 }) }
 
 /// x limited to ±l. Comparisons with NaN fail, so NaN passes through.
 #[inline]

@@ -29,6 +29,11 @@ name = "rustymath"
 test = false
 doctest = false
 
+# The timing suite: plain `cargo test` skips it; `cargo test --test speed` runs it.
+[[test]]
+name = "speed"
+test = false
+
 [features]
 default = ["native"]
 # Compiles rustymath's own linear algebra into macOS builds too, beside Accelerate, so `RUSTYMATH_NATIVE=1` can select it at run time.

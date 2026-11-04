@@ -38,6 +38,8 @@ cache-keys = [{ file = "pyproject.toml" }, { file = "Cargo.toml" }, { file = "py
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 session_timeout = 30
+# The timing suite runs only when named: `pytest -q tests/test_speed.py`.
+addopts = "--ignore=tests/test_speed.py"
 asyncio_default_fixture_loop_scope = "function"
 
 [tool.nbdev]

@@ -1,5 +1,5 @@
 //! The hyperbolic functions and their inverses. The functions build on `exp` and `expm1`, the inverses on `ln`'s reduction. Each computes at |x| and restores the sign of x where the function is odd.
-use crate::{exp::{exp_times, expm1_fast, expm1_times}, float::Native, ln::ln_parts};
+use crate::{float::Native, ln::ln_parts};
 
 /// sinh |x| = h(1 + 1/(2h + 1)), with h = (e^|x| - 1)/2. The halving joins `expm1`'s scaling, so sinh stays finite where e^|x| would overflow. Where h is ∞, 1/(2h + 1) is 0, and the result is ∞.
 #[inline]

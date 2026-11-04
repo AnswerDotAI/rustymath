@@ -14,6 +14,22 @@ mod timing {
         let _timing = exclusive().unwrap();
         for result in [shared(), exclusive()] { assert_eq!(result.err().unwrap().kind(), InvalidInput); }
     }
+
+    /// A budget is the expected cost times its multiplier, rounded up, and a `held` or `busy` line raises one column's budget to the budget for the cost it gives, or to twice a cost marked as an estimate. Only a gap's hold goes stale, once a cost is within 90% of the rule budget.
+    #[test]
+    fn budgets_follow_the_rule_and_holds() {
+        use rustymath::timing;
+        assert_eq!([0.2, 0.27, 15.6, 142.0, 12682.0].map(|c| timing::budget("f64", c, false)), [0.5, 0.54, 32.0, 220.0, 17000.0]);
+        assert_eq!((timing::budget("f64", 60.0, true), timing::budget("widths", 0.72, false)), (120.0, 0.97));
+        let text = "[f64]\n# 2 copies: one read and one write.\n# held linux 15.6: the cause isn't known yet\nExp\t4\t4\n# busy macos 2.7: a busy host\nLog\t4\t4\n# held linux ~60: no run has measured it\nSin\t4\t4\n";
+        let cases = timing::cases(text).unwrap();
+        let budget = |i: usize, column| timing::Budget::of(cases[i].section, &cases[i].budgets, &cases[i].holds, Some(column)).unwrap();
+        assert_eq!([budget(0, 0), budget(0, 1), budget(1, 0), budget(2, 1)].map(|b| b.to_string()), ["4", "32 held from 4", "5.4 busy from 4", "120 held from 4"]);
+        assert!(budget(0, 1).stale(3.6) && !budget(0, 1).stale(3.7) && !budget(1, 0).stale(1.0));
+        for bad in ["# held linux: no cost", "# held linux 15.6", "# held linux 1 linux 2: twice"] {
+            assert!(timing::cases(&format!("[f64]\n{bad}\nExp\t4\t4\n")).is_err(), "{bad}");
+        }
+    }
 }
 
 mod arith {

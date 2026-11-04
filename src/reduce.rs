@@ -2,7 +2,7 @@
 use crate::error::{Error, Kind};
 pub use crate::slice::running;
 use crate::{
-    Arg, Float, Native, agreement::{Mapping, Read, Walked, expanded_items}, arith::Overflowing, buffer::{Buffer, Element, View}, facts::Variant,
+    Arg, Float, Native, agreement::{Mapping, Walked, expanded_items}, arith::Overflowing, buffer::{Element, View},
     float::sealed::{Core, Folds}, gather::Steps, layout::Lanes, linalg::Scalar, parallel, slice::{CHUNK, appended, written}
 };
 use half::f16;
@@ -2239,7 +2239,7 @@ macro_rules! with_reduce {
 macro_rules! native_reduction {
     (@at $r:ty, $t:ty, |$R:ident, $T:ident| $body:expr) => {{ type $R = $r; type $T = $t; $body }};
     ($kind:expr, $dtype:expr, $checked:expr, |$R:ident, $T:ident| $body:expr) => {{
-        use crate::buffer::{DType, Width};
+        use crate::buffer::DType;
         use crate::reduce::Reduce;
         match ($dtype, $kind) {
             (DType::Boolean, Reduce::Sum) => native_reduction!(@at crate::reduce::SumAs<i64>, bool, |$R, $T| $body),
