@@ -518,7 +518,7 @@ objects!(1:
     crate::Sign { formula |_, o, [x]| Some(crate::recipe::sign(o, x)); slope |o, _, _| o.number(F::zero()); integers arithmetic; native_complex |_, _, [x]| Some(crate::complex::sign::<F, { crate::FUSED }>(x)); exact |_, [x]| Ok(Some(x.signum())); }
     crate::tolerant::Floor { formula |k, o, [x]| Some(crate::with_tolerance!(k.0, |t| t.floor_in(o, x))); slope |o, _, _| o.number(F::zero()); integers formula; native_complex |k, o, [x]| Some(crate::tolerant::TolerantComplex::complex_floor(native_tolerance(o.tolerance, k.0), x)); exact |_, [x]| Ok(Some(x.floor())); }
     crate::tolerant::Ceil { formula |k, o, [x]| Some(crate::with_tolerance!(k.0, |t| t.ceil_in(o, x))); slope |o, _, _| o.number(F::zero()); integers formula; native_complex |k, o, [x]| Some(crate::tolerant::TolerantComplex::complex_ceil(native_tolerance(o.tolerance, k.0), x)); exact |_, [x]| Ok(Some(x.ceil())); }
-    crate::Not { test |_, o, [x]| Some(o.equal(x, o.number(F::zero()))); integers only; valid |_, v, o, x, _| truth_valid(v, o, x); }
+    crate::Not { test |_, o, [x]| Some(o.equal(x, o.number(F::zero()))); integers formula; valid |_, v, o, x, _| truth_valid(v, o, x); }
     crate::Cis { output complex; native_complex |_, _, [x]| Some(crate::complex::exp::<F, { crate::FUSED }>(num_complex::Complex::new(-x.im, x.re))); }
     crate::LambertW { native_complex |_, _, [x]| Some(crate::lambert::complex(x)); native_real |_, _, [x]| Some(crate::lambert::lambertw::<F, { crate::FUSED }>(x)); checks nan; }
     crate::Lgamma { slope |o, x, _| o.digamma(x); native_complex |_, _, [x]| Some(crate::complex::lgamma::<F, { crate::FUSED }>(x)); native_real |_, _, [x]| Some(crate::special::lgamma::<F, { crate::FUSED }>(x)); checks nan; }
@@ -643,8 +643,8 @@ objects!(2:
         native_real |k, o, [x, y]| Some(lcm_from_gcd(x, y, native_tolerance(o.tolerance, k.0).gcd(x, y)));
         exact |_, [x, y]| Ok(Some(crate::exact::lcm(x, y))); checks nan;
     }
-    crate::Nand { table 7; test |_, o, [x, y]| Some(o.not(o.and(o.equal(x, o.number(F::one())), o.equal(y, o.number(F::one()))))); integers only; valid |_, v, o, x, _| truth_valid(v, o, x); }
-    crate::Nor { table 1; test |_, o, [x, y]| Some(o.and(o.equal(x, o.number(F::zero())), o.equal(y, o.number(F::zero())))); integers only; valid |_, v, o, x, _| truth_valid(v, o, x); }
+    crate::Nand { table 7; test |_, o, [x, y]| Some(o.not(o.and(boolean_one(o, x), boolean_one(o, y)))); integers formula; valid |_, v, o, x, _| truth_valid(v, o, x); }
+    crate::Nor { table 1; test |_, o, [x, y]| Some(o.and(o.equal(x, o.number(F::zero())), o.equal(y, o.number(F::zero())))); integers formula; valid |_, v, o, x, _| truth_valid(v, o, x); }
     crate::BitAnd { fold And; table 8; formula |_, o, [x, y]| Some(o.from_bits(o.integer_op(crate::recipe::Integer::And, o.to_bits(x), o.to_bits(y)))); integers only; }
     crate::BitOr { fold Or; table 14; formula |_, o, [x, y]| Some(o.from_bits(o.integer_op(crate::recipe::Integer::Or, o.to_bits(x), o.to_bits(y)))); integers only; }
     crate::BitXor { fold Xor; table 6; formula |_, o, [x, y]| Some(o.from_bits(o.integer_op(crate::recipe::Integer::Xor, o.to_bits(x), o.to_bits(y)))); integers only; }
@@ -848,10 +848,17 @@ fn shift_valid<F: crate::Float, O: Ops<F> + ?Sized>(variant: Variant, o: &O, cou
     })
 }
 
+/// Numeric Boolean true uses the default tolerance, independent of arithmetic settings.
+#[inline]
+fn boolean_one<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, x: O::V) -> O::B {
+    let one = o.number(F::one());
+    crate::recipe::equal(o, x, one, |o| crate::recipe::close(o, o.number(F::narrow(Tolerance::DEFAULT.value())), x, one))
+}
+
 fn truth_valid<F: crate::Float, O: Ops<F> + ?Sized, const N: usize>(variant: Variant, o: &O, args: [O::V; N]) -> Option<(crate::error::Kind, O::B)> {
     variant.checked.then(|| {
         let valid = args.into_iter().fold(o.equal(o.number(F::zero()), o.number(F::zero())), |valid, x| {
-            o.and(valid, o.or(o.equal(x, o.number(F::zero())), o.equal(x, o.number(F::one()))))
+            o.and(valid, o.or(o.equal(x, o.number(F::zero())), boolean_one(o, x)))
         });
         (crate::error::Kind::Domain, valid)
     })
