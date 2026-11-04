@@ -524,7 +524,10 @@ pub fn product(
     use crate::agreement::{Missing, Read};
     let dtype = output.dtype();
     if let Some(native) = map.native_product(map.variant, fold, map.boolean_inputs, Some(dtype), settings) {
-        if (native.run)(map.variant, inputs, plan, output)? {
+        let ran = if matches!(map.characters, Some(crate::characters::Policy::Codes { .. })) {
+            with_codes(&inputs, None, |inputs| (native.run)(map.variant, [inputs[0], inputs[1]], plan, output))?
+        } else { (native.run)(map.variant, inputs, plan, output)? };
+        if ran {
             return finish(output, dtype, (map.variant.checked || fold.variant.checked) && !map.variant.wrapping);
         }
     }
