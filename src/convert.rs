@@ -13,6 +13,17 @@ pub struct Conversion { pub input: crate::buffer::DType, pub output: crate::buff
 impl Conversion {
     pub fn validity<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(self, o: &O, x: O::V) -> Option<(crate::error::Kind, O::B)> {
         use crate::buffer::{DType, Width};
+        if self.kind == ConversionKind::Keep && self.input.is_integral() && self.output.is_integral() {
+            let bounds = |dtype| match dtype {
+                DType::Boolean => (0, 1), DType::Integer(width) => with_width!(width, T => (T::MIN as i64, T::MAX as i64)), _ => unreachable!()
+            };
+            let ((input_lo, input_hi), (lo, hi)) = (bounds(self.input), bounds(self.output));
+            if lo <= input_lo && hi >= input_hi { return None; }
+            let x = o.to_integer(x);
+            let valid = o.and(o.integer_compare(crate::recipe::Cmp::LessEqual, o.integer(lo.max(input_lo)), x),
+                o.integer_compare(crate::recipe::Cmp::LessEqual, x, o.integer(hi.min(input_hi))));
+            return Some((crate::error::Kind::Domain, valid));
+        }
         if self.kind != ConversionKind::Cast { return None; }
         let valid = match self.output {
             DType::Boolean => o.or(o.equal(x, o.number(F::zero())), o.equal(x, o.number(F::one()))),

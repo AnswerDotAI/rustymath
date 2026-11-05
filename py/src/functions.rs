@@ -257,6 +257,7 @@ macro_rules! functions {
 /// The real and complex dtypes, for an object whose forms serve two Python functions.
 const REAL: &[DType] = &[DType::Float(FloatWidth::F16), DType::Float(FloatWidth::F32), DType::Float(FloatWidth::F64)];
 const COMPLEX: &[DType] = &[DType::Complex(ComplexWidth::F32), DType::Complex(ComplexWidth::F64)];
+const INEXACT: &[DType] = &[REAL[0], REAL[1], REAL[2], COMPLEX[0], COMPLEX[1]];
 
 functions! {
     /// Bitwise AND, logical for Booleans.
@@ -355,7 +356,7 @@ functions! {
     #[doc = rustymath::function_doc!(gamma)]
     gamma(x) = rustymath::Gamma;
     #[doc = rustymath::function_doc!(factorial)]
-    factorial(x) = rustymath::Factorial;
+    factorial(x) = rustymath::Factorial, only INEXACT;
     #[doc = rustymath::function_doc!(lgamma)]
     gammaln(x) = rustymath::Lgamma, only REAL;
     #[doc = rustymath::function_doc!(digamma)]
@@ -621,7 +622,7 @@ fn _at<'py>(
         let buffer = match items { Items::Owned(b) => b, Items::Borrowed(v) => Buffer::copied(v, 0..v.len()) };
         Core::new(a.layout(), buffer).map_err(py_err)?
     };
-    let plan = crate::structure::selection(out.layout(), index, true)?;
+    let plan = crate::structure::selection(out.layout(), index)?;
     let b = b.into_core()?;
     released(py, || out.combine_at(&kernel, &plan, &b)).map_err(py_err)?;
     give(py, out, false)

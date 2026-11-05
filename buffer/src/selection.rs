@@ -44,16 +44,20 @@ pub fn selector(layout: &Layout, axis: usize, obj: &Bound<'_, PyAny>, array: imp
     unreachable!("`native` admits only the kinds decoded above")
 }
 
+/// A Boolean mask selects its true positions along an axis.
+pub fn boolean_selector(target: &Layout, axis: usize, layout: &Layout, mask: &[bool]) -> PyResult<(Selector, bool)> {
+    let size = *target.shape().get(axis).ok_or_else(|| PyIndexError::new_err("too many axis selectors"))?;
+    if layout.shape() != [size] { return Err(PyIndexError::new_err("a Boolean selector must be a vector matching its axis")); }
+    let positions: Vec<_> = mask.iter().enumerate().filter_map(|(i, &b)| b.then_some(i)).collect();
+    Ok((Selector::Indices { layout: Layout::from([positions.len()]), positions: Table::new(positions) }, false))
+}
+
 /// The selector that an array's items give: a character string picks a key, Booleans form a mask, and a table reads other numbers in place as positions.
 pub fn array_selector(target: &Layout, axis: usize, layout: Layout, indices: Arc<dyn IndexSource>) -> PyResult<(Selector, bool)> {
     let size = *target.shape().get(axis).ok_or_else(|| PyIndexError::new_err("too many axis selectors"))?;
     let positions = match indices.view() {
         View::Characters(text) if layout.shape().len() <= 1 => return Ok((Selector::At(key(target, axis, &text.iter().collect::<String>())?), true)),
-        View::Booleans(mask) => {
-            if layout.shape() != [size] { return Err(PyIndexError::new_err("a Boolean selector must be a vector matching its axis")); }
-            let positions: Vec<_> = mask.iter().enumerate().filter_map(|(i, &b)| b.then_some(i)).collect();
-            return Ok((Selector::Indices { layout: Layout::from([positions.len()]), positions: Table::new(positions) }, false));
-        }
+        View::Booleans(mask) => return boolean_selector(target, axis, &layout, mask),
         View::Integers(_) | View::Floats(_) => structure::index_table(indices.clone(), size).map_err(py_err)?,
         view if view.is_empty() => Table::new(vec![]),
         _ => return Err(PyTypeError::new_err("an axis selector must be an integer, key, slice, Boolean mask or integer or float array")),
@@ -75,19 +79,19 @@ pub fn parts<'py>(index: &Bound<'py, PyAny>) -> PyResult<Vec<IndexPart<Bound<'py
     }).collect()
 }
 
-/// Decodes brackets once, for a read or, where `writes`, an assignment, whose positions can repeat a key. Named selectors address their axis through `structure::addressed`.
+/// Decodes brackets once for reads and assignments. Named selectors address their axis through `structure::addressed`.
 pub fn selection(
-    layout: &Layout, index: &Bound<'_, PyAny>, writes: bool, name: impl FnMut(&Bound<'_, PyAny>) -> PyResult<Option<String>>,
+    layout: &Layout, index: &Bound<'_, PyAny>, name: impl FnMut(&Bound<'_, PyAny>) -> PyResult<Option<String>>,
     array: impl FnMut(&Layout, usize, &Bound<'_, PyAny>) -> PyResult<(Selector, bool)>) -> PyResult<(Plan, bool)> {
-    select_parts(layout, parts(index)?, writes, name, array)
+    select_parts(layout, parts(index)?, name, array)
 }
 
 pub fn select_parts(
-    layout: &Layout, written: Vec<IndexPart<Bound<'_, PyAny>>>, writes: bool, mut name: impl FnMut(&Bound<'_, PyAny>) -> PyResult<Option<String>>,
+    layout: &Layout, written: Vec<IndexPart<Bound<'_, PyAny>>>, mut name: impl FnMut(&Bound<'_, PyAny>) -> PyResult<Option<String>>,
     mut array: impl FnMut(&Layout, usize, &Bound<'_, PyAny>) -> PyResult<(Selector, bool)>) -> PyResult<(Plan, bool)> {
     let names = written.iter().map(|p| p.axis().map_or(Ok(None), &mut name)).collect::<PyResult<Vec<_>>>()?;
     let claims: Vec<_> = written.iter().zip(&names).map(|(p, n)| p.as_ref().map(|_| (n.as_deref(), 1))).collect();
-    structure::plan_parts(layout, &claims, None, true, writes, |i, axis| {
+    structure::plan_parts(layout, &claims, None, true, |i, axis| {
         let IndexPart::Axis(p) = &written[i] else { unreachable!("an axis refers to its written payload") };
         selector(layout, axis, p, || array(layout, axis, p))
     }, py_err)

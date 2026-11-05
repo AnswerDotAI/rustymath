@@ -1,5 +1,5 @@
 //! The principal branch W0 of the Lambert W function: the w with w e^w = x. Near the branch point x = -1/e, W0 + 1 is Corless et al.'s series in p = √(2(ex + 1)). Elsewhere two steps of Fritsch's iteration refine a first estimate. The complex version runs Halley steps from first estimates chosen by region, as SciPy's `lambertw` does.
-use crate::{FUSED, LambertW, arc, complex as cx, dd::Double, float::{Native, horner}, ln::{ln, log1p}, pow as p};
+use crate::{FUSED, LambertW, arc, buffer::{DType, FloatWidth}, complex as cx, facts::Range, dd::Double, float::{Native, horner}, ln::{ln, log1p}, pow as p};
 use num_complex::Complex;
 
 /// e as a double word.
@@ -16,15 +16,22 @@ const BRANCH: [f64; 36] = [
 /// The p below which W0 comes from `BRANCH` alone. A Fritsch step's error grows as 1 + W0 nears 0, in proportion to |W0| / (1 + W0).
 const NEAR: f64 = 0.5;
 
+fn branch_offset<const FUSED: bool>(x: f64, epsilon: f64) -> f64 {
+    // q = ex + 1 through ex as a double word: near the branch point ex + 1 cancels.
+    let ex = Double::new(E.0, E.1).mul_float::<FUSED>(x);
+    let q = (ex.hi + 1.0) + ex.lo;
+    if (q < 0.0) & (q >= -0.5 * epsilon) { 0.0 } else { q }
+}
+
+pub(crate) fn real_domain(dtype: DType, x: Range) -> Option<[Range; 1]> {
+    let width = crate::operation::numpy_float(dtype).max(FloatWidth::F32);
+    (x.lo >= 0.0 || branch_offset::<FUSED>(x.lo, width.epsilon()) >= 0.0).then_some([x])
+}
 /// W0(x), computed in f64. x below -1/e gives NaN. The float nearest -1/e lies below it at f32 and f64, so an x below -1/e by less than half an ulp of x gives -1.
 #[inline(always)]
 pub(crate) fn lambertw<R: Native, const FUSED: bool>(x: R) -> R {
-    let half_ulp = 0.5 * R::epsilon().wide();
     let x = x.wide();
-    // q = ex + 1 to within an ulp of q, through ex as a double word: near the branch point ex + 1 cancels.
-    let ex = Double::new(E.0, E.1).mul_float::<FUSED>(x);
-    let q = (ex.hi + 1.0) + ex.lo;
-    let q = if (q < 0.0) & (q >= -half_ulp) { 0.0 } else { q };
+    let q = branch_offset::<FUSED>(x, R::epsilon().wide());
     let p = (2.0 * q).sqrt();
     let near = p * horner::<f64, FUSED, 36>(p, BRANCH) - 1.0;
     // The first estimate: the start of the branch series up to p = 1, which covers x up to about -0.18, and Winitzki's formula above.

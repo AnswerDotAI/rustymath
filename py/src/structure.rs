@@ -36,8 +36,8 @@ fn edged(layout: &Layout, axis: usize, indices: &Bound<'_, PyAny>, edge: Edge) -
     let buffer = match positions { Edged::Positions(p) => i64::buffer(p.into_iter().map(|p| p as i64).collect()), Edged::Floats(f) => f64::buffer(f) };
     Ok(indexed(layout, axis, Core::new(indices.layout().clone(), buffer).map_err(py_err)?)?.0)
 }
-pub fn selection(layout: &Layout, index: &Bound<'_, PyAny>, writes: bool) -> PyResult<Plan> {
-    rustymath_buffer::selection::selection(layout, index, writes, |p| {
+pub fn selection(layout: &Layout, index: &Bound<'_, PyAny>) -> PyResult<Plan> {
+    rustymath_buffer::selection::selection(layout, index, |p| {
         if let Ok(a) = p.cast::<Array>() { return Ok(structure::sole_name(a.borrow().core().layout()).map(str::to_owned)); }
         Ok(if p.hasattr("__rustymath_array__")? {
             rustymath_buffer::read_array(p)?.and_then(|(_, layout)| structure::sole_name(&layout).map(str::to_owned))

@@ -2,8 +2,11 @@
 # With LTO, rustc runs these passes before the link step, and the loop vectorizer only at it. `loop-vectorize` runs first. Otherwise SLP packs the lanes of a short inner loop, and the loop vectorizer then leaves the outer loop alone.
 # A target's own `rustflags` replace these. The x86-64 entry repeats the passes.
 [build]
-rustflags = ["-C", "passes=loop-vectorize,slp-vectorizer"]
+rustflags = ["-C", "passes=loop-vectorize,slp-vectorizer", "-Zshare-generics=yes"]
 
 # Target AVX2-class x86-64 CPUs for vectorized maths kernels.
 [target.'cfg(target_arch = "x86_64")']
-rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "passes=loop-vectorize,slp-vectorizer"]
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "passes=loop-vectorize,slp-vectorizer", "-Zshare-generics=yes"]
+
+[env]
+RUSTC_BOOTSTRAP = "1"

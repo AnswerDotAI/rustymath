@@ -3,7 +3,7 @@
 //! Axes with the same name pair first. The remaining axes pair from the front unless their names conflict, so a vector pairs with the rows of a matrix. Two names conflict when they differ and are both hidden or both visible. A hidden name, which starts with `_`, meets a visible one as if that axis were unnamed, and the result keeps the visible name. An axis of length 1 repeats along its partner. Where both arguments key an axis, the result's keys are their union, and an item that one argument lacks reads as its type's fill.
 use crate::{
     Arg, Binary, CHUNK, Unary, buffer::{Element, Source}, error::{Error, Kind}, gather::{Same, Steps, Writes, cycled, walk_plan},
-    layout::{Alignment, Layout, count, generated_len, hidden, names_conflict, strides}, parallel::{Slots, extended}
+    hashing::{HashMap, HashSet}, layout::{Alignment, Layout, count, generated_len, hidden, names_conflict, strides}, parallel::{Slots, extended}
 };
 use std::{borrow::Cow, ops::Range, sync::{Arc, OnceLock}};
 
@@ -90,30 +90,51 @@ impl ReadPlan {
     }
     pub fn remapped(&self, map: Mapping, items: usize, missing: Missing) -> Self { Self::mapped(self.clone(), map, Self::fallback(missing, items), items) }
     pub fn try_for_each_source<E>(&self, visit: &mut impl FnMut(usize, usize) -> Result<(), E>) -> Result<(), E> {
+        self.visit_sources(visit, &mut HashSet::default())
+    }
+    fn visit_sources<E>(&self, visit: &mut impl FnMut(usize, usize) -> Result<(), E>, seen: &mut HashSet<*const ReadRoute>) -> Result<(), E> {
+        if !seen.insert(Arc::as_ptr(&self.route)) { return Ok(()); }
         match self.route() {
             ReadRoute::Input(source) => visit(*source, self.items),
-            ReadRoute::Map { input, missing, .. } => { input.try_for_each_source(visit)?; missing.try_for_each_source(visit) }
-            ReadRoute::Join(parts) => { for part in &**parts { part.plan.try_for_each_source(visit)?; } Ok(()) }
+            ReadRoute::Map { input, missing, .. } => { input.visit_sources(visit, seen)?; missing.visit_sources(visit, seen) }
+            ReadRoute::Join(parts) => { for part in &**parts { part.plan.visit_sources(visit, seen)?; } Ok(()) }
             ReadRoute::Index { .. } | ReadRoute::Default | ReadRoute::Invalid => Ok(()),
         }
     }
     /// Substitute producer routes without reading data or constructing item identifiers.
-    pub fn compose_inputs<E>(&self, bind: &mut impl FnMut(usize, usize) -> Result<Self, E>) -> Result<Self, E> { self.compose(bind, false) }
+    pub fn compose_inputs<E>(&self, bind: &mut impl FnMut(usize, usize) -> Result<Self, E>) -> Result<Self, E> { self.compose(bind, false, None) }
     /// Rebind inputs as write destinations: filled positions have no destination, unlike value reads through `compose_inputs`.
-    pub fn compose_addresses<E>(&self, bind: &mut impl FnMut(usize, usize) -> Result<Self, E>) -> Result<Self, E> { self.compose(bind, true) }
-    fn compose<E>(&self, bind: &mut impl FnMut(usize, usize) -> Result<Self, E>, addresses: bool) -> Result<Self, E> {
-        let route = match self.route() {
-            ReadRoute::Input(source) => return bind(*source, self.items),
-            ReadRoute::Map { input, map, missing } => ReadRoute::Map { input: input.compose(bind, addresses)?, map: map.clone(),
-                missing: if addresses { Self::fill(missing.len()) } else { missing.compose(bind, false)? } },
+    pub fn compose_addresses<E>(&self, bind: &mut impl FnMut(usize, usize) -> Result<Self, E>) -> Result<Self, E> { self.compose(bind, true, None) }
+    /// Preserve a logical character read's space default while its bindings become integer codepoints.
+    pub fn as_codes(&self, character: bool) -> Cow<'_, Self> {
+        if !character { return Cow::Borrowed(self); }
+        let plan = self.compose::<std::convert::Infallible>(
+            &mut |source, items| Ok(Self::input(source, items)), false, Some(<char as Element>::FILL as i64)).expect("codepoint projection does not bind sources");
+        Cow::Owned(plan)
+    }
+    fn compose<E>(&self, bind: &mut impl FnMut(usize, usize) -> Result<Self, E>, addresses: bool, default: Option<i64>) -> Result<Self, E> {
+        self.composed(bind, addresses, default, &mut HashMap::default())
+    }
+    fn composed<E>(
+        &self, bind: &mut impl FnMut(usize, usize) -> Result<Self, E>, addresses: bool, default: Option<i64>,
+        composed: &mut HashMap<*const ReadRoute, Self>
+    ) -> Result<Self, E> {
+        let key = Arc::as_ptr(&self.route);
+        if let Some(plan) = composed.get(&key) { return Ok(plan.clone()); }
+        let plan = match self.route() {
+            ReadRoute::Input(source) => bind(*source, self.items)?,
+            ReadRoute::Map { input, map, missing } => Self::mapped(input.composed(bind, addresses, default, composed)?, map.clone(),
+                if addresses { Self::fill(missing.len()) } else { missing.composed(bind, false, default, composed)? }, self.items),
             ReadRoute::Join(parts) => {
-                let parts =
-                    parts.iter().map(|part| Ok(ReadPart { end: part.end, plan: part.plan.compose(bind, addresses)? })).collect::<Result<Vec<_>, E>>()?;
-                ReadRoute::Join(parts.into())
+                let parts = parts.iter().map(|part| Ok(ReadPart { end: part.end, plan: part.plan.composed(bind, addresses, default, composed)? }))
+                    .collect::<Result<Vec<_>, E>>()?;
+                Self { route: Arc::new(ReadRoute::Join(parts.into())), items: self.items }
             }
-            ReadRoute::Index { .. } | ReadRoute::Default | ReadRoute::Invalid => return Ok(self.clone()),
+            ReadRoute::Default => default.map_or_else(|| self.clone(), |value| Self::index(value, 0, self.items)),
+            ReadRoute::Index { .. } | ReadRoute::Invalid => self.clone(),
         };
-        Ok(Self { route: Arc::new(route), items: self.items })
+        composed.insert(key, plan.clone());
+        Ok(plan)
     }
     /// Applies this cell's read to `frames` cells. `bind` supplies each source in frame-major order.
     pub fn framed(&self, frames: usize, bind: &mut impl FnMut(usize, usize) -> Result<Self, Error>) -> Result<Self, Error> {

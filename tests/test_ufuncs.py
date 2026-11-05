@@ -226,7 +226,7 @@ def test_scalar_functions_and_integer_binomial():
     assert rm.binom(-3, 3) == -10 and rm.binom(66, 33) == math.comb(66, 33)
     for n, k in (np.uint8(11), np.uint8(5)), (np.int64(67), np.int64(33)):
         with pytest.raises(OverflowError): rm.binom(n, k)
-    with pytest.raises(ValueError): rm.binom(3, -1)
+    assert rm.binom(3, -1) == 0 and rm.binom(-2, -3) == -2
 
 def test_minmax_and_truth_table_scan():
     for dt in [np.bool_, np.uint8, np.int16, np.float16, np.float32, np.float64]:

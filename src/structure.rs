@@ -100,25 +100,13 @@ pub fn addressed_parts(
     Ok(routed)
 }
 
-/// Plans a selection by written parts on `layout`, as `⌷` and the Python frontends read brackets. `claims` give each part's axis name and width, as for `addressed_parts`, and `explicit` its axes. `decode(i, axis)` gives the selector of written part `i` at source `axis`, with whether it reads one position. Axes that no part reaches stay whole, and a part wider than one axis reads its axes as one. Also gives whether the selection reads one item: one position on every source axis, in order. `broadcast` pairs index arrays as `select` does. `writes` plans a write, whose positions can repeat a key. `err` converts this module's errors to the caller's.
+/// Plans a selection by written parts on `layout`, as `⌷` and the Python frontends read brackets. `claims` give each part's axis name and width, as for `addressed_parts`, and `explicit` its axes. `decode(i, axis)` gives the selector of written part `i` at source `axis`, with whether it reads one position. Axes that no part reaches stay whole, and a part wider than one axis reads its axes as one. Also gives whether the selection reads one item: one position on every source axis, in order. `broadcast` pairs index arrays as `select` does. `err` converts this module's errors to the caller's.
 pub fn plan_parts<E>(
-    layout: &Layout, claims: &[IndexPart<(Option<&str>, usize)>], explicit: Option<&[usize]>, broadcast: bool, writes: bool,
+    layout: &Layout, claims: &[IndexPart<(Option<&str>, usize)>], explicit: Option<&[usize]>, broadcast: bool,
     decode: impl FnMut(usize, usize) -> Result<(Selector, bool), E>, err: impl Fn(Error) -> E) -> Result<(Plan, bool), E> {
     let r = routes(layout, claims, explicit, decode, &err)?;
-    Ok((plan_routes(layout, &r, broadcast, writes).map_err(&err)?, r.one))
+    Ok((plan_routes(layout, &r, broadcast).map_err(&err)?, r.one))
 }
-
-/// The layout of the selection that `plan_parts` plans, and whether it reads one item, where `decode` can give an index array by its layout alone (`Selector::Shaped`), as a planner that knows a value's description but not its positions gives it. `writes` plans a write, as for `plan_parts`.
-pub fn plan_layout<E>(
-    layout: &Layout, claims: &[IndexPart<(Option<&str>, usize)>], explicit: Option<&[usize]>, broadcast: bool, writes: bool,
-    decode: impl FnMut(usize, usize) -> Result<(Selector, bool), E>, err: impl Fn(Error) -> E) -> Result<(Layout, bool), E> {
-    let r = routes(layout, claims, explicit, decode, &err)?;
-    Ok((layout_routes(layout, &r, broadcast, writes).map_err(&err)?, r.one))
-}
-
-/// What a plan is for: a write, whose index arrays can repeat a key (`writes`), and a layout alone, whose index arrays can be known by their layouts (`layouts`, `plan_layout`).
-#[derive(Clone, Copy)]
-struct Planning { writes: bool, layouts: bool }
 
 /// The selectors of a selection by written parts (`routes`): one for each axis of the layout that `sources` regroups the source into, with the source axes that each reads, and whether the selection reads one item, one position on every source axis in order.
 #[derive(Clone, Debug)]
@@ -160,13 +148,13 @@ pub fn routes<E>(
     Ok(Routes { selectors, sources, one })
 }
 
-/// The plan of the selection that `routes` gives on `layout`, as `plan_parts` plans it: `writes` plans a write, whose positions can repeat a key.
-pub fn plan_routes(layout: &Layout, routes: &Routes, broadcast: bool, writes: bool) -> Result<Plan, Error> {
-    routed(layout, routes, broadcast, Planning { writes, layouts: false })
+/// The plan of the selection that `routes` gives on `layout`, as `plan_parts` plans it.
+pub fn plan_routes(layout: &Layout, routes: &Routes, broadcast: bool) -> Result<Plan, Error> {
+    routed(layout, routes, broadcast, false)
 }
 
-pub fn layout_routes(layout: &Layout, routes: &Routes, broadcast: bool, writes: bool) -> Result<Layout, Error> {
-    Ok(routed(layout, routes, broadcast, Planning { writes, layouts: true })?.layout)
+pub fn layout_routes(layout: &Layout, routes: &Routes, broadcast: bool) -> Result<Layout, Error> {
+    Ok(routed(layout, routes, broadcast, true)?.layout)
 }
 
 pub fn bound_routes(layout: &Layout, routes: &Routes, indices: &[View<'_>], broadcast: bool, checked: bool) -> Result<Plan, Error> {
@@ -200,12 +188,11 @@ pub fn bound_routes(layout: &Layout, routes: &Routes, indices: &[View<'_>], broa
         }
     }
     if input != indices.len() { return Err(Error::new(Kind::Length, "extra index arrays")); }
-    plan_routes(layout, &routes, broadcast, false)
+    plan_routes(layout, &routes, broadcast)
 }
 
-/// The plan of the selection that `routes` gives on `layout`, for `planning`.
-fn routed(layout: &Layout, routes: &Routes, broadcast: bool, planning: Planning) -> Result<Plan, Error> {
-    planned(route_layout(layout, routes)?.as_ref(), routes.selectors.clone(), broadcast, planning)
+fn routed(layout: &Layout, routes: &Routes, broadcast: bool, layouts: bool) -> Result<Plan, Error> {
+    planned(route_layout(layout, routes)?.as_ref(), routes.selectors.clone(), broadcast, layouts)
 }
 
 fn route_layout<'a>(layout: &'a Layout, routes: &Routes) -> Result<Cow<'a, Layout>, Error> {
@@ -214,26 +201,26 @@ fn route_layout<'a>(layout: &'a Layout, routes: &Routes) -> Result<Cow<'a, Layou
     regrouped(layout, routes.sources.iter().map(|s| s.iter().map(|&a| shape[a]).product()).collect(), &routes.sources, &[]).map(Cow::Owned)
 }
 
-/// One independent axis selector. Positions are zero-based and already normalized; a range can walk backwards. `All` keeps the whole axis, whatever its length. An index array replaces its axis by the axes of its layout. Its positions, a [`Table`], lie within the axis or are `Steps::FILL`, which reads the caller's fill. The code that builds an index array checks its positions, as `index_positions` and `index_table` do. `Shaped` is an index array known by its layout alone, whose positions arrive when the selection runs: only `plan_layout` takes it. `NewAxis` inserts a length-one axis without consuming an input axis.
+/// One independent axis selector. Positions are zero-based and already normalized; a range can walk backwards. `All` keeps the whole axis, whatever its length. An index array replaces its axis by the axes of its layout. Its positions, a [`Table`], lie within the axis or are `Steps::FILL`, which reads the caller's fill. The code that builds an index array checks its positions, as `index_positions` and `index_table` do. `Shaped` is an index array known by its layout alone, whose positions arrive when the selection runs: only `layout_routes` takes it. `NewAxis` inserts a length-one axis without consuming an input axis.
 #[derive(Clone, Debug)]
 pub enum Selector {
     At(usize), Range { start: usize, len: usize, step: isize }, All, Indices { layout: Layout, positions: Table }, Shaped { layout: Layout }, NewAxis
 }
 
-/// Selects with one selector for each leading axis of `layout`, in order, keeping the axes that no selector mentions. A single position removes its axis, and a range keeps it in place. An index array's axes replace its axis. An unnamed vector keeps the axis's name and the keys at the positions it selects, as a named vector without keys of its own keeps those keys, and an unnamed index array of another rank has plain axes. Index arrays pair, as arguments pair in arithmetic: all of them with `broadcast`, as `.[]` reads them, and otherwise those that share an axis name, as `⌷` reads them. Paired index arrays put their axes where the first of them was. A range pairs with an index array that has its axis's name. Positions that step evenly along each axis read as strides (`strided`), whether one index array gives them or paired arrays sum to them. One index array whose positions read a stretch of its axis past the ends, as edge modes and positions that count back from the end give them, reads as one padded or rotated entry.
+/// Selects with one selector for each leading axis of `layout`, in order, keeping the axes that no selector mentions. A single position removes its axis, and a range keeps it in place. An index array's axes replace its axis. An unnamed vector keeps the axis's name and the keys at the positions it selects if none repeats, as a named vector without keys of its own keeps those keys, and an unnamed index array of another rank has plain axes. Index arrays pair, as arguments pair in arithmetic: all of them with `broadcast`, as `.[]` reads them, and otherwise those that share an axis name, as `⌷` reads them. Paired index arrays put their axes where the first of them was. A range pairs with an index array that has its axis's name. Positions that step evenly along each axis read as strides (`strided`), whether one index array gives them or paired arrays sum to them. One index array whose positions read a stretch of its axis past the ends, as edge modes and positions that count back from the end give them, reads as one padded or rotated entry.
 pub fn select(layout: &Layout, selectors: Vec<Selector>, broadcast: bool) -> Result<Plan, Error> {
-    planned(layout, selectors, broadcast, Planning { writes: false, layouts: false })
+    planned(layout, selectors, broadcast, false)
 }
 
-/// `select`'s plan under `planning`: for a write, an index array's positions can repeat a key, and for a layout alone, an index array can be known by its layout (`Part::of`).
-fn planned(layout: &Layout, selectors: Vec<Selector>, broadcast: bool, planning: Planning) -> Result<Plan, Error> {
+/// With `layouts`, an index array can be known by its layout alone.
+fn planned(layout: &Layout, selectors: Vec<Selector>, broadcast: bool, layouts: bool) -> Result<Plan, Error> {
     let (shape, stride) = (layout.shape(), strides(layout.shape()));
     let mut parts = Vec::with_capacity(shape.len());
     let mut axis = 0;
     for selector in selectors {
         if matches!(selector, Selector::NewAxis) { parts.push(Part::new(Steps::along(1, 0), Layout::from([1]), 0, 1)); continue; }
         if axis == shape.len() { return Err(Error::new(Kind::Index, "too many axis selectors")); }
-        parts.push(Part::of(selector, layout, axis, stride[axis], planning)?);
+        parts.push(Part::of(selector, layout, axis, stride[axis], layouts)?);
         axis += 1;
     }
     parts.extend((axis..shape.len()).map(|a| Part::new(Steps::along(shape[a], 1), layout.axes(a..a + 1), stride[a], shape[a])));
@@ -277,14 +264,13 @@ struct Part { steps: Steps, axes: Layout, stride: usize, size: usize, array: boo
 impl Part {
     fn new(steps: Steps, axes: Layout, stride: usize, size: usize) -> Self { Part { steps, axes, stride, size, array: false, alone: None } }
 
-    /// The part that `selector` reads along `axis` of `layout`, whose items lie `stride` apart, under `planning`: a write's index array can repeat a key, and an index array known by its layout alone (`Selector::Shaped`) plans only a layout.
-    fn of(selector: Selector, layout: &Layout, axis: usize, stride: usize, planning: Planning) -> Result<Self, Error> {
+    fn of(selector: Selector, layout: &Layout, axis: usize, stride: usize, layouts: bool) -> Result<Self, Error> {
         let size = layout.shape()[axis];
         let outside = || Error::new(Kind::Index, "axis selector is outside its axis");
         match selector {
             Selector::At(i) if i < size => Ok(Part::new(Steps::Stride { start: i, len: 1, step: 0 }, Layout::EMPTY, stride, size)),
             Selector::At(_) => Err(outside()),
-            Selector::All => Self::of(Selector::Range { start: 0, len: size, step: 1 }, layout, axis, stride, planning),
+            Selector::All => Self::of(Selector::Range { start: 0, len: size, step: 1 }, layout, axis, stride, layouts),
             Selector::Range { start, len, step } => {
                 if len > 0 && !(start < size && start.checked_add_signed(step.saturating_mul((len - 1) as isize)).is_some_and(|i| i < size)) {
                     return Err(outside());
@@ -294,14 +280,15 @@ impl Part {
                 Ok(Part::new(steps, axes, stride, size))
             }
             Selector::Indices { layout: within, positions } => {
-                if generated_len(within.shape())? != positions.len() { return Err(Error::new(Kind::Length, "index array shape doesn't fit its positions")); }
+                if generated_len(within.shape())? != positions.len() {
+                    return Err(Error::new(Kind::Length, format!("index array shape {:?} needs {} positions, got {}", within.shape(), within.count(), positions.len())));
+                }
                 let steps = Steps::Table(positions);
-                // A read checks the selected keys even where the result drops them, as BPL selection does. A write can repeat a key (`Layout::written`).
-                let selected = if planning.writes { layout.written(axis, steps.offsets())? } else { layout.select(axis, steps.offsets())? };
+                let selected = layout.indexed(axis, steps.offsets())?;
                 Ok(Part { steps, alone: alone(&within, &selected, axis)?, axes: within, stride, size, array: true })
             }
             Selector::Shaped { layout: within } => {
-                if !planning.layouts { return Err(Error::new(Kind::Domain, "an index array known by its layout alone plans only a layout")); }
+                if !layouts { return Err(Error::new(Kind::Domain, "an index array known by its layout alone plans only a layout")); }
                 // The keys that an index array selects depend on its positions.
                 if layout.keys(axis).is_some() { return Err(Error::new(Kind::Index, "an index array known by its layout alone, along an axis with keys")); }
                 let len = generated_len(within.shape())?;
@@ -889,7 +876,7 @@ impl Windows {
         let steps = window_steps(&self.lengths, &self.axes, source);
         let keys = self.frame_keys(layout)?.into_iter().chain(self.cell_keys(layout)).collect();
         let names = (0..n).chain(0..self.cell().len()).map(|a| layout.name(a).cloned()).collect();
-        Ok(Plan { layout: Layout::from(self.lengths.clone()).with_keys(keys)?.inherit_names(names), steps })
+        Ok(Plan { layout: Layout::from(self.lengths.clone()).with_keys(keys)?.inherit_names(names).unique_names(), steps })
     }
 }
 

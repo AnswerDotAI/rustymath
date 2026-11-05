@@ -236,7 +236,9 @@ mod integer {
         assert_eq!(sum_bounds([i64::MIN, i64::MAX], 2, None, false), None);
         // Hours, minutes and seconds; a base of 0 that takes what remains; and a quotient that leaves `i64`.
         assert_eq!((encode(&[24, 60, 60], &[3661, 86399]), encode(&[0, 10], &[123])), (Some(vec![1, 1, 1, 23, 59, 59]), Some(vec![12, 3])));
-        assert_eq!((encode(&[-1], &[i64::MIN]), decode(&[24, 60, 60], &[1, 1, 1, 23, 59, 59])), (None, Some(vec![3661, 86399])));
+        assert_eq!((encode(&[-1], &[i64::MIN]), decode(&[24, 60, 60], &[1, 1, 1, 23, 59, 59])), (Some(vec![0]), Some(vec![3661, 86399])));
+        assert_eq!(encode(&[7, -1], &[i64::MIN, 5]), Some(vec![1, 0, 2, 0]));
+        assert_eq!(encode(&[0, -1], &[i64::MIN]), None);
         assert_eq!(decode(&[1, 1 << 62], &[2, 0]), None);
         let fit = |v: i128| i64::try_from(v).ok();
         for &x in &samples() {
@@ -279,13 +281,14 @@ mod integer {
                 if fits(53) { assert_eq!(rustymath::binom(n as f64, k as f64), c.unwrap() as f64, "f64 binom({n}, {k})") }
                 if fits(24) { assert_eq!(rustymath::binom(n as f32, k as f32), c.unwrap() as f32, "f32 binom({n}, {k})") }
             }
-            assert_eq!(binom(n, -1), None);
+            assert_eq!(binom(n, -1), Some(i64::from(n == -1)));
         }
         assert_eq!(binom(i64::MIN, 1), Some(i64::MIN));
         assert_eq!(binom(i64::MAX, 1), Some(i64::MAX));
         assert_eq!(binom(i64::MAX, 2), None);
         assert_eq!(binom(-2, 1_000_000_000_000), Some(1_000_000_000_001));
         assert_eq!(binom(-1, i64::MAX), Some(-1));
+        for (n, k, c) in [(-2, -3, -2), (-3, -5, 6)] { assert_eq!(binom(n, k), Some(c)); }
         // A whole k with a non-whole n takes the falling factorial, which stays accurate beside the polynomial's roots, where Γ(n + 1)/(Γ(k + 1) Γ(n - k + 1)) cancels: C(n, k) and its slope in n against mpmath, within the documented 2k ulps.
         let near = |got: f64, want: f64, k: f64| assert!((got - want).abs() <= 2.0 * k * f64::EPSILON * want.abs(), "{got} against {want}");
         for (n, k, c, slope) in [
@@ -532,7 +535,7 @@ mod operation {
 
     #[test]
     fn native_operations_use_input_kinds() {
-        use rustymath::{Add, Exp, Subtract};
+        use rustymath::{Add, Binom, Exp, Subtract};
         let (small, wide) = (DType::Integer(Width::I16), DType::Integer(Width::I64));
         let exp = Exp.resolve(Variant::checked(wide), [wide]).unwrap();
         let mut out = Buffer::with_capacity(exp.result_dtype(), 2);
@@ -552,6 +555,10 @@ mod operation {
         let mut out = Buffer::with_capacity(wide, 1);
         error::checked(|| crate::support::map(&wrapped, [i64::view(&[i64::MAX]), i64::view(&[1])], 1, &mut out)).unwrap();
         assert_eq!(i64::vec(out).unwrap(), [i64::MIN]);
+        let binom = Binom.resolve(Variant { wrapping: true, ..Variant::checked(wide) }, [wide; 2]).unwrap();
+        let mut out = Buffer::with_capacity(wide, 3);
+        error::checked(|| crate::support::map(&binom, [i64::view(&[200, -200, 67]), i64::view(&[100, 101, 33])], 3, &mut out)).unwrap();
+        assert_eq!(i64::vec(out).unwrap(), [3674307795577560168, -7960601317545944800, -4220223336089263246]);
         let input = [Binding::full(i16::view(&[10, 2, 3]))];
         let plan = ReadPlan::input(0, 3);
         let read = Read { sources: &input, plan: &plan };
@@ -566,6 +573,60 @@ mod operation {
         subtract.fold_read(&[3], 0, Seed::Tail(seed), Direction::Right, Settings::default(), read, &mut out).unwrap();
         assert_eq!(i16::vec(out).unwrap(), [-89]);
     }
+
+    #[test]
+    fn inverse_folds_keep_logical_order() {
+        use rustymath::{Divide, MathishDivide, Subtract, operation::{Piece, Total}};
+        let dtype = DType::Float(rustymath::buffer::FloatWidth::F64);
+        let subtract = Subtract.resolve(Variant::checked(dtype), [dtype; 2]).unwrap();
+        let divide = Divide.resolve(Variant::checked(dtype), [dtype; 2]).unwrap();
+        let mathish = MathishDivide.resolve(Variant::checked(dtype), [dtype; 2]).unwrap();
+        let fold = |kernel: &Kernel, shape: &[usize], axis, mapping: Mapping, data: &Buffer| {
+            let layout = Layout::from(shape.to_vec());
+            let input = view(&layout, data.view(), &mapping);
+            let mut out = Buffer::with_capacity(kernel.fold_dtype(data.dtype(), shape[axis], None), 0);
+            kernel.fold_read(shape, axis, Seed::Identity, Direction::Right, Settings::default(), input.read(), &mut out).unwrap();
+            out
+        };
+        let mut data = vec![0.; 128]; data[2] = 1.;
+        let data = f64::buffer(data);
+        assert_eq!(f64::vec(fold(&subtract, &[64, 2], 0, Mapping::Linear(1), &data)).unwrap(), [-1., 0.]);
+        let transpose = Mapping::from(vec![Steps::along(2, 1), Steps::along(64, 2)]);
+        assert_eq!(f64::vec(fold(&subtract, &[2, 64], 1, transpose, &data)).unwrap(), [-1., 0.]);
+        let reverse = Mapping::from(vec![Steps::Stride { start: 1, len: 2, step: -1 }]);
+        assert_eq!(f64::vec(fold(&subtract, &[2], 0, reverse, &f64::buffer(vec![1., 2.]))).unwrap(), [1.]);
+        let windows = Mapping::from(vec![Steps::along(2, 1), Steps::along(3, 1)]);
+        assert_eq!(f64::vec(fold(&subtract, &[2, 3], 1, windows, &f64::buffer(vec![1., 2., 3., 4.]))).unwrap(), [2., 3.]);
+        let add = rustymath::Add.resolve(Variant::checked(dtype), [dtype; 2]).unwrap();
+        let windows = Mapping::from(vec![Steps::along(2, 6), Steps::along(4, 1), Steps::along(3, 6), Steps::along(3, 1)]);
+        let data = f64::buffer((0..24).map(|n| 0.5 * f64::from(n)).collect());
+        let rows = fold(&add, &[2, 4, 3, 3], 3, windows, &data);
+        assert_eq!(rows.len(), 24);
+        let sums = fold(&add, &[2, 4, 3], 2, Mapping::Linear(1), &rows);
+        assert_eq!(f64::vec(sums).unwrap(), [31.5, 36., 40.5, 45., 58.5, 63., 67.5, 72.]);
+        for (kernel, values, expected) in [(&divide, vec![8., 2., 2.], 8.), (&mathish, vec![0., 0.], 0.), (&subtract, vec![], 0.), (&divide, vec![], 1.)] {
+            assert_eq!(f64::vec(fold(kernel, &[values.len()], 0, Mapping::Linear(1), &f64::buffer(values))).unwrap(), [expected]);
+        }
+        let values = [1., 2., 3., 4., 5., 6.];
+        let pieces = |range: std::ops::Range<usize>, emit: &mut dyn FnMut(usize, Piece<'_>)| {
+            for at in (range.start..range.end).step_by(3) { emit(at, Piece::Items(f64::view(&values[at..(at + 3).min(range.end)]))); }
+            Ok(())
+        };
+        let mut out = Buffer::with_capacity(dtype, 1);
+        subtract.fold_pieces([1, 6, 1], Seed::Identity, Direction::Right, Settings::default(), &pieces, &mut out).unwrap();
+        assert_eq!(f64::vec(out).unwrap(), [-3.]);
+        let partial = |_: std::ops::Range<usize>, emit: &mut dyn FnMut(usize, Piece<'_>)| { emit(0, Piece::Total(Total { items: 2, bits: 1f64.to_bits() })); Ok(()) };
+        let mut out = Buffer::with_capacity(dtype, 1);
+        assert!(subtract.fold_pieces([1, 2, 1], Seed::Identity, Direction::Right, Settings::default(), &partial, &mut out).is_err());
+        let byte = DType::Integer(Width::U8);
+        let wrapped = Subtract.resolve(Variant { wrapping: true, ..Variant::checked(byte) }, [byte; 2]).unwrap();
+        assert_eq!(u8::vec(fold(&wrapped, &[2], 0, Mapping::Linear(1), &u8::buffer(vec![0, 255]))).unwrap(), [1]);
+        let complex = DType::Complex(rustymath::buffer::ComplexWidth::F64);
+        let quotient = Divide.resolve(Variant::checked(complex), [complex; 2]).unwrap();
+        let data = num_complex::Complex64::buffer(vec![num_complex::Complex64::new(0., 2.), num_complex::Complex64::new(0., 1.)]);
+        assert_eq!(num_complex::Complex64::vec(fold(&quotient, &[2], 0, Mapping::Linear(1), &data)).unwrap(), [num_complex::Complex64::new(2., 0.)]);
+    }
+
 
     #[test]
     fn folds_keep_uncalled_values_and_scans_keep_their_carry() {
@@ -653,6 +714,29 @@ mod operation {
     }
 
     #[test]
+    fn composed_read_plans_keep_shared_routes_and_fills() {
+        use rustymath::agreement::{ReadAt, ReadRoute};
+        let mut plan = ReadPlan::copy(0, 2, Mapping::from(vec![Steps::table(vec![0, Steps::FILL, 1])]), 3, Missing::Scalar(1));
+        for _ in 0..12 { plan = ReadPlan::joined([plan.clone(), plan]).unwrap(); }
+        let rebound = plan.compose_inputs(&mut |source, items| Ok::<_, Error>(ReadPlan::input(source + 4, items))).unwrap();
+        let mut sources = Vec::new();
+        rebound.try_for_each_source(&mut |source, items| { sources.push((source, items)); Ok::<_, Error>(()) }).unwrap();
+        assert_eq!(sources, [(4, 2), (5, 1)]);
+        let mut branch = &rebound;
+        while let ReadRoute::Join(parts) = branch.route() {
+            assert!(std::ptr::eq(parts[0].plan.route(), parts[1].plan.route()));
+            branch = &parts[0].plan;
+        }
+        for (i, (source, position)) in [(4, 0), (5, 0), (4, 1), (4, 0), (5, 0), (4, 1)].into_iter().enumerate() {
+            assert_eq!(rebound.at(i), ReadAt::Input { source, position });
+        }
+        let destinations = plan.compose_addresses(&mut |source, items| Ok::<_, Error>(ReadPlan::input(source + 4, items))).unwrap();
+        assert_eq!(destinations.at(0), ReadAt::Input { source: 4, position: 0 });
+        assert_eq!(destinations.at(1), ReadAt::Default);
+        assert_eq!(destinations.at(2), ReadAt::Input { source: 4, position: 1 });
+    }
+
+    #[test]
     fn owned_views_share_detach_and_release_their_base() {
         use rustymath::structure::{self, Selector};
         let mut base = Array::new([2, 3].into(), i64::buffer((0..6).collect())).unwrap();
@@ -700,7 +784,7 @@ mod operation {
         assert_eq!(char::vec(characters(Maximum, &ints, &ab).unwrap()), Some(vec!['a', 'b']));
         assert_eq!(i64::vec(characters(Minimum, &ab, &ints).unwrap()), Some(vec![1, 2]));
         assert!(characters(Add, &text("\u{10FFFF}"), &i64::buffer(vec![1])).is_err());
-        let offsets = f64::buffer(vec![0.5, 1.0]);
+        let offsets = f64::buffer(vec![0.5, 1.000000000000001]);
         let kernel = Add.resolve(Variant::checked(offsets.dtype()), [ab.dtype(), offsets.dtype()]).unwrap();
         let layout = Layout::from([2]);
         let (chars, offsets) = (ArrayView::compact(&layout, ab.view()), ArrayView::compact(&layout, offsets.view()));
@@ -711,6 +795,14 @@ mod operation {
         let seed = f64::buffer(vec![0.5]);
         let seed = ArrayView::compact(&Layout::EMPTY, seed.view());
         assert!(kernel.scan([1, 2, 1], Seed::Initial(seed.read()), Direction::Left, Settings::default(), chars.read(), &mut output).is_err());
+        let (empty, chosen) = (text(""), text("x"));
+        let kernel = Add.resolve(Variant::checked(ints.dtype()), [DType::Character, ints.dtype()]).unwrap();
+        for (fill, want) in [(Missing::Default, vec!['!', '"']), (Missing::Scalar(1), vec!['y', 'z'])] {
+            let plan = ReadPlan::copy(0, 0, Mapping::Tiled(0), 2, fill);
+            let chars = ArrayView::new(&layout, vec![Binding::full(empty.view()), Binding::full(chosen.view())], plan).unwrap();
+            let result = apply(&kernel, [chars, ArrayView::compact(&layout, ints.view())]).unwrap();
+            assert_eq!(char::vec(result), Some(want));
+        }
     }
 }
 

@@ -67,6 +67,13 @@ libc = ">=0.2.190, <1"
 [profile.test]
 inherits = "release"
 
+[profile.quick]
+inherits = "test"
+lto = "off"
+
+[profile.lto]
+inherits = "release"
+
 [profile.release]
 opt-level = 2
 # Thin LTO across the crate's own codegen units, Cargo's default. Incremental builds put `#[inline]` helpers such as iterator adapters in codegen units of their own, where only LTO can inline them.

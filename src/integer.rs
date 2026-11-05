@@ -45,15 +45,43 @@ fn unsigned_gcd(mut a: u64, mut b: u64) -> u64 {
 /// The least common multiple of x and y, with the sign of x × y. It is 0 where either is 0.
 pub fn lcm(x: i64, y: i64) -> Option<i64> { if x == 0 || y == 0 { return Some(0); } (x / gcd(x, y)?).checked_mul(y) }
 
-/// The binomial coefficient C(n, k), the number of ways to choose k things from n, for k from 0. A negative n gives (-1)^k C(k - n - 1, k), the coefficient of t^k in (1 + t)^n. `None` for a negative k.
-pub fn binom(n: i64, k: i64) -> Option<i64> {
-    if k < 0 { return None; }
+/// The binomial coefficient C(n, k), with the integer continuations C(n, k) = (-1)^k C(k - n - 1, k) for negative n, and C(n, k) = (-1)^(n - k) C(-k - 1, n - k) for negative k. `None` where the result is outside `i64`.
+pub fn binom(n: i64, k: i64) -> Option<i64> { binomial(n, k, false) }
+
+pub(crate) fn binom_wrapped(n: i64, k: i64) -> Option<i64> { binomial(n, k, true) }
+
+fn binomial(n: i64, k: i64, wrapping: bool) -> Option<i64> {
+    if k < 0 {
+        if n >= 0 || k > n { return Some(0); }
+        let count = n - k;
+        return binomial(-(k + 1), count, wrapping).map(|c| if count % 2 == 0 { c } else { c.wrapping_neg() });
+    }
     let k = k as u64;
     // For a negative n, C(k - n - 1, k) is C(k + m, k) with m = -n - 1, which is never negative. k + m fits a u64.
     let (top, negative) = if n >= 0 { (n as u64, false) } else { (k + (n.unsigned_abs() - 1), k % 2 == 1) };
     if top < k { return Some(0); }
-    let c = choose(top, k.min(top - k), 1 << 63)? as i128;
-    i64::try_from(if negative { -c } else { c }).ok()
+    let k = k.min(top - k);
+    let c = if wrapping { choose_wrapped(top, k) } else { choose(top, k, if negative { 1 << 63 } else { i64::MAX as u64 })? };
+    Some(if negative { (c as i64).wrapping_neg() } else { c as i64 })
+}
+
+// Remove powers of two before division; the remaining denominator is invertible modulo 2^64.
+fn choose_wrapped(n: u64, k: u64) -> u64 {
+    let shift = k.count_ones() + (n - k).count_ones() - n.count_ones();
+    let (mut numerator, mut denominator) = (1u64, 1u64);
+    for i in 0..k {
+        if i % crate::BETWEEN_CHECKS as u64 == 0 && let Err(error) = crate::interrupt::check() {
+            crate::error::record(error);
+            return 0;
+        }
+        let (a, b) = (n - i, i + 1);
+        numerator = numerator.wrapping_mul(a >> a.trailing_zeros());
+        denominator = denominator.wrapping_mul(b >> b.trailing_zeros());
+    }
+    // An odd number is its own inverse modulo 8; five Newton steps give all 64 bits.
+    let mut inverse = denominator;
+    for _ in 0..5 { inverse = inverse.wrapping_mul(2u64.wrapping_sub(denominator.wrapping_mul(inverse))); }
+    numerator.wrapping_mul(inverse).checked_shl(shift).unwrap_or(0)
 }
 
 /// C(n, k) for 0 ≤ k ≤ n, through C(n, i + 1) = C(n, i) (n - i) / (i + 1), whose division is exact. Each step's product fits a `u128`. A coefficient beyond the caller's largest representable magnitude stops the steps.
@@ -183,10 +211,14 @@ fn fit(y: Arg<'_, i64>, n: usize) -> bool {
     match y { Arg::One(v) => fits(v), Arg::Many(v) => { v[..n].is_empty() || { let (lo, hi) = crate::reduce::extremes(&v[..n]); fits(lo) && fits(hi) } } }
 }
 
-/// The digits of each of `values` in the mixed radix of `bases`, as APL's `⊤` gives them: each value's digits together, the most significant first. A base of 0 takes all of what remains as its digit. `None` where a quotient isn't an `i64`.
+/// The digits of each of `values` in the mixed radix of `bases`, as APL's `⊤` gives them: each value's digits together, the most significant first. A base of 0 takes all of what remains as its digit. `None` where a digit isn't an `i64`.
 pub fn encode(bases: &[i64], values: &[i64]) -> Option<Vec<i64>> {
     let divisors: Vec<_> = bases.iter().map(|&b| Divisor::new(b)).collect();
-    crate::polynomial::encoded(&divisors, values, |d, v| match d { Some(d) => d.div_mod(v), None => Some((0, v)) })
+    crate::polynomial::encoded(&divisors, values, |d, v| match d { Some(d) => d.div_mod(v), None => Some((0, v)) }).or_else(|| {
+        let wide = |v: &[i64]| v.iter().map(|&n| i128::from(n)).collect::<Vec<_>>();
+        let digits = crate::polynomial::encode(&wide(bases), &wide(values), |&b, &v| if b == 0 { v } else { floored(v % b, b) });
+        digits.into_iter().map(|n| i64::try_from(n).ok()).collect()
+    })
 }
 
 /// The value of each cell of `bases.len()` digits in `digits`, in the mixed radix of `bases`, as APL's `⊥` gives it. The first base is never used. `None` where a step isn't an `i64`.

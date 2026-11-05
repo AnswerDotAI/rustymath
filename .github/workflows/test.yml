@@ -27,12 +27,12 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install -e '.[dev]'
-      - run: cargo develop
-      - run: cargo test
+      - run: cargo develop --profile lto
+      - run: cargo test --profile quick
       - run: pytest -q
         if: ${{ !cancelled() }}
       # With `RUSTYMATH_COSTS`, the Rust and Python speed tests log every cost, which `basedpl.bpltests.logged_costs` reads.
-      - run: RUSTYMATH_COSTS=1 cargo test --test speed
+      - run: RUSTYMATH_COSTS=1 cargo test --profile lto --test speed
         if: ${{ !cancelled() }}
       - run: RUSTYMATH_COSTS=1 pytest -q tests/test_speed.py
         if: ${{ !cancelled() }}

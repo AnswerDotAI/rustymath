@@ -167,13 +167,13 @@ array_methods! { folds [sum, prod, max, min, all, any, mean] scans [cumsum, cump
     }
     /// Selects each axis by an integer, key, slice, mask or index array. Index arrays pair by broadcasting from the front, as arguments do, and their axes take the first array's place. `None` inserts an axis and `...` keeps omitted axes. Basic slices share storage, with independent value semantics. No remaining axes gives a Python scalar.
     fn __getitem__<'py>(&self, py: Python<'py>, key: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
-        let plan = crate::structure::selection(self.core.layout(), key, false)?;
+        let plan = crate::structure::selection(self.core.layout(), key)?;
         give(py, released(py, || self.core.selected(plan, None)).map_err(py_err)?, true)
     }
     fn __contains__(slf: &Bound<'_, Self>, query: &Bound<'_, PyAny>) -> PyResult<bool> { crate::search::contains(slf.py(), slf, query) }
     /// Writes through the same selection as indexing, broadcasting from the front. Repeated targets take the last assigned item. Other arrays and existing buffer exports keep their values.
     fn __setitem__(slf: &Bound<'_, Self>, key: &Bound<'_, PyAny>, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        let plan = crate::structure::selection(slf.try_borrow()?.core.layout(), key, true)?;
+        let plan = crate::structure::selection(slf.try_borrow()?.core.layout(), key)?;
         // Finish reading/copying first: `value` can be this array, or a buffer that views its items.
         let source = crate::convert::one(value)?.into_core()?;
         slf.try_borrow_mut()?.core.assign(&plan, &source).map_err(py_err)

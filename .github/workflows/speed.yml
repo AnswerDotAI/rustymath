@@ -17,4 +17,4 @@ jobs:
         with:
           shared-key: native
           save-if: false
-      - run: RUSTYMATH_COSTS=1 cargo test --test speed
+      - run: RUSTYMATH_COSTS=1 cargo test --profile lto --test speed

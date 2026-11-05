@@ -1,4 +1,4 @@
-//! Powers and roots use the shared Exp/Ln bodies, except cheap constant powers and square/cube roots. Constant integer powers retain their exact cases. General power error grows with the rounding error in y·ln|x|; it is not uniformly bounded in ulps as |y·ln|x|| grows.
+//! Powers and roots use the shared Exp/Ln bodies, except cheap constant powers and square/cube roots. Runtime powers keep that same dispatch through the native kernel when a backend cannot emit it. General power error grows with the rounding error in y·ln|x|; it is not uniformly bounded in ulps as |y·ln|x|| grows.
 use crate::{buffer::FloatWidth, float::Native, recipe::{Cmp, Integer, Ops, root2}};
 
 #[inline]
@@ -9,7 +9,8 @@ pub(crate) fn parity<R: Native>(y: R) -> (bool, bool) {
 }
 
 pub(crate) fn formula<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, y: O::V) -> O::V {
-    if let Some(k) = o.constant(y) { if let Some(result) = crate::recipe::power(o, Exponent::of(k.wide()), x) { return result; } }
+    let Some(k) = o.constant(y) else { return o.binary(crate::recipe::Binary::Power, x, y); };
+    if let Some(result) = crate::recipe::power(o, Exponent::of(k.wide()), x) { return result; }
     general(o, x, y, false)
 }
 

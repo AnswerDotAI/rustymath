@@ -8,6 +8,11 @@ pub enum Rule { Identity, Ordered, Shift, Difference }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ByKinds { Truth(bool), Left, Right }
+impl ByKinds {
+    pub(crate) fn ordered([left, _]: [i32; 2], result: i32, boolean: bool) -> Self {
+        if boolean { Self::Truth(result != 0) } else if result == left { Self::Left } else { Self::Right }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Policy { Codes { computing: DType, result: DType }, Kinds(ByKinds) }
@@ -19,10 +24,9 @@ pub(crate) fn policy(
     let (computing, result) = match (rule, xc, yc) {
         (Some(Rule::Ordered), true, true) => (DType::Integer(Width::I32), if numeric_result == DType::Boolean { DType::Boolean } else { DType::Character }),
         (Some(Rule::Ordered), _, _) => {
-            let result = kinds([i32::from(xc), i32::from(yc)]).ok_or_else(|| Error::new(Kind::Domain, "ordered character function has no integer body"))?;
-            return Ok(Some(Policy::Kinds(if numeric_result == DType::Boolean { ByKinds::Truth(result != 0) }
-            else if (result == 1) == xc { ByKinds::Left }
-            else { ByKinds::Right })));
+            let classes = [i32::from(xc), i32::from(yc)];
+            let result = kinds(classes).ok_or_else(|| Error::new(Kind::Domain, "ordered character function has no integer body"))?;
+            return Ok(Some(Policy::Kinds(ByKinds::ordered(classes, result, numeric_result == DType::Boolean))));
         }
         (Some(Rule::Difference), true, true) => (DType::Integer(Width::I32), DType::Integer(Width::I32)),
         (Some(Rule::Shift), true, false) | (Some(Rule::Shift), false, true) | (Some(Rule::Difference), true, false)

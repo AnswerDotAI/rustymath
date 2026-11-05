@@ -409,8 +409,8 @@ impl Layout {
     }
     /// The layout with `axis` holding the positions it reads at `positions`, keeping their keys. `None` reads no position and has no key. A Domain error where a key repeats.
     pub fn select(&self, axis: usize, positions: impl ExactSizeIterator<Item = Option<usize>>) -> Result<Self, Error> { self.picked(axis, positions, false) }
-    /// The layout that a write through `positions` along `axis` reaches: as `select` gives it, except that the axis keeps no keys where one repeats, since a write can reach a position more than once.
-    pub fn written(&self, axis: usize, positions: impl ExactSizeIterator<Item = Option<usize>>) -> Result<Self, Error> { self.picked(axis, positions, true) }
+    /// The layout selected by an index array. A repeated source key leaves this axis without keys.
+    pub fn indexed(&self, axis: usize, positions: impl ExactSizeIterator<Item = Option<usize>>) -> Result<Self, Error> { self.picked(axis, positions, true) }
     /// `select`'s layout. Where `repeats` holds, a repeated key leaves the axis without keys instead of failing.
     fn picked(&self, axis: usize, positions: impl ExactSizeIterator<Item = Option<usize>>, repeats: bool) -> Result<Self, Error> {
         let mut layout = self.clone();

@@ -227,14 +227,15 @@ fn items<E: Copy, const N: usize>(x: &[Arg<'_, E>; N], i: usize) -> [E; N] { std
 /// Writes `f` for each of `n` results into `out`, for arguments `x`, and gives whether `f` said `true` for every result. One and two arguments run through [`pairs_into`], and three through `triples_into`, whose loops vectorize.
 #[inline(always)]
 pub(crate) fn mapped<E: Copy, O, const N: usize>(x: &[Arg<'_, E>; N], n: usize, out: &mut [MaybeUninit<O>], f: impl Fn([E; N]) -> (O, bool)) -> bool {
-    match x.as_slice() {
-        &[a] => pairs_into(a, Arg::One(()), n, out, #[inline(always)] |a, ()| f([a; N])),
-        &[a, b] => pairs_into(a, b, n, out, #[inline(always)] |a, b| f(std::array::from_fn(|k| if k == 0 { a } else { b }))),
-        &[a, b, c] => triples_into(a, b, c, n, out, #[inline(always)] |a, b, c| {
+    if const { N == 1 } {
+        pairs_into(x[0], Arg::One(()), n, out, #[inline(always)] |a, ()| f([a; N]))
+    } else if const { N == 2 } {
+        pairs_into(x[0], x[1], n, out, #[inline(always)] |a, b| f(std::array::from_fn(|k| if k == 0 { a } else { b })))
+    } else if const { N == 3 } {
+        triples_into(x[0], x[1], x[2], n, out, #[inline(always)] |a, b, c| {
             f(std::array::from_fn(|k| match k { 0 => a, 1 => b, _ => c }))
-        }),
-        _ => unreachable!("function objects take one to three arguments"),
-    }
+        })
+    } else { unreachable!("function objects take one to three arguments") }
 }
 
 /// Writes `f` for each of `n` results into `out`, for arguments `x`, and gives whether every result succeeded, as [`Outcome`] says. Slice forms call it through [`each!`]. The loop judges each output alone, and a [`Total`] output not at all. Only where some output is NaN does a second pass look at the arguments of the NaN outputs, which is rare.

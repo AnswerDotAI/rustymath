@@ -15,9 +15,9 @@ macro_rules! routes {
 routes! {
     Trace: "trace";
     Fusion: "fusion";
-    Batching: "batching";
     SlidingFold: "sliding fold";
     MappedFold: "mapped fold";
+    AlternatedFold: "alternated fold";
     MappedProduct: "mapped product";
     VectorKernel: "vector kernel";
     MappedKernel: "mapped kernel";
@@ -50,7 +50,7 @@ pub enum Event {
     Route(Record), Fused { glyphs: String, items: usize, blocks: usize, runs: usize, copied: usize },
     Stored { glyphs: String, items: usize, reason: &'static str, partway: bool },
     Forced { function: String, line: usize, column: usize, items: usize, reason: &'static str, site: Option<String> },
-    Program { event: &'static str, steps: usize, compiled: usize, blocks: usize, listing: String }, Fast { rule: &'static str, function: String },
+    Program { event: &'static str, steps: usize, listing: String }, Fast { rule: &'static str, function: String },
     Fallback { reason: String, items: usize }, Accumulation { items: usize, size: usize, path: &'static str },
     Mixed { code: String, line: usize, column: usize, target: &'static str, written: &'static str, items: usize },
     Compile { glyphs: String, microseconds: usize }
@@ -69,7 +69,7 @@ pub const TABLES: &[(&str, &[(&str, Column)])] = {
         ("fused", &[("glyphs", Text), ("items", Count), ("blocks", Count), ("runs", Count), ("copied", Count)]),
         ("stored", &[("glyphs", Text), ("items", Count), ("reason", Text), ("partway", Truth)]),
         ("forced", &[("function", Text), ("line", Count), ("column", Count), ("items", Count), ("reason", Text), ("site", Text)]),
-        ("programs", &[("event", Text), ("steps", Count), ("compiled", Count), ("blocks", Count), ("listing", Text)]),
+        ("programs", &[("event", Text), ("steps", Count), ("listing", Text)]),
         ("stopped", &[("reason", Text), ("calls", Count), ("items", Count), ("site", Text)]), ("fast", &[("rule", Text), ("function", Text)]),
         ("fallbacks", &[("reason", Text), ("items", Count)]), ("declined", &[("route", Text), ("reason", Text), ("calls", Count), ("items", Count)]),
         ("accumulations", &[("items", Count), ("size", Count), ("path", Text)]),
@@ -103,7 +103,7 @@ impl Event {
             Self::Forced { function, line, column, items, reason, site } => {
                 vec![Text(function), Count(*line), Count(*column), Count(*items), Text(reason), Text(site.as_deref().unwrap_or_default())]
             }
-            Self::Program { event, steps, compiled, blocks, listing } => vec![Text(event), Count(*steps), Count(*compiled), Count(*blocks), Text(listing)],
+            Self::Program { event, steps, listing } => vec![Text(event), Count(*steps), Text(listing)],
             Self::Fast { rule, function } => vec![Text(rule), Text(function)],
             Self::Fallback { reason, items } => vec![Text(reason), Count(*items)],
             Self::Accumulation { items, size, path } => vec![Count(*items), Count(*size), Text(path)],

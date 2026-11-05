@@ -37,6 +37,8 @@ pub enum Binary {
     Subtract,
     Multiply,
     Divide,
+    /// Runtime power retains the same exponent dispatch as the native kernel.
+    Power,
     /// `x` where `x > y`, otherwise `y`: `y` where either is NaN.
     Larger,
     /// `x` where `x < y`, otherwise `y`: `y` where either is NaN.
@@ -254,7 +256,7 @@ impl<F: Float, const FUSED: bool> Ops<F> for NativeOps<FUSED> {
         match op {
             Binary::Add => x + y, Binary::Subtract => x - y, Binary::Multiply => x * y, Binary::Divide => x / y, Binary::Larger => { if x > y { x } else { y } }
             Binary::Smaller => { if x < y { x } else { y } } Binary::Binom => crate::binom(x, y), Binary::BinomDn => crate::binom_dn(x, y),
-            Binary::BinomDk => crate::binom_dk(x, y), Binary::Polygamma => crate::polygamma(x, y),
+            Binary::Power => crate::pow::formula(self, x, y), Binary::BinomDk => crate::binom_dk(x, y), Binary::Polygamma => crate::polygamma(x, y),
             Binary::BitAnd => unreachable!("floats take no bitwise and: a recipe asks for one only where `Ops::integral` holds")
         }
     }

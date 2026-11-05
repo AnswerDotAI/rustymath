@@ -13,13 +13,16 @@ authors = [{name = "Jeremy Howard", email = "github@jhoward.fastmail.fm"}]
 classifiers = ["Programming Language :: Rust", "Programming Language :: Python :: Implementation :: CPython"]
 
 [project.optional-dependencies]
-dev = ["fastship>=0.0.11", "fastws-cli>=0.0.26", "maturin>=1.0,<2.0", "pytest", "pytest-timeout", "nbdev", "numpy", "pandas", "scipy"]
+dev = ["fastship>=0.0.11", "fastws-cli>=0.0.34", "maturin>=1.0,<2.0", "pytest", "pytest-timeout", "nbdev", "numpy", "pandas", "scipy"]
 
 [project.urls]
 Homepage = "https://github.com/AnswerDotAI/rustymath"
 Repository = "https://github.com/AnswerDotAI/rustymath"
 Issues = "https://github.com/AnswerDotAI/rustymath/issues"
 Documentation = "https://answerdotai.github.io/rustymath"
+
+[tool.fastws]
+dev-profile = "quick"
 
 [tool.fastship]
 branch = "main"

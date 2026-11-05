@@ -10,21 +10,27 @@ Keep the documented accuracy bounds that callers use. `nbs/accuracy.qmd` lists e
 
 Rustymath and basedpl have no outside users yet, so treat neither as published. Machinery is shared when it has two users: basedpl and rustymath's Python API. Changing rustymath to give them shared machinery is encouraged. Separate machinery in basedpl and rustymath for the same task is an error, unless Jeremy has asked for them to differ there.
 
+Development and planning run on Syd1 under `/home/ubuntu/aai-ws/{basedpl,rustymath}`. Both projects' `meta/` directories are maintained there and stay outside Git. Start at `../basedpl/meta/open.md` for the shared repair process. Mac copies are snapshots; never sync them over newer Syd1 work.
+
 ## Commands and builds
 
 ```bash
 cargo develop
-cargo test
+cargo test --profile quick
 pytest -q
-RUSTYMATH_COSTS=1 cargo test --test speed
+
+cargo develop --profile lto
+RUSTYMATH_COSTS=1 cargo test --profile lto --test speed
 RUSTYMATH_COSTS=1 pytest -q tests/test_speed.py
 nbdev-test
 nbdev-preview
 ```
 
-Use `cargo develop` to rebuild and install the Python extension into the editable package after Rust changes. It uses the `test` profile shared with `cargo test`. Cargo tests compile missing code but don't install it. Run plain `cargo test` while you work. It runs the Rust integration tests. The timing suites run only by name, as the commands above show: `cargo test --test speed` (`test = false` in `Cargo.toml`) and `pytest -q tests/test_speed.py` (`addopts` in `pyproject.toml` skips it otherwise). Use one test binary for a focused check. Run `pytest -q` at the end of a piece of work. Before you report a `pytest` failure in code you didn't touch, run `cargo develop` and rerun it. Give builds three minutes and test runs one minute; Cargo serializes builds in the same target directory. An already-running Python process retains its loaded extension.
+Use `cargo develop` to rebuild and install the Python extension with the `quick` profile after Rust changes. `fastws.cargo.run_tests(root, ...)` also defaults to `quick`. Bare `cargo test` uses Cargo's built-in `test` profile; pass `--profile quick` for native correctness checks. Install with `cargo develop --profile lto` before performance or budget checks, including Python timings. Cargo tests compile missing code but do not install it. An already-running Python process retains its loaded extension.
 
-Before a stage's closing review and before a release, run the full checks, as CI runs them: `cargo develop`, `cargo test`, `pytest -q`, `nbdev-test`, then both timing suites with `RUSTYMATH_COSTS=1`. Then run `bpl-tests target_builds /tmp/<prefix>_wasm` in basedpl. It builds this crate for Linux x86-64 and wasm32 as basedpl links it, with basedpl's wasm32 flags. basedpl's DEV.md describes it beside basedpl's own full checks.
+The timing suites run only by name: `cargo test --profile lto --test speed` (`test = false` in `Cargo.toml`) and `pytest -q tests/test_speed.py` (`addopts` skips it otherwise). Use one test binary for a focused check. Run `pytest -q` at the end of a piece of work. Before reporting a failure in untouched code, rebuild with the same profile and rerun it. Builds have no execution timeout. Use the documented managed runners with a 30-second test execution budget. Cargo serializes builds in the same target directory.
+
+Before a stage's closing review and before a release, run the full checks, as CI runs them: `cargo develop`, `cargo test --profile quick`, `pytest -q`, `nbdev-test`, then `cargo develop --profile lto` and both timing suites with `RUSTYMATH_COSTS=1`. Then run `bpl-tests target_builds /tmp/<prefix>_wasm` in basedpl. It builds this crate for Linux x86-64 and wasm32 as basedpl links it, with basedpl's wasm32 flags. basedpl's DEV.md describes it beside basedpl's own full checks.
 
 `cargo develop` keeps each build it installs, read-only and with its Python package, under an id that hashes the build's inputs and files (`fastws.store`). Another agent's `cargo develop` can install another build at any time, so before your change, note the installed build's id, from `fastws.store.builds(rms)`, as the baseline for your timings and tests. `basedpl.bpltests.pytest_costs` and `run_pytest` take it as `build=`, and put that build's Python package before the installed one on `PYTHONPATH`. Don't restore old code in the shared tree for a baseline.
 
@@ -37,6 +43,8 @@ Build nothing else without discussion: no scratch crates, alternate target direc
 The root package is the Python-free crate published to crates.io. `py/` is the unpublished PyO3 extension. `pyproject.toml` points maturin at its manifest. Editable installation through `uv sync` or `pip install -e` uses `fastws.build_backend` and compiles no Rust. Run `cargo develop` after installation. Don't use `maturin develop`: its build configuration differs from the shared local build.
 
 Rust 1.98 or later supplies algebraic float operations. The `test` profile inherits `release`: optimization level 2, incremental compilation, thin LTO across each crate's codegen units, no debug information, overflow checks or debug assertions. A `debug_assert!` therefore never runs here. Write a check that matters as an always-on test. The configs add LLVM's loop and SLP vectorizers as extra passes, the loop vectorizer first, for the reason basedpl's DEV.md gives under "Codegen and rebuilds". On x86-64 they also target x86-64-v3 for AVX2 and FMA. Without those target features, some conversions and rounding operations run one item at a time. `dist` disables incremental compilation and strips symbols.
+
+`[tool.fastws] dev-profile = "quick"` in `pyproject.toml` selects the development and managed correctness-test default. `quick` disables LTO; `lto` retains local ThinLTO. Both inherit the optimization level 2 and incremental settings above and enable cross-crate generic sharing. Cargo keeps independent caches in `target/quick/` and `target/lto/`. The compiler flags, Cargo-scoped bootstrap and tested toolchain are documented in basedpl's DEV.md, "Codegen and rebuilds".
 
 Keep these profiles aligned with basedpl's. Cargo uses the consuming workspace's profiles for dependencies. Concrete function forms compile in rustymath, but their build still uses that workspace's profile and target flags. Incremental builds limit how much code an edit recompiles; debug line tables and inlining across units increase that work.
 
@@ -278,7 +286,7 @@ Elementary real accuracy checks use a four-ulp bound with an additional allowanc
 
 ## CI and release
 
-`Test` runs on pushes to main and pull requests. It uses the shared test-profile build before Python/notebook tests. `Speed` is manual. `Release` runs separately on `v*` tags, builds dist wheels/sdist, publishes `rustymath` then `rustymath-buffer` to crates.io and the Python artifacts to PyPI, and attaches artifacts to the GitHub release. It does not wait for `Test` or run tests itself.
+`Test` runs on pushes to main and pull requests. It uses `quick` for native correctness tests and an installed `lto` build for Python speed budgets. `Speed` is manual. `Release` runs separately on `v*` tags, builds dist wheels/sdist, publishes `rustymath` then `rustymath-buffer` to crates.io and the Python artifacts to PyPI, and attaches artifacts to the GitHub release. It does not wait for `Test` or run tests itself.
 
 Before each release, run `bpl-tests prerelease` from basedpl's root. It runs rustymath's release checks and saves with basedpl's, as basedpl's DEV.md describes under "Release". Among them is `cargo test --profile checked`. That profile is the test profile with debug assertions on, which adds the standard library's checks in unsafe code. Those checks cost basedpl 12 to 55% per call, too much for the test profile that the budgets measure. The speed test marks itself ignored under debug assertions, so the run checks correctness only.
 

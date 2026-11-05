@@ -120,9 +120,9 @@ pub(crate) fn ln<R: Native, const FUSED: bool>(z: Complex<R>) -> Complex<R> {
     c(if near { l::log1p::<R, FUSED>(t) * R::narrow(0.5) } else { l::ln::<R, FUSED>(h) - k * hi - k * lo }, arc::atan2::<R, FUSED>(y, x))
 }
 
-/// ln(1 + w) for |w| up to 1. Below ½, ln |1 + w| is ½ log1p(u(2+u) + v²), which keeps its digits.
+/// ln(1 + w). Below |w| = ½, ln |1 + w| is ½ log1p(u(2+u) + v²), preserving digits near zero.
 #[inline]
-fn ln1p<R: Native, const FUSED: bool>(w: Complex<R>) -> Complex<R> {
+pub(crate) fn ln1p<R: Native, const FUSED: bool>(w: Complex<R>) -> Complex<R> {
     let (u, v) = (w.re, w.im);
     let small = modulus::<R, FUSED>(u, v) < R::narrow(0.5);
     let t = u.mla::<FUSED>(u + R::narrow(2.0), v * v);
