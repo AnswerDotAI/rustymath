@@ -15,8 +15,7 @@ use crate::functions::{NativeFunction, native_binary};
 
 /// `f`'s result on the views of `args`, run with the GIL released through the [`Stacked`] whose exact numbers compute as floats of the width that rustymath's own policy gives them ([`numpy_float`]).
 fn on_stacked<'py, const N: usize, R: Send>(
-    py: Python<'py>, args: [&Bound<'py, PyAny>; N], f: impl for<'c> FnOnce(Stacked, [ArrayView<'c>; N]) -> Result<R, Error> + Send
-) -> PyResult<R> {
+    py: Python<'py>, args: [&Bound<'py, PyAny>; N], f: impl for<'c> FnOnce(Stacked, [ArrayView<'c>; N]) -> Result<R, Error> + Send) -> PyResult<R> {
     let call = convert(&args)?;
     let (s, views) = (Stacked::new(numpy_float(call.args[0].view().dtype())), std::array::from_fn(|k| call.args[k].view()));
     released(py, || f(s, views)).map_err(py_err)
@@ -213,14 +212,11 @@ fn echelon<'py>(py: Python<'py>, a: &Bound<'py, PyAny>, columns: Option<usize>) 
 #[pyo3(signature = (f, g, x1, x2, name=None))]
 pub fn product<'py>(
     py: Python<'py>, f: NativeFunction<'_>, g: NativeFunction<'_>, x1: &Bound<'py, PyAny>, x2: &Bound<'py, PyAny>, name: Option<&str>
-) -> PyResult<Bound<'py, PyAny>> {
-    products(py, [x1, x2], |_| [f, g], name.unwrap_or("inner"))
-}
+) -> PyResult<Bound<'py, PyAny>> { products(py, [x1, x2], |_| [f, g], name.unwrap_or("inner")) }
 
 /// [`inner`] of `x1` and `x2`, converted to one dtype, by the formulas `f.g` that `pair` gives for that dtype, with the GIL released, as a Python result.
 fn products<'py, 'f>(
-    py: Python<'py>, [x1, x2]: [&Bound<'py, PyAny>; 2], pair: impl FnOnce(DType) -> [NativeFunction<'f>; 2], name: &str
-) -> PyResult<Bound<'py, PyAny>> {
+    py: Python<'py>, [x1, x2]: [&Bound<'py, PyAny>; 2], pair: impl FnOnce(DType) -> [NativeFunction<'f>; 2], name: &str) -> PyResult<Bound<'py, PyAny>> {
     let call = convert(&[x1, x2])?;
     let views = [call.args[0].view(), call.args[1].view()];
     let [f, g] = pair(views[0].dtype());

@@ -1,10 +1,7 @@
 //! Functions of `i64`s: greatest common divisor, least common multiple, binomial coefficients, powers, square roots and residues. Each gives `None` where its result isn't an `i64`. Their function objects are the ones that floats and complex numbers use: [`Gcd`], [`Lcm`] and [`Residue`] from [`tolerant`](crate::tolerant), whose integer forms ignore the tolerance they hold, and [`Binom`] and [`Pow`]. A slice form appends results to a vector and reports whether every item fitted. [`Divisor`] divides many integers by one, with multiplications in place of division instructions. Where every item has the same divisor, `Residue`'s slice form divides through `FloatDivisor`, which multiplies by the divisor's reciprocal in `f64` and vectorizes, for divisors and dividends below 2⁵¹ in magnitude. At types of 16 bits or fewer it multiplies 32-bit integers instead, and it takes `Divisor` for 64-bit dividends of 2⁵¹ or more.
 //!
 //! `Gcd`, `Lcm`, `Binom`, `Pow` and `Residue` also take the narrower integer types of compact buffers, `u8`, `i16` and `i32`, which they compute through these functions. A result that doesn't fit its type fails. `Pow` floors a negative power.
-use crate::{
-    Arg, Binom, Pow, convert::{self, WIDE_LIMIT}, float::sealed::Core,
-    tolerant::{Gcd, Lcm, Residue}
-};
+use crate::{Arg, Binom, Pow, convert::{self, WIDE_LIMIT}, float::sealed::Core, tolerant::{Gcd, Lcm, Residue}};
 use strength_reduce::StrengthReducedU64;
 
 /// The greatest common divisor of x and y, which is never negative. `gcd(0, 0)` is 0. `None` only where it is 2^63, as for `gcd(i64::MIN, 0)`.
@@ -32,7 +29,10 @@ pub(crate) fn lcm_wrapped(x: i64, y: i64) -> i64 { if x == 0 || y == 0 { 0 } els
 
 /// `exact`, or where it overflowed `i64`, `wrapped`'s result, reporting the overflow where `variant` fails on one: the rule that binomials, greatest common divisors, least common multiples and rounding share.
 pub(crate) fn overflowed(variant: crate::domain::Variant, exact: Option<i64>, wrapped: impl FnOnce() -> i64) -> i64 {
-    exact.unwrap_or_else(|| { if variant.fails_on_overflow() { (crate::error::Kind::Overflow.reporter())(); } wrapped() })
+    exact.unwrap_or_else(|| {
+        if variant.fails_on_overflow() { (crate::error::Kind::Overflow.reporter())(); }
+        wrapped()
+    })
 }
 
 /// The binomial coefficient C(n, k), with the integer continuations C(n, k) = (-1)^k C(k - n - 1, k) for negative n, and C(n, k) = (-1)^(n - k) C(-k - 1, n - k) for negative k. `None` where the result is outside `i64`.
@@ -60,10 +60,7 @@ fn choose_wrapped(n: u64, k: u64) -> u64 {
     let shift = k.count_ones() + (n - k).count_ones() - n.count_ones();
     let (mut numerator, mut denominator) = (1u64, 1u64);
     for i in 0..k {
-        if i % crate::BETWEEN_CHECKS as u64 == 0 && let Err(error) = crate::interrupt::check() {
-            crate::error::record(error);
-            return 0;
-        }
+        if i % crate::BETWEEN_CHECKS as u64 == 0 && let Err(error) = crate::interrupt::check() { crate::error::record(error); return 0; }
         let (a, b) = (n - i, i + 1);
         numerator = numerator.wrapping_mul(a >> a.trailing_zeros());
         denominator = denominator.wrapping_mul(b >> b.trailing_zeros());
@@ -258,7 +255,9 @@ narrower!(u8, i16, i32);
 
 /// x^y at `variant`'s integer width, as [`wrapped_power`] gives it. 0 to a negative power gives the greatest value: i64's under dynamic kinds, which a narrower width reports as an overflow so the call widens, and otherwise the width's. Where `variant` fails on overflow, a power that doesn't fit the width reports an overflow.
 pub(crate) fn native_power(variant: crate::domain::Variant, x: i64, y: i64) -> i64 {
-    let most = match variant.dtype { crate::buffer::DType::Integer(width) if !variant.fails_on_overflow() => with_width!(width, T => T::MAX as i64), _ => i64::MAX };
+    let most = match variant.dtype {
+        crate::buffer::DType::Integer(width) if !variant.fails_on_overflow() => with_width!(width, T => T::MAX as i64), _ => i64::MAX
+    };
     let (value, exact) = wrapped_power(x, y, most);
     let fits = exact && match variant.dtype { crate::buffer::DType::Integer(width) => width.holds(value), _ => true };
     if variant.fails_on_overflow() && !fits { (crate::error::Kind::Overflow.reporter())(); }

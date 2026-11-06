@@ -53,9 +53,7 @@ pub trait RunSink {
     fn walk(&mut self, _at: usize, _input: &ReadPlan, _map: &Mapping, _missing: &ReadPlan, _range: Range<usize>) -> Option<bool> { None }
 }
 
-impl<F: FnMut(usize, usize, Run) -> bool> RunSink for F {
-    fn run(&mut self, at: usize, len: usize, run: Run) -> bool { self(at, len, run) }
-}
+impl<F: FnMut(usize, usize, Run) -> bool> RunSink for F { fn run(&mut self, at: usize, len: usize, run: Run) -> bool { self(at, len, run) } }
 
 /// A part of a join: its read, and the end of its stretch of each row of the join.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,15 +109,20 @@ impl ReadPlan {
         if len == 0 { return true; }
         match self.route() {
             &ReadRoute::Input(source) => sink.run(at, len, Run::Source { source, first, stride }),
-            &ReadRoute::Index { base, step } => sink.run(at, len, Run::Index { first: base.wrapping_add(step.wrapping_mul(first as i64)), step: step.wrapping_mul(stride as i64) }),
+            &ReadRoute::Index { base, step } => {
+                sink.run(at, len, Run::Index { first: base.wrapping_add(step.wrapping_mul(first as i64)), step: step.wrapping_mul(stride as i64) })
+            }
             ReadRoute::Default => sink.run(at, len, Run::Fill),
             ReadRoute::Invalid => sink.run(at, len, Run::Invalid),
             ReadRoute::Join(parts) => {
                 let mut j = 0;
                 while j < len {
-                    let Some((plan, item, before, after)) = joined_at(parts, first.wrapping_add_signed(stride * j as isize)) else { return sink.run(at + j, len - j, Run::Invalid) };
+                    let Some((plan, item, before, after)) = joined_at(parts, first.wrapping_add_signed(stride * j as isize)) else {
+                        return sink.run(at + j, len - j, Run::Invalid);
+                    };
                     let n = (len - j).min(match stride.cmp(&0) {
-                        std::cmp::Ordering::Greater => after.div_ceil(stride as usize), std::cmp::Ordering::Less => before / stride.unsigned_abs() + 1, std::cmp::Ordering::Equal => len - j,
+                        std::cmp::Ordering::Greater => after.div_ceil(stride as usize), std::cmp::Ordering::Less => before / stride.unsigned_abs() + 1,
+                        std::cmp::Ordering::Equal => len - j
                     });
                     if !plan.runs_through(item, stride, n, at + j, sink) { return false; }
                     j += n;
@@ -133,17 +136,21 @@ impl ReadPlan {
                         if let Some(go) = sink.walk(at, input, map, missing, first..first + len) { return go; }
                         let mut go = true;
                         map.spans(first..first + len, input.len(), &mut |p, n, run| {
-                            go = match run { Some((q, s)) => input.runs_through(q, s, n, at + p - first, sink), None => missing.runs_through(p, 1, n, at + p - first, sink) };
+                            go = match run {
+                                Some((q, s)) => input.runs_through(q, s, n, at + p - first, sink), None => missing.runs_through(p, 1, n, at + p - first, sink)
+                            };
                             go
                         });
                         go
                     }
                     0 => match map.get(first).filter(|&q| q < input.len()) {
-                        Some(q) => input.runs_through(q, 0, len, at, sink), None => missing.runs_through(first, 0, len, at, sink),
+                        Some(q) => input.runs_through(q, 0, len, at, sink), None => missing.runs_through(first, 0, len, at, sink)
                     },
                     _ => (0..len).all(|j| {
                         let p = first.wrapping_add_signed(stride * j as isize);
-                        match map.get(p).filter(|&q| q < input.len()) { Some(q) => input.runs_through(q, 1, 1, at + j, sink), None => missing.runs_through(p, 1, 1, at + j, sink) }
+                        match map.get(p).filter(|&q| q < input.len()) {
+                            Some(q) => input.runs_through(q, 1, 1, at + j, sink), None => missing.runs_through(p, 1, 1, at + j, sink)
+                        }
                     }),
                 }
             }
@@ -246,7 +253,9 @@ impl ReadPlan {
         if range.is_empty() || range.end > self.items { return None; }
         let mut found = None;
         self.runs(range.clone(), &mut |_, len, run| {
-            if let Run::Source { source, first, stride } = run && len == range.len() && (len == 1 || matches!(stride, 0 | 1)) { found = Some((source, first, if len == 1 { 1 } else { stride })); }
+            if let Run::Source { source, first, stride } = run && len == range.len() && (len == 1 || matches!(stride, 0 | 1)) {
+                found = Some((source, first, if len == 1 { 1 } else { stride }));
+            }
             false
         });
         found
@@ -265,7 +274,8 @@ fn affine_bounds(base: usize, strides: &[isize], shape: &[usize]) -> Option<Rang
 }
 
 /// `Mapping::spans` of `n` positions of one row, from item `j0` of its innermost axis `axis`, which starts at offset `start`, given from result position `at`: a stride gives one span below `items` and one past it, and any other axis a span for each stretch that steps evenly.
-fn row_spans(start: usize, axis: &Steps, j0: usize, n: usize, items: usize, at: usize, f: &mut dyn FnMut(usize, usize, Option<(usize, isize)>) -> bool) -> bool {
+fn row_spans(
+    start: usize, axis: &Steps, j0: usize, n: usize, items: usize, at: usize, f: &mut dyn FnMut(usize, usize, Option<(usize, isize)>) -> bool) -> bool {
     if let Steps::Stride { start: offset, step, .. } = *axis {
         let first = start + offset.wrapping_add_signed(step * j0 as isize);
         return match step.cmp(&0) {
@@ -288,16 +298,13 @@ fn row_spans(start: usize, axis: &Steps, j0: usize, n: usize, items: usize, at: 
         let step = match (first, (j + 1 < end).then(|| position(j + 1)).flatten()) { (Some(p), Some(q)) => q as isize - p as isize, _ => 0 };
         let mut k = j + 1;
         while k < end && match (first, position(k)) {
-            (None, None) => true,
-            (Some(p), Some(q)) => q as isize - p as isize == step * (k - j) as isize,
-            _ => false,
+            (None, None) => true, (Some(p), Some(q)) => q as isize - p as isize == step * (k - j) as isize, _ => false
         } { k += 1; }
         if !f(at + j - j0, k - j, first.map(|p| (p, step))) { return false; }
         j = k;
     }
     true
 }
-
 
 /// A whole producer or its currently available logical window.
 #[derive(Clone, Copy)]
@@ -388,7 +395,9 @@ impl<'s> Read<'s> {
         Ok(Arg::Many(scratch))
     }
     /// Whether `part` reads `range` in place, writing no scratch: one run of a source that holds `T`, or one item that every position reads.
-    pub(crate) fn in_place<T: crate::buffer::Cast>(&self, range: &Range<usize>) -> bool { self.run_view(range).is_some_and(|(view, stride)| stride == 0 || view.dtype() == T::DTYPE) }
+    pub(crate) fn in_place<T: crate::buffer::Cast>(&self, range: &Range<usize>) -> bool {
+        self.run_view(range).is_some_and(|(view, stride)| stride == 0 || view.dtype() == T::DTYPE)
+    }
     /// This read as rows over a result of `shape`, which is rows then items, where every source is bound as the plan reads it, the plan maps one source that holds `T` affinely over `shape`, and each row reads one item or a run of items. `None` for any other read.
     pub(crate) fn rows<T: crate::buffer::Cast>(&self, shape: [usize; 2]) -> Option<Rows<'s, T>> {
         self.bindings().ok()?;
@@ -418,14 +427,19 @@ impl<'s> Read<'s> {
             lanes.push((match (T::of(view), stride) {
                 (Some(items), 1) => Cow::Borrowed(items),
                 (_, 0) => Cow::Owned(vec![kept(T::cast(view, 0), checked)?; rows * n]),
-                _ => { let mut items = Vec::new(); T::extend_cast(view, rows * n, checked, &mut items)?; Cow::Owned(items) }
+                _ => {
+                    let mut items = Vec::new();
+                    T::extend_cast(view, rows * n, checked, &mut items)?;
+                    Cow::Owned(items)
+                }
             }, n));
         }
         crate::gather::interleave(output, &lanes.iter().map(|(items, n)| (&items[..], *n)).collect::<Vec<_>>(), rows);
         Ok(true)
     }
     /// Appends `len` items of source `source` onto `output` at `T`, from position `first` and `stride` apart, where a stride of 0 repeats one item. Every position must lie within the source's bound window.
-    fn run_onto<T: crate::buffer::Cast>(&self, source: usize, first: usize, stride: isize, len: usize, checked: bool, output: &mut Vec<T>) -> Result<(), Error> {
+    fn run_onto<T: crate::buffer::Cast>(
+        &self, source: usize, first: usize, stride: isize, len: usize, checked: bool, output: &mut Vec<T>) -> Result<(), Error> {
         if len == 0 { return Ok(()); }
         let outside = || Error::new(Kind::Length, "read reaches outside its bound window");
         let last = first.checked_add_signed(stride * (len as isize - 1)).ok_or_else(outside)?;
@@ -454,10 +468,8 @@ impl<'s> Read<'s> {
         let binding = self.sources.get(source)?;
         let len = binding.view.len();
         (binding.start == 0 && len == input.len() && match *map {
-            Mapping::Single => true,
-            Mapping::Linear(r) => r > 0 && end.saturating_sub(1) / r < len,
-            Mapping::Tiled(m) => m > 0 && m <= len,
-            Mapping::Steps { base, ref steps } => Steps::furthest(base, &steps[..]).is_none_or(|furthest| furthest < len),
+            Mapping::Single => true, Mapping::Linear(r) => r > 0 && end.saturating_sub(1) / r < len, Mapping::Tiled(m) => m > 0 && m <= len,
+            Mapping::Steps { base, ref steps } => Steps::furthest(base, &steps[..]).is_none_or(|furthest| furthest < len)
         }).then_some(binding)
     }
     /// The whole source and the mapping of a read that maps one source with no fills, for a reader that walks the mapping itself (`linalg::Mapped`).
@@ -468,8 +480,7 @@ impl<'s> Read<'s> {
     }
     /// Walks `map` over the one source that `input` reads, onto `output`, as `copied` walks a mapping, where every position that the walk reaches lies within the source's whole binding and `missing` reads one item, the walk's fill: `false` for any other read.
     fn walk_onto<T: crate::buffer::Cast>(
-        &self, input: &ReadPlan, map: &Mapping, missing: &ReadPlan, range: Range<usize>, checked: bool, output: &mut Vec<T>
-    ) -> Result<bool, Error> {
+        &self, input: &ReadPlan, map: &Mapping, missing: &ReadPlan, range: Range<usize>, checked: bool, output: &mut Vec<T>) -> Result<bool, Error> {
         let Some(binding) = self.walkable(input, map, range.end) else { return Ok(false) };
         let Some(fill) = Filled::of(missing).filter(|&fill| fill != Filled::Never || !map.fills()) else { return Ok(false) };
         let walked = Walked::from(map);
@@ -503,7 +514,6 @@ impl<'s> Read<'s> {
         })
     }
 }
-
 
 /// The reader that `Read::read_onto` gives a plan's runs: it appends each run's items at `T` to `output`, and keeps the first error.
 struct Onto<'r, 'a, T> { read: &'r Read<'a>, checked: bool, output: &'r mut Vec<T>, error: Option<Error> }
@@ -552,20 +562,17 @@ enum Filled { Fill, Value(i64), Source(usize), Never }
 impl Filled {
     fn of(missing: &ReadPlan) -> Option<Self> {
         match missing.route() {
-            ReadRoute::Default => Some(Self::Fill),
-            ReadRoute::Invalid => Some(Self::Never),
-            &ReadRoute::Index { base, step: 0 } => Some(Self::Value(base)),
+            ReadRoute::Default => Some(Self::Fill), ReadRoute::Invalid => Some(Self::Never), &ReadRoute::Index { base, step: 0 } => Some(Self::Value(base)),
             &ReadRoute::Input(source) if missing.len() == 1 => Some(Self::Source(source)),
             ReadRoute::Map { input, map: Mapping::Single, .. } => match *input.route() { ReadRoute::Input(source) => Some(Self::Source(source)), _ => None },
-            _ => None,
+            _ => None
         }
     }
     /// The item as an `A`, where it is exactly one: `None` where an index value doesn't convert, or the source holds another dtype or no first item.
     fn item<A: crate::buffer::Cast>(self, sources: &[Binding<'_>]) -> Option<A> {
         match self {
-            Self::Fill | Self::Never => Some(A::FILL),
-            Self::Value(value) => A::cast(crate::buffer::View::Integers(crate::buffer::Ints::I64(&[value])), 0).ok(),
-            Self::Source(source) => A::of(sources.get(source).filter(|binding| binding.start == 0)?.view)?.first().copied(),
+            Self::Fill | Self::Never => Some(A::FILL), Self::Value(value) => A::cast(crate::buffer::View::Integers(crate::buffer::Ints::I64(&[value])), 0).ok(),
+            Self::Source(source) => A::of(sources.get(source).filter(|binding| binding.start == 0)?.view)?.first().copied()
         }
     }
 }
@@ -736,7 +743,10 @@ impl Mapping {
     pub fn composed(&self, outer: &Self, shape: &[usize], frame: &[usize], table: bool) -> Option<Self> {
         if let Some(mapping) = self.compose(outer, shape, frame) { return Some(mapping); }
         if !table { return None; }
-        let walked = |map: &Self, shape: &[usize]| { let (base, steps) = map.to_walk(shape); Steps::combined(base, &steps[..]) };
+        let walked = |map: &Self, shape: &[usize]| {
+            let (base, steps) = map.to_walk(shape);
+            Steps::combined(base, &steps[..])
+        };
         let inner = (count(shape) <= count(frame)).then(|| walked(self, shape));
         let at = |j: usize| match &inner {
             _ if j == Steps::FILL => j, Some(listed) => listed.get(j).copied().unwrap_or(Steps::FILL), None => self.get(j).unwrap_or(Steps::FILL)
@@ -901,25 +911,27 @@ impl Mapping {
         match *self {
             Self::Single => { f(at, range.len(), (items > 0).then_some((0, 0))); }
             Self::Linear(0) | Self::Tiled(0) => { f(at, range.len(), None); }
-            Self::Linear(r) => while at < range.end {
-                let (k, end) = (at / r, range.end.min((at / r + 1) * r));
-                if !f(at, end - at, (k < items).then_some((k, 0))) { return; }
-                at = end;
-            },
-            Self::Tiled(m) => while at < range.end {
-                let (p, end) = (at % m, range.end.min(at - at % m + m));
-                let below = items.saturating_sub(p).min(end - at);
-                if below > 0 && !f(at, below, Some((p, 1))) { return; }
-                if end > at + below && !f(at + below, end - at - below, None) { return; }
-                at = end;
-            },
-            Self::Steps { base, ref steps } => {
-                let Some((inner, outer)) = steps.split_last() else { f(at, range.len(), (base < items).then_some((base, 0))); return };
-                // A range that steps evenly across rows is one span.
-                if let Some((first, step)) = Steps::run(base, steps, at, range.len()) && first.max(first.wrapping_add_signed(step * (range.len() as isize - 1))) < items {
-                    f(at, range.len(), Some((first, step)));
-                    return;
+            Self::Linear(r) => {
+                while at < range.end {
+                    let (k, end) = (at / r, range.end.min((at / r + 1) * r));
+                    if !f(at, end - at, (k < items).then_some((k, 0))) { return; }
+                    at = end;
                 }
+            }
+            Self::Tiled(m) => {
+                while at < range.end {
+                    let (p, end) = (at % m, range.end.min(at - at % m + m));
+                    let below = items.saturating_sub(p).min(end - at);
+                    if below > 0 && !f(at, below, Some((p, 1))) { return; }
+                    if end > at + below && !f(at + below, end - at - below, None) { return; }
+                    at = end;
+                }
+            }
+            Self::Steps { base, ref steps } => {
+                let Some((inner, outer)) = steps.split_last() else { f(at, range.len(), (base < items).then_some((base, 0))); return; };
+                // A range that steps evenly across rows is one span.
+                if let Some((first, step)) = Steps::run(base, steps, at, range.len())
+                    && first.max(first.wrapping_add_signed(step * (range.len() as isize - 1))) < items { f(at, range.len(), Some((first, step))); return; }
                 let width = inner.len();
                 while at < range.end && width > 0 {
                     let (row, j) = (at / width, at % width);

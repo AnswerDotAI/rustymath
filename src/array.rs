@@ -201,7 +201,9 @@ impl Array {
         let source = source.view().remapped(agreement.right, agreement.len);
         let positions = ReadPlan::input(0, self.len()).remapped(Mapping::from(plan.steps.clone()), agreement.len, Missing::Default);
         let mut buffer = Buffer::with_capacity(self.dtype(), self.len());
-        crate::operation::at(combine, WriteRoot::Read(root.read()), source.read(), Positions::Route(&positions, 0), true, Settings { tolerance: crate::tolerant::Tolerance::EXACT }, &mut buffer)?;
+        crate::operation::at(
+            combine, WriteRoot::Read(root.read()), source.read(), Positions::Route(&positions, 0), true,
+            Settings { tolerance: crate::tolerant::Tolerance::EXACT }, &mut buffer)?;
         Ok(buffer)
     }
     /// Writes a broadcast source into a selection. Checks finish before replacing the array's storage.

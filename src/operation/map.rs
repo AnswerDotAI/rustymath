@@ -17,9 +17,11 @@ pub(super) fn map_formula<K: crate::facts::Formula<N>, const N: usize>(
         let blocks = match variant.dtype {
             DType::Float(FloatWidth::F64) => sliced(object, slices.double, inputs, range.clone(), variant.checked, &valid, output),
             DType::Float(FloatWidth::F32) => sliced(object, slices.single, inputs, range.clone(), variant.checked, &valid, output),
-            DType::Float(FloatWidth::F16) => slices.single.map(|single| map_blocks::<f32, half::f16, N>(inputs, range.clone(), variant.checked, output, &|args, n, out| {
-                valid(crate::slice::buffered(n, out, |out| single(object, args, n, out), half::f16::from_f32))
-            })),
+            DType::Float(FloatWidth::F16) => slices.single.map(|single| {
+                map_blocks::<f32, half::f16, N>(inputs, range.clone(), variant.checked, output, &|args, n, out| {
+                    valid(crate::slice::buffered(n, out, |out| single(object, args, n, out), half::f16::from_f32))
+                })
+            }),
             DType::Integer(Width::U8) => sliced(object, slices.byte, inputs, range.clone(), variant.checked, &valid, output),
             DType::Integer(Width::I16) => sliced(object, slices.short, inputs, range.clone(), variant.checked, &valid, output),
             DType::Integer(Width::I32) => sliced(object, slices.int, inputs, range.clone(), variant.checked, &valid, output),
@@ -33,12 +35,15 @@ pub(super) fn map_formula<K: crate::facts::Formula<N>, const N: usize>(
         DType::Float(FloatWidth::F32) => map_real::<K, f32, f32, N>(object, variant, inputs, range, settings, repair, judge, output),
         DType::Float(FloatWidth::F64) => map_real::<K, f64, f64, N>(object, variant, inputs, range, settings, repair, judge, output),
         DType::Boolean => match object.truth_table() {
-            Some(table) => map_truth::<N>(table, inputs, range, output),
-            None => map_integer::<K, u8, N>(object, variant, inputs, range, judge, output),
+            Some(table) => map_truth::<N>(table, inputs, range, output), None => map_integer::<K, u8, N>(object, variant, inputs, range, judge, output)
         },
         DType::Integer(width) => with_width!(width, I => map_integer::<K, I, N>(object, variant, inputs, range, judge, output)),
-        DType::Complex(crate::buffer::ComplexWidth::F32) if K::REAL_COMPLEX && real_inputs(inputs) => map_real_complex::<K, f32, N>(object, variant, inputs, range, settings, output),
-        DType::Complex(crate::buffer::ComplexWidth::F64) if K::REAL_COMPLEX && real_inputs(inputs) => map_real_complex::<K, f64, N>(object, variant, inputs, range, settings, output),
+        DType::Complex(crate::buffer::ComplexWidth::F32) if K::REAL_COMPLEX && real_inputs(inputs) => {
+            map_real_complex::<K, f32, N>(object, variant, inputs, range, settings, output)
+        }
+        DType::Complex(crate::buffer::ComplexWidth::F64) if K::REAL_COMPLEX && real_inputs(inputs) => {
+            map_real_complex::<K, f64, N>(object, variant, inputs, range, settings, output)
+        }
         DType::Complex(crate::buffer::ComplexWidth::F32) => map_complex::<K, f32, N>(object, variant, inputs, range, settings, judge, output),
         DType::Complex(crate::buffer::ComplexWidth::F64) => map_complex::<K, f64, N>(object, variant, inputs, range, settings, judge, output),
         DType::Character => Err(Error::new(Kind::Domain, "characters are not numerical kernel operands")),
@@ -59,14 +64,18 @@ fn map_truth<const N: usize>(table: u8, inputs: &[crate::agreement::Read<'_>], r
 }
 
 /// Whether no source of `inputs` holds complex items, so that a formula's complex results from real arguments (`Formula::real_complex`) can read them as reals.
-fn real_inputs(inputs: &[crate::agreement::Read<'_>]) -> bool { inputs.iter().all(|read| read.sources.iter().all(|b| !matches!(b.view.dtype(), DType::Complex(_)))) }
+fn real_inputs(inputs: &[crate::agreement::Read<'_>]) -> bool {
+    inputs.iter().all(|read| read.sources.iter().all(|b| !matches!(b.view.dtype(), DType::Complex(_))))
+}
 
 /// `apply` on each item of `inputs` over `range`, written to `output` through `map_written`.
 #[inline]
 fn map_values<F: crate::buffer::Cast, O: Element, const N: usize>(
-    inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, checked: bool, judged: bool, output: &mut Buffer,
-    apply: impl Fn([F; N]) -> O + Sync, kind: impl Fn([F; N], O) -> Option<Kind> + Sync) -> Result<(), Error> {
-    map_written(inputs, range, checked, judged, output, |args, n, out| { crate::slice::mapped(args, n, out, #[inline(always)] |x| (apply(x), true)); }, kind)
+    inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, checked: bool, judged: bool, output: &mut Buffer, apply: impl Fn([F; N]) -> O + Sync,
+    kind: impl Fn([F; N], O) -> Option<Kind> + Sync) -> Result<(), Error> {
+    map_written(inputs, range, checked, judged, output, |args, n, out| {
+        crate::slice::mapped(args, n, out, #[inline(always)] |x| (apply(x), true));
+    }, kind)
 }
 
 /// Each block of `inputs` over `range` as `write` writes all `n` of its slots, to `output`. Where `judged`, `kind` judges each stored result against its arguments: `None` for a valid result, otherwise its error kind. No body runs twice, because a resolved object's body gives a result for every item.
@@ -91,9 +100,12 @@ fn map_blocks<F: crate::buffer::Cast, O: Element, const N: usize>(
     if output.dtype() != O::DTYPE { *output = Buffer::with_capacity(O::DTYPE, range.len()); }
     let values = O::vec_mut(output).expect("kernel output has its selected dtype");
     values.clear();
-    let recorded = |result: Result<(), Kind>| result.map_err(|kind| crate::error::record(Error::new(kind, "numerical kernel argument is outside its domain"))).is_ok();
+    let recorded =
+        |result: Result<(), Kind>| result.map_err(|kind| crate::error::record(Error::new(kind, "numerical kernel argument is outside its domain"))).is_ok();
     if let Some((len, rows)) = by_rows::<F>(inputs) {
-        crate::parallel::extended(values, range.len(), crate::CHUNK, &|part, slots| slots.fill(part.len(), |out| recorded(fill_rows(&rows, len, part.start + range.start, out, apply))));
+        crate::parallel::extended(values, range.len(), crate::CHUNK, &|part, slots| {
+            slots.fill(part.len(), |out| recorded(fill_rows(&rows, len, part.start + range.start, out, apply)))
+        });
         return Ok(());
     }
     crate::parallel::extended(values, range.len(), crate::CHUNK, &|part, slots| {
@@ -123,9 +135,8 @@ const ROWS: usize = 16;
 fn by_rows<'a, F: crate::buffer::Cast>(inputs: &[crate::agreement::Read<'a>]) -> Option<(usize, Vec<crate::agreement::Rows<'a, F>>)> {
     use crate::agreement::{Mapping, ReadRoute};
     let len = inputs.iter().find_map(|read| match read.plan.route() {
-        ReadRoute::Map { map: Mapping::Linear(k) | Mapping::Tiled(k), .. } => Some(*k),
-        ReadRoute::Map { .. } => read.plan.shape_hint().last().copied(),
-        _ => None,
+        ReadRoute::Map { map: Mapping::Linear(k) | Mapping::Tiled(k), .. } => Some(*k), ReadRoute::Map { .. } => read.plan.shape_hint().last().copied(),
+        _ => None
     })?;
     let items = inputs.first()?.plan.len();
     if len < ROWS || items <= len || items % len != 0 { return None; }

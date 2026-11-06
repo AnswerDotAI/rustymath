@@ -17,7 +17,7 @@ pub(crate) fn ordered_scan<T: Copy>(
         for (items, outs) in data.chunks(len * inner).zip(slots.chunks_mut(len * inner)) {
             match seed {
                 Some(s) => failure = failure.or(block(s, &items[..inner], &mut outs[..inner]).err()),
-                None => for (slot, &x) in outs.iter_mut().zip(&items[..inner]) { slot.write(x); },
+                None => { for (slot, &x) in outs.iter_mut().zip(&items[..inner]) { slot.write(x); } }
             }
             for r in 1..len {
                 let (done, next) = outs.split_at_mut(r * inner);
@@ -29,7 +29,8 @@ pub(crate) fn ordered_scan<T: Copy>(
 }
 
 /// Appends the running results along each lane of `len` consecutive items in `data` to `out`, and gives whether every one fits: `first` gives each lane's first result, and `step` each later one from the one before. Lanes shorter than [`SHORT_LANE`] run [`LANES`] side by side (`rows_scan`).
-pub(crate) fn lanes_scan<T: Copy>(data: &[T], len: usize, out: &mut Vec<T>, first: impl Fn(T) -> (T, bool) + Copy, step: impl Fn(T, T) -> (T, bool) + Copy) -> bool {
+pub(crate) fn lanes_scan<T: Copy>(
+    data: &[T], len: usize, out: &mut Vec<T>, first: impl Fn(T) -> (T, bool) + Copy, step: impl Fn(T, T) -> (T, bool) + Copy) -> bool {
     rows_scan(data, [0, len, 1], out, |lane, out| {
         let (total, ok) = first(lane[0]);
         out.push(total);

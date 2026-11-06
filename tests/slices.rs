@@ -403,7 +403,7 @@ mod reductions {
                     let (seed, mut reduced) = (start.as_ref().map(std::slice::from_ref), Vec::new());
                     match code {
                         14 => scan_along::<bool, Max>(&b, shape, seed, &mut reduced), 8 => scan_along::<bool, Min>(&b, shape, seed, &mut reduced),
-                        6 => scan_along::<bool, Xor>(&b, shape, seed, &mut reduced), _ => scan_along::<bool, Xnor>(&b, shape, seed, &mut reduced),
+                        6 => scan_along::<bool, Xor>(&b, shape, seed, &mut reduced), _ => scan_along::<bool, Xnor>(&b, shape, seed, &mut reduced)
                     };
                     assert_eq!(reduced, want, "{shape:?} {start:?} {code}");
                 }
@@ -838,7 +838,10 @@ mod tolerant {
         let (x, y) = (2.2500000000000018, 0.7500000000000007);
         let f64s = DType::Float(FloatWidth::F64);
         let quotient = FloorDivide(Tolerance::EXACT).resolve(Variant::checked(f64s), [f64s; 2]).unwrap();
-        assert_eq!((quotient.real(&[x, y], rustymath::operation::Settings { tolerance: Tolerance::EXACT }).unwrap(), Residue(Tolerance::EXACT).one(y, x)), (2.0, x - 2.0 * y));
+        assert_eq!(
+            (quotient.real(&[x, y], rustymath::operation::Settings { tolerance: Tolerance::EXACT }).unwrap(), Residue(Tolerance::EXACT).one(y, x)),
+            (2.0, x - 2.0 * y)
+        );
         if rustymath::FUSED { assert_ne!(Exactly.residue(0.1, 1.0), 0.0); }
         assert_eq!(Exactly.residue(1e300, 1e-300), 1e-300);
         assert!((T.gcd(0.6, 0.4) - 0.2).abs() < 1e-15 && Exactly.gcd(0.6, 0.4) < 1e-15);

@@ -136,15 +136,14 @@ pub(crate) fn power_slice<F: crate::float::Native>(_: &Pow, [x, y]: [crate::Arg<
     if let (crate::Arg::Many(xs), crate::Arg::One(k)) = (x, y) {
         let e = Exponent::of(k.wide());
         powers(e, k, &xs[..n], &mut out[..n]);
-        return !matches!(e, Exponent::Halves { .. } | Exponent::General) || k.is_nan() || xs[..n].iter().zip(crate::slice::written(&mut out[..n]).iter()).all(|(x, r)| !r.is_nan() || x.is_nan());
+        return !matches!(e, Exponent::Halves { .. } | Exponent::General) || k.is_nan()
+            || xs[..n].iter().zip(crate::slice::written(&mut out[..n]).iter()).all(|(x, r)| !r.is_nan() || x.is_nan());
     }
     // Exponents that vary: `general` for every item in one loop that vectorizes, then each item whose exponent has a route of its own (`Exponent::of`) takes that route, as `formula` would.
     let o = crate::recipe::NativeOps::<{ crate::FUSED }>::DEFAULT;
     crate::slice::mapped(&[x, y], n, out, #[inline(always)] |[a, b]| (general(&o, a, b, false), true));
     let results = crate::slice::written(&mut out[..n]);
-    for (i, r) in results.iter_mut().enumerate() {
-        if let Some(exact) = crate::recipe::power(&o, Exponent::of(y.nth(i).wide()), x.nth(i)) { *r = exact; }
-    }
+    for (i, r) in results.iter_mut().enumerate() { if let Some(exact) = crate::recipe::power(&o, Exponent::of(y.nth(i).wide()), x.nth(i)) { *r = exact; } }
     results.iter().enumerate().all(|(i, r)| !r.is_nan() || x.nth(i).is_nan() || y.nth(i).is_nan())
 }
 
@@ -163,10 +162,14 @@ pub(crate) fn roots<F: crate::Float>(n: F, ys: &[F], out: &mut [std::mem::MaybeU
 pub(crate) fn root_slice<F: crate::float::Native>(_: &Root, [n, y]: [crate::Arg<'_, F>; 2], len: usize, out: &mut [std::mem::MaybeUninit<F>]) -> bool {
     if let (crate::Arg::One(k), crate::Arg::Many(ys)) = (n, y) {
         roots(k, &ys[..len], &mut out[..len]);
-        return matches!(Degree::of(k.wide()), Degree::One | Degree::Three) || k.is_nan() || ys[..len].iter().zip(crate::slice::written(&mut out[..len]).iter()).all(|(y, r)| !r.is_nan() || y.is_nan());
+        return matches!(Degree::of(k.wide()), Degree::One | Degree::Three) || k.is_nan()
+            || ys[..len].iter().zip(crate::slice::written(&mut out[..len]).iter()).all(|(y, r)| !r.is_nan() || y.is_nan());
     }
     let o = crate::recipe::NativeOps::<{ crate::FUSED }>::DEFAULT;
-    crate::slice::mapped(&[n, y], len, out, #[inline(always)] |[a, b]| { let r = root_formula(&o, a, b); (r, !r.is_nan() || a.is_nan() || b.is_nan()) })
+    crate::slice::mapped(&[n, y], len, out, #[inline(always)] |[a, b]| {
+        let r = root_formula(&o, a, b);
+        (r, !r.is_nan() || a.is_nan() || b.is_nan())
+    })
 }
 
 #[derive(Clone, Copy, Debug)]

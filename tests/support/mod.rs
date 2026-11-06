@@ -44,8 +44,7 @@ pub fn map<const N: usize>(
 
 /// `kernel`'s `n` results on `args`, each of one item or of `n`, or `None` where any result fails.
 pub fn mapped<T: rustymath::buffer::Element, O: rustymath::buffer::Element, const N: usize>(
-    kernel: &rustymath::operation::Kernel, args: [&[T]; N], n: usize
-) -> Option<Vec<O>> {
+    kernel: &rustymath::operation::Kernel, args: [&[T]; N], n: usize) -> Option<Vec<O>> {
     let mut out = rustymath::buffer::Buffer::with_capacity(kernel.result_dtype(), n);
     rustymath::error::checked(|| map(kernel, args.map(T::view), n, &mut out)).ok()?;
     O::vec(out)

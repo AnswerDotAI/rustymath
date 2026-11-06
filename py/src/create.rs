@@ -1,11 +1,11 @@
 //! Familiar constructors over rustymath's compact buffers and sequence generators.
 use crate::{array::{Array, core}, convert::{self, released}};
 use pyo3::{exceptions::PyValueError, prelude::*, types::{PyInt, PyTuple}};
+use rustymath::tolerant::Exactly;
 use rustymath::{
     array::Array as Core, buffer::{Buffer, DType, Element, FloatWidth, Source}, layout::{Layout, generated_len}, with_dtype, with_float_width, with_width
 };
 use rustymath_buffer::py_err;
-use rustymath::tolerant::Exactly;
 
 /// A shape given as one length or a sequence of lengths, checked against the shared allocation limits.
 pub fn shape(size: &Bound<'_, PyAny>) -> PyResult<Vec<usize>> {

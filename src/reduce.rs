@@ -3,7 +3,8 @@ use crate::error::{Error, Kind};
 pub use crate::slice::running;
 use crate::{
     Arg, Float, Native, agreement::{Mapping, Read, Walked, expanded_items}, arith::Overflowing, buffer::{Buffer, Cast, Element, View},
-    float::sealed::{Core, Folds}, gather::Steps, layout::Lanes, operation::{Piece as InputPiece, Pieces, Seed}, linalg::Scalar, parallel, slice::{CHUNK, appended, written}
+    float::sealed::{Core, Folds}, gather::Steps, layout::Lanes, linalg::Scalar, operation::{Piece as InputPiece, Pieces, Seed}, parallel,
+    slice::{CHUNK, appended, written}
 };
 use half::f16;
 use num_complex::Complex;
@@ -29,7 +30,10 @@ pub fn extremes<T: Copy>(x: &[T]) -> (T, T) where Min: Reduction<T, Total = T>, 
 #[inline]
 pub(crate) fn extremes_of<A: Copy, T: Copy>(x: &[A], key: impl Fn(A) -> T) -> (T, T) where Min: Reduction<T, Total = T>, Max: Reduction<T, Total = T> {
     let (min, max) = (<Min as Reduction<T>>::step, <Max as Reduction<T>>::step);
-    x.iter().fold((<Min as Reduction<T>>::unit(), <Max as Reduction<T>>::unit()), |(lo, hi), &a| { let v = key(a); (min(lo, v), max(hi, v)) })
+    x.iter().fold((<Min as Reduction<T>>::unit(), <Max as Reduction<T>>::unit()), |(lo, hi), &a| {
+        let v = key(a);
+        (min(lo, v), max(hi, v))
+    })
 }
 
 /// The greater of x and y, as [`max`] gives the greatest item. Beside NaN, or where they're equal, it gives y. A fold that passes its running result as y keeps it beside a NaN item. NumPy calls it `maximum`.
@@ -99,9 +103,7 @@ pub trait Reduction<T> {
 pub trait Totals: Copy {
     /// The buffer that holds `totals`.
     fn buffer_of(totals: Vec<Self>) -> crate::buffer::Buffer;
-    fn from_partial(_: crate::operation::Total) -> Result<Self, Error> {
-        Err(Error::new(Kind::Domain, "this reduction cannot read compiled partial totals"))
-    }
+    fn from_partial(_: crate::operation::Total) -> Result<Self, Error> { Err(Error::new(Kind::Domain, "this reduction cannot read compiled partial totals")) }
 }
 impl<T: crate::buffer::Cast> Totals for T {
     #[inline]

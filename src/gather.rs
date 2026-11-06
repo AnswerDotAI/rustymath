@@ -39,7 +39,10 @@ pub fn repeat<D: Copy, C: Key>(out: &mut Vec<D>, len: usize, counts: &[C], total
             let count_groups = counts.as_chunks::<4>().0;
             for (g, &c) in count_groups.iter().enumerate().take(len / 4) {
                 let j = 4 * g;
-                if k + 16 > total || c[0].key().max(c[1].key()).max(c[2].key()).max(c[3].key()) as u64 > 4 { for i in 0..4 { each(d, &mut k, item(j + i), c[i].key() as usize) } continue; }
+                if k + 16 > total || c[0].key().max(c[1].key()).max(c[2].key()).max(c[3].key()) as u64 > 4 {
+                    for i in 0..4 { each(d, &mut k, item(j + i), c[i].key() as usize) }
+                    continue;
+                }
                 let w = &mut d[k..k + 16];
                 let mut o = 0;
                 for i in 0..4 {
@@ -467,7 +470,10 @@ impl<'a> Writes<'a> {
     /// Combines the matching item of `values`, or its only item, into the item of `out` at each write by `f`, in order, as `out[o] = f(out[o], y).0`. A place that repeats combines again. With addition, this is the transpose of a gather that reads a position more than once. It gives the last failure that `f` reports.
     pub fn combine<D: Copy, S: Copy, E: Copy>(self, out: &mut [D], values: Arg<'_, S>, f: impl Fn(D, S) -> (D, Option<E>)) -> Option<E> {
         let mut failed = None;
-        self.runs_while(&mut |k, run| { failed = combine_run(out, run, values.part(k, run.len()), &f).or(failed); true });
+        self.runs_while(&mut |k, run| {
+            failed = combine_run(out, run, values.part(k, run.len()), &f).or(failed);
+            true
+        });
         failed
     }
 }
@@ -476,7 +482,11 @@ impl<'a> Writes<'a> {
 fn combine_run<D: Copy, S: Copy, E: Copy>(out: &mut [D], run: &[usize], values: Arg<'_, S>, f: &impl Fn(D, S) -> (D, Option<E>)) -> Option<E> {
     let mut failed = None;
     for (j, &o) in run.iter().enumerate() {
-        if o != Steps::FILL { let (r, e) = f(out[o], values.nth(j)); out[o] = r; failed = e.or(failed) }
+        if o != Steps::FILL {
+            let (r, e) = f(out[o], values.nth(j));
+            out[o] = r;
+            failed = e.or(failed)
+        }
     }
     failed
 }
@@ -981,11 +991,9 @@ impl Steps {
     pub fn furthest(base: usize, steps: &[impl std::borrow::Borrow<Self>]) -> Option<usize> {
         steps.iter().try_fold(base, |at, s| {
             let furthest = match *s.borrow() {
-                ref s if s.len() == 0 => return None,
-                Self::Stride { start, len, step } => start.wrapping_add_signed(step.max(0) * (len - 1) as isize),
-                Self::Padded { size, stride, .. } => size.saturating_sub(1) * stride,
-                Self::Rotated { len, stride, .. } => (len - 1) * stride,
-                Self::Table(ref t) => (0..t.len()).filter_map(|j| t.get(j)).max().unwrap_or(0),
+                ref s if s.len() == 0 => return None, Self::Stride { start, len, step } => start.wrapping_add_signed(step.max(0) * (len - 1) as isize),
+                Self::Padded { size, stride, .. } => size.saturating_sub(1) * stride, Self::Rotated { len, stride, .. } => (len - 1) * stride,
+                Self::Table(ref t) => (0..t.len()).filter_map(|j| t.get(j)).max().unwrap_or(0)
             };
             Some(at + furthest)
         })
@@ -1053,7 +1061,11 @@ impl Steps {
             Self::Table(ref t) => {
                 let (mut j, at) = (0, stride);
                 stride *= t.len();
-                t.all(|o| { let ordered = o == Some(j * at); j += 1; ordered })
+                t.all(|o| {
+                    let ordered = o == Some(j * at);
+                    j += 1;
+                    ordered
+                })
             }
             _ => false,
         })
@@ -1336,7 +1348,11 @@ fn lane_pairs<const L: usize, U: Unit>(slots: &mut [MaybeUninit<U>], [a, b]: [&[
     let (a, b, mut to) = (a.as_ptr().cast::<[U; L]>(), b.as_ptr().cast::<[U; L]>(), slots.as_mut_ptr().cast::<[U; L]>());
     for r in 0..slots.len() / (2 * L) {
         // SAFETY: each part holds a lane of `L` units for each row, and `slots` holds a row of both lanes for each.
-        unsafe { to.write(a.add(r).read()); to.add(1).write(b.add(r).read()); to = to.add(2) }
+        unsafe {
+            to.write(a.add(r).read());
+            to.add(1).write(b.add(r).read());
+            to = to.add(2)
+        }
     }
 }
 

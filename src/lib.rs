@@ -6,7 +6,6 @@ mod arc;
 mod arith;
 #[macro_use]
 pub mod buffer;
-pub mod domain;
 pub mod agreement;
 pub mod array;
 pub mod characters;
@@ -16,6 +15,7 @@ pub mod create;
 mod dd;
 pub mod derivative;
 pub mod distribution;
+pub mod domain;
 pub mod error;
 pub mod events;
 pub mod exact;
@@ -55,8 +55,7 @@ mod trig;
 
 pub use arc::{RealAcos, RealAsin};
 pub use arith::{
-    Add, BitAnd, BitOr, Bitwise, Divide, LeftShift, MathishDivide, Multiply, Nand, Negate, Nor, Not, PiTimes, Reciprocal, RightShift, Subtract,
-    bitwise,
+    Add, BitAnd, BitOr, Bitwise, Divide, LeftShift, MathishDivide, Multiply, Nand, Negate, Nor, Not, PiTimes, Reciprocal, RightShift, Subtract, bitwise,
 };
 pub use complex::{Cis, divide};
 pub use exp::{Exp, Expm1};

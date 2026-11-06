@@ -2,16 +2,18 @@ use super::*;
 
 pub(super) fn map_complex<K, F, const N: usize>(
     object: &K, variant: crate::domain::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings,
-    judge: crate::domain::Variant, output: &mut Buffer
-) -> Result<(), Error> where K: crate::facts::Formula<N>, F: crate::float::Native + crate::buffer::Cast, num_complex::Complex<F>: crate::buffer::Cast {
+    judge: crate::domain::Variant, output: &mut Buffer) -> Result<(), Error> where K: crate::facts::Formula<N>, F: crate::float::Native + crate::buffer::Cast,
+    num_complex::Complex<F>: crate::buffer::Cast {
     let ops = settings.ops();
     let value = |x| object.complex(&ops, x).unwrap_or(num_complex::Complex::new(F::zero(), F::zero()));
     let invalid = |x, r| (!complex_valid::<K, F, N>(&ops, x, r)).then_some(Kind::Domain);
     if const { K::BOOLEAN } {
-        map_values::<num_complex::Complex<F>, bool, N>(inputs, range, variant.checked, judge.checked, output, |x| value(x).re != F::zero(),
+        map_values::<num_complex::Complex<F>, bool, N>(
+            inputs, range, variant.checked, judge.checked, output, |x| value(x).re != F::zero(),
             |x, r| invalid(x, num_complex::Complex::new(if r { F::one() } else { F::zero() }, F::zero())))
     } else if output.dtype().is_real() {
-        map_values::<num_complex::Complex<F>, F, N>(inputs, range, variant.checked, judge.checked, output, |x| value(x).re, |x, r| invalid(x, num_complex::Complex::new(r, F::zero())))
+        map_values::<num_complex::Complex<F>, F, N>(
+            inputs, range, variant.checked, judge.checked, output, |x| value(x).re, |x, r| invalid(x, num_complex::Complex::new(r, F::zero())))
     } else {
         map_values::<num_complex::Complex<F>, num_complex::Complex<F>, N>(inputs, range, variant.checked, judge.checked, output, value, invalid)
     }

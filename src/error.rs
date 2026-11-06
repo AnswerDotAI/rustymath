@@ -98,5 +98,9 @@ pub fn checked<R>(run: impl FnOnce() -> Result<R, Error>) -> Result<R, Error> {
 fn recorded(run: &mut dyn FnMut()) -> Option<Error> {
     if ACTIVE.with(|active| active.borrow().is_some()) { run(); return None; }
     thread_local! { static SPARE: ErrorSlot = ErrorSlot::new(); }
-    SPARE.with(|slot| { slot.take(); slot.enter(run); slot.take() })
+    SPARE.with(|slot| {
+        slot.take();
+        slot.enter(run);
+        slot.take()
+    })
 }

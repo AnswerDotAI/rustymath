@@ -304,9 +304,9 @@ impl DType {
     pub fn computes_in(self, int: Width, float: FloatWidth, has: impl Fn(DType) -> bool) -> Option<DType> {
         if has(self) { return Some(self); }
         let (integer, float, whole) = match self {
-            Self::Boolean => (Some(Self::Integer(int)), Self::Float(float), None), Self::Integer(w) => (Some(Self::Integer(w.join(int))), Self::Float(float), None),
-            Self::Float(_) => (None, self.inexact(float)?.0, Some(Self::Integer(int))),
-            _ => (None, self.inexact(float)?.0, None)
+            Self::Boolean => (Some(Self::Integer(int)), Self::Float(float), None),
+            Self::Integer(w) => (Some(Self::Integer(w.join(int))), Self::Float(float), None),
+            Self::Float(_) => (None, self.inexact(float)?.0, Some(Self::Integer(int))), _ => (None, self.inexact(float)?.0, None)
         };
         integer.into_iter().chain(Self::ALL.into_iter().filter(|&d| float.widens_to(d))).chain(whole).find(|&d| has(d))
     }
@@ -460,9 +460,8 @@ impl Buffer {
     /// Copies `range` of `source` when it has this buffer's dtype, and gives whether it could. Integers of another width don't copy.
     pub fn extend_from(&mut self, source: View<'_>, range: std::ops::Range<usize>) -> bool {
         match (self, source) {
-            (Self::Booleans(d), View::Booleans(s)) => d.extend_from_slice(&s[range]),
-            (Self::Integers(d), View::Integers(s)) => return d.extend_from(s, range), (Self::Floats(d), View::Floats(s)) => return d.extend_from(s, range),
-            (Self::Complexes(d), View::Complexes(s)) => return d.extend_from(s, range),
+            (Self::Booleans(d), View::Booleans(s)) => d.extend_from_slice(&s[range]), (Self::Integers(d), View::Integers(s)) => return d.extend_from(s, range),
+            (Self::Floats(d), View::Floats(s)) => return d.extend_from(s, range), (Self::Complexes(d), View::Complexes(s)) => return d.extend_from(s, range),
             (Self::Characters(d), View::Characters(s)) => d.extend_from_slice(&s[range]), _ => return false
         }
         true
@@ -669,8 +668,8 @@ fn integer(view: View<'_>, i: usize) -> Result<i64, Error> {
 /// Item `i` of a numeric `view` as a Boolean. Only exactly 0 and 1 convert, and anything else gives an Overflow error.
 fn boolean(view: View<'_>, i: usize) -> Result<bool, Error> {
     let x = match view {
-        View::Booleans(v) => return Ok(v[i]), View::Integers(v) => Source::<f64>::read(v.get(i)),
-        View::Floats(v) => v.get(i), View::Complexes(v) => real_part(v.get(i))?, View::Characters(_) => unreachable!("cast refuses characters first")
+        View::Booleans(v) => return Ok(v[i]), View::Integers(v) => Source::<f64>::read(v.get(i)), View::Floats(v) => v.get(i),
+        View::Complexes(v) => real_part(v.get(i))?, View::Characters(_) => unreachable!("cast refuses characters first")
     };
     if truth(x) { Ok(x != 0.0) } else { Err(overflow(x)) }
 }
@@ -722,10 +721,8 @@ impl Cast for bool {
     fn cast(view: View<'_>, item: usize) -> Result<Self, Error> { numeric(view)?; boolean(view, item) }
     fn extend_cast(view: View<'_>, len: usize, checked: bool, out: &mut Vec<Self>) -> Result<(), Error> {
         match view {
-            View::Booleans(v) => out.extend_from_slice(&v[..len]),
-            View::Integers(v) => with_ints!(v, |v| truths(&v[..len], checked, out)?),
-            View::Floats(v) => with_floats!(v, |v| truths(&v[..len], checked, out)?),
-            _ => return itemwise(view, len, checked, out),
+            View::Booleans(v) => out.extend_from_slice(&v[..len]), View::Integers(v) => with_ints!(v, |v| truths(&v[..len], checked, out)?),
+            View::Floats(v) => with_floats!(v, |v| truths(&v[..len], checked, out)?), _ => return itemwise(view, len, checked, out)
         }
         Ok(())
     }

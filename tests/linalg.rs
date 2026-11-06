@@ -15,7 +15,7 @@ mod products {
     #[test]
     fn native_inner_pairs_keep_right_folds_and_bounded_terms() {
         use rustymath::{
-            agreement::{Binding, Missing, Read, ReadPlan}, buffer::{Buffer, Element, View}, error::{self, Error}, domain::Variant, facts::Formula,
+            agreement::{Binding, Missing, Read, ReadPlan}, buffer::{Buffer, Element, View}, domain::Variant, error::{self, Error}, facts::Formula,
             operation::{Direction, Kernel, Seed, Settings}, tolerant::{Equal, Greater, Tolerance}
         };
         fn fold(kernel: &Kernel, data: View<'_>, dims: [usize; 3], tail: Option<View<'_>>) -> Result<Buffer, Error> {
@@ -25,7 +25,9 @@ mod products {
             let tail_plan = ReadPlan::input(1, tail.map_or(0, View::len));
             let seed = if tail.is_some() { Seed::Tail(Read { sources: &sources, plan: &tail_plan }) } else { Seed::Identity };
             let mut out = Buffer::with_capacity(kernel.result_dtype(), dims[0] * dims[2]);
-            error::checked(|| kernel.fold_read(&dims, 1, seed, Direction::Right, Settings { tolerance: Tolerance::EXACT }, Read { sources: &sources, plan: &plan }, &mut out))?;
+            error::checked(|| {
+                kernel.fold_read(&dims, 1, seed, Direction::Right, Settings { tolerance: Tolerance::EXACT }, Read { sources: &sources, plan: &plan }, &mut out)
+            })?;
             Ok(out)
         }
         macro_rules! inner {

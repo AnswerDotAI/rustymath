@@ -22,7 +22,8 @@ impl Conversion {
             let ((input_lo, input_hi), (lo, hi)) = (bounds(self.input), bounds(self.output));
             if lo <= input_lo && hi >= input_hi { return None; }
             let x = o.to_integer(x);
-            let valid = o.and(o.integer_compare(crate::recipe::Cmp::LessEqual, o.integer(lo.max(input_lo)), x),
+            let valid = o.and(
+                o.integer_compare(crate::recipe::Cmp::LessEqual, o.integer(lo.max(input_lo)), x),
                 o.integer_compare(crate::recipe::Cmp::LessEqual, x, o.integer(hi.min(input_hi))));
             return Some((crate::error::Kind::Domain, valid));
         }
@@ -105,9 +106,7 @@ impl<I: Int, F: Float> Saturates<I> for F {
 impl<I: Bounded + for<'a> TryFrom<&'a BigInt>> Saturates<I> for &BigInt {
     fn saturated(self) -> I { I::try_from(self).unwrap_or_else(|_| if self.sign() == Sign::Minus { I::min_value() } else { I::max_value() }) }
 }
-impl<I: Bounded + TryFrom<u64>> Saturates<I> for u64 {
-    fn saturated(self) -> I { I::try_from(self).unwrap_or_else(|_| I::max_value()) }
-}
+impl<I: Bounded + TryFrom<u64>> Saturates<I> for u64 { fn saturated(self) -> I { I::try_from(self).unwrap_or_else(|_| I::max_value()) } }
 /// The floor of `x` within `t` as an integer of type `I`, saturated at `I`'s range as [`saturated`] saturates: NaN gives 0. The one float-to-integer rule for conversions that change a number's domain: BPL's `ₓ` marks and Python's `astype` and integer `dtype=`.
 #[inline(always)]
 pub fn floored<I: Int, F: Float>(x: F, t: impl crate::tolerant::Tolerant) -> I { saturated(t.floor(x)) }

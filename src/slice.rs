@@ -205,9 +205,8 @@ fn items<E: Copy, const N: usize>(x: &[Arg<'_, E>; N], i: usize) -> [E; N] { std
 /// Writes `f` for each of `n` results into `out`, for arguments `x`, and gives whether `f` said `true` for every result. One and two arguments run through [`pairs_into`], and three through `triples_into`, whose loops vectorize.
 #[inline(always)]
 pub(crate) fn mapped<E: Copy, O, const N: usize>(x: &[Arg<'_, E>; N], n: usize, out: &mut [MaybeUninit<O>], f: impl Fn([E; N]) -> (O, bool)) -> bool {
-    if const { N == 1 } {
-        pairs_into(x[0], Arg::One(()), n, out, #[inline(always)] |a, ()| f([a; N]))
-    } else if const { N == 2 } {
+    if const { N == 1 } { pairs_into(x[0], Arg::One(()), n, out, #[inline(always)] |a, ()| f([a; N])) }
+    else if const { N == 2 } {
         pairs_into(x[0], x[1], n, out, #[inline(always)] |a, b| f(std::array::from_fn(|k| if k == 0 { a } else { b })))
     } else if const { N == 3 } {
         triples_into(x[0], x[1], x[2], n, out, #[inline(always)] |a, b, c| {
@@ -461,13 +460,10 @@ pub(crate) fn triples_into<X: Copy, Y: Copy, Z: Copy, B>(
 #[inline(always)]
 pub(crate) fn judged<E: Copy, O: Copy, const N: usize>(x: &[Arg<'_, E>; N], out: &[O], valid: impl Fn([E; N], O) -> bool) -> bool {
     let (n, mut bad) = (out.len(), 0u8);
-    if const { N == 1 } {
-        each_pair!(x[0], Arg::Many(out), n, |_i, a, r| bad |= u8::from(!valid([a; N], r)));
-    } else if const { N == 2 } {
+    if const { N == 1 } { each_pair!(x[0], Arg::Many(out), n, |_i, a, r| bad |= u8::from(!valid([a; N], r))); }
+    else if const { N == 2 } {
         each_triple!(x[0], x[1], Arg::Many(out), n, |_i, a, b, r| bad |= u8::from(!valid(std::array::from_fn(|k| if k == 0 { a } else { b }), r)));
-    } else {
-        for i in 0..n { bad |= u8::from(!valid(items(x, i), out[i])); }
-    }
+    } else { for i in 0..n { bad |= u8::from(!valid(items(x, i), out[i])); } }
     bad == 0
 }
 

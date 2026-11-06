@@ -1,5 +1,4 @@
 //! Shared function definitions for numerical frontends. Each [`Formula`] row owns its kind and character policies, numerical body, validity and repair predicates, ranges, identities, partial derivatives and exact cases. [`Kernel`](crate::operation::Kernel) erases the arity for execution. [`facts!`](crate::facts) lists typed product pairs and Python names.
-use crate::{Betainc, BetaincAt, FUSED, Flipped, Float, Native};
 use crate::buffer::{DType, FloatWidth};
 use crate::domain::{Range, Variant};
 use crate::float::sealed::Core;
@@ -7,6 +6,7 @@ use crate::pow::parity;
 use crate::recipe::{NativeOps, Ops};
 use crate::reduce::{Maximum, Minimum, Product, Reduce, Reduction};
 use crate::tolerant::{Tolerance, Tolerant, TolerantComplex, lcm_from_gcd};
+use crate::{Betainc, BetaincAt, FUSED, Flipped, Float, Native};
 use num_complex::Complex;
 use num_traits::{One, Signed, Zero};
 use std::f64::consts::PI;
@@ -88,10 +88,12 @@ pub trait Formula<const N: usize>: Clone + Send + Sync + 'static {
     fn truth(&self) -> Option<Reduce> {
         match self.truth_table()? { 8 => Some(Reduce::Min), 14 => Some(Reduce::Max), 6 => Some(Reduce::Xor), 9 => Some(Reduce::Xnor), _ => None }
     }
+    /// Refines the real result interval when both operands denote the same value.
     fn same(&self, _arg: Range) -> Option<Range> { None }
     fn reads(&self) -> Reads { Reads::Items }
     fn resolve(&self, variant: Variant, types: [DType; N]) -> Result<Kernel, crate::error::Error> {
-        Kernel::try_resolve(self.clone(), variant, types)?.ok_or_else(|| crate::error::Error::new(crate::error::Kind::Domain, "function has no numerical body for these arguments"))
+        Kernel::try_resolve(self.clone(), variant, types)?
+            .ok_or_else(|| crate::error::Error::new(crate::error::Kind::Domain, "function has no numerical body for these arguments"))
     }
     fn supports(&self, _dtype: DType) -> bool { false }
     fn emit<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(&self, _o: &O, _x: [O::V; N]) -> Option<O::V> { None }
@@ -171,26 +173,30 @@ impl Op {
     /// The dtype this formula computes in for arguments of `input` (`Formula::computing_dtype`), with `arity` as [`Op::visit`] takes it.
     pub fn computing_dtype(self, arity: usize, input: DType) -> Option<DType> {
         struct Of(DType);
-        impl Visit for Of { type Out = Option<DType>; fn visit<K: Formula<N>, const N: usize>(self, object: K) -> Option<DType> { object.computing_dtype(self.0) } }
+        impl Visit for Of {
+            type Out = Option<DType>;
+            fn visit<K: Formula<N>, const N: usize>(self, object: K) -> Option<DType> { object.computing_dtype(self.0) }
+        }
         self.visit(arity, Of(input))
     }
     /// Whether this formula has a body at `dtype` (`Formula::supports`), with `arity` as [`Op::visit`] takes it.
     pub fn supports(self, arity: usize, dtype: DType) -> bool {
         struct Of(DType);
-        impl Visit for Of { type Out = bool; fn visit<K: Formula<N>, const N: usize>(self, object: K) -> bool { object.supports(self.0) } }
+        impl Visit for Of {
+            type Out = bool;
+            fn visit<K: Formula<N>, const N: usize>(self, object: K) -> bool { object.supports(self.0) }
+        }
         self.visit(arity, Of(dtype))
     }
 }
 /// A formula's slice forms (`Unary::slice`, `Binary::slice`), at each item type that has one. `map_formula` runs a variant's blocks through the form at its dtype, or at `f32` for `f16`. At a dtype with no form, the formula's item bodies (`Formula::real`, `Formula::integer`) run instead.
 pub struct NativeSlices<K, const N: usize> {
-    pub single: Option<Slice<K, f32, N>>, pub double: Option<Slice<K, f64, N>>,
-    pub byte: Option<Slice<K, u8, N>>, pub short: Option<Slice<K, i16, N>>, pub int: Option<Slice<K, i32, N>>, pub long: Option<Slice<K, i64, N>>,
+    pub single: Option<Slice<K, f32, N>>, pub double: Option<Slice<K, f64, N>>, pub byte: Option<Slice<K, u8, N>>, pub short: Option<Slice<K, i16, N>>,
+    pub int: Option<Slice<K, i32, N>>, pub long: Option<Slice<K, i64, N>>
 }
 /// A slice form writes `n` results of type `T` from `N` arguments and gives whether every item is valid.
 pub type Slice<K, T, const N: usize> = fn(&K, [crate::Arg<'_, T>; N], usize, &mut [std::mem::MaybeUninit<T>]) -> bool;
-impl<K, const N: usize> NativeSlices<K, N> {
-    const NONE: Self = Self { single: None, double: None, byte: None, short: None, int: None, long: None };
-}
+impl<K, const N: usize> NativeSlices<K, N> { const NONE: Self = Self { single: None, double: None, byte: None, short: None, int: None, long: None }; }
 impl<K> NativeSlices<K, 1> where K: crate::Unary<f32, Out = f32> + crate::Unary<f64, Out = f64> {
     pub(crate) fn unary() -> Self { Self { single: Some(<K as crate::Unary<f32>>::slice), double: Some(<K as crate::Unary<f64>>::slice), ..Self::NONE } }
 }
@@ -200,10 +206,11 @@ impl NativeSlices<crate::Pow, 2> {
 impl NativeSlices<crate::Root, 2> {
     fn root() -> Self { Self { single: Some(crate::pow::root_slice::<f32>), double: Some(crate::pow::root_slice::<f64>), ..Self::NONE } }
 }
-impl<K> NativeSlices<K, 2> where K: crate::Binary<u8, Out = u8> + crate::Binary<i16, Out = i16> + crate::Binary<i32, Out = i32> + crate::Binary<i64, Out = i64> {
+impl<K> NativeSlices<K, 2> where K: crate::Binary<u8, Out = u8> + crate::Binary<i16, Out = i16> + crate::Binary<i32, Out = i32> + crate::Binary<i64, Out = i64>
+{
     fn integers() -> Self {
-        Self { byte: Some(<K as crate::Binary<u8>>::slice), short: Some(<K as crate::Binary<i16>>::slice),
-            int: Some(<K as crate::Binary<i32>>::slice), long: Some(<K as crate::Binary<i64>>::slice), ..Self::NONE }
+        Self { byte: Some(<K as crate::Binary<u8>>::slice), short: Some(<K as crate::Binary<i16>>::slice), int: Some(<K as crate::Binary<i32>>::slice),
+            long: Some(<K as crate::Binary<i64>>::slice), ..Self::NONE }
     }
 }
 
@@ -658,9 +665,7 @@ objects!(3:
 );
 
 impl BetaincAt {
-    fn parameters(&self, width: FloatWidth) -> [f64; 2] {
-        with_float_width!(width, T => [self.0, self.1].map(|x| <T as Float>::Working::narrow(x).wide()))
-    }
+    fn parameters(&self, width: FloatWidth) -> [f64; 2] { with_float_width!(width, T => [self.0, self.1].map(|x| <T as Float>::Working::narrow(x).wide())) }
 }
 
 impl Formula<1> for BetaincAt {
@@ -699,14 +704,21 @@ fn masked<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, x: O::V, y:
 fn native_tolerance(value: Option<f64>, fallback: Tolerance) -> Tolerance { value.and_then(Tolerance::new).unwrap_or(fallback) }
 
 /// The tolerance at which `o` compares at tolerance `t`: the one that `o` sets, otherwise `t` (`Ops::tolerance`). `None` where it isn't known when the recipe is built.
-pub(crate) fn run_tolerance<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, t: crate::tolerant::Tolerance) -> Option<crate::tolerant::Tolerance> { crate::tolerant::Tolerance::new(o.constant(o.tolerance(F::narrow(t.value())))?.wide()) }
+pub(crate) fn run_tolerance<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, t: crate::tolerant::Tolerance) -> Option<crate::tolerant::Tolerance> {
+    crate::tolerant::Tolerance::new(o.constant(o.tolerance(F::narrow(t.value())))?.wide())
+}
 /// Comparison `k` of `v` with the one number `c`, as `k`'s kernel compares items with a number: the band that `v` must lie in against the range of floats equal to `c` at tolerance `t`, or at the tolerance that `o` sets (`tolerant::against_steps`). `left` says whether `v` is the left argument. `None` where the tolerance isn't known when the recipe is built, or `c` is NaN.
-fn against<K: crate::tolerant::Banding, F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(k: K, t: crate::tolerant::Tolerance, o: &O, c: F, v: O::V, left: bool) -> Option<O::B> { crate::tolerant::against_steps(k, run_tolerance(o, t)?, o, c, v, left) }
+fn against<K: crate::tolerant::Banding, F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(
+    k: K, t: crate::tolerant::Tolerance, o: &O, c: F, v: O::V, left: bool) -> Option<O::B> {
+    crate::tolerant::against_steps(k, run_tolerance(o, t)?, o, c, v, left)
+}
 
 /// Comparison `k`'s truth value through `o`, as its kernel computes it: against a number that exactly one argument holds (`Ops::constant`) through `against`, and otherwise step by step (`tolerant::Stepped`). Native ops hold every item as a number, so each item compares step by step rather than building the range of floats equal to the other.
 fn tested<K, F, O>(k: K, t: crate::tolerant::Tolerance, o: &O, x: O::V, y: O::V) -> O::B where K: crate::tolerant::Stepped + crate::tolerant::Banding + Copy,
     F: crate::Float, O: crate::recipe::Ops<F> + ?Sized {
-    let side = match (o.constant(x), o.constant(y)) { (Some(_), Some(_)) => None, (None, Some(c)) => Some((c, x, true)), (Some(c), None) => Some((c, y, false)), _ => None };
+    let side = match (o.constant(x), o.constant(y)) {
+        (Some(_), Some(_)) => None, (None, Some(c)) => Some((c, x, true)), (Some(c), None) => Some((c, y, false)), _ => None
+    };
     side.and_then(|(c, v, left)| against(k, t, o, c, v, left)).unwrap_or_else(|| k.steps::<F, O>(o, x, y))
 }
 
@@ -744,7 +756,6 @@ impl Formula<2> for crate::Bitwise {
     fn integer<I: crate::recipe::Overflowing>(&self, o: &crate::recipe::IntegerOps<I>, x: [I; 2]) -> Option<I> { <Self as Formula<2>>::emit(self, o, x) }
 }
 
-
 impl<K: Formula<2>> Formula<2> for Flipped<K> {
     fn truth_table(&self) -> Option<u8> { self.0.truth_table().map(|t| (t & 9) | (t & 2) << 1 | (t & 4) >> 1) }
     fn character_policy(&self, [x, y]: [DType; 2]) -> Result<Option<crate::characters::Policy>, crate::error::Error> {
@@ -760,6 +771,7 @@ impl<K: Formula<2>> Formula<2> for Flipped<K> {
     fn character_rule(&self) -> Option<crate::characters::Rule> { self.0.character_rule() }
     fn result_dtype(&self, input: DType) -> DType { self.0.result_dtype(input) }
     fn range(&self, [x, y]: [Range; 2]) -> Range { self.0.range([y, x]) }
+    fn same(&self, x: Range) -> Option<Range> { self.0.same(x) }
     fn domain(&self, dtype: DType, [x, y]: [Range; 2]) -> Option<[Range; 2]> { self.0.domain(dtype, [y, x]).map(|[y, x]| [x, y]) }
     fn identity(&self) -> [Option<f64>; 2] { let [x, y] = self.0.identity(); [y, x] }
     const INTEGER_FORMULA: bool = K::INTEGER_FORMULA;
@@ -821,9 +833,8 @@ fn boolean_one<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, x: O::V) -> O::B {
 #[inline(always)]
 fn truth_valid<F: crate::Float, O: Ops<F> + ?Sized, const N: usize>(variant: Variant, o: &O, args: [O::V; N]) -> Option<(crate::error::Kind, O::B)> {
     variant.checked.then(|| {
-        let valid = args.into_iter().fold(o.equal(o.number(F::zero()), o.number(F::zero())), |valid, x| {
-            o.and(valid, o.or(o.equal(x, o.number(F::zero())), boolean_one(o, x)))
-        });
+        let valid = args.into_iter()
+            .fold(o.equal(o.number(F::zero()), o.number(F::zero())), |valid, x| o.and(valid, o.or(o.equal(x, o.number(F::zero())), boolean_one(o, x))));
         (crate::error::Kind::Domain, valid)
     })
 }

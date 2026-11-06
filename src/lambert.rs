@@ -1,5 +1,5 @@
 //! The principal branch W0 of the Lambert W function: the w with w e^w = x. Near the branch point x = -1/e, W0 + 1 is Corless et al.'s series in p = √(2(ex + 1)). Elsewhere two steps of Fritsch's iteration refine a first estimate. The complex version runs Halley steps from first estimates chosen by region, as SciPy's `lambertw` does.
-use crate::{FUSED, arc, buffer::{DType, FloatWidth}, complex as cx, domain::Range, dd::Double, float::{Native, horner}, ln::{ln, log1p}, pow as p};
+use crate::{FUSED, arc, buffer::{DType, FloatWidth}, complex as cx, dd::Double, domain::Range, float::{Native, horner}, ln::{ln, log1p}, pow as p};
 use num_complex::Complex;
 
 /// e as a double word.

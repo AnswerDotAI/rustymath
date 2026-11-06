@@ -32,7 +32,8 @@ fn fill_of(fill: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Arc<Buffer>>> {
 /// The selector that `indices` make on `axis` of `layout` under `edge`: each index reads the position that `edge` gives it on the axis, or the fill where it gives none (`Edge::positions`).
 fn edged(layout: &Layout, axis: usize, indices: &Bound<'_, PyAny>, edge: Edge) -> PyResult<Selector> {
     let indices = convert::one(indices)?.into_core()?.compact();
-    let positions = edge.positions(indices.view().contiguous().expect("compact index values"), layout.shape()[axis], crate::functions::comparison(false)).map_err(py_err)?;
+    let positions = edge.positions(indices.view().contiguous().expect("compact index values"), layout.shape()[axis], crate::functions::comparison(false))
+        .map_err(py_err)?;
     let buffer = match positions { Edged::Positions(p) => i64::buffer(p.into_iter().map(|p| p as i64).collect()), Edged::Floats(f) => f64::buffer(f) };
     Ok(indexed(layout, axis, Core::new(indices.layout().clone(), buffer).map_err(py_err)?)?.0)
 }
@@ -49,9 +50,8 @@ pub fn with_missing_keys(core: &Core, index: &Bound<'_, PyAny>) -> PyResult<Opti
 /// The one axis name of `p`, an index part, where it's an array with exactly one named axis.
 fn axis_name(p: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
     if let Ok(a) = p.cast::<Array>() { return Ok(structure::sole_name(a.borrow().core().layout()).map(str::to_owned)); }
-    Ok(if p.hasattr("__rustymath_array__")? {
-        rustymath_buffer::read_array(p)?.and_then(|(_, layout)| structure::sole_name(&layout).map(str::to_owned))
-    } else { None })
+    Ok(if p.hasattr("__rustymath_array__")? { rustymath_buffer::read_array(p)?.and_then(|(_, layout)| structure::sole_name(&layout).map(str::to_owned)) }
+    else { None })
 }
 
 fn planned(py: Python<'_>, arg: Arg, build: impl FnOnce(&Layout) -> Result<Plan, Error>) -> PyResult<Array> {

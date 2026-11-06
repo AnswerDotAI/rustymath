@@ -509,15 +509,22 @@ pub trait Stepped {
 
 /// `recipe::close` of `x` and `y` at `o`'s tolerance for `t`: `t` itself, or a recording backend's runtime setting slot.
 #[inline(always)]
-fn close_steps<F: Float, O: recipe::Ops<F> + ?Sized>(t: Tolerance, o: &O, x: O::V, y: O::V) -> O::B { recipe::close(o, o.tolerance(F::narrow(t.value())), x, y) }
+fn close_steps<F: Float, O: recipe::Ops<F> + ?Sized>(t: Tolerance, o: &O, x: O::V, y: O::V) -> O::B {
+    recipe::close(o, o.tolerance(F::narrow(t.value())), x, y)
+}
 
 /// Whether `o` holds the tolerance for `t` as zero before the loop (`Ops::constant`), where a comparison is exact and takes no tolerance steps.
 #[inline(always)]
-fn exact<F: Float, O: recipe::Ops<F> + ?Sized>(t: impl Tolerant, o: &O) -> bool { o.constant(o.tolerance(F::narrow(t.value()))).is_some_and(|t| t == F::zero()) }
+fn exact<F: Float, O: recipe::Ops<F> + ?Sized>(t: impl Tolerant, o: &O) -> bool {
+    o.constant(o.tolerance(F::narrow(t.value()))).is_some_and(|t| t == F::zero())
+}
 
 impl Stepped for Equal {
     #[inline(always)]
-    fn steps<F: Float, O: recipe::Ops<F> + ?Sized>(self, o: &O, x: O::V, y: O::V) -> O::B { if exact(self.0, o) { return o.equal(x, y); } recipe::equal(o, x, y, |o| close_steps(self.0, o, x, y)) }
+    fn steps<F: Float, O: recipe::Ops<F> + ?Sized>(self, o: &O, x: O::V, y: O::V) -> O::B {
+        if exact(self.0, o) { return o.equal(x, y); }
+        recipe::equal(o, x, y, |o| close_steps(self.0, o, x, y))
+    }
 }
 
 impl Stepped for NotEqual {
@@ -527,12 +534,18 @@ impl Stepped for NotEqual {
 
 impl Stepped for Less {
     #[inline(always)]
-    fn steps<F: Float, O: recipe::Ops<F> + ?Sized>(self, o: &O, x: O::V, y: O::V) -> O::B { if exact(self.0, o) { return o.less(x, y); } recipe::less(o, x, y, |o| close_steps(self.0, o, x, y)) }
+    fn steps<F: Float, O: recipe::Ops<F> + ?Sized>(self, o: &O, x: O::V, y: O::V) -> O::B {
+        if exact(self.0, o) { return o.less(x, y); }
+        recipe::less(o, x, y, |o| close_steps(self.0, o, x, y))
+    }
 }
 
 impl Stepped for LessEqual {
     #[inline(always)]
-    fn steps<F: Float, O: recipe::Ops<F> + ?Sized>(self, o: &O, x: O::V, y: O::V) -> O::B { if exact(self.0, o) { return o.less_equal(x, y); } recipe::less_equal(o, x, y, |o| close_steps(self.0, o, x, y)) }
+    fn steps<F: Float, O: recipe::Ops<F> + ?Sized>(self, o: &O, x: O::V, y: O::V) -> O::B {
+        if exact(self.0, o) { return o.less_equal(x, y); }
+        recipe::less_equal(o, x, y, |o| close_steps(self.0, o, x, y))
+    }
 }
 
 impl Stepped for Greater {
@@ -600,10 +613,7 @@ pub(crate) fn exact_residue<F: Float>(x: F, y: F) -> F { if far(x, y) { far_resi
 /// [`exact_residue`] where [`far`] holds. It stays out of line: inlined, a loop over residues computes this remainder, a libm call, for every item.
 #[cold]
 #[inline(never)]
-fn far_residue<F: Float>(x: F, y: F) -> F {
-    let r = y % x;
-    if r == F::zero() { F::zero() } else if (r < F::zero()) != (x < F::zero()) { r + x } else { r }
-}
+fn far_residue<F: Float>(x: F, y: F) -> F { let r = y % x; if r == F::zero() { F::zero() } else if (r < F::zero()) != (x < F::zero()) { r + x } else { r } }
 
 /// The tolerant floor of rounded `x ÷ y`, as a formula object. A float quotient never fails. Integers divide exactly, give a zero divisor the type's limit of the dividend's sign, and fail on an overflowing quotient.
 #[derive(Clone, Copy, Debug, PartialEq)]

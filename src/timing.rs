@@ -41,8 +41,7 @@ const CI_CPU: &str = "AMD Ryzen 9 7950X3D 16-Core Processor";
 /// The CPU of the development Mac, on which the macOS budgets were set.
 const DEV_CPU: &str = "Apple M5 Max";
 
-/// The CPU of Syd1, the Linux machine where the integration runs build and time both projects. It checks no budgets.
-#[cfg(not(target_arch = "wasm32"))]
+/// The authoritative x86 budget CPU for native and browser timings on Syd1.
 const SYD1_CPU: &str = "Intel(R) Xeon(R) Silver 4216 CPU @ 2.10GHz";
 
 /// The copy times of the machines that run the speed tests in native builds, for copies whose source and destination fit in `CACHED_BYTES`: the CPU's name as [`cpu`] reads it, an item's size in bytes, the number of items, and the time for each item in seconds. Each is at the slower end of what that machine's copy normally takes, which is the copy that the expected costs in the budget files assume. On CI's runner, a copy measured beside each case varied more than 3 times between cases, while every function's own time varied at most 1.18 times. A stored time keeps that noise out of every cost.
@@ -292,15 +291,15 @@ pub const RETRY_PAUSES: [f64; 3] = [0.1, 1.0, 10.0];
 /// Keeps the calling thread busy for 0.1 s by reading the clock, so that a timing after a pause runs at the core's full speed. An idle core runs slower until it has been busy for a while. A timing's `RUNS` calls of a small case finish within microseconds, before the core speeds up: on the development Mac, cases of 65,536 items that cost 0.74-0.84 copies cost 2.28-3.06 straight after a 10 s pause (30 October 2026). [`retried`] calls it after each pause, and the Python and browser speed tests call it after theirs.
 pub fn warm() { let start = Instant::now(); while start.elapsed() < Duration::from_millis(100) {} }
 
-/// Which of a budget file's two native budgets this machine's speed tests compare costs with: 0, for macOS on Apple silicon, where matrix products run on Accelerate, or 1, for Linux on x86-64, as CI's runner is. Other machines, such as Linux on Arm, have no budgets: their speed tests report costs without comparing them. [`checks_budgets`] says whether a cost over its budget fails.
+/// Which of a budget file's two native budgets this machine's speed tests compare costs with: 0, for macOS on Apple silicon, where matrix products run on Accelerate, or 1, for Linux on x86-64, as Syd1 is. Other machines, such as Linux on Arm, have no budgets: their speed tests report costs without comparing them. [`checks_budgets`] says whether a cost over its budget fails.
 pub const NATIVE_COLUMN: Option<usize> = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
     Some(0)
 } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) { Some(1) }
 else { None };
 
-/// The CPU that this build's budgets were set for, as [`cpu`] names it: the development Mac's for macOS on Apple silicon, and CI's runner's for Linux on x86-64 and for the browser build. `None` for a build with no budgets, such as Linux on Arm.
+/// The authoritative budget CPU: Jeremy's development Mac for macOS on Apple silicon, Syd1 for Linux x86-64 and the browser build. `None` for a build without budgets, such as Linux on Arm.
 pub const BUDGET_CPU: Option<&str> = match NATIVE_COLUMN {
-    Some(0) => Some(DEV_CPU), Some(_) => Some(CI_CPU), None if cfg!(target_arch = "wasm32") => Some(CI_CPU), None => None
+    Some(0) => Some(DEV_CPU), Some(_) => Some(SYD1_CPU), None if cfg!(target_arch = "wasm32") => Some(SYD1_CPU), None => None
 };
 
 /// Whether this machine's speed tests fail on a case still over its budget after the retries: only where [`cpu`] is [`BUDGET_CPU`]. On any other CPU they print every cost, then each case still over its budget, marked `over`, and fail on none.
@@ -381,7 +380,8 @@ mod lock {
                     Err(TryLockError::Error(e)) => return Err(io::Error::new(e.kind(), format!("{path}: {e}")))
                 }
                 if self.start.elapsed() > Duration::from_secs(300) {
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, format!("{others} has held {path} for 5 minutes. Processes with it open: {}", users(path))));
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut, format!("{others} has held {path} for 5 minutes. Processes with it open: {}", users(path))));
                 }
                 if !self.waiting { eprintln!("waiting for {others} to release {path}"); }
                 if !self.shared && !self.reported && self.start.elapsed() > Duration::from_secs(30) {

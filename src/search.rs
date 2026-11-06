@@ -177,9 +177,7 @@ pub fn firsts<K: Key>(x: &[K]) -> Vec<bool> {
 
 /// The number of items of `x` equal to `v`. Each chunk counts in byte lanes, and 192 is the largest multiple of 64 items whose count fits in a byte. Nested lane loops vectorize across blocks at opt-level 3, at 7 times this version's instructions.
 #[inline]
-fn count_eq<K: Key>(x: &[K], v: K) -> usize {
-    x.chunks(192).map(|c| usize::from(c.iter().map(|&k| u8::from(k == v)).sum::<u8>())).sum()
-}
+fn count_eq<K: Key>(x: &[K], v: K) -> usize { x.chunks(192).map(|c| usize::from(c.iter().map(|&k| u8::from(k == v)).sum::<u8>())).sum() }
 
 /// The least key of `x`, and the number of items with each key from it to the greatest (`counts_into`), when `table` allows that range.
 pub fn counts<K: Key>(x: &[K]) -> Option<(i64, Vec<usize>)> {
@@ -865,7 +863,10 @@ const RADIX_PIECE: usize = 1 << 16;
 
 /// Brings a radix sort's result back where an odd number of passes left it in `spare`: `from` holds the result, and `to` the caller's keys and payload.
 fn settled<K: Copy, P: Copy>(passes: usize, from: (&mut [K], &mut [P]), to: (&mut [K], &mut [P])) {
-    if passes % 2 == 1 { to.0.copy_from_slice(from.0); to.1.copy_from_slice(from.1); }
+    if passes % 2 == 1 {
+        to.0.copy_from_slice(from.0);
+        to.1.copy_from_slice(from.1);
+    }
 }
 
 /// `radix` across threads, for more than one `RADIX_PIECE` of keys. Each pass counts the byte's values in each piece, gives each piece its own run of every bucket, after the runs of the pieces before it, and moves each piece's keys into its runs in order. The sort stays stable, so it gives `radix`'s result. A pass splits the unwritten part of `spare` into its runs, so each piece writes only its own.

@@ -18,16 +18,15 @@ fn piece_values<T: crate::buffer::Cast>(range: std::ops::Range<usize>, checked: 
 /// The ordered folds of each lane of `[outer, len, inner]`, read from `pieces` a chunk of rows at a time. Each chunk folds from the right onto the fold so far: by `lane`, one call for each lane, along the last axis, and by `block`, one call for each row, along any other axis.
 pub(super) fn ordered_fold<T: crate::buffer::Cast>(
     [outer, len, inner]: [usize; 3], seed: Seed<'_>, direction: Direction, checked: bool, identity: Option<f64>, pieces: &Pieces<'_>,
-    lane: &dyn Fn(&[T], T) -> (T, Option<Kind>), block: &dyn Fn(&[T], &[T], &mut [std::mem::MaybeUninit<T>]) -> Result<(), Kind>,
-    output: &mut Buffer) -> Result<(), Error> {
+    lane: &dyn Fn(&[T], T) -> (T, Option<Kind>), block: &dyn Fn(&[T], &[T], &mut [std::mem::MaybeUninit<T>]) -> Result<(), Kind>, output: &mut Buffer
+) -> Result<(), Error> {
     let (mut result, mut items, mut seed_scratch) = (Vec::with_capacity(outer * inner), Vec::new(), Vec::new());
     if inner == 0 { *output = T::buffer(result); return Ok(()); }
     let right = direction == Direction::Right;
     let fold = |items: &[T], carry: Option<&[T]>| {
         let (rows, tail) = match carry { Some(tail) => (items, tail), None => items.split_at(items.len() - inner) };
         let (mut total, mut next, mut failure) = (tail.to_vec(), Vec::with_capacity(inner), None);
-        if inner == 1 { (total[0], failure) = lane(rows, tail[0]); }
-        else {
+        if inner == 1 { (total[0], failure) = lane(rows, tail[0]); } else {
             for row in rows.chunks_exact(inner).rev() {
                 next.clear();
                 failure = failure.or(crate::slice::appended(&mut next, inner, |slots| block(&total, row, slots)).err());

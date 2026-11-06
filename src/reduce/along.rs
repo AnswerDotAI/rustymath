@@ -84,4 +84,3 @@ pub fn along_mapped<T: Element, R: Reduction<T>>(data: &[T], mapping: &Mapping, 
     });
     (totals, fits, None)
 }
-

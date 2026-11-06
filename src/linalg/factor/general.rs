@@ -87,7 +87,8 @@ fn hessenberg<T: Scalar>(h: &mut [T], n: usize, ld: usize) -> (Vec<T>, Vec<T>) {
 }
 
 /// The row where the active block that holds row `i` starts, searching up to row `l`: the row below the last negligible subdiagonal item, by Ahues and Tisseur's conservative test as LAPACK applies it, or `l`. `mag` measures an item and `sub` a subdiagonal one. The complex reduction keeps its subdiagonal real and measures it by its real part, as `zlahqr` does.
-fn split<T: Copy + std::ops::Sub<Output = T>, R: Native>(h: &[T], ld: usize, n: usize, l: usize, i: usize, [smlnum, ulp]: [R; 2], mag: impl Fn(T) -> R, sub: impl Fn(T) -> R) -> usize {
+fn split<T: Copy + std::ops::Sub<Output = T>, R: Native>(
+    h: &[T], ld: usize, n: usize, l: usize, i: usize, [smlnum, ulp]: [R; 2], mag: impl Fn(T) -> R, sub: impl Fn(T) -> R) -> usize {
     let mut k = i;
     while k > l {
         let s = h[k * ld + k - 1];

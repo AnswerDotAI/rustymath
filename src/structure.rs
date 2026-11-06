@@ -161,14 +161,10 @@ fn route_layout<'a>(layout: &'a Layout, routes: &Routes) -> Result<Cow<'a, Layou
 
 /// One independent axis selector. Positions are zero-based and already normalized; a range can walk backwards. `All` keeps the whole axis, whatever its length. An index array replaces its axis by the axes of its layout. Its positions, a [`Table`], lie within the axis or are `Steps::FILL`, which reads the caller's fill. The code that builds an index array checks its positions, as `index_positions` and `index_table` do. `NewAxis` inserts a length-one axis without consuming an input axis.
 #[derive(Clone, Debug)]
-pub enum Selector {
-    At(usize), Range { start: usize, len: usize, step: isize }, All, Indices { layout: Layout, positions: Table }, NewAxis
-}
+pub enum Selector { At(usize), Range { start: usize, len: usize, step: isize }, All, Indices { layout: Layout, positions: Table }, NewAxis }
 
 /// Selects with one selector for each leading axis of `layout`, in order, keeping the axes that no selector mentions. A single position removes its axis, and a range keeps it in place. An index array's axes replace its axis. An unnamed vector keeps the axis's name and the keys at the positions it selects if none repeats, as a named vector without keys of its own keeps those keys, and an unnamed index array of another rank has plain axes. Index arrays pair, as arguments pair in arithmetic: all of them with `broadcast`, as `.[]` reads them, and otherwise those that share an axis name, as `⌷` reads them. Paired index arrays put their axes where the first of them was. A range pairs with an index array that has its axis's name. Positions that step evenly along each axis read as strides (`strided`), whether one index array gives them or paired arrays sum to them. One index array whose positions read a stretch of its axis past the ends, as edge modes and positions that count back from the end give them, reads as one padded or rotated entry.
-pub fn select(layout: &Layout, selectors: Vec<Selector>, broadcast: bool) -> Result<Plan, Error> {
-    planned(layout, selectors, broadcast)
-}
+pub fn select(layout: &Layout, selectors: Vec<Selector>, broadcast: bool) -> Result<Plan, Error> { planned(layout, selectors, broadcast) }
 
 fn planned(layout: &Layout, selectors: Vec<Selector>, broadcast: bool) -> Result<Plan, Error> {
     let (shape, stride) = (layout.shape(), strides(layout.shape()));
@@ -238,7 +234,8 @@ impl Part {
             }
             Selector::Indices { layout: within, positions } => {
                 if generated_len(within.shape())? != positions.len() {
-                    return Err(Error::new(Kind::Length, format!("index array shape {:?} needs {} positions, got {}", within.shape(), within.count(), positions.len())));
+                    return Err(Error::new(
+                        Kind::Length, format!("index array shape {:?} needs {} positions, got {}", within.shape(), within.count(), positions.len())));
                 }
                 let steps = Steps::Table(positions);
                 let selected = layout.select(axis, steps.offsets())?;
@@ -481,10 +478,8 @@ pub fn float_position<F: Float>(y: F, t: crate::tolerant::Tolerance) -> Option<i
 /// The signed position that each index value gives, before any axis applies: integers as they are, and floats as `float_position` reads them within tolerance `t`, with `None` for a NaN or a value that isn't whole. Items that aren't real numbers have no position. [`positions`] reads the values and checks them against an axis in one pass.
 pub fn signed_positions(view: View<'_>, t: crate::tolerant::Tolerance) -> Vec<Option<i64>> {
     match view {
-        View::Booleans(b) => b.iter().map(|&i| Some(i.into())).collect(),
-        View::Integers(ix) => with_ints!(ix, |i| i.iter().map(|&i| Some(i.into())).collect()),
-        View::Floats(x) => with_floats!(x, |x| x.iter().map(|&y| float_position(y, t)).collect()),
-        _ => vec![None; view.len()],
+        View::Booleans(b) => b.iter().map(|&i| Some(i.into())).collect(), View::Integers(ix) => with_ints!(ix, |i| i.iter().map(|&i| Some(i.into())).collect()),
+        View::Floats(x) => with_floats!(x, |x| x.iter().map(|&y| float_position(y, t)).collect()), _ => vec![None; view.len()]
     }
 }
 
@@ -581,7 +576,10 @@ fn replication<C: crate::search::Key>(layout: &Layout, axis: usize, counts: &[C]
     };
     // The greatest count times their number bounds the sum, which then runs unchecked.
     let most = if counts.is_empty() { 0 } else { let (lo, hi) = C::range(counts); lo.unsigned_abs().max(hi.unsigned_abs()) };
-    let total = if inverse { Some(len) } else { most.checked_mul(len as u64).and_then(|_| usize::try_from(if single { most * len as u64 } else { counts.iter().map(|n| n.key().unsigned_abs()).sum() }).ok()) };
+    let total = if inverse { Some(len) } else {
+        most.checked_mul(len as u64)
+            .and_then(|_| usize::try_from(if single { most * len as u64 } else { counts.iter().map(|n| n.key().unsigned_abs()).sum() }).ok())
+    };
     let mut shape = layout.shape().to_vec();
     shape[axis] = total.ok_or_else(|| Error::new(Kind::Limit, "repeat length overflow"))?;
     generated_len(&shape)?;
@@ -589,7 +587,9 @@ fn replication<C: crate::search::Key>(layout: &Layout, axis: usize, counts: &[C]
 }
 
 /// `shape` with `layout`'s keys on its other axes and its names, as a repeat with no keys along its axis lays out.
-fn unkeyed(layout: &Layout, shape: Vec<usize>) -> Result<Layout, Error> { Ok(Layout::from(shape).with_keys(layout.all_keys())?.inherit_names(layout.names().to_vec())) }
+fn unkeyed(layout: &Layout, shape: Vec<usize>) -> Result<Layout, Error> {
+    Ok(Layout::from(shape).with_keys(layout.all_keys())?.inherit_names(layout.names().to_vec()))
+}
 
 /// The plan of `repeat`, or of `expand` where `inverse`. Repeating, each count uses up one cell. Undoing, each count uses up the cells it made and gives back one.
 fn replicated(layout: &Layout, axis: usize, counts: &[i64], inverse: bool) -> Result<Plan, Error> {
@@ -618,8 +618,11 @@ fn replicated(layout: &Layout, axis: usize, counts: &[i64], inverse: bool) -> Re
         // The table repeats each count's cell by the count's magnitude, with a fill in place of the cell where the count is negative. A mask of counts 0 and 1 takes `gather::positions`, which skips blocks of zeros.
         let cell = |j: usize| if lanes.len == 1 { 0 } else { j };
         let (mut table, mut positions) = (Vec::with_capacity(shape[axis]), Vec::new());
-        if !single && !keyed && counts.iter().all(|&n| n == 0 || n == 1) { crate::gather::positions(&mut table, counts, shape[axis], |j| cell(j) * lanes.inner) } else {
-            let sizes: std::borrow::Cow<'_, [i64]> = if counts.iter().all(|&n| n >= 0) { counts.into() } else { counts.iter().map(|&n| size(n) as i64).collect() };
+        if !single && !keyed && counts.iter().all(|&n| n == 0 || n == 1) {
+            crate::gather::positions(&mut table, counts, shape[axis], |j| cell(j) * lanes.inner)
+        } else {
+            let sizes: std::borrow::Cow<'_, [i64]> =
+                if counts.iter().all(|&n| n >= 0) { counts.into() } else { counts.iter().map(|&n| size(n) as i64).collect() };
             let at = |j: usize| (count(j) > 0).then_some(cell(j));
             crate::gather::repeat(&mut table, len, &sizes, shape[axis], |j| at(j).map_or(Steps::FILL, |c| c * lanes.inner));
             if keyed { crate::gather::repeat(&mut positions, len, &sizes, shape[axis], at); }
@@ -886,6 +889,19 @@ impl Walk {
             read.push([len, moves]);
         }
         (first + last < n).then_some((first, read))
+    }
+    /// The leading windows read by this copy, as `[number, width, step]` per axis. The copy's axes must be frames, windows, then unchanged source axes. Each frame starts at 0.
+    pub fn windows(&self, source: &[usize]) -> Option<Vec<[usize; 3]>> {
+        let s = self.steps.len().checked_sub(source.len())?;
+        if self.base != 0 || s == 0 || 2 * s > self.steps.len() { return None; }
+        if (s..source.len())
+            .any(|a| !matches!(self.steps[s + a], Steps::Stride { start: 0, len, step } if len == source[a] && step == self.strides[a] as isize)) {
+                return None;
+            }
+        (0..s).map(|a| {
+            if self.along[a] != Some(a) || self.along[s + a] != Some(a) { return None; }
+            match self.read(a, source[a])? { (0, read) => match read[..] { [[n, moves], [w, 1]] => Some([n, w, moves]), _ => None }, _ => None }
+        }).collect()
     }
 }
 

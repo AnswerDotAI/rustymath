@@ -31,7 +31,6 @@ routes! {
     PartialGrade: "partial grade", true, true, false;
     PartialSort: "partial sort", true, true, false;
     Ranks: "ranks", true, true, false;
-    Accuracy: "accuracy rule", true, false, false;
     KeyClasses: "key classes", true, false, false;
     GroupCounts: "group counts", true, false, false;
     GroupFolds: "group folds", true, true, false;
@@ -71,11 +70,10 @@ pub enum Event {
     Route(Record), Fused { glyphs: String, items: usize, blocks: usize, runs: usize, copied: usize },
     Stored { glyphs: String, items: usize, reason: &'static str, partway: bool },
     Forced { function: String, line: usize, column: usize, items: usize, reason: &'static str, site: Option<String> },
-    Program { event: &'static str, steps: usize, listing: String }, Fast { rule: &'static str, function: String },
-    Fallback { reason: String, items: usize }, Accumulation { items: usize, size: usize, path: &'static str },
+    Program { event: &'static str, steps: usize, listing: String }, Fast { rule: &'static str, function: String }, Fallback { reason: String, items: usize },
+    Accumulation { items: usize, size: usize, path: &'static str },
     Mixed { code: String, line: usize, column: usize, target: &'static str, written: &'static str, items: usize },
-    Compile { glyphs: String, microseconds: usize },
-    Itemwise { function: String, line: usize, column: usize, route: Route, items: usize }
+    Compile { glyphs: String, microseconds: usize }, Itemwise { function: String, line: usize, column: usize, route: Route, items: usize }
 }
 #[derive(Clone, Copy)]
 pub enum Column { Text, Count, Truth }
@@ -115,8 +113,7 @@ impl Event {
         match self {
             Self::Route(Record { kind: EventKind::Stopped, reason, .. }) | Self::Stored { reason, .. } => Some(*reason),
             Self::Forced { function: name, .. } | Self::Fallback { reason: name, .. } | Self::Mixed { code: name, .. } => Some(name.as_str()),
-            Self::Itemwise { route, .. } => Some(route.name()),
-            _ => None,
+            Self::Itemwise { route, .. } => Some(route.name()), _ => None
         }
     }
     pub fn fields(&self) -> Vec<Field<'_>> {

@@ -173,9 +173,7 @@ impl Product { pub fn compares_exactly(self) -> bool { matches!(self, Self::Plus
 
 /// Layout and reads of an inner product. Contracted axes follow output axes in `iteration`.
 #[derive(Clone, Debug)]
-pub struct ProductPlan {
-    pub layout: crate::layout::Layout, pub iteration: crate::layout::Layout, pub mappings: [Mapping; 2], pub contracted: usize
-}
+pub struct ProductPlan { pub layout: crate::layout::Layout, pub iteration: crate::layout::Layout, pub mappings: [Mapping; 2], pub contracted: usize }
 
 #[derive(Clone, Copy, Debug)]
 pub struct MatrixProduct { pub frame_rank: usize, pub row_rank: usize, pub size: [usize; 3] }
@@ -207,10 +205,13 @@ impl ProductPlan {
         let mut nominal = owners.clone();
         for (side, input) in inputs.iter().enumerate() {
             let plan = input.plan.remapped(self.mappings[side].clone(), self.iteration.count(), crate::agreement::Missing::Invalid);
-            let map = crate::agreement::Read { sources: input.sources, plan: &plan }.positional(shape).map_or_else(|| self.mappings[side].clone(), |(_, map)| map);
+            let map =
+                crate::agreement::Read { sources: input.sources, plan: &plan }.positional(shape).map_or_else(|| self.mappings[side].clone(), |(_, map)| map);
             let (_, steps) = map.affine(shape)?;
             for (axis, owner) in owners.iter_mut().enumerate() { if steps[axis] != 0 { *owner |= 1 << side; } }
-            if let Some((_, free)) = self.mappings[side].affine(shape) { for (named, &step) in nominal.iter_mut().zip(&free) { if step != 0 { *named |= 1 << side; } } }
+            if let Some((_, free)) = self.mappings[side].affine(shape) {
+                for (named, &step) in nominal.iter_mut().zip(&free) { if step != 0 { *named |= 1 << side; } }
+            }
         }
         // An axis of one item adds nothing to any size, so any class that keeps the order serves.
         let mut last = 3;
@@ -365,8 +366,7 @@ fn packed<const NOT: bool>(a: &[bool], b: &[bool], [m, k, n]: [usize; 3], c: &mu
         }
     }
 }
-// The pairs at `i64` and `+.×`'s pair at `i32`. `tiered` runs the pairs at `i64` only where every value that a product forms fits `i64`. Their wrapping operations then never wrap. The pair at `i32` wraps, as the products of [`Wrapped<PlusTimes>`] do.
-// The pairs at `i128`, which `checked_into` uses where a result could pass `i64`. Each step of `+.×` checks that its running total fits 128 bits.
+// The pairs at `i64` and `+.×`'s pair at `i32`. `tiered` runs the pairs at `i64` only where every value that a product forms fits `i64`. Their wrapping operations then never wrap. The pair at `i32` wraps, as the products of [`Wrapped<PlusTimes>`] do. The pairs at `i128`, which `checked_into` uses where a result could pass `i64`. Each step of `+.×` checks that its running total fits 128 bits.
 pairs! {
     PlusTimes: i64 => i64 = 0, |a, b| a.wrapping_mul(b), |x, y| x.wrapping_add(y);
     PlusTimes: i32 => i32 = 0, |a, b| a.wrapping_mul(b), |x, y| x.wrapping_add(y);

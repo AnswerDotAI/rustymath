@@ -118,9 +118,13 @@ fn product_typed<T: crate::buffer::Cast, P: crate::linalg::Inner<T>>(
     let reads = std::array::from_fn::<_, 2, _>(|i| Read { sources: inputs[i].sources, plan: &expanded[i] });
     // Each operand's walk over the frames and the matrix axes `[m, n, k]`, composed once where it reads its source positionally: a frame moves only the walk's base. A source of another dtype converts to `T` once, whole.
     let walked: Vec<usize> = frame_shape.iter().copied().chain([m, n, k]).collect();
-    let positional = reads.each_ref().map(|read| match read.positional(&walked) { Some((view, Mapping::Steps { base, steps })) => Some((view, base, steps)), _ => None });
+    let positional = reads.each_ref().map(|read| match read.positional(&walked) {
+        Some((view, Mapping::Steps { base, steps })) => Some((view, base, steps)), _ => None
+    });
     let mut casts: [Vec<T>; 2] = [Vec::new(), Vec::new()];
-    for (cast, p) in casts.iter_mut().zip(&positional) { if let Some((view, ..)) = p && T::of(*view).is_none() { T::extend_cast(*view, view.len(), variant.checked, cast)?; } }
+    for (cast, p) in casts.iter_mut().zip(&positional) {
+        if let Some((view, ..)) = p && T::of(*view).is_none() { T::extend_cast(*view, view.len(), variant.checked, cast)?; }
+    }
     let walks = std::array::from_fn::<_, 2, _>(|i| positional[i].as_ref().map(|(view, base, steps)| (T::of(*view).unwrap_or(&casts[i][..]), *base, steps)));
     let mut result = Vec::with_capacity(plan.layout.count());
     let overflow = || if variant.checked { Err(Error::new(Kind::Overflow, "product does not fit its integer result")) } else { Ok(false) };
@@ -129,18 +133,15 @@ fn product_typed<T: crate::buffer::Cast, P: crate::linalg::Inner<T>>(
             let (mut ab, mut bb) = (Vec::new(), Vec::new());
             let start = result.len();
             result.resize(start + m * n, P::Out::default());
-            if !pair.checked_into(a.read(0, m * k, &mut ab), b.read(0, k * n, &mut bb), matrix.size, &mut result[start..]) {
-                return overflow();
-            }
-        } else {
-            result.extend(pair.inner_mapped(a, b, [Orientation::Normal; 2], matrix.size));
-        }
+            if !pair.checked_into(a.read(0, m * k, &mut ab), b.read(0, k * n, &mut bb), matrix.size, &mut result[start..]) { return overflow(); }
+        } else { result.extend(pair.inner_mapped(a, b, [Orientation::Normal; 2], matrix.size)); }
         Ok(true)
     };
     if let [Some((a, a0, a_steps)), Some((b, b0, b_steps))] = &walks {
         // A frame's matrix along axes `axes` of `[m, n, k]`, at the first item of axis `other`, which the operand doesn't step along.
         let matrix_at = |base: usize, steps: &[Steps], frame: usize, axes: [usize; 2], other: usize| {
-            Some(Walked::from(Mapping::Steps { base: Steps::reach(base, &steps[..r], frame)? + steps[r + other].get(0)?, steps: axes.map(|a| steps[r + a].clone()).into() }))
+            Some(Walked::from(Mapping::Steps { base: Steps::reach(base, &steps[..r], frame)? + steps[r + other].get(0)?,
+                steps: axes.map(|a| steps[r + a].clone()).into() }))
         };
         // Where both matrix axes of each operand step evenly, a stack takes each frame's two matrices as row-major slices (`frame_matrix`), so a tiny product runs `Inner`'s direct loop with nothing allocated per frame.
         let strided = |steps: &[Steps], axes: [usize; 2], other: usize| match axes.map(|x| &steps[r + x]) {
@@ -179,7 +180,8 @@ fn product_typed<T: crate::buffer::Cast, P: crate::linalg::Inner<T>>(
 }
 
 /// The `len` items that `read` reads, as one slice: `scratch` holds them where the read copies them.
-fn read_all<'a, T: crate::buffer::Cast>(read: &'a crate::agreement::Read<'_>, len: usize, checked: bool, scratch: &'a mut Vec<T>) -> Result<std::borrow::Cow<'a, [T]>, Error> {
+fn read_all<'a, T: crate::buffer::Cast>(
+    read: &'a crate::agreement::Read<'_>, len: usize, checked: bool, scratch: &'a mut Vec<T>) -> Result<std::borrow::Cow<'a, [T]>, Error> {
     Ok(match read.part::<T>(0..len, checked, scratch)? { Arg::One(x) => std::borrow::Cow::Owned(vec![x; len]), Arg::Many(x) => std::borrow::Cow::Borrowed(x) })
 }
 
@@ -188,8 +190,12 @@ fn matrix_items<'a, T: crate::buffer::Cast>(
     read: &'a crate::agreement::Read<'_>, shape: [usize; 2], checked: bool, scratch: &'a mut Vec<T>
 ) -> Result<(std::borrow::Cow<'a, [T]>, crate::agreement::Walked<'static>), Error> {
     use crate::agreement::{Mapping, Walked};
-    if let Some((view, mapping)) = read.positional(&shape) && let Some(data) = T::of(view) { return Ok((std::borrow::Cow::Borrowed(data), Walked::from(mapping))); }
-    if let Some((view, mapping)) = read.mapped_source() && let Some(data) = T::of(view) { return Ok((std::borrow::Cow::Borrowed(data), Walked::from(mapping.clone()))); }
+    if let Some((view, mapping)) = read.positional(&shape) && let Some(data) = T::of(view) {
+        return Ok((std::borrow::Cow::Borrowed(data), Walked::from(mapping)));
+    }
+    if let Some((view, mapping)) = read.mapped_source() && let Some(data) = T::of(view) {
+        return Ok((std::borrow::Cow::Borrowed(data), Walked::from(mapping.clone())));
+    }
     Ok((read_all(read, shape[0] * shape[1], checked, scratch)?, Walked::from(Mapping::Linear(1))))
 }
 

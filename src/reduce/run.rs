@@ -35,52 +35,54 @@ impl Reduce {
     pub fn total_dtype(self, variant: crate::domain::Variant) -> Option<crate::buffer::DType> {
         native_reduction!(self, variant.dtype, variant.fails_on_overflow(), |R, T| Some(<<R as Reduction<T>>::Total as Element>::DTYPE))
     }
-    pub fn run_pieces(
-        self, variant: crate::domain::Variant, dims: [usize; 3], seed: Seed<'_>, pieces: &Pieces<'_>, output: &mut Buffer) -> Result<(), Error> {
+    pub fn run_pieces(self, variant: crate::domain::Variant, dims: [usize; 3], seed: Seed<'_>, pieces: &Pieces<'_>, output: &mut Buffer) -> Result<(), Error> {
         // No count of trues exceeds its lane's length: an unseeded count asked for in `i16` or `i32` totals in that type where the length fits.
         use crate::buffer::{DType, Width};
-        if self == Reduce::Sum && variant.dtype == DType::Boolean && matches!(seed, Seed::Identity) && let DType::Integer(w @ (Width::I16 | Width::I32)) = output.dtype()
-            && crate::domain::Range::of_dtype(output.dtype()).hi >= dims[1] as f64 {
-            return if w == Width::I16 { counted::<i16>(dims, variant.checked, pieces, output) } else { counted::<i32>(dims, variant.checked, pieces, output) };
-        }
+        if self == Reduce::Sum && variant.dtype == DType::Boolean && matches!(seed, Seed::Identity)
+            && let DType::Integer(w @ (Width::I16 | Width::I32)) = output.dtype() && crate::domain::Range::of_dtype(output.dtype()).hi >= dims[1] as f64 {
+                return if w == Width::I16 { counted::<i16>(dims, variant.checked, pieces, output) }
+                else { counted::<i32>(dims, variant.checked, pieces, output) };
+            }
         native_reduction!(self, variant.dtype, variant.fails_on_overflow(), |R, T| Some(
             native_pieces::<T, R>(dims, variant.checked, pieces).and_then(|result| finish_fold::<T, R>(result, seed, variant.checked, output))
         )).unwrap_or_else(|| Err(Error::new(Kind::Domain, "reduction does not support this dtype")))
     }
     pub fn run_read(
-        self, variant: crate::domain::Variant, shape: &[usize], axis: usize, seed: Seed<'_>, input: Read<'_>, output: &mut Buffer) -> Result<Option<Vec<Steps>>, Error> {
-        native_reduction!(self, variant.dtype, variant.fails_on_overflow(), |R, T| Some(
-            native_read::<T, R>(shape, axis, variant.checked, input).and_then(|(buffer, fits, order)| {
+        self, variant: crate::domain::Variant, shape: &[usize], axis: usize, seed: Seed<'_>, input: Read<'_>, output: &mut Buffer
+    ) -> Result<Option<Vec<Steps>>, Error> {
+        native_reduction!(self, variant.dtype, variant.fails_on_overflow(), |R, T| Some(native_read::<T, R>(shape, axis, variant.checked, input).and_then(
+            |(buffer, fits, order)| {
                 // A seeded fold walks its totals into the result's order, which its seed reads in.
                 let (buffer, order) = if seed.read().is_some() { (buffer.ordered(order), None) } else { (buffer, order) };
                 finish_fold::<T, R>((buffer, fits), seed, variant.checked, output).map(|()| order)
-            })
-        )).unwrap_or_else(|| Err(Error::new(Kind::Domain, "reduction does not support this dtype")))
+            }
+        ))).unwrap_or_else(|| Err(Error::new(Kind::Domain, "reduction does not support this dtype")))
     }
     /// The folds by this reduction of each window along axes 1 and 3 of `input`, an array of shape `dims`, as [`sliding_2d`] folds them, with each axis's window width and the positions between windows' starts. A domain error for windows wider than `sliding_2d` folds directly.
     pub fn run_sliding_2d(
-        self, variant: crate::domain::Variant, dims: [usize; 5], widths: [usize; 2], every: [usize; 2], input: View<'_>, output: &mut Buffer) -> Result<(), Error> {
+        self, variant: crate::domain::Variant, dims: [usize; 5], widths: [usize; 2], every: [usize; 2], input: View<'_>, output: &mut Buffer
+    ) -> Result<(), Error> {
         native_reduction!(self, variant.dtype, variant.fails_on_overflow(), |R, T| Some(items::<T>(input).and_then(|data| {
             let folds = sliding_2d::<T, R>(data, dims, widths, every).ok_or_else(|| Error::new(Kind::Domain, "windows too wide to fold directly"))?;
             totals::<T, R>(folds, variant.checked, output)
         }))).unwrap_or_else(|| Err(Error::new(Kind::Domain, "reduction does not support this dtype")))
     }
     /// The fold by this reduction of each group of `input` that `groups` gives, in group order (`Grouping::fold`).
-    pub fn run_groups(
-        self, variant: crate::domain::Variant, groups: &impl crate::search::Grouping, input: View<'_>, output: &mut Buffer) -> Result<(), Error> {
-        native_reduction!(self, variant.dtype, variant.fails_on_overflow(), |R, T| Some(
-            items::<T>(input).and_then(|data| totals::<T, R>(groups.fold::<T, R>(data), variant.checked, output))
-        )).unwrap_or_else(|| Err(Error::new(Kind::Domain, "reduction does not support this dtype")))
+    pub fn run_groups(self, variant: crate::domain::Variant, groups: &impl crate::search::Grouping, input: View<'_>, output: &mut Buffer) -> Result<(), Error> {
+        native_reduction!(self, variant.dtype, variant.fails_on_overflow(), |R, T| Some(items::<T>(input).and_then(|data| totals::<T, R>(
+            groups.fold::<T, R>(data), variant.checked, output
+        )))).unwrap_or_else(|| Err(Error::new(Kind::Domain, "reduction does not support this dtype")))
     }
     #[inline(never)]
-    pub(crate) fn inverse_pieces(
-        self, variant: crate::domain::Variant, dims: [usize; 3], pieces: &Pieces<'_>) -> Result<Option<Buffer>, Error> {
-        inverse_result(native_reduction!(@inverse self, variant.dtype, |R, T| Some(native_pieces::<T, R>(dims, variant.checked, pieces))), dims.into_iter().product())
+    pub(crate) fn inverse_pieces(self, variant: crate::domain::Variant, dims: [usize; 3], pieces: &Pieces<'_>) -> Result<Option<Buffer>, Error> {
+        inverse_result(
+            native_reduction!(@inverse self, variant.dtype, |R, T| Some(native_pieces::<T, R>(dims, variant.checked, pieces))), dims.into_iter().product())
     }
     #[inline(never)]
-    pub(crate) fn inverse_read(
-        self, variant: crate::domain::Variant, shape: &[usize], axis: usize, input: Read<'_>) -> Result<Option<Buffer>, Error> {
-        inverse_result(native_reduction!(@inverse self, variant.dtype, |R, T| Some(native_read::<T, R>(shape, axis, variant.checked, input).map(|(buffer, fits, order)| (buffer.ordered(order), fits)))), crate::layout::count(shape))
+    pub(crate) fn inverse_read(self, variant: crate::domain::Variant, shape: &[usize], axis: usize, input: Read<'_>) -> Result<Option<Buffer>, Error> {
+        inverse_result(
+            native_reduction!(@inverse self, variant.dtype, |R, T| Some(native_read::<T, R>(shape, axis, variant.checked, input).map(|(buffer, fits, order)| (buffer.ordered(order), fits)))),
+            crate::layout::count(shape))
     }
 }
 
@@ -90,8 +92,8 @@ fn inverse_result(result: Option<Result<(Buffer, bool), Error>>, items: usize) -
     Ok(result)
 }
 
-fn native_read<T, R>(shape: &[usize], axis: usize, checked: bool, input: Read<'_>) -> Result<(Buffer, bool, Option<Vec<Steps>>), Error>
-where T: Cast, R: Reduction<T>, R::Total: Totals {
+fn native_read<T, R>(shape: &[usize], axis: usize, checked: bool, input: Read<'_>) -> Result<(Buffer, bool, Option<Vec<Steps>>), Error> where T: Cast,
+    R: Reduction<T>, R::Total: Totals {
     let dims = Lanes::new(shape, axis)?.dims();
     if let Some((view, mapping)) = input.positional(shape) && let Some(data) = T::of(view) {
         return crate::error::checked(|| {
@@ -134,8 +136,7 @@ fn counted<C: Tally + Cast>(dims: [usize; 3], checked: bool, pieces: &Pieces<'_>
     native_pieces::<bool, SumAs<C>>(dims, checked, pieces).and_then(|result| finish_fold::<bool, SumAs<C>>(result, Seed::Identity, checked, output))
 }
 
-fn native_pieces<T, R>(dims: [usize; 3], checked: bool, pieces: &Pieces<'_>) -> Result<(Buffer, bool), Error>
-where T: Cast, R: Reduction<T>, R::Total: Totals {
+fn native_pieces<T, R>(dims: [usize; 3], checked: bool, pieces: &Pieces<'_>) -> Result<(Buffer, bool), Error> where T: Cast, R: Reduction<T>, R::Total: Totals {
     let [outer, len, inner] = dims;
     let mut totals = vec![if len == 0 { R::unit() } else { R::identity() }; outer * inner];
     crate::error::checked(|| {
@@ -158,9 +159,8 @@ where T: Cast, R: Reduction<T>, R::Total: Totals {
     })
 }
 
-fn finish_fold<T, R: Reduction<T>>(
-    (mut buffer, fits): (Buffer, bool), seed: Seed<'_>, checked: bool, output: &mut Buffer) -> Result<(), Error>
-where R::Total: Cast {
+fn finish_fold<T, R: Reduction<T>>((mut buffer, fits): (Buffer, bool), seed: Seed<'_>, checked: bool, output: &mut Buffer) -> Result<(), Error> where
+    R::Total: Cast {
     crate::error::checked(|| {
         if checked && !fits { return Err(Error::new(Kind::Overflow, "integer fold overflowed")); }
         let totals = R::Total::of_mut(&mut buffer).expect("an associative total keeps its storage type");
@@ -210,15 +210,21 @@ pub(crate) fn negated_scan(
     variant: crate::domain::Variant, dims: [usize; 3], seed: crate::operation::Seed<'_>, input: crate::agreement::Read<'_>, output: &mut crate::buffer::Buffer
 ) -> Result<bool, Error> {
     use crate::buffer::{DType, FloatWidth};
-    macro_rules! negated { ($t:ty) => { scan_read::<$t, $t>(dims, seed, crate::operation::Direction::Left, variant.checked, input, output, &|items, dims, seed, out| {
-        negated_cells::<$t, Sum>(items, dims, seed, out, |x| -x);
-        Ok(())
-    }) } }
+    macro_rules! negated {
+        ($t:ty) => {
+            scan_read::<$t, $t>(dims, seed, crate::operation::Direction::Left, variant.checked, input, output, &|items, dims, seed, out| {
+                negated_cells::<$t, Sum>(items, dims, seed, out, |x| -x);
+                Ok(())
+            })
+        };
+    }
     match variant.dtype {
         DType::Float(FloatWidth::F16 | FloatWidth::F32) => negated!(f32)?,
         DType::Float(FloatWidth::F64) => negated!(f64)?,
         DType::Complex(w) => with_complex_width!(w, C => negated!(C))?,
-        DType::Integer(_) | DType::Boolean => return bounded_scan(variant, dims, seed, crate::operation::Direction::Left, true, input, output).map_or(Ok(false), |done| done.map(|()| true)),
+        DType::Integer(_) | DType::Boolean => {
+            return bounded_scan(variant, dims, seed, crate::operation::Direction::Left, true, input, output).map_or(Ok(false), |done| done.map(|()| true));
+        }
         _ => return Ok(false),
     }
     Ok(true)
@@ -245,17 +251,19 @@ pub(crate) fn bounded_scan(
     let stored = input.plan.try_for_each_source(&mut |s, _| if input.sources.get(s).is_some_and(|b| fits(b.view.dtype())) { Ok(()) } else { Err(()) });
     if !matches!(variant.dtype, DType::Boolean | DType::Integer(_)) || stored.is_err() { return None; }
     let checked = variant.fails_on_overflow();
-    Some(if total == Width::I16 { totalled::<i16>(dims, seed, direction, checked, negate, input, output) } else { totalled::<i32>(dims, seed, direction, checked, negate, input, output) })
+    Some(if total == Width::I16 { totalled::<i16>(dims, seed, direction, checked, negate, input, output) }
+    else { totalled::<i32>(dims, seed, direction, checked, negate, input, output) })
 }
 
 /// `bounded_scan`'s scan in `C`, reading the items as `C`. Where `checked`, each total is then tested from the total before it and its item: a sum overflows where its sign differs from both its arguments', and a difference where its arguments' signs differ and its sign differs from the first's. Every item fits `C`, which makes the tests exact. An overflow fails the scan.
 fn totalled<C>(
     dims: [usize; 3], seed: crate::operation::Seed<'_>, direction: crate::operation::Direction, checked: bool, negate: bool, input: crate::agreement::Read<'_>,
-    output: &mut crate::buffer::Buffer) -> Result<(), Error>
-where C: crate::buffer::Cast + Tally + Term + Into<i64> + Ord + Default + std::ops::BitXor<Output = C> + std::ops::BitAnd<Output = C> + std::ops::BitOr<Output = C> {
+    output: &mut crate::buffer::Buffer) -> Result<(), Error> where C: crate::buffer::Cast + Tally + Term + Into<i64> + Ord + Default
+        + std::ops::BitXor<Output = C> + std::ops::BitAnd<Output = C> + std::ops::BitOr<Output = C> {
     scan_read::<C, C>(dims, seed, direction, checked, input, output, &|items, [g, n, inner], seed, out| {
         let from = out.len();
-        if negate { negated_cells::<C, SumAs<C>>(items, [g, n, inner], seed, out, |x| C::low(-x.into())) } else { scan_along::<C, SumAs<C>>(items, [g, n, inner], seed, out); }
+        if negate { negated_cells::<C, SumAs<C>>(items, [g, n, inner], seed, out, |x| C::low(-x.into())) }
+        else { scan_along::<C, SumAs<C>>(items, [g, n, inner], seed, out); }
         if !checked { return Ok(()); }
         let test = |p: C, x: C, c: C| if negate { (p ^ x) & (p ^ c) } else { (p ^ c) & (x ^ c) };
         let along = |p: &[C], x: &[C], c: &[C]| p.iter().zip(x).zip(c).fold(C::default(), |b, ((&p, &x), &c)| b | test(p, x, c));
@@ -269,7 +277,8 @@ where C: crate::buffer::Cast + Tally + Term + Into<i64> + Ord + Default + std::o
 }
 
 /// Cell `cell`'s `inner` seed items from `read`: its one item in every column where it holds one, else the cell's own row.
-pub(crate) fn seed_row<T: crate::buffer::Cast>(read: &crate::agreement::Read<'_>, cell: usize, inner: usize, checked: bool, scratch: &mut Vec<T>) -> Result<Vec<T>, Error> {
+pub(crate) fn seed_row<T: crate::buffer::Cast>(
+    read: &crate::agreement::Read<'_>, cell: usize, inner: usize, checked: bool, scratch: &mut Vec<T>) -> Result<Vec<T>, Error> {
     let one = read.plan.len() == 1;
     let arg = read.part::<T>(if one { 0..1 } else { cell * inner..(cell + 1) * inner }, checked, scratch)?;
     Ok((0..inner).map(|i| arg.nth(if one { 0 } else { i })).collect())
@@ -328,7 +337,7 @@ pub(crate) fn adjacent_read<T: crate::buffer::Cast>(
     for cell in (0..outer).filter(|_| len > 0) {
         let start = seed.map(|read| seed_row(&read, cell, inner, checked, &mut seed_scratch)).transpose()?;
         let lane: std::borrow::Cow<'_, [T]> = match input.part::<T>(cell * len * inner..(cell + 1) * len * inner, checked, &mut scratch)? {
-            Arg::Many(items) => items.into(), Arg::One(item) => vec![item; len * inner].into(),
+            Arg::Many(items) => items.into(), Arg::One(item) => vec![item; len * inner].into()
         };
         match &start { Some(start) => pair(start, &lane[..inner], &mut values), None => values.extend_from_slice(&lane[..inner]) }
         pair(&lane[..(len - 1) * inner], &lane[inner..], &mut values);

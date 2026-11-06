@@ -571,30 +571,12 @@ mod complex {
     /// The function named `name` at the arguments `z`, or `None` where the name isn't one of these functions.
     fn apply<R: Native>(name: &str, z: &[Complex<R>]) -> Option<Complex<R>> {
         Some(match name {
-            "exp" => unary(Exp, z[0]),
-            "log" => unary(Ln, z[0]),
-            "sqrt" => unary(Sqrt, z[0]),
-            "sin" => unary(Sin, z[0]),
-            "cos" => unary(Cos, z[0]),
-            "tan" => unary(Tan, z[0]),
-            "sinh" => unary(Sinh, z[0]),
-            "cosh" => unary(Cosh, z[0]),
-            "tanh" => unary(Tanh, z[0]),
-            "asin" => unary(Asin, z[0]),
-            "acos" => unary(Acos, z[0]),
-            "atan" => unary(Atan, z[0]),
-            "asinh" => unary(Asinh, z[0]),
-            "acosh" => unary(Acosh, z[0]),
-            "atanh" => unary(Atanh, z[0]),
-            "lgamma" => unary(Lgamma, z[0]),
-            "gamma" => unary(Gamma, z[0]),
-            "pow" => binary(Pow, z[0], z[1]),
-            "binom" => binary(Binom, z[0], z[1]),
-            "lambertw" => unary(LambertW, z[0]),
-            "sqrt1mx2" => unary(Sqrt1mx2, z[0]),
-            "sqrtx2m1" => unary(Sqrtx2m1, z[0]),
-            "sqrt1px2" => unary(Sqrt1px2, z[0]),
-            _ => return None,
+            "exp" => unary(Exp, z[0]), "log" => unary(Ln, z[0]), "sqrt" => unary(Sqrt, z[0]), "sin" => unary(Sin, z[0]), "cos" => unary(Cos, z[0]),
+            "tan" => unary(Tan, z[0]), "sinh" => unary(Sinh, z[0]), "cosh" => unary(Cosh, z[0]), "tanh" => unary(Tanh, z[0]), "asin" => unary(Asin, z[0]),
+            "acos" => unary(Acos, z[0]), "atan" => unary(Atan, z[0]), "asinh" => unary(Asinh, z[0]), "acosh" => unary(Acosh, z[0]),
+            "atanh" => unary(Atanh, z[0]), "lgamma" => unary(Lgamma, z[0]), "gamma" => unary(Gamma, z[0]), "pow" => binary(Pow, z[0], z[1]),
+            "binom" => binary(Binom, z[0], z[1]), "lambertw" => unary(LambertW, z[0]), "sqrt1mx2" => unary(Sqrt1mx2, z[0]), "sqrtx2m1" => unary(Sqrtx2m1, z[0]),
+            "sqrt1px2" => unary(Sqrt1px2, z[0]), _ => return None
         })
     }
 
@@ -646,10 +628,7 @@ mod complex {
 
     #[test]
     fn accuracy() {
-        let rows = [
-            ("f64", worst::<f64>(f64::EPSILON, |v| v, apply::<f64>)),
-            ("f32", worst::<f32>(f32::EPSILON.into(), |v| v as f32, apply::<f32>)),
-        ];
+        let rows = [("f64", worst::<f64>(f64::EPSILON, |v| v, apply::<f64>)), ("f32", worst::<f32>(f32::EPSILON.into(), |v| v as f32, apply::<f32>))];
         let over: Vec<_> = rows.iter().flat_map(|(how, r)| r.iter().filter(|(_, e, _)| *e > BOUND).map(move |(n, e, a)| (*how, n, *e, a))).collect();
         if std::env::var("RUSTYMATH_COMPLEX").is_ok() { for (how, r) in &rows { for (n, e, a) in r { println!("{how} {n} {e:.2} {a:?}"); } } }
         assert!(over.is_empty(), "{over:#?}");
@@ -679,12 +658,8 @@ mod complex {
             assert!(close(got.re.into(), want.re, e) && close(got.im.into(), want.im, e), "f32 {name}({z}) gave {got}, not {want}");
         }
         for x in [0.5, 3.0, -2.0, 700.0, 1e-300] {
-            for name in ["exp", "sin", "cos", "sinh", "cosh", "tanh", "tan"] {
-                assert_eq!(apply::<f64>(name, &[k(x, 0.0)]).unwrap().im, 0.0, "{name}({x})");
-            }
-            if x > 0.0 {
-                for name in ["log", "sqrt"] { assert_eq!(apply::<f64>(name, &[k(x, 0.0)]).unwrap().im, 0.0, "{name}({x})"); }
-            }
+            for name in ["exp", "sin", "cos", "sinh", "cosh", "tanh", "tan"] { assert_eq!(apply::<f64>(name, &[k(x, 0.0)]).unwrap().im, 0.0, "{name}({x})"); }
+            if x > 0.0 { for name in ["log", "sqrt"] { assert_eq!(apply::<f64>(name, &[k(x, 0.0)]).unwrap().im, 0.0, "{name}({x})"); } }
             for name in ["sin", "sinh", "tan", "tanh"] { assert_eq!(apply::<f64>(name, &[k(0.0, x)]).unwrap().re, 0.0, "{name}({x}i)"); }
         }
         assert_eq!(binary(Pow, k(1.0, 1.0), k(0.0, 0.0)), k(1.0, 0.0));
@@ -753,8 +728,8 @@ mod complex {
 }
 
 mod lambert {
-    use num_complex::Complex;
     use super::complex::unary;
+    use num_complex::Complex;
     use rustymath::{LambertW, lambertw};
 
     #[test]

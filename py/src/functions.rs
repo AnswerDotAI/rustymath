@@ -57,7 +57,9 @@ fn axes_of(axis: Option<&Axes>, layout: &Layout) -> PyResult<Vec<usize>> {
 fn computes(function: &str, op: Op, arity: usize, dtype: DType, only: Option<&[DType]>) -> PyResult<DType> {
     match only {
         None => op.computing_dtype(arity, dtype),
-        Some(allowed) => dtype.computes_in(rustymath::buffer::Width::I64, rustymath::operation::numpy_float(dtype), |at| allowed.contains(&at) && op.supports(arity, at)),
+        Some(allowed) => {
+            dtype.computes_in(rustymath::buffer::Width::I64, rustymath::operation::numpy_float(dtype), |at| allowed.contains(&at) && op.supports(arity, at))
+        }
     }.ok_or_else(|| missing(function, dtype))
 }
 /// The kernel of `op` on arguments of types `types`, or of its partial in argument `side` (`Kernel::slope`), whose last type is then the result's.
@@ -65,16 +67,18 @@ pub(crate) fn select(function: &str, op: Op, slope: Option<usize>, dtype: DType,
     let arity = types.len() - usize::from(slope.is_some());
     let dtype = if only.is_some() { computes(function, op, arity, dtype, only)? } else { dtype };
     let variant = rustymath::domain::Variant { dtype, checked: true, wrapping };
-    let mut kernel = match slope { Some(side) => Kernel::slope(op, side, variant, types), None => Kernel::of(op, variant, types) }.map_err(py_err)?
-        .ok_or_else(|| py_err(Error::new(Kind::Domain, "function has no numerical body for these arguments")))?;
-    kernel.variant.checked = kernel.variant.dtype.is_integral();
-    Ok(kernel)
+    let kernel = match slope {
+        Some(side) => Kernel::slope(op, side, variant, types), None => Kernel::of(op, variant, types)
+    }.map_err(py_err)?.ok_or_else(|| py_err(Error::new(Kind::Domain, "function has no numerical body for these arguments")))?;
+    let checked = kernel.variant().dtype.is_integral();
+    Ok(kernel.with_checked(checked))
 }
 fn call_dtype(call: &Call) -> DType {
     if call.args.iter().any(|x| x.view().dtype() == DType::Character) { DType::Character } else { call.args[0].view().dtype() }
 }
 /// Conversion and wrapping surround one shared mapped execution, for every arity and kind.
-pub(crate) fn apply<'py>(py: Python<'py>, kernel: &rustymath::operation::Kernel, call: &Call, settings: rustymath::operation::Settings) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn apply<'py>(
+    py: Python<'py>, kernel: &rustymath::operation::Kernel, call: &Call, settings: rustymath::operation::Settings) -> PyResult<Bound<'py, PyAny>> {
     let views: Vec<_> = call.args.iter().map(|a| a.view()).collect();
     let (layout, inputs) = match views.as_slice() {
         [x] => (x.layout().clone(), vec![x.clone()]),
@@ -101,8 +105,7 @@ pub(crate) fn apply<'py>(py: Python<'py>, kernel: &rustymath::operation::Kernel,
 }
 
 /// Folds use the same mapped reader and reduction driver as graph execution.
-fn totals(
-    function: &str, op: Op, x: ArrayView<'_>, axis: Option<&Axes>, only: Option<&[DType]>) -> PyResult<Option<Core>> {
+fn totals(function: &str, op: Op, x: ArrayView<'_>, axis: Option<&Axes>, only: Option<&[DType]>) -> PyResult<Option<Core>> {
     let mut axes = match axis { None => vec![None], Some(a) => a.positions(x.layout())?.into_iter().map(Some).collect() };
     axes.sort_unstable_by(|a, b| b.cmp(a));
     let mut out: Option<Core> = None;
@@ -115,14 +118,13 @@ fn totals(
         let kernel = select(function, op, None, view.dtype(), &[view.dtype(); 2], true, only)?;
         let mut buffer = Buffer::with_capacity(kernel.fold_dtype(view.dtype(), shape[axis.unwrap_or(0)], None), next.count());
         let order = kernel.fold_read(
-                shape, axis.unwrap_or(0), rustymath::operation::Seed::Identity, rustymath::operation::Direction::Right,
-                settings(false), view.read(), &mut buffer).map_err(py_err)?;
+                shape, axis.unwrap_or(0), rustymath::operation::Seed::Identity, rustymath::operation::Direction::Right, settings(false), view.read(),
+                &mut buffer).map_err(py_err)?;
         out = Some(Core::new(next, buffer.ordered(order)).map_err(py_err)?);
     }
     Ok(out)
 }
-fn fold<'py>(
-    py: Python<'py>, function: &str, op: Op, x: &Bound<'py, PyAny>, axis: Option<Axes>, only: Option<&[DType]>) -> PyResult<Bound<'py, PyAny>> {
+fn fold<'py>(py: Python<'py>, function: &str, op: Op, x: &Bound<'py, PyAny>, axis: Option<Axes>, only: Option<&[DType]>) -> PyResult<Bound<'py, PyAny>> {
     let x = one(x)?;
     let view = x.view();
     let core = match released(py, || totals(function, op, view, axis.as_ref(), only))? { Some(core) => core, None => x.into_core()? };
@@ -135,18 +137,14 @@ pub(crate) fn along_axis(layout: Layout, len: usize, axis: Option<Axis>) -> PyRe
         Some(a) => { let a = a.of(&layout)?; Ok((Lanes::new(layout.shape(), a).map_err(py_err)?.dims(), layout, Some(a))) }
     }
 }
-fn scan<'py>(
-    py: Python<'py>, function: &str, op: Op, x: &Bound<'py, PyAny>, axis: Option<Axis>, only: Option<&[DType]>) -> PyResult<Bound<'py, PyAny>> {
+fn scan<'py>(py: Python<'py>, function: &str, op: Op, x: &Bound<'py, PyAny>, axis: Option<Axis>, only: Option<&[DType]>) -> PyResult<Bound<'py, PyAny>> {
     let x = one(x)?;
     let view = x.view();
     let (dims, layout, _) = along_axis(x.layout(), view.len(), axis)?;
     let kernel = select(function, op, None, view.dtype(), &[view.dtype(); 2], true, only)?;
-    let mut buffer = Buffer::with_capacity(kernel.scan_dtype(), view.len());
-    released(py, || {
-        kernel.scan(
-            dims, rustymath::operation::Seed::Identity, rustymath::operation::Direction::Left, settings(false), view.read(),
-            &mut buffer)
-    }).map_err(py_err)?;
+    let mut buffer = Buffer::with_capacity(kernel.scan_dtype(false), view.len());
+    released(py, || kernel.scan(dims, rustymath::operation::Seed::Identity, rustymath::operation::Direction::Left, settings(false), view.read(), &mut buffer))
+        .map_err(py_err)?;
     give_items(py, layout, buffer, false)
 }
 
@@ -536,9 +534,8 @@ fn logical_scan<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, table: [[bool; 2]; 
     let start = start.map(|s| Buffer::Booleans(vec![s]));
     let start = start.as_ref().map(|s| ArrayView::compact(&Layout::EMPTY, s.view()));
     let seed = start.as_ref().map_or(rustymath::operation::Seed::Identity, |s| rustymath::operation::Seed::Initial(s.read()));
-    let mut buffer = Buffer::with_capacity(DType::Boolean, 0);
-    released(py, || kernel.scan(dims, seed, rustymath::operation::Direction::Left, settings(false), input.read(), &mut buffer))
-        .map_err(py_err)?;
+    let mut buffer = Buffer::with_capacity(kernel.scan_dtype(start.is_some()), 0);
+    released(py, || kernel.scan(dims, seed, rustymath::operation::Direction::Left, settings(false), input.read(), &mut buffer)).map_err(py_err)?;
     give_items(py, layout, buffer, false)
 }
 
@@ -556,9 +553,8 @@ fn _accumulate<'py>(
     let (function, mode) = function;
     let kernel = (native_binary(function)?.kernel)(view.dtype(), mode)?;
     let seed = start.as_ref().map_or(rustymath::operation::Seed::Identity, |s| rustymath::operation::Seed::Initial(s.read()));
-    let mut buffer = Buffer::with_capacity(kernel.scan_dtype(), view.len());
-    released(py, || kernel.scan(dims, seed, rustymath::operation::Direction::Left, settings(mode), view.read(), &mut buffer))
-        .map_err(py_err)?;
+    let mut buffer = Buffer::with_capacity(kernel.scan_dtype(start.is_some()), view.len());
+    released(py, || kernel.scan(dims, seed, rustymath::operation::Direction::Left, settings(mode), view.read(), &mut buffer)).map_err(py_err)?;
     give_items(py, layout, buffer, false)
 }
 
@@ -592,9 +588,7 @@ fn _sliding<'py>(py: Python<'py>, function: NativeFunction<'_>, x: &Bound<'py, P
     let dims = [lanes.outer * (lanes.len + 1 - width), width, lanes.inner];
     let mut buffer = Buffer::with_capacity(kernel.fold_dtype(view.dtype(), width, None), layout.count());
     let order = released(py, || {
-        kernel.fold_read(
-            &dims, 1, rustymath::operation::Seed::Identity, rustymath::operation::Direction::Right, settings(mode), input.read(),
-            &mut buffer)
+        kernel.fold_read(&dims, 1, rustymath::operation::Seed::Identity, rustymath::operation::Direction::Right, settings(mode), input.read(), &mut buffer)
     }).map_err(py_err)?;
     give_items(py, layout, buffer.ordered(order), false)
 }

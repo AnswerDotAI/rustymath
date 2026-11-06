@@ -55,7 +55,9 @@ pub fn array_selector(target: &Layout, axis: usize, layout: Layout, indices: Arc
         View::Characters(text) if layout.shape().len() <= 1 => {
             return Ok((structure::key_selector(target, axis, [&*text.iter().collect::<String>()], None).map_err(py_err)?, true));
         }
-        View::Booleans(_) | View::Integers(_) | View::Floats(_) => structure::index_table(indices.clone(), size, rustymath::tolerant::Tolerance::EXACT).map_err(py_err)?,
+        View::Booleans(_) | View::Integers(_) | View::Floats(_) => {
+            structure::index_table(indices.clone(), size, rustymath::tolerant::Tolerance::EXACT).map_err(py_err)?
+        }
         view if view.is_empty() => Table::new(vec![]),
         _ => return Err(PyTypeError::new_err("an axis selector must be an integer, key, slice, or Boolean, integer or float array")),
     };
@@ -94,13 +96,15 @@ fn select_parts(
 }
 
 /// For each axis of `layout`, the keys that a write by `index` names with Python's own strings and lists of strings and the axis lacks (`structure::missing_keys`). The write adds them before it plans (`structure::extended`), as BPL's assignment does. `name` gives a part's one axis name, as for `selection`.
-pub fn missing_keys(layout: &Layout, index: &Bound<'_, PyAny>, name: impl FnMut(&Bound<'_, PyAny>) -> PyResult<Option<String>>) -> PyResult<Vec<Vec<Arc<str>>>> {
+pub fn missing_keys(
+    layout: &Layout, index: &Bound<'_, PyAny>, name: impl FnMut(&Bound<'_, PyAny>) -> PyResult<Option<String>>) -> PyResult<Vec<Vec<Arc<str>>>> {
     let written = parts(index)?;
     let names = axis_names(&written, name)?;
     let keys: Vec<_> = written.iter().map(|p| p.axis().and_then(key_names).unwrap_or_default()).collect();
     let routes = structure::addressed_parts(layout, &claims(&written, &names), None).map_err(py_err)?;
-    structure::missing_keys(layout, routes.iter().filter_map(|(axis, p)| match p { IndexPart::Axis(i) => Some((*axis, keys[*i].iter().map(String::as_str))), _ => None }))
-        .map_err(py_err)
+    structure::missing_keys(layout, routes.iter().filter_map(|(axis, p)| match p {
+        IndexPart::Axis(i) => Some((*axis, keys[*i].iter().map(String::as_str))), _ => None
+    })).map_err(py_err)
 }
 
 /// The one axis name of each written axis part, where `name` gives one.

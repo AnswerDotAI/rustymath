@@ -73,8 +73,7 @@ impl Range {
     pub fn at_width(self, dtype: DType) -> Self {
         match dtype {
             DType::Float(width @ (FloatWidth::F32 | FloatWidth::F16)) => Self { lo: outward(self.lo, false, width), hi: outward(self.hi, true, width) },
-            DType::Integer(_) => Self { lo: self.lo.floor(), hi: self.hi.ceil() },
-            _ => self,
+            DType::Integer(_) => Self { lo: self.lo.floor(), hi: self.hi.ceil() }, _ => self
         }
     }
 }

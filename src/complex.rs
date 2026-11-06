@@ -35,7 +35,11 @@ pub(crate) fn quarter<R: Native>(y: R) -> Option<(R, R)> {
     let (k, exact) = turns(y);
     if !exact { return None; }
     let (zero, one, m) = (R::zero(), R::one(), k - R::narrow(4.0) * (k * R::narrow(0.25)).floor());
-    Some(if m == zero { (one, if y == zero { y } else { zero }) } else if m == one { (zero, one) } else if m == one + one { (-one, zero) } else { (zero, -one) })
+    Some(if m == zero { (one, if y == zero { y }
+    else { zero }) }
+    else if m == one { (zero, one) }
+    else if m == one + one { (-one, zero) }
+    else { (zero, -one) })
 }
 
 /// A part of e^z: `scale` times `d`, the cosine or sine of y. A part that `quarter` makes exactly 0 stays 0, even where e^x overflows, unless x is NaN.

@@ -274,7 +274,8 @@ def test_native_accumulation():
     assert result.tolist() == [[7., 5, 4], [4., -1, -5]] and result.keys == x.keys and result.names == x.names
     assert rm.accumulate(rm.add, [1, 2, 3], start=10).tolist() == [11, 13, 16]
     assert rm.accumulate(rm.less, [3, 2, 1]).tolist() == [3, 0, 1]
-    assert rm.accumulate(rm.less, [3, 2, 1], start=1).tolist() == [1, 1, 0]
+    seeded = A(rm.accumulate(rm.less, [3, 2, 1], start=1.5))
+    assert seeded.dtype == np.bool_ and seeded.tolist() == [True, True, False]
     assert rm.accumulate(rm.logical_xor, [True, False, True], start=True).tolist() == [False, False, True]
     for name in ['bitwise_and', 'bitwise_or', 'bitwise_xor']:
         for x in [np.array([12, 10, 14, -3], np.int16), np.array([200, 100, 7], np.uint8), np.array([True, False, True])]:

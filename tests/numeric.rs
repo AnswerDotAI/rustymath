@@ -29,7 +29,9 @@ mod timing {
         let text = "[f64]\n# 2 copies: one read and one write.\n# held linux 15.6: the cause isn't known yet\nExp\t4\t4\n# busy macos 2.7: a busy host\nLog\t4\t4\n# held linux ~60: no run has measured it\nSin\t4\t4\n";
         let cases = timing::cases(text).unwrap();
         let budget = |i: usize, column| timing::Budget::of(cases[i].section, &cases[i].budgets, &cases[i].holds, Some(column)).unwrap();
-        assert_eq!([budget(0, 0), budget(0, 1), budget(1, 0), budget(2, 1)].map(|b| b.to_string()), ["4", "32 held from 4", "5.4 busy from 4", "120 held from 4"]);
+        assert_eq!(
+            [budget(0, 0), budget(0, 1), budget(1, 0), budget(2, 1)].map(|b| b.to_string()), ["4", "32 held from 4", "5.4 busy from 4", "120 held from 4"]
+        );
         assert!(budget(0, 1).stale(3.6) && !budget(0, 1).stale(3.7) && !budget(1, 0).stale(1.0));
         for bad in ["# held linux: no cost", "# held linux 15.6", "# held linux 1 linux 2: twice"] {
             assert!(timing::cases(&format!("[f64]\n{bad}\nExp\t4\t4\n")).is_err(), "{bad}");
@@ -433,7 +435,10 @@ mod integer {
         // Integers compare exactly, however close they are within the tolerance.
         let (n, m) = (1_000_000_000_000_000i64, 1_000_000_000_000_001i64);
         let (v, ints) = (Variant::checked(i64::DTYPE), [i64::DTYPE; 2]);
-        let compare = [Equal(t).resolve(v, ints), NotEqual(t).resolve(v, ints), LessEqual(t).resolve(v, ints), GreaterEqual(t).resolve(v, ints), Greater(t).resolve(v, ints)];
+        let compare = [
+            Equal(t).resolve(v, ints), NotEqual(t).resolve(v, ints), LessEqual(t).resolve(v, ints), GreaterEqual(t).resolve(v, ints),
+            Greater(t).resolve(v, ints),
+        ];
         let got = compare.map(|k| mapped(&k.unwrap(), [&[m][..], &[n][..]], 1).map(|r: Vec<bool>| r[0]));
         assert_eq!(got, [false, true, false, true, true].map(Some));
         let [floor, ceil] = [Floor(t).resolve(v, [i64::DTYPE]), Ceil(t).resolve(v, [i64::DTYPE])].map(Result::unwrap);
@@ -537,7 +542,7 @@ mod number_theory {
 mod operation {
     use rustymath::{
         agreement::{Agreement, Binding, Mapping, Missing, Read, ReadPlan}, array::{Array, ArrayView}, buffer::{Buffer, DType, Element, Width},
-        error::{self, Error, ErrorSlot}, domain::Variant, facts::Formula, gather::Steps, layout::Layout, operation::{Direction, Kernel, Seed, Settings}
+        domain::{Range, Variant}, error::{self, Error, ErrorSlot}, facts::Formula, gather::Steps, layout::Layout, operation::{Direction, Kernel, Seed, Settings}
     };
 
     fn view<'a>(layout: &'a Layout, data: rustymath::buffer::View<'a>, mapping: &Mapping) -> ArrayView<'a> {
@@ -575,6 +580,8 @@ mod operation {
         let mut out = Buffer::with_capacity(wide, 1);
         error::checked(|| crate::support::map(&wrapped, [i64::view(&[i64::MAX]), i64::view(&[1])], 1, &mut out)).unwrap();
         assert_eq!(i64::vec(out).unwrap(), [i64::MIN]);
+        let range = wrapped.range_on(&[Range::of(Some(i64::MAX as f64)), Range::of(Some(1.))], false);
+        assert!(Range::of(Some(i64::MIN as f64)).within(range.lo, range.hi));
         let binom = Binom.resolve(Variant { wrapping: true, ..Variant::checked(wide) }, [wide; 2]).unwrap();
         let mut out = Buffer::with_capacity(wide, 3);
         error::checked(|| crate::support::map(&binom, [i64::view(&[200, -200, 67]), i64::view(&[100, 101, 33])], 3, &mut out)).unwrap();
@@ -590,7 +597,8 @@ mod operation {
         let scalar = ReadPlan::input(0, 1);
         let seed = Read { sources: &seed, plan: &scalar };
         let mut out = Buffer::with_capacity(small, 1);
-        subtract.fold_read(&[3], 0, Seed::Tail(seed), Direction::Right, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, read, &mut out).unwrap();
+        subtract.fold_read(&[3], 0, Seed::Tail(seed), Direction::Right, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, read, &mut out)
+            .unwrap();
         assert_eq!(i16::vec(out).unwrap(), [-89]);
     }
 
@@ -605,10 +613,13 @@ mod operation {
             let layout = Layout::from(shape.to_vec());
             let input = view(&layout, data.view(), &mapping);
             let mut out = Buffer::with_capacity(kernel.fold_dtype(data.dtype(), shape[axis], None), 0);
-            let order = kernel.fold_read(shape, axis, Seed::Identity, Direction::Right, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, input.read(), &mut out).unwrap();
+            let order = kernel.fold_read(
+                    shape, axis, Seed::Identity, Direction::Right, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, input.read(), &mut out)
+                .unwrap();
             out.ordered(order)
         };
-        let mut data = vec![0.; 128]; data[2] = 1.;
+        let mut data = vec![0.; 128];
+        data[2] = 1.;
         let data = f64::buffer(data);
         assert_eq!(f64::vec(fold(&subtract, &[64, 2], 0, Mapping::Linear(1), &data)).unwrap(), [-1., 0.]);
         let transpose = Mapping::from(vec![Steps::along(2, 1), Steps::along(64, 2)]);
@@ -633,20 +644,29 @@ mod operation {
             Ok(())
         };
         let mut out = Buffer::with_capacity(dtype, 1);
-        subtract.fold_pieces([1, 6, 1], Seed::Identity, Direction::Right, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, &pieces, &mut out).unwrap();
+        subtract.fold_pieces([1, 6, 1], Seed::Identity, Direction::Right, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, &pieces, &mut out)
+            .unwrap();
         assert_eq!(f64::vec(out).unwrap(), [-3.]);
-        let partial = |_: std::ops::Range<usize>, emit: &mut dyn FnMut(usize, Piece<'_>)| { emit(0, Piece::Total(Total { items: 2, bits: 1f64.to_bits() })); Ok(()) };
+        let partial = |_: std::ops::Range<usize>, emit: &mut dyn FnMut(usize, Piece<'_>)| {
+            emit(0, Piece::Total(Total { items: 2, bits: 1f64.to_bits() }));
+            Ok(())
+        };
         let mut out = Buffer::with_capacity(dtype, 1);
-        assert!(subtract.fold_pieces([1, 2, 1], Seed::Identity, Direction::Right, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, &partial, &mut out).is_err());
+        assert!(
+            subtract
+                .fold_pieces([1, 2, 1], Seed::Identity, Direction::Right, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, &partial, &mut out)
+                .is_err()
+        );
         let byte = DType::Integer(Width::U8);
         let wrapped = Subtract.resolve(Variant { wrapping: true, ..Variant::checked(byte) }, [byte; 2]).unwrap();
         assert_eq!(u8::vec(fold(&wrapped, &[2], 0, Mapping::Linear(1), &u8::buffer(vec![0, 255]))).unwrap(), [1]);
+        let range = wrapped.range_on(&[Range::of(Some(0.)), Range::of(Some(255.))], false);
+        assert!(Range::of(Some(1.)).within(range.lo, range.hi));
         let complex = DType::Complex(rustymath::buffer::ComplexWidth::F64);
         let quotient = Divide.resolve(Variant::checked(complex), [complex; 2]).unwrap();
         let data = num_complex::Complex64::buffer(vec![num_complex::Complex64::new(0., 2.), num_complex::Complex64::new(0., 1.)]);
         assert_eq!(num_complex::Complex64::vec(fold(&quotient, &[2], 0, Mapping::Linear(1), &data)).unwrap(), [num_complex::Complex64::new(2., 0.)]);
     }
-
 
     #[test]
     fn folds_keep_uncalled_values_and_scans_keep_their_carry() {
@@ -668,13 +688,15 @@ mod operation {
         }
         let plan = ReadPlan::input(0, 3);
         let read = Read { sources: &input, plan: &plan };
-        let mut out = Buffer::with_capacity(less.scan_dtype(), 3);
+        let mut out = Buffer::with_capacity(less.scan_dtype(false), 3);
         less.scan([1, 3, 1], Seed::Identity, Direction::Left, Settings { tolerance: rustymath::tolerant::Tolerance::EXACT }, read, &mut out).unwrap();
         assert_eq!(i64::vec(out).unwrap(), [3, 0, 1]);
         let sum = Add.resolve(Variant::checked(DType::Integer(Width::I16)), [DType::Integer(Width::I16); 2]).unwrap();
         let narrow = [Binding::full(i16::view(&[3]))];
         let mut out = Buffer::with_capacity(sum.fold_dtype(DType::Integer(Width::I16), 1, None), 1);
-        sum.fold_read(&[1], 0, Seed::Identity, Direction::Right, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, Read { sources: &narrow, plan: &scalar }, &mut out).unwrap();
+        sum.fold_read(
+            &[1], 0, Seed::Identity, Direction::Right, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT },
+            Read { sources: &narrow, plan: &scalar }, &mut out).unwrap();
         assert_eq!(i64::vec(out).unwrap(), [3]);
     }
     #[test]
@@ -791,7 +813,14 @@ mod operation {
         assert!(kernel.map(&[chars.read(), offsets.read()], 0..1, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, &mut output).is_err());
         let seed = f64::buffer(vec![0.5]);
         let seed = ArrayView::compact(&Layout::EMPTY, seed.view());
-        assert!(kernel.scan([1, 2, 1], Seed::Initial(seed.read()), Direction::Left, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, chars.read(), &mut output).is_err());
+        assert!(
+            kernel
+                .scan(
+                    [1, 2, 1], Seed::Initial(seed.read()), Direction::Left, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, chars.read(),
+                    &mut output
+                )
+                .is_err()
+        );
         let (empty, chosen) = (text(""), text("x"));
         let kernel = Add.resolve(Variant::checked(ints.dtype()), [DType::Character, ints.dtype()]).unwrap();
         for (fill, want) in [(Missing::Default, vec!['!', '"']), (Missing::Scalar(1), vec!['y', 'z'])] {

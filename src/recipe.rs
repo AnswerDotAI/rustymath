@@ -3,20 +3,51 @@ use crate::{Exponent, Float, float::sealed::Core, tolerant::Band};
 /// `Ops`' integer methods on bit patterns held in `u64`, `bits` wide, which `NativeOps` and `IntegerOps` share.
 macro_rules! u64_integers {
     ($bits:expr) => {
-        #[inline(always)] fn integer(&self, x: i64) -> u64 { x as u64 }
-        #[inline(always)] fn integer_op(&self, op: Integer, x: u64, y: u64) -> u64 { crate::recipe::integer_op(op, x, y, $bits) }
-        #[inline(always)] fn integer_compare(&self, op: Cmp, x: u64, y: u64) -> bool { crate::recipe::integer_compare(op, x, y) }
-        #[inline(always)] fn integer_select(&self, test: bool, x: u64, y: u64) -> u64 { if test { x } else { y } }
+        #[inline(always)]
+        fn integer(&self, x: i64) -> u64 {
+            x as u64
+        }
+        #[inline(always)]
+        fn integer_op(&self, op: Integer, x: u64, y: u64) -> u64 {
+            crate::recipe::integer_op(op, x, y, $bits)
+        }
+        #[inline(always)]
+        fn integer_compare(&self, op: Cmp, x: u64, y: u64) -> bool {
+            crate::recipe::integer_compare(op, x, y)
+        }
+        #[inline(always)]
+        fn integer_select(&self, test: bool, x: u64, y: u64) -> u64 {
+            if test { x } else { y }
+        }
     };
 }
 /// The comparison and Boolean `Ops` methods that `NativeOps` and `IntegerOps` share, on plain values and `bool` masks.
 macro_rules! plain_logic {
     ($t:ty) => {
-        #[inline(always)] fn compare(&self, c: Cmp, x: $t, y: $t) -> bool { match c { Cmp::Less => x < y, Cmp::LessEqual => x <= y, Cmp::Equal => x == y } }
-        #[inline(always)] fn and(&self, x: bool, y: bool) -> bool { x & y }
-        #[inline(always)] fn or(&self, x: bool, y: bool) -> bool { x | y }
-        #[inline(always)] fn not(&self, x: bool) -> bool { !x }
-        #[inline(always)] fn select(&self, test: bool, x: $t, y: $t) -> $t { if test { x } else { y } }
+        #[inline(always)]
+        fn compare(&self, c: Cmp, x: $t, y: $t) -> bool {
+            match c {
+                Cmp::Less => x < y,
+                Cmp::LessEqual => x <= y,
+                Cmp::Equal => x == y,
+            }
+        }
+        #[inline(always)]
+        fn and(&self, x: bool, y: bool) -> bool {
+            x & y
+        }
+        #[inline(always)]
+        fn or(&self, x: bool, y: bool) -> bool {
+            x | y
+        }
+        #[inline(always)]
+        fn not(&self, x: bool) -> bool {
+            !x
+        }
+        #[inline(always)]
+        fn select(&self, test: bool, x: $t, y: $t) -> $t {
+            if test { x } else { y }
+        }
     };
 }
 mod integer;
@@ -86,8 +117,7 @@ pub enum Integer { Add, Subtract, And, Or, Xor, ShiftLeft, ShiftRight, SignedShi
 pub(crate) fn integer_op(op: Integer, x: u64, y: u64, bits: u32) -> u64 {
     match op {
         Integer::Add => x.wrapping_add(y), Integer::Subtract => x.wrapping_sub(y), Integer::And => x & y, Integer::Or => x | y, Integer::Xor => x ^ y,
-        Integer::ShiftLeft => shifted(x, y as i64),
-        Integer::ShiftRight => if y >= 64 { 0 } else { (x & (u64::MAX >> (64 - bits))) >> y },
+        Integer::ShiftLeft => shifted(x, y as i64), Integer::ShiftRight => { if y >= 64 { 0 } else { (x & (u64::MAX >> (64 - bits))) >> y } }
         Integer::SignedShiftRight => shifted(x, (y as i64).saturating_neg())
     }
 }
@@ -100,9 +130,7 @@ pub(crate) fn integer_compare(op: Cmp, x: u64, y: u64) -> bool {
 
 /// `x`'s bits shifted left by `count`, or right with the sign filled in for a negative count. A count of 64 or more saturates: to 0 leftward, and to the sign rightward. Items hold their sign extended to 64 bits, so a count past an item's own width saturates the same way once the result narrows.
 #[inline(always)]
-fn shifted(x: u64, count: i64) -> u64 {
-    if count >= 64 { 0 } else if count >= 0 { x << count } else { ((x as i64) >> count.unsigned_abs().min(63)) as u64 }
-}
+fn shifted(x: u64, count: i64) -> u64 { if count >= 64 { 0 } else if count >= 0 { x << count } else { ((x as i64) >> count.unsigned_abs().min(63)) as u64 } }
 
 /// The named methods of `Ops`, each the operation of its id.
 macro_rules! named {
@@ -221,7 +249,7 @@ impl<F: Float> Ops<F> for RangeOps {
         use crate::facts::Formula;
         let result = match op {
             Binary::Add => crate::Add.range([x, y]), Binary::Subtract => crate::Subtract.range([x, y]), Binary::Multiply => crate::Multiply.range([x, y]),
-            _ => return None,
+            _ => return None
         };
         let fits = crate::domain::Range::of_dtype(self.0);
         let exact = |bound: f64| bound.abs() < 2f64.powi(53);
