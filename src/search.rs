@@ -629,6 +629,8 @@ impl Groups {
 
     /// Every position, group by group, in one buffer. Groups that share a buffer hand it over.
     pub fn into_positions(mut self) -> Vec<u32> { if self.buffers.len() == 1 { return self.buffers.pop().expect("one buffer"); } self.buffers.concat() }
+    /// The buffers of positions, without a copy: one for each class of a slice of two keys, or one holding every group.
+    pub fn into_buffers(self) -> Vec<Vec<u32>> { self.buffers }
 }
 
 /// The classes of a slice, numbered from 0 in order of their first positions, with the positions of each.

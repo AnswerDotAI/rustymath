@@ -807,16 +807,6 @@ pub fn along<T: Copy + Sync, R: Reduction<T>>(data: &[T], shape: [usize; 3]) -> 
     (totals, fits)
 }
 
-/// [`along`], followed by each lane's already-folded right `tail`. Associative reductions keep their vectorized folds and may regroup items across this boundary.
-pub fn along_with_tail<T: Copy + Sync, R: Reduction<T>>(data: &[T], dims: [usize; 3], tail: Option<&[R::Total]>) -> (Vec<R::Total>, bool) {
-    let (mut totals, mut ok) = along::<T, R>(data, dims);
-    if let Some(tail) = tail {
-        assert_eq!(tail.len(), totals.len(), "one tail per lane");
-        ok &= merges_of::<T, R>(&mut totals, tail);
-    }
-    (totals, ok)
-}
-
 /// Items of an array that [`along_mapped`] copies through a mapping at a time. A fold along an earlier axis steps strips of columns down each block's rows. A block of 4096 items holds too few rows of a 1024-column matrix for that to pay. Larger blocks also cost a strided read's walk less for each item.
 const MAPPED: usize = 1 << 16;
 
@@ -2306,18 +2296,39 @@ pub(crate) use native_reduction;
 
 impl Reduce {
     pub fn total_dtype(self, variant: crate::facts::Variant) -> Option<crate::buffer::DType> {
-        native_reduction!(self, variant.dtype, variant.checked && !variant.wrapping, |R, T| Some(<<R as Reduction<T>>::Total as Element>::DTYPE))
+        native_reduction!(self, variant.dtype, variant.fails_on_overflow(), |R, T| Some(<<R as Reduction<T>>::Total as Element>::DTYPE))
     }
     pub fn run_pieces(
         self, variant: crate::facts::Variant, dims: [usize; 3], seed: Seed<'_>, pieces: &Pieces<'_>, output: &mut Buffer) -> Result<(), Error> {
-        native_reduction!(self, variant.dtype, variant.checked && !variant.wrapping, |R, T| Some(
+        native_reduction!(self, variant.dtype, variant.fails_on_overflow(), |R, T| Some(
             native_pieces::<T, R>(dims, variant.checked, pieces).and_then(|result| finish_fold::<T, R>(result, seed, variant.checked, output))
         )).unwrap_or_else(|| Err(Error::new(Kind::Domain, "reduction does not support this dtype")))
     }
     pub fn run_read(
         self, variant: crate::facts::Variant, shape: &[usize], axis: usize, seed: Seed<'_>, input: Read<'_>, output: &mut Buffer) -> Result<(), Error> {
-        native_reduction!(self, variant.dtype, variant.checked && !variant.wrapping, |R, T| Some(
+        native_reduction!(self, variant.dtype, variant.fails_on_overflow(), |R, T| Some(
             native_read::<T, R>(shape, axis, variant.checked, input).and_then(|result| finish_fold::<T, R>(result, seed, variant.checked, output))
+        )).unwrap_or_else(|| Err(Error::new(Kind::Domain, "reduction does not support this dtype")))
+    }
+    /// The folds by this reduction of each window of `width` rows along the middle axis of `input`, an array of shape `dims`, as [`sliding`] folds them.
+    pub fn run_sliding(self, variant: crate::facts::Variant, dims: [usize; 3], width: usize, input: View<'_>, output: &mut Buffer) -> Result<(), Error> {
+        native_reduction!(self, variant.dtype, variant.fails_on_overflow(), |R, T| Some(
+            items::<T>(input).and_then(|data| totals::<T, R>(sliding::<T, R>(data, dims, width), variant.checked, output))
+        )).unwrap_or_else(|| Err(Error::new(Kind::Domain, "reduction does not support this dtype")))
+    }
+    /// The folds by this reduction of each window along axes 1 and 3 of `input`, an array of shape `dims`, as [`sliding_2d`] folds them, with each axis's window width and the positions between windows' starts. A domain error for windows wider than `sliding_2d` folds directly.
+    pub fn run_sliding_2d(
+        self, variant: crate::facts::Variant, dims: [usize; 5], widths: [usize; 2], every: [usize; 2], input: View<'_>, output: &mut Buffer) -> Result<(), Error> {
+        native_reduction!(self, variant.dtype, variant.fails_on_overflow(), |R, T| Some(items::<T>(input).and_then(|data| {
+            let folds = sliding_2d::<T, R>(data, dims, widths, every).ok_or_else(|| Error::new(Kind::Domain, "windows too wide to fold directly"))?;
+            totals::<T, R>(folds, variant.checked, output)
+        }))).unwrap_or_else(|| Err(Error::new(Kind::Domain, "reduction does not support this dtype")))
+    }
+    /// The fold by this reduction of each group of `input` that `groups` gives, in group order (`Grouping::fold`).
+    pub fn run_groups(
+        self, variant: crate::facts::Variant, groups: &impl crate::search::Grouping, input: View<'_>, output: &mut Buffer) -> Result<(), Error> {
+        native_reduction!(self, variant.dtype, variant.fails_on_overflow(), |R, T| Some(
+            items::<T>(input).and_then(|data| totals::<T, R>(groups.fold::<T, R>(data), variant.checked, output))
         )).unwrap_or_else(|| Err(Error::new(Kind::Domain, "reduction does not support this dtype")))
     }
     #[inline(never)]
@@ -2426,11 +2437,19 @@ where R::Total: Cast {
     })
 }
 
+/// `view`'s items as a slice of `T`, where they have `T`'s dtype.
+fn items<'a, T: Element>(view: View<'a>) -> Result<&'a [T], Error> { T::of(view).ok_or_else(|| Error::new(Kind::Domain, "fold input has the wrong dtype")) }
+
+/// A reduction's totals as `output`, as `finish_fold` keeps them without a seed: an overflow error where a checked total doesn't fit.
+fn totals<T, R: Reduction<T>>((totals, fits): (Vec<R::Total>, bool), checked: bool, output: &mut Buffer) -> Result<(), Error> where R::Total: Cast + Totals {
+    finish_fold::<T, R>((R::Total::buffer_of(totals), fits), Seed::Identity, checked, output)
+}
+
 impl Reduce {
     pub fn run_scan(
         self, variant: crate::facts::Variant, dims: [usize; 3], seed: crate::operation::Seed<'_>, direction: crate::operation::Direction,
         input: crate::agreement::Read<'_>, output: &mut crate::buffer::Buffer) -> Result<(), Error> {
-        native_reduction!(self, variant.dtype, variant.checked && !variant.wrapping, |R, T| Some(native_scan::<T, R>(
+        native_reduction!(self, variant.dtype, variant.fails_on_overflow(), |R, T| Some(native_scan::<T, R>(
             dims, seed, direction, variant.checked, input, output
         ))).unwrap_or_else(|| Err(Error::new(Kind::Domain, "scan does not support this dtype")))
     }
@@ -2488,6 +2507,40 @@ pub(crate) fn scan_read<T: crate::buffer::Cast, S: crate::buffer::Cast>(
     }
     if reversed.is_some() { reverse_rows(&mut values, dims); }
     *output = S::buffer(values);
+    Ok(())
+}
+
+/// Each item of `input`, an array of shape `dims`, combined by `apply` with the item one row before it along the middle axis, and each lane's first row with `seed`'s item in its column, or kept as it is without a seed: [`adjacent`]'s walk, as an inverse scan runs it. `flip` swaps the arguments, so the earlier item comes second. A failed combination is an error where the walk is checked.
+pub(crate) fn adjacent_read<T: crate::buffer::Cast>(
+    [outer, len, inner]: [usize; 3], seed: Option<crate::agreement::Read<'_>>, flip: bool, checked: bool, input: crate::agreement::Read<'_>,
+    output: &mut crate::buffer::Buffer, apply: impl Fn(T, T) -> (T, Option<Kind>)) -> Result<(), Error> {
+    let (mut values, mut scratch, mut seed_scratch) = (Vec::with_capacity(outer * len * inner), Vec::new(), Vec::new());
+    let failure = std::cell::Cell::new(None);
+    let step = |earlier: T, item: T| {
+        let (value, failed) = if flip { apply(item, earlier) } else { apply(earlier, item) };
+        if failed.is_some() { failure.set(failed); }
+        value
+    };
+    for cell in 0..outer {
+        let start = match seed {
+            None => None,
+            Some(read) => {
+                let one = read.plan.len() == 1;
+                let arg = read.part::<T>(if one { 0..1 } else { cell * inner..(cell + 1) * inner }, checked, &mut seed_scratch)?;
+                Some((0..inner).map(|i| arg.nth(if one { 0 } else { i })).collect::<Vec<_>>())
+            }
+        };
+        let at = cell * len * inner;
+        let lane: std::borrow::Cow<'_, [T]> = match input.part::<T>(at..at + len * inner, checked, &mut scratch)? {
+            Arg::Many(items) => items.into(), Arg::One(value) => vec![value; len * inner].into(),
+        };
+        adjacent(&lane, [1, len, inner], &mut values, |first, out| {
+            match &start { Some(start) => out.extend(start.iter().zip(first).map(|(&s, &x)| step(s, x))), None => out.extend_from_slice(first) }
+            true
+        }, |earlier, items, out| { out.extend(earlier.iter().zip(items).map(|(&e, &x)| step(e, x))); true });
+    }
+    if checked && let Some(kind) = failure.get() { return Err(Error::new(kind, "a combination of adjacent items failed")); }
+    *output = T::buffer(values);
     Ok(())
 }
 

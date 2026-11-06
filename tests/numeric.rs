@@ -255,12 +255,15 @@ mod integer {
                 assert_eq!(d.div_mod(y), fit((b - r) / a).map(|q| (q, r as i64)), "div_mod({x}, {y})");
             }
             for y in -3..70 {
-                let want = if y < 0 { (x.abs() == 1).then(|| if y % 2 == 0 { 1 } else { x }) } else { BigInt::from(x).pow(y as u32).try_into().ok() };
+                // A negative y floors 1 ÷ x^-y, and 0 to a negative power gives the greatest i64.
+                let want = if y < 0 {
+                    Some(if x == 0 { i64::MAX } else { num_integer::Integer::div_floor(&BigInt::from(1), &BigInt::from(x).pow(-y as u32)).try_into().unwrap() })
+                } else { BigInt::from(x).pow(y as u32).try_into().ok() };
                 assert_eq!(power(x, y), want, "power({x}, {y})");
             }
         }
-        assert_eq!([power(0, 0), power(0, -1), power(-1, i64::MIN), power(-2, 63), power(2, 63)], [Some(1), None, Some(1), Some(i64::MIN), None]);
-        for (x, y, result) in [(2, -1, None), (200, 2, Some(-25536)), (-1, -3, Some(-1))] {
+        assert_eq!([power(0, 0), power(0, -1), power(-1, i64::MIN), power(-2, 63), power(2, 63)], [Some(1), Some(i64::MAX), Some(1), Some(i64::MIN), None]);
+        for (x, y, result) in [(2, -1, Some(0)), (-2, -1, Some(-1)), (0, -1, Some(i16::MAX)), (200, 2, Some(-25536)), (-1, -3, Some(-1))] {
             assert_eq!(Binary::<i16>::checked(&rustymath::WrappingPow, x, y), result);
         }
     }
@@ -388,12 +391,13 @@ mod integer {
                 assert_eq!(Binary::<u8>::checked(&Lcm(t), x, y), fit(lcm(a, b)), "lcm({x}, {y})");
                 assert_eq!(Binary::<u8>::checked(&Pow, x, y), fit(power(a, b)), "power({x}, {y})");
                 assert_eq!(i64::from(Residue(t).one(x, y)), residue(a, b), "residue({x}, {y})");
-                assert_eq!(Binary::<u8>::checked(&FloorDivide(t), x, y), fit(floor_quotient(a, b)), "floor quotient({x}, {y})");
+                let quotient = if y == 0 { Some(if x == 0 { 0 } else { u8::MAX }) } else { fit(floor_quotient(a, b)) };
+                assert_eq!(Binary::<u8>::checked(&FloorDivide(t), x, y), quotient, "floor quotient({x}, {y})");
             }
         }
-        // `i16` and `i32` floor division divides in `f32` and `f64`, where the quotients have exact floors. It agrees with `floor_quotient` on every `i16` dividend and on `i32` samples beside the type's ends. A zero divisor, or a quotient past the type, fails the whole call.
+        // `i16` and `i32` floor division agrees with `floor_quotient` on every `i16` dividend and on `i32` samples beside the type's ends. A zero divisor gives the type's limit of the dividend's sign, and a quotient past the type fails the whole call.
         let xs16: Vec<i16> = (i16::MIN..=i16::MAX).collect();
-        let floor16 = |x: i16, y: i16| floor_quotient(x.into(), y.into()).and_then(|q| i16::try_from(q).ok());
+        let floor16 = |x: i16, y: i16| if y == 0 { Some(match x.signum() { 1 => i16::MAX, -1 => i16::MIN, _ => 0 }) } else { floor_quotient(x.into(), y.into()).and_then(|q| i16::try_from(q).ok()) };
         let ds16: Vec<i16> = xs16.iter().map(|&x| x.rotate_left(5) | 1).collect();
         let want: Option<Vec<i16>> = xs16.iter().zip(&ds16).map(|(&x, &d)| floor16(x, d)).collect();
         let mut out = Vec::new();
@@ -406,7 +410,7 @@ mod integer {
             }
         }
         let xs32: Vec<i32> = samples().into_iter().map(|v| v as i32).chain([i32::MIN, i32::MIN + 1, i32::MAX, i32::MAX - 1]).collect();
-        let floor32 = |x: i32, y: i32| floor_quotient(x.into(), y.into()).and_then(|q| i32::try_from(q).ok());
+        let floor32 = |x: i32, y: i32| if y == 0 { Some(match x.signum() { 1 => i32::MAX, -1 => i32::MIN, _ => 0 }) } else { floor_quotient(x.into(), y.into()).and_then(|q| i32::try_from(q).ok()) };
         for d in [3i32, -3, 7, -12, 1, -1, i32::MAX, i32::MIN, 1 << 16, -(1 << 16) - 1, 0] {
             for xs in [&xs32[..], &xs32[..xs32.len() - 4]] {
                 let want: Option<Vec<i32>> = xs.iter().map(|&x| floor32(x, d)).collect();
@@ -711,29 +715,6 @@ mod operation {
         let chosen = chosen.selected(padding, Some(std::sync::Arc::new(f64::buffer(vec![8.])))).unwrap();
         let args = [chosen.view(), ArrayView::compact(&Layout::EMPTY, f64::view(&[1.])), ArrayView::compact(&Layout::EMPTY, f64::view(&[10.]))];
         assert_eq!(f64::vec(apply(&clip, args).unwrap()).unwrap(), [8., 4., 2., 4., 8.]);
-    }
-
-    #[test]
-    fn composed_read_plans_keep_shared_routes_and_fills() {
-        use rustymath::agreement::{ReadAt, ReadRoute};
-        let mut plan = ReadPlan::copy(0, 2, Mapping::from(vec![Steps::table(vec![0, Steps::FILL, 1])]), 3, Missing::Scalar(1));
-        for _ in 0..12 { plan = ReadPlan::joined([plan.clone(), plan]).unwrap(); }
-        let rebound = plan.compose_inputs(&mut |source, items| Ok::<_, Error>(ReadPlan::input(source + 4, items))).unwrap();
-        let mut sources = Vec::new();
-        rebound.try_for_each_source(&mut |source, items| { sources.push((source, items)); Ok::<_, Error>(()) }).unwrap();
-        assert_eq!(sources, [(4, 2), (5, 1)]);
-        let mut branch = &rebound;
-        while let ReadRoute::Join(parts) = branch.route() {
-            assert!(std::ptr::eq(parts[0].plan.route(), parts[1].plan.route()));
-            branch = &parts[0].plan;
-        }
-        for (i, (source, position)) in [(4, 0), (5, 0), (4, 1), (4, 0), (5, 0), (4, 1)].into_iter().enumerate() {
-            assert_eq!(rebound.at(i), ReadAt::Input { source, position });
-        }
-        let destinations = plan.compose_addresses(&mut |source, items| Ok::<_, Error>(ReadPlan::input(source + 4, items))).unwrap();
-        assert_eq!(destinations.at(0), ReadAt::Input { source: 4, position: 0 });
-        assert_eq!(destinations.at(1), ReadAt::Default);
-        assert_eq!(destinations.at(2), ReadAt::Input { source: 4, position: 1 });
     }
 
     #[test]

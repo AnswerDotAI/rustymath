@@ -5,7 +5,7 @@ def test_selection_and_metadata():
     assert a[[1, 0], [2, 0]].tolist() == [60, 10]
     assert np.array_equal(a[[[1], [0]], [[0, 2]]], np.asarray(a)[np.ix_([1, 0], [0, 2])])
     assert a[:, ::-1].tolist() == [[30, 20, 10], [60, 50, 40]] and a[None, ...].shape == (1, 2, 3)
-    assert a[[True, False], [0, 2]].tolist() == [10, 30] and a[1, -1] == 60
+    assert a[[True, False], [0, 2]].tolist() == [40, 30] and a[:, [True]].tolist() == [[20], [50]] and a[:, True].tolist() == [20, 50] and a[1, -1] == 60
     assert a[np.array([[1, 0]])].shape == (1, 2, 3) and a[:0, ::-1].shape == (0, 3)
     assert rm.array(3)[()] == 3 and rm.array(3)[None].tolist() == [3]
     keyed = rm.array({'a': [1, 2], 'b': [3, 4]})
@@ -13,11 +13,12 @@ def test_selection_and_metadata():
     picked = keyed[['b', 'a'], :1]
     assert picked.tolist() == [[3], [1]] and picked.keys == (('b', 'a'), None) and picked.names == keyed.names
     assert keyed['b', :].names == ('column',)
-    for index in ([2], (..., ...), (slice(None), [True]), (0, 0, 0)):
+    for index in ((..., ...), (0, 0, 0)):
         with pytest.raises(IndexError): a[index]
     assert a[[1.0, np.nan]].tolist() == [[40, 50, 60], [0, 0, 0]]
-    with pytest.raises(ValueError): a[[0.5]]
-    with pytest.raises(ValueError, match='duplicate key: a'): keyed[['a', 'a']]
+    assert a[[2]].tolist() == a[[0.5]].tolist() == [[0, 0, 0]]
+    repeated = keyed[['a', 'a']]
+    assert repeated.tolist() == [[1, 2], [1, 2]] and repeated.keys == (None, None)
 
 def test_named_index_arrays_pair_and_address_by_name():
     a = rm.array([[0, 1, 2], [3, 4, 5], [6, 7, 8]])
@@ -117,7 +118,8 @@ def test_edge_modes_pad_take_and_windows():
     assert rm.pad(x, 1, fill=-1).tolist() == [-1, 0, 1, 2, 3, 4, -1] and rm.pad([], 1, mode='wrap').tolist() == [0, 0]
     assert rm.take(x, [-2, 0, 6], mode='clamp').tolist() == [0, 0, 4] and rm.array(x).take([-2, 6], mode='wrap').tolist() == [3, 1]
     assert rm.take(x, [6, np.nan], mode='fill', fill=7).tolist() == [7, 7]
-    with pytest.raises(ValueError): rm.pad({'a': 1., 'b': 2.}, 1, mode='wrap')
+    padded = rm.pad({'a': 1., 'b': 2.}, 1, mode='wrap')
+    assert padded.tolist() == [2., 1., 2., 1.] and padded.keys == (None,)
     with pytest.raises(ValueError): rm.pad(np.arange(3), 1, fill=0.5)
     with pytest.raises(ValueError): rm.take(x, [0], mode='mirror')
     assert rm.windows(range(6), 3).tolist() == [[0, 1, 2], [1, 2, 3], [2, 3, 4], [3, 4, 5]]

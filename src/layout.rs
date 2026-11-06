@@ -407,17 +407,13 @@ impl Layout {
         let names = (0..shape.len()).map(|a| source(a).and_then(|s| self.name(s).cloned())).collect();
         Self::from(shape).with_keys(keys).unwrap().inherit_names(names)
     }
-    /// The layout with `axis` holding the positions it reads at `positions`, keeping their keys. `None` reads no position and has no key. A Domain error where a key repeats.
-    pub fn select(&self, axis: usize, positions: impl ExactSizeIterator<Item = Option<usize>>) -> Result<Self, Error> { self.picked(axis, positions, false) }
-    /// The layout selected by an index array. A repeated source key leaves this axis without keys.
-    pub fn indexed(&self, axis: usize, positions: impl ExactSizeIterator<Item = Option<usize>>) -> Result<Self, Error> { self.picked(axis, positions, true) }
-    /// `select`'s layout. Where `repeats` holds, a repeated key leaves the axis without keys instead of failing.
-    fn picked(&self, axis: usize, positions: impl ExactSizeIterator<Item = Option<usize>>, repeats: bool) -> Result<Self, Error> {
+    /// The layout with `axis` holding the positions it reads at `positions`, keeping their keys. `None` reads no position and has no key. A repeated key leaves the axis without keys.
+    pub fn select(&self, axis: usize, positions: impl ExactSizeIterator<Item = Option<usize>>) -> Result<Self, Error> {
         let mut layout = self.clone();
         layout.shape[axis] = positions.len();
         let Some(keys) = self.keys(axis) else { return Ok(layout) };
         let mut all = self.all_keys();
-        all[axis] = if repeats { keys.select(positions).ok() } else { Some(keys.select(positions)?) };
+        all[axis] = keys.select(positions).ok();
         layout.with_keys(all)
     }
     /// Grows the first axis by `len` positions. `names` gives their keys. A Domain error, with the layout unchanged, when one of them is already on that axis or appears twice.

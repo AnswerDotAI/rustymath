@@ -86,7 +86,7 @@ def test_python_values():
     with pytest.raises(ValueError): rm.array(['ab'])
     with pytest.raises(OverflowError): rm.array([2**70])
     with pytest.raises(TypeError): rm.array(x for x in [1])
-    with pytest.raises(KeyError): t['c']
+    assert t['c'].tolist() == [0, 0]
     with pytest.raises(IndexError): m[2]
 
 def test_data_frames():

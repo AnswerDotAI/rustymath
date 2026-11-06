@@ -626,7 +626,7 @@ pub(crate) fn exact_residue<F: Float>(x: F, y: F) -> F {
     if r == F::zero() { F::zero() } else if (r < F::zero()) != (x < F::zero()) { r + x } else { r }
 }
 
-/// The tolerant floor of rounded `x ÷ y`, through [`Tolerant::floor_quotient`], as a function object. Float forms never fail. Its integer forms, from the `integer` module, divide exactly and fail on a zero divisor or an overflowing quotient.
+/// The tolerant floor of rounded `x ÷ y`, through [`Tolerant::floor_quotient`], as a function object. Float forms never fail. Its integer forms, from the `integer` module, divide exactly, give a zero divisor the type's limit of the dividend's sign, and fail on an overflowing quotient.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FloorDivide(pub Tolerance);
 tolerant!(FloorDivide at real: |t, [x, y]| Total(t.floor_quotient(x, y)));
@@ -635,7 +635,7 @@ tolerant!(FloorDivide at real: |t, [x, y]| Total(t.floor_quotient(x, y)));
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MathishFloorDivide(pub Tolerance);
 tolerant!(MathishFloorDivide at real: |t, [x, y]| Total(if crate::arith::both_zero(x, y) { x } else { t.floor_quotient(x, y) }));
-forms!(MathishFloorDivide at u8, i16, i32, i64: |k, [x, y]| if crate::arith::both_zero(x, y) { Some(x) } else { crate::Binary::checked(&FloorDivide(k.0), x, y) });
+forms!(#[inline] MathishFloorDivide at u8, i16, i32, i64: |k, [x, y]| crate::facts::integer_at(k, [x, y]));
 
 /// [`Tolerant::gcd`], or [`TolerantComplex::complex_gcd`] for complex items, at the tolerance it holds, as a function object. A non-finite argument gives NaN, which marks the item failed. Its `i64` form is [`integer::gcd`](crate::integer::gcd).
 #[derive(Clone, Copy, Debug, PartialEq)]

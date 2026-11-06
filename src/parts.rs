@@ -76,14 +76,17 @@ pub(crate) fn rounded<F: crate::Float>(x: F, scale: f64) -> F {
 }
 
 #[inline(always)]
-pub(crate) fn rounded_integer<T: Into<i128> + TryFrom<i128>>(x: T, scale: f64) -> Option<T> {
-    if scale >= 1.0 { return Some(x); }
+pub(crate) fn rounded_integer<T: Into<i128> + TryFrom<i128>>(x: T, scale: f64) -> Option<T> { T::try_from(rounded_wide(x.into(), scale)).ok() }
+
+/// `x` rounded to the nearest multiple of 1 ÷ `scale`, ties to even, exactly at `i128`, where no `i64` rounds past the type.
+#[inline(always)]
+pub(crate) fn rounded_wide(x: i128, scale: f64) -> i128 {
+    if scale >= 1.0 { return x; }
     let scale = (1.0 / scale).round() as i128;
-    let x = x.into();
     let (q, rem) = (x / scale, x % scale);
     let away = rem.abs() * 2;
     let q = q + if away > scale || away == scale && q & 1 != 0 { x.signum() } else { 0 };
-    T::try_from(q * scale).ok()
+    q * scale
 }
 
 forms!(Isnan at real => bool: |_, [x]| x.is_nan());

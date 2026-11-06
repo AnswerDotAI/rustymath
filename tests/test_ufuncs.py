@@ -50,10 +50,10 @@ def test_integers():
     assert (A(rm.gcd(a, b)) == np.gcd(a, b)).all() and (A(rm.lcm(a, b)) == np.sign(a * b) * np.lcm(a, b)).all() and rm.gcd(a, b).dtype == 'int64'
     assert (A(rm.remainder(a, b + 100)) == np.remainder(a, b + 100)).all()
     assert (A(rm.power(a, 3)) == a**3).all() and rm.power(a, 3).dtype == 'int64'
-    # An integer power that doesn't fit wraps, as NumPy's does. A negative exponent has no integer power beside a base other than 1 or -1, whatever other pairs give, and a padded view's fill counts as an exponent.
+    # An integer power that doesn't fit wraps, as NumPy's does. A negative exponent floors, as integer division does, so `3**-1` is 0, and a padded view's fill counts as an exponent.
     assert rm.power(np.array([10, 3]), 30).tolist() == np.power(np.array([10, 3]), 30).tolist() and rm.power(np.array([3], np.uint8), 6).tolist() == [729 % 256]
-    with pytest.raises(ValueError): rm.power(np.array([2, 3]), np.array([1, -1]))
-    with pytest.raises(ValueError): rm.power(2, rm.pad(rm.array([1, 2]), 1, fill=-1))
+    assert rm.power(np.array([2, 3]), np.array([1, -1])).tolist() == [2, 0]
+    assert rm.power(2, rm.pad(rm.array([1, 2]), 1, fill=-1)).tolist() == [0, 2, 4, 0]
     assert rm.power(np.array([1, 2]), np.array([-1, 63])).tolist() == [1, -2**63]
     # Each integer width keeps its type.
     for t in [np.uint8, np.int16, np.int32, np.int64]:
@@ -161,7 +161,7 @@ def test_mathish():
     assert np.isnan(mm.logb(np.float32(1), np.float32(1)))
     for dtype in (np.float16, np.float32, np.complex64): assert np.isnan(mm.divide(np.zeros(1, dtype), 0)).all()
     for dtype in (np.float16, np.float32): assert np.isnan(mm.floor_divide(np.zeros(1, dtype), 0)).all()
-    with pytest.raises(OverflowError): mm.floor_divide(0, 0)
+    assert mm.floor_divide(0, 0) == 0
     assert rm.linalg.inner(rm.add, mm.divide)([0., 2.], [0., 2.]) == 1
     assert rm.linalg.inner(mm.divide, rm.add)([0., 0.], [0., 0.]) == 0
     assert rm.accumulate(mm.divide, [0., 0.]).tolist() == [0., 0.] and rm.at(mm.divide, [0.], [0], 0.).tolist() == [0.]
@@ -370,7 +370,7 @@ def test_parallel_errors(threads):
     x[-1] = -1
     counts = np.full(len(x), 3, np.int64)
     counts[-1] = 64
-    with pytest.raises(OverflowError): rm.left_shift(np.ones(len(x), np.int64), counts)
+    assert rm.left_shift(np.ones(len(x), np.int64), counts).tolist()[-2:] == [8, 0]
     y = A(rm.log(x))
     assert np.isnan(y[-1]) and np.allclose(y[:-1], 0)
     assert np.isnan(A(rm.log(np.full(len(x), np.nan)))).all()

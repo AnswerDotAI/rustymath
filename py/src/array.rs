@@ -165,17 +165,19 @@ array_methods! { folds [sum, prod, max, min, all, any, mean] scans [cumsum, cump
         let items = self.core.view().cast(self.core.dtype()).map_err(py_err)?;
         item(py, items.view(), 0)?.is_truthy()
     }
-    /// Selects each axis by an integer, key, slice, mask or index array. Index arrays pair by broadcasting from the front, as arguments do, and their axes take the first array's place. `None` inserts an axis and `...` keeps omitted axes. Basic slices share storage, with independent value semantics. No remaining axes gives a Python scalar.
+    /// Selects each axis by an integer, key, slice or index array. Booleans are positions 0 and 1, as in BPL's indexing. Index arrays pair by broadcasting from the front, as arguments do, and their axes take the first array's place. `None` inserts an axis and `...` keeps omitted axes. Basic slices share storage, with independent value semantics. No remaining axes gives a Python scalar.
     fn __getitem__<'py>(&self, py: Python<'py>, key: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let plan = crate::structure::selection(self.core.layout(), key)?;
         give(py, released(py, || self.core.selected(plan, None)).map_err(py_err)?, true)
     }
     fn __contains__(slf: &Bound<'_, Self>, query: &Bound<'_, PyAny>) -> PyResult<bool> { crate::search::contains(slf.py(), slf, query) }
-    /// Writes through the same selection as indexing, broadcasting from the front. Repeated targets take the last assigned item. Other arrays and existing buffer exports keep their values.
+    /// Writes through the same selection as indexing, broadcasting from the front. A key that the array lacks is added first, holding the fill, as BPL's assignment adds it. Repeated targets take the last assigned item. Other arrays and existing buffer exports keep their values.
     fn __setitem__(slf: &Bound<'_, Self>, key: &Bound<'_, PyAny>, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        let plan = crate::structure::selection(slf.try_borrow()?.core.layout(), key)?;
         // Finish reading/copying first: `value` can be this array, or a buffer that views its items.
         let source = crate::convert::one(value)?.into_core()?;
+        let extended = crate::structure::with_missing_keys(&slf.try_borrow()?.core, key)?;
+        if let Some(core) = extended { slf.try_borrow_mut()?.core = core; }
+        let plan = crate::structure::selection(slf.try_borrow()?.core.layout(), key)?;
         slf.try_borrow_mut()?.core.assign(&plan, &source).map_err(py_err)
     }
     /// The items as nested lists of Python scalars, or one Python scalar for a rank-0 array.

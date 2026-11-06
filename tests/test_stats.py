@@ -92,5 +92,6 @@ def test_bitwise_decimal_rounding_and_angles():
     assert rm.array([1, 2], dtype='int16').round(2).dtype == 'int16'
     assert rm.round([True, False], -1).tolist() == [0, 0]
     assert rm.round([1.25 + 2.75j], 1).tolist() == [1.2 + 2.8j]
-    for fn, args in ((rm.left_shift, (a, -1)), (rm.floor_divide, (a, 0)), (rm.bitwise_and, ([1.], 2))):
-        with pytest.raises((ValueError, OverflowError)): fn(*args)
+    # A negative shift count shifts the other way, and division by zero saturates to the width's limit of the dividend's sign, as BPL's do. A whole float takes part in a bitwise function.
+    assert rm.left_shift(a, -1).tolist() == [-4, -1, 0, 1, 3] and rm.floor_divide(a, 0).tolist() == [-32768, -32768, 0, 32767, 32767]
+    assert rm.bitwise_and([1.], 2).tolist() == [0]

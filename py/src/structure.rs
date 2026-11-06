@@ -37,12 +37,21 @@ fn edged(layout: &Layout, axis: usize, indices: &Bound<'_, PyAny>, edge: Edge) -
     Ok(indexed(layout, axis, Core::new(indices.layout().clone(), buffer).map_err(py_err)?)?.0)
 }
 pub fn selection(layout: &Layout, index: &Bound<'_, PyAny>) -> PyResult<Plan> {
-    rustymath_buffer::selection::selection(layout, index, |p| {
-        if let Ok(a) = p.cast::<Array>() { return Ok(structure::sole_name(a.borrow().core().layout()).map(str::to_owned)); }
-        Ok(if p.hasattr("__rustymath_array__")? {
-            rustymath_buffer::read_array(p)?.and_then(|(_, layout)| structure::sole_name(&layout).map(str::to_owned))
-        } else { None })
-    }, array_selector).map(|(plan, _)| plan)
+    rustymath_buffer::selection::selection(layout, index, axis_name, array_selector).map(|(plan, _)| plan)
+}
+/// `core` with the keys that a write by `index` names and it lacks added before the write plans, as BPL's assignment adds them (`structure::extended`). The new items hold the fill. `None` where no key is missing.
+pub fn with_missing_keys(core: &Core, index: &Bound<'_, PyAny>) -> PyResult<Option<Core>> {
+    let added = rustymath_buffer::selection::missing_keys(core.layout(), index, axis_name)?;
+    if added.iter().all(Vec::is_empty) { return Ok(None); }
+    let plan = structure::extended(core.layout(), &added).map_err(py_err)?;
+    core.selected(plan, None).map(Some).map_err(py_err)
+}
+/// The one axis name of `p`, an index part, where it's an array with exactly one named axis.
+fn axis_name(p: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
+    if let Ok(a) = p.cast::<Array>() { return Ok(structure::sole_name(a.borrow().core().layout()).map(str::to_owned)); }
+    Ok(if p.hasattr("__rustymath_array__")? {
+        rustymath_buffer::read_array(p)?.and_then(|(_, layout)| structure::sole_name(&layout).map(str::to_owned))
+    } else { None })
 }
 
 fn planned(py: Python<'_>, arg: Arg, build: impl FnOnce(&Layout) -> Result<Plan, Error>) -> PyResult<Array> {

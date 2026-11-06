@@ -517,7 +517,7 @@ fn factored(function: &str, factors: &Layout, p: &ArrayView<'_>) -> Result<(usiz
     if p.layout().shape().last() != Some(&n) { return Err(Error::new(Kind::Length, format!("{function} needs {n} row positions for each matrix"))); }
     let items = p.cast(p.dtype())?;
     let positions =
-        crate::structure::signed_positions(items.view())?.into_iter().map(|r| usize::try_from(r?).ok().filter(|&r| r < n)).collect::<Option<Vec<_>>>();
+        crate::structure::signed_positions(items.view()).into_iter().map(|r| usize::try_from(r?).ok().filter(|&r| r < n)).collect::<Option<Vec<_>>>();
     Ok((n, positions.ok_or_else(|| Error::new(Kind::Index, format!("{function} needs row positions from 0 to {}", n.saturating_sub(1))))?))
 }
 

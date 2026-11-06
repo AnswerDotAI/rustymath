@@ -260,17 +260,17 @@ const COMPLEX: &[DType] = &[DType::Complex(ComplexWidth::F32), DType::Complex(Co
 const INEXACT: &[DType] = &[REAL[0], REAL[1], REAL[2], COMPLEX[0], COMPLEX[1]];
 
 functions! {
-    /// Bitwise AND, logical for Booleans.
-    bitwise_and(x, y) = rustymath::BitAnd;
-    /// Bitwise OR, logical for Booleans.
-    bitwise_or(x, y) = rustymath::BitOr;
-    /// Bitwise XOR, logical for Booleans.
-    bitwise_xor(x, y) = rustymath::BitXor;
-    /// Bitwise complement, logical negation for Booleans.
-    bitwise_not(x) = rustymath::BitNot;
-    /// Shift left, discarding high bits. The count must be below the item width.
+    /// Bitwise AND, logical for Booleans. A whole float computes as the integer it holds; any other float fails.
+    bitwise_and(x, y) = rustymath::Bitwise(8);
+    /// Bitwise OR, logical for Booleans. A whole float computes as the integer it holds; any other float fails.
+    bitwise_or(x, y) = rustymath::Bitwise(14);
+    /// Bitwise XOR, logical for Booleans. A whole float computes as the integer it holds; any other float fails.
+    bitwise_xor(x, y) = rustymath::Bitwise(6);
+    /// Bitwise complement, logical negation for Booleans, as BPL's `~ᵇ` gives it: an unsigned byte's complement is an `i64`.
+    bitwise_not(x) = rustymath::Bitwise(1);
+    /// Shift left, discarding high bits. A negative count shifts right, keeping a signed integer's sign. A count of the item width or more gives 0.
     left_shift(x, y) = rustymath::LeftShift;
-    /// Shift right, preserving signed integers' sign bit. The count must be below the item width.
+    /// Shift right, preserving signed integers' sign bit. A negative count shifts left. A count of the item width or more gives 0, or -1 for a negative signed integer.
     right_shift(x, y) = rustymath::RightShift;
     /// Convert radians to degrees.
     degrees(x) = rustymath::Scale(180.0 / ::std::f64::consts::PI);
@@ -440,8 +440,8 @@ functions! {
     ceil(x; ct) = Ceil(ct);
     /// The remainder of x divided by y. A zero y gives x, by APL's rule. Floats use the floored quotient and native fused multiply-add where available. Mathish mode snaps the remainder to zero when the product equals x within tolerance.
     remainder(x, y; ct) = Flipped(Residue(ct));
-    /// The floor of rounded x / y. Mathish mode uses tolerant flooring and defines zero divided by zero as zero for float64. Integer zero divisors and overflowing quotients fail.
-    floor_divide(x, y; ct) = FloorDivide(ct) => MathishFloorDivide(ct);
+    /// The floor of rounded x / y. Mathish mode uses tolerant flooring and defines zero divided by zero as zero for float64. An integer zero divisor gives the dtype's limit with the sign of x, and 0 for 0 // 0. An integer quotient that doesn't fit its dtype wraps, as NumPy's does.
+    floor_divide(x, y; ct) = FloorDivide(ct) => MathishFloorDivide(ct), wrapping true;
     /// The greatest common divisor of x and y, never negative for integers and floats. Float and complex remainder steps compare under Mathish mode.
     gcd(x, y; ct) = Gcd(ct);
     /// The least common multiple of x and y, with the sign of x y. Float remainder steps compare under Mathish mode.

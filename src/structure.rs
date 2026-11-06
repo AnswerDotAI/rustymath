@@ -150,49 +150,7 @@ pub fn routes<E>(
 
 /// The plan of the selection that `routes` gives on `layout`, as `plan_parts` plans it.
 pub fn plan_routes(layout: &Layout, routes: &Routes, broadcast: bool) -> Result<Plan, Error> {
-    routed(layout, routes, broadcast, false)
-}
-
-pub fn layout_routes(layout: &Layout, routes: &Routes, broadcast: bool) -> Result<Layout, Error> {
-    Ok(routed(layout, routes, broadcast, true)?.layout)
-}
-
-pub fn bound_routes(layout: &Layout, routes: &Routes, indices: &[View<'_>], broadcast: bool, checked: bool) -> Result<Plan, Error> {
-    let grouped = route_layout(layout, routes)?;
-    let mut routes = routes.clone();
-    let (mut source, mut input) = (0, 0);
-    for selector in &mut routes.selectors {
-        if matches!(selector, Selector::NewAxis) { continue; }
-        let size: usize = routes.sources[source].iter().map(|&a| layout.shape()[a]).product();
-        source += 1;
-        if let Selector::Shaped { layout: within } = selector {
-            let view = *indices.get(input).ok_or_else(|| Error::new(Kind::Length, "missing index array"))?;
-            input += 1;
-            let positions = positions_mode(view, size, checked)?;
-            *selector = Selector::Indices { layout: within.clone(), positions: Table::new(positions) };
-        } else if !checked {
-            match selector {
-                Selector::At(position) if *position >= size => {
-                    *selector = Selector::Indices { layout: Layout::EMPTY, positions: Table::new(vec![Steps::FILL]) };
-                }
-                Selector::Range { start, len, step }
-                    if *len > 0 && !(*start < size && start.checked_add_signed(step.saturating_mul((*len - 1) as isize)).is_some_and(|p| p < size)) =>
-                {
-                    let positions: Vec<_> =
-                        (0..*len).map(|i| start.checked_add_signed(step.saturating_mul(i as isize)).filter(|&p| p < size).unwrap_or(Steps::FILL)).collect();
-                    let within = grouped.select(source - 1, positions.iter().map(|&p| (p != Steps::FILL).then_some(p)))?.axes(source - 1..source);
-                    *selector = Selector::Indices { layout: within, positions: Table::new(positions) };
-                }
-                _ => {}
-            }
-        }
-    }
-    if input != indices.len() { return Err(Error::new(Kind::Length, "extra index arrays")); }
-    plan_routes(layout, &routes, broadcast)
-}
-
-fn routed(layout: &Layout, routes: &Routes, broadcast: bool, layouts: bool) -> Result<Plan, Error> {
-    planned(route_layout(layout, routes)?.as_ref(), routes.selectors.clone(), broadcast, layouts)
+    planned(route_layout(layout, routes)?.as_ref(), routes.selectors.clone(), broadcast)
 }
 
 fn route_layout<'a>(layout: &'a Layout, routes: &Routes) -> Result<Cow<'a, Layout>, Error> {
@@ -201,26 +159,25 @@ fn route_layout<'a>(layout: &'a Layout, routes: &Routes) -> Result<Cow<'a, Layou
     regrouped(layout, routes.sources.iter().map(|s| s.iter().map(|&a| shape[a]).product()).collect(), &routes.sources, &[]).map(Cow::Owned)
 }
 
-/// One independent axis selector. Positions are zero-based and already normalized; a range can walk backwards. `All` keeps the whole axis, whatever its length. An index array replaces its axis by the axes of its layout. Its positions, a [`Table`], lie within the axis or are `Steps::FILL`, which reads the caller's fill. The code that builds an index array checks its positions, as `index_positions` and `index_table` do. `Shaped` is an index array known by its layout alone, whose positions arrive when the selection runs: only `layout_routes` takes it. `NewAxis` inserts a length-one axis without consuming an input axis.
+/// One independent axis selector. Positions are zero-based and already normalized; a range can walk backwards. `All` keeps the whole axis, whatever its length. An index array replaces its axis by the axes of its layout. Its positions, a [`Table`], lie within the axis or are `Steps::FILL`, which reads the caller's fill. The code that builds an index array checks its positions, as `index_positions` and `index_table` do. `NewAxis` inserts a length-one axis without consuming an input axis.
 #[derive(Clone, Debug)]
 pub enum Selector {
-    At(usize), Range { start: usize, len: usize, step: isize }, All, Indices { layout: Layout, positions: Table }, Shaped { layout: Layout }, NewAxis
+    At(usize), Range { start: usize, len: usize, step: isize }, All, Indices { layout: Layout, positions: Table }, NewAxis
 }
 
 /// Selects with one selector for each leading axis of `layout`, in order, keeping the axes that no selector mentions. A single position removes its axis, and a range keeps it in place. An index array's axes replace its axis. An unnamed vector keeps the axis's name and the keys at the positions it selects if none repeats, as a named vector without keys of its own keeps those keys, and an unnamed index array of another rank has plain axes. Index arrays pair, as arguments pair in arithmetic: all of them with `broadcast`, as `.[]` reads them, and otherwise those that share an axis name, as `⌷` reads them. Paired index arrays put their axes where the first of them was. A range pairs with an index array that has its axis's name. Positions that step evenly along each axis read as strides (`strided`), whether one index array gives them or paired arrays sum to them. One index array whose positions read a stretch of its axis past the ends, as edge modes and positions that count back from the end give them, reads as one padded or rotated entry.
 pub fn select(layout: &Layout, selectors: Vec<Selector>, broadcast: bool) -> Result<Plan, Error> {
-    planned(layout, selectors, broadcast, false)
+    planned(layout, selectors, broadcast)
 }
 
-/// With `layouts`, an index array can be known by its layout alone.
-fn planned(layout: &Layout, selectors: Vec<Selector>, broadcast: bool, layouts: bool) -> Result<Plan, Error> {
+fn planned(layout: &Layout, selectors: Vec<Selector>, broadcast: bool) -> Result<Plan, Error> {
     let (shape, stride) = (layout.shape(), strides(layout.shape()));
     let mut parts = Vec::with_capacity(shape.len());
     let mut axis = 0;
     for selector in selectors {
         if matches!(selector, Selector::NewAxis) { parts.push(Part::new(Steps::along(1, 0), Layout::from([1]), 0, 1)); continue; }
         if axis == shape.len() { return Err(Error::new(Kind::Index, "too many axis selectors")); }
-        parts.push(Part::of(selector, layout, axis, stride[axis], layouts)?);
+        parts.push(Part::of(selector, layout, axis, stride[axis])?);
         axis += 1;
     }
     parts.extend((axis..shape.len()).map(|a| Part::new(Steps::along(shape[a], 1), layout.axes(a..a + 1), stride[a], shape[a])));
@@ -264,13 +221,13 @@ struct Part { steps: Steps, axes: Layout, stride: usize, size: usize, array: boo
 impl Part {
     fn new(steps: Steps, axes: Layout, stride: usize, size: usize) -> Self { Part { steps, axes, stride, size, array: false, alone: None } }
 
-    fn of(selector: Selector, layout: &Layout, axis: usize, stride: usize, layouts: bool) -> Result<Self, Error> {
+    fn of(selector: Selector, layout: &Layout, axis: usize, stride: usize) -> Result<Self, Error> {
         let size = layout.shape()[axis];
         let outside = || Error::new(Kind::Index, "axis selector is outside its axis");
         match selector {
             Selector::At(i) if i < size => Ok(Part::new(Steps::Stride { start: i, len: 1, step: 0 }, Layout::EMPTY, stride, size)),
             Selector::At(_) => Err(outside()),
-            Selector::All => Self::of(Selector::Range { start: 0, len: size, step: 1 }, layout, axis, stride, layouts),
+            Selector::All => Self::of(Selector::Range { start: 0, len: size, step: 1 }, layout, axis, stride),
             Selector::Range { start, len, step } => {
                 if len > 0 && !(start < size && start.checked_add_signed(step.saturating_mul((len - 1) as isize)).is_some_and(|i| i < size)) {
                     return Err(outside());
@@ -284,17 +241,8 @@ impl Part {
                     return Err(Error::new(Kind::Length, format!("index array shape {:?} needs {} positions, got {}", within.shape(), within.count(), positions.len())));
                 }
                 let steps = Steps::Table(positions);
-                let selected = layout.indexed(axis, steps.offsets())?;
+                let selected = layout.select(axis, steps.offsets())?;
                 Ok(Part { steps, alone: alone(&within, &selected, axis)?, axes: within, stride, size, array: true })
-            }
-            Selector::Shaped { layout: within } => {
-                if !layouts { return Err(Error::new(Kind::Domain, "an index array known by its layout alone plans only a layout")); }
-                // The keys that an index array selects depend on its positions.
-                if layout.keys(axis).is_some() { return Err(Error::new(Kind::Index, "an index array known by its layout alone, along an axis with keys")); }
-                let len = generated_len(within.shape())?;
-                let selected = layout.select(axis, std::iter::repeat_n(None, len))?;
-                // These steps read no positions: a layout plan gives only its layout.
-                Ok(Part { steps: Steps::Stride { start: 0, len, step: 0 }, alone: alone(&within, &selected, axis)?, axes: within, stride, size, array: true })
             }
             Selector::NewAxis => unreachable!("a new axis reads no positions"),
         }
@@ -426,47 +374,63 @@ pub fn select_axis(layout: &Layout, axis: usize, selector: Selector) -> Result<P
     select(layout, selectors, false)
 }
 
-/// The positions that index values give along an axis of length `size`. A negative value counts back from the end, and a value outside the axis is an Index error.
-pub fn index_positions<I: IndexValue>(values: &[I], size: usize) -> Result<Vec<usize>, Error> {
-    let mut positions = vec![0; values.len()];
-    let mut inside = true;
-    for (p, &i) in positions.iter_mut().zip(values) {
-        *p = counted_back(i.position(), size);
-        inside &= *p < size;
-    }
-    if inside { return Ok(positions); }
-    Err(first_outside(values, size))
+/// The position of key `name` on `axis` of `layout`, or `Steps::FILL` where the axis lacks it: a missing key reads the fill and writes nothing, as a position outside the axis does. BPL and both Python bindings read keys by this rule.
+pub fn key_position(layout: &Layout, axis: usize, name: &str) -> Result<usize, Error> {
+    let keys = layout.keys(axis).ok_or_else(|| Error::new(Kind::Index, "axis has no keys"))?;
+    Ok(keys.position(name).unwrap_or(Steps::FILL))
 }
 
-/// A table that reads the index values in `values` as positions along an axis of length `size`, as [`positions`] reads them, converting each one as it reads it. A value outside the axis is an Index error. The one pass that checks the values writes nothing, and also finds whether they give evenly spaced positions, so that a walk can read them as one stride. Floats read in place only where every one is a whole number. Otherwise the table lists the positions that [`filled_positions`] gives, within the default tolerance and with a NaN as a fill.
+/// The selector that keys give on `axis` of `layout`, by [`key_position`]: one key's position, which removes the axis, where `within` is `None`, and otherwise an index array of the keys' positions, laid out as `within`.
+pub fn key_selector<'a>(layout: &Layout, axis: usize, names: impl IntoIterator<Item = &'a str>, within: Option<Layout>) -> Result<Selector, Error> {
+    let positions = names.into_iter().map(|n| key_position(layout, axis, n)).collect::<Result<Vec<_>, _>>()?;
+    if within.is_none() && let [p] = positions[..] && p != Steps::FILL { return Ok(Selector::At(p)); }
+    Ok(Selector::Indices { layout: within.unwrap_or(Layout::EMPTY), positions: Table::new(positions) })
+}
+
+/// For each axis of `layout`, the keys that `wanted` names on it and it lacks, each once, in order. `wanted` pairs an axis with the keys that one selector names on it. A write adds these keys before it plans ([`extended`]).
+pub fn missing_keys<'a, K: IntoIterator<Item = &'a str>>(layout: &Layout, wanted: impl IntoIterator<Item = (usize, K)>) -> Result<Vec<Vec<Arc<str>>>, Error> {
+    let mut added: Vec<Vec<Arc<str>>> = vec![vec![]; layout.shape().len()];
+    for (axis, names) in wanted {
+        for name in names {
+            let lacked = added.get_mut(axis).ok_or_else(|| Error::new(Kind::Rank, "too many axis selectors"))?;
+            if layout.keys(axis).is_none_or(|k| k.position(name).is_none()) && !lacked.iter().any(|n| &**n == name) { lacked.push(name.into()); }
+        }
+    }
+    Ok(added)
+}
+
+/// The plan that appends the keys in `added`, a list for each axis, to the axes of `layout`, as [`missing_keys`] gives them. An axis without keys takes them after a position without a key for each of its items. The new positions read `Steps::FILL`, and the others read the items in place.
+pub fn extended(layout: &Layout, added: &[Vec<Arc<str>>]) -> Result<Plan, Error> {
+    let (mut shape, mut keys) = (layout.shape().to_vec(), layout.all_keys());
+    for (axis, names) in added.iter().enumerate().filter(|(_, names)| !names.is_empty()) {
+        let mut all = keys[axis].as_ref().map_or_else(|| vec![None; shape[axis]], |k| k.names().to_vec());
+        all.extend(names.iter().cloned().map(Some));
+        shape[axis] = all.len();
+        keys[axis] = Some(Keys::partial(all)?);
+    }
+    generated_len(&shape)?;
+    let steps = shape.iter().zip(layout.shape()).zip(strides(layout.shape())).map(|((&len, &size), stride)| Steps::clipped(0, len, size, stride)).collect();
+    Ok(Plan { layout: Layout::from(shape).with_keys(keys)?.inherit_names(layout.names().to_vec()), steps })
+}
+
+/// A table that reads the index values in `values` as positions along an axis of length `size`, as [`positions`] reads them, converting each one as it reads it. The one pass that checks the values writes nothing, and also finds whether they give evenly spaced positions, so that a walk can read them as one stride. Floats read in place only where every one is a whole number and inside the axis, and so do integers. Otherwise the table lists the positions that [`positions`] gives, with the fill position for each value outside the axis.
 pub fn index_table(values: Arc<dyn IndexSource>, size: usize) -> Result<Table, Error> {
-    /// `None` where some value is a float that isn't a whole number. Otherwise the first position and the step where the positions are evenly spaced, or the Index error for a value outside the axis.
-    fn check<I: IndexValue>(values: &[I], size: usize) -> Option<Result<Option<(usize, isize)>, Error>> {
+    /// `None` where some value is a float that isn't a whole number, or is outside the axis. Otherwise the first position and the step where the positions are evenly spaced.
+    fn check<I: IndexValue>(values: &[I], size: usize) -> Option<Option<(usize, isize)>> {
         let (lo, hi, whole) = I::bounds(values);
         if !whole { return None; }
-        if !values.is_empty() && !(lo >= -(size as i64) && hi < size as i64) { return Some(Err(first_outside(values, size))); }
+        if !values.is_empty() && !(lo >= -(size as i64) && hi < size as i64) { return None; }
         let at = |k: usize| values[k].position();
-        if values.len() < 2 { return Some(Ok(None)); }
+        if values.len() < 2 { return Some(None); }
         // Values of one sign give evenly spaced positions where they're evenly spaced themselves. Checking the second step first skips the full pass for values in no order.
         let step = at(1) - at(0);
         let even = (lo >= 0 || hi < 0) && (values.len() < 3 || at(2) - at(1) == step)
             && values.windows(2).fold(true, |even, w| even & (w[1].position() - w[0].position() == step));
-        Some(Ok(even.then(|| (counted_back(at(0), size), step as isize))))
+        Some(even.then(|| (counted_back(at(0), size), step as isize)))
     }
     match crate::gather::with_index_values!(values.view(), |x| check(x, size)) {
-        Some(even) => Ok(Table::indices(values, size, even?)), None => positions(values.view(), size).map(Table::new)
+        Some(even) => Ok(Table::indices(values, size, even)), None => positions(values.view(), size).map(Table::new)
     }
-}
-
-/// The Index error for the first of `values` outside an axis of length `size`.
-fn first_outside<I: IndexValue>(values: &[I], size: usize) -> Error {
-    let k = values.iter().position(|&i| counted_back(i.position(), size) >= size).expect("a position is outside the axis");
-    outside(values[k].position(), size)
-}
-
-/// The Index error for `position` on an axis of length `size`.
-fn outside(position: impl std::fmt::Display, size: usize) -> Error {
-    Error::new(Kind::Index, format!("position {position} is outside an axis of length {size}"))
 }
 
 /// Position `i` on an axis of length `size`, where a negative `i` counts back from the end. Adding `size` to a negative position without a branch keeps a loop over positions vectorised. A position outside the axis is then at least `size`.
@@ -484,12 +448,8 @@ pub(crate) fn counted_back(i: i64, size: usize) -> usize {
     position_recipe::<f64, _>(&ops, i as u64, size as i64).0 as usize
 }
 
-/// The positions that index values give along an axis of length `size`: integers as `index_positions` reads them, and floats as `filled_positions` does. Other items are a Domain error.
-pub fn positions(view: View<'_>, size: usize) -> Result<Vec<usize>, Error> { index_view!(view, |ix| index_positions(ix, size), |x| filled_positions(x, size)) }
-
-/// Logical index positions; unchecked invalid numbers read the fill position.
-pub fn positions_mode(view: View<'_>, size: usize, checked: bool) -> Result<Vec<usize>, Error> {
-    if checked { return positions(view, size); }
+/// The positions that index values give along an axis of length `size`. A negative value counts back from the end. A value outside the axis, one that isn't a whole number, or a NaN gives the fill position (`Steps::FILL`), which reads the fill and writes nothing. Items that aren't numbers are a Domain error.
+pub fn positions(view: View<'_>, size: usize) -> Result<Vec<usize>, Error> {
     if !matches!(view.dtype(), crate::buffer::DType::Boolean | crate::buffer::DType::Integer(_) | crate::buffer::DType::Float(_)) {
         return Err(Error::new(Kind::Domain, "indices must be real numbers"));
     }
@@ -520,49 +480,25 @@ macro_rules! index_view {
 }
 use index_view;
 
-/// The whole number that a float index value equals within the default tolerance, or `None` for a NaN, which reads the fill. Any other value is a Domain error.
-pub fn float_position<F: Float>(y: F) -> Result<Option<i64>, Error> {
-    if y.is_nan() { return Ok(None); }
-    match Tolerance::DEFAULT.nearest_whole(y) { (n, true) => Ok(Some(n.wide() as i64)), _ => Err(not_whole()) }
+/// The whole number that a float index value equals within the default tolerance, or `None` for a NaN or a value that isn't whole, which reads the fill.
+pub fn float_position<F: Float>(y: F) -> Option<i64> {
+    if y.is_nan() { return None; }
+    match Tolerance::DEFAULT.nearest_whole(y) { (n, true) => Some(n.wide() as i64), _ => None }
 }
 
-/// The positions that float index values give along an axis of length `size`, as `index_positions` gives them from integers, with each value read by `float_position`. A NaN gives `Steps::FILL`, which reads the fill and drops a write.
-pub fn filled_positions<F: Float>(values: &[F], size: usize) -> Result<Vec<usize>, Error> {
-    // The first loop has no branch, which keeps it vectorised. A value that isn't exactly whole is read again by `float_position`.
-    let mut positions = vec![0; values.len()];
-    let (mut whole, mut inside) = (true, true);
-    for (p, &y) in positions.iter_mut().zip(values) {
-        let (x, nan) = (y.wide(), y.is_nan());
-        let q = counted_back(x as i64, size);
-        whole &= nan | (x as i64 as f64 == x);
-        inside &= nan | (q < size);
-        *p = if nan { Steps::FILL } else { q };
+/// The signed position that each index value gives, before any axis applies: integers as they are, and floats as `float_position` reads them, with `None` for a NaN or a value that isn't whole. Items that aren't real numbers have no position. [`positions`] reads the values and checks them against an axis in one pass.
+pub fn signed_positions(view: View<'_>) -> Vec<Option<i64>> {
+    match view {
+        View::Booleans(b) => b.iter().map(|&i| Some(i.into())).collect(),
+        View::Integers(ix) => with_ints!(ix, |i| i.iter().map(|&i| Some(i.into())).collect()),
+        View::Floats(x) => with_floats!(x, |x| x.iter().map(|&y| float_position(y)).collect()),
+        _ => vec![None; view.len()],
     }
-    if !whole {
-        inside = true;
-        for (p, &y) in positions.iter_mut().zip(values) {
-            if let Some(i) = float_position(y)? {
-                *p = counted_back(i, size);
-                inside &= *p < size;
-            }
-        }
-    }
-    if inside { return Ok(positions); }
-    let k = positions.iter().zip(values).position(|(&p, y)| !y.is_nan() && p >= size).expect("a position is outside the axis");
-    let x = values[k].wide();
-    Err(outside(if x.abs() < 1e16 { x.to_string() } else { format!("{x:e}") }, size))
 }
 
-/// The signed position that each index value gives, before any axis applies: integers as they are, and floats as `float_position` reads them, with `None` for a NaN. Other items are a Domain error. [`positions`] reads the values and checks them against an axis in one pass.
-pub fn signed_positions(view: View<'_>) -> Result<Vec<Option<i64>>, Error> {
-    index_view!(view, |ix| Ok(ix.iter().map(|&i| Some(i.into())).collect()), |x| x.iter().map(|&y| float_position(y)).collect())
-}
-
-/// The positions along an axis of length `size` that signed positions give, as `index_positions` gives them, with `Steps::FILL` for `None`.
-pub fn counted_positions(values: &[Option<i64>], size: usize) -> Result<Vec<usize>, Error> {
-    values.iter().map(|&q| match q.map(|i| (i, counted_back(i, size))) {
-        None => Ok(Steps::FILL), Some((_, p)) if p < size => Ok(p), Some((i, _)) => Err(outside(i, size))
-    }).collect()
+/// The positions along an axis of length `size` that signed positions give, as [`positions`] gives them, with `Steps::FILL` for `None` and for a position outside the axis.
+pub fn counted_positions(values: &[Option<i64>], size: usize) -> Vec<usize> {
+    values.iter().map(|&q| q.map(|i| counted_back(i, size)).filter(|&p| p < size).unwrap_or(Steps::FILL)).collect()
 }
 
 /// How a position outside an axis maps to one inside it, as edge modes of padding do. `Fill` gives no position, which reads the fill.
@@ -608,7 +544,7 @@ impl Edge {
                     }),
                 ));
             }
-            let signed = x.iter().map(|&y| float_position(y)).collect::<Result<Vec<_>, _>>()?;
+            let signed: Vec<_> = x.iter().map(|&y| float_position(y)).collect();
             Ok(self.mapped(n, nan, signed.into_iter()))
         })
     }

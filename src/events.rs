@@ -2,38 +2,59 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, atomic::{AtomicUsize, Ordering::Relaxed}};
 
 macro_rules! routes {
-    ($($id:ident: $name:literal;)+) => {
+    ($($id:ident: $name:literal, $taken:literal, $declined:literal, $itemwise:literal;)+) => {
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
         pub enum Route { $($id),+ }
         impl Route {
             pub const ALL: &'static [Self] = &[$(Self::$id),+];
             pub const REQUIRED: &'static [Self] = &[Self::Compiled, Self::FusedFold, Self::Trace];
             pub const fn name(self) -> &'static str { match self { $(Self::$id => $name),+ } }
+            /// Whether a frontend reports the calls that took this route.
+            pub const fn reports_taken(self) -> bool { match self { $(Self::$id => $taken),+ } }
+            /// Whether a frontend reports the calls that declined this route.
+            pub const fn reports_decline(self) -> bool { match self { $(Self::$id => $declined),+ } }
+            /// Whether this route handles items one at a time, which basedpl records in `•explain`'s own rows.
+            pub const fn reports_itemwise(self) -> bool { match self { $(Self::$id => $itemwise),+ } }
         }
     };
 }
 routes! {
-    Trace: "trace";
-    Fusion: "fusion";
-    SlidingFold: "sliding fold";
-    MappedFold: "mapped fold";
-    AlternatedFold: "alternated fold";
-    MappedProduct: "mapped product";
-    VectorKernel: "vector kernel";
-    MappedKernel: "mapped kernel";
-    PartialGrade: "partial grade";
-    PartialSort: "partial sort";
-    Ranks: "ranks";
-    Accuracy: "accuracy rule";
-    KeyClasses: "key classes";
-    Determinant: "determinant";
-    Permanent: "permanent";
-    MaskedSelect: "masked select";
-    Contraction: "contraction";
-    Program: "program";
-    FusedFold: "fused fold";
-    Compiled: "compiled";
-    InPlace: "in place";
+    Trace: "trace", true, false, false;
+    Fusion: "fusion", true, true, false;
+    Batching: "batching", true, true, false;
+    SlidingFold: "sliding fold", true, false, false;
+    MappedFold: "mapped fold", true, false, false;
+    AlternatedFold: "alternated fold", true, false, false;
+    MappedProduct: "mapped product", true, false, false;
+    VectorKernel: "vector kernel", true, false, false;
+    MappedKernel: "mapped kernel", true, false, false;
+    PartialGrade: "partial grade", true, true, false;
+    PartialSort: "partial sort", true, true, false;
+    Ranks: "ranks", true, true, false;
+    Accuracy: "accuracy rule", true, false, false;
+    KeyClasses: "key classes", true, false, false;
+    GroupCounts: "group counts", true, false, false;
+    GroupFolds: "group folds", true, true, false;
+    Determinant: "determinant", true, true, false;
+    Permanent: "permanent", true, true, false;
+    MaskedSelect: "masked select", true, false, false;
+    Contraction: "contraction", true, true, false;
+    Program: "program", false, true, false;
+    FusedFold: "fused fold", true, true, false;
+    Compiled: "compiled", true, true, false;
+    InPlace: "in place", true, true, false;
+    ItemPairs: "item pairs", false, false, true;
+    ItemLanes: "item lanes", false, false, true;
+    NumberParts: "number parts", false, false, true;
+    Accumulation: "accumulation", false, false, true;
+    NestedLabels: "nested labels", false, false, true;
+    LabelIds: "label ids", false, false, true;
+    InverseScan: "inverse scan", false, false, true;
+    KeyGroups: "key groups", false, false, true;
+    BatchCells: "batch cells", false, false, true;
+    BatchedItems: "batched items", false, false, true;
+    DerivativeItems: "∂ items", false, false, true;
+    TracedItems: "traced items", false, false, true;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,7 +74,8 @@ pub enum Event {
     Program { event: &'static str, steps: usize, listing: String }, Fast { rule: &'static str, function: String },
     Fallback { reason: String, items: usize }, Accumulation { items: usize, size: usize, path: &'static str },
     Mixed { code: String, line: usize, column: usize, target: &'static str, written: &'static str, items: usize },
-    Compile { glyphs: String, microseconds: usize }
+    Compile { glyphs: String, microseconds: usize },
+    Itemwise { function: String, line: usize, column: usize, route: Route, items: usize }
 }
 #[derive(Clone, Copy)]
 pub enum Column { Text, Count, Truth }
@@ -75,6 +97,7 @@ pub const TABLES: &[(&str, &[(&str, Column)])] = {
         ("accumulations", &[("items", Count), ("size", Count), ("path", Text)]),
         ("mixed", &[("code", Text), ("line", Count), ("column", Count), ("target", Text), ("written", Text), ("items", Count)]),
         ("compiles", &[("glyphs", Text), ("microseconds", Count)]), ("routes", &[("route", Text), ("calls", Count), ("items", Count)]),
+        ("itemwise", &[("function", Text), ("line", Count), ("column", Count), ("route", Text), ("items", Count)]),
     ]
 };
 impl Event {
@@ -82,13 +105,19 @@ impl Event {
         match self {
             Self::Fused { .. } => 0, Self::Stored { .. } => 1, Self::Forced { .. } => 2, Self::Program { .. } => 3,
             Self::Route(r) => match r.kind { EventKind::Stopped => 4, EventKind::Declined => 7, EventKind::Taken => 11 }, Self::Fast { .. } => 5,
-            Self::Fallback { .. } => 6, Self::Accumulation { .. } => 8, Self::Mixed { .. } => 9, Self::Compile { .. } => 10
+            Self::Fallback { .. } => 6, Self::Accumulation { .. } => 8, Self::Mixed { .. } => 9, Self::Compile { .. } => 10, Self::Itemwise { .. } => 12
         }
     }
     pub const fn name(&self) -> &'static str { TABLES[self.table()].0 }
     pub fn route(&self) -> Option<&Record> { match self { Self::Route(r) => Some(r), _ => None } }
-    pub const fn slow(&self) -> bool {
-        matches!(self, Self::Stored { partway: true, .. } | Self::Forced { .. } | Self::Fallback { .. } | Self::Route(Record { kind: EventKind::Stopped, .. }))
+    /// The text that names this event in a route directive, where the event marks a slow path: a stopped trace, a stored or forced pending array, a fallback, a mixed write or an itemwise route. `None` for every other event.
+    pub fn slow_name(&self) -> Option<&str> {
+        match self {
+            Self::Route(Record { kind: EventKind::Stopped, reason, .. }) | Self::Stored { reason, .. } => Some(*reason),
+            Self::Forced { function: name, .. } | Self::Fallback { reason: name, .. } | Self::Mixed { code: name, .. } => Some(name.as_str()),
+            Self::Itemwise { route, .. } => Some(route.name()),
+            _ => None,
+        }
     }
     pub fn fields(&self) -> Vec<Field<'_>> {
         use Field::*;
@@ -111,6 +140,7 @@ impl Event {
                 vec![Text(code), Count(*line), Count(*column), Text(target), Text(written), Count(*items)]
             }
             Self::Compile { glyphs, microseconds } => vec![Text(glyphs), Count(*microseconds)],
+            Self::Itemwise { function, line, column, route, items } => vec![Text(function), Count(*line), Count(*column), Text(route.name()), Count(*items)],
         }
     }
 }

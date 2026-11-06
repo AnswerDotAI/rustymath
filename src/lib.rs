@@ -57,7 +57,7 @@ mod vforce;
 pub use arc::{RealAcos, RealAsin};
 pub use arith::{
     Add, BitAnd, BitNot, BitOr, BitXor, Bitwise, Divide, LeftShift, MathishDivide, Multiply, Nand, Negate, Nor, Not, PiTimes, Reciprocal, RightShift, Subtract,
-    WholeDivide, bitwise,
+    bitwise,
 };
 pub use complex::{Cis, divide};
 pub use exp::{Exp, Expm1};

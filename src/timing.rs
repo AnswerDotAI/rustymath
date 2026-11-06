@@ -370,7 +370,7 @@ mod lock {
                     Err(TryLockError::Error(e)) => return Err(io::Error::new(e.kind(), format!("{path}: {e}")))
                 }
                 if self.start.elapsed() > Duration::from_secs(300) {
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, format!("{others} has held {LOCK} for 5 minutes")));
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, format!("{others} has held {LOCK} for 5 minutes. Processes with it open: {}", users())));
                 }
                 if !self.waiting { eprintln!("waiting for {others} to release {LOCK}"); }
                 if !self.shared && !self.reported && self.start.elapsed() > Duration::from_secs(30) {

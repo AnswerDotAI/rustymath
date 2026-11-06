@@ -673,8 +673,23 @@ fn boolean(view: View<'_>, i: usize) -> Result<bool, Error> {
     else { Err(overflow(x)) }
 }
 
-/// Convert one stored item using the destination dtype's checked conversion.
-pub trait Cast: Element { fn cast(view: View<'_>, item: usize) -> Result<Self, Error>; }
+/// Convert stored items using the destination dtype's checked conversion.
+pub trait Cast: Element {
+    /// Item `item` of `view`, or an error where it doesn't convert.
+    fn cast(view: View<'_>, item: usize) -> Result<Self, Error>;
+    /// Appends the first `len` items of `view` to `out`, each as [`Cast::cast`] converts it and [`kept`] keeps it. Element types override this with one typed loop for each source dtype they read often.
+    fn extend_cast(view: View<'_>, len: usize, checked: bool, out: &mut Vec<Self>) -> Result<(), Error> { itemwise(view, len, checked, out) }
+}
+/// `value`, or the fill where it didn't convert, unless `checked`.
+pub(crate) fn kept<T: Element>(value: Result<T, Error>, checked: bool) -> Result<T, Error> {
+    match value { Ok(value) => Ok(value), Err(error) if checked => Err(error), Err(_) => Ok(T::FILL) }
+}
+/// [`Cast::extend_cast`] one item at a time, through [`Cast::cast`].
+fn itemwise<T: Cast>(view: View<'_>, len: usize, checked: bool, out: &mut Vec<T>) -> Result<(), Error> {
+    out.reserve(len);
+    for i in 0..len { out.push(kept(T::cast(view, i), checked)?); }
+    Ok(())
+}
 fn numeric(view: View<'_>) -> Result<(), Error> {
     if matches!(view, View::Characters(_)) { Err(Error::new(Kind::Domain, "characters convert only to characters")) } else { Ok(()) }
 }
@@ -697,9 +712,32 @@ macro_rules! casts {
             let value = integer(view, item)?;
             Self::try_from(value).map_err(|_| overflow(value))
         }
+        // A checked cast first looks for an item that doesn't fit. The typed loop gives the fill for one.
+        fn extend_cast(view: View<'_>, len: usize, checked: bool, out: &mut Vec<Self>) -> Result<(), Error> {
+            match view {
+                View::Booleans(v) => out.extend(v[..len].iter().map(|&b| Self::from(b))),
+                View::Integers(v) => with_ints!(v, |v| {
+                    let v = &v[..len];
+                    if checked { if let Some(&x) = v.iter().find(|&&x| Self::try_from(x).is_err()) { return Err(overflow(x)); } }
+                    out.extend(v.iter().map(|&x| Self::try_from(x).unwrap_or(Self::FILL)));
+                }),
+                _ => return itemwise(view, len, checked, out),
+            }
+            Ok(())
+        }
     })+};
     (floats $($t:ty),+) => {$(impl Cast for $t {
         fn cast(view: View<'_>, item: usize) -> Result<Self, Error> { real(view, item).map(Source::<Self>::read) }
+        // Converting a real item can't fail.
+        fn extend_cast(view: View<'_>, len: usize, checked: bool, out: &mut Vec<Self>) -> Result<(), Error> {
+            match view {
+                View::Booleans(v) => out.extend(v[..len].iter().map(|&b| Source::<Self>::read(f64::from(u8::from(b))))),
+                View::Integers(v) => with_ints!(v, |v| out.extend(v[..len].iter().map(|&x| Source::<Self>::read(Source::<f64>::read(i64::from(x)))))),
+                View::Floats(v) => with_floats!(v, |v| out.extend(v[..len].iter().map(|&x| Source::<Self>::read(f64::from(x))))),
+                _ => return itemwise(view, len, checked, out),
+            }
+            Ok(())
+        }
     })+};
     (complex $($t:ty),+) => {$(impl Cast for $t {
         fn cast(view: View<'_>, item: usize) -> Result<Self, Error> {
@@ -781,7 +819,7 @@ impl Buffer {
             (View::Floats(values), DType::Integer(width)) => {
                 Ok(with_width!(width, I => I::buffer(with_floats!(values, |values| values.iter().map(|&x| crate::convert::saturated::<I, _>(x)).collect()))))
             }
-            (View::Integers(values), DType::Integer(width)) => {
+            (View::Integers(values), DType::Integer(width)) if !checked => {
                 Ok(with_width!(width, T => with_ints!(values, |values| T::buffer(values.iter().map(|&x| x as T).collect()))))
             }
             (View::Booleans(values), DType::Integer(width)) => Ok(with_width!(width, T => T::buffer(values.iter().map(|&x| x as T).collect()))),
@@ -795,9 +833,8 @@ impl Buffer {
                 Ok(Self::Characters(items))
             }
             _ => with_dtype!(dtype, T => {
-                let items = (0..view.len()).map(|i| match T::cast(view, i) {
-                    Ok(value) => Ok(value), Err(error) if checked => Err(error), Err(_) => Ok(T::FILL),
-                }).collect::<Result<Vec<_>, _>>()?;
+                let mut items = Vec::new();
+                T::extend_cast(view, view.len(), checked, &mut items)?;
                 Ok(T::buffer(items))
             }),
         }

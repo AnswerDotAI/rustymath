@@ -1,4 +1,4 @@
-//! Arithmetic as function objects. Addition, subtraction, multiplication and negation take every float and complex type and the integer types of compact buffers, `u8`, `i16`, `i32` and `i64`. Division, reciprocals and multiples of π take every float and complex type, and squares take floats. Exact division and reciprocals take the integer types, and bitwise and logical functions take them and Booleans. A float or complex result never fails. An integer sum, difference, product or negation that doesn't fit its type fails, and holds the result wrapped to the type, as NumPy gives it. Any other integer result that the type can't hold fails.
+//! Arithmetic as function objects. Addition, subtraction, multiplication and negation take every float and complex type and the integer types of compact buffers, `u8`, `i16`, `i32` and `i64`. Division, reciprocals and multiples of π take every float and complex type, and squares take floats. Reciprocals also take the integer types, where they floor, as integer division of 1 does. Bitwise and logical functions take them and Booleans. A float or complex result never fails. An integer sum, difference, product or negation that doesn't fit its type fails, and holds the result wrapped to the type, as NumPy gives it. Any other integer result that the type can't hold fails.
 use crate::{Abs, Sign, float::sealed::Sealed, slice::Total};
 use num_complex::Complex;
 
@@ -41,52 +41,37 @@ bitwise! {
     BitNot [x] !x;
 }
 
-/// Left shift, discarding high bits. A negative count or one at least the item width fails.
+/// Left shift, discarding high bits. A negative count shifts right, and a count at least the item width saturates to 0.
 #[derive(Clone, Copy, Debug)]
 pub struct LeftShift;
-/// Right shift, retaining the sign bit for signed integers. A negative count or one at least the item width fails.
+/// Right shift, retaining the sign bit for signed integers. A negative count shifts left, and a count at least the item width saturates to the sign.
 #[derive(Clone, Copy, Debug)]
 pub struct RightShift;
-forms!(LeftShift at u8, i16, i32, i64: |_, [x, y]| u32::try_from(y).ok().and_then(|y| x.checked_shl(y)));
-forms!(RightShift at u8, i16, i32, i64: |_, [x, y]| u32::try_from(y).ok().and_then(|y| x.checked_shr(y)));
+forms!(#[inline] LeftShift at u8, i16, i32, i64: |k, [x, y]| crate::facts::integer_at(k, [x, y]));
+forms!(#[inline] RightShift at u8, i16, i32, i64: |k, [x, y]| crate::facts::integer_at(k, [x, y]));
 
-// The float and complex forms are `#[inline]`, as the integer forms are, so that a caller's own loop over items, such as a fold's, inlines them.
-forms!(#[inline] Add at real: |_, [x, y]| Total(x + y));
-forms!(#[inline] Subtract at real: |_, [x, y]| Total(x - y));
-forms!(#[inline] Multiply at real: |_, [x, y]| Total(x * y));
-forms!(#[inline] Add at Complex<f32>, Complex<f64>: |_, [x, y]| Total(x + y));
-forms!(#[inline] Subtract at Complex<f32>, Complex<f64>: |_, [x, y]| Total(x - y));
-forms!(#[inline] Multiply at Complex<f32>, Complex<f64>: |_, [x, y]| Total(x * y));
-forms!(#[inline] Divide at real: |_, [x, y]| Total(x / y));
-forms!(#[inline] Divide at Complex<f32>, Complex<f64>: |_, [x, y]| Total(crate::divide(x, y)));
-forms!(#[inline] MathishDivide at real: |k, [x, y]| Total(crate::facts::formula_at(k, [x, y])));
-forms!(#[inline] MathishDivide at Complex<f32>, Complex<f64>: |_, [x, y]| Total(if both_zero(x, y) { x } else { crate::divide(x, y) }));
+/// Each object's float and complex forms, from the formula that the kernels run (`facts::formula_at`, `facts::complex_at`). The forms are `#[inline]`, as the integer forms are, so that a caller's own loop over items, such as a fold's, inlines them.
+macro_rules! formula_forms {
+    ($($object:ident [$($x:ident),+];)+) => {$(
+        forms!(#[inline] $object at real: |k, [$($x),+]| Total(crate::facts::formula_at(k, [$($x),+])));
+        forms!(#[inline] $object at Complex<f32>, Complex<f64>: |k, [$($x),+]| Total(crate::facts::complex_at(k, [$($x),+])));
+    )+};
+}
 
 /// -x. A float or complex result never fails. An integer result fails where it doesn't fit its type, as the negation of a signed type's least value or of an unsigned byte other than 0 doesn't, and holds the result wrapped to the type.
 #[derive(Clone, Copy, Debug)]
 pub struct Negate;
-/// 1 ÷ x. A float or complex result never fails. An integer's reciprocal is an integer only for 1 and -1, and fails for every other integer.
+/// 1 ÷ x. A float or complex result never fails. An integer's reciprocal floors, as integer [`FloorDivide`](crate::tolerant::FloorDivide) of 1 does: 1 gives 1, 2 or more give 0, -1 or less give -1, and 0 gives the type's greatest value.
 #[derive(Clone, Copy, Debug)]
 pub struct Reciprocal;
 /// π × x, or π × (x ÷ y) of two arguments, at every float and complex type.
 #[derive(Clone, Copy, Debug)]
 pub struct PiTimes;
-/// x ÷ y, of integers whose quotient is an integer. Any other quotient, or a zero or overflowing divisor, fails.
-#[derive(Clone, Copy, Debug)]
-pub struct WholeDivide;
-forms!(#[inline] Negate at real: |_, [x]| Total(-x));
-forms!(#[inline] Negate at Complex<f32>, Complex<f64>: |_, [x]| Total(-x));
-forms!(#[inline] Negate at u8, i16, i32, i64: |_, [x]| { let (r, overflowed) = x.overflowing_neg(); (r, !overflowed) });
-forms!(#[inline] Reciprocal at real: |k, [x]| Total(crate::facts::formula_at(k, [x])));
-forms!(#[inline] Reciprocal at Complex<f32>, Complex<f64>: |_, [x]| Total(crate::divide(Complex::new(1.0, 0.0), x)));
-forms!(#[inline] Reciprocal at u8, i16, i32, i64: |_, [x]| (x.checked_mul(x) == Some(1)).then_some(x));
-forms!(#[inline] PiTimes at real: |k, [x]| Total(crate::facts::formula_at(k, [x])));
-forms!(#[inline] PiTimes at real: |k, [x, y]| Total(crate::facts::formula_at(k, [x, y])));
-forms!(#[inline] PiTimes at Complex<f32>: |_, [x]| Total(x * std::f32::consts::PI));
-forms!(#[inline] PiTimes at Complex<f64>: |_, [x]| Total(x * std::f64::consts::PI));
-forms!(#[inline] PiTimes at Complex<f32>: |_, [x, y]| Total(crate::divide(x, y) * std::f32::consts::PI));
-forms!(#[inline] PiTimes at Complex<f64>: |_, [x, y]| Total(crate::divide(x, y) * std::f64::consts::PI));
-forms!(#[inline] WholeDivide at u8, i16, i32, i64: |_, [x, y]| if x.checked_rem(y) == Some(0) { x.checked_div(y) } else { None });
+formula_forms! {
+    Add [x, y]; Subtract [x, y]; Multiply [x, y]; Divide [x, y]; MathishDivide [x, y]; Negate [x]; Reciprocal [x]; PiTimes [x]; PiTimes [x, y];
+}
+forms!(#[inline] Negate at u8, i16, i32, i64: |k, [x]| crate::facts::integer_at(k, [x]));
+forms!(#[inline] Reciprocal at u8, i16, i32, i64: |k, [x]| crate::facts::integer_at(k, [x]));
 
 /// Applies the Boolean function whose truth table is `table`, indexed by `2*x+y`, to every bit of `x` and `y`, the leading sign bits included. It computes the table's algebraic normal form, `a0 ^ (a1 & x) ^ (a2 & y) ^ (a3 & x & y)`, with each coefficient spread to every bit, so every table runs the same code. A `match` on the table would put 16 paths into each loop that inlines it. It takes any integer type, exact ones included.
 #[inline]
@@ -104,6 +89,8 @@ pub(crate) fn bitwise_with<T: Clone>(table: u8, x: T, y: T, ones: T, and: impl F
 }
 
 /// [`bitwise`] with the truth table it holds, as a function object. One argument is the second, with 0 as the first. Booleans and the signed types hold every result, because each leading sign bit takes the same entry of the table. An unsigned byte computes at `i64`, where its leading zeros can become ones, and fails where the result doesn't fit.
+///
+/// Its kernels (`facts::Formula`) also take `f64` arguments that hold whole numbers, as those integers, and give `i64` results. Any other float fails. BPL's `ᵇ` and the Python wrapper's `bitwise_and`, `bitwise_or` and `bitwise_xor` run them.
 #[derive(Clone, Copy, Debug)]
 pub struct Bitwise(pub u8);
 forms!(#[inline] Bitwise at bool, i16, i32, i64: |k, [x, y]| bitwise(k.0, x, y));
@@ -121,19 +108,18 @@ pub struct Nand;
 /// See [`Not`].
 #[derive(Clone, Copy, Debug)]
 pub struct Nor;
-/// An integer that is 0 or 1 as a Boolean.
-#[inline]
-fn truth<T: Into<i64>>(x: T) -> Option<bool> { match x.into() { 0 => Some(false), 1 => Some(true), _ => None } }
-forms!(#[inline] Not at bool: |_, [x]| !x);
-forms!(#[inline] Nand at bool: |_, [x, y]| !(x & y));
-forms!(#[inline] Nor at bool: |_, [x, y]| !(x | y));
-forms!(#[inline] Not at u8 => bool, i16 => bool, i32 => bool, i64 => bool: |_, [x]| truth(x).map(|x| !x));
-forms!(#[inline] Nand at u8 => bool, i16 => bool, i32 => bool, i64 => bool: |_, [x, y]| truth(x).zip(truth(y)).map(|(x, y)| !(x & y)));
-forms!(#[inline] Nor at u8 => bool, i16 => bool, i32 => bool, i64 => bool: |_, [x, y]| truth(x).zip(truth(y)).map(|(x, y)| !(x | y)));
+forms!(#[inline] Not at bool: |k, [x]| crate::facts::table_at(k, [x]));
+forms!(#[inline] Nand at bool: |k, [x, y]| crate::facts::table_at(k, [x, y]));
+forms!(#[inline] Nor at bool: |k, [x, y]| crate::facts::table_at(k, [x, y]));
+forms!(#[inline] Not at u8 => bool, i16 => bool, i32 => bool, i64 => bool: |k, [x]| crate::facts::truth_at(k, [x]));
+forms!(#[inline] Nand at u8 => bool, i16 => bool, i32 => bool, i64 => bool: |k, [x, y]| crate::facts::truth_at(k, [x, y]));
+forms!(#[inline] Nor at u8 => bool, i16 => bool, i32 => bool, i64 => bool: |k, [x, y]| crate::facts::truth_at(k, [x, y]));
 
 /// An integer type's arithmetic. Each operation that can overflow gives its result wrapped to the type, and whether that is the exact result, so that a caller with exact integers can take another path. The tests have no branch, so a loop of them vectorizes. The one exception is a 64-bit product, because no vector instruction gives its 128-bit result. [`Add`], [`Subtract`], [`Multiply`], [`Abs`](crate::Abs) and [`Sign`](crate::Sign) run these on slices.
 pub trait Overflowing: crate::buffer::Cast + Ord + Into<i64> + Sealed {
     fn low(x: i64) -> Self;
+    /// The type's greatest value for a positive `sign`, its least for a negative one, and 0 for 0: the floor of a quotient by 0, and of a negative power of 0 where `sign` is 1.
+    fn limit(sign: i64) -> Self;
     /// x + y.
     fn plus(self, y: Self) -> (Self, bool);
     /// x - y.
@@ -160,6 +146,8 @@ macro_rules! signed {
         impl Overflowing for $t {
             fn low(x: i64) -> Self { x as $t }
             #[inline(always)]
+            fn limit(sign: i64) -> Self { match sign.signum() { 1 => <$t>::MAX, -1 => <$t>::MIN, _ => 0 } }
+            #[inline(always)]
             fn plus(self, y: Self) -> (Self, bool) { let s = self.wrapping_add(y); (s, ((self ^ s) & (y ^ s)) >= 0) }
             #[inline(always)]
             fn minus(self, y: Self) -> (Self, bool) { let d = self.wrapping_sub(y); (d, ((self ^ y) & (self ^ d)) >= 0) }
@@ -181,6 +169,8 @@ macro_rules! unsigned {
     ($($t:ty: |$x:ident, $y:ident| $times:expr),+) => {$(
         impl Overflowing for $t {
             fn low(x: i64) -> Self { x as $t }
+            #[inline(always)]
+            fn limit(sign: i64) -> Self { match sign.signum() { 1 => <$t>::MAX, -1 => <$t>::MIN, _ => 0 } }
             #[inline(always)]
             fn plus(self, y: Self) -> (Self, bool) { let s = self.wrapping_add(y); (s, s >= self) }
             #[inline(always)]

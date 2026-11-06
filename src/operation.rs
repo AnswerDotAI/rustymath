@@ -17,22 +17,22 @@ pub enum Direction { Left, Right }
 #[derive(Clone, Copy)]
 pub enum Seed<'a> { Identity, Initial(crate::agreement::Read<'a>), Tail(crate::agreement::Read<'a>) }
 
-/// Write positions from numeric indices or the addresses of a selection's root source.
+/// Write positions: numeric indices, the addresses of a selection's root source, or flat offsets. A write skips an invalid position: one outside the array, an invalid route position, or a [`crate::gather::Steps::FILL`] offset, as in [`crate::gather::Writes`].
 #[derive(Clone, Copy)]
-pub enum Positions<'a> { Indices(crate::agreement::Read<'a>, DType), Route(&'a crate::agreement::ReadPlan, usize) }
+pub enum Positions<'a> { Indices(crate::agreement::Read<'a>, DType), Route(&'a crate::agreement::ReadPlan, usize), Offsets(&'a [usize]) }
 
 impl Positions<'_> {
-    pub fn len(self) -> usize { match self { Self::Indices(read, _) => read.plan.len(), Self::Route(plan, _) => plan.len() } }
-    pub fn chunk(self, range: std::ops::Range<usize>, size: usize, checked: bool, scratch: &mut Buffer) -> Result<Vec<usize>, Error> {
+    pub fn len(self) -> usize { match self { Self::Indices(read, _) => read.plan.len(), Self::Route(plan, _) => plan.len(), Self::Offsets(offsets) => offsets.len() } }
+    /// The positions that `range` of these writes target in an array of `size` items. A position outside the array, an invalid route position and a `FILL` offset all give `FILL`, which writes nothing.
+    pub fn chunk(self, range: std::ops::Range<usize>, size: usize, scratch: &mut Buffer) -> Result<Vec<usize>, Error> {
         use crate::{agreement::ReadAt, gather::Steps};
         match self {
-            Self::Indices(read, dtype) => crate::structure::positions_mode(read.part_view(range, dtype, checked, scratch)?, size, checked),
-            Self::Route(plan, root) => range.map(|i| match plan.at(i) {
-                ReadAt::Input { source, position } if source == root && position < size => Ok(position),
-                ReadAt::Invalid => Err(Error::new(Kind::Index, "a checked selection has an invalid position")),
-                ReadAt::Input { source, .. } if source == root && checked => Err(Error::new(Kind::Index, "write position is outside the array")),
-                _ => Ok(Steps::FILL),
-            }).collect(),
+            Self::Indices(read, dtype) => crate::structure::positions(read.part_view(range, dtype, false, scratch)?, size),
+            Self::Route(plan, root) => Ok(range.map(|i| match plan.at(i) {
+                ReadAt::Input { source, position } if source == root && position < size => position,
+                _ => Steps::FILL,
+            }).collect()),
+            Self::Offsets(offsets) => Ok(offsets[range].iter().map(|&o| if o < size { o } else { Steps::FILL }).collect()),
         }
     }
 }
@@ -55,6 +55,7 @@ impl WriteRoot<'_> {
     }
 }
 
+/// A compiled fold's total over `items` items, as its 8-byte slot holds it: a float as an f64's bits, an integer extended to 64 bits, and a Boolean as 0 or 1.
 #[derive(Clone, Copy, Debug)]
 pub struct Total { pub items: usize, pub bits: u64 }
 impl Total {
@@ -69,9 +70,7 @@ impl Total {
                 };
                 T::cast(View::Integers(Ints::I64(&[value])), 0)
             }
-            DType::Float(FloatWidth::F16) => T::cast(View::Floats(Floats::F16(&[half::f16::from_bits(self.bits as u16)])), 0),
-            DType::Float(FloatWidth::F32) => T::cast(View::Floats(Floats::F32(&[f32::from_bits(self.bits as u32)])), 0),
-            DType::Float(FloatWidth::F64) => T::cast(View::Floats(Floats::F64(&[f64::from_bits(self.bits)])), 0),
+            DType::Float(_) => T::cast(View::Floats(Floats::F64(&[f64::from_bits(self.bits)])), 0),
             _ => Err(Error::new(Kind::Domain, "compiled totals have a real machine dtype")),
         }
     }
@@ -84,7 +83,7 @@ pub type Pieces<'a> = dyn Fn(std::ops::Range<usize>, &mut dyn FnMut(usize, Piece
 /// One resolved mathematical definition and its captured numerical policies.
 #[derive(Clone)]
 pub struct Kernel {
-    pub variant: crate::facts::Variant, result: DType, boolean_inputs: bool, typed_domain: bool, repair: bool, raising: bool,
+    pub variant: crate::facts::Variant, result: DType, boolean_inputs: bool, repair: bool, raising: bool,
     policy: Option<crate::characters::Policy>, definition: std::sync::Arc<dyn Application>
 }
 
@@ -97,9 +96,11 @@ impl std::fmt::Debug for Kernel {
 trait Application: Send + Sync {
     fn exact(&self, args: &[num_rational::BigRational]) -> Result<Option<num_rational::BigRational>, Error>;
     fn has_exact(&self) -> bool;
+    fn integer(&self, variant: crate::facts::Variant, args: &[i64]) -> Result<i64, Error>;
     fn real(&self, variant: crate::facts::Variant, args: &[f64], settings: Settings, repair: bool) -> Result<f64, Error>;
     fn complex(&self, variant: crate::facts::Variant, args: &[num_complex::Complex64], settings: Settings) -> Result<num_complex::Complex64, Error>;
     fn arity(&self) -> usize;
+    fn inputs(&self) -> &[crate::facts::Range];
     fn integer_formula(&self) -> bool;
     fn ordered_kinds(&self, classes: [i32; 2]) -> Option<crate::characters::ByKinds>;
     fn may_raise(&self, variant: crate::facts::Variant, ranges: &[crate::facts::Range]) -> bool;
@@ -113,7 +114,6 @@ trait Application: Send + Sync {
         &self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>,
         x: &[crate::facts::Slot]) -> Option<crate::facts::Slot>;
     fn repair_routine(&self) -> Option<crate::facts::Repair>;
-    fn needs_repair(&self, variant: crate::facts::Variant, ranges: &[crate::facts::Range]) -> Option<bool>;
     fn validity(
         &self, variant: crate::facts::Variant,
         ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>,
@@ -122,21 +122,26 @@ trait Application: Send + Sync {
         &self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>,
         x: &[crate::facts::Slot], result: crate::facts::Slot, needed: &[bool], output: &mut [Option<crate::facts::Slot>]);
     fn range(&self, x: &[crate::facts::Range]) -> crate::facts::Range;
-    fn domain(&self, dtype: DType, x: &[crate::facts::Range]) -> bool;
     fn identity(&self) -> Option<f64>;
-    fn fold(&self) -> Option<crate::reduce::Reduce>;
+    fn kept(&self, constants: &[Option<f64>]) -> Option<usize>;
+    fn reduction(&self, variant: crate::facts::Variant) -> Option<crate::reduce::Reduce>;
+    fn inverse_fold(&self) -> Option<crate::reduce::Reduce>;
     fn truth_table(&self) -> Option<u8>;
     fn product(
         &self, variant: crate::facts::Variant, fold: Option<crate::reduce::Reduce>, boolean_inputs: bool, wanted: Option<DType>, settings: Settings
     ) -> Option<NativeProduct>;
+    /// `judged`: whether each item's result is checked for errors, which a kernel skips where its arguments' types can't make one (`Kernel::may_raise`).
     fn map(
         &self, variant: crate::facts::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, repair: bool,
-        output: &mut Buffer) -> Result<(), Error>;
+        judged: bool, output: &mut Buffer) -> Result<(), Error>;
     fn fold_pieces(
         &self, variant: crate::facts::Variant, dims: [usize; 3], seed: Seed<'_>, direction: Direction, settings: Settings, pieces: &Pieces<'_>,
         output: &mut Buffer) -> Result<(), Error>;
     fn fold_read(
         &self, variant: crate::facts::Variant, shape: &[usize], axis: usize, seed: Seed<'_>, direction: Direction, settings: Settings,
+        input: crate::agreement::Read<'_>, output: &mut Buffer) -> Result<(), Error>;
+    fn adjacent(
+        &self, variant: crate::facts::Variant, dims: [usize; 3], seed: Option<crate::agreement::Read<'_>>, flip: bool, settings: Settings,
         input: crate::agreement::Read<'_>, output: &mut Buffer) -> Result<(), Error>;
     fn at(
         &self, variant: crate::facts::Variant, root: WriteRoot<'_>, values: crate::agreement::Read<'_>, ids: Positions<'_>, checked: bool, codes: bool,
@@ -147,7 +152,8 @@ trait Application: Send + Sync {
         output: &mut Buffer) -> Result<(), Error>;
 }
 
-struct Definition<K, const N: usize> { object: K }
+/// `object`, for arguments whose values lie in `inputs`, the ranges of their types.
+struct Definition<K, const N: usize> { object: K, inputs: [crate::facts::Range; N] }
 
 impl<K: crate::facts::Formula<N>, const N: usize> Application for Definition<K, N> {
     fn exact(&self, args: &[num_rational::BigRational]) -> Result<Option<num_rational::BigRational>, Error> {
@@ -155,6 +161,17 @@ impl<K: crate::facts::Formula<N>, const N: usize> Application for Definition<K, 
         self.object.exact(std::array::from_fn(|i| &args[i]))
     }
     fn has_exact(&self) -> bool { self.object.has_exact() }
+    fn integer(&self, variant: crate::facts::Variant, args: &[i64]) -> Result<i64, Error> {
+        let x: [i64; N] = args.try_into().map_err(|_| Error::new(Kind::Length, "scalar operand count changed"))?;
+        let width = match variant.dtype {
+            DType::Integer(w) => w, DType::Boolean => Width::U8,
+            _ => return Err(Error::new(Kind::Domain, "an integer scalar call needs an integer computing dtype")),
+        };
+        with_width!(width, I => {
+            let ops = crate::recipe::IntegerOps::<I>::new(variant);
+            crate::error::checked(|| scalar_result(integer_value(&self.object, variant, &ops, x.map(<I as crate::recipe::Overflowing>::low)))).map(Into::into)
+        })
+    }
     fn real(&self, variant: crate::facts::Variant, args: &[f64], settings: Settings, repair: bool) -> Result<f64, Error> {
         let x: [f64; N] = args.try_into().map_err(|_| Error::new(Kind::Length, "scalar operand count changed"))?;
         let ops = crate::recipe::NativeOps::<{ crate::FUSED }> { tolerance: settings.tolerance };
@@ -180,10 +197,14 @@ impl<K: crate::facts::Formula<N>, const N: usize> Application for Definition<K, 
         }
     }
     fn arity(&self) -> usize { N }
+    fn inputs(&self) -> &[crate::facts::Range] { &self.inputs }
     fn integer_formula(&self) -> bool { self.object.integer_formula() }
     fn may_raise(&self, variant: crate::facts::Variant, ranges: &[crate::facts::Range]) -> bool {
+        if variant.dtype == DType::Boolean && ranges.iter().all(|r| r.within(0.0, 1.0)) { return boolean_raises(&self.object, variant); }
         if matches!(variant.dtype, DType::Complex(_)) || variant.dtype.is_integral() && !self.object.integer_formula() { return true; }
         let Ok(args) = ranges.try_into() else { return true; };
+        // A float result raises only outside the domain that the formula declares (`Formula::domain`): range arithmetic can't show that a result isn't NaN.
+        if matches!(variant.dtype, DType::Float(_)) && self.object.domain(variant.dtype, args).is_some() { return false; }
         self.object.emit_valid::<f64, _>(variant, &crate::recipe::RangeOps(variant.dtype), args, self.object.range(args))
             .is_some_and(|(_, valid)| valid != Some(true))
     }
@@ -197,9 +218,6 @@ impl<K: crate::facts::Formula<N>, const N: usize> Application for Definition<K, 
         &self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>,
         x: &[crate::facts::Slot]) -> Option<crate::facts::Slot> { self.object.emit_repair(ops, x.try_into().ok()?) }
     fn repair_routine(&self) -> Option<crate::facts::Repair> { crate::facts::Formula::repair_routine(&self.object) }
-    fn needs_repair(&self, variant: crate::facts::Variant, ranges: &[crate::facts::Range]) -> Option<bool> {
-        self.object.emit_repair::<f64, _>(&crate::recipe::RangeOps(variant.dtype), ranges.try_into().ok()?)?
-    }
     fn validity(
         &self, variant: crate::facts::Variant,
         ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>,
@@ -213,20 +231,25 @@ impl<K: crate::facts::Formula<N>, const N: usize> Application for Definition<K, 
         output.copy_from_slice(&self.object.emit_partials(ops, x, result, needed));
     }
     fn range(&self, x: &[crate::facts::Range]) -> crate::facts::Range { x.try_into().map_or(crate::facts::Range::ANY, |x| self.object.range(x)) }
-    fn domain(&self, dtype: DType, x: &[crate::facts::Range]) -> bool { x.try_into().is_ok_and(|x| !self.object.has_domain() || self.object.domain(dtype, x).is_some()) }
     fn ordered_kinds(&self, classes: [i32; 2]) -> Option<crate::characters::ByKinds> {
         if N != 2 || self.object.character_rule() != Some(crate::characters::Rule::Ordered) { return None; }
         Some(crate::characters::ByKinds::ordered(classes, self.object.ordered_kinds(classes)?, self.object.boolean()))
     }
     fn identity(&self) -> Option<f64> { self.object.identity().last().copied().flatten() }
-    fn fold(&self) -> Option<crate::reduce::Reduce> { self.object.fold() }
+    fn kept(&self, constants: &[Option<f64>]) -> Option<usize> {
+        let identity = self.object.identity();
+        if N != 2 || constants.len() != 2 { return None; }
+        [1, 0].into_iter().find(|&i| constants[i].is_some() && constants[i] == identity[i]).map(|i| 1 - i)
+    }
+    fn reduction(&self, variant: crate::facts::Variant) -> Option<crate::reduce::Reduce> { reduction(&self.object, variant) }
+    fn inverse_fold(&self) -> Option<crate::reduce::Reduce> { self.object.inverse_fold() }
     fn truth_table(&self) -> Option<u8> { self.object.truth_table() }
     fn product(
         &self, variant: crate::facts::Variant, fold: Option<crate::reduce::Reduce>, boolean_inputs: bool, wanted: Option<DType>, settings: Settings
     ) -> Option<NativeProduct> { product_for::<K, N>(&self.object, variant, fold, boolean_inputs, wanted, settings) }
     fn map(
         &self, variant: crate::facts::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, repair: bool,
-        output: &mut Buffer) -> Result<(), Error> { map_formula::<K, N>(&self.object, variant, inputs, range, settings, repair, output) }
+        judged: bool, output: &mut Buffer) -> Result<(), Error> { map_formula::<K, N>(&self.object, variant, inputs, range, settings, repair, judged, output) }
     fn fold_pieces(
         &self, variant: crate::facts::Variant, dims: [usize; 3], seed: Seed<'_>, direction: Direction, settings: Settings, pieces: &Pieces<'_>,
         output: &mut Buffer) -> Result<(), Error> { fold_formula::<K, N>(&self.object, variant, dims, seed, direction, settings, pieces, output) }
@@ -234,6 +257,11 @@ impl<K: crate::facts::Formula<N>, const N: usize> Application for Definition<K, 
         &self, variant: crate::facts::Variant, shape: &[usize], axis: usize, seed: Seed<'_>, direction: Direction, settings: Settings,
         input: crate::agreement::Read<'_>, output: &mut Buffer) -> Result<(), Error> {
         fold_read_formula::<K, N>(&self.object, variant, shape, axis, seed, direction, settings, input, output)
+    }
+    fn adjacent(
+        &self, variant: crate::facts::Variant, dims: [usize; 3], seed: Option<crate::agreement::Read<'_>>, flip: bool, settings: Settings,
+        input: crate::agreement::Read<'_>, output: &mut Buffer) -> Result<(), Error> {
+        adjacent_formula::<K, N>(&self.object, variant, dims, seed, flip, settings, input, output)
     }
     fn at(
         &self, variant: crate::facts::Variant, root: WriteRoot<'_>, values: crate::agreement::Read<'_>, ids: Positions<'_>, checked: bool, codes: bool,
@@ -263,7 +291,7 @@ impl Kernel {
             (1, true) => picked!(crate::Asin, crate::RealAsin), (2, true) => picked!(crate::Acos, crate::RealAcos),
             (3, true) => picked!(crate::Atan, crate::Atan), (4, true) => picked!(crate::Sqrtx2m1, crate::RealSqrtx2m1),
             (5, true) => picked!(crate::Asinh, crate::Asinh), (6, true) => picked!(crate::Acosh, crate::RealAcosh),
-            (7, true) => picked!(crate::Atanh, crate::RealAtanh), (8, inverse) => Self::try_resolve(crate::sqrts::Sqrtm1mx2(inverse), variant, types),
+            (7, true) => picked!(crate::Atanh, crate::RealAtanh), (8, inverse) => picked!(crate::sqrts::Sqrtm1mx2(inverse), crate::RealSqrtm1mx2(inverse)),
             _ => return Ok(None)
         })? else { return Ok(None); };
         if real_part && let DType::Complex(width) = kernel.result { kernel.result = DType::Float(width.into()); }
@@ -273,7 +301,7 @@ impl Kernel {
         use crate::recipe::Unary::*;
         macro_rules! kernel {
             ($object:expr) => {
-                crate::facts::Formula::kernel(&$object, variant).map(|mut kernel| { kernel.typed_domain = true; kernel })
+                crate::facts::Formula::kernel(&$object, variant)
             };
         }
         match op {
@@ -288,7 +316,7 @@ impl Kernel {
         use crate::recipe::Binary::*;
         macro_rules! kernel {
             ($object:expr) => {
-                crate::facts::Formula::kernel(&$object, variant).map(|mut kernel| { kernel.typed_domain = true; kernel })
+                crate::facts::Formula::kernel(&$object, variant)
             };
         }
         match op {
@@ -306,11 +334,13 @@ impl Kernel {
     pub fn integer_compare(op: crate::recipe::Cmp, variant: crate::facts::Variant) -> Option<Self> {
         crate::facts::Formula::kernel(&crate::facts::IntegerComparison(op), variant)
     }
-    pub fn new<K: crate::facts::Formula<N>, const N: usize>(object: K, variant: crate::facts::Variant) -> Self {
-        let (result, typed_domain) = (object.result_dtype(variant.dtype), object.typed_domain([variant.dtype; N]));
-        let definition: std::sync::Arc<dyn Application> = std::sync::Arc::new(Definition::<K, N> { object });
-        let raising = definition.may_raise(variant, &[crate::facts::Range::ANY; N]);
-        Self { repair: true, raising, typed_domain, result, policy: None, boolean_inputs: variant.dtype == DType::Boolean, variant, definition }
+    pub fn new<K: crate::facts::Formula<N>, const N: usize>(object: K, variant: crate::facts::Variant) -> Self { Self::typed(object, variant, [variant.dtype; N]) }
+    /// The kernel for arguments of `types`, whose values bound the errors it can raise (`may_raise`).
+    fn typed<K: crate::facts::Formula<N>, const N: usize>(object: K, variant: crate::facts::Variant, types: [DType; N]) -> Self {
+        let result = object.result_dtype(variant.dtype);
+        let definition: std::sync::Arc<dyn Application> = std::sync::Arc::new(Definition::<K, N> { object, inputs: types.map(Range::of_dtype) });
+        let raising = definition.may_raise(variant, definition.inputs());
+        Self { repair: true, raising, result, policy: None, boolean_inputs: types.iter().all(|&d| d == DType::Boolean), variant, definition }
     }
     pub fn try_resolve<K: crate::facts::Formula<N>, const N: usize>(object: K, mut variant: crate::facts::Variant, types: [DType; N]) -> Result<Option<Self>, Error> {
         use crate::characters::{ByKinds, Policy};
@@ -339,12 +369,9 @@ impl Kernel {
                 object.result_dtype(variant.dtype)
             }
         };
-        let typed_domain = object.typed_domain(types);
-        let mut kernel = Self::new(object, variant);
+        let mut kernel = Self::typed(object, variant, types);
         kernel.result = result;
         kernel.policy = characters;
-        kernel.typed_domain = typed_domain;
-        kernel.boolean_inputs = types.iter().all(|&d| d == DType::Boolean);
         Ok(Some(kernel))
     }
     pub fn arity(&self) -> usize { self.definition.arity() }
@@ -366,9 +393,11 @@ impl Kernel {
     }
     pub fn exact(&self, args: &[num_rational::BigRational]) -> Result<Option<num_rational::BigRational>, Error> { self.definition.exact(args) }
     pub fn has_exact(&self) -> bool { self.definition.has_exact() }
-    pub fn real(&self, args: &[f64], settings: Settings) -> Result<f64, Error> { self.definition.real(self.variant, args, settings, self.repair) }
+    /// The formula on one item of each integer argument, at the kernel's integer computing width, with its checked or wrapping variant. A Boolean computing kind reads 0 and 1.
+    pub fn integers(&self, args: &[i64]) -> Result<i64, Error> { self.definition.integer(self.variant, args) }
+    pub fn real(&self, args: &[f64], settings: Settings) -> Result<f64, Error> { crate::error::checked(|| self.definition.real(self.variant, args, settings, self.repair)) }
     pub fn complex(&self, args: &[num_complex::Complex64], settings: Settings) -> Result<num_complex::Complex64, Error> {
-        let value = self.definition.complex(self.variant, args, settings)?;
+        let value = crate::error::checked(|| self.definition.complex(self.variant, args, settings))?;
         Ok(if matches!(self.result, DType::Complex(_)) { value } else { num_complex::Complex64::new(value.re, 0.0) })
     }
     fn kind_result<T: Copy>(&self, x: &[T], truth: impl FnOnce(bool) -> T) -> Option<T> {
@@ -382,7 +411,7 @@ impl Kernel {
         &self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>,
         x: &[crate::facts::Slot]) -> Option<crate::facts::Slot> {
         if let Some(result) = self.kind_result(x, |value| ops.equal(ops.number(0.0), ops.number(u8::from(!value) as f64))) { return Some(result); }
-        if self.variant.dtype.is_integral() && self.variant.checked && !self.variant.wrapping && !self.definition.integer_formula() { return None; }
+        if self.variant.dtype.is_integral() && self.variant.fails_on_overflow() && !self.definition.integer_formula() { return None; }
         self.definition.formula(ops, x)
     }
     pub fn test(
@@ -395,13 +424,16 @@ impl Kernel {
         &self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>,
         x: &[crate::facts::Slot]) -> Option<crate::facts::Slot> { self.definition.repair_predicate(ops, x) }
     pub fn repair_routine(&self) -> Option<crate::facts::Repair> { if self.repair { self.definition.repair_routine() } else { None } }
-    pub fn ranged(mut self, ranges: &[crate::facts::Range]) -> Self {
-        self.repair = self.definition.needs_repair(self.variant, ranges) != Some(false);
-        self.raising = self.definition.may_raise(self.variant, ranges);
-        self
-    }
-    /// Whether checked execution can record a numeric data error.
+    /// Whether checked execution can record a numeric data error, for arguments that hold any values of their types.
     pub fn may_raise(&self) -> bool { self.variant.checked && (self.result == DType::Character || self.raising) }
+    /// Whether checked execution can record a numeric data error where each argument holds values of its type within its range in `narrowed`, such as a constant's own value or the nonnegative numbers.
+    pub fn may_raise_on(&self, narrowed: &[Range]) -> bool {
+        self.variant.checked && (self.result == DType::Character || self.definition.may_raise(self.variant, &self.points(narrowed)))
+    }
+    /// Whether every result is nonnegative where each argument holds values of its type within its range in `narrowed`. A fold by a dyadic formula keeps the fact where `nonnegative_on(&[Range::NONNEGATIVE; 2])` holds.
+    pub fn nonnegative_on(&self, narrowed: &[Range]) -> bool { self.range(&self.points(narrowed)).lo >= 0.0 }
+    /// Each argument's range: its type's values within its range in `narrowed`.
+    fn points(&self, narrowed: &[Range]) -> Vec<Range> { self.definition.inputs().iter().zip(narrowed).map(|(&range, &n)| range.meet(n)).collect() }
     pub fn validity(
         &self, ops: &dyn crate::recipe::Ops<f64, V = crate::facts::Slot, B = crate::facts::Slot, I = crate::facts::Slot, W = crate::facts::Slot>,
         x: &[crate::facts::Slot], result: crate::facts::Slot) -> Option<(Kind, crate::facts::Slot)> {
@@ -422,16 +454,13 @@ impl Kernel {
     pub fn range(&self, x: &[crate::facts::Range]) -> crate::facts::Range {
         self.kind_result(x, |value| Range::of(Some(u8::from(value) as f64))).unwrap_or_else(|| self.definition.range(x))
     }
-    /// Whether the computing kind or bounds rule out real-to-complex promotion. Validity is checked separately.
-    pub fn domain(&self, x: &[crate::facts::Range]) -> bool {
-        matches!(self.variant.dtype, DType::Complex(_)) || self.typed_domain || self.definition.domain(self.variant.dtype, x)
-    }
     pub fn identity(&self) -> Option<f64> { self.definition.identity() }
-    pub fn fold(&self) -> Option<crate::reduce::Reduce> { self.definition.fold() }
-    /// Bounds every partial result, using a finite count only for associative reductions.
-    pub fn fold_range(&self, items: Range, seed: Option<Range>, len: usize) -> Range {
-        Range::folded(items, seed, self.fold().map(|_| len), |args| self.range(&args))
-    }
+    /// The argument that a dyadic call returns unchanged where `constants` gives the arguments that are one number, 0 for the left and 1 for the right, from the formula's identities: `x+0` and `0+x` keep `x`, `x-0` keeps `x`, and `0-x` keeps nothing.
+    pub fn kept(&self, constants: &[Option<f64>]) -> Option<usize> { self.definition.kept(constants) }
+    /// The reduction by which a fold through this kernel combines its items, as `reduction` gives it at the kernel's variant.
+    pub fn fold(&self) -> Option<crate::reduce::Reduce> { self.definition.reduction(self.variant) }
+    /// The reduction that an unseeded right fold by this formula runs as an alternating one, as `-` runs as an alternating `+`.
+    pub fn inverse_fold(&self) -> Option<crate::reduce::Reduce> { self.definition.inverse_fold() }
     pub fn truth_table(&self) -> Option<u8> { self.definition.truth_table() }
     pub fn total_dtype(&self) -> Option<DType> { self.fold()?.total_dtype(self.variant) }
     pub fn fold_dtype(&self, input: DType, len: usize, seed: Option<DType>) -> DType {
@@ -463,11 +492,11 @@ impl Kernel {
                 inputs[side].read_into(range, self.result, self.variant.checked, output)?;
             }
             Some(Policy::Codes { .. }) => {
-                with_codes(inputs, Some(range.clone()), |inputs| self.definition.map(self.variant, inputs, range, settings, self.repair, output))?
+                with_codes(inputs, Some(range.clone()), |inputs| self.definition.map(self.variant, inputs, range, settings, self.repair, self.may_raise(), output))?
             }
-            None => self.definition.map(self.variant, inputs, range, settings, self.repair, output)?,
+            None => self.definition.map(self.variant, inputs, range, settings, self.repair, self.may_raise(), output)?,
         }
-        finish(output, wanted, self.variant.checked)
+        finish(output, wanted, self.variant)
     }
     pub fn fold_pieces(
         &self, dims: [usize; 3], seed: Seed<'_>, direction: Direction, settings: Settings, pieces: &Pieces<'_>, output: &mut Buffer) -> Result<(), Error> {
@@ -480,7 +509,7 @@ impl Kernel {
             };
             with_code_inputs(&[], seed, |_, seed| self.definition.fold_pieces(self.variant, dims, seed, direction, settings, &projected, output))?;
         } else { self.definition.fold_pieces(self.variant, dims, seed, direction, settings, pieces, output)?; }
-        finish(output, dtype, self.variant.checked)
+        finish(output, dtype, self.variant)
     }
     pub fn scan(
         &self, dims: [usize; 3], seed: Seed<'_>, direction: Direction, settings: Settings, input: crate::agreement::Read<'_>, output: &mut Buffer
@@ -489,7 +518,20 @@ impl Kernel {
         if matches!(self.policy, Some(crate::characters::Policy::Codes { .. })) {
             with_code_inputs(&[input], seed, |inputs, seed| self.definition.scan(self.variant, dims, seed, direction, settings, inputs[0], output))?;
         } else { self.definition.scan(self.variant, dims, seed, direction, settings, input, output)?; }
-        finish(output, dtype, self.variant.checked)
+        finish(output, dtype, self.variant)
+    }
+    /// Each item of `input`, an array of shape `dims`, combined with the item a row before it along the middle axis, and each lane's first row with `seed`, or kept as it is without one, as an inverse scan runs: `flip` swaps the arguments, so the earlier item comes second. The results take `output`'s dtype, so a comparison's 0s and 1s and an unseeded first row keep the items' type where the caller asks for it.
+    pub fn adjacent(
+        &self, dims: [usize; 3], seed: Option<crate::agreement::Read<'_>>, flip: bool, settings: Settings, input: crate::agreement::Read<'_>, output: &mut Buffer
+    ) -> Result<(), Error> {
+        let dtype = output.dtype();
+        if matches!(self.policy, Some(crate::characters::Policy::Codes { .. })) {
+            with_code_inputs(&[input], seed.map_or(Seed::Identity, Seed::Initial), |inputs, seed| {
+                let seed = match seed { Seed::Initial(read) | Seed::Tail(read) => Some(read), Seed::Identity => None };
+                self.definition.adjacent(self.variant, dims, seed, flip, settings, inputs[0], output)
+            })?;
+        } else { self.definition.adjacent(self.variant, dims, seed, flip, settings, input, output)?; }
+        finish(output, dtype, self.variant)
     }
     pub fn fold_read(
         &self, shape: &[usize], axis: usize, seed: Seed<'_>, direction: Direction, settings: Settings, input: crate::agreement::Read<'_>, output: &mut Buffer
@@ -500,7 +542,7 @@ impl Kernel {
                 self.definition.fold_read(self.variant, shape, axis, seed, direction, settings, inputs[0], output)
             })?;
         } else { self.definition.fold_read(self.variant, shape, axis, seed, direction, settings, input, output)?; }
-        finish(output, dtype, self.variant.checked)
+        finish(output, dtype, self.variant)
     }
 }
 
@@ -524,7 +566,7 @@ fn choose_typed<T: crate::buffer::Cast>(
         crate::parallel::extended(output, range.len(), crate::CHUNK, &|range, slots| {
             let part = |read: crate::agreement::Read<'_>| if read.plan.len() == 1 { 0..1 } else { start + range.start..start + range.end };
             let mut indices = Buffer::with_capacity(selector.1, 0);
-            let positions = Positions::Indices(selector.0, selector.1).chunk(part(selector.0), choices.len(), checked, &mut indices);
+            let positions = Positions::Indices(selector.0, selector.1).chunk(part(selector.0), choices.len(), &mut indices);
             let mut storage: Vec<Vec<T>> = choices.iter().map(|_| Vec::new()).collect();
             let args = choices.iter().zip(&mut storage).map(|(read, scratch)| read.part::<T>(part(*read), checked, scratch)).collect::<Result<Vec<_>, _>>();
             match positions.and_then(|positions| args.map(|args| (positions, args))) {
@@ -554,7 +596,7 @@ pub fn product(
             with_codes(&inputs, None, |inputs| (native.run)(map.variant, [inputs[0], inputs[1]], plan, output))?
         } else { (native.run)(map.variant, inputs, plan, output)? };
         if ran {
-            return finish(output, dtype, (map.variant.checked || fold.variant.checked) && !map.variant.wrapping);
+            return finish(output, dtype, crate::facts::Variant { checked: map.variant.checked || fold.variant.checked, ..map.variant });
         }
     }
     let plans = std::array::from_fn::<_, 2, _>(|i| inputs[i].plan.remapped(plan.mappings[i].clone(), plan.iteration.count(), Missing::Invalid));
@@ -584,31 +626,37 @@ fn product_for<K: crate::facts::Formula<N>, const N: usize>(
     if wanted == Some(DType::Boolean) && !boolean_inputs { return None; }
     if matches!(wanted, Some(DType::Boolean | DType::Float(FloatWidth::F16))) { variant.dtype = wanted.unwrap(); }
     if !variant.wrapping && matches!(variant.dtype, DType::Integer(_)) { variant.dtype = DType::Integer(Width::I64); }
+    let truth = if boolean_inputs { object.truth_table() } else { None };
     macro_rules! pairs {
         (($($arg:tt)*) folds {$($folds:tt)*} booleans {$($booleans:tt)*}
             products {$($pair:ident: [$(($map:ty, $reduce:ident)),*] at [$($t:ty),*] $(wrapping [$($wt:ty),*])? => [$($names:tt)*];)*}
-            boolean_products {$($bp:ident: [$(($bm:ty, $bf:ident)),*] at [$($bt:ty),*] => [$($bn:tt)*];)*}
+            boolean_products {$($bp:ident: [$(($bm:path, $bf:ident)),*] at [$($bt:ty),*] => [$($bn:tt)*];)*}
         ) => {
-            pairs!(@rows $($pair: [$(($map, $reduce)),*] at [$($t),*] $(wrapping [$($wt),*])?;)* $($bp: [$(($bm, $bf)),*] at [$($bt),*];)*);
+            $(if false $(|| (TypeId::of::<K>() == TypeId::of::<$map>() && fold == crate::reduce::Reduce::$reduce))* {
+                pairs!(@run $pair at [$($t),*] $(wrapping [$($wt),*])?);
+            })*
+            // A Boolean row also takes a function on Booleans with its map's truth table, as `∧` and `∨` (`tolerant::Lcm`, `tolerant::Gcd`) have `BitAnd`'s and `BitOr`'s.
+            $(if false $(|| ((TypeId::of::<K>() == TypeId::of::<$bm>() || truth.is_some() && truth == crate::facts::Formula::<2>::truth_table(&$bm))
+                && fold == crate::reduce::Reduce::$bf))* {
+                pairs!(@run $bp at [$($bt),*]);
+            })*
         };
-        (@rows $($pair:ident: [$(($map:ty, $reduce:ident)),*] at [$($t:ty),*] $(wrapping [$($wt:ty),*])?;)*) => {$(
-            if false $(|| (TypeId::of::<K>() == TypeId::of::<$map>() && fold == crate::reduce::Reduce::$reduce))* {
-                let pair = crate::linalg::Product::$pair;
-                if wanted.is_some() && pair.compares_exactly() && !variant.dtype.is_integral() && settings.tolerance.or(object.tolerance()).unwrap_or(0.0) != 0.0 { return None; }
-                if !(variant.wrapping && matches!(variant.dtype, DType::Integer(_))) {
-                    $(if variant.dtype == <$t as Element>::DTYPE {
-                        let result = product_result::<$t, crate::linalg::$pair>(variant);
-                        if wanted.is_some_and(|d| d != result) { return None; }
-                        return Some(NativeProduct { result, run: |v, x, p, out| product_typed::<$t, _>(crate::linalg::$pair, v, x, p, out) });
-                    })*
-                }
-                $($(if variant.wrapping && variant.dtype == <$wt as Element>::DTYPE {
-                    let result = variant.dtype;
+        (@run $pair:ident at [$($t:ty),*] $(wrapping [$($wt:ty),*])?) => {{
+            let pair = crate::linalg::Product::$pair;
+            if wanted.is_some() && pair.compares_exactly() && !variant.dtype.is_integral() && settings.tolerance.or(object.tolerance()).unwrap_or(0.0) != 0.0 { return None; }
+            if !(variant.wrapping && matches!(variant.dtype, DType::Integer(_))) {
+                $(if variant.dtype == <$t as Element>::DTYPE {
+                    let result = product_result::<$t, crate::linalg::$pair>(variant);
                     if wanted.is_some_and(|d| d != result) { return None; }
-                    return Some(NativeProduct { result, run: |v, x, p, out| product_typed::<$wt, _>(crate::Wrapped(crate::linalg::$pair), v, x, p, out) });
-                })*)?
+                    return Some(NativeProduct { result, run: |v, x, p, out| product_typed::<$t, _>(crate::linalg::$pair, v, x, p, out) });
+                })*
             }
-        )*};
+            $($(if variant.wrapping && variant.dtype == <$wt as Element>::DTYPE {
+                let result = variant.dtype;
+                if wanted.is_some_and(|d| d != result) { return None; }
+                return Some(NativeProduct { result, run: |v, x, p, out| product_typed::<$wt, _>(crate::Wrapped(crate::linalg::$pair), v, x, p, out) });
+            })*)?
+        }};
     }
     crate::facts!(pairs);
     None
@@ -659,43 +707,11 @@ fn product_typed<T: crate::buffer::Cast, P: crate::linalg::Inner<T>>(
     Ok(true)
 }
 
-pub fn gather_plan(
-    layout: &crate::layout::Layout, routes: &crate::structure::Routes, indices: &[(crate::agreement::Read<'_>, DType)], broadcast: bool, checked: bool,
-    filled: bool) -> Result<crate::agreement::ReadPlan, Error> {
-    use crate::agreement::{Mapping, Missing, ReadPlan};
-    let mut scratch: Vec<_> = indices.iter().map(|(_, dtype)| Buffer::with_capacity(*dtype, 0)).collect();
-    let views = indices.iter().zip(&mut scratch).map(|((read, dtype), scratch)| read.part_view(0..read.plan.len(), *dtype, checked, scratch))
-        .collect::<Result<Vec<_>, _>>()?;
-    let plan = crate::structure::bound_routes(layout, routes, &views, broadcast, checked)?;
-    Ok(ReadPlan::copy(0, layout.count(), Mapping::from(plan.steps), plan.layout.count(), if filled { Missing::Scalar(1) } else { Missing::Default }))
-}
-pub fn gather(
-    source: crate::agreement::Read<'_>, layout: &crate::layout::Layout, routes: &crate::structure::Routes, indices: &[(crate::agreement::Read<'_>, DType)],
-    broadcast: bool, checked: bool, fill: Option<crate::agreement::Read<'_>>, output: &mut Buffer) -> Result<(), Error> {
-    use crate::agreement::{Binding, Read, ReadPlan};
-    if source.plan.len() != layout.count() { return Err(Error::new(Kind::Length, "gather source does not fit its layout")); }
-    let plan = gather_plan(layout, routes, indices, broadcast, checked, fill.is_some())?;
-    let mut sources = source.sources.to_vec();
-    let mut prototype = Buffer::with_capacity(output.dtype(), 1);
-    let fill_source = sources.len();
-    if let Some(fill) = fill {
-        if fill.plan.len() != 1 { return Err(Error::new(Kind::Length, "gather fill must be scalar")); }
-        fill.read_into(0..1, output.dtype(), checked, &mut prototype)?;
-        sources.push(Binding::full(prototype.view()));
-    }
-    let read = plan.compose_inputs::<Error>(&mut |which, _| Ok(if which == 0 { source.plan.clone() } else { ReadPlan::input(fill_source, 1) }))?;
-    Read { sources: &sources, plan: &read }.read_into(0..read.len(), output.dtype(), checked, output)
-}
-
 pub fn at(
     combine: Option<&Kernel>, root: WriteRoot<'_>, values: crate::agreement::Read<'_>, ids: Positions<'_>, checked: bool, settings: Settings,
     output: &mut Buffer) -> Result<(), Error> {
     let (wanted, len, n) = (output.dtype(), root.len(), ids.len());
     if values.plan.len() != 1 && values.plan.len() != n { return Err(Error::new(Kind::Length, "write values do not match positions")); }
-    if checked || matches!(ids, Positions::Route(..)) {
-        let mut scratch = Buffer::with_capacity(DType::Boolean, 0);
-        for start in (0..n).step_by(crate::CHUNK) { ids.chunk(start..n.min(start + crate::CHUNK), len, checked, &mut scratch)?; }
-    }
     let codes = combine.is_some_and(|kernel| matches!(kernel.policy, Some(crate::characters::Policy::Codes { .. })));
     match combine {
         None => {
@@ -705,7 +721,7 @@ pub fn at(
         Some(kernel) if codes => with_codes(&[values], None, |inputs| kernel.definition.at(kernel.variant, root, inputs[0], ids, checked, true, settings, output))?,
         Some(kernel) => kernel.definition.at(kernel.variant, root, values, ids, checked, false, settings, output)?,
     }
-    finish(output, wanted, checked)
+    finish(output, wanted, crate::facts::Variant { checked, ..crate::facts::Variant::checked(wanted) })
 }
 
 fn with_code_inputs<R>(
@@ -765,7 +781,7 @@ pub(crate) fn at_typed<T: crate::buffer::Cast>(
     let mut scratch = Vec::new();
     for start in (0..n).step_by(crate::CHUNK) {
         let end = n.min(start + crate::CHUNK);
-        let positions = ids.chunk(start..end, len, checked, &mut indices)?;
+        let positions = ids.chunk(start..end, len, &mut indices)?;
         let source = values.part::<T>(if values.plan.len() == 1 { 0..1 } else { start..end }, checked, &mut scratch)?;
         let writes = crate::gather::Writes::Offsets(&positions);
         match &apply {
@@ -824,14 +840,14 @@ fn at_formula<K: crate::facts::Formula<N>, const N: usize>(
 ) -> Result<(), Error> {
     if const { N != 2 } { return Err(Error::new(Kind::Length, "a modified write needs a binary function")); }
     let working = with_binary_body!(object, variant, settings, |T, _apply| Ok(T::DTYPE))?;
-    if let Some(fold) = object.fold() {
-        native_reduction!(fold, variant.dtype, variant.checked && !variant.wrapping, |R, T| {
+    if let Some(fold) = reduction(object, variant) {
+        native_reduction!(fold, variant.dtype, variant.fails_on_overflow(), |R, T| {
             type S = <R as crate::reduce::Reduction<T>>::Total;
             if S::DTYPE == variant.dtype || S::DTYPE == working {
                 root.initialize(S::DTYPE, checked, codes, output)?;
                 return at_typed::<S>(values, ids, checked, Some(|x, y| {
                     let (value, ok) = <R as crate::reduce::Reduction<T>>::chain(x, y);
-                    (value, (!ok && variant.checked && !variant.wrapping).then_some(Kind::Overflow))
+                    (value, (!ok && variant.fails_on_overflow()).then_some(Kind::Overflow))
                 }), output);
             }
             None::<()>
@@ -852,12 +868,14 @@ pub fn report_maps<'a>(plans: impl IntoIterator<Item = &'a crate::agreement::Rea
 
 fn map_formula<K: crate::facts::Formula<N>, const N: usize>(
     object: &K, variant: crate::facts::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, repair: bool,
-    output: &mut Buffer) -> Result<(), Error> {
+    judged: bool, output: &mut Buffer) -> Result<(), Error> {
     if inputs.len() != N { return Err(Error::new(Kind::Length, "kernel operand count changed")); }
     crate::events::taken(crate::events::Route::VectorKernel, range.len());
     report_maps(inputs.iter().map(|read| read.plan), range.clone());
+    // A kernel whose arguments' types can't make an error judges no item: `judge` is `variant` unchecked. Reads and `IntegerOps` keep `variant`, so an argument that doesn't convert, or an overflow that `IntegerOps::result` reports, still fails.
+    let judge = crate::facts::Variant { checked: variant.checked && judged, ..variant };
     if let Some(slices) = object.native_slices() {
-        let valid = |ok: bool| if variant.checked && !ok { Err(Kind::Domain) } else { Ok(()) };
+        let valid = |ok: bool| if judge.checked && !ok { Err(Kind::Domain) } else { Ok(()) };
         return match variant.dtype {
             DType::Float(FloatWidth::F64) => {
                 map_blocks::<f64, f64, N>(inputs, range, variant.checked, output, &|args, n, out| valid((slices.double)(object, args, n, out)))
@@ -872,13 +890,16 @@ fn map_formula<K: crate::facts::Formula<N>, const N: usize>(
         };
     }
     match variant.dtype {
-        DType::Float(FloatWidth::F16) => map_real::<K, f32, half::f16, N>(object, variant, inputs, range, settings, repair, output),
-        DType::Float(FloatWidth::F32) => map_real::<K, f32, f32, N>(object, variant, inputs, range, settings, repair, output),
-        DType::Float(FloatWidth::F64) => map_real::<K, f64, f64, N>(object, variant, inputs, range, settings, repair, output),
-        DType::Boolean => map_integer::<K, u8, N>(object, variant, inputs, range, output),
-        DType::Integer(width) => with_width!(width, I => map_integer::<K, I, N>(object, variant, inputs, range, output)),
-        DType::Complex(crate::buffer::ComplexWidth::F32) => map_complex::<K, f32, N>(object, variant, inputs, range, settings, output),
-        DType::Complex(crate::buffer::ComplexWidth::F64) => map_complex::<K, f64, N>(object, variant, inputs, range, settings, output),
+        DType::Float(FloatWidth::F16) => map_real::<K, f32, half::f16, N>(object, variant, inputs, range, settings, repair, judge, output),
+        DType::Float(FloatWidth::F32) => map_real::<K, f32, f32, N>(object, variant, inputs, range, settings, repair, judge, output),
+        DType::Float(FloatWidth::F64) => map_real::<K, f64, f64, N>(object, variant, inputs, range, settings, repair, judge, output),
+        DType::Boolean => match object.truth_table() {
+            Some(table) => map_truth::<N>(table, inputs, range, output),
+            None => map_integer::<K, u8, N>(object, variant, inputs, range, judge, output),
+        },
+        DType::Integer(width) => with_width!(width, I => map_integer::<K, I, N>(object, variant, inputs, range, judge, output)),
+        DType::Complex(crate::buffer::ComplexWidth::F32) => map_complex::<K, f32, N>(object, variant, inputs, range, settings, judge, output),
+        DType::Complex(crate::buffer::ComplexWidth::F64) => map_complex::<K, f64, N>(object, variant, inputs, range, settings, judge, output),
         DType::Character => Err(Error::new(Kind::Domain, "characters are not numerical kernel operands")),
     }
 }
@@ -902,6 +923,15 @@ fn integer_value<K, I, const N: usize>(object: &K, variant: crate::facts::Varian
     (result, error)
 }
 
+/// Whether `object`'s integer body at the Boolean `variant` raises for some Boolean arguments: it fails, or a formula that doesn't give truths gives a number other than 0 or 1, which a Boolean result can't hold. It tries all 2^N arguments.
+fn boolean_raises<K: crate::facts::Formula<N>, const N: usize>(object: &K, variant: crate::facts::Variant) -> bool {
+    let ops = crate::recipe::IntegerOps::<u8>::new(variant);
+    (0..1usize << N).any(|bits| {
+        let (value, error) = integer_value(object, variant, &ops, std::array::from_fn(|i| ((bits >> i) & 1) as u8));
+        error.is_some() || !K::BOOLEAN && value > 1
+    })
+}
+
 #[inline(always)]
 fn complex_value<K, F, const N: usize>(
     object: &K, variant: crate::facts::Variant, ops: &crate::recipe::NativeOps<{ crate::FUSED }>, x: [num_complex::Complex<F>; N]
@@ -916,12 +946,12 @@ fn scalar_result<T>((value, error): (T, Option<Kind>)) -> Result<T, Error> {
 }
 fn map_real<K, F, Dst, const N: usize>(
     object: &K, variant: crate::facts::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, repair: bool,
-    output: &mut Buffer) -> Result<(), Error> where K: crate::facts::Formula<N>, F: crate::float::Native + crate::buffer::Cast + Source<Dst>,
+    judge: crate::facts::Variant, output: &mut Buffer) -> Result<(), Error> where K: crate::facts::Formula<N>, F: crate::float::Native + crate::buffer::Cast + Source<Dst>,
     Dst: Element + crate::Float {
     let ops = crate::recipe::NativeOps::<{ crate::FUSED }> { tolerance: settings.tolerance };
     if const { K::BOOLEAN } {
         return map_values::<F, bool, N>(inputs, range, variant.checked, output, &|x| {
-            let (value, error) = real_value(object, variant, &ops, x, false);
+            let (value, error) = real_value(object, judge, &ops, x, false);
             (value != F::zero(), error)
         });
     }
@@ -930,20 +960,21 @@ fn map_real<K, F, Dst, const N: usize>(
         return map_blocks::<F, Dst, N>(inputs, range, variant.checked, output, &|args, n, out| {
             let needs = |x| object.emit_repair(&ops, x).unwrap_or(false);
             let ok = crate::slice::two_pass(args, n, out, |x| (!needs(x)).then(|| body(x)), |x| if needs(x) { repair.apply(x[0]) } else { body(x) });
-            if variant.checked && object.fails_nan() && !ok { Err(Kind::Domain) } else { Ok(()) }
+            if judge.checked && object.fails_nan() && !ok { Err(Kind::Domain) } else { Ok(()) }
         });
     }
     map_values::<F, Dst, N>(inputs, range, variant.checked, output, &|x| {
-        let (result, error) = real_value(object, variant, &ops, x, false);
+        let (result, error) = real_value(object, judge, &ops, x, false);
         (Source::<Dst>::read(result), error)
     })
 }
 
 fn map_integer<K, I, const N: usize>(
-    object: &K, variant: crate::facts::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, output: &mut Buffer) -> Result<(), Error>
+    object: &K, variant: crate::facts::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, judge: crate::facts::Variant,
+    output: &mut Buffer) -> Result<(), Error>
 where K: crate::facts::Formula<N>, I: crate::recipe::Overflowing {
     let ops = crate::recipe::IntegerOps::<I>::new(variant);
-    let apply = |x| integer_value(object, variant, &ops, x);
+    let apply = |x| integer_value(object, judge, &ops, x);
     if const { K::BOOLEAN } {
         return map_values::<I, bool, N>(inputs, range, variant.checked, output, &|x| {
             let (x, e) = apply(x);
@@ -953,11 +984,17 @@ where K: crate::facts::Formula<N>, I: crate::recipe::Overflowing {
     map_values::<I, I, N>(inputs, range, variant.checked, output, &apply)
 }
 
+/// A function of Booleans by its truth table (`Formula::truth_table`): bit `2x+y` of the table, or bit `x` for one argument, gives its result. A function with a table gives it for every Boolean argument, so no item checks its validity.
+fn map_truth<const N: usize>(table: u8, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, output: &mut Buffer) -> Result<(), Error> {
+    map_values::<bool, bool, N>(inputs, range, false, output, &|x| (crate::facts::truth_bit(table, x), None))
+}
+
 fn map_complex<K, F, const N: usize>(
-    object: &K, variant: crate::facts::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, output: &mut Buffer
+    object: &K, variant: crate::facts::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings,
+    judge: crate::facts::Variant, output: &mut Buffer
 ) -> Result<(), Error> where K: crate::facts::Formula<N>, F: crate::float::Native + crate::buffer::Cast, num_complex::Complex<F>: crate::buffer::Cast {
     let ops = crate::recipe::NativeOps::<{ crate::FUSED }> { tolerance: settings.tolerance };
-    let apply = |x| complex_value(object, variant, &ops, x);
+    let apply = |x| complex_value(object, judge, &ops, x);
     if const { K::BOOLEAN } {
         map_values::<num_complex::Complex<F>, bool, N>(inputs, range, variant.checked, output, &|x| {
             let (x, e) = apply(x);
@@ -1017,7 +1054,7 @@ fn inverse_fold<K: crate::facts::Formula<N>, const N: usize>(object: &K, seed: S
 fn fold_formula<K: crate::facts::Formula<N>, const N: usize>(
     object: &K, variant: crate::facts::Variant, dims: [usize; 3], seed: Seed<'_>, direction: Direction, settings: Settings, pieces: &Pieces<'_>,
     output: &mut Buffer) -> Result<(), Error> {
-    if let Some(fold) = object.fold() { return fold.run_pieces(variant, dims, seed, pieces, output); }
+    if let Some(fold) = reduction(object, variant) { return fold.run_pieces(variant, dims, seed, pieces, output); }
     if let Some(fold) = inverse_fold(object, seed, direction)
         && let Some(buffer) = fold.inverse_pieces(variant, dims, pieces)? { *output = buffer; return Ok(()); }
     ordered_formula(object, variant, dims, seed, direction, settings, pieces, output)
@@ -1040,9 +1077,7 @@ fn piece_values<T: crate::buffer::Cast>(range: std::ops::Range<usize>, checked: 
         if failure.is_some() { return; }
         let Piece::Items(view) = piece else { failure = Some(Error::new(Kind::Length, "ordered fold received a precomputed total")); return; };
         if at != next || at + view.len() > range.end { failure = Some(Error::new(Kind::Length, "fold pieces do not cover the requested range")); return; }
-        for i in 0..view.len() {
-            match T::cast(view, i) { Ok(value) => out.push(value), Err(error) if checked => { failure = Some(error); return; } Err(_) => out.push(T::FILL) }
-        }
+        if let Err(error) = T::extend_cast(view, view.len(), checked, out) { failure = Some(error); return; }
         next += view.len();
     })?;
     if let Some(error) = failure { return Err(error); }
@@ -1108,7 +1143,7 @@ fn ordered_fold<T: crate::buffer::Cast + Source<T>>(
 fn scan_formula<K: crate::facts::Formula<N>, const N: usize>(
     object: &K, variant: crate::facts::Variant, dims: [usize; 3], seed: Seed<'_>, direction: Direction, settings: Settings, input: crate::agreement::Read<'_>,
     output: &mut Buffer) -> Result<(), Error> {
-    if let Some(fold) = object.fold() { return fold.run_scan(variant, dims, seed, direction, input, output); }
+    if let Some(fold) = reduction(object, variant) { return fold.run_scan(variant, dims, seed, direction, input, output); }
     if const { N != 2 } { return Err(Error::new(Kind::Length, "a scan needs a binary function")); }
     with_binary_body!(object, variant, settings, |T, apply| crate::reduce::scan_read::<T, T>(
         dims, seed, direction, variant.checked, input, output, |items, dims, seed, out| {
@@ -1131,7 +1166,7 @@ fn scan_formula<K: crate::facts::Formula<N>, const N: usize>(
 fn fold_read_formula<K: crate::facts::Formula<N>, const N: usize>(
     object: &K, variant: crate::facts::Variant, shape: &[usize], axis: usize, seed: Seed<'_>, direction: Direction, settings: Settings,
     input: crate::agreement::Read<'_>, output: &mut Buffer) -> Result<(), Error> {
-    if let Some(fold) = object.fold() { return fold.run_read(variant, shape, axis, seed, input, output); }
+    if let Some(fold) = reduction(object, variant) { return fold.run_read(variant, shape, axis, seed, input, output); }
     if let Some(fold) = inverse_fold(object, seed, direction)
         && let Some(buffer) = fold.inverse_read(variant, shape, axis, input)? { *output = buffer; return Ok(()); }
     let dims = crate::layout::Lanes::new(shape, axis)?.dims();
@@ -1144,10 +1179,24 @@ fn fold_read_formula<K: crate::facts::Formula<N>, const N: usize>(
     };
     ordered_formula(object, variant, dims, seed, direction, settings, &pieces, output)
 }
+
+/// `object`'s walk of adjacent items (`reduce::adjacent_read`) at `variant`: each item combined with the one a row before it, and a lane's first row with `seed`, or kept.
+fn adjacent_formula<K: crate::facts::Formula<N>, const N: usize>(
+    object: &K, variant: crate::facts::Variant, dims: [usize; 3], seed: Option<crate::agreement::Read<'_>>, flip: bool, settings: Settings,
+    input: crate::agreement::Read<'_>, output: &mut Buffer) -> Result<(), Error> {
+    if const { N != 2 } { return Err(Error::new(Kind::Length, "a walk of adjacent items needs a binary function")); }
+    with_binary_body!(object, variant, settings, |T, apply| crate::reduce::adjacent_read::<T>(dims, seed, flip, variant.checked, input, output, apply))
+}
+/// The reduction by which a fold by `object` at `variant` combines its items: for Booleans the formula's `truth`, which counts for `+` and otherwise names the reduction of its truth table, before its `fold` for numbers.
+fn reduction<K: crate::facts::Formula<N>, const N: usize>(object: &K, variant: crate::facts::Variant) -> Option<crate::reduce::Reduce> {
+    if variant.dtype == DType::Boolean { object.truth().or_else(|| object.fold()) } else { object.fold() }
+}
+
 /// The float width that a Boolean or integer computes in under rustymath's own policy, NumPy's: the float that [`DType::inexact`] gives it under `f64`. `f64` for any other dtype.
 pub fn numpy_float(dtype: DType) -> FloatWidth { match dtype.inexact(FloatWidth::F64) { Some((DType::Float(w), _)) => w, _ => FloatWidth::F64 } }
 
-fn finish(output: &mut Buffer, dtype: DType, checked: bool) -> Result<(), Error> {
-    if output.dtype() != dtype { *output = Buffer::cast_results(output.view(), dtype, checked)?; }
+/// `output`, a kernel's results at `variant`, as `dtype`, which a caller can ask for narrower than the kernel's result type. An integer that doesn't fit fails where `variant.fails_on_overflow()`, and wraps otherwise.
+fn finish(output: &mut Buffer, dtype: DType, variant: crate::facts::Variant) -> Result<(), Error> {
+    if output.dtype() != dtype { *output = Buffer::cast_results(output.view(), dtype, variant.fails_on_overflow())?; }
     Ok(())
 }

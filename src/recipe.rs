@@ -180,7 +180,19 @@ impl<F: Float> Ops<F> for RangeOps {
     fn binary(&self, _: Binary, _: Self::V, _: Self::V) -> Self::V { crate::facts::Range::ANY }
     fn compare(&self, op: Cmp, x: Self::V, y: Self::V) -> Self::B { Self::compare(op, x, y) }
     fn multiply_add(&self, _: Self::V, _: Self::V, _: Self::V) -> Self::V { crate::facts::Range::ANY }
-    fn overflow(&self, _: Binary, _: Self::V, _: Self::V) -> Self::B { None }
+    /// No overflow (`Some(false)`) where the operation's range, as its formula's facts give it, lies within the computing dtype's values. Past 2⁵³ a bound and the result's ends round, so a result stays strictly inside such a bound.
+    fn overflow(&self, op: Binary, x: Self::V, y: Self::V) -> Self::B {
+        use crate::facts::Formula;
+        let result = match op {
+            Binary::Add => crate::Add.range([x, y]), Binary::Subtract => crate::Subtract.range([x, y]), Binary::Multiply => crate::Multiply.range([x, y]),
+            _ => return None,
+        };
+        let fits = crate::facts::Range::of_dtype(self.0);
+        let exact = |bound: f64| bound.abs() < 2f64.powi(53);
+        let above = if exact(fits.lo) { result.lo >= fits.lo } else { result.lo > fits.lo };
+        let below = if exact(fits.hi) { result.hi <= fits.hi } else { result.hi < fits.hi };
+        (above && below).then_some(false)
+    }
     fn and(&self, x: Self::B, y: Self::B) -> Self::B {
         match (x, y) { (Some(false), _) | (_, Some(false)) => Some(false), (Some(true), Some(true)) => Some(true), _ => None }
     }

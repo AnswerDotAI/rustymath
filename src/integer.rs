@@ -1,6 +1,6 @@
 //! Functions of `i64`s: greatest common divisor, least common multiple, binomial coefficients, powers, square roots and residues. Each gives `None` where its result isn't an `i64`. Their function objects are the ones that floats and complex numbers use: [`Gcd`], [`Lcm`], [`Residue`] and [`FloorDivide`] from [`tolerant`](crate::tolerant), whose integer forms ignore the tolerance they hold, and [`Binom`] and [`Pow`]. A slice form appends results to a vector and reports whether every item fitted. [`Divisor`] divides many integers by one, with multiplications in place of division instructions. Where every item has the same divisor, `Residue`'s slice form divides through `FloatDivisor`, which multiplies by the divisor's reciprocal in `f64` and vectorizes, for divisors and dividends below 2⁵¹ in magnitude. At types of 16 bits or fewer it multiplies 32-bit integers instead, and it takes `Divisor` for 64-bit dividends of 2⁵¹ or more.
 //!
-//! `Gcd`, `Lcm`, `Binom`, `Pow` and `Residue` also take the narrower integer types of compact buffers, `u8`, `i16` and `i32`, which they compute through these functions. A result that doesn't fit its type fails. `FloorDivide` divides each integer type exactly, and fails on a zero divisor or an overflowing quotient. The tolerant comparisons, [`Floor`] and [`Ceil`] take each of these integer types exactly, ignoring the tolerance. [`Abs`] and [`Sign`] take them through the integer arithmetic of the `arith` module, and `Abs` of a signed type's least value fails. `Floor`, `Ceil` and `Abs` keep Booleans as they are.
+//! `Gcd`, `Lcm`, `Binom`, `Pow` and `Residue` also take the narrower integer types of compact buffers, `u8`, `i16` and `i32`, which they compute through these functions. A result that doesn't fit its type fails. `FloorDivide` divides each integer type exactly, gives a zero divisor the type's limit of the dividend's sign, and fails on an overflowing quotient. `Pow` floors a negative power. The tolerant comparisons, [`Floor`] and [`Ceil`] take each of these integer types exactly, ignoring the tolerance. [`Abs`] and [`Sign`] take them through the integer arithmetic of the `arith` module, and `Abs` of a signed type's least value fails. `Floor`, `Ceil` and `Abs` keep Booleans as they are.
 use crate::{
     Abs, Arg, Binom, Pow, WrappingPow, convert::{self, WIDE_LIMIT}, float::sealed::Core,
     tolerant::{Ceil, Equal, Floor, FloorDivide, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue}
@@ -28,6 +28,8 @@ pub fn product_bounds([a, b]: [i64; 2], [c, d]: [i64; 2]) -> Option<[i64; 2]> {
 
 /// The greatest common divisor of x and y, which is never negative. `gcd(0, 0)` is 0. `None` only where it is 2^63, as for `gcd(i64::MIN, 0)`.
 pub fn gcd(x: i64, y: i64) -> Option<i64> { i64::try_from(unsigned_gcd(x.unsigned_abs(), y.unsigned_abs())).ok() }
+/// [`gcd`] wrapped to `i64`: 2^63 becomes `i64::MIN`.
+pub(crate) fn gcd_wrapped(x: i64, y: i64) -> i64 { unsigned_gcd(x.unsigned_abs(), y.unsigned_abs()) as i64 }
 
 /// The greatest common divisor of a and b by Stein's algorithm, with shifts and subtractions and no division. It is 0 for 0 and 0.
 fn unsigned_gcd(mut a: u64, mut b: u64) -> u64 {
@@ -44,6 +46,13 @@ fn unsigned_gcd(mut a: u64, mut b: u64) -> u64 {
 
 /// The least common multiple of x and y, with the sign of x × y. It is 0 where either is 0.
 pub fn lcm(x: i64, y: i64) -> Option<i64> { if x == 0 || y == 0 { return Some(0); } (x / gcd(x, y)?).checked_mul(y) }
+/// [`lcm`] wrapped to `i64`.
+pub(crate) fn lcm_wrapped(x: i64, y: i64) -> i64 { if x == 0 || y == 0 { 0 } else { (x / gcd_wrapped(x, y)).wrapping_mul(y) } }
+
+/// `exact`, or where it overflowed `i64`, `wrapped`'s result, reporting the overflow where `variant` fails on one: the rule that binomials, greatest common divisors, least common multiples and rounding share.
+pub(crate) fn overflowed(variant: crate::facts::Variant, exact: Option<i64>, wrapped: impl FnOnce() -> i64) -> i64 {
+    exact.unwrap_or_else(|| { if variant.fails_on_overflow() { (crate::error::Kind::Overflow.reporter())(); } wrapped() })
+}
 
 /// The binomial coefficient C(n, k), with the integer continuations C(n, k) = (-1)^k C(k - n - 1, k) for negative n, and C(n, k) = (-1)^(n - k) C(-k - 1, n - k) for negative k. `None` where the result is outside `i64`.
 pub fn binom(n: i64, k: i64) -> Option<i64> { binomial(n, k, false) }
@@ -92,15 +101,16 @@ fn choose(n: u64, k: u64, limit: u64) -> Option<u64> {
     })
 }
 
-/// x^y. 0^0 is 1. `None` where the power doesn't fit an `i64`, and for a negative y beside an x other than 1 or -1, where the power isn't a whole number.
-pub fn power(x: i64, y: i64) -> Option<i64> { let (p, exact) = wrapped_power(x, y); exact.then_some(p) }
+/// x^y. 0^0 is 1. A negative y floors the power, as [`wrapped_power`] does, with `i64`'s greatest value for an x of 0. `None` where the power doesn't fit an `i64`.
+pub fn power(x: i64, y: i64) -> Option<i64> { let (p, exact) = wrapped_power(x, y, i64::MAX); exact.then_some(p) }
 
-/// x^y wrapped to `i64`, and whether that is the exact power, by repeated squaring. A negative y beside an x other than 1 or -1 gives 0, which isn't the power.
-pub(crate) fn wrapped_power(x: i64, y: i64) -> (i64, bool) {
+/// x^y wrapped to `i64`, and whether that is the exact power, by repeated squaring. A negative y gives the power's floor, the floor of 1 ÷ x^-y: 1 for an x of 1, ±1 by y's parity for -1, 0 or -1 by the power's sign for any other nonzero x, and `most`, the greatest value of the caller's width, for 0.
+pub(crate) fn wrapped_power(x: i64, y: i64, most: i64) -> (i64, bool) {
     match x {
         1 => (1, true),
         -1 => (if y % 2 == 0 { 1 } else { -1 }, true),
-        _ if y < 0 => (0, false),
+        0 if y < 0 => (most, true),
+        _ if y < 0 => (if x < 0 && y % 2 != 0 { -1 } else { 0 }, true),
         0 => (i64::from(y == 0), true),
         _ => {
             // A square that overflows makes the power inexact only where a later bit of y multiplies it in.
@@ -127,10 +137,10 @@ pub fn residue(x: i64, y: i64) -> i64 { if x == 0 { y } else { floored(y.wrappin
 #[inline]
 pub fn mask(x: i64) -> Option<i64> { (x > 0 && x.count_ones() == 1).then(|| x - 1) }
 
-/// The floor of x/y, or `None` for a zero y or a quotient that overflows. A dividend below 2^53 in magnitude divides in `f64`, where integer division is slow: the quotient then rounds by less than its distance from the nearest whole number, so its floor is exact. A divisor that `f64` rounds then exceeds the dividend in magnitude, and the quotient's floor is 0 or ¯1 either way.
+/// The floor of x/y, or `None` for a quotient that overflows. A zero y gives the `i64` limit of x's sign, and 0 for an x of 0. A dividend below 2^53 in magnitude divides in `f64`, where integer division is slow: the quotient then rounds by less than its distance from the nearest whole number, so its floor is exact. A divisor that `f64` rounds then exceeds the dividend in magnitude, and the quotient's floor is 0 or ¯1 either way.
 #[inline]
 pub fn floor_quotient(x: i64, y: i64) -> Option<i64> {
-    if y == 0 { return None; }
+    if y == 0 { return Some(<i64 as crate::arith::Overflowing>::limit(x)); }
     if x.unsigned_abs() < 1 << 53 { return Some((x as f64 / y as f64).floor() as i64); }
     x.checked_div(y).map(|q| if x % y != 0 && (x < 0) != (y < 0) { q - 1 } else { q })
 }
@@ -240,9 +250,8 @@ forms!(#[inline] Lcm at i64: |_, [x, y]| lcm(x, y));
 forms!(#[inline] Gcd at bool: |_, [x, y]| x | y);
 forms!(#[inline] Lcm at bool: |_, [x, y]| x & y);
 forms!(#[inline] Binom at i64: |_, [n, k]| binom(n, k));
-forms!(#[inline] Pow at i64: |_, [x, y]| wrapped_power(x, y));
-fn wrapping_power(x: i64, y: i64) -> Option<i64> { let (p, exact) = wrapped_power(x, y); (exact | (y >= 0)).then_some(p) }
-forms!(#[inline] WrappingPow at i64: |_, [x, y]| wrapping_power(x, y));
+forms!(#[inline] Pow at i64: |_, [x, y]| wrapped_power(x, y, i64::MAX));
+forms!(#[inline] WrappingPow at i64: |_, [x, y]| wrapped_power(x, y, i64::MAX).0);
 forms!(
     #[inline] Residue at i64: |_, [x, y]| residue(x, y), many |_, [x, y], n, out| if let Arg::One(d) = x && let Some(m) = mask(d) {
         each!([y], n, out, |[y]| y & m)
@@ -261,8 +270,8 @@ macro_rules! narrower {
         forms!(#[inline] Gcd at $t: |_, [x, y]| gcd(x.into(), y.into()).and_then(|r| <$t>::try_from(r).ok()));
         forms!(#[inline] Lcm at $t: |_, [x, y]| lcm(x.into(), y.into()).and_then(|r| <$t>::try_from(r).ok()));
         forms!(#[inline] Binom at $t: |_, [n, k]| binom(n.into(), k.into()).and_then(|r| <$t>::try_from(r).ok()));
-        forms!(#[inline] Pow at $t: |_, [x, y]| { let (p, exact) = wrapped_power(x.into(), y.into()); (p as $t, exact && <$t>::try_from(p).is_ok()) });
-        forms!(#[inline] WrappingPow at $t: |_, [x, y]| wrapping_power(x.into(), y.into()).map(|p| p as $t));
+        forms!(#[inline] Pow at $t: |_, [x, y]| { let (p, exact) = wrapped_power(x.into(), y.into(), <$t>::MAX.into()); (p as $t, exact && <$t>::try_from(p).is_ok()) });
+        forms!(#[inline] WrappingPow at $t: |_, [x, y]| wrapped_power(x.into(), y.into(), <$t>::MAX.into()).0 as $t);
         forms!(
             #[inline] Residue at $t: |_, [x, y]| residue(x.into(), y.into()) as $t,
             many |_, [x, y], n, out| if let Arg::One(d) = x && let Some(m) = mask(d.into()) {
@@ -278,14 +287,8 @@ macro_rules! narrower {
     )+};
 }
 narrower!(u8, i16, i32);
-/// Floor division at the narrower types, through a float type in which every quotient's floor is exact, as `floor_quotient`'s doc explains. A zero divisor and a quotient that doesn't fit the type fail without a branch. The loop then vectorizes.
-macro_rules! floor_divides {
-    ($($t:ty => $f:ty),+) => {$(
-        forms!(FloorDivide at $t: |_, [x, y]| { let q = (<$f>::from(x) / <$f>::from(y)).floor(); (y != 0 && q <= <$t>::MAX as $f).then_some(q as $t) });
-    )+};
-}
-floor_divides!(u8 => f32, i16 => f32, i32 => f64);
-forms!(FloorDivide at i64: |_, [x, y]| floor_quotient(x, y));
+/// Floor division at each integer type, from the formula that the kernels run (`facts::integer_at`). A zero divisor gives the type's limit of the dividend's sign, and 0 for 0 ÷ 0. A quotient that doesn't fit the type, the least value divided by -1, fails.
+forms!(#[inline] FloorDivide at u8, i16, i32, i64: |k, [x, y]| crate::facts::integer_at(k, [x, y]));
 
 /// Each comparison's exact forms, which give Booleans: at each integer type of compact buffers, and at Booleans, where `false` orders before `true`. Characters compare as their code points, through these forms at `i32` ([`characters`](crate::characters)).
 macro_rules! exactly {
@@ -305,10 +308,11 @@ forms!(Floor at u8, i16, i32, i64, bool: |_, [x]| x);
 forms!(Ceil at u8, i16, i32, i64, bool: |_, [x]| x);
 forms!(Abs at bool: |_, [x]| x);
 
-pub(crate) fn native_power(variant: crate::facts::Variant, x: i64, y: i64) -> Option<i64> {
-    let (value, exact) = wrapped_power(x, y);
-    if y < 0 && !exact { return None; }
+/// x^y at `variant`'s integer width, as [`wrapped_power`] gives it. 0 to a negative power gives the greatest value: i64's under dynamic kinds, which a narrower width reports as an overflow so the call widens, and otherwise the width's. Where `variant` fails on overflow, a power that doesn't fit the width reports an overflow.
+pub(crate) fn native_power(variant: crate::facts::Variant, x: i64, y: i64) -> i64 {
+    let most = match variant.dtype { crate::buffer::DType::Integer(width) if !variant.fails_on_overflow() => with_width!(width, T => T::MAX as i64), _ => i64::MAX };
+    let (value, exact) = wrapped_power(x, y, most);
     let fits = exact && match variant.dtype { crate::buffer::DType::Integer(width) => width.holds(value), _ => true };
-    if variant.checked && !variant.wrapping && !fits { (crate::error::Kind::Overflow.reporter())(); }
-    Some(value)
+    if variant.fails_on_overflow() && !fits { (crate::error::Kind::Overflow.reporter())(); }
+    value
 }
