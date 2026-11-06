@@ -84,14 +84,6 @@ pub fn power_slope<F: Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, y: O::V, r: O::
     }
 }
 
-/// `y x^(y-1)` as a smooth expression, avoiding `0 * 0^-1` where both arguments are zero.
-#[inline(always)]
-pub fn reduced_power_slope<F: Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, y: O::V) -> O::V {
-    let (zero, one) = (o.number(F::zero()), o.number(F::one()));
-    let base = o.select(o.and(o.equal(x, zero), o.equal(y, zero)), one, x);
-    o.multiply(y, o.real_power(base, o.subtract(y, one)))
-}
-
 /// The slopes of x^y: in x as `power_slope` gives it, and in y r ln x, which is 0 where x isn't positive, where x stands in as 1.
 #[inline(always)]
 pub(crate) fn power<F: Float, O: Ops<F> + ?Sized>(o: &O, [x, y]: [O::V; 2], r: O::V, [nx, ny]: [bool; 2]) -> [Option<O::V>; 2] {

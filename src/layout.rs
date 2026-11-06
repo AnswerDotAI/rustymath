@@ -297,10 +297,6 @@ impl Layout {
     /// The number of items in an array of this layout (`count`).
     #[inline]
     pub fn count(&self) -> usize { count(&self.shape) }
-    /// This layout with lengths `shape`, keeping its keys and names: each axis with keys keeps its length.
-    pub fn resized(&self, shape: impl Into<Shape>) -> Self { Self { shape: shape.into(), meta: self.meta.clone() } }
-    /// Whether `other` has this layout's rank, keys and names, whatever its lengths.
-    pub fn same_but_lengths(&self, other: &Self) -> bool { self.shape.len() == other.shape.len() && self.meta == other.meta }
     /// The name of each axis, with `None` for an axis without one. Empty when no axis has a name (`has_names`).
     #[inline]
     pub fn names(&self) -> &[Option<Arc<str>>] { self.meta.as_ref().map_or(&[], |l| &l.names) }

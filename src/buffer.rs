@@ -669,16 +669,31 @@ fn integer(view: View<'_>, i: usize) -> Result<i64, Error> {
 /// Item `i` of a numeric `view` as a Boolean. Only exactly 0 and 1 convert, and anything else gives an Overflow error.
 fn boolean(view: View<'_>, i: usize) -> Result<bool, Error> {
     let x = match view {
-        View::Booleans(v) => return Ok(v[i]), View::Integers(v) => { return match v.get(i) { 0 => Ok(false), 1 => Ok(true), k => Err(overflow(k)) }; }
+        View::Booleans(v) => return Ok(v[i]), View::Integers(v) => Source::<f64>::read(v.get(i)),
         View::Floats(v) => v.get(i), View::Complexes(v) => real_part(v.get(i))?, View::Characters(_) => unreachable!("cast refuses characters first")
     };
+    if truth(x) { Ok(x != 0.0) } else { Err(overflow(x)) }
+}
+/// Whether `x` converts to a Boolean, by [`crate::convert::Conversion::validity`]'s rule: only exactly 0 and 1 do.
+#[inline]
+fn truth(x: f64) -> bool {
     let cast = crate::convert::Conversion { input: DType::Float(FloatWidth::F64), output: DType::Boolean, kind: crate::convert::ConversionKind::Cast };
-    if cast.validity::<f64, _>(&crate::recipe::NativeOps::<{ crate::FUSED }>::DEFAULT, x).is_some_and(|(_, valid)| valid) { Ok(x != 0.0) }
-    else { Err(overflow(x)) }
+    cast.validity::<f64, _>(&crate::recipe::NativeOps::<{ crate::FUSED }>::DEFAULT, x).is_some_and(|(_, valid)| valid)
+}
+/// Appends the Booleans that the real items `v` stand for. A checked cast fails at the first item that isn't a [`truth`]; an unchecked one gives the fill, false, for it. Each item is tested against 0 and 1 in its own type, by `truth`'s rule, without widening integers to floats.
+fn truths<S: Copy + PartialEq + From<u8> + Source<f64>>(v: &[S], checked: bool, out: &mut Vec<bool>) -> Result<(), Error> {
+    let (zero, one) = (S::from(0), S::from(1));
+    // One fold checks every item and vectorizes. Only a failure then looks for the first item that isn't a truth.
+    if checked && !v.iter().fold(true, |ok, &x| ok & ((x == zero) | (x == one))) {
+        let x = v.iter().map(|&x| Source::<f64>::read(x)).find(|&x| !truth(x)).expect("an item that isn't a truth");
+        return Err(overflow(x));
+    }
+    out.extend(v.iter().map(|&x| x == one));
+    Ok(())
 }
 
 /// Convert stored items using the destination dtype's checked conversion.
-pub trait Cast: Element {
+pub trait Cast: Element + crate::gather::Item {
     /// Item `item` of `view`, or an error where it doesn't convert.
     fn cast(view: View<'_>, item: usize) -> Result<Self, Error>;
     /// Appends the first `len` items of `view` to `out`, each as [`Cast::cast`] converts it and [`kept`] keeps it. Element types override this with one typed loop for each source dtype they read often.
@@ -703,7 +718,18 @@ fn real(view: View<'_>, item: usize) -> Result<f64, Error> {
         View::Complexes(v) => real_part(v.get(item))?, View::Characters(_) => return Err(Error::new(Kind::Domain, "characters convert only to characters"))
     })
 }
-impl Cast for bool { fn cast(view: View<'_>, item: usize) -> Result<Self, Error> { numeric(view)?; boolean(view, item) } }
+impl Cast for bool {
+    fn cast(view: View<'_>, item: usize) -> Result<Self, Error> { numeric(view)?; boolean(view, item) }
+    fn extend_cast(view: View<'_>, len: usize, checked: bool, out: &mut Vec<Self>) -> Result<(), Error> {
+        match view {
+            View::Booleans(v) => out.extend_from_slice(&v[..len]),
+            View::Integers(v) => with_ints!(v, |v| truths(&v[..len], checked, out)?),
+            View::Floats(v) => with_floats!(v, |v| truths(&v[..len], checked, out)?),
+            _ => return itemwise(view, len, checked, out),
+        }
+        Ok(())
+    }
+}
 impl Cast for char {
     fn cast(view: View<'_>, item: usize) -> Result<Self, Error> {
         match view { View::Characters(v) => Ok(v[item]), _ => Err(Error::new(Kind::Domain, "characters convert only to characters")) }
@@ -736,7 +762,7 @@ macro_rules! casts {
         fn extend_cast(view: View<'_>, len: usize, checked: bool, out: &mut Vec<Self>) -> Result<(), Error> {
             match view {
                 View::Booleans(v) => out.extend(v[..len].iter().map(|&b| Source::<Self>::read(f64::from(u8::from(b))))),
-                View::Integers(v) => with_ints!(v, |v| out.extend(v[..len].iter().map(|&x| Source::<Self>::read(Source::<f64>::read(i64::from(x)))))),
+                View::Integers(v) => with_ints!(v, |v| out.extend(v[..len].iter().map(|&x| Source::<Self>::read(Source::<f64>::read(x))))),
                 View::Floats(v) => with_floats!(v, |v| out.extend(v[..len].iter().map(|&x| Source::<Self>::read(f64::from(x))))),
                 _ => return itemwise(view, len, checked, out),
             }
@@ -759,12 +785,17 @@ impl Buffer {
     pub fn nonzero(view: View<'_>) -> Vec<usize> {
         with_dtype!(view.dtype(), T => T::of(view).expect("matching dtype").iter().enumerate().filter_map(|(i, &x)| (x != T::FILL).then_some(i)).collect())
     }
+    /// Whether any item equals its type's fill: zero, false or a space.
+    pub fn any_fill(view: View<'_>) -> bool {
+        with_dtype!(view.dtype(), T => T::of(view).expect("matching dtype").iter().fold(false, |found, &x| found | (x == T::FILL)))
+    }
     /// Whether every item has the first item's bits, as an array of one repeated value does: `0` and `¯0` differ, and a NaN matches only a NaN with its bits. An empty view gives true.
     pub fn same(view: View<'_>) -> bool {
         let size = view.dtype().bytes();
         // SAFETY: a view holds `len` initialised items of `size` bytes each at `as_ptr`, and no element type has padding.
         let bytes = unsafe { std::slice::from_raw_parts(view.as_ptr(), view.len() * size) };
-        bytes.chunks_exact(size).all(|item| item == &bytes[..size])
+        // Every item has the first one's bits exactly where each item matches the next.
+        bytes.len() <= size || bytes[size..] == bytes[..bytes.len() - size]
     }
     /// Copies the first `n` items of a structural walk from `base`, using the type's fill for missing positions and whole-slice copies for contiguous runs. `n` can be shorter than the walk, as it is for a view whose mapping reaches past its own items.
     pub fn walked(view: View<'_>, base: usize, steps: &[crate::gather::Steps], n: usize) -> Self {
@@ -774,6 +805,10 @@ impl Buffer {
             crate::gather::walk_plan(&mut out, T::of(view).expect("matching dtype"), base, &plan, T::FILL, 0, n, crate::gather::Same);
             T::buffer(out)
         })
+    }
+    /// The items in the order that `order` reads them, or the buffer itself without one. `Kernel::fold_read` gives such an order with totals that stay in their source's order.
+    pub fn ordered(self, order: Option<Vec<crate::gather::Steps>>) -> Self {
+        match order { Some(order) => Self::walked(self.view(), 0, &order, crate::gather::Steps::count(&order)), None => self }
     }
     /// A new buffer holding the items of `view` in `range`.
     pub fn copied(view: View<'_>, range: std::ops::Range<usize>) -> Self {

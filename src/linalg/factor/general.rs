@@ -86,6 +86,27 @@ fn hessenberg<T: Scalar>(h: &mut [T], n: usize, ld: usize) -> (Vec<T>, Vec<T>) {
     (w, taus)
 }
 
+/// The row where the active block that holds row `i` starts, searching up to row `l`: the row below the last negligible subdiagonal item, by Ahues and Tisseur's conservative test as LAPACK applies it, or `l`. `mag` measures an item and `sub` a subdiagonal one. The complex reduction keeps its subdiagonal real and measures it by its real part, as `zlahqr` does.
+fn split<T: Copy + std::ops::Sub<Output = T>, R: Native>(h: &[T], ld: usize, n: usize, l: usize, i: usize, [smlnum, ulp]: [R; 2], mag: impl Fn(T) -> R, sub: impl Fn(T) -> R) -> usize {
+    let mut k = i;
+    while k > l {
+        let s = h[k * ld + k - 1];
+        if mag(s) <= smlnum { break; }
+        let mut tst = mag(h[(k - 1) * ld + k - 1]) + mag(h[k * ld + k]);
+        if tst == R::zero() { if k >= 2 { tst = tst + sub(h[(k - 1) * ld + k - 2]) } if k + 1 < n { tst = tst + sub(h[(k + 1) * ld + k]) } }
+        if sub(s) <= ulp * tst {
+            let (s, sup) = (mag(s), mag(h[(k - 1) * ld + k]));
+            let (ab, ba) = (s.max(sup), s.min(sup));
+            let (d, e) = (mag(h[k * ld + k]), mag(h[(k - 1) * ld + k - 1] - h[k * ld + k]));
+            let (aa, bb) = (d.max(e), d.min(e));
+            let t = aa + ab;
+            if ba * (ab / t) <= smlnum.max(ulp * (bb * (aa / t))) { break; }
+        }
+        k -= 1;
+    }
+    k
+}
+
 /// Reduces the upper Hessenberg matrix `h`, whose rows start `ld` items apart, to real Schur form by Francis double-shift QR iterations, as LAPACK's `dlahqr` does. Gives the real and imaginary parts of the eigenvalues. Where `wantt` is true, each iteration transforms the whole of `h`. Each reflection and rotation then also acts on the rows of `zt`, which hold Qᵀ on entry and Zᵀ on exit. Where `wantt` is false, `zt` is empty. Each iteration then transforms only the rows and columns it still acts on. Each converged 2×2 block takes the standard form that `standard` gives. `None` where a block takes more than `30 max(10, n)` iterations.
 fn francis<T: Native>(h: &mut [T], ld: usize, zt: &mut [T], n: usize, wantt: bool) -> Option<(Vec<T>, Vec<T>)> {
     let (zero, one, two) = (T::zero(), T::one(), T::one() + T::one());
@@ -105,25 +126,7 @@ fn francis<T: Native>(h: &mut [T], ld: usize, zt: &mut [T], n: usize, wantt: boo
         let mut l = 0;
         let mut its = 0;
         loop {
-            // The last negligible subdiagonal item at or above row i splits off the block that holds row i.
-            let mut k = i;
-            while k > l {
-                let sub = h[k * ld + k - 1].abs();
-                if sub <= smlnum { break; }
-                let mut tst = h[(k - 1) * ld + k - 1].abs() + h[k * ld + k].abs();
-                if tst == zero { if k >= 2 { tst = tst + h[(k - 1) * ld + k - 2].abs() } if k + 1 < n { tst = tst + h[(k + 1) * ld + k].abs() } }
-                // Ahues and Tisseur's conservative test, as LAPACK applies it.
-                if sub <= ulp * tst {
-                    let sup = h[(k - 1) * ld + k].abs();
-                    let (ab, ba) = (sub.max(sup), sub.min(sup));
-                    let (d, e) = (h[k * ld + k].abs(), (h[(k - 1) * ld + k - 1] - h[k * ld + k]).abs());
-                    let (aa, bb) = (d.max(e), d.min(e));
-                    let s = aa + ab;
-                    if ba * (ab / s) <= smlnum.max(ulp * (bb * (aa / s))) { break; }
-                }
-                k -= 1;
-            }
-            l = k;
+            l = split(h, ld, n, l, i, [smlnum, ulp], |x: T| x.abs(), |x: T| x.abs());
             if l > 0 { h[l * ld + l - 1] = zero }
             if l + 1 >= i { break; }
             its += 1;
@@ -427,25 +430,7 @@ fn single_shift<R: Native>(h: &mut [Complex<R>], ld: usize, zt: &mut [Complex<R>
         let mut l = 0;
         let mut its = 0;
         loop {
-            // The last negligible subdiagonal item at or above row i splits off the block that holds row i.
-            let mut k = i;
-            while k > l {
-                let sub = h[k * ld + k - 1];
-                if sub.abs1() <= smlnum { break; }
-                let mut tst = h[(k - 1) * ld + k - 1].abs1() + h[k * ld + k].abs1();
-                if tst == rzero { if k >= 2 { tst = tst + h[(k - 1) * ld + k - 2].re.abs() } if k + 1 < n { tst = tst + h[(k + 1) * ld + k].re.abs() } }
-                // Ahues and Tisseur's conservative test, as LAPACK applies it.
-                if sub.re.abs() <= ulp * tst {
-                    let (sub, sup) = (sub.abs1(), h[(k - 1) * ld + k].abs1());
-                    let (ab, ba) = (sub.max(sup), sub.min(sup));
-                    let (d, e) = (h[k * ld + k].abs1(), (h[(k - 1) * ld + k - 1] - h[k * ld + k]).abs1());
-                    let (aa, bb) = (d.max(e), d.min(e));
-                    let s = aa + ab;
-                    if ba * (ab / s) <= smlnum.max(ulp * (bb * (aa / s))) { break; }
-                }
-                k -= 1;
-            }
-            l = k;
+            l = split(h, ld, n, l, i, [smlnum, ulp], |x: Complex<R>| x.abs1(), |x: Complex<R>| x.re.abs());
             if l > 0 { h[l * ld + l - 1] = zero }
             if l >= i { break; }
             its += 1;

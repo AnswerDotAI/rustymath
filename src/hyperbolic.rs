@@ -74,9 +74,7 @@ pub(crate) fn atanh<R: Native, const FUSED: bool>(x: R) -> R {
 /// The real part of acosh x, or of its principal value at a complex z, as a function object: acosh |x| for |x| at least 1, and 0 between -1 and 1. The real part of `6○⁻¹`.
 #[derive(Clone, Copy, Debug)]
 pub struct RealAcosh;
-forms!(#[inline] RealAcosh at real: |_, [x]| crate::slice::Total(acosh::<_, { crate::FUSED }>(if x.abs() < 1.0 { 1.0 } else { x.abs() })));
 
 /// The real part of atanh x, or of its principal value at a complex z, as a function object: atanh x for x between -1 and 1, and atanh (1 ÷ x) beyond, which is ½ ln |(1 + x) ÷ (1 - x)|. The real part of `7○⁻¹`.
 #[derive(Clone, Copy, Debug)]
 pub struct RealAtanh;
-forms!(#[inline] RealAtanh at real: |_, [x]| crate::slice::Total(atanh::<_, { crate::FUSED }>(if x.abs() > 1.0 { 1.0 / x } else { x })));

@@ -25,31 +25,30 @@ pub(crate) fn cycled<T: Copy>(d: &mut Vec<T>, s: &[T], from: usize, n: usize) {
 /// The bytes of whole periods that `cycled` copies at a time, small enough to stay in cache.
 const CYCLE_BLOCK: usize = 32 << 10;
 
-/// Appends each of `items`, converted by `f`, as many times as its count. `counts` holds one count for all the items, or one for each item. The counts are nonnegative and sum to `total`. An item with a count of at most 4 writes four copies where its run starts. The items after it overwrite the copies beyond its count. A larger count fills its run. With a count for each item, a group of 4 items whose counts are all at most 4 writes its copies after one check for the whole group. With a check and a taken branch for each item, the loop's cost varied by about a third with where its code was placed.
+/// Appends `item(j)` for each `j` below `len`, as many times as its count. `counts` holds one count for all the items, or one for each item. The counts are nonnegative and sum to `total`. An item with a count of at most 4 writes four copies where its run starts. The items after it overwrite the copies beyond its count. A larger count fills its run. With a count for each item, a group of 4 items whose counts are all at most 4 writes its copies after one check for the whole group. With a check and a taken branch for each item, the loop's cost varied by about a third with where its code was placed.
 #[inline]
-pub fn repeat<S: Copy, D: Copy>(out: &mut Vec<D>, items: &[S], counts: &[i64], total: usize, f: impl Fn(S) -> D) {
+pub fn repeat<D: Copy, C: Key>(out: &mut Vec<D>, len: usize, counts: &[C], total: usize, item: impl Fn(usize) -> D) {
     crate::slice::appended(out, total, |d| {
         let mut k = 0;
-        let each = |d: &mut [MaybeUninit<D>], k: &mut usize, x: S, n: usize| {
-            let x = MaybeUninit::new(f(x));
+        let each = |d: &mut [MaybeUninit<D>], k: &mut usize, x: D, n: usize| {
+            let x = MaybeUninit::new(x);
             match d[*k..].first_chunk_mut::<4>() { Some(w) if n <= 4 => *w = [x; 4], _ => d[*k..*k + n].fill(x) }
             *k += n;
         };
-        if let [n] = *counts { for &x in items { each(d, &mut k, x, n as usize) } } else {
-            let (groups, rest) = items.as_chunks::<4>();
+        if let [n] = *counts { for j in 0..len { each(d, &mut k, item(j), n.key() as usize) } } else {
             let count_groups = counts.as_chunks::<4>().0;
-            for j in 0..groups.len() {
-                let (g, c) = (groups[j], count_groups[j]);
-                if k + 16 > total || c[0].max(c[1]).max(c[2]).max(c[3]) as u64 > 4 { for i in 0..4 { each(d, &mut k, g[i], c[i] as usize) } continue; }
+            for (g, &c) in count_groups.iter().enumerate().take(len / 4) {
+                let j = 4 * g;
+                if k + 16 > total || c[0].key().max(c[1].key()).max(c[2].key()).max(c[3].key()) as u64 > 4 { for i in 0..4 { each(d, &mut k, item(j + i), c[i].key() as usize) } continue; }
                 let w = &mut d[k..k + 16];
                 let mut o = 0;
                 for i in 0..4 {
-                    *w[o..].first_chunk_mut::<4>().expect("each count in the group is at most 4") = [MaybeUninit::new(f(g[i])); 4];
-                    o += c[i] as usize;
+                    *w[o..].first_chunk_mut::<4>().expect("each count in the group is at most 4") = [MaybeUninit::new(item(j + i)); 4];
+                    o += c[i].key() as usize;
                 }
                 k += o;
             }
-            for (&x, &n) in rest.iter().zip(&counts[groups.len() * 4..]) { each(d, &mut k, x, n as usize) }
+            for j in len / 4 * 4..len { each(d, &mut k, item(j), counts[j].key() as usize) }
         }
         assert_eq!(k, total, "the counts must sum to `total`");
     })
@@ -465,41 +464,21 @@ impl<'a> Writes<'a> {
     pub fn write<S: Item, D: Item>(self, out: &mut [D], items: &[S], conv: impl Convert<S, D>) {
         match self { Self::Offsets(offsets) => scatter(out, offsets, items, conv), Self::Walk { base, steps } => scatter_walk(out, items, base, steps, conv) }
     }
-    /// Combines the matching item of `values`, or its only item, into the item of `out` at each write by `f`, in order, as `out[o] = f(out[o], y)`. A place that repeats combines again. With addition, this is the transpose of a gather that reads a position more than once.
-    pub fn combine<D: Copy, S: Copy>(self, out: &mut [D], values: Arg<'_, S>, f: impl Fn(D, S) -> D) {
-        self.runs_while(&mut |k, run| {
-            for (j, &o) in run.iter().enumerate() { if o != Steps::FILL { out[o] = f(out[o], values.nth(k + j)) } }
-            true
-        });
+    /// Combines the matching item of `values`, or its only item, into the item of `out` at each write by `f`, in order, as `out[o] = f(out[o], y).0`. A place that repeats combines again. With addition, this is the transpose of a gather that reads a position more than once. It gives the last failure that `f` reports.
+    pub fn combine<D: Copy, S: Copy, E: Copy>(self, out: &mut [D], values: Arg<'_, S>, f: impl Fn(D, S) -> (D, Option<E>)) -> Option<E> {
+        let mut failed = None;
+        self.runs_while(&mut |k, run| { failed = combine_run(out, run, values.part(k, run.len()), &f).or(failed); true });
+        failed
     }
-    /// [`Writes::combine`] by the reduction `R`: each write steps the item of `out` at its place, the place's running fold, by its value through `R::checked`. A place written more than once folds its values as `R` folds, with `R`'s rule beside NaN. It gives whether every step fits.
-    pub fn fold<R: crate::reduce::Reduction<T>, T: Copy>(self, out: &mut [R::Total], values: Arg<'_, T>) -> bool {
-        let fits = std::cell::Cell::new(true);
-        self.combine(out, values, |acc, x| {
-            let (t, f) = R::checked(acc, x);
-            fits.set(fits.get() & f);
-            t
-        });
-        fits.get()
+}
+
+/// [`Writes::combine`] over one run of offsets, with its values. As an argument, `out` tells the compiler that its writes leave what `f` reads unchanged: the loop then reads `f`'s settings once, not at every write.
+fn combine_run<D: Copy, S: Copy, E: Copy>(out: &mut [D], run: &[usize], values: Arg<'_, S>, f: &impl Fn(D, S) -> (D, Option<E>)) -> Option<E> {
+    let mut failed = None;
+    for (j, &o) in run.iter().enumerate() {
+        if o != Steps::FILL { let (r, e) = f(out[o], values.nth(j)); out[o] = r; failed = e.or(failed) }
     }
-    /// [`Writes::combine`] for an `f` that gives `None` for a pair it can't combine. At the first such pair, it restores every item that earlier writes changed and gives false. It restores from a copy of `out` where `out` holds no more items than there are writes, as a histogram's counters do, and otherwise from a record of each item it changes.
-    pub fn try_combine<D: Copy, S: Copy>(self, out: &mut [D], values: Arg<'_, S>, f: impl Fn(D, S) -> Option<D>) -> bool {
-        let saved = (out.len() <= self.len()).then(|| out.to_vec());
-        let mut undo = Vec::new();
-        let ok = self.runs_while(&mut |k, run| {
-            for (j, &o) in run.iter().enumerate() {
-                if o == Steps::FILL { continue; }
-                let Some(new) = f(out[o], values.nth(k + j)) else { return false };
-                if saved.is_none() { undo.push((o, out[o])) }
-                out[o] = new;
-            }
-            true
-        });
-        if !ok {
-            match saved { Some(saved) => out.copy_from_slice(&saved), None => { for (o, old) in undo.into_iter().rev() { out[o] = old } } }
-        }
-        ok
-    }
+    failed
 }
 
 /// Whether `xs` is 0, 1, 2 and so on: offsets that read a source in order, or an axis order that a transpose leaves unchanged.
@@ -529,25 +508,19 @@ pub enum Steps {
 
 /// Index values that a table reads as positions along an axis, converting each one as it reads it, so that the values aren't first copied into a list of offsets. [`Table::indices`] takes them.
 pub trait IndexSource: Send + Sync {
-    /// The index values, as Booleans, integers, or floats within the default tolerance of whole numbers ([`IndexValue`]).
+    /// The index values, as Booleans or integers ([`IndexValue`]).
     fn view(&self) -> View<'_>;
 }
 impl IndexSource for crate::buffer::Buffer { fn view(&self) -> View<'_> { self.view() } }
 
-/// A value that names a position along an axis: a Boolean, an integer, or a float within the default tolerance of a whole number. This is the one rule for float index values; [`crate::structure::float_position`] reads it.
+/// A value that names a position along an axis: a Boolean or an integer. A float index value names the whole number it equals within the comparison tolerance, which [`crate::structure::float_position`] reads before any table holds it.
 pub trait IndexValue: Copy {
     /// The position the value names, where a negative one counts back from the end.
     fn position(self) -> i64;
-    /// Whether the value names a position: every Boolean and integer does, and a float equal to a whole number within the default tolerance.
-    #[inline(always)]
-    fn whole(self) -> bool { true }
-    /// The least and greatest positions that `values` name, which mean nothing where `values` is empty, and whether every value is a whole number.
-    fn bounds(values: &[Self]) -> (i64, i64, bool) {
+    /// The least and greatest positions that `values` name, which mean nothing where `values` is empty.
+    fn bounds(values: &[Self]) -> (i64, i64) {
         // Folding with no branch keeps the loop vectorised.
-        values.iter().fold((i64::MAX, i64::MIN, true), |(lo, hi, whole), &i| {
-            let p = i.position();
-            (lo.min(p), hi.max(p), whole & i.whole())
-        })
+        values.iter().fold((i64::MAX, i64::MIN), |(lo, hi), &i| { let p = i.position(); (lo.min(p), hi.max(p)) })
     }
 }
 impl IndexValue for bool {
@@ -555,20 +528,15 @@ impl IndexValue for bool {
     fn position(self) -> i64 { self.into() }
 }
 macro_rules! index_values {
-    ($($t:ty),*; $($f:ty),*) => {
+    ($($t:ty),*) => {
         $(impl IndexValue for $t {
             #[inline(always)] fn position(self) -> i64 { self.into() }
             // Folding in the integers' own type, before they widen to positions, uses that type's vector lanes.
-            fn bounds(values: &[Self]) -> (i64, i64, bool) { let (lo, hi) = values.iter().fold((<$t>::MAX, <$t>::MIN), |(lo, hi), &i| (lo.min(i), hi.max(i))); (lo.into(), hi.into(), true) }
-        })*
-        $(impl IndexValue for $f {
-            #[inline(always)] fn position(self) -> i64 { crate::tolerant::Tolerant::nearest_whole(crate::tolerant::Tolerance::DEFAULT, crate::float::Float::wide(self)).0 as i64 }
-            // A NaN or an infinity equals no whole number within tolerance.
-            #[inline(always)] fn whole(self) -> bool { crate::tolerant::Tolerant::nearest_whole(crate::tolerant::Tolerance::DEFAULT, crate::float::Float::wide(self)).1 }
+            fn bounds(values: &[Self]) -> (i64, i64) { let (lo, hi) = values.iter().fold((<$t>::MAX, <$t>::MIN), |(lo, hi), &i| (lo.min(i), hi.max(i))); (lo.into(), hi.into()) }
         })*
     };
 }
-index_values!(i8, i16, i32, i64, u8, u16, u32; crate::half::f16, f32, f64);
+index_values!(i8, i16, i32, i64, u8, u16, u32);
 
 /// Explicit offsets along one axis, with [`Steps::FILL`] where a fill goes: a list of offsets, or index values that each give one. `start` and `len` choose the offsets in use, so that slicing a table copies none of them.
 #[derive(Clone, Debug)]
@@ -589,14 +557,13 @@ impl std::fmt::Debug for Positions {
 /// The most offsets that [`Table::chunks`] converts from index values at a time, into a buffer on the stack.
 const TABLE_CHUNK: usize = 256;
 
-/// `$body` on the index values `$view`, as a slice `$x` of Booleans, integers or floats.
+/// `$body` on the index values `$view`, as a slice `$x` of Booleans or integers. Float index values become positions before they reach a table ([`crate::structure::index_table`]).
 macro_rules! with_index_values {
     ($view:expr, |$x:ident| $body:expr) => {
         match $view {
             View::Booleans($x) => $body,
             View::Integers(ix) => with_ints!(ix, |$x| $body),
-            View::Floats(x) => with_floats!(x, |$x| $body),
-            _ => unreachable!("index values are Booleans, integers or floats"),
+            _ => unreachable!("a table's index values are Booleans or integers"),
         }
     };
 }
@@ -1348,6 +1315,43 @@ unsafe fn written_as<A, B>(items: &mut [A]) -> &mut [B] {
     unsafe { std::slice::from_raw_parts_mut(items.as_mut_ptr().cast(), items.len()) }
 }
 
+/// Appends `rows` rows to `out`, each holding the next lane of each part in turn, as arrays joined along an axis lay out their lanes. Lane `r` of a part whose lanes hold `n` items is its items from `r × n` up to `(r + 1) × n`. Rows go straight into `out`'s spare capacity, so each result item is written once. Where two parts' lanes hold one length of at most `RUN` items, each lane moves as one block of units. Other lanes copy item by item.
+pub fn interleave<T: Item>(out: &mut Vec<T>, parts: &[(&[T], usize)], rows: usize) {
+    assert!(parts.iter().all(|&(items, n)| items.len() == rows * n), "each part holds one lane for every row");
+    let width = parts.iter().map(|&(_, n)| n).sum::<usize>();
+    let parts: Vec<(&[T::Unit], usize)> = parts.iter().map(|&(items, n)| (units(items), n)).collect();
+    crate::slice::appended(out, rows * width, |slots| {
+        // SAFETY: each unit written below is a unit of an item, read through `units`.
+        let slots = unsafe { written_as::<MaybeUninit<T>, MaybeUninit<T::Unit>>(slots) };
+        match *parts {
+            [(a, n), (b, m)] if n == m && (1..=RUN).contains(&n) => runs!(n, L => lane_pairs::<L, T::Unit>(slots, [a, b])),
+            _ => lane_items(slots, &parts, width),
+        }
+    })
+}
+
+/// [`interleave`]'s rows where two parts' lanes hold `L` units: each lane moves as one block, with both sources in registers.
+#[inline]
+fn lane_pairs<const L: usize, U: Unit>(slots: &mut [MaybeUninit<U>], [a, b]: [&[U]; 2]) {
+    let (a, b, mut to) = (a.as_ptr().cast::<[U; L]>(), b.as_ptr().cast::<[U; L]>(), slots.as_mut_ptr().cast::<[U; L]>());
+    for r in 0..slots.len() / (2 * L) {
+        // SAFETY: each part holds a lane of `L` units for each row, and `slots` holds a row of both lanes for each.
+        unsafe { to.write(a.add(r).read()); to.add(1).write(b.add(r).read()); to = to.add(2) }
+    }
+}
+
+/// [`interleave`]'s rows where the parts are more than two, or their lanes differ in length or are long: each lane copies item by item.
+fn lane_items<U: Unit>(slots: &mut [MaybeUninit<U>], parts: &[(&[U], usize)], width: usize) {
+    if width == 0 { return; }
+    for (r, row) in slots.chunks_exact_mut(width).enumerate() {
+        let mut at = 0;
+        for &(items, n) in parts {
+            for (slot, &u) in row[at..at + n].iter_mut().zip(&items[r * n..][..n]) { slot.write(u); }
+            at += n;
+        }
+    }
+}
+
 /// Writes `items` into `out`, each converted by `conv`, as [`windows_into`] writes units: one cell at each start along a stride of `step` from `at`, with its items where `rest` reaches. Gives `false` where `rest` isn't a short cell (`short_cells`). Only the sources that [`Item::cells_into_f64`] names call it, so its loops compile for those pairs alone.
 fn converted_cells<S: Copy, D, C: Convert<S, D>>(out: &mut [D], items: &[S], conv: &C, at: usize, step: isize, rest: &[Cow<'_, Steps>]) -> bool {
     fn cells<const L: usize, S: Copy, D, C: Convert<S, D>>(out: &mut [D], items: &[S], conv: &C, at: usize, step: isize, cell: &Cell) {
@@ -1401,8 +1405,9 @@ fn walked<S: Item, D, C: Convert<S, D>>(out: &mut Vec<D>, conv: &C, n: usize, wa
                 true
             });
         }
-        Some(out) => walk(out, 0, n),
+        Some(out) => { out.reserve(n); walk(out, 0, n) }
         None => {
+            out.reserve(n);
             let mut block = Vec::with_capacity(n.min(CHUNK));
             for from in (0..n).step_by(CHUNK) {
                 block.clear();

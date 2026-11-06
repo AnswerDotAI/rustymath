@@ -93,7 +93,7 @@ Gammaincinv	3600	3600
 Betainc	2400	2400
 # 4800 copies, for about four evaluations of Betainc.
 Betaincinv	9600	9600
-# 10 copies, for 78 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: exp of the real part and sin and cos of the imaginary part. The count leaves out `split`'s passes over the parts and the results. It costs about 16.5 copies on macOS. CI measured about 24 copies on 22 October, before `exp_parts` stopped calling `quarter` for every item. CI's earlier runs showed 8 to 11 copies only because each divided by a copy read from memory. After that change CI measured 19.1, about twice its expected cost, where a budget of twice it would fail by chance, so its Linux budget stays held.
+# Times the per-item kernel through `time_map`: `complex::exp` on each item, exp of the real part and sin and cos of the imaginary part. The expected cost of 10 copies, for 78 f64 ops per complex item, was worked out for the split slice form that this row timed before that form was deleted. The per-item kernel's cost isn't studied yet, and its Linux budget stays held.
 complex Exp	20	43
 # 12.5 copies, for 100 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: hypot, ln with care near |z| = 1, atan2. It costs about 30 copies on macOS and 32.4 on CI on 22 October 2026, more than twice that, so both budgets are unchanged until the cost is studied.
 complex Ln	63	61
@@ -113,7 +113,7 @@ complex Lgamma	110	350
 complex Gamma	280	480
 # 2 copies, for 16 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: hypot; reading two floats and writing one take 0.75.
 complex Abs	4	4
-# 11.5 copies, for 92 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: two complex square roots, each a hypot pass and then one pass that writes both parts, then a product and a rebalance. It costs about 23.8 copies on macOS since `sqrt_parts` became one pass on 23 October 2026 (25.8 before), and 29.3 on CI on 22 October 2026, more than twice that, so both budgets are unchanged until the cost is studied.
+# Times the per-item kernel through `time_map`: `complex::sqrt1mx2` on each item, two complex square roots, then a product and a rebalance. The expected cost of 11.5 copies, for 92 f64 ops per complex item, was worked out for the split slice form that this row timed before that form was deleted. Both budgets stay unchanged until the per-item kernel's cost is studied.
 complex Sqrt1mx2	53	62
 # 23 copies, for 184 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: a complex ln, a complex product, a complex exp. It costs about 50.6 copies on macOS and 55.3 on CI on 22 October 2026, more than twice that, so both budgets are unchanged until the cost is studied.
 complex Pow	110	130
@@ -260,7 +260,7 @@ Gammaincinv	7400	11000
 Betainc	6000	8300
 # 3400 copies, for about four evaluations of Betainc's narrow route. It costs about 8512 copies on macOS and 11278 on CI on 22 October 2026, more than twice that, so both budgets are unchanged until the cost is studied.
 Betaincinv	18000	26000
-# 10 copies, for 78 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: exp of the real part and sin and cos of the imaginary part. The count leaves out `split`'s passes over the parts and the results. It costs about 20 copies on macOS. CI measured about 21 copies on 22 October, before `exp_parts` stopped calling `quarter` for every item. CI's earlier runs showed about 9 copies only because each divided by a copy read from memory. After that change CI measured 18.3, about twice its expected cost, where a budget of twice it would fail by chance, so both budgets stay held.
+# Times the per-item kernel through `time_map`: `complex::exp` on each item, exp of the real part and sin and cos of the imaginary part. The expected cost of 10 copies, for 78 f64 ops per complex item, was worked out for the split slice form that this row timed before that form was deleted. The per-item kernel's cost isn't studied yet, and both budgets stay held.
 complex Exp	47	52
 # 12.5 copies, for 100 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: hypot, ln with care near |z| = 1, atan2. It costs about 30.5 copies on macOS and 27.1 on CI on 22 October 2026, more than twice that, so both budgets are unchanged until the cost is studied.
 complex Ln	59	62
@@ -280,7 +280,7 @@ complex Lgamma	210	640
 complex Gamma	560	810
 # 2 copies, for 16 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: hypot; reading two floats and writing one take 0.75.
 complex Abs	4	4
-# 11.5 copies, for 92 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: two complex square roots, each a hypot pass and then one pass that writes both parts, then a product and a rebalance. It costs about 28.0 copies on macOS since `sqrt_parts` became one pass on 23 October 2026 (29.4 before), and 33.2 on CI on 22 October 2026, more than twice that, so both budgets are unchanged until the cost is studied.
+# Times the per-item kernel through `time_map`: `complex::sqrt1mx2` on each item, two complex square roots, then a product and a rebalance. The expected cost of 11.5 copies, for 92 f64 ops per complex item, was worked out for the split slice form that this row timed before that form was deleted. Both budgets stay unchanged until the per-item kernel's cost is studied.
 complex Sqrt1mx2	59	92
 # 23 copies, for 184 f64 ops per complex item, at a quarter copy per op and two floats per complex copy: a complex ln, a complex product, a complex exp. It costs about 52.3 copies on macOS and 51.5 on CI on 22 October 2026, more than twice that, so both budgets are unchanged until the cost is studied.
 complex Pow	110	130

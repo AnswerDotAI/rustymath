@@ -60,12 +60,6 @@ pub(crate) mod sealed {
         type Bits: Copy;
         /// `u - less` as a float, for a whole number u below 2^m, through the bits of 2^m + u. A loop that calls it vectorizes even where the target has no vector conversion for u's type. [`convert`](crate::convert) builds on it.
         fn from_low(u: Self::Bits, less: Self) -> Self;
-        /// The whole number nearest `self`, for `self` from 0 to below 2^m, as the low bits of 2^m + `self`. `from_low` reverses it.
-        fn to_low(self) -> Self::Bits;
-        /// The bits of a positive `self` without their low `BITS - m`, read as a whole number, as a float. They grow nearly in proportion to `self`'s logarithm. `from_top` reverses it.
-        fn top(self) -> Self;
-        /// The float whose bits without their low `BITS - m` are the whole number `t`, for a `t` from 0 to below 2^m.
-        fn from_top(t: Self) -> Self;
         /// `self×b+c`, with one rounding when `FUSED` is true and two otherwise.
         fn mla<const FUSED: bool>(self, b: Self, c: Self) -> Self;
         /// 2^n, from `z` = `SHIFT + n`, for a whole n within the exponents of normal floats.
@@ -179,12 +173,6 @@ macro_rules! native {
                 let two_m = (1 as $bits << $mantissa) as $t;
                 $t::from_bits(two_m.to_bits() | u) - (two_m + less)
             }
-            #[inline]
-            fn to_low(self) -> $bits { (self + (1 as $bits << $mantissa) as $t).to_bits() & ((1 << $mantissa) - 1) }
-            #[inline]
-            fn top(self) -> $t { Self::from_low(self.to_bits() >> (<$bits>::BITS - $mantissa), 0.0) }
-            #[inline]
-            fn from_top(t: $t) -> $t { $t::from_bits(t.to_low() << (<$bits>::BITS - $mantissa)) }
             #[inline]
             fn mla<const FUSED: bool>(self, b: $t, c: $t) -> $t { if FUSED { self.mul_add(b, c) } else { self * b + c } }
             // The low bits of `z` hold n. Adding the bias to them and shifting them into the exponent field gives 2^n. Integer adds and shifts vectorize on every target, where a conversion from a float to a 64-bit integer doesn't on x86-64.

@@ -32,7 +32,7 @@ fn fill_of(fill: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Arc<Buffer>>> {
 /// The selector that `indices` make on `axis` of `layout` under `edge`: each index reads the position that `edge` gives it on the axis, or the fill where it gives none (`Edge::positions`).
 fn edged(layout: &Layout, axis: usize, indices: &Bound<'_, PyAny>, edge: Edge) -> PyResult<Selector> {
     let indices = convert::one(indices)?.into_core()?.compact();
-    let positions = edge.positions(indices.view().contiguous().expect("compact index values"), layout.shape()[axis]).map_err(py_err)?;
+    let positions = edge.positions(indices.view().contiguous().expect("compact index values"), layout.shape()[axis], crate::functions::comparison(false)).map_err(py_err)?;
     let buffer = match positions { Edged::Positions(p) => i64::buffer(p.into_iter().map(|p| p as i64).collect()), Edged::Floats(f) => f64::buffer(f) };
     Ok(indexed(layout, axis, Core::new(indices.layout().clone(), buffer).map_err(py_err)?)?.0)
 }

@@ -2,7 +2,7 @@
 //!
 //! The lock keeps timings apart from builds and test runs on one machine. A timing takes it exclusively. A build or a test run takes it shared. It is an `flock` on the file `LOCK`. A timing holds a second file, `GATE`, exclusively from before it takes `LOCK` until it releases it, and a shared hold passes `GATE` before it takes `LOCK`. A waiting timing then stops new builds and test runs from starting, and it runs once the holds already taken end. `fastws.timelock` takes the same locks from Python. The browser build has no timing lock.
 #[cfg(not(target_arch = "wasm32"))]
-pub use lock::{GATE, Hold, LOCK, exclusive, shared};
+pub use lock::{GATE, Hold, LOCK, exclusive, hold_at, shared};
 /// The clock that timings and `parallel`'s rounds read: the browser's in a browser build, where `std::time::Instant` panics.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) use std::time::Instant;
@@ -342,12 +342,13 @@ mod lock {
     impl Drop for Hold { fn drop(&mut self) { if let Some(n) = self.threads { set_threads(n); } } }
 
     /// Takes the timing lock exclusively, for a timing. It waits up to 5 minutes for builds, test runs and other timings, then fails. From the start of its wait it holds `GATE`, so no build or test run starts meanwhile. After waiting 30 seconds it prints, once, the other processes that have the lock's file open. On macOS it also sets the calling thread's QoS class to user-interactive. macOS then favours the performance cores for that thread. QoS isn't CPU affinity.
-    pub fn exclusive() -> io::Result<Hold> { hold(false) }
+    pub fn exclusive() -> io::Result<Hold> { hold_at(LOCK, false) }
 
     /// Takes the timing lock shared, for a build or a test run. It waits behind any timing that holds `GATE` or the lock, for up to 5 minutes, then fails. A nested shared hold acquired by the same thread reuses its file.
-    pub fn shared() -> io::Result<Hold> { hold(true) }
+    pub fn shared() -> io::Result<Hold> { hold_at(LOCK, true) }
 
-    fn hold(shared: bool) -> io::Result<Hold> {
+    /// Takes the timing lock whose file is `lock`, exclusively or `shared`, as [`exclusive`] and [`shared`] take `LOCK`. Its gate is `GATE` for `LOCK`, and `<lock>.gate` for any other file. A test of the protocol holds a file of its own, which no build or timing holds.
+    pub fn hold_at(lock: &str, shared: bool) -> io::Result<Hold> {
         if let Some((was_shared, file)) = HELD.with(|h| { let h = h.borrow(); h.1.upgrade().map(|f| (h.0, f)) }) {
             if shared && was_shared { return Ok(Hold { _file: file, _gate: None, threads: None }); }
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "timing locks can only nest shared inside shared"));
@@ -357,16 +358,17 @@ mod lock {
             unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
         }
         let open = |path: &str| File::options().create(true).append(true).open(path).map_err(|e| io::Error::new(e.kind(), format!("{path}: {e}")));
-        let (gate, file) = (open(GATE)?, open(LOCK)?);
+        let gate = if lock == LOCK { GATE.into() } else { format!("{lock}.gate") };
+        let (gate_file, file) = (open(&gate)?, open(lock)?);
         let mut wait = Wait { start: Instant::now(), shared, waiting: false, reported: false };
-        wait.take(&gate, GATE)?;
-        wait.take(&file, LOCK)?;
+        wait.take(&gate_file, &gate)?;
+        wait.take(&file, lock)?;
         let file = Arc::new(file);
         HELD.with(|h| *h.borrow_mut() = (shared, Arc::downgrade(&file)));
-        Ok(Hold { _file: file, _gate: (!shared).then_some(gate), threads: (!shared).then(|| set_threads(1)) })
+        Ok(Hold { _file: file, _gate: (!shared).then_some(gate_file), threads: (!shared).then(|| set_threads(1)) })
     }
 
-    /// One hold's wait for `GATE` and then `LOCK`, against one deadline of 5 minutes.
+    /// One hold's wait for its gate and then its lock, against one deadline of 5 minutes.
     struct Wait { start: Instant, shared: bool, waiting: bool, reported: bool }
 
     impl Wait {
@@ -379,11 +381,11 @@ mod lock {
                     Err(TryLockError::Error(e)) => return Err(io::Error::new(e.kind(), format!("{path}: {e}")))
                 }
                 if self.start.elapsed() > Duration::from_secs(300) {
-                    return Err(io::Error::new(io::ErrorKind::TimedOut, format!("{others} has held {LOCK} for 5 minutes. Processes with it open: {}", users())));
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, format!("{others} has held {path} for 5 minutes. Processes with it open: {}", users(path))));
                 }
-                if !self.waiting { eprintln!("waiting for {others} to release {LOCK}"); }
+                if !self.waiting { eprintln!("waiting for {others} to release {path}"); }
                 if !self.shared && !self.reported && self.start.elapsed() > Duration::from_secs(30) {
-                    eprintln!("{LOCK} is still taken after 30 seconds. Processes with it open: {}", users());
+                    eprintln!("{path} is still taken after 30 seconds. Processes with it open: {}", users(path));
                     self.reported = true;
                 }
                 self.waiting = true;
@@ -393,8 +395,8 @@ mod lock {
     }
 
     /// The processes other than this one that have the lock's file open, as `pid command` pairs from `lsof`. On macOS, where `lsof` doesn't show `flock` holds, the list also includes any other process waiting for the lock.
-    fn users() -> String {
-        let Ok(out) = std::process::Command::new("lsof").args(["+c", "0", "-F", "pc", LOCK]).output() else {
+    fn users(path: &str) -> String {
+        let Ok(out) = std::process::Command::new("lsof").args(["+c", "0", "-F", "pc", path]).output() else {
             return "unknown, because lsof didn't run".into();
         };
         let (text, me) = (String::from_utf8_lossy(&out.stdout), std::process::id().to_string());

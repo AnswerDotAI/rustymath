@@ -1,5 +1,5 @@
 //! The inverse circle functions. `asin` and `acos` reduce as SLEEF's `xasin_u35` and `xacos_u35` do (see `THIRD-PARTY.md`). `atan` reduces to three intervals, as Cephes' `atan` does. The polynomials are minimax fits.
-use crate::float::{Native, horner};
+use crate::{Atan, float::{Native, horner}};
 
 /// The coefficients of (asin s - s)/s³ as a polynomial in s², highest degree first, for |s| up to ½.
 const ASIN_64: [f64; 12] = [
@@ -70,6 +70,9 @@ pub(crate) fn atan<R: Native, const FUSED: bool>(x: R) -> R {
     (hi + ((u * z).mla::<FUSED>(p, u) + lo)).copysign(x)
 }
 
+// The Cauchy distribution's cdf runs this slice form (`distribution::through`).
+forms!(Atan at real: |_, [x]| crate::slice::Total(atan::<_, { crate::FUSED }>(x)));
+
 /// [`atan2`](crate::atan2), as atan(y/x) in the point's quadrant. It takes the arctangent of the smaller magnitude over the larger, which never overflows.
 #[inline]
 pub(crate) fn atan2<R: Native, const FUSED: bool>(y: R, x: R) -> R {
@@ -95,9 +98,7 @@ pub(crate) fn real_angle<R: Native>(x: R) -> R {
 /// The real part of asin x, or of its principal value at a complex z, as a function object: asin x for x from -1 to 1, and asin of the nearer of -1 and 1 beyond. The real part of `1○⁻¹`.
 #[derive(Clone, Copy, Debug)]
 pub struct RealAsin;
-forms!(#[inline] RealAsin at real: |_, [x]| crate::slice::Total(asin::<_, { crate::FUSED }>(if x > 1.0 { 1.0 } else if x < -1.0 { -1.0 } else { x })));
 
 /// The real part of acos x, or of its principal value at a complex z, as a function object: acos x for x from -1 to 1, and acos of the nearer of -1 and 1 beyond. The real part of `2○⁻¹`.
 #[derive(Clone, Copy, Debug)]
 pub struct RealAcos;
-forms!(#[inline] RealAcos at real: |_, [x]| crate::slice::Total(acos::<_, { crate::FUSED }>(if x > 1.0 { 1.0 } else if x < -1.0 { -1.0 } else { x })));

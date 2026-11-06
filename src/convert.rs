@@ -1,5 +1,7 @@
-//! Conversions between floats and integers whose loops vectorize on every target. AVX2 and wasm have no vector instruction for converting between `f64` and a 64-bit integer. AArch64 converts bytes to floats two lanes at a time. A loop that converts such types with `as` runs one item at a time on those targets. [`int`] and [`float`] convert them through a float's bits. They use the conversion instruction for types that every target converts in vector form, and for 64-bit integers where the target can. [`count`] writes runs of whole numbers as floats. Where the target can't convert 64-bit integers in vector form, it converts one item in 8.
+//! Conversions between floats and integers whose loops vectorize on every target. AVX2 and wasm have no vector instruction for converting between `f64` and a 64-bit integer. AArch64 converts bytes to floats two lanes at a time. A loop that converts such types with `as` runs one item at a time on those targets. [`int`] and [`float`] convert them through a float's bits. They use the conversion instruction for types that every target converts in vector form, and for 64-bit integers where the target can. [`count`] writes runs of whole numbers as floats. Where the target can't convert 64-bit integers in vector form, it converts one item in 8. [`saturated`] also converts big integers and `u64`s, saturating them at an integer type's range.
 use crate::float::{Float, sealed::{Core, Sealed}};
+use num_bigint::{BigInt, Sign};
+use num_traits::Bounded;
 
 /// An integer type that [`int`] and [`float`] convert: `i8`, `i16`, `i32`, `i64`, `u8`, `u16` or `u32`.
 pub trait Int: Copy + Sealed + sealed::Ways {}
@@ -39,7 +41,7 @@ impl Conversion {
     }
     pub fn may_raise(self, checked: bool) -> bool {
         self.kind == ConversionKind::Keep || checked && (self.output == crate::buffer::DType::Character || self
-                        .validity::<f64, _>(&crate::recipe::RangeOps(self.input), crate::facts::Range::of_dtype(self.input))
+                        .validity::<f64, _>(&crate::recipe::RangeOps(self.input), crate::domain::Range::of_dtype(self.input))
                         .is_some_and(|(_, valid)| valid != Some(true)))
     }
     pub fn map(
@@ -91,9 +93,21 @@ pub(crate) mod sealed {
 #[inline(always)]
 pub fn int<I: Int, F: Float>(x: F) -> Option<I> { if <F::Working as Core>::WIDE { I::from_f64(x.wide()) } else { I::from_f32(x.wide() as f32) } }
 
-/// `x` as an integer of type `I`, as Rust's `as` converts a float: NaN gives 0, a fraction gives the integer toward 0, and a value past `I`'s range gives its largest or smallest value. A type that fits an `i32` converts in vector form on every target, where `as` would convert one item at a time, as it does from an `f64` on AArch64 and from any float on x86-64.
+/// `x` as an integer of type `I`, or `I`'s largest or smallest value where `x` lies past its range. A float converts as Rust's `as` converts it: NaN gives 0, and a fraction gives the integer toward 0. A type that fits an `i32` converts from a float in vector form on every target, where `as` would convert one item at a time, as it does from an `f64` on AArch64 and from any float on x86-64. [`Saturates`] lists the other sources.
 #[inline(always)]
-pub fn saturated<I: Int, F: Float>(x: F) -> I { if <F::Working as Core>::WIDE { I::saturated_f64(x.wide()) } else { I::saturated_f32(x.wide() as f32) } }
+pub fn saturated<I, S: Saturates<I>>(x: S) -> I { x.saturated() }
+/// A number that [`saturated`] converts to the integer type `I`: a float to any [`Int`], and a big integer or a `u64` to any integer type that `TryFrom` converts it to.
+pub trait Saturates<I> { fn saturated(self) -> I; }
+impl<I: Int, F: Float> Saturates<I> for F {
+    #[inline(always)]
+    fn saturated(self) -> I { if <F::Working as Core>::WIDE { I::saturated_f64(self.wide()) } else { I::saturated_f32(self.wide() as f32) } }
+}
+impl<I: Bounded + for<'a> TryFrom<&'a BigInt>> Saturates<I> for &BigInt {
+    fn saturated(self) -> I { I::try_from(self).unwrap_or_else(|_| if self.sign() == Sign::Minus { I::min_value() } else { I::max_value() }) }
+}
+impl<I: Bounded + TryFrom<u64>> Saturates<I> for u64 {
+    fn saturated(self) -> I { I::try_from(self).unwrap_or_else(|_| I::max_value()) }
+}
 /// The floor of `x` within `t` as an integer of type `I`, saturated at `I`'s range as [`saturated`] saturates: NaN gives 0. The one float-to-integer rule for conversions that change a number's domain: BPL's `ₓ` marks and Python's `astype` and integer `dtype=`.
 #[inline(always)]
 pub fn floored<I: Int, F: Float>(x: F, t: impl crate::tolerant::Tolerant) -> I { saturated(t.floor(x)) }

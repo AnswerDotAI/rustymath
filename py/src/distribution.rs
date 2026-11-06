@@ -1,10 +1,10 @@
 //! rustymath's `distribution` module. Each constructor checks its parameters and gives a `Distribution`, whose methods take a number or an array of any shape.
 use crate::array::{core, give};
 use crate::convert::{convert, released};
-use crate::functions::{apply, select};
+use crate::functions::{apply, select, settings};
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyFloat};
 use rustymath::random::{Items, Key, Stream};
-use rustymath::{distribution::{self as dist, standard::*}, layout::generated_len};
+use rustymath::{distribution::{self as dist, standard::*}, facts::Op, layout::generated_len};
 use rustymath_buffer::py_err;
 
 /// A probability distribution, with a density, a cumulative distribution, a quantile function and a sampler.
@@ -32,24 +32,24 @@ impl Distribution {
     fn pdf<'py>(&self, py: Python<'py>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let call = convert(&[x])?;
         let dtype = call.args[0].view().dtype();
-        let kernel = select("pdf", dist::Pdf(self.0), dtype, [dtype], false, None)?;
-        apply(py, &kernel, &call)
+        let kernel = select("pdf", Op::Pdf(self.0), None, dtype, &[dtype], false, None)?;
+        apply(py, &kernel, &call, settings(false))
     }
 
     /// The probability of a value at most each item of `x`.
     fn cdf<'py>(&self, py: Python<'py>, x: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let call = convert(&[x])?;
         let dtype = call.args[0].view().dtype();
-        let kernel = select("cdf", dist::Cdf(self.0), dtype, [dtype], false, None)?;
-        apply(py, &kernel, &call)
+        let kernel = select("cdf", Op::Cdf(self.0), None, dtype, &[dtype], false, None)?;
+        apply(py, &kernel, &call, settings(false))
     }
 
     /// The least value whose `cdf` is at least each item of `p`. A `p` outside 0 to 1 gives NaN.
     fn quantile<'py>(&self, py: Python<'py>, p: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let call = convert(&[p])?;
         let dtype = call.args[0].view().dtype();
-        let kernel = select("quantile", dist::Quantile(self.0), dtype, [dtype], false, None)?;
-        apply(py, &kernel, &call)
+        let kernel = select("quantile", Op::Quantile(self.0), None, dtype, &[dtype], false, None)?;
+        apply(py, &kernel, &call, settings(false))
     }
 
     /// Values drawn from the distribution: one float with no `size`, or else an array of shape `size`. The same `seed` gives the same values.

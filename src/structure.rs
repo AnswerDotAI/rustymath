@@ -413,12 +413,11 @@ pub fn extended(layout: &Layout, added: &[Vec<Arc<str>>]) -> Result<Plan, Error>
     Ok(Plan { layout: Layout::from(shape).with_keys(keys)?.inherit_names(layout.names().to_vec()), steps })
 }
 
-/// A table that reads the index values in `values` as positions along an axis of length `size`, as [`positions`] reads them, converting each one as it reads it. The one pass that checks the values writes nothing, and also finds whether they give evenly spaced positions, so that a walk can read them as one stride. Floats read in place only where every one is a whole number and inside the axis, and so do integers. Otherwise the table lists the positions that [`positions`] gives, with the fill position for each value outside the axis.
-pub fn index_table(values: Arc<dyn IndexSource>, size: usize) -> Result<Table, Error> {
-    /// `None` where some value is a float that isn't a whole number, or is outside the axis. Otherwise the first position and the step where the positions are evenly spaced.
+/// A table that reads the index values in `values` as positions along an axis of length `size`, as [`positions`] reads them. Booleans and integers that all lie inside the axis read in place, each converted as it's read: the one pass that checks them writes nothing, and also finds whether they give evenly spaced positions, so that a walk can read them as one stride. Floats, read within tolerance `t`, and values with any outside the axis become the list of positions that [`positions`] gives, with the fill position for each value that names none.
+pub fn index_table(values: Arc<dyn IndexSource>, size: usize, t: crate::tolerant::Tolerance) -> Result<Table, Error> {
+    /// `None` where some value is outside the axis. Otherwise the first position and the step where the positions are evenly spaced.
     fn check<I: IndexValue>(values: &[I], size: usize) -> Option<Option<(usize, isize)>> {
-        let (lo, hi, whole) = I::bounds(values);
-        if !whole { return None; }
+        let (lo, hi) = I::bounds(values);
         if !values.is_empty() && !(lo >= -(size as i64) && hi < size as i64) { return None; }
         let at = |k: usize| values[k].position();
         if values.len() < 2 { return Some(None); }
@@ -428,9 +427,8 @@ pub fn index_table(values: Arc<dyn IndexSource>, size: usize) -> Result<Table, E
             && values.windows(2).fold(true, |even, w| even & (w[1].position() - w[0].position() == step));
         Some(even.then(|| (counted_back(at(0), size), step as isize)))
     }
-    match crate::gather::with_index_values!(values.view(), |x| check(x, size)) {
-        Some(even) => Ok(Table::indices(values, size, even)), None => positions(values.view(), size).map(Table::new)
-    }
+    let checked = match values.view() { View::Floats(_) => None, view => crate::gather::with_index_values!(view, |x| check(x, size)) };
+    match checked { Some(even) => Ok(Table::indices(values, size, even)), None => positions(values.view(), size, t).map(Table::new) }
 }
 
 /// Position `i` on an axis of length `size`, where a negative `i` counts back from the end. Adding `size` to a negative position without a branch keeps a loop over positions vectorised. A position outside the axis is then at least `size`.
@@ -444,21 +442,19 @@ pub fn position_recipe<F: Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, value
     (position, valid)
 }
 pub(crate) fn counted_back(i: i64, size: usize) -> usize {
-    let ops = crate::recipe::IntegerOps::<i64>::new(crate::facts::Variant::checked(crate::buffer::DType::Integer(crate::buffer::Width::I64)));
+    let ops = crate::recipe::IntegerOps::<i64>::new(crate::domain::Variant::checked(crate::buffer::DType::Integer(crate::buffer::Width::I64)));
     position_recipe::<f64, _>(&ops, i as u64, size as i64).0 as usize
 }
 
-/// The positions that index values give along an axis of length `size`. A negative value counts back from the end. A value outside the axis, one that isn't a whole number, or a NaN gives the fill position (`Steps::FILL`), which reads the fill and writes nothing. Items that aren't numbers are a Domain error.
-pub fn positions(view: View<'_>, size: usize) -> Result<Vec<usize>, Error> {
-    if !matches!(view.dtype(), crate::buffer::DType::Boolean | crate::buffer::DType::Integer(_) | crate::buffer::DType::Float(_)) {
-        return Err(Error::new(Kind::Domain, "indices must be real numbers"));
-    }
-    Ok(crate::gather::with_index_values!(view, |values| values
-        .iter().map(|&v| {
-            let p = counted_back(v.position(), size);
-            if v.whole() && p < size { p } else { Steps::FILL }
-        })
-        .collect()))
+/// The positions that index values give along an axis of length `size`. A negative value counts back from the end. A value outside the axis, a float that isn't a whole number within tolerance `t` (`float_position`), or a NaN gives the fill position (`Steps::FILL`), which reads the fill and writes nothing. Items that aren't numbers are a Domain error.
+pub fn positions(view: View<'_>, size: usize, t: crate::tolerant::Tolerance) -> Result<Vec<usize>, Error> {
+    let at = |p: Option<i64>| p.map(|p| counted_back(p, size)).filter(|&p| p < size).unwrap_or(Steps::FILL);
+    Ok(match view {
+        View::Booleans(b) => b.iter().map(|&i| at(Some(i.into()))).collect(),
+        View::Integers(ix) => with_ints!(ix, |i| i.iter().map(|&i| at(Some(i.into()))).collect()),
+        View::Floats(x) => with_floats!(x, |x| x.iter().map(|&y| at(float_position(y, t))).collect()),
+        _ => return Err(Error::new(Kind::Domain, "indices must be real numbers")),
+    })
 }
 
 /// The message of the Domain error for an index value that isn't a whole number.
@@ -479,15 +475,15 @@ macro_rules! index_view {
     };
 }
 
-/// The whole number that a float index value names ([`crate::gather::IndexValue`]: within the default tolerance), or `None` for a NaN or a value that isn't whole, which reads the fill.
-pub fn float_position<F: crate::gather::IndexValue>(y: F) -> Option<i64> { y.whole().then(|| y.position()) }
+/// The whole number that a float index value names: the one it equals within tolerance `t`, the comparison tolerance, which only Mathish makes nonzero. `None` for a NaN or a value that isn't whole, which reads the fill. A whole number past `i64` saturates, and so lies outside every axis. The one rule for float index values: [`positions`], [`signed_positions`], [`index_table`] and [`Edge::positions`] read floats through it.
+pub fn float_position<F: Float>(y: F, t: crate::tolerant::Tolerance) -> Option<i64> { crate::tolerant::Tolerant::whole(t, y.wide()).map(|n| n as i64) }
 
-/// The signed position that each index value gives, before any axis applies: integers as they are, and floats as `float_position` reads them, with `None` for a NaN or a value that isn't whole. Items that aren't real numbers have no position. [`positions`] reads the values and checks them against an axis in one pass.
-pub fn signed_positions(view: View<'_>) -> Vec<Option<i64>> {
+/// The signed position that each index value gives, before any axis applies: integers as they are, and floats as `float_position` reads them within tolerance `t`, with `None` for a NaN or a value that isn't whole. Items that aren't real numbers have no position. [`positions`] reads the values and checks them against an axis in one pass.
+pub fn signed_positions(view: View<'_>, t: crate::tolerant::Tolerance) -> Vec<Option<i64>> {
     match view {
         View::Booleans(b) => b.iter().map(|&i| Some(i.into())).collect(),
         View::Integers(ix) => with_ints!(ix, |i| i.iter().map(|&i| Some(i.into())).collect()),
-        View::Floats(x) => with_floats!(x, |x| x.iter().map(|&y| float_position(y)).collect()),
+        View::Floats(x) => with_floats!(x, |x| x.iter().map(|&y| float_position(y, t)).collect()),
         _ => vec![None; view.len()],
     }
 }
@@ -524,10 +520,10 @@ impl Edge {
         };
         usize::try_from(q).ok().filter(|&q| q < n as usize)
     }
-    /// The position on an axis of `n` items that each index value in `view` reads (`position`): integers as they are, and floats as `float_position` reads them. A NaN, or a float that isn't a whole number, reads the fill.
-    pub fn positions(self, view: View<'_>, n: usize) -> Result<Edged, Error> {
+    /// The position on an axis of `n` items that each index value in `view` reads (`position`): integers as they are, and floats as `float_position` reads them within tolerance `t`. A NaN, or a float that isn't a whole number, reads the fill.
+    pub fn positions(self, view: View<'_>, n: usize, t: crate::tolerant::Tolerance) -> Result<Edged, Error> {
         index_view!(view, |ix| Ok(self.mapped(n, false, ix.iter().map(|&i| Some(i.into())))), |x| {
-            let signed: Vec<_> = x.iter().map(|&y| float_position(y)).collect();
+            let signed: Vec<_> = x.iter().map(|&y| float_position(y, t)).collect();
             let unread = signed.iter().any(Option::is_none);
             Ok(self.mapped(n, unread, signed.into_iter()))
         })
@@ -547,44 +543,90 @@ pub fn repeat(layout: &Layout, axis: usize, counts: &[i64]) -> Result<Plan, Erro
 /// Undoes `repeat` with the same counts: one cell for each count. A positive count gives the first cell it made, and any other count a fill. One count must divide the number of cells. More counts must use every cell, unless the axis has one cell.
 pub fn expand(layout: &Layout, axis: usize, counts: &[i64]) -> Result<Plan, Error> { replicated(layout, axis, counts, true) }
 
-/// The plan of `repeat`, or of `expand` where `inverse`. Repeating, each count uses up one cell. Undoing, each count uses up the cells it made and gives back one.
-fn replicated(layout: &Layout, axis: usize, counts: &[i64], inverse: bool) -> Result<Plan, Error> {
+/// `repeat`'s items with no plan to walk: `view`, the items of `layout`, with each cell along `axis` written as many times as its count, a run at a time (`gather::repeat`, or `gather::positions` for counts of 0 and 1). `None` where a count is negative or `axis` has keys, which `repeat`'s plan serves.
+pub fn repeated<C: crate::search::Key>(view: View<'_>, layout: &Layout, axis: usize, counts: &[C]) -> Result<Option<(Layout, crate::buffer::Buffer)>, Error> {
+    use crate::buffer::Element;
+    let (lo, hi) = if counts.is_empty() { (0, 0) } else { C::range(counts) };
+    if layout.keys(axis).is_some() || lo < 0 { return Ok(None); }
+    let (lanes, len, shape) = replication(layout, axis, counts, false)?;
+    let (total, inner, cell) = (shape[axis], lanes.inner, |j: usize| if lanes.len == 1 { 0 } else { j });
+    let mask = counts.len() > 1 && hi <= 1;
+    let buffer = with_dtype!(view.dtype(), T => {
+        let items = T::of(view).expect("a view's items have its dtype");
+        let mut out = Vec::with_capacity(lanes.outer * total * inner);
+        for block in items.chunks((lanes.len * inner).max(1)) {
+            if inner > 1 { for j in 0..len { for _ in 0..counts[if counts.len() == 1 { 0 } else { j }].key() { out.extend_from_slice(&block[cell(j) * inner..][..inner]); } } }
+            else if mask { crate::gather::positions(&mut out, counts, total, |j| block[cell(j)]) }
+            else { crate::gather::repeat(&mut out, len, counts, total, |j| block[cell(j)]) }
+        }
+        T::buffer(out)
+    });
+    Ok(Some((unkeyed(layout, shape)?, buffer)))
+}
+
+/// The lanes along `axis` of `layout`, the number of cells that `counts` repeat or undo, and the result's shape, for `repeat`, or `expand` where `inverse`.
+fn replication<C: crate::search::Key>(layout: &Layout, axis: usize, counts: &[C], inverse: bool) -> Result<(Lanes, usize, Vec<usize>), Error> {
     let lanes = Lanes::new(layout.shape(), axis)?;
     let single = counts.len() == 1;
-    let count = |j: usize| counts[if single { 0 } else { j }];
     let size = |n: i64| Count::of(n).magnitude;
     let len = match (inverse, single) {
         (false, true) => lanes.len,
         (false, false) if lanes.len == 1 || counts.len() == lanes.len => counts.len(),
         (false, false) => return Err(Error::new(Kind::Length, "repeat needs one count, or one count for each cell")),
-        (true, true) => match size(counts[0]) {
+        (true, true) => match size(counts[0].key()) {
             0 if lanes.len == 0 => 1, n if n > 0 && lanes.len % n == 0 => lanes.len / n,
             _ => return Err(Error::new(Kind::Domain, "one count must divide the number of cells to invert"))
         },
         (true, false) => counts.len(),
     };
-    let total = if inverse { Some(len) } else { (0..len).try_fold(0usize, |total, j| total.checked_add(size(count(j)))) };
+    // The greatest count times their number bounds the sum, which then runs unchecked.
+    let most = if counts.is_empty() { 0 } else { let (lo, hi) = C::range(counts); lo.unsigned_abs().max(hi.unsigned_abs()) };
+    let total = if inverse { Some(len) } else { most.checked_mul(len as u64).and_then(|_| usize::try_from(if single { most * len as u64 } else { counts.iter().map(|n| n.key().unsigned_abs()).sum() }).ok()) };
     let mut shape = layout.shape().to_vec();
     shape[axis] = total.ok_or_else(|| Error::new(Kind::Limit, "repeat length overflow"))?;
     generated_len(&shape)?;
+    Ok((lanes, len, shape))
+}
+
+/// `shape` with `layout`'s keys on its other axes and its names, as a repeat with no keys along its axis lays out.
+fn unkeyed(layout: &Layout, shape: Vec<usize>) -> Result<Layout, Error> { Ok(Layout::from(shape).with_keys(layout.all_keys())?.inherit_names(layout.names().to_vec())) }
+
+/// The plan of `repeat`, or of `expand` where `inverse`. Repeating, each count uses up one cell. Undoing, each count uses up the cells it made and gives back one.
+fn replicated(layout: &Layout, axis: usize, counts: &[i64], inverse: bool) -> Result<Plan, Error> {
+    let (lanes, len, shape) = replication(layout, axis, counts, inverse)?;
+    let single = counts.len() == 1;
+    let count = |j: usize| counts[if single { 0 } else { j }];
+    let size = |n: i64| Count::of(n).magnitude;
     let keyed = layout.keys(axis).is_some();
-    let unkeyed = |shape: Vec<usize>| Ok::<_, Error>(Layout::from(shape).with_keys(layout.all_keys())?.inherit_names(layout.names().to_vec()));
     let rows = Steps::along(lanes.outer, lanes.len * lanes.inner);
     if !inverse && single && counts[0] >= 0 && !keyed {
-        return Ok(Plan { layout: unkeyed(shape)?,
+        return Ok(Plan { layout: unkeyed(layout, shape)?,
             steps: vec![rows, Steps::along(lanes.len, lanes.inner), Steps::along(size(counts[0]), 0), Steps::along(lanes.inner, 1)] });
     }
-    let (mut table, mut positions, mut used) = (Vec::with_capacity(shape[axis]), Vec::new(), 0usize);
-    for j in 0..len {
-        let n = count(j);
-        let cell = (n > 0).then_some(if lanes.len == 1 { 0 } else { used });
-        used = used.saturating_add(if inverse { size(n) } else { 1 });
-        let copies = if inverse { 1 } else { size(n) };
-        table.extend(std::iter::repeat_n(cell.map_or(Steps::FILL, |c| c * lanes.inner), copies));
-        if keyed { positions.extend(std::iter::repeat_n(cell, copies)); }
-    }
-    if inverse && lanes.len != 1 && used != lanes.len { return Err(Error::new(Kind::Length, "the counts must use every cell to invert")); }
-    let result = if keyed { layout.select(axis, positions.into_iter())? } else { unkeyed(shape)? };
+    let (table, positions) = if inverse {
+        let (mut table, mut positions, mut used) = (Vec::with_capacity(len), Vec::new(), 0usize);
+        for j in 0..len {
+            let n = count(j);
+            let cell = (n > 0).then_some(if lanes.len == 1 { 0 } else { used });
+            used = used.saturating_add(size(n));
+            table.push(cell.map_or(Steps::FILL, |c| c * lanes.inner));
+            if keyed { positions.push(cell); }
+        }
+        if lanes.len != 1 && used != lanes.len { return Err(Error::new(Kind::Length, "the counts must use every cell to invert")); }
+        (table, positions)
+    } else {
+        // The table repeats each count's cell by the count's magnitude, with a fill in place of the cell where the count is negative. A mask of counts 0 and 1 takes `gather::positions`, which skips blocks of zeros.
+        let cell = |j: usize| if lanes.len == 1 { 0 } else { j };
+        let (mut table, mut positions) = (Vec::with_capacity(shape[axis]), Vec::new());
+        if !single && !keyed && counts.iter().all(|&n| n == 0 || n == 1) { crate::gather::positions(&mut table, counts, shape[axis], |j| cell(j) * lanes.inner) } else {
+            let sizes: std::borrow::Cow<'_, [i64]> = if counts.iter().all(|&n| n >= 0) { counts.into() } else { counts.iter().map(|&n| size(n) as i64).collect() };
+            let at = |j: usize| (count(j) > 0).then_some(cell(j));
+            crate::gather::repeat(&mut table, len, &sizes, shape[axis], |j| at(j).map_or(Steps::FILL, |c| c * lanes.inner));
+            if keyed { crate::gather::repeat(&mut positions, len, &sizes, shape[axis], at); }
+        }
+        (table, positions)
+    };
+    let result = if keyed { layout.select(axis, positions.into_iter())? } else { unkeyed(layout, shape)? };
     Ok(Plan { layout: result, steps: vec![rows, Steps::table(table), Steps::along(lanes.inner, 1)] })
 }
 

@@ -1,30 +1,11 @@
-//! Functions of `i64`s: greatest common divisor, least common multiple, binomial coefficients, powers, square roots and residues. Each gives `None` where its result isn't an `i64`. Their function objects are the ones that floats and complex numbers use: [`Gcd`], [`Lcm`], [`Residue`] and [`FloorDivide`] from [`tolerant`](crate::tolerant), whose integer forms ignore the tolerance they hold, and [`Binom`] and [`Pow`]. A slice form appends results to a vector and reports whether every item fitted. [`Divisor`] divides many integers by one, with multiplications in place of division instructions. Where every item has the same divisor, `Residue`'s slice form divides through `FloatDivisor`, which multiplies by the divisor's reciprocal in `f64` and vectorizes, for divisors and dividends below 2⁵¹ in magnitude. At types of 16 bits or fewer it multiplies 32-bit integers instead, and it takes `Divisor` for 64-bit dividends of 2⁵¹ or more.
+//! Functions of `i64`s: greatest common divisor, least common multiple, binomial coefficients, powers, square roots and residues. Each gives `None` where its result isn't an `i64`. Their function objects are the ones that floats and complex numbers use: [`Gcd`], [`Lcm`] and [`Residue`] from [`tolerant`](crate::tolerant), whose integer forms ignore the tolerance they hold, and [`Binom`] and [`Pow`]. A slice form appends results to a vector and reports whether every item fitted. [`Divisor`] divides many integers by one, with multiplications in place of division instructions. Where every item has the same divisor, `Residue`'s slice form divides through `FloatDivisor`, which multiplies by the divisor's reciprocal in `f64` and vectorizes, for divisors and dividends below 2⁵¹ in magnitude. At types of 16 bits or fewer it multiplies 32-bit integers instead, and it takes `Divisor` for 64-bit dividends of 2⁵¹ or more.
 //!
-//! `Gcd`, `Lcm`, `Binom`, `Pow` and `Residue` also take the narrower integer types of compact buffers, `u8`, `i16` and `i32`, which they compute through these functions. A result that doesn't fit its type fails. `FloorDivide` divides each integer type exactly, gives a zero divisor the type's limit of the dividend's sign, and fails on an overflowing quotient. `Pow` floors a negative power. The tolerant comparisons, [`Floor`] and [`Ceil`] take each of these integer types exactly, ignoring the tolerance. [`Abs`] and [`Sign`] take them through the integer arithmetic of the `arith` module, and `Abs` of a signed type's least value fails. `Floor`, `Ceil` and `Abs` keep Booleans as they are.
+//! `Gcd`, `Lcm`, `Binom`, `Pow` and `Residue` also take the narrower integer types of compact buffers, `u8`, `i16` and `i32`, which they compute through these functions. A result that doesn't fit its type fails. `Pow` floors a negative power.
 use crate::{
-    Abs, Arg, Binom, Pow, convert::{self, WIDE_LIMIT}, float::sealed::Core,
-    tolerant::{Ceil, Equal, Floor, FloorDivide, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue}
+    Arg, Binom, Pow, convert::{self, WIDE_LIMIT}, float::sealed::Core,
+    tolerant::{Gcd, Lcm, Residue}
 };
 use strength_reduce::StrengthReducedU64;
-
-/// Bounds for every prefix sum of up to `len` items in `[lo, hi]`, from `start` or 0. With `subtract`, bounds every running difference instead: `start` less up to `len` items, or without `start`, the first item less up to `len - 1` more. `None` where the bounds leave `i64`.
-pub fn sum_bounds([lo, hi]: [i64; 2], len: usize, start: Option<i64>, subtract: bool) -> Option<[i64; 2]> {
-    let (lo, hi, len) = (i128::from(lo), i128::from(hi), len as i128);
-    let (least, most) = match (start, subtract) {
-        (None, true) => (lo + ((len - 1) * -hi).min(0), hi + ((len - 1) * -lo).max(0)),
-        _ => {
-            let ([lo, hi], s) = (if subtract { [-hi, -lo] } else { [lo, hi] }, i128::from(start.unwrap_or(0)));
-            (s + lo.min(len * lo), s + hi.max(len * hi))
-        }
-    };
-    Some([i64::try_from(least).ok()?, i64::try_from(most).ok()?])
-}
-
-/// Bounds for products of one item in each inclusive range, or `None` where an endpoint product leaves `i64`.
-pub fn product_bounds([a, b]: [i64; 2], [c, d]: [i64; 2]) -> Option<[i64; 2]> {
-    let corners = [i128::from(a) * i128::from(c), i128::from(a) * i128::from(d), i128::from(b) * i128::from(c), i128::from(b) * i128::from(d)];
-    Some([i64::try_from(*corners.iter().min()?).ok()?, i64::try_from(*corners.iter().max()?).ok()?])
-}
 
 /// The greatest common divisor of x and y, which is never negative. `gcd(0, 0)` is 0. `None` only where it is 2^63, as for `gcd(i64::MIN, 0)`.
 pub fn gcd(x: i64, y: i64) -> Option<i64> { i64::try_from(unsigned_gcd(x.unsigned_abs(), y.unsigned_abs())).ok() }
@@ -50,7 +31,7 @@ pub fn lcm(x: i64, y: i64) -> Option<i64> { if x == 0 || y == 0 { return Some(0)
 pub(crate) fn lcm_wrapped(x: i64, y: i64) -> i64 { if x == 0 || y == 0 { 0 } else { (x / gcd_wrapped(x, y)).wrapping_mul(y) } }
 
 /// `exact`, or where it overflowed `i64`, `wrapped`'s result, reporting the overflow where `variant` fails on one: the rule that binomials, greatest common divisors, least common multiples and rounding share.
-pub(crate) fn overflowed(variant: crate::facts::Variant, exact: Option<i64>, wrapped: impl FnOnce() -> i64) -> i64 {
+pub(crate) fn overflowed(variant: crate::domain::Variant, exact: Option<i64>, wrapped: impl FnOnce() -> i64) -> i64 {
     exact.unwrap_or_else(|| { if variant.fails_on_overflow() { (crate::error::Kind::Overflow.reporter())(); } wrapped() })
 }
 
@@ -136,14 +117,6 @@ pub fn residue(x: i64, y: i64) -> i64 { if x == 0 { y } else { floored(y.wrappin
 /// The mask whose bitwise and with an integer y gives y's residue modulo x, where x is a positive power of two: x - 1. In two's complement, y ∧ (x - 1) is y - x⌊y/x⌋ for every y of every width. `None` for any other x.
 #[inline]
 pub fn mask(x: i64) -> Option<i64> { (x > 0 && x.count_ones() == 1).then(|| x - 1) }
-
-/// The floor of x/y, or `None` for a quotient that overflows. A zero y gives the `i64` limit of x's sign, and 0 for an x of 0. A dividend below 2^53 in magnitude divides in `f64`, where integer division is slow: the quotient then rounds by less than its distance from the nearest whole number, so its floor is exact. A divisor that `f64` rounds then exceeds the dividend in magnitude, and the quotient's floor is 0 or ¯1 either way.
-#[inline]
-pub fn floor_quotient(x: i64, y: i64) -> Option<i64> {
-    if y == 0 { return Some(<i64 as crate::arith::Overflowing>::limit(x)); }
-    if x.unsigned_abs() < 1 << 53 { return Some((x as f64 / y as f64).floor() as i64); }
-    x.checked_div(y).map(|q| if x % y != 0 && (x < 0) != (y < 0) { q - 1 } else { q })
-}
 
 /// `r`, a remainder of a division by x with the dividend's sign, moved to x's sign.
 #[inline]
@@ -282,29 +255,9 @@ macro_rules! narrower {
     )+};
 }
 narrower!(u8, i16, i32);
-// Floor division at each integer type, from the formula that the kernels run (`facts::integer_at`). A zero divisor gives the type's limit of the dividend's sign, and 0 for 0 ÷ 0. A quotient that doesn't fit the type, the least value divided by -1, fails.
-forms!(#[inline] FloorDivide at u8, i16, i32, i64: |k, [x, y]| crate::facts::integer_at(k, [x, y]));
-
-/// Each comparison's exact forms, which give Booleans: at each integer type of compact buffers, and at Booleans, where `false` orders before `true`. Characters compare as their code points, through these forms at `i32` ([`characters`](crate::characters)).
-macro_rules! exactly {
-    ($($object:ident: |$x:ident, $y:ident| $body:expr;)+) => {$(
-        forms!(#[inline] $object at u8 => bool, i16 => bool, i32 => bool, i64 => bool, bool => bool: |_, [$x, $y]| $body);
-    )+};
-}
-exactly! {
-    Equal: |x, y| x == y;
-    NotEqual: |x, y| x != y;
-    Less: |x, y| x < y;
-    LessEqual: |x, y| x <= y;
-    Greater: |x, y| x > y;
-    GreaterEqual: |x, y| x >= y;
-}
-forms!(Floor at u8, i16, i32, i64, bool: |_, [x]| x);
-forms!(Ceil at u8, i16, i32, i64, bool: |_, [x]| x);
-forms!(Abs at bool: |_, [x]| x);
 
 /// x^y at `variant`'s integer width, as [`wrapped_power`] gives it. 0 to a negative power gives the greatest value: i64's under dynamic kinds, which a narrower width reports as an overflow so the call widens, and otherwise the width's. Where `variant` fails on overflow, a power that doesn't fit the width reports an overflow.
-pub(crate) fn native_power(variant: crate::facts::Variant, x: i64, y: i64) -> i64 {
+pub(crate) fn native_power(variant: crate::domain::Variant, x: i64, y: i64) -> i64 {
     let most = match variant.dtype { crate::buffer::DType::Integer(width) if !variant.fails_on_overflow() => with_width!(width, T => T::MAX as i64), _ => i64::MAX };
     let (value, exact) = wrapped_power(x, y, most);
     let fits = exact && match variant.dtype { crate::buffer::DType::Integer(width) => width.holds(value), _ => true };

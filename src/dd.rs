@@ -47,14 +47,10 @@ impl<R: Native> Double<R> {
         let u = nh * th - s + nh * tl + nl * th + nl * tl + s * (R::one() - dh * th - dh * tl - dl * th - dl * tl);
         Self::new(s, t.mla::<false>(self.lo - s * d.lo, u))
     }
-    /// The polynomial of degree 12 with coefficients `c`, highest degree first, at `x`, by Horner's rule in double words. The steps are written out because at opt-level 2, as basedpl builds, LLVM leaves a loop of them rolled, and that loop stops the caller's loop vectorizing.
+    /// The polynomial of degree 12 with coefficients `c`, highest degree first, at `x`, by Horner's rule in double words.
     #[inline(always)]
     pub(crate) fn horner<const FUSED: bool>(x: R, c: [f64; 13]) -> Self {
-        let step = |y: Self, k: f64| y.mul_float::<FUSED>(x).plus(Self::new(R::narrow(k), R::zero()));
-        let y = step(step(step(Self::new(R::narrow(c[0]), R::zero()), c[1]), c[2]), c[3]);
-        let y = step(step(step(y, c[4]), c[5]), c[6]);
-        let y = step(step(step(y, c[7]), c[8]), c[9]);
-        step(step(step(y, c[10]), c[11]), c[12])
+        c[1..].iter().fold(Self::new(R::narrow(c[0]), R::zero()), |y, &k| y.mul_float::<FUSED>(x).plus(Self::new(R::narrow(k), R::zero())))
     }
 }
 

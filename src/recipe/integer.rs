@@ -2,8 +2,8 @@
 use super::{Binary, Cmp, Integer, Ops, Overflowing, Unary};
 use crate::buffer::FloatWidth;
 
-pub struct IntegerOps<T> { pub variant: crate::facts::Variant, item: std::marker::PhantomData<T> }
-impl<T> IntegerOps<T> { #[inline(always)] pub fn new(variant: crate::facts::Variant) -> Self { Self { variant, item: std::marker::PhantomData } } }
+pub struct IntegerOps<T> { pub variant: crate::domain::Variant, item: std::marker::PhantomData<T> }
+impl<T> IntegerOps<T> { #[inline(always)] pub fn new(variant: crate::domain::Variant) -> Self { Self { variant, item: std::marker::PhantomData } } }
 impl<T: Overflowing> IntegerOps<T> {
     #[inline(always)]
     pub fn result(&self, value: i64) -> T {
@@ -32,23 +32,7 @@ impl<T: Overflowing> Ops<f64> for IntegerOps<T> {
     fn wide_multiply_add(&self, x: f64, y: f64, z: f64) -> f64 { x * y + z }
     #[inline(always)]
     fn narrow(&self, x: f64) -> T { T::low(x as i64) }
-    #[inline(always)]
-    fn integer(&self, x: i64) -> u64 { x as u64 }
-    #[inline(always)]
-    fn integer_op(&self, op: Integer, x: u64, y: u64) -> u64 {
-        match op {
-            Integer::Add => x.wrapping_add(y), Integer::Subtract => x.wrapping_sub(y), Integer::And => x & y, Integer::Or => x | y, Integer::Xor => x ^ y,
-            Integer::ShiftLeft => shifted(x, y as i64),
-            Integer::ShiftRight => if y >= 64 { 0 } else { (x & (u64::MAX >> (64 - 8 * self.variant.dtype.bytes()))) >> y },
-            Integer::SignedShiftRight => shifted(x, (y as i64).saturating_neg())
-        }
-    }
-    #[inline(always)]
-    fn integer_compare(&self, op: Cmp, x: u64, y: u64) -> bool {
-        match op { Cmp::Less => (x as i64) < y as i64, Cmp::LessEqual => (x as i64) <= y as i64, Cmp::Equal => x == y }
-    }
-    #[inline(always)]
-    fn integer_select(&self, test: bool, x: u64, y: u64) -> u64 { if test { x } else { y } }
+    u64_integers!(8 * std::mem::size_of::<T>() as u32);
     #[inline(always)]
     fn to_integer(&self, x: T) -> u64 { Into::<i64>::into(x) as u64 }
     #[inline(always)]
@@ -91,22 +75,7 @@ impl<T: Overflowing> Ops<f64> for IntegerOps<T> {
             _ => true
         }
     }
-    #[inline(always)]
-    fn compare(&self, c: Cmp, x: T, y: T) -> bool { match c { Cmp::Less => x < y, Cmp::LessEqual => x <= y, Cmp::Equal => x == y } }
+    plain_logic!(T);
     #[inline(always)]
     fn multiply_add(&self, x: T, y: T, z: T) -> T { self.binary(Binary::Add, self.binary(Binary::Multiply, x, y), z) }
-    #[inline(always)]
-    fn and(&self, x: bool, y: bool) -> bool { x & y }
-    #[inline(always)]
-    fn or(&self, x: bool, y: bool) -> bool { x | y }
-    #[inline(always)]
-    fn not(&self, x: bool) -> bool { !x }
-    #[inline(always)]
-    fn select(&self, test: bool, x: T, y: T) -> T { if test { x } else { y } }
-}
-
-/// `x`'s bits shifted left by `count`, or right with the sign filled in for a negative count. A count of 64 or more saturates: to 0 leftward, and to the sign rightward. Items hold their sign extended to 64 bits, so a count past an item's own width saturates the same way once the result narrows.
-#[inline(always)]
-fn shifted(x: u64, count: i64) -> u64 {
-    if count >= 64 { 0 } else if count >= 0 { x << count } else { ((x as i64) >> count.unsigned_abs().min(63)) as u64 }
 }

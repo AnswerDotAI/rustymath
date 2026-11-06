@@ -22,7 +22,7 @@ Issues = "https://github.com/AnswerDotAI/rustymath/issues"
 Documentation = "https://answerdotai.github.io/rustymath"
 
 [tool.fastws]
-dev-profile = "quick"
+dev-profile = "release"
 
 [tool.fastship]
 branch = "main"

@@ -1,6 +1,7 @@
-//! Shared function definitions for numerical frontends and graph planners. Each [`Formula`] row owns its kind and character policies, numerical body, validity and repair predicates, ranges, identities, partial derivatives and exact cases. [`Kernel`](crate::operation::Kernel) erases the arity for execution. [`facts!`](crate::facts) lists typed product pairs and Python names.
+//! Shared function definitions for numerical frontends. Each [`Formula`] row owns its kind and character policies, numerical body, validity and repair predicates, ranges, identities, partial derivatives and exact cases. [`Kernel`](crate::operation::Kernel) erases the arity for execution. [`facts!`](crate::facts) lists typed product pairs and Python names.
 use crate::{Betainc, BetaincAt, FUSED, Flipped, Float, Native};
-use crate::buffer::{DType, FloatWidth, View};
+use crate::buffer::{DType, FloatWidth};
+use crate::domain::{Range, Variant};
 use crate::float::sealed::Core;
 use crate::pow::parity;
 use crate::recipe::{NativeOps, Ops};
@@ -10,118 +11,8 @@ use num_complex::Complex;
 use num_traits::{One, Signed, Zero};
 use std::f64::consts::PI;
 
-/// The values other than NaN that the items of an argument or a result can take: each lies from `lo` to `hi`. ¯0 and +0 count as one value, because the sign of a zero isn't promised and can differ by route. Any range can also hold NaN. A rule's range is sound where it holds every result that the object's kernels give, within their accuracy.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Range { pub lo: f64, pub hi: f64 }
-
-impl Range {
-    /// Every value.
-    pub const ANY: Self = Self { lo: f64::NEG_INFINITY, hi: f64::INFINITY };
-    /// Every value from 0 up.
-    pub const NONNEGATIVE: Self = Self { lo: 0.0, hi: f64::INFINITY };
-    /// No value, as an array of no items holds. It's `join`'s identity: its `lo` is ∞ and its `hi` ¯∞.
-    pub const EMPTY: Self = Self { lo: f64::INFINITY, hi: f64::NEG_INFINITY };
-    /// The range of an argument that is the one number `c`, or `ANY` where `c` is NaN or `None`, as for an argument that isn't one number.
-    #[inline]
-    pub fn of(c: Option<f64>) -> Self { c.filter(|c| !c.is_nan()).map_or(Self::ANY, |c| Self { lo: c, hi: c }) }
-    /// The values that items of `dtype` hold: 0 and 1 for Booleans, from each integer width's least integer to its greatest, and any value for other dtypes.
-    #[inline]
-    pub fn of_dtype(dtype: DType) -> Self {
-        match dtype {
-            DType::Boolean => Self { lo: 0.0, hi: 1.0 }, DType::Integer(width) => with_width!(width, T => Self { lo: T::MIN as f64, hi: T::MAX as f64 }),
-            _ => Self::ANY
-        }
-    }
-    /// The range of `view`'s items, from the least to the greatest, for Booleans, integers and floats. A float's NaN items take no part, as a range holds every value but NaN. An empty view, or one of NaN items alone, holds no value (`EMPTY`). Other items take `ANY`.
-    pub fn of_view(view: View<'_>) -> Self {
-        match view {
-            View::Booleans([]) => Self::EMPTY,
-            View::Booleans(x) => Self { lo: if x.contains(&false) { 0.0 } else { 1.0 }, hi: if x.contains(&true) { 1.0 } else { 0.0 } },
-            View::Integers(x) => with_ints!(x, |x| match x {
-                [] => Self::EMPTY,
-                x => {
-                    let (lo, hi) = crate::reduce::extremes(x);
-                    Self { lo: lo as f64, hi: hi as f64 }
-                }
-            }),
-            View::Floats(x) => with_floats!(x, |x| Self { lo: crate::reduce::min(x).into(), hi: crate::reduce::max(x).into() }),
-            _ => Self::ANY,
-        }
-    }
-    /// The one number that the range holds, if it holds only one.
-    #[inline]
-    pub fn constant(self) -> Option<f64> { (self.lo == self.hi).then_some(self.lo) }
-    /// Whether the range holds no negative number.
-    #[inline]
-    pub fn nonnegative(self) -> bool { self.lo >= 0.0 }
-    /// Whether the range holds no value (`EMPTY`).
-    #[inline]
-    pub fn is_empty(self) -> bool { self.lo > self.hi }
-    /// Whether every value lies from `lo` to `hi`.
-    #[inline]
-    pub fn within(self, lo: f64, hi: f64) -> bool { lo <= self.lo && self.hi <= hi }
-    /// Whether no value equals `c`.
-    #[inline]
-    pub fn excludes(self, c: f64) -> bool { c < self.lo || self.hi < c }
-    /// The values that both ranges hold.
-    #[inline]
-    pub fn meet(self, other: Self) -> Self { Self { lo: self.lo.max(other.lo), hi: self.hi.min(other.hi) } }
-    /// The least range that holds both ranges.
-    #[inline]
-    pub fn join(self, other: Self) -> Self { Self { lo: self.lo.min(other.lo), hi: self.hi.max(other.hi) } }
-    /// The range of |x| for the values x of this range.
-    pub fn magnitude(self) -> Self {
-        if self.lo >= 0.0 { self } else if self.hi <= 0.0 { Self { lo: -self.hi, hi: -self.lo } } else { Self { lo: 0.0, hi: self.hi.max(-self.lo) } }
-    }
-    /// The range of x × x for the values x of this range, as `⊼x` squares them.
-    pub fn square(self) -> Self { let m = self.magnitude(); Self { lo: m.lo * m.lo, hi: m.hi * m.hi } }
-    /// The range of a fold's results, from its items' range, its seed's, if it has one, and `step`, which gives the range of a step's result from the ranges of its two arguments. Every lane holds an item. One bound holds for any fold: the least range that holds the items and the seed, where a step's results stay in it. Where they don't, as a sum's don't, each bound widens to an infinity, except that a bound on the far side of 0 stops at 0: [2, 3] widens to [0, ∞]. Where a step's results leave that range too, that bound is `ANY`.
-    ///
-    /// Where `lane` gives the most items that a lane holds and `step` is an associative function's, as `+ × ⌈ ⌊ ∧ ∨` are, a second bound holds, and the range is the meet of both. It starts at the items' and seed's range, and joins in `step` of the range on itself while the lane length that it covers doubles, up to `lane`: [2, 3] over lanes of up to 4 items gives [2, 12]. It holds because a lane of up to 2m items splits into two lanes of up to m items whose results, by associativity, one step combines, and `step` bounds that step for any arguments within its two ranges. A scan's running results are the results of shorter lanes. A seed counts as one more item.
-    pub fn folded(items: Self, seed: Option<Self>, lane: Option<usize>, step: impl Fn([Self; 2]) -> Self) -> Self {
-        let start = seed.map_or(items, |s| s.join(items));
-        let (lo, hi) = (if start.lo >= 0.0 { 0.0 } else { f64::NEG_INFINITY }, if start.hi <= 0.0 { 0.0 } else { f64::INFINITY });
-        let kept = [start, Self { lo, hi }].into_iter().find(|&r| step([r, r]).inside(r)).unwrap_or(Self::ANY);
-        let Some(lane) = lane else { return kept };
-        let (mut covered, mut m, items) = (start, 1, lane.saturating_add(usize::from(seed.is_some())));
-        while m < items {
-            covered = covered.join(step([covered, covered]));
-            m = m.saturating_mul(2);
-        }
-        covered.meet(kept)
-    }
-    /// Whether `other` holds every value of this range.
-    fn inside(self, other: Self) -> bool { other.lo <= self.lo && self.hi <= other.hi }
-    /// This range with each bound moved `ULPS` units in the last place outward, for bounds that a kernel computes within its accuracy, as the transcendental functions do. A bound never moves past 0, and 0 or an infinite bound stays.
-    fn loose(self) -> Self { Self { lo: outward(self.lo, false, FloatWidth::F64), hi: outward(self.hi, true, FloatWidth::F64) } }
-    /// This range as a kernel's results of `dtype` hold it. The bounds are f64, and a kernel at a narrower float rounds each result to that width, within its accuracy there: each bound moves `ULPS` units in that width's last place outward, as `loose` moves it at f64. Other dtypes keep the range.
-    pub fn at_width(self, dtype: DType) -> Self {
-        match dtype {
-            DType::Float(width @ (FloatWidth::F32 | FloatWidth::F16)) => Self { lo: outward(self.lo, false, width), hi: outward(self.hi, true, width) },
-            _ => self,
-        }
-    }
-}
-
-/// How far a computed bound can lie from a kernel's result on the same argument, in units in the last place: a kernel lies within 4 of the correctly rounded result, and so does the function that computes the bound.
-const ULPS: u64 = 8;
 /// From ¯1 to 1: the values of the sine and the cosine, and the arguments on which the inverse sine, the inverse cosine and the inverse hyperbolic tangent are real.
 const UNIT: (f64, f64) = (-1.0, 1.0);
-
-/// `x` moved `ULPS` units in the last place of floats of `width` up, or down, but not past 0. A zero or an infinity stays. A bound between two floats of `width` starts from the nearer, which the move covers.
-fn outward(x: f64, up: bool, width: FloatWidth) -> f64 {
-    if x == 0.0 || x.is_infinite() { return x; }
-    let (bits, infinity): (u64, u64) = match width {
-        FloatWidth::F64 => (x.abs().to_bits(), f64::INFINITY.to_bits()), FloatWidth::F32 => ((x.abs() as f32).to_bits().into(), f32::INFINITY.to_bits().into()),
-        FloatWidth::F16 => (half::f16::from_f64(x.abs()).to_bits().into(), half::f16::INFINITY.to_bits().into())
-    };
-    let moved = if up == x.is_sign_positive() { (bits + ULPS).min(infinity) } else { bits.saturating_sub(ULPS) };
-    let moved = match width {
-        FloatWidth::F64 => f64::from_bits(moved), FloatWidth::F32 => f32::from_bits(moved as u32).into(),
-        FloatWidth::F16 => half::f16::from_bits(moved as u16).to_f64()
-    };
-    moved.copysign(x)
-}
 
 /// The range from `lo` to `hi`, bounds that correctly rounded arithmetic gives on the arguments' bounds, as `+` and `√` give them. A NaN bound, as ∞ - ∞ gives, becomes an infinity.
 fn exact(lo: f64, hi: f64) -> Range { Range { lo: if lo.is_nan() { f64::NEG_INFINITY } else { lo }, hi: if hi.is_nan() { f64::INFINITY } else { hi } } }
@@ -169,14 +60,15 @@ pub trait Formula<const N: usize>: Clone + Send + Sync + 'static {
     const FAILS_NAN: bool = false;
     /// Whether `exact` computes this formula on rationals.
     const HAS_EXACT: bool = false;
-    /// Whether `integer` computes this formula on integers, which a checked integer kernel needs.
+    /// Whether `integer` runs this formula's `emit` on integers, so that range arithmetic over `emit_valid` bounds an integer kernel's failures (`may_raise`). A row with a `native_integer` body supports integers and leaves this false.
     const INTEGER_FORMULA: bool = false;
+    /// Whether kernels of this formula only map. Modified writes, folds, scans and walks of adjacent items build no code for it: each refuses it at compile time, as it refuses a formula of another arity. A derivative's slope (`derivative::Slope`) only maps.
+    const MAP_ONLY: bool = false;
     fn result_dtype(&self, input: DType) -> DType { if Self::BOOLEAN { DType::Boolean } else { input } }
     fn computing_dtype(&self, input: DType) -> Option<DType> {
         input.computes_in(crate::buffer::Width::I64, crate::operation::numpy_float(input), |d| self.supports(d))
     }
     fn character_rule(&self) -> Option<crate::characters::Rule> { None }
-    fn tolerance(&self) -> Option<f64> { None }
     fn ordered_kinds(&self, [x, y]: [i32; 2]) -> Option<i32> {
         let ops = crate::recipe::IntegerOps::<i32>::new(Variant::checked(DType::Integer(crate::buffer::Width::I32)));
         self.integer(&ops, std::array::from_fn(|i| if i == 0 { x } else { y }))
@@ -198,47 +90,120 @@ pub trait Formula<const N: usize>: Clone + Send + Sync + 'static {
     }
     fn same(&self, _arg: Range) -> Option<Range> { None }
     fn reads(&self) -> Reads { Reads::Items }
-    fn kernel(&self, variant: Variant) -> Option<Kernel> { self.supports(variant.dtype).then(|| Kernel::new::<Self, N>(self.clone(), variant)) }
     fn resolve(&self, variant: Variant, types: [DType; N]) -> Result<Kernel, crate::error::Error> {
         Kernel::try_resolve(self.clone(), variant, types)?.ok_or_else(|| crate::error::Error::new(crate::error::Kind::Domain, "function has no numerical body for these arguments"))
     }
     fn supports(&self, _dtype: DType) -> bool { false }
-    #[inline(always)]
     fn emit<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(&self, _o: &O, _x: [O::V; N]) -> Option<O::V> { None }
-    #[inline(always)]
     fn emit_test<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(&self, _o: &O, _x: [O::V; N]) -> Option<O::B> { None }
     /// This comparison of `v` with the one number `c` through `o`, where that has a cheaper recipe than comparing item by item, as a held constant has. `left` says whether `v` is the left argument. `None` for other formulas.
-    #[inline(always)]
     fn emit_against<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(&self, _o: &O, _c: F, _v: O::V, _left: bool) -> Option<O::B> { None }
-    #[inline(always)]
+    /// This comparison's tolerance, and the bands that an item on the left and on the right of one number must lie in (`tolerant::Banding`), through which it compares many items with one number (`tolerant::against`). `None` for other formulas.
+    fn bands(&self) -> Option<(crate::tolerant::Tolerance, crate::tolerant::Band, crate::tolerant::Band)> { None }
     fn emit_repair<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(&self, _o: &O, _x: [O::V; N]) -> Option<O::B> { None }
     fn repair_routine(&self) -> Option<Repair> { None }
-    // The default bodies inline, as `objects!`'s do, so that a kernel's loop over items (`operation::map_values`) inlines a formula that has no native body, such as `Add`'s.
-    #[inline(always)]
     fn emit_valid<F: crate::Float, O: Ops<F> + ?Sized>(&self, _variant: Variant, o: &O, x: [O::V; N], result: O::V) -> Option<(crate::error::Kind, O::B)> {
         Self::FAILS_NAN.then(|| (crate::error::Kind::Domain, nan_valid(o, x, [result])))
     }
-    #[inline(always)]
     fn real<F: crate::float::Native>(&self, ops: &crate::recipe::NativeOps<{ crate::FUSED }>, x: [F; N]) -> Option<F> {
         if const { Self::BOOLEAN } { self.emit_test(ops, x).map(|x| if x { F::one() } else { F::zero() }) } else { self.emit(ops, x) }
     }
-    #[inline(always)]
     fn integer<I: crate::recipe::Overflowing>(&self, _ops: &crate::recipe::IntegerOps<I>, _x: [I; N]) -> Option<I> { None }
     fn complex<F: crate::float::Native>(
         &self, _ops: &crate::recipe::NativeOps<{ crate::FUSED }>, _x: [num_complex::Complex<F>; N]) -> Option<num_complex::Complex<F>> { None }
+    /// Whether `real_complex` gives this formula's complex results from real arguments.
+    const REAL_COMPLEX: bool = false;
+    /// The complex result from real arguments, where that costs less than from the arguments as complex numbers. `None` sends the item to `complex`.
+    fn real_complex<F: crate::float::Native>(&self, _ops: &crate::recipe::NativeOps<{ crate::FUSED }>, _x: [F; N]) -> Option<num_complex::Complex<F>> { None }
     fn native_slices(&self) -> Option<NativeSlices<Self, N>> { None }
     fn emit_partials<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(&self, _o: &O, _x: [O::V; N], _result: O::V, _needed: [bool; N]) -> [Option<O::V>; N] {
         [None; N]
     }
 }
 
+/// A use of a formula object by code generic over formulas, as [`Op::visit`] hands it over. `unary` and `binary` receive the one- and two-argument objects, through `visit` unless a visitor wraps them, as [`Kernel::slope`] does.
+pub trait Visit: Sized {
+    type Out;
+    fn visit<K: Formula<N>, const N: usize>(self, object: K) -> Self::Out;
+    fn unary<K: Formula<1>>(self, object: K) -> Self::Out { self.visit(object) }
+    fn binary<K: Formula<2>>(self, object: K) -> Self::Out { self.visit(object) }
+}
+
+/// Writes `Op` and `Op::visit` from one list: objects without fields by arity (`reduce`'s are binary), then objects that hold a value, with the arity and constructor of each.
+macro_rules! ops {
+    (unary [$($u:ident)*] binary [$($b:ident)*] reduce [$($r:ident)*] ternary [$($t:ident)*] held [$($h:ident($ty:ty) => $how:ident $make:expr),* $(,)?]) => {
+        /// A formula object by name, for a front end that picks its formula at run time, as BPL's primitives and rustymath's Python functions do: [`Kernel::of`] resolves one, so each formula's kernel code compiles once, here, and [`Op::visit`] hands its object to code generic over formulas.
+        #[derive(Clone, Copy, Debug)]
+        pub enum Op { $($u,)* $($b,)* $($r,)* $($t,)* $($h($ty),)* PiTimes, Bitwise(u8), BetaincAt(f64, f64), FlippedBinom }
+        impl Op {
+            /// `v` on this formula's object. `arity` picks between the two forms of `PiTimes` and of `Bitwise`, which take one argument or two; every other object has one form.
+            pub fn visit<V: Visit>(self, arity: usize, v: V) -> V::Out {
+                match self {
+                    $(Op::$u => v.unary(crate::$u),)* $(Op::$b => v.binary(crate::$b),)* $(Op::$r => v.binary(crate::reduce::$r),)* $(Op::$t => v.visit(crate::$t),)*
+                    $(Op::$h(x) => v.$how($make(x)),)*
+                    Op::PiTimes if arity == 1 => v.unary(crate::PiTimes), Op::PiTimes => v.binary(crate::PiTimes),
+                    Op::Bitwise(table) if arity == 1 => v.unary(crate::Bitwise(table)), Op::Bitwise(table) => v.binary(crate::Bitwise(table)),
+                    Op::BetaincAt(a, b) => v.unary(BetaincAt(a, b)), Op::FlippedBinom => v.binary(Flipped(crate::Binom)),
+                }
+            }
+        }
+    };
+}
+ops! {
+    unary [Conj Negate Sign Reciprocal Abs Exp Ln Log2 Log10 Log1p Expm1 Cis Sqrt Cbrt RealSqrt RealLn Factorial Gamma Lgamma Digamma LambertW Erf Erfc Erfinv Erfcinv
+        Not Isnan Isfinite Isinf Real Imag Angle Trunc Rint Sin Cos Tan Asin Acos Atan Sinh Cosh Tanh Asinh Acosh Atanh Sqrt1mx2 Sqrt1px2 Sqrtx2m1]
+    binary [Add Subtract Multiply Divide MathishDivide Pow Root RealPow Logb MathishLogb Nand Nor Hypot Atan2 Binom BinomDn BinomDk Polygamma Beta Gammainc Gammaincc
+        Gammaincinv LeftShift RightShift]
+    reduce [Minimum Maximum Xor Xnor]
+    ternary [Clip Betainc Betaincinv]
+    held [
+        Floor(Tolerance) => unary crate::tolerant::Floor, Ceil(Tolerance) => unary crate::tolerant::Ceil, Residue(Tolerance) => binary crate::tolerant::Residue,
+        FlippedResidue(Tolerance) => binary |t| Flipped(crate::tolerant::Residue(t)), FloorDivide(Tolerance) => binary crate::tolerant::FloorDivide,
+        MathishFloorDivide(Tolerance) => binary crate::tolerant::MathishFloorDivide, Gcd(Tolerance) => binary crate::tolerant::Gcd, Lcm(Tolerance) => binary crate::tolerant::Lcm,
+        Equal(Tolerance) => binary crate::tolerant::Equal, NotEqual(Tolerance) => binary crate::tolerant::NotEqual, Less(Tolerance) => binary crate::tolerant::Less,
+        LessEqual(Tolerance) => binary crate::tolerant::LessEqual, Greater(Tolerance) => binary crate::tolerant::Greater,
+        GreaterEqual(Tolerance) => binary crate::tolerant::GreaterEqual, Scale(f64) => unary crate::Scale, Round(crate::Round) => unary std::convert::identity,
+        Pdf(crate::distribution::Distribution) => unary crate::distribution::Pdf, Cdf(crate::distribution::Distribution) => unary crate::distribution::Cdf,
+        Quantile(crate::distribution::Distribution) => unary crate::distribution::Quantile,
+    ]
+}
+impl Op {
+    /// The dtype this formula computes in for arguments of `input` (`Formula::computing_dtype`), with `arity` as [`Op::visit`] takes it.
+    pub fn computing_dtype(self, arity: usize, input: DType) -> Option<DType> {
+        struct Of(DType);
+        impl Visit for Of { type Out = Option<DType>; fn visit<K: Formula<N>, const N: usize>(self, object: K) -> Option<DType> { object.computing_dtype(self.0) } }
+        self.visit(arity, Of(input))
+    }
+    /// Whether this formula has a body at `dtype` (`Formula::supports`), with `arity` as [`Op::visit`] takes it.
+    pub fn supports(self, arity: usize, dtype: DType) -> bool {
+        struct Of(DType);
+        impl Visit for Of { type Out = bool; fn visit<K: Formula<N>, const N: usize>(self, object: K) -> bool { object.supports(self.0) } }
+        self.visit(arity, Of(dtype))
+    }
+}
+/// A formula's slice forms (`Unary::slice`, `Binary::slice`), at each item type that has one. `map_formula` runs a variant's blocks through the form at its dtype, or at `f32` for `f16`. At a dtype with no form, the formula's item bodies (`Formula::real`, `Formula::integer`) run instead.
 pub struct NativeSlices<K, const N: usize> {
-    pub single: fn(&K, [crate::Arg<'_, f32>; N], usize, &mut [std::mem::MaybeUninit<f32>]) -> bool,
-    pub double: fn(&K, [crate::Arg<'_, f64>; N], usize, &mut [std::mem::MaybeUninit<f64>]) -> bool,
+    pub single: Option<Slice<K, f32, N>>, pub double: Option<Slice<K, f64, N>>,
+    pub byte: Option<Slice<K, u8, N>>, pub short: Option<Slice<K, i16, N>>, pub int: Option<Slice<K, i32, N>>, pub long: Option<Slice<K, i64, N>>,
+}
+/// A slice form writes `n` results of type `T` from `N` arguments and gives whether every item is valid.
+pub type Slice<K, T, const N: usize> = fn(&K, [crate::Arg<'_, T>; N], usize, &mut [std::mem::MaybeUninit<T>]) -> bool;
+impl<K, const N: usize> NativeSlices<K, N> {
+    const NONE: Self = Self { single: None, double: None, byte: None, short: None, int: None, long: None };
 }
 impl<K> NativeSlices<K, 1> where K: crate::Unary<f32, Out = f32> + crate::Unary<f64, Out = f64> {
-    fn unary() -> Self {
-        Self { single: |k, x, n, out| crate::Unary::<f32>::slice(k, x, n, out), double: |k, x, n, out| crate::Unary::<f64>::slice(k, x, n, out) }
+    pub(crate) fn unary() -> Self { Self { single: Some(<K as crate::Unary<f32>>::slice), double: Some(<K as crate::Unary<f64>>::slice), ..Self::NONE } }
+}
+impl NativeSlices<crate::Pow, 2> {
+    fn power() -> Self { Self { single: Some(crate::pow::power_slice::<f32>), double: Some(crate::pow::power_slice::<f64>), ..Self::NONE } }
+}
+impl NativeSlices<crate::Root, 2> {
+    fn root() -> Self { Self { single: Some(crate::pow::root_slice::<f32>), double: Some(crate::pow::root_slice::<f64>), ..Self::NONE } }
+}
+impl<K> NativeSlices<K, 2> where K: crate::Binary<u8, Out = u8> + crate::Binary<i16, Out = i16> + crate::Binary<i32, Out = i32> + crate::Binary<i64, Out = i64> {
+    fn integers() -> Self {
+        Self { byte: Some(<K as crate::Binary<u8>>::slice), short: Some(<K as crate::Binary<i16>>::slice),
+            int: Some(<K as crate::Binary<i32>>::slice), long: Some(<K as crate::Binary<i64>>::slice), ..Self::NONE }
     }
 }
 
@@ -269,17 +234,6 @@ pub enum Reads { Items, Whole }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Slot(pub u32);
 
-/// Policies captured when the call is built; never read from force-time preferences.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Variant { pub dtype: DType, pub checked: bool, pub wrapping: bool }
-
-impl Variant {
-    pub const fn checked(dtype: DType) -> Self { Self { dtype, checked: true, wrapping: false } }
-    /// Whether an integer result that doesn't fit its type fails, as checked arithmetic that doesn't wrap gives it, rather than wrapping or filling. It covers a computed result and a result narrowed to a smaller output type.
-    #[inline]
-    pub const fn fails_on_overflow(self) -> bool { self.checked && !self.wrapping }
-}
-
 pub use crate::operation::Kernel;
 
 /// `k`'s scalar real result, including repairs, computed at the argument's working precision.
@@ -291,34 +245,6 @@ pub fn formula_at<K: Formula<N>, F: crate::Float, const N: usize>(k: &K, x: [F; 
     else { k.real(&o, x).expect("a real body that gives every result") };
     F::from_working(result)
 }
-
-/// `k`'s complex result.
-#[inline(always)]
-pub fn complex_at<K: Formula<N>, F: crate::float::Native, const N: usize>(k: &K, x: [num_complex::Complex<F>; N]) -> num_complex::Complex<F> {
-    k.complex(&crate::recipe::NativeOps::<{ crate::FUSED }>::DEFAULT, x).expect("a complex body that gives every result")
-}
-
-/// `k`'s integer result at `T`, wrapped to `T`, and whether `k`'s validity holds for it at `T`'s checked variant: an integer form's result. It computes wrapping, so it reports no overflow (`IntegerOps::result`) into a caller's error slot.
-#[inline(always)]
-pub fn integer_at<K: Formula<N>, T: crate::recipe::Overflowing, const N: usize>(k: &K, x: [T; N]) -> (T, bool) {
-    let judge = Variant::checked(T::DTYPE);
-    let o = crate::recipe::IntegerOps::<T>::new(Variant { wrapping: true, ..judge });
-    match k.integer(&o, x) {
-        Some(r) => (r, k.emit_valid::<f64, _>(judge, &o, x, r).map_or(true, |(_, valid)| valid)),
-        None => (T::low(0), false),
-    }
-}
-
-/// `k`'s test on integers as a Boolean, and whether `k`'s validity holds, as [`integer_at`] gives them.
-#[inline(always)]
-pub fn truth_at<K: Formula<N>, T: crate::recipe::Overflowing, const N: usize>(k: &K, x: [T; N]) -> (bool, bool) {
-    let (r, valid) = integer_at(k, x);
-    (Into::<i64>::into(r) != 0, valid)
-}
-
-/// `k` on Booleans, by its truth table (`Formula::truth_table`).
-#[inline(always)]
-pub fn table_at<K: Formula<N>, const N: usize>(k: &K, x: [bool; N]) -> bool { truth_bit(k.truth_table().expect("a Boolean function's truth table"), x) }
 
 /// Bit `2x+y` of `table`, or bit `x` for one argument: a Boolean function's result by its truth table.
 #[inline(always)]
@@ -377,13 +303,14 @@ macro_rules! objects {
     };
     ($n:tt: $($object:ty {
         $(range $args:pat => $range:expr;)? $(domain $domain_dtype:pat_param, $targs:pat => $domain:expr;)? $(identity $identity:expr;)? $(fold $fold:ident;)? $(inverse_fold $inverse_fold:ident;)? $(truth $truth:ident;)? $(table $table:expr;)?
-        $(output $output:ident;)? $(characters $rule:ident;)? $(tolerance |$tolk:pat_param| $tolerance:expr;)? $(same |$sx:pat_param| $same:expr;)? $(formula |$k:pat_param, $o:tt, $fargs:tt| $formula:expr;)? $(test |$tk:pat_param, $to:tt, $targs2:tt| $test:expr;)? $(against |$ak:pat_param| $atol:expr;)?
+        $(output $output:ident;)? $(characters $rule:ident;)? $(same |$sx:pat_param| $same:expr;)? $(formula |$k:pat_param, $o:tt, $fargs:tt| $formula:expr;)? $(test |$tk:pat_param, $to:tt, $targs2:tt| $test:expr;)? $(against |$ak:pat_param| $atol:expr;)?
         $(slope |$so:tt, $sx1:tt, $sr:tt| $slope:expr;)? $(slopes |$s2o:tt, $s2x:tt, $s2y:tt, $s2r:tt| [$dx:expr, $dy:expr];)? $(shared $shared:ident;)?
         $(repair $repair:expr;)?
         $(integers $integer:ident;)?
         $(native_integer |$nik:pat_param, $nio:tt, $nix:tt| $native_integer:expr;)?
         $(native_complex |$nfk:pat_param, $nfo:tt, $nfx:tt| $native_complex:expr;)?
         $(native_real |$nrk:pat_param, $nro:tt, $nrx:tt| $native_real:expr;)?
+        $(real_complex |$rck:pat_param, $rco:tt, $rcx:tt| $real_complex:expr;)?
         $(slices $slices:ident;)?
         $(exact |$ek:pat_param, $ex:tt| $exact:expr;)?
         $(checks $checks:ident;)?
@@ -392,7 +319,6 @@ macro_rules! objects {
         impl Formula<$n> for $object {
             $(fn exact(&self, $ex: [&num_rational::BigRational; $n]) -> Result<Option<num_rational::BigRational>, crate::error::Error> { let $ek = self; $exact } const HAS_EXACT: bool = true;)?
             $(fn character_rule(&self) -> Option<crate::characters::Rule> { Some(crate::characters::Rule::$rule) })?
-            $(fn tolerance(&self) -> Option<f64> { let $tolk = self; Some($tolerance) })?
             $(fn result_dtype(&self, dtype: DType) -> DType { objects!(@output dtype, $output) } objects!(@computing $output);)?
             $(objects!(@test_output $test);)?
             $(fn range(&self, $args: [Range; $n]) -> Range { $range })?
@@ -414,7 +340,8 @@ macro_rules! objects {
             }
             $(#[inline(always)] fn emit<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(&self, $o: &O, $fargs: [O::V; $n]) -> Option<O::V> { let $k = self; $formula })?
             $(#[inline(always)] fn emit_test<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(&self, $to: &O, $targs2: [O::V; $n]) -> Option<O::B> { let $tk = self; $test })?
-            $(#[inline(always)] fn emit_against<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(&self, o: &O, c: F, v: O::V, left: bool) -> Option<O::B> { let $ak = self; against(*self, $atol, o, c, v, left) })?
+            $(#[inline(always)] fn emit_against<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(&self, o: &O, c: F, v: O::V, left: bool) -> Option<O::B> { let $ak = self; against(*self, $atol, o, c, v, left) }
+            fn bands(&self) -> Option<(crate::tolerant::Tolerance, crate::tolerant::Band, crate::tolerant::Band)> { let $ak = self; let (left, right) = <Self as crate::tolerant::Banding>::BANDS; Some(($atol, left, right)) })?
             $(fn emit_repair<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(&self, o: &O, x: [O::V; $n]) -> Option<O::B> { Some(($repair).predicate(o, x[0])) }
             fn repair_routine(&self) -> Option<Repair> { Some(($repair).routine()) })?
             objects!(@partials $n, $(slope |$so, $sx1, $sr| $slope)? $(slopes |$s2o, $s2x, $s2y, $s2r| [$dx, $dy])? $(shared $shared)?);
@@ -424,6 +351,7 @@ macro_rules! objects {
             $(#[inline(always)] fn integer<I: crate::recipe::Overflowing>(&self, $nio: &crate::recipe::IntegerOps<I>, $nix: [I; $n]) -> Option<I> { let $nik = self; $native_integer })?
             $(#[inline(always)] fn complex<F: crate::float::Native>(&self, $nfo: &crate::recipe::NativeOps<{ crate::FUSED }>, $nfx: [num_complex::Complex<F>; $n]) -> Option<num_complex::Complex<F>> { let $nfk = self; $native_complex })?
             $(#[inline(always)] fn real<F: crate::float::Native>(&self, $nro: &crate::recipe::NativeOps<{ crate::FUSED }>, $nrx: [F; $n]) -> Option<F> { let $nrk = self; $native_real })?
+            $(const REAL_COMPLEX: bool = true; #[inline(always)] fn real_complex<F: crate::float::Native>(&self, $rco: &crate::recipe::NativeOps<{ crate::FUSED }>, $rcx: [F; $n]) -> Option<num_complex::Complex<F>> { let $rck = self; $real_complex })?
             $(fn native_slices(&self) -> Option<NativeSlices<Self, $n>> { Some(NativeSlices::$slices()) })?
         }
     )+};
@@ -442,13 +370,12 @@ objects!(1:
     crate::Trunc { native_integer |_, _, [x]| Some(x); native_real |_, _, [x]| Some(x.trunc()); }
     crate::Rint { native_integer |_, _, [x]| Some(x); native_complex |_, _, [x]| Some(num_complex::Complex::new(x.re.round_ties_even(), x.im.round_ties_even())); native_real |_, _, [x]| Some(x.round_ties_even()); }
     crate::Scale { formula |k, o, [x]| Some(o.multiply(x, o.number(F::narrow(k.0)))); }
-    crate::BitNot { native_integer |_, o, [x]| Some(o.result(if o.variant.dtype == DType::Boolean { i64::from(x == I::low(0)) } else { !Into::<i64>::into(x) })); }
     crate::Round { native_integer |k, o, [x]| { let wide = crate::parts::rounded_wide(Into::<i64>::into(x).into(), k.scale); Some(o.result(crate::integer::overflowed(o.variant, i64::try_from(wide).ok(), || wide as i64))) }; native_complex |k, _, [x]| Some(num_complex::Complex::new(crate::parts::rounded(x.re, k.scale), crate::parts::rounded(x.im, k.scale))); native_real |k, _, [x]| Some(crate::parts::rounded(x, k.scale)); }
-    crate::Sqrt { range [x] => exact(x.lo.max(0.0).sqrt(), x.hi.sqrt()); domain _, [x] => inside([x], [Range::NONNEGATIVE]); formula |_, o, [x]| Some(o.sqrt(x)); slope |o, _, r| o.reciprocal(o.add(r, r)); native_complex |_, _, [x]| Some(crate::complex::sqrt::<F, { crate::FUSED }>(x)); checks nan; }
+    crate::Sqrt { range [x] => exact(x.lo.max(0.0).sqrt(), x.hi.sqrt()); domain _, [x] => inside([x], [Range::NONNEGATIVE]); formula |_, o, [x]| Some(o.sqrt(x)); slope |o, _, r| o.reciprocal(o.add(r, r)); native_complex |_, _, [x]| Some(crate::complex::sqrt::<F, { crate::FUSED }>(x)); real_complex |_, o, [x]| { let r = o.sqrt(o.magnitude(x)); Some(if x < F::zero() { num_complex::Complex::new(F::zero(), r) } else { num_complex::Complex::new(r, F::zero()) }) }; checks nan; }
     crate::Cbrt { range [x] => increasing(x, f64::cbrt); formula |_, o, [x]| Some(crate::pow::cbrt_formula(o, x)); slope |o, _, r| o.reciprocal(o.multiply(o.number(F::narrow(3.0)), o.multiply(r, r))); }
     crate::Exp { range [x] => increasing(x, f64::exp).meet(Range::NONNEGATIVE); formula |_, o, [x]| Some(crate::exp::formula(o, x)); slope |_, _, r| r; native_complex |_, _, [x]| Some(crate::complex::exp::<F, { crate::FUSED }>(x)); }
     crate::Expm1 { range [x] => increasing(x, f64::exp_m1); formula |_, o, [x]| Some(crate::exp::minus_one_formula(o, x, o.number(F::zero()))); slope |o, _, r| o.add(r, o.number(F::one())); native_complex |_, _, [x]| Some(crate::complex::exp::<F, { crate::FUSED }>(x) - Complex::new(F::one(), F::zero())); }
-    crate::Ln { range [x] => increasing(x, |v| if v < 0.0 { f64::NEG_INFINITY } else { v.ln() }); domain _, [x] => inside([x], [Range::NONNEGATIVE]); formula |_, o, [x]| Some(crate::ln::formula(o, x)); slope |o, x, _| o.reciprocal(x); native_complex |_, _, [x]| Some(crate::complex::ln::<F, { crate::FUSED }>(x)); checks nan; }
+    crate::Ln { range [x] => increasing(x, |v| if v < 0.0 { f64::NEG_INFINITY } else { v.ln() }); domain _, [x] => inside([x], [Range::NONNEGATIVE]); formula |_, o, [x]| Some(crate::ln::formula(o, x)); slope |o, x, _| o.reciprocal(x); native_complex |_, _, [x]| Some(crate::complex::ln::<F, { crate::FUSED }>(x)); real_complex |_, o, [x]| Some(num_complex::Complex::new(crate::ln::formula(o, o.magnitude(x)), if x < F::zero() { F::narrow(PI) } else { F::zero() })); checks nan; }
     crate::Log2 { range [x] => increasing(x, f64::log2); domain _, [x] => inside([x], [Range::NONNEGATIVE]); formula |_, o, [x]| Some(crate::ln::log_with(o, x, crate::ln::base2(o))); slope |o, x, _| o.divide(o.number(F::narrow(std::f64::consts::LOG2_E)), x); slices unary; checks nan; }
     crate::Log10 { range [x] => increasing(x, f64::log10); domain _, [x] => inside([x], [Range::NONNEGATIVE]); formula |_, o, [x]| Some(crate::ln::log_with(o, x, crate::ln::base10(o))); slope |o, x, _| o.divide(o.number(F::narrow(std::f64::consts::LOG10_E)), x); slices unary; checks nan; }
     crate::RealLn { range [x] => increasing(x.magnitude(), f64::ln); output real; formula |_, o, [x]| Some(crate::ln::formula(o, o.magnitude(x))); slope |o, x, _| o.reciprocal(x); native_complex |_, _, [x]| Some(crate::complex::ln::<F, { crate::FUSED }>(x)); }
@@ -564,7 +491,7 @@ objects!(1:
     crate::tolerant::Floor { formula |k, o, [x]| Some(crate::with_tolerance!(k.0, |t| t.floor_in(o, x))); slope |o, _, _| o.number(F::zero()); integers formula; native_complex |k, o, [x]| Some(crate::tolerant::TolerantComplex::complex_floor(native_tolerance(o.tolerance, k.0), x)); exact |_, [x]| Ok(Some(x.floor())); }
     crate::tolerant::Ceil { formula |k, o, [x]| Some(crate::with_tolerance!(k.0, |t| t.ceil_in(o, x))); slope |o, _, _| o.number(F::zero()); integers formula; native_complex |k, o, [x]| Some(crate::tolerant::TolerantComplex::complex_ceil(native_tolerance(o.tolerance, k.0), x)); exact |_, [x]| Ok(Some(x.ceil())); }
     crate::Not { table 1; test |_, o, [x]| Some(o.equal(x, o.number(F::zero()))); integers formula; valid |_, v, o, x, _| truth_valid(v, o, x); }
-    crate::Cis { output complex; native_complex |_, _, [x]| Some(crate::complex::exp::<F, { crate::FUSED }>(num_complex::Complex::new(-x.im, x.re))); }
+    crate::Cis { output complex; native_complex |_, _, [x]| Some(crate::complex::exp::<F, { crate::FUSED }>(num_complex::Complex::new(-x.im, x.re))); real_complex |_, o, [x]| (!crate::trig::Kind::Cos.predicate(o, x)).then(|| { let (c, s) = crate::complex::quarter(x).unwrap_or_else(|| (crate::trig::formula(o, x, crate::trig::Kind::Cos), crate::trig::formula(o, x, crate::trig::Kind::Sin))); num_complex::Complex::new(c, s) }); }
     crate::LambertW { domain dtype, [x] => crate::lambert::real_domain(dtype, x); native_complex |_, _, [x]| Some(crate::lambert::complex(x)); native_real |_, _, [x]| Some(crate::lambert::lambertw::<F, { crate::FUSED }>(x)); checks nan; }
     crate::Lgamma { slope |o, x, _| o.digamma(x); native_complex |_, _, [x]| Some(crate::complex::lgamma::<F, { crate::FUSED }>(x)); native_real |_, _, [x]| Some(crate::special::lgamma::<F, { crate::FUSED }>(x)); checks nan; }
     // ψ's slope is ψ⁽¹⁾.
@@ -609,15 +536,15 @@ objects!(2:
         range [x, y] => powered(x, y); domain _, [x, y] => if whole(y) { Some([x, y]) } else { inside([x, y], [Range::NONNEGATIVE, Range::ANY]) };
         identity [None, Some(1.0)]; formula |_, o, [x, y]| Some(crate::pow::formula(o, x, y)); shared power;
         native_integer |_, o, [x, y]| Some(I::low(crate::integer::native_power(o.variant, x.into(), y.into())));
-        native_complex |_, _, [x, y]| Some(crate::complex::pow::<F, { crate::FUSED }>(x, y)); exact |_, [x, y]| crate::exact::power(x, y); checks nan;
+        native_complex |_, _, [x, y]| Some(crate::complex::pow::<F, { crate::FUSED }>(x, y)); slices power; exact |_, [x, y]| crate::exact::power(x, y); checks nan;
         valid |_, v, o, x, r| power_valid(v, o, x, r);
     }
     crate::RealPow { range [x, _] => signs([x]); identity [None, Some(1.0)]; output real; formula |_, o, [x, y]| Some(crate::pow::real_formula(o, x, y)); shared real_power; native_complex |_, _, [x, y]| Some(crate::complex::pow::<F, { crate::FUSED }>(x, y)); }
     // The yth root of x, x^(1/y).
-    crate::Root { range [_, y] => signs([y]); domain _, [n, y] => root_domain(n, y); formula |_, o, [n, y]| Some(crate::pow::root_formula(o, n, y)); slopes |o, x, y, r| [o.negate(o.divide(o.multiply(r, o.ln(y)), o.multiply(x, x))), o.divide(r, o.multiply(x, y))]; native_complex |_, _, [n, y]| Some(crate::complex::nth_root::<F, { crate::FUSED }>(n, y)); exact |_, [n, y]| { if num_traits::Zero::is_zero(n) { return Err(crate::error::Error::new(crate::error::Kind::Domain, "root degree is zero")); } crate::exact::power(y, &n.recip()) }; checks nan; }
+    crate::Root { range [_, y] => signs([y]); domain _, [n, y] => root_domain(n, y); formula |_, o, [n, y]| Some(crate::pow::root_formula(o, n, y)); slopes |o, x, y, r| [o.negate(o.divide(o.multiply(r, o.ln(y)), o.multiply(x, x))), o.divide(r, o.multiply(x, y))]; native_complex |_, _, [n, y]| Some(crate::complex::nth_root::<F, { crate::FUSED }>(n, y)); slices root; exact |_, [n, y]| { if num_traits::Zero::is_zero(n) { return Err(crate::error::Error::new(crate::error::Kind::Domain, "root degree is zero")); } crate::exact::power(y, &n.recip()) }; checks nan; }
     crate::Logb { domain _, [x, y] => inside([x, y], [Range::NONNEGATIVE; 2]); shared logb; native_complex |_, _, [b, x]| Some(crate::complex::divide(crate::complex::ln::<F, { crate::FUSED }>(x), crate::complex::ln::<F, { crate::FUSED }>(b))); native_real |_, _, [b, x]| Some(crate::ln::logb::<F, { crate::FUSED }>(b, x)); valid |_, _, o, x, r| logarithm_valid(o, x, r); }
-    crate::MathishLogb { domain _, [x, y] => inside([x, y], [Range::NONNEGATIVE; 2]); shared logb; native_complex |_, _, [b, x]| { let one = num_complex::Complex::new(F::one(), F::zero()); Some(if b == one && x == one { num_complex::Complex::new(F::zero(), F::zero()) } else { crate::complex::divide(crate::complex::ln::<F, { crate::FUSED }>(x), crate::complex::ln::<F, { crate::FUSED }>(b)) }) }; native_real |_, _, [b, x]| Some(if b == F::one() && x == F::one() { F::zero() } else { crate::ln::logb::<F, { crate::FUSED }>(b, x) }); valid |_, _, o, x, r| logarithm_valid(o, x, r); }
-    // `y` modulo `x`. Its slope in `x` is minus the quotient's floor, (y - r) ÷ x from the result, and 0 where `x` is 0, where the residue is `y` itself. Integers take a positive power of two that every item shares as a mask (`masked`).
+    crate::MathishLogb { domain _, [x, y] => inside([x, y], [Range::NONNEGATIVE; 2]); shared logb; native_complex |_, _, [b, x]| { let one = num_complex::Complex::new(F::one(), F::zero()); Some(if b == one && x == one { num_complex::Complex::new(F::zero(), F::zero()) } else { crate::complex::divide(crate::complex::ln::<F, { crate::FUSED }>(x), crate::complex::ln::<F, { crate::FUSED }>(b)) }) }; native_real |_, _, [b, x]| { let r = crate::ln::logb::<F, { crate::FUSED }>(b, x); Some(if (b == F::one()) & (x == F::one()) { F::zero() } else { r }) }; valid |_, _, o, x, r| logarithm_valid(o, x, r); }
+    // `y` modulo `x`. Its slope in `x` is minus the quotient's floor, (y - r) ÷ x from the result, and 0 where `x` is 0, where the residue is `y` itself. Integers take a positive power of two that every item shares as a mask (`masked`). Integer kernels run its slice forms (`integer.rs`). Where a whole block shares one divisor, those take a mask or a reciprocal in place of a division.
     crate::tolerant::Residue {
         identity [Some(0.0), None];
         formula |k, o, [x, y]| if o.integral() { masked(o, x, y) } else { (!k.0.is_exact()).then(|| k.0.residue_in(o, x, y)) };
@@ -631,6 +558,7 @@ objects!(2:
             let t = native_tolerance(o.tolerance, k.0);
             Some(if t.is_exact() { crate::tolerant::exact_residue(x, y) } else { crate::tolerant::Tolerant::residue(t, x, y) })
         };
+        slices integers;
         exact |_, [x, y]| Ok(Some(crate::exact::residue(x, y)));
     }
     // C(n, k), with n first.
@@ -669,14 +597,14 @@ objects!(2:
         valid |_, v, o, [x, y], _| arithmetic_valid(v, o, crate::recipe::Binary::Divide, x, y);
     }
     crate::tolerant::Gcd {
-        identity [Some(0.0), Some(0.0)]; table 14; tolerance |k| k.0.value();
+        identity [Some(0.0), Some(0.0)]; table 14;
         native_integer |_, o, [x, y]| { let (x, y) = (x.into(), y.into()); Some(o.result(crate::integer::overflowed(o.variant, crate::integer::gcd(x, y), || crate::integer::gcd_wrapped(x, y)))) };
         native_complex |k, o, [x, y]| Some(native_tolerance(o.tolerance, k.0).complex_gcd(x, y));
         native_real |k, o, [x, y]| Some(native_tolerance(o.tolerance, k.0).gcd(x, y));
         exact |_, [x, y]| Ok(Some(crate::exact::gcd(x, y))); checks nan;
     }
     crate::tolerant::Lcm {
-        identity [Some(1.0), Some(1.0)]; table 8; tolerance |k| k.0.value();
+        identity [Some(1.0), Some(1.0)]; table 8;
         native_integer |_, o, [x, y]| { let (x, y) = (x.into(), y.into()); Some(o.result(crate::integer::overflowed(o.variant, crate::integer::lcm(x, y), || crate::integer::lcm_wrapped(x, y)))) };
         native_complex |k, o, [x, y]| Some(lcm_from_gcd(x, y, native_tolerance(o.tolerance, k.0).complex_gcd(x, y)));
         native_real |k, o, [x, y]| Some(lcm_from_gcd(x, y, native_tolerance(o.tolerance, k.0).gcd(x, y)));
@@ -686,7 +614,6 @@ objects!(2:
     crate::Nor { table 1; test |_, o, [x, y]| Some(o.and(o.equal(x, o.number(F::zero())), o.equal(y, o.number(F::zero())))); integers formula; valid |_, v, o, x, _| truth_valid(v, o, x); }
     crate::BitAnd { fold And; table 8; formula |_, o, [x, y]| Some(o.from_bits(o.integer_op(crate::recipe::Integer::And, o.to_bits(x), o.to_bits(y)))); integers only; }
     crate::BitOr { fold Or; table 14; formula |_, o, [x, y]| Some(o.from_bits(o.integer_op(crate::recipe::Integer::Or, o.to_bits(x), o.to_bits(y)))); integers only; }
-    crate::BitXor { fold Xor; table 6; formula |_, o, [x, y]| Some(o.from_bits(o.integer_op(crate::recipe::Integer::Xor, o.to_bits(x), o.to_bits(y)))); integers only; }
     crate::LeftShift { formula |_, o, [x, y]| Some(o.from_bits(o.integer_op(crate::recipe::Integer::ShiftLeft, o.to_bits(x), o.to_integer(y)))); integers bits; }
     crate::RightShift {
         formula |_, o, [x, y]| Some(o.from_bits(o.integer_op(crate::recipe::Integer::SignedShiftRight, o.to_bits(x), o.to_integer(y))));
@@ -695,13 +622,13 @@ objects!(2:
     crate::reduce::Xor { fold Xor; table 6; test |_, o, [x, y]| Some(o.not(o.equal(x, y))); integers only; valid |_, v, o, x, _| truth_valid(v, o, x); }
     crate::reduce::Xnor { fold Xnor; table 9; test |_, o, [x, y]| Some(o.equal(x, y)); integers only; valid |_, v, o, x, _| truth_valid(v, o, x); }
     crate::tolerant::Equal {
-        identity [Some(1.0), Some(1.0)]; table 9; characters Ordered; tolerance |k| k.0.value();
+        identity [Some(1.0), Some(1.0)]; table 9; characters Ordered;
         test |k, o, [x, y]| Some(tested(*k, k.0, o, x, y)); against |k| k.0; integers formula;
         native_complex |k, o, [x, y]| Some(if native_tolerance(o.tolerance, k.0).complex_equal(x, y) { Complex::one() } else { Complex::zero() });
         exact |_, [x, y]| Ok(Some(crate::exact::boolean(x == y)));
     }
     crate::tolerant::NotEqual {
-        identity [Some(0.0), Some(0.0)]; table 6; characters Ordered; tolerance |k| k.0.value();
+        identity [Some(0.0), Some(0.0)]; table 6; characters Ordered;
         test |k, o, [x, y]| Some(tested(*k, k.0, o, x, y)); against |k| k.0; integers formula;
         native_complex |k, o, [x, y]| Some(if !native_tolerance(o.tolerance, k.0).complex_equal(x, y) { Complex::one() } else { Complex::zero() });
         exact |_, [x, y]| Ok(Some(crate::exact::boolean(x != y)));
@@ -771,15 +698,12 @@ fn masked<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, x: O::V, y:
 #[inline]
 fn native_tolerance(value: Option<f64>, fallback: Tolerance) -> Tolerance { value.and_then(Tolerance::new).unwrap_or(fallback) }
 
+/// The tolerance at which `o` compares at tolerance `t`: the one that `o` sets, otherwise `t` (`Ops::tolerance`). `None` where it isn't known when the recipe is built.
+pub(crate) fn run_tolerance<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, t: crate::tolerant::Tolerance) -> Option<crate::tolerant::Tolerance> { crate::tolerant::Tolerance::new(o.constant(o.tolerance(F::narrow(t.value())))?.wide()) }
 /// Comparison `k` of `v` with the one number `c`, as `k`'s kernel compares items with a number: the band that `v` must lie in against the range of floats equal to `c` at tolerance `t`, or at the tolerance that `o` sets (`tolerant::against_steps`). `left` says whether `v` is the left argument. `None` where the tolerance isn't known when the recipe is built, or `c` is NaN.
-#[inline(always)]
-fn against<K: crate::tolerant::Banding, F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(k: K, t: crate::tolerant::Tolerance, o: &O, c: F, v: O::V, left: bool) -> Option<O::B> {
-    let tolerance = o.constant(o.tolerance(F::narrow(t.value())))?;
-    crate::tolerant::against_steps(k, crate::tolerant::Tolerance::new(tolerance.wide())?, o, c, v, left)
-}
+fn against<K: crate::tolerant::Banding, F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(k: K, t: crate::tolerant::Tolerance, o: &O, c: F, v: O::V, left: bool) -> Option<O::B> { crate::tolerant::against_steps(k, run_tolerance(o, t)?, o, c, v, left) }
 
 /// Comparison `k`'s truth value through `o`, as its kernel computes it: against a number that exactly one argument holds (`Ops::constant`) through `against`, and otherwise step by step (`tolerant::Stepped`). Native ops hold every item as a number, so each item compares step by step rather than building the range of floats equal to the other.
-#[inline(always)]
 fn tested<K, F, O>(k: K, t: crate::tolerant::Tolerance, o: &O, x: O::V, y: O::V) -> O::B where K: crate::tolerant::Stepped + crate::tolerant::Banding + Copy,
     F: crate::Float, O: crate::recipe::Ops<F> + ?Sized {
     let side = match (o.constant(x), o.constant(y)) { (Some(_), Some(_)) => None, (None, Some(c)) => Some((c, x, true)), (Some(c), None) => Some((c, y, false)), _ => None };
@@ -823,7 +747,6 @@ impl Formula<2> for crate::Bitwise {
 
 impl<K: Formula<2>> Formula<2> for Flipped<K> {
     fn truth_table(&self) -> Option<u8> { self.0.truth_table().map(|t| (t & 9) | (t & 2) << 1 | (t & 4) >> 1) }
-    fn tolerance(&self) -> Option<f64> { self.0.tolerance() }
     fn character_policy(&self, [x, y]: [DType; 2]) -> Result<Option<crate::characters::Policy>, crate::error::Error> {
         use crate::characters::{ByKinds, Policy};
         self.0.character_policy([y, x]).map(|p| {
@@ -843,22 +766,16 @@ impl<K: Formula<2>> Formula<2> for Flipped<K> {
     fn supports(&self, dtype: DType) -> bool { self.0.supports(dtype) }
     const BOOLEAN: bool = K::BOOLEAN;
     const FAILS_NAN: bool = K::FAILS_NAN;
-    #[inline(always)]
     fn integer<I: crate::recipe::Overflowing>(&self, o: &crate::recipe::IntegerOps<I>, [x, y]: [I; 2]) -> Option<I> { self.0.integer(o, [y, x]) }
-    #[inline(always)]
     fn real<F: crate::float::Native>(&self, o: &crate::recipe::NativeOps<{ crate::FUSED }>, [x, y]: [F; 2]) -> Option<F> { self.0.real(o, [y, x]) }
-    #[inline(always)]
     fn complex<F: crate::float::Native>(
         &self, o: &crate::recipe::NativeOps<{ crate::FUSED }>, [x, y]: [num_complex::Complex<F>; 2]) -> Option<num_complex::Complex<F>> {
         self.0.complex(o, [y, x])
     }
-    #[inline(always)]
     fn emit_valid<F: crate::Float, O: Ops<F> + ?Sized>(&self, v: Variant, o: &O, [x, y]: [O::V; 2], r: O::V) -> Option<(crate::error::Kind, O::B)> {
         self.0.emit_valid(v, o, [y, x], r)
     }
-    #[inline(always)]
     fn emit<F: crate::Float, O: Ops<F> + ?Sized>(&self, o: &O, [x, y]: [O::V; 2]) -> Option<O::V> { self.0.emit(o, [y, x]) }
-    #[inline(always)]
     fn emit_test<F: crate::Float, O: Ops<F> + ?Sized>(&self, o: &O, [x, y]: [O::V; 2]) -> Option<O::B> { self.0.emit_test(o, [y, x]) }
     fn emit_partials<F: crate::Float, O: Ops<F> + ?Sized>(&self, o: &O, [x, y]: [O::V; 2], r: O::V, [nx, ny]: [bool; 2]) -> [Option<O::V>; 2] {
         let [dy, dx] = self.0.emit_partials(o, [y, x], r, [ny, nx]);
@@ -867,6 +784,7 @@ impl<K: Formula<2>> Formula<2> for Flipped<K> {
 }
 
 impl<K: Formula<1>> Formula<2> for crate::derivative::Slope<K> {
+    const MAP_ONLY: bool = true;
     fn supports(&self, dtype: DType) -> bool { matches!(dtype, DType::Float(_)) }
     fn emit<F: crate::Float, O: Ops<F> + ?Sized>(&self, o: &O, [x, r]: [O::V; 2]) -> Option<O::V> {
         Some(self.0.emit_partials(o, [x], r, [true])[0].unwrap_or_else(|| o.number(F::narrow(f64::NAN))))
@@ -874,45 +792,11 @@ impl<K: Formula<1>> Formula<2> for crate::derivative::Slope<K> {
 }
 
 impl<K: Formula<2>, const SIDE: usize> Formula<3> for crate::derivative::Slope<K, SIDE> {
+    const MAP_ONLY: bool = true;
     fn supports(&self, dtype: DType) -> bool { matches!(dtype, DType::Float(_)) }
     fn emit<F: crate::Float, O: Ops<F> + ?Sized>(&self, o: &O, [x, y, r]: [O::V; 3]) -> Option<O::V> {
         Some(self.0.emit_partials(o, [x, y], r, std::array::from_fn(|i| i == SIDE))[SIDE].unwrap_or_else(|| o.number(F::narrow(f64::NAN))))
     }
-}
-
-/// Calls `$then!` with the fold and product tables after the supplied arguments in parentheses. `folds` and `booleans` give Reduce variants and Python names for numerical and Boolean folds. Each `products` or `boolean_products` row gives map-object/fold pairs, native item types and Python names. An optional `wrapping` list uses the pair's existing fixed-width implementation. Boolean matrix products use OR-AND.
-#[macro_export]
-macro_rules! facts {
-    ($then:ident $(, $arg:tt)*) => { $then! { ($($arg),*)
-        folds {
-            Sum: ["add"];
-            Product: ["multiply"];
-            Max: ["maximum"];
-            Min: ["minimum"];
-            And: ["bitwise_and"];
-            Or: ["bitwise_or"];
-            Xor: ["bitwise_xor"];
-            Xnor: [];
-        }
-        booleans {
-            Sum: [];
-            Max: ["logical_or"];
-            Min: ["logical_and"];
-            Xor: ["logical_xor"];
-            Xnor: ["logical_xnor"];
-        }
-        products {
-            PlusTimes: [(crate::Multiply, Sum)] at [i64, half::f16, f32, f64, num_complex::Complex32, num_complex::Complex64] wrapping [u8, i16, i32] => [("add", "multiply")];
-            MaxPlus: [(crate::Add, Max)] at [i64, f32, f64] => [("maximum", "add")];
-            MinPlus: [(crate::Add, Min)] at [i64, f32, f64] => [("minimum", "add")];
-            PlusEqual: [(crate::tolerant::Equal, Sum)] at [i16, i32, i64, f32, f64] => [("add", "equal")];
-            PlusNotEqual: [(crate::tolerant::NotEqual, Sum)] at [i16, i32, i64, f32, f64] => [("add", "not_equal")];
-        }
-        boolean_products {
-            OrAnd: [(crate::Multiply, Sum), (crate::BitAnd, Max), (crate::BitAnd, Or), (crate::Multiply, Max)] at [bool] => [("add", "multiply"), ("logical_or", "logical_and")];
-            AndOr: [(crate::BitOr, Min), (crate::BitOr, And)] at [bool] => [("logical_and", "logical_or")];
-        }
-    } };
 }
 
 #[inline(always)]
@@ -927,11 +811,11 @@ fn negation_valid<F: crate::Float, O: Ops<F> + ?Sized>(variant: Variant, o: &O, 
     Some((kind, if magnitude { o.or(o.less_equal(o.number(F::zero()), x), valid) } else { valid }))
 }
 
-/// Numeric Boolean true uses the default tolerance, independent of arithmetic settings.
+/// Numeric Boolean true: 1 within the run's comparison tolerance (`Ops::tolerance`), which BPL makes nonzero only under Mathish. The default tolerance where a run sets none.
 #[inline]
 fn boolean_one<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, x: O::V) -> O::B {
     let one = o.number(F::one());
-    crate::recipe::equal(o, x, one, |o| crate::recipe::close(o, o.number(F::narrow(Tolerance::DEFAULT.value())), x, one))
+    crate::recipe::equal(o, x, one, |o| crate::recipe::close(o, o.tolerance(F::narrow(Tolerance::DEFAULT.value())), x, one))
 }
 
 #[inline(always)]

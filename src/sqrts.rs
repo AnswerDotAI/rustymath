@@ -1,30 +1,25 @@
-//! Square roots: √x, and √(1 - x²), √(1 + x²) and √(x - 1) √(x + 1) without the digits that squaring x first loses or the overflow it risks. `complex.rs` attaches the complex forms of all four.
+//! Square roots: √x, and √(1 - x²), √(1 + x²) and √(x - 1) √(x + 1) without the digits that squaring x first loses or the overflow it risks. `complex.rs` computes all four at complex arguments.
 use crate::float::Native;
 
 /// √x, or the principal √z of a complex z, whose real part is never negative, as a function object. A negative x gives NaN.
 #[derive(Clone, Copy, Debug)]
 pub struct Sqrt;
-forms!(Sqrt at real: |_, [x]| x.sqrt());
 
-/// The real part of √x, or of the principal √z of a complex z, as a function object: √x for a positive x, and 0 at or below 0. Its real form is its formula, `recipe::real_sqrt` (`Facts::formula`).
+/// The real part of √x, or of the principal √z of a complex z, as a function object: √x for a positive x, and 0 at or below 0. Its formula is `recipe::real_sqrt`.
 #[derive(Clone, Copy, Debug)]
 pub struct RealSqrt;
-forms!(#[inline] RealSqrt at real: |k, [x]| crate::slice::Total(crate::facts::formula_at(k, [x])));
 
 /// The real part of √(1 - x²), or of its principal value at a complex z, as a function object: √(1 - x²) for x from -1 to 1, and 0 beyond. The real part of `0○` and `0○⁻¹`.
 #[derive(Clone, Copy, Debug)]
 pub struct RealSqrt1mx2;
-forms!(#[inline] RealSqrt1mx2 at real: |_, [x]| crate::slice::Total(if x.abs() > 1.0 { 0.0 } else { sqrt1mx2::<_, { crate::FUSED }>(x) }));
 
 /// The real part of √(x - 1) √(x + 1), or of its principal value at a complex z, as a function object: x's sign times √(x² - 1) for |x| at least 1, and 0 between -1 and 1. The real part of `4○⁻¹`, on APL's branch.
 #[derive(Clone, Copy, Debug)]
 pub struct RealSqrtx2m1;
-forms!(#[inline] RealSqrtx2m1 at real: |_, [x]| crate::slice::Total(if x.abs() < 1.0 { 0.0 } else { x.signum() * sqrtx2m1::<_, { crate::FUSED }>(x.abs()) }));
 
 /// The real part of √(-1 - x²), or of its principal value at a complex z, negated where the flag is set, as a function object: 0 for every real x, whose `8○` is imaginary. The real part of `8○`, and of `8○⁻¹` with the flag.
 #[derive(Clone, Copy, Debug)]
 pub struct RealSqrtm1mx2(pub bool);
-forms!(#[inline] RealSqrtm1mx2 at real: |_, [x]| crate::slice::Total(if x.is_nan() { x } else { 0.0 }));
 
 /// √(1 - x²) as √((1 - x)(1 + x)). For |x| from 1/2 to 1, the factor that nears 0 is exact, and elsewhere neither factor loses digits. A magnitude beyond 1 gives NaN.
 #[inline]
@@ -43,4 +38,4 @@ pub(crate) fn sqrtx2m1<R: Native, const FUSED: bool>(x: R) -> R {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct Sqrtm1mx2(pub bool);
+pub(crate) struct Sqrtm1mx2(pub(crate) bool);

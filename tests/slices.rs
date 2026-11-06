@@ -50,7 +50,6 @@ mod parallel {
 
 mod forms {
     use half::f16;
-    use num_complex::Complex;
     use rustymath::{reduce::{Maximum, Minimum}, *};
     use std::fmt::Debug;
 
@@ -69,7 +68,7 @@ mod forms {
     }
 
     fn check<F: Float + buffer::Element + Debug, K: facts::Formula<A>, const A: usize>(k: &K, name: &str, args: [Arg<'_, F>; A], n: usize) {
-        let kernel = k.resolve(facts::Variant { checked: false, ..facts::Variant::checked(F::DTYPE) }, [F::DTYPE; A]).unwrap();
+        let kernel = k.resolve(domain::Variant { checked: false, ..domain::Variant::checked(F::DTYPE) }, [F::DTYPE; A]).unwrap();
         let views = args.each_ref().map(|a| {
             F::view(match a { Arg::One(v) => std::slice::from_ref(v), Arg::Many(s) => s })
         });
@@ -132,12 +131,11 @@ mod forms {
                 Lgamma, Erf, Erfc, Erfinv, Erfcinv, LambertW, Sqrt, Sqrt1mx2, Sqrt1px2, Sqrtx2m1, Abs, Sign, Angle;
             binary: Pow, Root, Hypot, Atan2, Gammainc, Gammaincc, Gammaincinv, Binom, Logb, Maximum, Minimum; ternary: Betainc, Betaincinv
         );
-        // `Erfinv`'s and `Erfcinv`'s f64 slice forms place each block's items by region. Several blocks of uniform items, in random order, reach every region.
+        // `Erfcinv`'s f64 slice form places each block's items by region. Several blocks of uniform items, in random order, reach every region.
         use rand::RngExt;
         let mut rng = crate::support::seeded(1);
         let q: Vec<f64> = (0..2000).map(|_| 2.0 * rng.random::<f64>()).collect();
         unary(Erfcinv, "Erfcinv", &q);
-        unary(Erfinv, "Erfinv", &q.iter().map(|&q| q - 1.0).collect::<Vec<_>>());
         // The logarithms' slice forms take each block of 64 items whose every item is positive, normal and finite through a form with no special values. Blocks of such items, some holding a special value, reach both forms.
         let mut x: Vec<f64> = (0..2000).map(|_| 1000.0 * rng.random::<f64>()).collect();
         for (i, v) in [0.0, -1.0, 1e-310, f64::INFINITY, f64::NAN, 1.0].into_iter().enumerate() { x[300 * i + 5] = v }
@@ -156,32 +154,10 @@ mod forms {
         let ramp32: Vec<f32> = ramp.iter().map(|&v| v as f32).collect();
         unary(Erfc, "Erfc", &ramp);
         unary(Erfc, "Erfc", &ramp32);
-        // Complex `Sqrt` takes a plain form for blocks of 64 items whose parts are all 0 or of moderate size, which gives exactly the full form's parts. Random items, with special or extreme items in some blocks and a run of real items, reach both forms.
-        fn roots<F: Float + Debug>(z: &[Complex<F>]) where Sqrt: Unary<Complex<F>, Out = Complex<F>> {
-            let exact = |a: F, b: F| (a == b && a.is_sign_negative() == b.is_sign_negative()) || (a.is_nan() && b.is_nan());
-            let mut out = Vec::new();
-            Sqrt.many(Arg::Many(z), z.len(), &mut out);
-            for (&z, &r) in z.iter().zip(&out) {
-                let s = Sqrt.one(z);
-                assert!(exact(r.re, s.re) && exact(r.im, s.im), "complex Sqrt({z:?}): {r:?} against {s:?}")
-            }
-        }
-        let mut z: Vec<Complex<f64>> = (0..2000).map(|_| Complex::new(8.0 * rng.random::<f64>() - 4.0, 8.0 * rng.random::<f64>() - 4.0)).collect();
-        for (i, (re, im)) in [(0.0, 0.0), (f64::INFINITY, 1.0), (1.0, f64::NAN), (1e-300, 0.0), (2.0, 1e-160), (1e160, 1.0)].into_iter().enumerate() {
-            z[300 * i + 5] = Complex::new(re, im)
-        }
-        for v in &mut z[1600..1700] { v.im = 0.0 }
-        roots(&z);
-        roots(&z.iter().map(|z| Complex::new(z.re as f32, z.im as f32)).collect::<Vec<_>>());
-        for b in [2.0, 10.0] {
-            let mut out = Vec::new();
-            let ok = Logb.many(Arg::One(b), Arg::Many(&x), x.len(), &mut out);
-            assert!(x.iter().zip(&out).all(|(&v, &r)| same(r, Logb.one(b, v))), "Logb at base {b}");
-            assert_eq!(ok, x.iter().all(|&v| Logb.checked(b, v).is_some()), "Logb at base {b}");
-        }
+        for b in [2.0, 10.0] { check(&Logb, "Logb", [Arg::One(b), Arg::Many(&x)], x.len()); }
     }
 
-    /// An output type other than the item type, at each float type, f16 included, and at concrete complex types. A `bool` output is never NaN, so it never fails.
+    /// An output type other than the item type, at each float type, f16 included. A `bool` output is never NaN, so it never fails.
     #[test]
     fn outputs_can_differ_from_items() {
         use rustymath::tolerant::{Greater, Tolerance};
@@ -193,9 +169,6 @@ mod forms {
         assert_eq!(positive(&[1.0f64, -1.0, f64::NAN]), [true, false, false]);
         assert_eq!(positive(&[f16::from_f32(2.0), f16::NAN]), [true, false]);
         assert_eq!(Greater(Tolerance::EXACT).checked(f32::NAN, 0.0), Some(false));
-        let mut out = Vec::new();
-        assert!(Abs.many(Arg::Many(&[Complex::new(3.0f32, 4.0), Complex::new(f32::INFINITY, f32::NAN)]), 2, &mut out));
-        assert_eq!(out, [5.0, f32::INFINITY]);
     }
 }
 
@@ -203,7 +176,6 @@ mod reductions {
     use half::f16;
     use num_complex::Complex;
     use rustymath::reduce::*;
-    use rustymath::{Arg, Binary, tolerant::{Less, Tolerance}};
 
     /// Each reduction and scan against the same taken item by item, in order: sums and running sums of `sums`, and the product of `prods`. Their items keep every sum and product exact at every width, so any grouping gives the same result.
     fn exact<T: Copy + PartialEq + std::fmt::Debug, S: Copy + PartialEq + std::fmt::Debug>(
@@ -392,57 +364,17 @@ mod reductions {
                 }
             }
             let mut out = Vec::new();
-            assert!(scan_along::<i64, Sum>(&x, shape, Some(10), &mut out));
+            assert!(scan_along::<i64, Sum>(&x, shape, Some(&[10]), &mut out));
             assert_eq!(out, want, "{shape:?}");
-            let mut ordered = Vec::new();
-            assert!(left_scan(&x, shape, Some(&[10]), &mut ordered, |a: i64, b| {
-                let (v, overflow) = a.overflowing_add(b);
-                (v, !overflow)
-            }));
-            assert_eq!(ordered, want, "{shape:?}");
-            ordered.clear();
-            assert!(left_scan(&x, shape, None, &mut ordered, |a: i64, b| {
-                let (v, overflow) = a.overflowing_sub(b);
-                (v, !overflow)
-            }));
-            let mut running = Vec::new();
-            difference_scan_along(&x, shape, None, &mut running);
-            assert_eq!(running, ordered, "{shape:?}");
-            running.clear();
-            difference_scan_as::<_, i64>(&x, shape, None, &mut running);
-            assert_eq!(running, ordered, "{shape:?}");
-            let mut differences = Vec::new();
-            assert!(adjacent(
-                &x, shape, &mut differences, |_, _| true, |before, next, out| {
-                    out.extend(next.iter().zip(before).map(|(&a, &b)| a - b));
-                    true
-                }
-            ));
-            let want: Vec<_> = x.chunks((len * inner).max(1)).flat_map(|lane| lane[inner..].iter().zip(lane).map(|(&a, &b)| a - b)).collect();
-            assert_eq!(differences, want, "{shape:?}");
-            for seed in [None, Some(10)] {
-                ordered.clear();
-                assert!(left_scan(&x, shape, seed.as_ref().map(std::slice::from_ref), &mut ordered, |a, b| (
-                    i64::from(Less(Tolerance::EXACT).one(a, b)), true
-                )));
-                let starts = seed.map(|s| x.chunks((len * inner).max(1)).flat_map(|lane| lane[..inner].iter().map(move |&v| s < v)).collect::<Vec<_>>());
-                let (bits, ok) =
-                    comparison_scan(&x, shape, starts.as_deref(), 0, 1, &|t, xs, out| Less(Tolerance::EXACT).many(t, Arg::Many(xs), xs.len(), out));
-                assert!(ok && bits.len() == ordered.len());
-                assert!(
-                    bits.iter().zip(&ordered).enumerate().all(|(i, (&bit, &v))| seed.is_none() && i % (len * inner) < inner || i64::from(bit) == v),
-                    "{shape:?} {seed:?}"
-                );
-            }
             // `SumAs`'s running sums of Booleans and of narrow integers match `Sum`'s, which run at 64 bits.
-            let wide = |items: Vec<i64>, start: Option<i64>| {
+            let wide = |items: Vec<i64>, seed: Option<&[i64]>| {
                 let mut out = Vec::new();
-                scan_along::<i64, Sum>(&items, shape, start, &mut out);
+                scan_along::<i64, Sum>(&items, shape, seed, &mut out);
                 out.into_iter().map(|v| v as i32).collect::<Vec<_>>()
             };
             let mut counts = Vec::new();
-            scan_along::<bool, SumAs<i32>>(&x.iter().map(|v| v % 3 == 0).collect::<Vec<_>>(), shape, Some(3), &mut counts);
-            assert_eq!(counts, wide(x.iter().map(|v| i64::from(v % 3 == 0)).collect(), Some(3)), "{shape:?}");
+            scan_along::<bool, SumAs<i32>>(&x.iter().map(|v| v % 3 == 0).collect::<Vec<_>>(), shape, Some(&[3]), &mut counts);
+            assert_eq!(counts, wide(x.iter().map(|v| i64::from(v % 3 == 0)).collect(), Some(&[3])), "{shape:?}");
             let mut sums = Vec::new();
             scan_along::<i16, SumAs<i32>>(&x.iter().map(|&v| v as i16).collect::<Vec<_>>(), shape, None, &mut sums);
             assert_eq!(sums, wide(x.clone(), None), "{shape:?}");
@@ -454,66 +386,32 @@ mod reductions {
             assert_eq!(along::<bool, Xor>(&b, shape).0, lanes.iter().map(|l| ones(l) % 2 == 1).collect::<Vec<_>>());
             assert_eq!(along::<bool, Xnor>(&b, shape).0, lanes.iter().map(|l| (l.len() - ones(l)) % 2 == 0).collect::<Vec<_>>());
             assert_eq!(along::<bool, SumAs<u8>>(&b, shape).0, lanes.iter().map(|l| ones(l) as u8).collect::<Vec<_>>());
+            // The Boolean reductions scan by their truth tables `t`, item `t[r][x]` for the running result `r` and the next item `x`: `or` is 14, `and` 8, `!=` 6 and `==` 9.
             for start in [None, Some(false), Some(true)] {
-                for code in 0..16 {
-                    let table = Logical([[code & 1 != 0, code & 2 != 0], [code & 4 != 0, code & 8 != 0]]);
+                for code in [14, 8, 6, 9] {
+                    let table = [[code & 1 != 0, code & 2 != 0], [code & 4 != 0, code & 8 != 0]];
                     let mut want = b.clone();
                     for i in 0..outer {
                         for k in 0..inner {
                             (0..len).fold(start, |t, j| {
                                 let p = (i * len + j) * inner + k;
-                                want[p] = t.map_or(b[p], |t| table.0[usize::from(t)][usize::from(b[p])]);
+                                want[p] = t.map_or(b[p], |t| table[usize::from(t)][usize::from(b[p])]);
                                 Some(want[p])
                             });
                         }
                     }
-                    let mut out = Vec::new();
-                    table.scan_along(&b, shape, start, &mut out);
-                    assert_eq!(out, want, "{shape:?} {start:?} {code}");
-                    // `fold` gives each lane's right fold by the table, `x₀ f (x₁ f (… f last))`, with `start` as every lane's tail where it's given.
-                    if Logical::folds(shape) {
-                        let folds: Vec<bool> = lanes.iter().map(|l| {
-                            let (last, items) = match start { Some(s) => (s, &l[..]), None => (l[len - 1], &l[..len - 1]) };
-                            items.iter().rev().fold(last, |r, &v| table.0[usize::from(v)][usize::from(r)])
-                        }).collect();
-                        assert_eq!(table.fold(&b, len, start.map(|s| vec![s; outer]).as_deref()), folds, "{shape:?} {start:?} {code}");
-                    }
-                    // The Boolean reductions scan by their tables: `or` is 14, `and` 8, `!=` 6 and `==` 9.
-                    let mut reduced = Vec::new();
+                    let (seed, mut reduced) = (start.as_ref().map(std::slice::from_ref), Vec::new());
                     match code {
-                        14 => scan_along::<bool, Max>(&b, shape, start, &mut reduced), 8 => scan_along::<bool, Min>(&b, shape, start, &mut reduced),
-                        6 => scan_along::<bool, Xor>(&b, shape, start, &mut reduced), 9 => scan_along::<bool, Xnor>(&b, shape, start, &mut reduced),
-                        _ => continue
+                        14 => scan_along::<bool, Max>(&b, shape, seed, &mut reduced), 8 => scan_along::<bool, Min>(&b, shape, seed, &mut reduced),
+                        6 => scan_along::<bool, Xor>(&b, shape, seed, &mut reduced), _ => scan_along::<bool, Xnor>(&b, shape, seed, &mut reduced),
                     };
                     assert_eq!(reduced, want, "{shape:?} {start:?} {code}");
                 }
-            }
-            // `chosen` picks each item's result from `low` or `high` by the result before it, from either carry. Item `first + i·len` takes `fixed[i]` whatever the result before it.
-            let high: Vec<bool> = x.iter().map(|v| v % 5 != 0).collect();
-            for (carry, len, first, restarts) in [(false, 1, 0, false), (true, 1, 0, false), (true, 3, 2, true), (false, 4, 1, true), (true, 70, 5, true)] {
-                let fixed: Vec<bool> = if restarts { (first..b.len()).step_by(len).map(|p| x[p] % 3 == 0).collect() } else { Vec::new() };
-                let mut t = carry;
-                let want: Vec<bool> = (0..b.len()).map(|k| {
-                    let restart = (k >= first && (k - first) % len == 0).then(|| fixed.get((k - first) / len)).flatten();
-                    t = restart.copied().unwrap_or(if t { high[k] } else { b[k] });
-                    t
-                }).collect();
-                let mut out = Vec::new();
-                chosen(carry, &b, &high, len, first, &fixed, &mut out);
-                assert_eq!(out, want, "{shape:?} {carry} {len} {first}");
             }
         }
         assert!(!along::<i64, Sum>(&[i64::MAX, 1], [1, 2, 1]).1);
         assert!(!along::<i64, Sum>(&[i64::MAX, 0, 1, 0], [1, 2, 2]).1);
         assert!(!scan_along::<i64, Sum>(&[i64::MAX, 0, 1, 0], [1, 2, 2], None, &mut Vec::new()));
-        assert!(!left_scan(&[i64::MAX, 1], [1, 2, 1], None, &mut Vec::new(), |a: i64, b| {
-            let (v, overflow) = a.overflowing_add(b);
-            (v, !overflow)
-        }));
-        assert!(!left_scan(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i64::MAX, 1], [8, 2, 1], None, &mut Vec::new(), |a: i64, b| {
-            let (v, overflow) = a.overflowing_add(b);
-            (v, !overflow)
-        }));
     }
 
     /// Each window's fold matches the same reduction of that window's items alone, for windows folded directly, across the blocks of a long lane and by van Herk-Gil-Werman, a last block cut short, a window as wide as its lane, and windows down rows. A float maximum skips each NaN item, as `Max::step` does. Each window's pick is its first row that gives its maximum or minimum, and so is each whole lane's pick and each running pick. A sum that wraps reports it.
@@ -928,6 +826,7 @@ mod tolerant {
 
     #[test]
     fn residue_and_gcd() {
+        use rustymath::{buffer::{DType, FloatWidth}, domain::Variant, facts::Formula};
         assert_eq!([(3.0, -5.0), (3.0, 5.0), (-3.0, -4.0), (-3.0, 4.0)].map(|(x, y)| T.residue(x, y)), [1.0, 2.0, -1.0, -2.0]);
         let r = [3.12, -1.0, -0.6].map(|y| T.residue(0.5, y));
         assert!((r[0] - 0.12).abs() < 1e-15 && r[1] == 0.0 && (r[2] - 0.4).abs() < 1e-15);
@@ -937,7 +836,9 @@ mod tolerant {
         assert_eq!((T.residue(0.1, 0.3), T.residue(0.0, 2.5)), (0.0, 2.5));
         assert!((Exactly.residue(0.1, 0.3) - 0.1).abs() < 1e-15);
         let (x, y) = (2.2500000000000018, 0.7500000000000007);
-        assert_eq!((FloorDivide(Tolerance::EXACT).one(x, y), Residue(Tolerance::EXACT).one(y, x)), (2.0, x - 2.0 * y));
+        let f64s = DType::Float(FloatWidth::F64);
+        let quotient = FloorDivide(Tolerance::EXACT).resolve(Variant::checked(f64s), [f64s; 2]).unwrap();
+        assert_eq!((quotient.real(&[x, y], rustymath::operation::Settings { tolerance: Tolerance::EXACT }).unwrap(), Residue(Tolerance::EXACT).one(y, x)), (2.0, x - 2.0 * y));
         if rustymath::FUSED { assert_ne!(Exactly.residue(0.1, 1.0), 0.0); }
         assert_eq!(Exactly.residue(1e300, 1e-300), 1e-300);
         assert!((T.gcd(0.6, 0.4) - 0.2).abs() < 1e-15 && Exactly.gcd(0.6, 0.4) < 1e-15);
@@ -1021,7 +922,7 @@ mod tolerant {
     #[test]
     fn objects() {
         let (xs, ys) = (&[3.0, -3.0, 0.3, 0.0, f64::NAN, 2.0][..], &[-5.0, 5.0, 0.1 + 0.2, 7.0, 1.0, 2.9999999999999996][..]);
-        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let agree = |a: &[f64], b: &[f64]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x == y || x.is_nan() && y.is_nan());
         for t in [T, Tolerance::EXACT] {
             let (mut floors, mut residues, mut equal, mut order) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             assert!(Floor(t).many(Arg::Many(ys), 6, &mut floors) & Ceil(t).many(Arg::Many(ys), 6, &mut floors));
@@ -1031,7 +932,8 @@ mod tolerant {
             let floor: Vec<f64> = ys.iter().map(|&y| t.floor(y)).chain(ys.iter().map(|&y| t.ceil(y))).collect();
             let residue: Vec<f64> = (0..6).map(|i| t.residue(xs[i], ys[i])).chain(ys.iter().map(|&y| t.residue(3.0, y))).collect();
             let eq: Vec<bool> = (0..6).map(|i| t.equal(xs[i], ys[i])).chain(xs.iter().map(|&x| t.matches(x, f64::NAN))).collect();
-            assert_eq!((bits(&floors), bits(&residues), equal), (bits(&floor), bits(&residue), eq));
+            assert!(agree(&floors, &floor) && agree(&residues, &residue), "{floors:?} {residues:?}");
+            assert_eq!(equal, eq);
             assert_eq!(order, (0..6).map(|i| t.compare(xs[i], ys[i]).unwrap_or(Ordering::Greater)).collect::<Vec<_>>());
             let check = |many: &dyn Fn(&mut Vec<bool>) -> bool, one: &dyn Fn(f64, f64) -> bool| {
                 let mut got = Vec::new();
@@ -1211,7 +1113,7 @@ mod gather {
             let mut scattered = vec![0; source.iter().product()];
             for (i, &x) in u.iter().enumerate() { scattered[Steps::reach(0, &tables, i).expect("windows read no fill")] += x; }
             let mut summed = vec![0; scattered.len()];
-            assert!(Writes::Walk { base: 0, steps: &tables }.fold::<rustymath::reduce::Sum, i64>(&mut summed, rustymath::Arg::Many(&u)));
+            Writes::Walk { base: 0, steps: &tables }.combine(&mut summed, rustymath::Arg::Many(&u), |a, x| (a + x, None::<()>));
             assert_eq!(summed, scattered, "{tables:?}");
         };
         for (s, start) in [(1, 0), (1, 2), (2, 0), (2, 1), (3, 0), (3, 2), (4, 1)] {

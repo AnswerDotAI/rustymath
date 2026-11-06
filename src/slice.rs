@@ -1,5 +1,4 @@
 //! Slice forms of rustymath's functions. Each function object, such as [`Pow`], has a scalar form `one` and a slice form `many`. Both run code that rustymath compiles once for each item type, inside its own crate. A caller's build settings can't change that code, and rustymath's speed test times what callers run. An edit to a function's body rebuilds only rustymath.
-use crate::buffer::Element;
 use crate::float::Float;
 use num_complex::Complex;
 use std::mem::MaybeUninit;
@@ -57,16 +56,12 @@ nan_items!(f32, f64, half::f16, Complex<f32>, Complex<f64>);
 macro_rules! exact_items { ($($t:ty),+) => {$( impl KernelItem for $t { const NAN: bool = false; #[inline(always)] fn has_nan(self) -> bool { false } } )+} }
 exact_items!(u8, i16, i32, i64, bool, char, std::cmp::Ordering);
 
-/// The results of a function object of `N` items of type `T`: their type, whether any can fail, and how a failed result is written. [`Unary`], [`Binary`] and [`Ternary`] each require it, so code that takes a function object of any arity reads these through one bound.
+/// The results of a function object of `N` items of type `T`: their type and whether any can fail. [`Unary`], [`Binary`] and [`Ternary`] each require it, so code that takes a function object of any arity reads these through one bound.
 pub trait Results<T, const N: usize> {
     /// The type of each result.
     type Out: KernelItem;
     /// Whether no result fails: `checked` always gives `Some`, and `many` and `many_into` always give true. A total float function gives NaN from arguments that aren't NaN only where NaN is its value, as [`Subtract`](crate::Subtract) gives for ∞ - ∞ and [`Sin`](crate::Sin) for ±∞.
     const TOTAL: bool;
-    /// Whether a failed result is written wrapped to its type, as integer arithmetic writes one. A caller that takes integers as wrapping, as NumPy does, keeps it.
-    const WRAPS: bool;
-    /// Whether the slice forms run the scalar form in a loop, and the scalar forms inline into a caller in another crate, as `forms!` makes an object with `#[inline]` and no `many` body. A caller's own loop over items, through `judged`, then runs as fast as `many` without its call, and can convert each item as it reads it.
-    const INLINE: bool;
 }
 
 /// Native scalar and slice interfaces. The slice body initializes every output slot even when an item fails.
@@ -90,14 +85,6 @@ macro_rules! arities {
             fn many_into(&self, $($x: Arg<'_, T>,)+ n: usize, out: &mut crate::parallel::Slots<'_, Self::Out>) -> bool where T: Copy {
                 out.fill(n, |slots| crate::parallel::in_chunks(0, slots, |at, part| self.slice([$($x.part(at, part.len())),+], part.len(), part)))
             }
-            fn many_converted<C>(&self, $($x: Arg<'_, T>,)+ n: usize, out: &mut crate::parallel::Slots<'_, C>, convert: impl Fn(Self::Out) -> (C, bool)) -> bool where T: Copy {
-                out.fill(n, |slots| crate::parallel::in_chunks(0, slots, |at, part| {
-                    let mut buf = [const { MaybeUninit::uninit() }; CHUNK];
-                    let (n, buf) = (part.len(), &mut buf[..part.len()]);
-                    let ok = self.slice([$($x.part(at, n)),+], n, buf);
-                    pairs_into(Arg::Many(written(buf)), Arg::One(()), n, part, |r, ()| convert(r)) & ok
-                }))
-            }
         }
     )+};
 }
@@ -118,8 +105,6 @@ pub struct Flipped<K>(pub K);
 impl<T, K: Results<T, 2>> Results<T, 2> for Flipped<K> {
     type Out = K::Out;
     const TOTAL: bool = K::TOTAL;
-    const WRAPS: bool = K::WRAPS;
-    const INLINE: bool = K::INLINE;
 }
 unsafe impl<T, K: Binary<T>> Binary<T> for Flipped<K> {
     fn one(&self, x: T, y: T) -> K::Out { self.0.one(y, x) }
@@ -134,8 +119,6 @@ pub struct Wrapped<K>(pub K);
 impl<T, K: Results<T, N>, const N: usize> Results<T, N> for Wrapped<K> {
     type Out = K::Out;
     const TOTAL: bool = true;
-    const WRAPS: bool = false;
-    const INLINE: bool = K::INLINE;
 }
 macro_rules! wrapped {
     ($arity:ident, $n:literal, $($x:ident),+) => {
@@ -156,14 +139,12 @@ wrapped!(Ternary, 3, x, y, z);
 #[inline(always)]
 pub(crate) fn kept<O: KernelItem, E: KernelItem, const N: usize>(r: O, args: [E; N]) -> bool { !r.has_nan() | args.iter().any(|a| a.has_nan()) }
 
-/// What a function object's item body gives: an output, which fails where it is NaN and no argument is, an `Option` of one, which fails where it is `None`, a wrapped output paired with whether it's exact, which fails where it isn't, or a [`Total`] output, which never fails. Integer arithmetic, whose result can overflow, gives a wrapped output. An integer function with no wrapped result to give, such as a binomial coefficient, gives an `Option`. An output that is never NaN, such as `bool`, fails only through `None` or an inexact pair.
+/// What a function object's item body gives: an output, which fails where it is NaN and no argument is, an `Option` of one, which fails where it is `None`, a wrapped output paired with whether it's exact, which fails where it isn't, or a [`Total`] output, which never fails. An integer power, whose result can overflow, gives a wrapped output. An integer function with no wrapped result to give, such as a binomial coefficient, gives an `Option`. An output that is never NaN, such as `bool`, fails only through `None` or an inexact pair.
 pub(crate) trait Outcome<O: KernelItem>: Sized {
     /// Whether an output that `split` fails can still succeed, as a NaN output does where an argument is NaN. Only a plain output can.
     const RESCUE: bool;
     /// Whether no output fails: a [`Total`] output, or a plain output of a type without NaN.
     const TOTAL: bool;
-    /// Whether a failed output's slot holds the result wrapped to its type: only a wrapped pair's does.
-    const WRAPS: bool = false;
     /// The output, as a scalar form gives it. `None` panics, because a scalar form has no other way to report it.
     fn value(self) -> O;
     /// The output, and whether it succeeded, judged by the output alone, so that a NaN output fails. That costs one test for each item, where testing each argument too would cost one more for each argument.
@@ -191,11 +172,10 @@ impl<O: KernelItem + Default> Outcome<O> for Option<O> {
     fn split(self) -> (O, bool) { (self.unwrap_or_default(), self.is_some()) }
 }
 
-/// An output wrapped to its type, and whether it's the exact result, as integer arithmetic gives it. A result that isn't exact fails, and its slot holds the wrapped output. That output is NumPy's result for fixed-width integers.
+/// An output wrapped to its type, and whether it's the exact result, as an integer power gives it. A result that isn't exact fails, and its slot holds the wrapped output. That output is NumPy's result for fixed-width integers.
 impl<O: KernelItem> Outcome<O> for (O, bool) {
     const RESCUE: bool = false;
     const TOTAL: bool = false;
-    const WRAPS: bool = true;
     #[inline(always)]
     fn value(self) -> O { self.0 }
     #[inline(always)]
@@ -217,8 +197,6 @@ impl<O: KernelItem> Outcome<O> for Total<O> {
 
 /// Whether an item body never fails, as its outcome type `R` says. `forms!` passes the body as a closure, which names that type without running it.
 pub(crate) const fn total<K, E, O: KernelItem, R: Outcome<O>, const N: usize>(_: fn(&K, [E; N]) -> R) -> bool { R::TOTAL }
-/// Whether an item body that fails leaves its result wrapped to the output type, as its outcome type `R` says.
-pub(crate) const fn wraps<K, E, O: KernelItem, R: Outcome<O>, const N: usize>(_: fn(&K, [E; N]) -> R) -> bool { R::WRAPS }
 
 /// The items of `x` that result `i` takes.
 #[inline(always)]
@@ -302,13 +280,13 @@ macro_rules! each {
     };
 }
 
-/// Writes a function object's forms, compiled inside rustymath. The list names the item types, such as `Complex<f32>` or `i64`. `real` stands for `f32` and `f64`, and also writes an `f16` form, which runs the `f32` form and narrows its outputs. `=> T` makes the output type `T` in place of the item type: for each listed type, or after `real` for every float type. The object is the first argument of the item body, and its items the bracketed ones. The body gives an output, an `Option` of one, or a [`Total`] output, as [`Outcome`] says. A `many` body replaces the default slice form, which runs the item body through [`each!`]. Its arguments are the object, the bracketed `Arg`s, the number of results, and the slots it writes them into. Attributes before the object, such as `#[inline]`, go on its scalar forms, `one` and `judged`, so that a caller in another crate can inline a small form into its own loop over items. `#[inline]` with no `many` body makes the object [`INLINE`](Results::INLINE).
+/// Writes a function object's forms, compiled inside rustymath. The list names the item types, such as `Complex<f32>` or `i64`. `real` stands for `f32` and `f64`, and also writes an `f16` form, which runs the `f32` form and narrows its outputs. `=> T` makes the output type `T` in place of the item type: for each listed type, or after `real` for every float type. The object is the first argument of the item body, and its items the bracketed ones. The body gives an output, an `Option` of one, or a [`Total`] output, as [`Outcome`] says. A `many` body replaces the default slice form, which runs the item body through [`each!`]. Its arguments are the object, the bracketed `Arg`s, the number of results, and the slots it writes them into. Attributes before the object, such as `#[inline]`, go on its scalar forms, `one` and `judged`, so that a caller in another crate can inline a small form into its own loop over items.
 ///
 /// A function object is a concrete type, never a generic one, so that its forms compile here. Settings that choose a loop, such as whether a tolerance is 0, are read once per call inside `many`, which then runs `each!`.
 ///
 /// ```text
-/// forms!(Sqrt at real: |_, [x]| x.sqrt());
-/// forms!(Abs at Complex<f32> => f32, Complex<f64> => f64: |_, [z]| p::hypot::<_, { crate::FUSED }>(z.re, z.im));
+/// forms!(Choose at real: |_, [x, y, m]| Total(if m != 0.0 { x } else { y }));
+/// forms!(Choose at bool: |_, [x, y, m]| (m & x) | (!m & y));
 /// forms!(Gcd at i64: |_, [x, y]| gcd(x, y));
 /// forms!(Less at real => bool: |k, [x, y]| k.0.less(x, y),
 ///     many |k, [x, y], n, out| with_tolerance!(k.0, |t| each!([x, y], n, out, |[x, y]| t.less(x, y))));
@@ -343,8 +321,6 @@ macro_rules! forms {
         impl crate::slice::Results<$e, $arity_n> for $object {
             type Out = $o;
             const TOTAL: bool = crate::slice::total::<Self, $e, $o, _, $arity_n>(|$k, [$($x),+]| $body);
-            const WRAPS: bool = crate::slice::wraps::<Self, $e, $o, _, $arity_n>(|$k, [$($x),+]| $body);
-            const INLINE: bool = forms!(@inline [$(#[$($m)+])*] $many);
         }
         unsafe impl crate::slice::$arity<$e> for $object {
             $(#[$($m)+])*
@@ -379,8 +355,6 @@ macro_rules! forms {
         impl crate::slice::Results<half::f16, $arity_n> for $object {
             type Out = $o;
             const TOTAL: bool = <Self as crate::slice::Results<f32, $arity_n>>::TOTAL;
-            const WRAPS: bool = <Self as crate::slice::Results<f32, $arity_n>>::WRAPS;
-            const INLINE: bool = false;
         }
         unsafe impl crate::slice::$arity<half::f16> for $object {
             $(#[$($m)+])*
@@ -395,10 +369,6 @@ macro_rules! forms {
             }
         }
     };
-    // Whether the attributes hold `#[inline]` and there is no `many` body, which makes the object `INLINE`.
-    (@inline [#[inline] $($rest:tt)*] []) => { true };
-    (@inline [#[$($a:tt)+] $($rest:tt)*] []) => { forms!(@inline [$($rest)*] []) };
-    (@inline $attrs:tt $many:tt) => { false };
     (@out $e:ty) => { $e };
     (@out $e:ty, $o:ty) => { $o };
     (@narrow) => { half::f16::from_f32 };
@@ -487,23 +457,18 @@ pub(crate) fn triples_into<X: Copy, Y: Copy, Z: Copy, B>(
     ok
 }
 
-/// Appends `n` items to `out`: item `i` of `x` where item `i` of `mask` is true, and item `i` of `y` where it's false, through [`Choose`](crate::Choose). An `Arg::One` serves every item. Like [`pairs`], a long call splits across threads.
-#[inline(never)]
-pub fn choose<E: Element>(mask: Arg<'_, bool>, x: Arg<'_, E>, y: Arg<'_, E>, n: usize, out: &mut Vec<E>) where crate::Choose: crate::Ternary<E, Out = E> {
-    masked(&crate::Choose, x, y, mask, n, out);
-}
-
-/// `k` on `x`, `y` and a Boolean `mask`, appending `n` results to `out`, and whether every result succeeded. Each chunk of the mask becomes items of `T` through [`Element::truth`] while the chunk is in the cache, because a kernel on lanes as wide as its items vectorizes where one on Booleans doesn't. Like [`pairs`], a long call splits across threads.
-pub(crate) fn masked<K: Ternary<T> + Sync, T: Element>(k: &K, x: Arg<'_, T>, y: Arg<'_, T>, mask: Arg<'_, bool>, n: usize, out: &mut Vec<K::Out>) -> bool where
-    K::Out: Copy + Send {
-    crate::parallel::extended(out, n, CHUNK, &|range, slots| {
-        let mut lanes = Vec::new();
-        (range.start..range.end).step_by(CHUNK).fold(true, |ok, at| {
-            let len = CHUNK.min(range.end - at);
-            let m = mask.converted(at, len, &mut lanes, T::truth);
-            k.many_into(x.part(at, len), y.part(at, len), m, len, slots) & ok
-        })
-    })
+/// Whether `valid` holds for every result in `out` with the items of `x` that gave it, paired as [`mapped`] pairs them. These loops only judge: a loop that also computes each result stops vectorizing for some bodies, such as `Ln`'s. Failures gather as bits, with no branch.
+#[inline(always)]
+pub(crate) fn judged<E: Copy, O: Copy, const N: usize>(x: &[Arg<'_, E>; N], out: &[O], valid: impl Fn([E; N], O) -> bool) -> bool {
+    let (n, mut bad) = (out.len(), 0u8);
+    if const { N == 1 } {
+        each_pair!(x[0], Arg::Many(out), n, |_i, a, r| bad |= u8::from(!valid([a; N], r)));
+    } else if const { N == 2 } {
+        each_triple!(x[0], x[1], Arg::Many(out), n, |_i, a, b, r| bad |= u8::from(!valid(std::array::from_fn(|k| if k == 0 { a } else { b }), r)));
+    } else {
+        for i in 0..n { bad |= u8::from(!valid(items(x, i), out[i])); }
+    }
+    bad == 0
 }
 
 /// Appends `n` items to `out`, which `write` writes into its spare capacity, never zeroed first, and gives `write`'s result. `write` must write every slot it gets. Each caller's loop does, by its construction.
@@ -541,41 +506,6 @@ pub(crate) fn two_pass<R, O, const N: usize>(
         ok &= kept(*r, a);
     }
     ok
-}
-
-/// Writes `f` for each of `n` results into `out`, for complex arguments `x`, through real slice forms. The items split into a slice of real parts and a slice of imaginary parts for each argument, with a `One` argument repeated. `fast` computes the results' real and imaginary parts from those slices, through real slice forms, and appends them. Each result that `rare` picks, from its arguments and its fast value, then takes `f`, the scalar function, which handles what the fast formula doesn't, such as tiny or infinite parts. The results succeed as [`each`] judges them. Slice forms call it through [`split!`].
-pub(crate) fn split<R: crate::Native, const N: usize>(
-    x: [Arg<'_, Complex<R>>; N], n: usize, out: &mut [MaybeUninit<Complex<R>>], fast: impl Fn([(&[R], &[R]); N], &mut Vec<R>, &mut Vec<R>),
-    rare: impl Fn([Complex<R>; N], Complex<R>) -> bool, f: impl Fn([Complex<R>; N]) -> Complex<R>) -> bool where Complex<R>: KernelItem {
-    let (mut parts, mut re, mut im) = ([(); N].map(|()| (Vec::new(), Vec::new())), Vec::new(), Vec::new());
-    let out = &mut out[..n];
-    for ((xs, ys), a) in parts.iter_mut().zip(x) {
-        match a {
-            Arg::One(z) => {
-                xs.resize(n, z.re);
-                ys.resize(n, z.im);
-            }
-            Arg::Many(s) => {
-                xs.extend(s[..n].iter().map(|z| z.re));
-                ys.extend(s[..n].iter().map(|z| z.im));
-            }
-        }
-    }
-    fast(std::array::from_fn(|k| (&parts[k].0[..], &parts[k].1[..])), &mut re, &mut im);
-    assert!(re.len() == n && im.len() == n, "`fast` gives the parts of every result");
-    for ((slot, &a), &b) in out.iter_mut().zip(&re).zip(&im) { slot.write(Complex::new(a, b)); }
-    let zs = written(out);
-    if (0..n).fold(false, |any, i| any | rare(items(&x, i), zs[i])) { for i in 0..n { let a = items(&x, i); if rare(a, zs[i]) { zs[i] = f(a); } } }
-    zs.iter().all(|r| !r.has_nan()) || zs.iter().enumerate().all(|(i, &r)| kept(r, items(&x, i)))
-}
-
-/// [`split`] with `rare` marked `#[inline(always)]`, as [`each!`] marks its body, because the scan for rare items runs on every item.
-macro_rules! split {
-    ($x:expr, $n:expr, $out:expr, |$pa:pat_param, $re:pat_param, $im:pat_param| $fast:expr, |$ra:pat_param, $rr:pat_param| $rare:expr, |$fa:pat_param| $f:expr $(,)?) => {
-        crate::slice::split(
-            $x, $n, $out, |$pa, $re, $im| $fast, #[inline(always)] |$ra, $rr| $rare, |$fa| $f,
-        )
-    };
 }
 
 /// `f`, a slice form at `F`'s working type, for narrower floats, as `forms!`'s `f16` forms run it: the items convert to the working type and run, and `narrow` turns each output into the output at `F`.

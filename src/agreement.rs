@@ -33,9 +33,31 @@ impl Missing {
     }
 }
 
+/// A run of a plan's items, as [`ReadPlan::runs`] gives them: a source's items from position `first`, `stride` apart, where a stride of 0 repeats one item; index values from `first`, `step` apart; fills; or positions that reach no source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReadAt { Input { source: usize, position: usize }, Index(i64), Default, Invalid }
+pub enum Run { Source { source: usize, first: usize, stride: isize }, Index { first: i64, step: i64 }, Fill, Invalid }
 
+impl Run {
+    /// The source positions of the `len` items of a source run, and none for any other run.
+    pub fn positions(self, len: usize) -> impl Iterator<Item = usize> {
+        let (first, stride, len) = if let Self::Source { first, stride, .. } = self { (first, stride, len) } else { (0, 0, 0) };
+        (0..len).map(move |j| first.wrapping_add_signed(stride * j as isize))
+    }
+}
+
+/// What a reader does with the runs of a plan's items ([`ReadPlan::runs`]). A closure gives only `run`.
+pub trait RunSink {
+    /// `len` items from result position `at`, read as `run`: `false` stops the read.
+    fn run(&mut self, at: usize, len: usize, run: Run) -> bool;
+    /// Items `range` of `map` over `input`, from result position `at`, where the reader walks them whole: `None` gives them as runs instead.
+    fn walk(&mut self, _at: usize, _input: &ReadPlan, _map: &Mapping, _missing: &ReadPlan, _range: Range<usize>) -> Option<bool> { None }
+}
+
+impl<F: FnMut(usize, usize, Run) -> bool> RunSink for F {
+    fn run(&mut self, at: usize, len: usize, run: Run) -> bool { self(at, len, run) }
+}
+
+/// A part of a join: its read, and the end of its stretch of each row of the join.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadPart { pub end: usize, pub plan: ReadPlan }
 
@@ -61,41 +83,85 @@ impl ReadPlan {
     pub fn copy(source: usize, source_items: usize, map: Mapping, items: usize, missing: Missing) -> Self {
         Self::input(source, source_items).remapped(map, items, missing)
     }
-    pub fn joined(parts: impl IntoIterator<Item = Self>) -> Result<Self, Error> {
-        let (mut joined, mut items) = (Vec::new(), 0usize);
+    /// The read of `parts` side by side in `rows` rows, as a catenate reads its arguments: each row holds each part's next stretch of its items in turn, an equal share of the part's items.
+    pub fn joined(rows: usize, parts: impl IntoIterator<Item = Self>) -> Result<Self, Error> {
+        let too_large = || Error::new(Kind::Length, "joined source is too large");
+        let (mut joined, mut width) = (Vec::new(), 0usize);
         for plan in parts {
-            items = items.checked_add(plan.len()).ok_or_else(|| Error::new(Kind::Length, "joined source is too large"))?;
-            joined.push(ReadPart { end: items, plan });
+            let share = if rows == 0 { 0 } else { plan.len() / rows };
+            if share * rows != plan.len() { return Err(Error::new(Kind::Length, "a joined part doesn't fill its rows")); }
+            width = width.checked_add(share).ok_or_else(too_large)?;
+            joined.push(ReadPart { end: width, plan });
         }
-        Ok(Self { route: Arc::new(ReadRoute::Join(joined.into())), items })
-    }
-    pub fn join(sources: impl IntoIterator<Item = (usize, usize)>, map: Mapping, items: usize, missing: Missing) -> Result<Self, Error> {
-        Ok(Self::joined(sources.into_iter().map(|(source, count)| Self::input(source, count)))?.remapped(map, items, missing))
+        Ok(Self { route: Arc::new(ReadRoute::Join(joined.into())), items: width.checked_mul(rows).ok_or_else(too_large)? })
     }
     pub fn len(&self) -> usize { self.items }
     pub fn is_empty(&self) -> bool { self.items == 0 }
     pub fn route(&self) -> &ReadRoute { &self.route }
-    pub fn at(&self, item: usize) -> ReadAt {
-        if item >= self.items { return ReadAt::Invalid; }
+    /// What item `item` reads, as a one-item run (`runs`), or `Run::Invalid` past the end.
+    pub fn at(&self, item: usize) -> Run {
+        let mut found = Run::Invalid;
+        if item < self.items { self.runs(item..item + 1, &mut |_, _, run| { found = run; false }); }
+        found
+    }
+    /// Gives `sink` the runs of items `range`, in order, until it stops, and whether it took every run. A source gives a run of its items, an index plan a run of values, a default fills, and a join each part's stretch of each row. A map gives the runs of its positions (`Mapping::spans`), each read through its input, and its misses through its plan of misses, unless the sink walks it whole (`RunSink::walk`). Only a strided run through a map reads one position at a time.
+    pub fn runs(&self, range: Range<usize>, sink: &mut dyn RunSink) -> bool { self.runs_through(range.start, 1, range.len(), range.start, sink) }
+    /// `runs` of `len` items from position `first`, `stride` apart, given from result position `at`.
+    fn runs_through(&self, first: usize, stride: isize, len: usize, at: usize, sink: &mut dyn RunSink) -> bool {
+        if len == 0 { return true; }
         match self.route() {
-            ReadRoute::Input(source) => ReadAt::Input { source: *source, position: item },
-            ReadRoute::Index { base, step } => ReadAt::Index(base.wrapping_add(step.wrapping_mul(item as i64))),
-            ReadRoute::Default => ReadAt::Default,
-            ReadRoute::Invalid => ReadAt::Invalid,
-            ReadRoute::Map { input, map, missing } => {
-                if input.is_empty() { return missing.at(item); }
-                match map.get(item).filter(|&position| position < input.len()) { Some(position) => input.at(position), None => missing.at(item) }
-            }
+            &ReadRoute::Input(source) => sink.run(at, len, Run::Source { source, first, stride }),
+            &ReadRoute::Index { base, step } => sink.run(at, len, Run::Index { first: base.wrapping_add(step.wrapping_mul(first as i64)), step: step.wrapping_mul(stride as i64) }),
+            ReadRoute::Default => sink.run(at, len, Run::Fill),
+            ReadRoute::Invalid => sink.run(at, len, Run::Invalid),
             ReadRoute::Join(parts) => {
-                let part = parts.partition_point(|part| part.end <= item);
-                let start = if part == 0 { 0 } else { parts[part - 1].end };
-                parts.get(part).map_or(ReadAt::Invalid, |part| part.plan.at(item - start))
+                let mut j = 0;
+                while j < len {
+                    let Some((plan, item, before, after)) = joined_at(parts, first.wrapping_add_signed(stride * j as isize)) else { return sink.run(at + j, len - j, Run::Invalid) };
+                    let n = (len - j).min(match stride.cmp(&0) {
+                        std::cmp::Ordering::Greater => after.div_ceil(stride as usize), std::cmp::Ordering::Less => before / stride.unsigned_abs() + 1, std::cmp::Ordering::Equal => len - j,
+                    });
+                    if !plan.runs_through(item, stride, n, at + j, sink) { return false; }
+                    j += n;
+                }
+                true
+            }
+            ReadRoute::Map { input, map, missing } => {
+                if input.is_empty() { return missing.runs_through(first, stride, len, at, sink); }
+                match stride {
+                    1 => {
+                        if let Some(go) = sink.walk(at, input, map, missing, first..first + len) { return go; }
+                        let mut go = true;
+                        map.spans(first..first + len, input.len(), &mut |p, n, run| {
+                            go = match run { Some((q, s)) => input.runs_through(q, s, n, at + p - first, sink), None => missing.runs_through(p, 1, n, at + p - first, sink) };
+                            go
+                        });
+                        go
+                    }
+                    0 => match map.get(first).filter(|&q| q < input.len()) {
+                        Some(q) => input.runs_through(q, 0, len, at, sink), None => missing.runs_through(first, 0, len, at, sink),
+                    },
+                    _ => (0..len).all(|j| {
+                        let p = first.wrapping_add_signed(stride * j as isize);
+                        match map.get(p).filter(|&q| q < input.len()) { Some(q) => input.runs_through(q, 1, 1, at + j, sink), None => missing.runs_through(p, 1, 1, at + j, sink) }
+                    }),
+                }
             }
         }
     }
     pub fn mapped(input: ReadPlan, map: Mapping, missing: ReadPlan, items: usize) -> Self {
-        if map == Mapping::Linear(1) && items == input.items { return input; }
+        if map.in_order(input.items, &[items]) { return input; }
+        if let Some(plan) = Self::single_map(&input, &map, items) { return plan; }
         Self { route: Arc::new(ReadRoute::Map { input, map, missing }), items }
+    }
+    /// `map` over `input`'s own map, composed into one map over `input`'s input. A read of the result then walks the source once, not once for each run of `map`. `None` unless `map` stays within `input`, `input`'s misses read a fill or are invalid, and the composition is structural with no longer tables.
+    fn single_map(input: &ReadPlan, map: &Mapping, items: usize) -> Option<Self> {
+        let ReadRoute::Map { input: inner, map: first, missing } = input.route() else { return None };
+        let frame = map.shape(items);
+        if map.bounds(&frame)?.end > input.items { return None; }
+        let misses = match missing.route() { ReadRoute::Default => Missing::Default, ReadRoute::Invalid => Missing::Invalid, _ => return None };
+        let composed = first.compose(map, &input.shape_hint(), &frame)?;
+        (composed.footprint() <= first.footprint() + map.footprint()).then(|| Self::mapped(inner.clone(), composed, Self::fallback(misses, items), items))
     }
     pub fn remapped(&self, map: Mapping, items: usize, missing: Missing) -> Self { Self::mapped(self.clone(), map, Self::fallback(missing, items), items) }
     /// Calls `visit` with each source that this read reaches and its item count. A plan's routes form a tree, so each place that reads a source visits it once.
@@ -128,12 +194,7 @@ impl ReadPlan {
         let (source, start, stride) = self.run(&range)?;
         (stride == 1 || range.len() == 1).then(|| (source, start..start + range.len()))
     }
-    fn shape_hint(&self) -> Vec<usize> {
-        match self.route() {
-            ReadRoute::Map { map: Mapping::Steps { steps, .. }, .. } if Steps::count(steps) == self.items => steps.iter().map(Steps::len).collect(),
-            _ => vec![self.items],
-        }
-    }
+    pub(crate) fn shape_hint(&self) -> Vec<usize> { match self.route() { ReadRoute::Map { map, .. } => map.shape(self.items), _ => vec![self.items] } }
     /// The one source that a read over a result of `shape` reaches by an affine map, and that map, where every position stays within the source. `None` for a read that joins sources, fills, or maps otherwise.
     pub fn positional(&self, shape: &[usize]) -> Option<(usize, Mapping)> {
         if count(shape) != self.items { return None; }
@@ -180,44 +241,15 @@ impl ReadPlan {
         }).collect::<Option<Vec<_>>>()?;
         Some(Mapping::from(steps))
     }
-    /// Exact source windows for one bounded read block. Invalid producer positions remain errors.
-    pub fn source_ranges(&self, range: Range<usize>) -> Result<Vec<(usize, Range<usize>)>, Error> {
-        if range.start > range.end || range.end > self.items { return Err(Error::new(Kind::Length, "read range exceeds its result")); }
-        if range.is_empty() { return Ok(Vec::new()); }
-        if let Some((source, start, stride)) = self.run(&range) { return Ok(vec![(source, start..start + if stride == 0 { 1 } else { range.len() })]); }
-        let mut ranges = Vec::new();
-        for item in range {
-            match self.at(item) {
-                ReadAt::Input { source, position } => ranges.push((source, position..position + 1)),
-                ReadAt::Invalid => return Err(Error::new(Kind::Index, "read position is outside its source")), ReadAt::Index(_) | ReadAt::Default => ()
-            }
-        }
-        ranges.sort_unstable_by_key(|(source, range)| (*source, range.start));
-        ranges.dedup_by(|later, earlier| {
-            if later.0 != earlier.0 || later.1.start > earlier.1.end { return false; }
-            earlier.1.end = earlier.1.end.max(later.1.end);
-            true
-        });
-        Ok(ranges)
-    }
+    /// The items that `range` reads as one run of a source: its source, first position and stride, 0 for one item that every position reads and 1 for consecutive items. `runs` must give the whole range as that one run.
     fn run(&self, range: &Range<usize>) -> Option<(usize, usize, isize)> {
         if range.is_empty() || range.end > self.items { return None; }
-        match self.route() {
-            ReadRoute::Input(source) => Some((*source, range.start, 1)),
-            ReadRoute::Map { input, map, .. } => {
-                let (start, stride) = contiguous_run(map, range)?;
-                let end = start.checked_add(if stride == 0 { 1 } else { range.len() })?;
-                let (source, first, inner) = input.run(&(start..end))?;
-                Some((source, first, if stride == 0 { 0 } else { inner }))
-            }
-            ReadRoute::Join(parts) => {
-                let part = parts.partition_point(|part| part.end <= range.start);
-                let start = if part == 0 { 0 } else { parts[part - 1].end };
-                let part = parts.get(part).filter(|part| range.end <= part.end)?;
-                part.plan.run(&(range.start - start..range.end - start))
-            }
-            ReadRoute::Index { .. } | ReadRoute::Default | ReadRoute::Invalid => None,
-        }
+        let mut found = None;
+        self.runs(range.clone(), &mut |_, len, run| {
+            if let Run::Source { source, first, stride } = run && len == range.len() && (len == 1 || matches!(stride, 0 | 1)) { found = Some((source, first, if len == 1 { 1 } else { stride })); }
+            false
+        });
+        found
     }
 }
 
@@ -232,15 +264,40 @@ fn affine_bounds(base: usize, strides: &[isize], shape: &[usize]) -> Option<Rang
     Some(usize::try_from(lo).ok()?..usize::try_from(hi).ok()?.checked_add(1)?)
 }
 
-fn contiguous_run(map: &Mapping, range: &Range<usize>) -> Option<(usize, isize)> {
-    let last = range.end.checked_sub(1)?;
-    match *map {
-        Mapping::Single => Some((0, 0)), Mapping::Linear(1) => Some((range.start, 1)),
-        Mapping::Linear(repeat) if repeat > 0 && range.start / repeat == last / repeat => Some((range.start / repeat, 0)),
-        Mapping::Tiled(period) if period > 0 && range.start / period == last / period => Some((range.start % period, 1)),
-        Mapping::Steps { .. } => map.run(range.start, range.len()).filter(|&(_, stride)| matches!(stride, 0 | 1)), _ => None
+/// `Mapping::spans` of `n` positions of one row, from item `j0` of its innermost axis `axis`, which starts at offset `start`, given from result position `at`: a stride gives one span below `items` and one past it, and any other axis a span for each stretch that steps evenly.
+fn row_spans(start: usize, axis: &Steps, j0: usize, n: usize, items: usize, at: usize, f: &mut dyn FnMut(usize, usize, Option<(usize, isize)>) -> bool) -> bool {
+    if let Steps::Stride { start: offset, step, .. } = *axis {
+        let first = start + offset.wrapping_add_signed(step * j0 as isize);
+        return match step.cmp(&0) {
+            // Rising positions lie below `items` for a leading stretch, and falling ones for a trailing stretch.
+            std::cmp::Ordering::Greater => {
+                let below = if first >= items { 0 } else { n.min((items - 1 - first) / step as usize + 1) };
+                (below == 0 || f(at, below, Some((first, step)))) && (below == n || f(at + below, n - below, None))
+            }
+            std::cmp::Ordering::Equal => f(at, n, (first < items).then_some((first, 0))),
+            std::cmp::Ordering::Less => {
+                let past = if first < items { 0 } else { n.min((first - items) / step.unsigned_abs() + 1) };
+                (past == 0 || f(at, past, None)) && (past == n || f(at + past, n - past, Some((first.wrapping_add_signed(step * past as isize), step))))
+            }
+        };
     }
+    let position = |j: usize| axis.get(j).map(|o| start + o).filter(|&p| p < items);
+    let (mut j, end) = (j0, j0 + n);
+    while j < end {
+        let first = position(j);
+        let step = match (first, (j + 1 < end).then(|| position(j + 1)).flatten()) { (Some(p), Some(q)) => q as isize - p as isize, _ => 0 };
+        let mut k = j + 1;
+        while k < end && match (first, position(k)) {
+            (None, None) => true,
+            (Some(p), Some(q)) => q as isize - p as isize == step * (k - j) as isize,
+            _ => false,
+        } { k += 1; }
+        if !f(at + j - j0, k - j, first.map(|p| (p, step))) { return false; }
+        j = k;
+    }
+    true
 }
+
 
 /// A whole producer or its currently available logical window.
 #[derive(Clone, Copy)]
@@ -268,16 +325,18 @@ impl<'a> Binding<'a> {
 #[derive(Clone, Copy)]
 pub struct Read<'a> { pub sources: &'a [Binding<'a>], pub plan: &'a ReadPlan }
 
-impl Read<'_> {
-    /// Checks each source that the plan reads: bound, of the length the plan reads, with its window inside that length, and of `dtype` where one is given.
-    fn bindings(&self, dtype: Option<crate::buffer::DType>) -> Result<(), Error> {
+/// A read by rows, from [`Read::rows`]: row `r` starts at `items[first + r × step]`, and reads a run of items from there where `run` is true, and else that one item for the whole row.
+pub(crate) struct Rows<'a, T> { pub items: &'a [T], pub first: usize, pub step: isize, pub run: bool }
+
+impl<'s> Read<'s> {
+    /// Checks each source that the plan reads: bound, of the length the plan reads, with its window inside that length.
+    fn bindings(&self) -> Result<(), Error> {
         self.plan.try_for_each_source(&mut |source, count| {
             let binding = self.sources.get(source).ok_or_else(|| Error::new(Kind::Length, "missing read source"))?;
             if binding.items != count { return Err(Error::new(Kind::Length, "read source changed length")); }
             if binding.start.checked_add(binding.view.len()).is_none_or(|end| end > count) {
                 return Err(Error::new(Kind::Length, "read window exceeds its producer"));
             }
-            if dtype.is_some_and(|dtype| binding.view.dtype() != dtype) { return Err(Error::new(Kind::Domain, "read source has the wrong dtype")); }
             Ok(())
         })
     }
@@ -288,20 +347,12 @@ impl Read<'_> {
         let (base, steps) = mapping.entries(shape)?;
         Some((binding.view, Mapping::Steps { base: base.checked_sub(binding.start)?, steps }))
     }
-    pub fn validate(&self, dtype: crate::buffer::DType) -> Result<(), Error> { self.bindings(Some(dtype)) }
     fn range(&self, range: &Range<usize>) -> Result<(), Error> {
         if range.start > range.end || range.end > self.plan.len() { return Err(Error::new(Kind::Length, "read range exceeds its result")); }
-        self.bindings(None)
-    }
-    fn item(&self, at: ReadAt) -> Result<(Option<(crate::buffer::View<'_>, usize)>, bool), Error> {
-        let ReadAt::Input { source, position } = at else { return Ok((None, at != ReadAt::Invalid)) };
-        let binding = &self.sources[source];
-        let position = position.checked_sub(binding.start).filter(|&position| position < binding.view.len())
-            .ok_or_else(|| Error::new(Kind::Length, "read reaches outside its bound window"))?;
-        Ok((Some((binding.view, position)), true))
+        self.bindings()
     }
     /// The items that `range` reads as one run of a source's storage, at whatever dtype it holds: the borrowed run and its stride, 1 for consecutive items and 0 for one item that every position reads (`ReadPlan::run`).
-    fn run_view(&self, range: &Range<usize>) -> Option<(crate::buffer::View<'_>, usize)> {
+    fn run_view(&self, range: &Range<usize>) -> Option<(crate::buffer::View<'s>, usize)> {
         let (source, start, stride) = self.plan.run(range)?;
         let binding = self.sources.get(source)?;
         let end = start.checked_add(if stride == 0 { 1 } else { range.len() })?;
@@ -332,29 +383,108 @@ impl Read<'_> {
             let items = T::of(view).expect("a typed read selected its dtype");
             return Ok(if stride == 0 { Arg::One(items[0]) } else { Arg::Many(items) });
         }
-        self.copy_items::<T>(range, checked, scratch)?;
+        scratch.clear();
+        self.read_onto(range, checked, scratch)?;
         Ok(Arg::Many(scratch))
     }
-    fn copy_items<T: crate::buffer::Cast>(&self, range: Range<usize>, checked: bool, output: &mut Vec<T>) -> Result<(), Error> {
-        if let ReadRoute::Map { input, map: map @ Mapping::Steps { base, steps }, missing } = self.plan.route()
-            && let ReadRoute::Input(source) = input.route() && matches!(missing.route(), ReadRoute::Default)
-            && let Some(binding) = self.sources.get(*source).filter(|binding| binding.start == 0)
-            && let Some(data) = T::of(binding.view) && Steps::furthest(*base, &steps[..]).is_none_or(|end| end < data.len()) {
-            copy_walked(&Walked::new(Cow::Borrowed(map)), data, range.start, range.len(), output);
+    /// Whether `part` reads `range` in place, writing no scratch: one run of a source that holds `T`, or one item that every position reads.
+    pub(crate) fn in_place<T: crate::buffer::Cast>(&self, range: &Range<usize>) -> bool { self.run_view(range).is_some_and(|(view, stride)| stride == 0 || view.dtype() == T::DTYPE) }
+    /// This read as rows over a result of `shape`, which is rows then items, where every source is bound as the plan reads it, the plan maps one source that holds `T` affinely over `shape`, and each row reads one item or a run of items. `None` for any other read.
+    pub(crate) fn rows<T: crate::buffer::Cast>(&self, shape: [usize; 2]) -> Option<Rows<'s, T>> {
+        self.bindings().ok()?;
+        let (source, base, strides) = self.plan.affine(&shape)?;
+        let (view, first) = self.sources.get(source)?.affine(base, &strides, &shape)?;
+        let &[step, inner @ (0 | 1)] = &strides[..] else { return None };
+        Some(Rows { items: T::of(view)?, first, step, run: inner == 1 })
+    }
+    /// Appends items `range` of the plan onto `output` at `T`, a run at a time (`ReadPlan::runs`): a map over one source walks whole where it can (`walk_onto`), and each other run copies a source's run, gives index values or fills.
+    fn read_onto<T: crate::buffer::Cast>(&self, range: Range<usize>, checked: bool, output: &mut Vec<T>) -> Result<(), Error> {
+        output.reserve(range.len());
+        if self.join_onto(&range, checked, output)? { return Ok(()); }
+        let mut onto = Onto { read: self, checked, output, error: None };
+        self.plan.runs(range, &mut onto);
+        onto.error.map_or(Ok(()), Err)
+    }
+    /// Appends whole rows `range` of a join whose parts each read one run of their source, lane by lane (`gather::interleave`), and gives `false` for any other read. A part held at another dtype converts once, whole. A part that reads one item repeats it in each of its places.
+    fn join_onto<T: crate::buffer::Cast>(&self, range: &Range<usize>, checked: bool, output: &mut Vec<T>) -> Result<bool, Error> {
+        let ReadRoute::Join(parts) = self.plan.route() else { return Ok(false) };
+        let width = parts.last().map_or(0, |part| part.end);
+        if width == 0 || range.start % width != 0 || range.len() % width != 0 { return Ok(false); }
+        let (first, rows) = (range.start / width, range.len() / width);
+        let (mut lanes, mut start) = (Vec::with_capacity(parts.len()), 0);
+        for part in parts.iter() {
+            let n = part.end - std::mem::replace(&mut start, part.end);
+            let Some((view, stride)) = (Read { sources: self.sources, plan: &part.plan }).run_view(&(first * n..(first + rows) * n)) else { return Ok(false) };
+            lanes.push((match (T::of(view), stride) {
+                (Some(items), 1) => Cow::Borrowed(items),
+                (_, 0) => Cow::Owned(vec![kept(T::cast(view, 0), checked)?; rows * n]),
+                _ => { let mut items = Vec::new(); T::extend_cast(view, rows * n, checked, &mut items)?; Cow::Owned(items) }
+            }, n));
+        }
+        crate::gather::interleave(output, &lanes.iter().map(|(items, n)| (&items[..], *n)).collect::<Vec<_>>(), rows);
+        Ok(true)
+    }
+    /// Appends `len` items of source `source` onto `output` at `T`, from position `first` and `stride` apart, where a stride of 0 repeats one item. Every position must lie within the source's bound window.
+    fn run_onto<T: crate::buffer::Cast>(&self, source: usize, first: usize, stride: isize, len: usize, checked: bool, output: &mut Vec<T>) -> Result<(), Error> {
+        if len == 0 { return Ok(()); }
+        let outside = || Error::new(Kind::Length, "read reaches outside its bound window");
+        let last = first.checked_add_signed(stride * (len as isize - 1)).ok_or_else(outside)?;
+        let low = first.min(last);
+        let view = self.sources[source].borrow(low..first.max(last) + 1).ok_or_else(outside)?;
+        if stride == 0 {
+            let item = kept(T::cast(view, 0), checked)?;
+            output.resize(output.len() + len, item);
             return Ok(());
         }
-        output.clear();
-        for item in range {
-            let route = self.plan.at(item);
-            let (at, valid) = self.item(route)?;
-            if !valid { return Err(Error::new(Kind::Index, "read position is outside its source")); }
-            let value = match route {
-                ReadAt::Index(value) => T::cast(crate::buffer::View::Integers(crate::buffer::Ints::I64(&[value])), 0),
-                _ => at.map_or(Ok(T::FILL), |(view, i)| T::cast(view, i)),
-            };
-            output.push(kept(value, checked)?);
+        if stride == 1 {
+            if let Some(items) = T::of(view) { output.extend_from_slice(items); return Ok(()); }
+            return T::extend_cast(view, len, checked, output);
         }
-        Ok(())
+        let walked = Walked::from(Mapping::Steps { base: 0, steps: vec![Steps::Stride { start: first - low, len, step: stride }] });
+        if let Some(items) = T::of(view) { copy_walked(&walked, items, 0, len, T::FILL, output); return Ok(()); }
+        with_dtype!(view.dtype(), S => {
+            let mut items = Vec::with_capacity(len);
+            copy_walked(&walked, S::of(view).expect("the view has its dtype"), 0, len, S::FILL, &mut items);
+            T::extend_cast(S::view(&items), len, checked, output)
+        })
+    }
+    /// The binding of the one source that `input` reads, where every position that `map` gives result items up to `end` lies within the source's whole binding.
+    fn walkable(&self, input: &ReadPlan, map: &Mapping, end: usize) -> Option<&'s Binding<'s>> {
+        let &ReadRoute::Input(source) = input.route() else { return None };
+        let binding = self.sources.get(source)?;
+        let len = binding.view.len();
+        (binding.start == 0 && len == input.len() && match *map {
+            Mapping::Single => true,
+            Mapping::Linear(r) => r > 0 && end.saturating_sub(1) / r < len,
+            Mapping::Tiled(m) => m > 0 && m <= len,
+            Mapping::Steps { base, ref steps } => Steps::furthest(base, &steps[..]).is_none_or(|furthest| furthest < len),
+        }).then_some(binding)
+    }
+    /// The whole source and the mapping of a read that maps one source with no fills, for a reader that walks the mapping itself (`linalg::Mapped`).
+    pub fn mapped_source(&self) -> Option<(crate::buffer::View<'s>, &'s Mapping)> {
+        let ReadRoute::Map { input, map, .. } = self.plan.route() else { return None };
+        if map.fills() { return None; }
+        Some((self.walkable(input, map, self.plan.len())?.view, map))
+    }
+    /// Walks `map` over the one source that `input` reads, onto `output`, as `copied` walks a mapping, where every position that the walk reaches lies within the source's whole binding and `missing` reads one item, the walk's fill: `false` for any other read.
+    fn walk_onto<T: crate::buffer::Cast>(
+        &self, input: &ReadPlan, map: &Mapping, missing: &ReadPlan, range: Range<usize>, checked: bool, output: &mut Vec<T>
+    ) -> Result<bool, Error> {
+        let Some(binding) = self.walkable(input, map, range.end) else { return Ok(false) };
+        let Some(fill) = Filled::of(missing).filter(|&fill| fill != Filled::Never || !map.fills()) else { return Ok(false) };
+        let walked = Walked::from(map);
+        if let Some(items) = T::of(binding.view) {
+            let Some(fill) = fill.item::<T>(self.sources) else { return Ok(false) };
+            copy_walked(&walked, items, range.start, range.len(), fill, output);
+            return Ok(true);
+        }
+        with_dtype!(binding.view.dtype(), S => {
+            let Some(fill) = fill.item::<S>(self.sources) else { return Ok(false) };
+            let mut items = Vec::with_capacity(range.len());
+            copy_walked(&walked, S::of(binding.view).expect("the view has its dtype"), range.start, range.len(), fill, &mut items);
+            T::extend_cast(S::view(&items), items.len(), checked, output)?;
+            Ok(true)
+        })
     }
     pub fn read_into(&self, range: Range<usize>, dtype: crate::buffer::DType, checked: bool, output: &mut crate::buffer::Buffer) -> Result<(), Error> {
         self.range(&range)?;
@@ -368,16 +498,76 @@ impl Read<'_> {
                 if stride == 0 { items.resize(range.len(), source[0]); } else { items.extend_from_slice(source); }
                 return Ok(());
             }
-            self.copy_items::<T>(range, checked, items)
+            items.clear();
+            self.read_onto(range, checked, items)
         })
     }
 }
 
+
+/// The reader that `Read::read_onto` gives a plan's runs: it appends each run's items at `T` to `output`, and keeps the first error.
+struct Onto<'r, 'a, T> { read: &'r Read<'a>, checked: bool, output: &'r mut Vec<T>, error: Option<Error> }
+
+impl<T: crate::buffer::Cast> RunSink for Onto<'_, '_, T> {
+    fn run(&mut self, _at: usize, len: usize, run: Run) -> bool {
+        let read = match run {
+            Run::Source { source, first, stride } => self.read.run_onto(source, first, stride, len, self.checked, self.output),
+            Run::Index { first, step } => {
+                let values: Vec<i64> = (0..len).map(|j| first.wrapping_add(step.wrapping_mul(j as i64))).collect();
+                T::extend_cast(crate::buffer::View::Integers(crate::buffer::Ints::I64(&values)), len, self.checked, self.output)
+            }
+            Run::Fill => { self.output.resize(self.output.len() + len, T::FILL); Ok(()) }
+            Run::Invalid => Err(Error::new(Kind::Index, "read position is outside its source")),
+        };
+        read.map_err(|e| self.error = Some(e)).is_ok()
+    }
+    fn walk(&mut self, _at: usize, input: &ReadPlan, map: &Mapping, missing: &ReadPlan, range: Range<usize>) -> Option<bool> {
+        match self.read.walk_onto(input, map, missing, range, self.checked, self.output) {
+            Ok(true) => Some(true), Ok(false) => None, Err(e) => { self.error = Some(e); Some(false) }
+        }
+    }
+}
+
+/// Where position `position` of a join of `parts` lies: the part's read, the position among the part's own items, and how many of the part's positions in that row lie before it and from it on.
+fn joined_at(parts: &[ReadPart], position: usize) -> Option<(&ReadPlan, usize, usize, usize)> {
+    let width = parts.last().map_or(0, |part| part.end);
+    if width == 0 { return None; }
+    let (row, column) = (position / width, position % width);
+    let k = parts.partition_point(|part| part.end <= column);
+    let start = if k == 0 { 0 } else { parts[k - 1].end };
+    let part = parts.get(k)?;
+    Some((&part.plan, row * (part.end - start) + column - start, column - start, part.end - column))
+}
 /// The `len` items of a borrowed run of another dtype, as `T` in `output`: one typed loop over the run ([`Cast::extend_cast`](crate::buffer::Cast::extend_cast)), in place of a routed read for each item. A stride of 0 repeats the run's one item.
 fn cast_run<T: crate::buffer::Cast>(view: crate::buffer::View<'_>, stride: usize, len: usize, checked: bool, output: &mut Vec<T>) -> Result<(), Error> {
     output.clear();
     if stride == 0 { output.resize(len, kept(T::cast(view, 0), checked)?); return Ok(()); }
     T::extend_cast(view, len, checked, output)
+}
+
+/// The one item that every missing position of a walk reads, which `Filled::of` finds in the plan of a map's misses: the dtype's fill, an index plan's one value, or a source's first item. `Never` is a plan of misses that no position may reach, where the walk's fill goes unread.
+#[derive(Clone, Copy, PartialEq)]
+enum Filled { Fill, Value(i64), Source(usize), Never }
+
+impl Filled {
+    fn of(missing: &ReadPlan) -> Option<Self> {
+        match missing.route() {
+            ReadRoute::Default => Some(Self::Fill),
+            ReadRoute::Invalid => Some(Self::Never),
+            &ReadRoute::Index { base, step: 0 } => Some(Self::Value(base)),
+            &ReadRoute::Input(source) if missing.len() == 1 => Some(Self::Source(source)),
+            ReadRoute::Map { input, map: Mapping::Single, .. } => match *input.route() { ReadRoute::Input(source) => Some(Self::Source(source)), _ => None },
+            _ => None,
+        }
+    }
+    /// The item as an `A`, where it is exactly one: `None` where an index value doesn't convert, or the source holds another dtype or no first item.
+    fn item<A: crate::buffer::Cast>(self, sources: &[Binding<'_>]) -> Option<A> {
+        match self {
+            Self::Fill | Self::Never => Some(A::FILL),
+            Self::Value(value) => A::cast(crate::buffer::View::Integers(crate::buffer::Ints::I64(&[value])), 0).ok(),
+            Self::Source(source) => A::of(sources.get(source).filter(|binding| binding.start == 0)?.view)?.first().copied(),
+        }
+    }
 }
 
 /// How a mapping's positions read the same items again (`Mapping::period`).
@@ -520,10 +710,16 @@ impl Mapping {
         };
         (base, Cow::Owned(steps))
     }
-    /// Whether a read through this mapping over a result of `shape` takes each of a source's `len` items once, in order, from the first: a copy through it is the source unchanged, so a view of the source serves. `Linear(1)` answers at once, and any other mapping by its walk ([`Mapping::to_walk`], [`Steps::in_order`]).
-    pub fn in_order(&self, len: usize, shape: &[usize]) -> bool {
-        len == count(shape) && (matches!(self, Self::Linear(1)) || { let (base, steps) = self.to_walk(shape); base == 0 && Steps::in_order(&steps) })
+    /// The result shape that this mapping's steps describe for `items` items, or one axis of `items`.
+    fn shape(&self, items: usize) -> Vec<usize> {
+        match self { Self::Steps { steps, .. } if Steps::count(steps) == items => steps.iter().map(Steps::len).collect(), _ => vec![items] }
     }
+    /// Whether a read through this mapping over a result of `shape` takes each of a source's `len` items once, in order, from the first: a copy through it is the source unchanged, so a view of the source serves. `Linear(1)` answers at once, and any other mapping by its walk ([`Mapping::to_walk`], [`Mapping::walk_in_order`]).
+    pub fn in_order(&self, len: usize, shape: &[usize]) -> bool {
+        len == count(shape) && (matches!(self, Self::Linear(1)) || { let (base, steps) = self.to_walk(shape); Self::walk_in_order(base, &steps, len) })
+    }
+    /// Whether a walk from `base` through `steps` takes each of a source's `len` items once, in order, from the first, as [`Mapping::in_order`] asks of a mapping's walk. The walk needs exactly `len` positions, because a walk read past its last position starts again ([`Steps::reach`]).
+    pub fn walk_in_order(base: usize, steps: &[Steps], len: usize) -> bool { base == 0 && Steps::count(steps) == len && Steps::in_order(steps) }
     /// Positional steps with the base as a leading singleton step.
     pub fn tables(&self, shape: &[usize]) -> Vec<Steps> { let (base, steps) = self.to_walk(shape); Steps::with_base(base, steps.into_owned()) }
     /// The bytes that this mapping's entries take: each entry, and a table's listed offsets.
@@ -699,6 +895,43 @@ impl Mapping {
     }
     /// Whether some position reads a fill, as a padded read's does.
     pub fn fills(&self) -> bool { matches!(self, Self::Steps { steps, .. } if steps.iter().any(Steps::fills)) }
+    /// Calls `f(at, len, run)` for consecutive spans of result positions `range`, in order, until it gives `false`: `run` holds the first position and stride of a span whose positions all lie below `items`, and is `None` for a span whose positions all miss. A `Steps` mapping gives the spans of each row of its innermost axis (`row_spans`), a repeat a span for each item, and a cycle a span for each pass.
+    pub fn spans(&self, range: Range<usize>, items: usize, f: &mut dyn FnMut(usize, usize, Option<(usize, isize)>) -> bool) {
+        let mut at = range.start;
+        match *self {
+            Self::Single => { f(at, range.len(), (items > 0).then_some((0, 0))); }
+            Self::Linear(0) | Self::Tiled(0) => { f(at, range.len(), None); }
+            Self::Linear(r) => while at < range.end {
+                let (k, end) = (at / r, range.end.min((at / r + 1) * r));
+                if !f(at, end - at, (k < items).then_some((k, 0))) { return; }
+                at = end;
+            },
+            Self::Tiled(m) => while at < range.end {
+                let (p, end) = (at % m, range.end.min(at - at % m + m));
+                let below = items.saturating_sub(p).min(end - at);
+                if below > 0 && !f(at, below, Some((p, 1))) { return; }
+                if end > at + below && !f(at + below, end - at - below, None) { return; }
+                at = end;
+            },
+            Self::Steps { base, ref steps } => {
+                let Some((inner, outer)) = steps.split_last() else { f(at, range.len(), (base < items).then_some((base, 0))); return };
+                // A range that steps evenly across rows is one span.
+                if let Some((first, step)) = Steps::run(base, steps, at, range.len()) && first.max(first.wrapping_add_signed(step * (range.len() as isize - 1))) < items {
+                    f(at, range.len(), Some((first, step)));
+                    return;
+                }
+                let width = inner.len();
+                while at < range.end && width > 0 {
+                    let (row, j) = (at / width, at % width);
+                    let n = (width - j).min(range.end - at);
+                    let go = match Steps::reach(base, outer, row) { Some(start) => row_spans(start, inner, j, n, items, at, f), None => f(at, n, None) };
+                    if !go { return; }
+                    at += n;
+                }
+            }
+        }
+    }
+
     /// The innermost axis of a `Steps` mapping that reaches more than one offset.
     fn inner(&self) -> Option<&Steps> { let Self::Steps { steps, .. } = self else { return None }; steps.iter().rev().find(|s| s.len() > 1) }
 }
@@ -917,32 +1150,34 @@ pub fn tiled_cycle<A: Element>(data: &[A], mapping: &Mapping, run: usize, buf: &
 
 /// Items `start..start + n` that `mapping` lays out, copied into `buf`, cleared first: what `expanded` gives where `in_place` refuses them. A caller that has just had `in_place` refuse them copies here directly, and the copy records that refusal.
 pub fn copied<'a, A: Element>(mapping: &Walked, data: &[A], start: usize, n: usize, buf: &'a mut Vec<A>) -> &'a [A] {
-    let reason = copy_walked(mapping, data, start, n, buf);
+    buf.clear();
+    let reason = copy_walked(mapping, data, start, n, A::FILL, buf);
     crate::events::declined(crate::events::Route::InPlace, reason, n);
     &buf[..n]
 }
 
-/// `copied`'s copy, the one walk of a mapping's items, giving the reason that a view couldn't serve them. It's out of line, so it compiles once for each item type rather than in each caller.
+/// The one walk of a mapping's items: appends items `start..start + n` that `mapping` lays out over `data` to `buf`, with `fill` where a position misses, and gives the reason that a view couldn't serve them. It's out of line, so it compiles once for each item type rather than in each caller.
 #[inline(never)]
-fn copy_walked<A: Element>(mapping: &Walked, data: &[A], start: usize, n: usize, buf: &mut Vec<A>) -> &'static str {
-    buf.clear();
+fn copy_walked<A: Element>(mapping: &Walked, data: &[A], start: usize, n: usize, fill: A, buf: &mut Vec<A>) -> &'static str {
+    let at = buf.len();
     match **mapping {
-        Mapping::Single => { buf.resize(n, data[0]); "a repeated item" }
+        _ if n == 0 => "no items",
+        Mapping::Single => { buf.resize(at + n, data[0]); "a repeated item" }
         Mapping::Linear(r) => {
             // The range can start and end inside an item's run. The whole runs between go through `repeat`.
             let (k0, end) = (start / r, start + n);
-            buf.resize(((k0 + 1) * r).min(end) - start, data[k0]);
-            if buf.len() < n {
+            buf.resize(at + ((k0 + 1) * r).min(end) - start, data[k0]);
+            if buf.len() - at < n {
                 let (k1, k2) = (k0 + 1, end / r);
-                crate::gather::repeat(buf, &data[k1..k2], &[r as i64], (k2 - k1) * r, |x| x);
-                if end % r != 0 { buf.resize(n, data[k2]) }
+                crate::gather::repeat(buf, k2 - k1, &[r as i64], (k2 - k1) * r, |j| data[k1 + j]);
+                if end % r != 0 { buf.resize(at + n, data[k2]) }
             }
             "repeats of each item"
         }
         Mapping::Tiled(m) => { cycled(buf, &data[..m], start, n); "a cycle that wraps" }
         Mapping::Steps { base, .. } => {
             let (offset, plan) = mapping.walk();
-            walk_plan(buf, data, base + offset, plan, A::FILL, start, n, Same);
+            walk_plan(buf, data, base + offset, plan, fill, start, n, Same);
             "steps other than a forward run"
         }
     }

@@ -15,25 +15,41 @@ pub(crate) fn formula<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, y: O:
 }
 
 pub(crate) fn root_formula<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, n: O::V, y: O::V) -> O::V {
-    if let Some(n) = o.constant(n) {
-        let result = match n.wide().abs() {
-            1.0 => Some(y),
-            2.0 => Some(root2(o, y)),
-            3.0 => Some(cbrt_formula(o, y)),
-            4.0 => Some(root2(o, root2(o, y))),
-            8.0 => Some(root2(o, root2(o, root2(o, y)))),
-            0.5 => {
-                let x = if n < F::zero() { o.reciprocal(y) } else { y };
-                return o.select(o.less(y, o.number(F::zero())), o.number(F::nan()), o.multiply(x, x));
-            }
-            _ => None,
-        };
-        if let Some(result) = result { return if n < F::zero() { o.reciprocal(result) } else { result }; }
+    match o.constant(n) { Some(k) => rooted(o, Degree::of(k.wide()), k < F::zero(), n, y), None => general(o, y, n, true) }
+}
+
+/// The route [`Root`] takes for a degree n, chosen by n's magnitude. `General` takes e^(ln|y|/n) for a degree with no route of its own. The slice form reads the route once for a constant n.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Degree { One, Two, Three, Four, Eight, Half, General }
+
+impl Degree {
+    /// The route for degree n.
+    #[inline(always)]
+    fn of(n: f64) -> Self {
+        match n.abs() { 1.0 => Self::One, 2.0 => Self::Two, 3.0 => Self::Three, 4.0 => Self::Four, 8.0 => Self::Eight, 0.5 => Self::Half, _ => Self::General }
     }
-    general(o, y, n, true)
+}
+
+/// The root of degree n of y by n's route `d`. A negative n (`negative`) takes the reciprocal of the route's root. For `Half` it squares y's reciprocal instead.
+#[inline(always)]
+fn rooted<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, d: Degree, negative: bool, n: O::V, y: O::V) -> O::V {
+    let r = match d {
+        Degree::One => y,
+        Degree::Two => root2(o, y),
+        Degree::Three => cbrt_formula(o, y),
+        Degree::Four => root2(o, root2(o, y)),
+        Degree::Eight => root2(o, root2(o, root2(o, y))),
+        Degree::Half => {
+            let x = if negative { o.reciprocal(y) } else { y };
+            return o.select(o.less(y, o.number(F::zero())), o.number(F::nan()), o.multiply(x, x));
+        }
+        Degree::General => return general(o, y, n, true),
+    };
+    if negative { o.reciprocal(r) } else { r }
 }
 
 // A more accurate compensated implementation is in a1b7044cd3416194bf5dc423f197280c6933c9b9:src/pow.rs and src/table.rs; it can replace this formula if greater accuracy is needed.
+#[inline]
 fn general<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, y: O::V, root: bool) -> O::V {
     let (zero, one, half) = (o.number(F::zero()), o.number(F::one()), o.number(F::narrow(0.5)));
     let a = o.magnitude(x);
@@ -87,6 +103,70 @@ impl Exponent {
         let halves = a + a;
         if (halves == 1.0) | (halves == 3.0) { Self::Halves { m: halves as u32, negative } } else { Self::General }
     }
+}
+
+/// `f` of each of `xs` into `out`, at the working precision. Each route's loop inlines it and vectorizes.
+#[inline(always)]
+fn each<F: crate::Float>(xs: &[F], out: &mut [std::mem::MaybeUninit<F>], f: impl Fn(F::Working) -> F::Working) {
+    for (r, &x) in out.iter_mut().zip(xs) { r.write(F::from_working(f(F::working(x)))); }
+}
+
+/// `x^k` into `out` for each of `xs`, with `k`'s route (`Exponent::of`) chosen once, at the working precision. Each whole power up to `MULTIPLIED`, each power of halves and the general route have a loop of their own, so squarings unroll and each loop vectorizes. Larger whole powers share one loop.
+pub(crate) fn powers<F: crate::Float>(e: Exponent, k: F, xs: &[F], out: &mut [std::mem::MaybeUninit<F>]) {
+    #[inline(always)]
+    fn route<F: crate::Float>(e: Exponent, xs: &[F], out: &mut [std::mem::MaybeUninit<F>]) {
+        let o = crate::recipe::NativeOps::<{ crate::FUSED }>::DEFAULT;
+        each(xs, out, #[inline(always)] |x| crate::recipe::power(&o, e, x).expect("a route off the general route"));
+    }
+    macro_rules! routes { ($($kind:ident $m:literal),+) => { match e {
+        $(Exponent::$kind { m: $m, negative: false } => route(Exponent::$kind { m: $m, negative: false }, xs, out),
+          Exponent::$kind { m: $m, negative: true } => route(Exponent::$kind { m: $m, negative: true }, xs, out),)+
+        Exponent::General => {
+            let o = crate::recipe::NativeOps::<{ crate::FUSED }>::DEFAULT;
+            let k = o.number(F::working(k));
+            each(xs, out, #[inline(always)] |x| general(&o, x, k, false))
+        }
+        e => route(e, xs, out),
+    } } }
+    routes!(Whole 1, Whole 2, Whole 3, Whole 4, Whole 5, Whole 6, Whole 7, Whole 8, Halves 1, Halves 3);
+}
+
+/// [`Pow`]'s slice form: [`powers`] for an exponent that every item shares, else `general` for every item, then the exact route for each item whose exponent has one. It gives whether every result is valid, as `power_valid` judges results: not NaN, or from a NaN argument.
+pub(crate) fn power_slice<F: crate::float::Native>(_: &Pow, [x, y]: [crate::Arg<'_, F>; 2], n: usize, out: &mut [std::mem::MaybeUninit<F>]) -> bool {
+    if let (crate::Arg::Many(xs), crate::Arg::One(k)) = (x, y) {
+        let e = Exponent::of(k.wide());
+        powers(e, k, &xs[..n], &mut out[..n]);
+        return !matches!(e, Exponent::Halves { .. } | Exponent::General) || k.is_nan() || xs[..n].iter().zip(crate::slice::written(&mut out[..n]).iter()).all(|(x, r)| !r.is_nan() || x.is_nan());
+    }
+    // Exponents that vary: `general` for every item in one loop that vectorizes, then each item whose exponent has a route of its own (`Exponent::of`) takes that route, as `formula` would.
+    let o = crate::recipe::NativeOps::<{ crate::FUSED }>::DEFAULT;
+    crate::slice::mapped(&[x, y], n, out, #[inline(always)] |[a, b]| (general(&o, a, b, false), true));
+    let results = crate::slice::written(&mut out[..n]);
+    for (i, r) in results.iter_mut().enumerate() {
+        if let Some(exact) = crate::recipe::power(&o, Exponent::of(y.nth(i).wide()), x.nth(i)) { *r = exact; }
+    }
+    results.iter().enumerate().all(|(i, r)| !r.is_nan() || x.nth(i).is_nan() || y.nth(i).is_nan())
+}
+
+/// The root of degree `n` of each of `ys` into `out`, at the working precision, with `n`'s route (`Degree::of`) chosen once. Each route and sign has its own loop, which vectorizes.
+pub(crate) fn roots<F: crate::Float>(n: F, ys: &[F], out: &mut [std::mem::MaybeUninit<F>]) {
+    let o = crate::recipe::NativeOps::<{ crate::FUSED }>::DEFAULT;
+    let k = o.number(F::working(n));
+    macro_rules! routes { ($($d:ident),+) => { match (Degree::of(n.wide()), n < F::zero()) {
+        $((Degree::$d, false) => each(ys, out, #[inline(always)] |y| rooted(&o, Degree::$d, false, k, y)),
+          (Degree::$d, true) => each(ys, out, #[inline(always)] |y| rooted(&o, Degree::$d, true, k, y)),)+
+    } } }
+    routes!(One, Two, Three, Four, Eight, Half, General);
+}
+
+/// [`Root`]'s slice form: [`roots`] for a degree that every item shares, else [`root_formula`] for each item. It gives whether every result is valid: not NaN, or from a NaN argument.
+pub(crate) fn root_slice<F: crate::float::Native>(_: &Root, [n, y]: [crate::Arg<'_, F>; 2], len: usize, out: &mut [std::mem::MaybeUninit<F>]) -> bool {
+    if let (crate::Arg::One(k), crate::Arg::Many(ys)) = (n, y) {
+        roots(k, &ys[..len], &mut out[..len]);
+        return matches!(Degree::of(k.wide()), Degree::One | Degree::Three) || k.is_nan() || ys[..len].iter().zip(crate::slice::written(&mut out[..len]).iter()).all(|(y, r)| !r.is_nan() || y.is_nan());
+    }
+    let o = crate::recipe::NativeOps::<{ crate::FUSED }>::DEFAULT;
+    crate::slice::mapped(&[n, y], len, out, #[inline(always)] |[a, b]| { let r = root_formula(&o, a, b); (r, !r.is_nan() || a.is_nan() || b.is_nan()) })
 }
 
 #[derive(Clone, Copy, Debug)]

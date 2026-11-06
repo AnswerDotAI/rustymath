@@ -1,5 +1,5 @@
 //! Shared short trigonometric reductions and polynomials, with scalar repairs for rare large arguments. Polynomial sources: Arm Optimized Routines; see THIRD-PARTY.md.
-use crate::{Float, buffer::FloatWidth, facts::Repair, float::Native, recipe::{Cmp, Integer, NativeOps, Ops}};
+use crate::{Float, buffer::FloatWidth, facts::Repair, float::Native, recipe::{NativeOps, Ops}};
 use std::f64::consts::FRAC_1_PI;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -35,9 +35,6 @@ pub struct Cos;
 #[derive(Clone, Copy, Debug)]
 pub struct Tan;
 
-forms!(Sin at real: |_, [x]| sin::<_, { crate::FUSED }>(x));
-forms!(Cos at real: |_, [x]| cos::<_, { crate::FUSED }>(x));
-forms!(Tan at real: |_, [x]| tan::<_, { crate::FUSED }>(x));
 #[inline]
 fn scalar<R: Native, const FUSED: bool>(x: R, kind: Kind) -> R {
     let o = NativeOps::<FUSED>::DEFAULT;
@@ -55,7 +52,10 @@ pub(crate) fn formula<F: Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, kind: Kind) 
     let finite = o.less(o.magnitude(x), o.number(F::infinity()));
     let safe = o.select(o.and(finite, o.not(kind.predicate(o, x))), x, zero);
     let (r, n) = if o.fused() { reduce_fused(o, safe, kind) } else { reduce_split(o, safe, kind) };
-    let odd = o.integer_compare(Cmp::Equal, o.integer_op(Integer::And, o.to_integer(n), o.integer(1)), o.integer(1));
+    // n is a whole number well inside the shift's exact range, so rounding n/2 with the shift gives its parity exactly. An integer conversion would run scalar on AVX2.
+    let (half, shift) = (o.multiply(n, o.number(F::narrow(0.5))), crate::recipe::rounding_shift(o));
+    let even = o.subtract(o.add(half, shift), shift);
+    let odd = o.not(o.equal(n, o.add(even, even)));
     let y = if kind == Kind::Tan { tangent(o, r, odd) } else {
         let y = sine(o, r);
         let y = o.select(odd, o.negate(y), y);

@@ -1,5 +1,24 @@
 //! Formulas that rustymath's kernels compute and basedpl's JIT compiles, each written once over the operations it uses (`Ops`): tolerant closeness, comparison (each item, or through the range of floats equal to one number), floor, ceiling and the residue; Mathish division, sign, the reciprocal and `π`'s two forms; and the powers that `Exponent` routes off the general route, with the square root they take for halves. `Floats` runs a recipe on floats, as the kernels do. A compiler's `Ops` records the same operations as steps, so both routes round alike, step for step.
 use crate::{Exponent, Float, float::sealed::Core, tolerant::Band};
+/// `Ops`' integer methods on bit patterns held in `u64`, `bits` wide, which `NativeOps` and `IntegerOps` share.
+macro_rules! u64_integers {
+    ($bits:expr) => {
+        #[inline(always)] fn integer(&self, x: i64) -> u64 { x as u64 }
+        #[inline(always)] fn integer_op(&self, op: Integer, x: u64, y: u64) -> u64 { crate::recipe::integer_op(op, x, y, $bits) }
+        #[inline(always)] fn integer_compare(&self, op: Cmp, x: u64, y: u64) -> bool { crate::recipe::integer_compare(op, x, y) }
+        #[inline(always)] fn integer_select(&self, test: bool, x: u64, y: u64) -> u64 { if test { x } else { y } }
+    };
+}
+/// The comparison and Boolean `Ops` methods that `NativeOps` and `IntegerOps` share, on plain values and `bool` masks.
+macro_rules! plain_logic {
+    ($t:ty) => {
+        #[inline(always)] fn compare(&self, c: Cmp, x: $t, y: $t) -> bool { match c { Cmp::Less => x < y, Cmp::LessEqual => x <= y, Cmp::Equal => x == y } }
+        #[inline(always)] fn and(&self, x: bool, y: bool) -> bool { x & y }
+        #[inline(always)] fn or(&self, x: bool, y: bool) -> bool { x | y }
+        #[inline(always)] fn not(&self, x: bool) -> bool { !x }
+        #[inline(always)] fn select(&self, test: bool, x: $t, y: $t) -> $t { if test { x } else { y } }
+    };
+}
 mod integer;
 pub use crate::arith::Overflowing;
 pub use integer::IntegerOps;
@@ -62,12 +81,35 @@ pub enum Cmp { Less, LessEqual, Equal }
 #[derive(Clone, Copy, Debug, PartialEq, Hash, Eq)]
 pub enum Integer { Add, Subtract, And, Or, Xor, ShiftLeft, ShiftRight, SignedShiftRight }
 
+/// `op` on the bit patterns `x` and `y` of integers `bits` wide. Sums and differences wrap. Left and signed right shifts follow `shifted`. An unsigned right shift reads `x` as `bits` wide and gives 0 for a count of 64 or more. `NativeOps` and `IntegerOps` both compute through it.
+#[inline(always)]
+pub(crate) fn integer_op(op: Integer, x: u64, y: u64, bits: u32) -> u64 {
+    match op {
+        Integer::Add => x.wrapping_add(y), Integer::Subtract => x.wrapping_sub(y), Integer::And => x & y, Integer::Or => x | y, Integer::Xor => x ^ y,
+        Integer::ShiftLeft => shifted(x, y as i64),
+        Integer::ShiftRight => if y >= 64 { 0 } else { (x & (u64::MAX >> (64 - bits))) >> y },
+        Integer::SignedShiftRight => shifted(x, (y as i64).saturating_neg())
+    }
+}
+
+/// Comparison `op` of the bit patterns `x` and `y`, read as signed 64-bit integers.
+#[inline(always)]
+pub(crate) fn integer_compare(op: Cmp, x: u64, y: u64) -> bool {
+    match op { Cmp::Less => (x as i64) < y as i64, Cmp::LessEqual => (x as i64) <= y as i64, Cmp::Equal => x == y }
+}
+
+/// `x`'s bits shifted left by `count`, or right with the sign filled in for a negative count. A count of 64 or more saturates: to 0 leftward, and to the sign rightward. Items hold their sign extended to 64 bits, so a count past an item's own width saturates the same way once the result narrows.
+#[inline(always)]
+fn shifted(x: u64, count: i64) -> u64 {
+    if count >= 64 { 0 } else if count >= 0 { x << count } else { ((x as i64) >> count.unsigned_abs().min(63)) as u64 }
+}
+
 /// The named methods of `Ops`, each the operation of its id.
 macro_rules! named {
     (unary: $($u:ident $uid:ident),+; binary: $($b:ident $bid:ident),+; compare: $($c:ident $cid:ident),+) => {
-        $( #[inline(always)] fn $u(&self, x: Self::V) -> Self::V { self.unary(Unary::$uid, x) } )+
-        $( #[inline(always)] fn $b(&self, x: Self::V, y: Self::V) -> Self::V { self.binary(Binary::$bid, x, y) } )+
-        $( #[inline(always)] fn $c(&self, x: Self::V, y: Self::V) -> Self::B { self.compare(Cmp::$cid, x, y) } )+
+        $( fn $u(&self, x: Self::V) -> Self::V { self.unary(Unary::$uid, x) } )+
+        $( fn $b(&self, x: Self::V, y: Self::V) -> Self::V { self.binary(Binary::$bid, x, y) } )+
+        $( fn $c(&self, x: Self::V, y: Self::V) -> Self::B { self.compare(Cmp::$cid, x, y) } )+
     };
 }
 
@@ -109,31 +151,22 @@ pub trait Ops<F: Float> {
     /// `x` where `m` holds, otherwise `y`. `∂`'s recorder runs a recipe on whole values, where `m` and each array case must have one layout: build them from the same arguments.
     fn select(&self, m: Self::B, x: Self::V, y: Self::V) -> Self::V;
     /// 1 where `m` holds, otherwise 0.
-    #[inline(always)]
     fn one_where(&self, m: Self::B) -> Self::V { self.select(m, self.number(F::one()), self.number(F::zero())) }
     /// `v` where it's one number that every item shares, known before any item is read, such as the 3 of `x^3`. A recipe can pick a cheaper formula by it. `None` where `v` varies by item.
-    #[inline(always)]
     fn constant(&self, _v: Self::V) -> Option<F> { None }
     /// Whether values are integers, as a compiler's values at an integer type are. A recipe for an integer object asks before taking an integer-only step (`Binary::BitAnd`). Floats never are.
-    #[inline(always)]
     fn integral(&self) -> bool { false }
     /// Captured tolerance; recording backends return its runtime setting slot.
-    #[inline(always)]
     fn tolerance(&self, fallback: F) -> Self::V { self.number(fallback) }
     /// The sign of `x`, as [`sign`] gives it.
-    #[inline(always)]
     fn sign(&self, x: Self::V) -> Self::V { sign(self, x) }
     /// `1 ÷ x`, as [`reciprocal`] gives it.
-    #[inline(always)]
     fn reciprocal(&self, x: Self::V) -> Self::V { reciprocal(self, x) }
     /// `x` raised to `k`, a constant that `Exponent::of` routes off the general route, as [`power`] gives it.
-    #[inline(always)]
     fn power(&self, k: F, x: Self::V) -> Self::V { power(self, Exponent::of(k.wide()), x).expect("an exponent off the general route") }
     /// The real part of `x^y` through the existing power formula.
-    #[inline(always)]
     fn real_power(&self, x: Self::V, y: Self::V) -> Self::V { crate::pow::real_formula(self, x, y) }
     /// The partial in `x` of `x^y = r`; `halves` permits constant half-integer powers.
-    #[inline(always)]
     fn power_slope(&self, x: Self::V, y: Self::V, r: Self::V, halves: bool) -> Self::V { crate::derivative::power_slope(self, x, y, r, halves) }
     named! {
         unary: negate Negate, magnitude Magnitude, sqrt Sqrt, floor Floor, ln Ln, sin Sin, cos Cos, sinh Sinh, cosh Cosh, sqrt1mx2 Sqrt1mx2, sqrt1px2 Sqrt1px2, digamma Digamma, exp Exp, lgamma Lgamma, complement Not;
@@ -145,7 +178,7 @@ pub trait Ops<F: Float> {
 /// Conservative range interpretation of the shared predicates.
 pub(crate) struct RangeOps(pub crate::buffer::DType);
 impl RangeOps {
-    fn compare(op: Cmp, x: crate::facts::Range, y: crate::facts::Range) -> Option<bool> {
+    fn compare(op: Cmp, x: crate::domain::Range, y: crate::domain::Range) -> Option<bool> {
         if x.is_empty() || y.is_empty() { return None; }
         match op {
             Cmp::Less if x.hi < y.lo => Some(true), Cmp::Less if x.lo >= y.hi => Some(false), Cmp::LessEqual if x.hi <= y.lo => Some(true),
@@ -153,36 +186,36 @@ impl RangeOps {
             Cmp::Equal if x.hi < y.lo || y.hi < x.lo => Some(false), _ => None
         }
     }
-    fn selected(test: Option<bool>, x: crate::facts::Range, y: crate::facts::Range) -> crate::facts::Range {
+    fn selected(test: Option<bool>, x: crate::domain::Range, y: crate::domain::Range) -> crate::domain::Range {
         match test { Some(true) => x, Some(false) => y, None => x.join(y) }
     }
 }
 impl<F: Float> Ops<F> for RangeOps {
-    type V = crate::facts::Range;
+    type V = crate::domain::Range;
     type B = Option<bool>;
-    type I = crate::facts::Range;
-    type W = crate::facts::Range;
+    type I = crate::domain::Range;
+    type W = crate::domain::Range;
     fn width(&self) -> crate::buffer::FloatWidth { crate::operation::numpy_float(self.0) }
     fn fused(&self) -> bool { crate::FUSED }
     fn integral(&self) -> bool { self.0.is_integral() }
-    fn widen(&self, _: Self::V) -> Self::W { crate::facts::Range::ANY }
-    fn wide_number(&self, x: f64) -> Self::W { crate::facts::Range::of(Some(x)) }
-    fn wide_multiply_add(&self, _: Self::W, _: Self::W, _: Self::W) -> Self::W { crate::facts::Range::ANY }
-    fn narrow(&self, _: Self::W) -> Self::V { crate::facts::Range::ANY }
-    fn integer(&self, x: i64) -> Self::I { crate::facts::Range::of((x.unsigned_abs() <= 1 << 53).then_some(x as f64)) }
-    fn integer_op(&self, _: Integer, _: Self::I, _: Self::I) -> Self::I { crate::facts::Range::ANY }
+    fn widen(&self, _: Self::V) -> Self::W { crate::domain::Range::ANY }
+    fn wide_number(&self, x: f64) -> Self::W { crate::domain::Range::of(Some(x)) }
+    fn wide_multiply_add(&self, _: Self::W, _: Self::W, _: Self::W) -> Self::W { crate::domain::Range::ANY }
+    fn narrow(&self, _: Self::W) -> Self::V { crate::domain::Range::ANY }
+    fn integer(&self, x: i64) -> Self::I { crate::domain::Range::of((x.unsigned_abs() <= 1 << 53).then_some(x as f64)) }
+    fn integer_op(&self, _: Integer, _: Self::I, _: Self::I) -> Self::I { crate::domain::Range::ANY }
     fn integer_compare(&self, op: Cmp, x: Self::I, y: Self::I) -> Self::B { Self::compare(op, x, y) }
     fn integer_select(&self, test: Self::B, x: Self::I, y: Self::I) -> Self::I { Self::selected(test, x, y) }
-    fn to_integer(&self, _: Self::V) -> Self::I { crate::facts::Range::ANY }
-    fn from_integer(&self, _: Self::I) -> Self::V { crate::facts::Range::ANY }
-    fn to_bits(&self, _: Self::V) -> Self::I { crate::facts::Range::ANY }
-    fn from_bits(&self, _: Self::I) -> Self::V { crate::facts::Range::ANY }
-    fn number(&self, x: F) -> Self::V { crate::facts::Range::of(Some(x.wide())) }
+    fn to_integer(&self, _: Self::V) -> Self::I { crate::domain::Range::ANY }
+    fn from_integer(&self, _: Self::I) -> Self::V { crate::domain::Range::ANY }
+    fn to_bits(&self, _: Self::V) -> Self::I { crate::domain::Range::ANY }
+    fn from_bits(&self, _: Self::I) -> Self::V { crate::domain::Range::ANY }
+    fn number(&self, x: F) -> Self::V { crate::domain::Range::of(Some(x.wide())) }
     fn constant(&self, x: Self::V) -> Option<F> { x.constant().map(F::narrow) }
-    fn unary(&self, op: Unary, x: Self::V) -> Self::V { if op == Unary::Magnitude { x.magnitude() } else { crate::facts::Range::ANY } }
-    fn binary(&self, _: Binary, _: Self::V, _: Self::V) -> Self::V { crate::facts::Range::ANY }
+    fn unary(&self, op: Unary, x: Self::V) -> Self::V { if op == Unary::Magnitude { x.magnitude() } else { crate::domain::Range::ANY } }
+    fn binary(&self, _: Binary, _: Self::V, _: Self::V) -> Self::V { crate::domain::Range::ANY }
     fn compare(&self, op: Cmp, x: Self::V, y: Self::V) -> Self::B { Self::compare(op, x, y) }
-    fn multiply_add(&self, _: Self::V, _: Self::V, _: Self::V) -> Self::V { crate::facts::Range::ANY }
+    fn multiply_add(&self, _: Self::V, _: Self::V, _: Self::V) -> Self::V { crate::domain::Range::ANY }
     /// No overflow (`Some(false)`) where the operation's range, as its formula's facts give it, lies within the computing dtype's values. Past 2⁵³ a bound and the result's ends round, so a result stays strictly inside such a bound.
     fn overflow(&self, op: Binary, x: Self::V, y: Self::V) -> Self::B {
         use crate::facts::Formula;
@@ -190,7 +223,7 @@ impl<F: Float> Ops<F> for RangeOps {
             Binary::Add => crate::Add.range([x, y]), Binary::Subtract => crate::Subtract.range([x, y]), Binary::Multiply => crate::Multiply.range([x, y]),
             _ => return None,
         };
-        let fits = crate::facts::Range::of_dtype(self.0);
+        let fits = crate::domain::Range::of_dtype(self.0);
         let exact = |bound: f64| bound.abs() < 2f64.powi(53);
         let above = if exact(fits.lo) { result.lo >= fits.lo } else { result.lo > fits.lo };
         let below = if exact(fits.hi) { result.hi <= fits.hi } else { result.hi < fits.hi };
@@ -231,22 +264,7 @@ impl<F: Float, const FUSED: bool> Ops<F> for NativeOps<FUSED> {
     fn narrow(&self, x: f64) -> F { F::narrow(x) }
     #[inline(always)]
     fn width(&self) -> crate::buffer::FloatWidth { if F::Working::WIDE { crate::buffer::FloatWidth::F64 } else { crate::buffer::FloatWidth::F32 } }
-    #[inline(always)]
-    fn integer(&self, x: i64) -> u64 { x as u64 }
-    #[inline(always)]
-    fn integer_op(&self, op: Integer, x: u64, y: u64) -> u64 {
-        match op {
-            Integer::Add => x.wrapping_add(y), Integer::Subtract => x.wrapping_sub(y), Integer::And => x & y, Integer::Or => x | y, Integer::Xor => x ^ y,
-            Integer::ShiftLeft => x.wrapping_shl(y as u32), Integer::ShiftRight => x.wrapping_shr(y as u32),
-            Integer::SignedShiftRight => (x as i64).wrapping_shr(y as u32) as u64
-        }
-    }
-    #[inline(always)]
-    fn integer_compare(&self, op: Cmp, x: u64, y: u64) -> bool {
-        match op { Cmp::Less => (x as i64) < y as i64, Cmp::LessEqual => (x as i64) <= y as i64, Cmp::Equal => x == y }
-    }
-    #[inline(always)]
-    fn integer_select(&self, test: bool, x: u64, y: u64) -> u64 { if test { x } else { y } }
+    u64_integers!(64);
     #[inline(always)]
     fn to_integer(&self, x: F) -> u64 { (x.wide() as i64) as u64 }
     #[inline(always)]
@@ -275,20 +293,11 @@ impl<F: Float, const FUSED: bool> Ops<F> for NativeOps<FUSED> {
             Binary::BitAnd => unreachable!("floats take no bitwise and: a recipe asks for one only where `Ops::integral` holds")
         }
     }
-    #[inline(always)]
-    fn compare(&self, c: Cmp, x: F, y: F) -> bool { match c { Cmp::Less => x < y, Cmp::LessEqual => x <= y, Cmp::Equal => x == y } }
+    plain_logic!(F);
     #[inline(always)]
     fn multiply_add(&self, x: F, y: F, z: F) -> F { F::from_working(x.working().mla::<FUSED>(y.working(), z.working())) }
     #[inline(always)]
     fn overflow(&self, _op: Binary, _x: F, _y: F) -> bool { false }
-    #[inline(always)]
-    fn and(&self, x: bool, y: bool) -> bool { x & y }
-    #[inline(always)]
-    fn or(&self, x: bool, y: bool) -> bool { x | y }
-    #[inline(always)]
-    fn not(&self, x: bool) -> bool { !x }
-    #[inline(always)]
-    fn select(&self, m: bool, x: F, y: F) -> F { if m { x } else { y } }
     #[inline(always)]
     fn constant(&self, value: F) -> Option<F> { Some(value) }
     #[inline(always)]
@@ -505,7 +514,7 @@ fn multiplied<F: Float, O: Ops<F> + ?Sized>(o: &O, m: u32, negative: bool, x: O:
 /// A power that [`whole`] has part computed: `h + l` in double words, or `h` alone where `l` is `None`.
 pub(crate) type Word<V> = (V, Option<V>);
 
-/// x^m, or x^-m where `negative`, for a whole m from `MULTIPLIED` + 1 to `COMPENSATED`, which `Exponent::of` routes here only where the target fuses multiply-add. It raises [`base`] by squaring and multiplying from m's highest set bit, with a [`step`] for each lower bit. A result that the float holds exactly comes out exactly. `Pow`'s slice form writes the steps out for each bit length of m, so that its loop vectorizes.
+/// x^m, or x^-m where `negative`, for a whole m from `MULTIPLIED` + 1 to `COMPENSATED`, which `Exponent::of` routes here only where the target fuses multiply-add. It raises [`base`] by squaring and multiplying from m's highest set bit, with a [`step`] for each lower bit. A result that the float holds exactly comes out exactly.
 #[inline(always)]
 pub(crate) fn whole<F: Float, O: Ops<F> + ?Sized>(o: &O, m: u32, negative: bool, x: O::V) -> O::V {
     let (b, mut error) = base(o, negative, x);

@@ -71,17 +71,13 @@ pub trait Tolerant: Copy + Send + Sync {
     /// The order of `x` and `y`, which is `Equal` when they are equal. `None` when either is NaN.
     #[inline]
     fn compare<F: Float>(self, x: F, y: F) -> Option<Ordering> { if self.equal(x, y) { Some(Ordering::Equal) } else { x.partial_cmp(&y) } }
-    /// The tolerant floor of rounded `x/y`.
-    #[inline]
-    fn floor_quotient<F: Float>(self, x: F, y: F) -> F { self.floor(x / y) }
     /// `y` modulo `x`, through `recipe::residue`: `y - x·floor(y/x)` from this tolerance's floor of the quotient, rounded once where the target fuses multiply-add. At nonzero tolerance, a product equal to `y` within tolerance leaves no remainder. `x` = 0 gives `y`.
     #[inline]
     fn residue<F: Float>(self, x: F, y: F) -> F { self.residue_in::<F, Floats>(&Floats, x, y) }
     /// `residue` through `o`.
     #[inline]
     fn residue_in<F: Float, O: recipe::Ops<F> + ?Sized>(self, o: &O, x: O::V, y: O::V) -> O::V {
-        let tolerance = o.tolerance(F::narrow(self.value()));
-        let tolerance = if o.constant(tolerance).is_some_and(|t| t == F::zero()) { None } else { Some(tolerance) };
+        let tolerance = (!exact(self, o)).then(|| o.tolerance(F::narrow(self.value())));
         recipe::residue(o, tolerance, x, y, |o, v| self.floor_in(o, v))
     }
     /// The whole number nearest `y`, and whether `y` equals it within this tolerance.
@@ -336,21 +332,6 @@ impl Band {
     /// Whether `v` lies in this band against the range `lo` to `hi`.
     #[inline(always)]
     fn holds<F: Float>(self, lo: F, hi: F, v: F) -> bool { recipe::in_band(&Floats, self, lo, hi, v) }
-    /// The values that an item in this band against the range `lo` to `hi` can take, as a closed range: `Below` holds `lo` and `Above` holds `hi`, and `Outside`, which is two pieces, holds every value.
-    pub fn range(self, lo: f64, hi: f64) -> crate::facts::Range {
-        let (lo, hi) = match self {
-            Band::Inside => (lo, hi), Band::Outside => (f64::NEG_INFINITY, f64::INFINITY), Band::Below => (f64::NEG_INFINITY, lo),
-            Band::NotAbove => (f64::NEG_INFINITY, hi), Band::Above => (hi, f64::INFINITY), Band::NotBelow => (lo, f64::INFINITY)
-        };
-        crate::facts::Range { lo, hi }
-    }
-    /// The band of the items that lie outside this one.
-    fn complement(self) -> Self {
-        match self {
-            Band::Inside => Band::Outside, Band::Outside => Band::Inside, Band::Below => Band::NotBelow, Band::NotBelow => Band::Below,
-            Band::NotAbove => Band::Above, Band::Above => Band::NotAbove
-        }
-    }
 }
 
 /// The bands that an item must lie in for a comparison with one number to hold, when the item is on the left of that number and when it's on the right (`against`).
@@ -362,14 +343,6 @@ pub fn against_steps<K: Banding, F: Float, O: recipe::Ops<F> + ?Sized>(_k: K, t:
     let band = if left { K::BANDS.0 } else { K::BANDS.1 };
     let (lo, hi) = (o.number(lo), o.number(hi));
     Some(recipe::in_band(o, band, lo, hi, v))
-}
-
-/// The values of the items `v` of type `F` for which comparison `k` of `v` with the one number `c` holds, and of those for which it doesn't, as `k`'s slice form decides them at tolerance `t`: the band that `v` must lie in against the range of floats equal to `c` (`Tolerant::range`), and the band outside it, each as a closed range (`Band::range`). `left` says whether `v` is the left argument. `None` where `c` is NaN.
-pub fn against_ranges<K: Banding, F: Float>(_k: K, t: Tolerance, c: F, left: bool) -> Option<[crate::facts::Range; 2]> {
-    let (lo, hi) = t.range(c)?;
-    let band = if left { K::BANDS.0 } else { K::BANDS.1 };
-    let (lo, hi) = (lo.to_f64()?, hi.to_f64()?);
-    Some([band.range(lo, hi), band.complement().range(lo, hi)])
 }
 
 /// Runs `$body` with `$b` naming the band `$band` holds, as a constant item in each arm. A closure in `$body` then compiles with the band folded in. It doesn't capture a variable, which would leave each item to test the band.
@@ -395,7 +368,7 @@ fn in_band<F: Float, O>(xs: &[F], lo: F, hi: F, band: Band, out: &mut [std::mem:
 }
 
 /// The float types that `against` compares with one number to give Booleans. The default writes them through `in_band`. Wasm's `f64` and `f32` override it in `narrowed`.
-trait Banded: Float {
+pub(crate) trait Banded: Float {
     /// Writes into `out` whether each item of `xs` lies in `band` against the range `lo` to `hi`.
     #[inline(always)]
     fn banded(xs: &[Self], lo: Self, hi: Self, band: Band, out: &mut [std::mem::MaybeUninit<bool>]) { in_band(xs, lo, hi, band, out, |b| b) }
@@ -407,7 +380,7 @@ impl Banded for f64 {}
 
 /// Compares each item of the `Many` argument with the `One` argument `c`, through the range of floats equal to `c`, worked out once. Each item then takes one or two plain comparisons, which `banded` writes: Booleans through `Banded`, or an `Indicator`'s floats through `in_band`. `left` is the band an item on the left of `c` must lie in, and `right` the band for an item on its right. `None`, writing nothing, unless exactly one argument is `One` and `c` isn't NaN.
 #[inline(always)]
-fn against<F: Float, O>(
+pub(crate) fn against<F: Float, O>(
     t: Tolerance, x: Arg<'_, F>, y: Arg<'_, F>, n: usize, out: &mut [std::mem::MaybeUninit<O>], left: Band, right: Band,
     banded: impl FnOnce(&[F], F, F, Band, &mut [std::mem::MaybeUninit<O>])) -> Option<bool> {
     let (items, (lo, hi), band) = match (x, y) {
@@ -534,11 +507,17 @@ pub trait Stepped {
     fn steps<F: Float, O: recipe::Ops<F> + ?Sized>(self, o: &O, x: O::V, y: O::V) -> O::B;
 }
 
+/// `recipe::close` of `x` and `y` at `o`'s tolerance for `t`: `t` itself, or a recording backend's runtime setting slot.
+#[inline(always)]
+fn close_steps<F: Float, O: recipe::Ops<F> + ?Sized>(t: Tolerance, o: &O, x: O::V, y: O::V) -> O::B { recipe::close(o, o.tolerance(F::narrow(t.value())), x, y) }
+
+/// Whether `o` holds the tolerance for `t` as zero before the loop (`Ops::constant`), where a comparison is exact and takes no tolerance steps.
+#[inline(always)]
+fn exact<F: Float, O: recipe::Ops<F> + ?Sized>(t: impl Tolerant, o: &O) -> bool { o.constant(o.tolerance(F::narrow(t.value()))).is_some_and(|t| t == F::zero()) }
+
 impl Stepped for Equal {
     #[inline(always)]
-    fn steps<F: Float, O: recipe::Ops<F> + ?Sized>(self, o: &O, x: O::V, y: O::V) -> O::B {
-        recipe::equal(o, x, y, |o| recipe::close(o, o.tolerance(F::narrow(self.0.value())), x, y))
-    }
+    fn steps<F: Float, O: recipe::Ops<F> + ?Sized>(self, o: &O, x: O::V, y: O::V) -> O::B { if exact(self.0, o) { return o.equal(x, y); } recipe::equal(o, x, y, |o| close_steps(self.0, o, x, y)) }
 }
 
 impl Stepped for NotEqual {
@@ -548,16 +527,12 @@ impl Stepped for NotEqual {
 
 impl Stepped for Less {
     #[inline(always)]
-    fn steps<F: Float, O: recipe::Ops<F> + ?Sized>(self, o: &O, x: O::V, y: O::V) -> O::B {
-        recipe::less(o, x, y, |o| recipe::close(o, o.tolerance(F::narrow(self.0.value())), x, y))
-    }
+    fn steps<F: Float, O: recipe::Ops<F> + ?Sized>(self, o: &O, x: O::V, y: O::V) -> O::B { if exact(self.0, o) { return o.less(x, y); } recipe::less(o, x, y, |o| close_steps(self.0, o, x, y)) }
 }
 
 impl Stepped for LessEqual {
     #[inline(always)]
-    fn steps<F: Float, O: recipe::Ops<F> + ?Sized>(self, o: &O, x: O::V, y: O::V) -> O::B {
-        recipe::less_equal(o, x, y, |o| recipe::close(o, o.tolerance(F::narrow(self.0.value())), x, y))
-    }
+    fn steps<F: Float, O: recipe::Ops<F> + ?Sized>(self, o: &O, x: O::V, y: O::V) -> O::B { if exact(self.0, o) { return o.less_equal(x, y); } recipe::less_equal(o, x, y, |o| close_steps(self.0, o, x, y)) }
 }
 
 impl Stepped for Greater {
@@ -620,22 +595,23 @@ fn far<F: Float>(x: F, y: F) -> bool { (x != F::zero()) & (y.abs() >= F::narrow(
 fn near<F: Float>(x: F, y: F) -> bool { y.abs() < F::narrow(2.0) / F::epsilon() * x.abs() }
 
 /// `y` modulo `x` at no tolerance. It is [`Exactly`]'s residue, except where [`far`] picks `y/x`. There it comes from Rust's float remainder, which is exact and has `y`'s sign. Where `x`'s sign differs, the residue is that remainder plus `x`. A zero remainder gives +0, as [`Tolerant::residue`] does.
-pub(crate) fn exact_residue<F: Float>(x: F, y: F) -> F {
-    if !far(x, y) { return Exactly.residue(x, y); }
+pub(crate) fn exact_residue<F: Float>(x: F, y: F) -> F { if far(x, y) { far_residue(x, y) } else { Exactly.residue(x, y) } }
+
+/// [`exact_residue`] where [`far`] holds. It stays out of line: inlined, a loop over residues computes this remainder, a libm call, for every item.
+#[cold]
+#[inline(never)]
+fn far_residue<F: Float>(x: F, y: F) -> F {
     let r = y % x;
     if r == F::zero() { F::zero() } else if (r < F::zero()) != (x < F::zero()) { r + x } else { r }
 }
 
-/// The tolerant floor of rounded `x ÷ y`, through [`Tolerant::floor_quotient`], as a function object. Float forms never fail. Its integer forms, from the `integer` module, divide exactly, give a zero divisor the type's limit of the dividend's sign, and fail on an overflowing quotient.
+/// The tolerant floor of rounded `x ÷ y`, as a formula object. A float quotient never fails. Integers divide exactly, give a zero divisor the type's limit of the dividend's sign, and fail on an overflowing quotient.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FloorDivide(pub Tolerance);
-tolerant!(FloorDivide at real: |t, [x, y]| Total(t.floor_quotient(x, y)));
 
 /// [`FloorDivide`] with zero divided by zero defined as zero.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MathishFloorDivide(pub Tolerance);
-tolerant!(MathishFloorDivide at real: |t, [x, y]| Total(if crate::arith::both_zero(x, y) { x } else { t.floor_quotient(x, y) }));
-forms!(#[inline] MathishFloorDivide at u8, i16, i32, i64: |k, [x, y]| crate::facts::integer_at(k, [x, y]));
 
 /// [`Tolerant::gcd`], or [`TolerantComplex::complex_gcd`] for complex items, at the tolerance it holds, as a function object. A non-finite argument gives NaN, which marks the item failed. Its `i64` form is [`integer::gcd`](crate::integer::gcd).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -776,13 +752,17 @@ pub fn wholes<F: Float>(t: impl Tolerant, x: &[F], limit: f64) -> Option<(Vec<i6
     let (limit, mut keys, mut exact) = (F::narrow(limit), Vec::with_capacity(x.len()), true);
     for block in x.chunks(WHOLES) {
         let (fits, whole) = crate::slice::appended(&mut keys, block.len(), |slots| {
-            let (mut fits, mut whole) = (true, true);
+            // For an integral `n` below 2^51 in magnitude, the bits of `n + 1.5·2^52` minus the bits of `1.5·2^52` equal `n`. On AVX2 this conversion vectorizes and `as i64` doesn't. A block with a larger item converts each item by `as i64`.
+            const MAGIC: f64 = 6_755_399_441_055_744.0;
+            let (mut fits, mut whole, mut small) = (true, true, true);
             for (slot, &y) in slots.iter_mut().zip(block) {
                 let n = nearest(y);
                 fits &= n.abs() < limit;
                 whole &= n == y;
-                slot.write(n.wide() as i64);
+                small &= n.wide().abs() < 2_251_799_813_685_248.0;
+                slot.write(((n.wide() + MAGIC).to_bits() as i64).wrapping_sub(MAGIC.to_bits() as i64));
             }
+            if !small { for (slot, &y) in slots.iter_mut().zip(block) { slot.write(nearest(y).wide() as i64); } }
             (fits, whole)
         });
         if !fits || !whole && !block.iter().fold(true, |equal, &y| equal & t.nearest_whole(y).1) { return None; }

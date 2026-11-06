@@ -68,7 +68,12 @@ impl ErrorSlot {
     pub fn take(&self) -> Option<Error> { self.0.first.lock().unwrap().take() }
     /// Captured by the parallel runtime before it starts workers.
     pub fn current() -> Option<Self> { ACTIVE.with(|active| active.borrow().clone()) }
-    pub fn within<R>(&self, run: impl FnOnce() -> R) -> R { let _restore = Restore(ACTIVE.with(|active| active.replace(Some(self.clone())))); run() }
+    pub fn within<R>(&self, run: impl FnOnce() -> R) -> R {
+        let (mut run, mut result) = (Some(run), None);
+        self.enter(&mut || result = run.take().map(|run| run()));
+        result.expect("the run ran")
+    }
+    fn enter(&self, run: &mut dyn FnMut()) { let _restore = Restore(ACTIVE.with(|active| active.replace(Some(self.clone())))); run() }
 }
 
 /// Record in the active read's slot; standalone scalar maths has no slot.
@@ -84,8 +89,14 @@ pub fn record(error: Error) {
 
 /// Checked eager entry for Rust and Python callers.
 pub fn checked<R>(run: impl FnOnce() -> Result<R, Error>) -> Result<R, Error> {
-    if ErrorSlot::current().is_some() { return run(); }
-    let slot = ErrorSlot::new();
-    let result = slot.within(run)?;
-    match slot.take() { Some(error) => Err(error), None => Ok(result) }
+    let (mut run, mut result) = (Some(run), None);
+    let recorded = recorded(&mut || result = run.take().map(|run| run()));
+    let result = result.expect("the run ran")?;
+    recorded.map_or(Ok(result), Err)
+}
+/// Runs `run` in the thread's spare error slot unless one is active, giving the first error recorded in it. Every caller of [`checked`] shares this one non-generic copy. The spare is cleared before each run: a run that unwound can leave its error in it.
+fn recorded(run: &mut dyn FnMut()) -> Option<Error> {
+    if ACTIVE.with(|active| active.borrow().is_some()) { run(); return None; }
+    thread_local! { static SPARE: ErrorSlot = ErrorSlot::new(); }
+    SPARE.with(|slot| { slot.take(); slot.enter(run); slot.take() })
 }

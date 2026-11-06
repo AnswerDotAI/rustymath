@@ -39,7 +39,7 @@ Pow.many(Arg::Many(&[1.5, 2.0, 3.0]), Arg::One(2.0), 3, &mut squares); // square
 `facts::Formula` holds an object's numerical and kind rules. `Formula::resolve` selects a working dtype and returns an `operation::Kernel` for callers choosing dtypes at run time. Its `map`, `fold_read`, `fold_pieces` and `scan` methods consume shared `agreement::Read` plans. `Kernel::real`, `complex` and `exact` evaluate scalar arguments through the same object.
 
 ```rust
-use rustymath::{Exp, facts::{Formula, Variant}, buffer::{DType, FloatWidth, Width}};
+use rustymath::{Exp, domain::Variant, facts::Formula, buffer::{DType, FloatWidth, Width}};
 
 let double = DType::Float(FloatWidth::F64);
 let exp = Exp.resolve(Variant::checked(double), [DType::Integer(Width::I32)]).unwrap();
@@ -49,8 +49,6 @@ assert_eq!(exp.variant.dtype, double);
 `Sin`, `Cos` and `Tan` use short reduction and polynomials for their common range. An object's repair predicate marks arguments beyond 2^23 at f64 or 2^20 at f32. Its native slice driver applies the object's scalar repair routine to those items before returning the results. `Kernel::ranged` omits repair when the same predicate is proved false over the supplied ranges.
 
 `atan2(y, x)` and its object `Atan2` give the angle of the point (x, y), from -π to π. `y` comes first, as in `f64::atan2`.
-
-The complex slice forms of `Exp`, `Ln`, `Pow`, `Sin`, `Cos`, `Sinh` and `Cosh` vectorize too. Each one splits a chunk of complex items into their real and imaginary parts and computes the results from the real slice forms. On macOS, the sines and cosines they need come from vForce, which computes both in one call. It then redoes the rare items with the scalar complex function: items with a tiny or non-finite part, and `Pow`'s special cases. `Abs` and `Angle` keep their loop over items, which runs faster than a split for their short formulas. So does `Sqrt`, whose loop takes each block of 64 items with no tiny, huge or non-finite part through a form with no scaling or special cases. Other complex slice forms, such as `Lgamma`'s, compute one item at a time.
 
 `divide(x, y)` divides complex numbers, inline in the caller's loop, as the free functions do. Two real arguments divide as reals, so a real zero divisor gives ±∞ or NaN with an imaginary part of 0. Its formula's |y|² overflows beyond about 1e154 at f64 and 1e19 at f32.
 
@@ -93,7 +91,7 @@ Equal(Tolerance::DEFAULT).many(Arg::Many(&[0.3, 0.1 + 0.2, 0.31]), Arg::One(0.3)
 
 The special functions `gamma`, `lgamma`, `digamma`, `erf`, `erfc`, their inverses, `binom` with its slopes `binom_dn` and `binom_dk`, the incomplete gamma and beta functions and Lambert W have free functions and objects at the crate root, as the elementary functions do.
 
-`Add`, `Subtract` and `Multiply` are objects at the crate root, for every float, complex and integer type. Their integer forms, and `Abs`'s, report where a result doesn't fit its type. `Kernel` applies its explicit `Variant` checking and wrapping policy. Unbounded rational callers use `Formula::exact` through `Kernel::exact`.
+`Add`, `Subtract`, `Multiply` and the other arithmetic objects at the crate root have no scalar or slice forms. `Kernel` runs them at every float, complex and integer type, with its explicit `Variant` checking and wrapping policy. Unbounded rational callers use `Formula::exact` through `Kernel::exact`.
 
 ## Accuracy and speed
 

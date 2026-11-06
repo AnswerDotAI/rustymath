@@ -16,21 +16,20 @@ Development and planning run on Syd1 under `/home/ubuntu/aai-ws/{basedpl,rustyma
 
 ```bash
 cargo develop
-cargo test --profile quick
+cargo test --release
 pytest -q
 
-cargo develop --profile lto
-RUSTYMATH_COSTS=1 cargo test --profile lto --test speed
+RUSTYMATH_COSTS=1 cargo test --release --test speed
 RUSTYMATH_COSTS=1 pytest -q tests/test_speed.py
 nbdev-test
 nbdev-preview
 ```
 
-Use `cargo develop` to rebuild and install the Python extension with the `quick` profile after Rust changes. `fastws.cargo.run_tests(root, ...)` also defaults to `quick`. Bare `cargo test` uses Cargo's built-in `test` profile; pass `--profile quick` for native correctness checks. Install with `cargo develop --profile lto` before performance or budget checks, including Python timings. Cargo tests compile missing code but do not install it. An already-running Python process retains its loaded extension.
+Use `cargo develop` to rebuild and install the Python extension after Rust changes. It builds the `release` profile, which development, tests and timings all use; `fastws.cargo.run_tests(root, ...)` builds it too. Bare `cargo test` uses Cargo's built-in `test` profile, which has `release`'s settings but builds again; pass `--release`. Cargo tests compile missing code but do not install it. An already-running Python process retains its loaded extension.
 
-The timing suites run only by name: `cargo test --profile lto --test speed` (`test = false` in `Cargo.toml`) and `pytest -q tests/test_speed.py` (`addopts` skips it otherwise). Use one test binary for a focused check. Run `pytest -q` at the end of a piece of work. Before reporting a failure in untouched code, rebuild with the same profile and rerun it. Builds have no execution timeout. Use the documented managed runners with a 30-second test execution budget. Cargo serializes builds in the same target directory.
+The timing suites run only by name: `cargo test --release --test speed` (`test = false` in `Cargo.toml`) and `pytest -q tests/test_speed.py` (`addopts` skips it otherwise). Use one test binary for a focused check. Run `pytest -q` at the end of a piece of work. Before reporting a failure in untouched code, rebuild with the same profile and rerun it. Builds have no execution timeout. Use the documented managed runners with a 30-second test execution budget. Cargo serializes builds in the same target directory.
 
-Before a stage's closing review and before a release, run the full checks, as CI runs them: `cargo develop`, `cargo test --profile quick`, `pytest -q`, `nbdev-test`, then `cargo develop --profile lto` and both timing suites with `RUSTYMATH_COSTS=1`. Then run `bpl-tests target_builds /tmp/<prefix>_wasm` in basedpl. It builds this crate for Linux x86-64 and wasm32 as basedpl links it, with basedpl's wasm32 flags. basedpl's DEV.md describes it beside basedpl's own full checks.
+Before a stage's closing review and before a release, run the full checks, as CI runs them: `cargo develop`, `cargo test --release`, `pytest -q`, `nbdev-test`, then both timing suites with `RUSTYMATH_COSTS=1`. Then run `bpl-tests target_builds /tmp/<prefix>_wasm` in basedpl. It builds this crate for Linux x86-64 and wasm32 as basedpl links it, with basedpl's wasm32 flags. basedpl's DEV.md describes it beside basedpl's own full checks.
 
 `cargo develop` keeps each build it installs, read-only and with its Python package, under an id that hashes the build's inputs and files (`fastws.store`). Another agent's `cargo develop` can install another build at any time, so before your change, note the installed build's id, from `fastws.store.builds(rms)`, as the baseline for your timings and tests. `basedpl.bpltests.pytest_costs` and `run_pytest` take it as `build=`, and put that build's Python package before the installed one on `PYTHONPATH`. Don't restore old code in the shared tree for a baseline.
 
@@ -42,9 +41,9 @@ Build nothing else without discussion: no scratch crates, alternate target direc
 
 The root package is the Python-free crate published to crates.io. `py/` is the unpublished PyO3 extension. `pyproject.toml` points maturin at its manifest. Editable installation through `uv sync` or `pip install -e` uses `fastws.build_backend` and compiles no Rust. Run `cargo develop` after installation. Don't use `maturin develop`: its build configuration differs from the shared local build.
 
-Rust 1.98 or later supplies algebraic float operations. The `test` profile inherits `release`: optimization level 2, incremental compilation, thin LTO across each crate's codegen units, no debug information, overflow checks or debug assertions. A `debug_assert!` therefore never runs here. Write a check that matters as an always-on test. The configs add LLVM's loop and SLP vectorizers as extra passes, the loop vectorizer first, for the reason basedpl's DEV.md gives under "Codegen and rebuilds". On x86-64 they also target x86-64-v3 for AVX2 and FMA. Without those target features, some conversions and rounding operations run one item at a time. `dist` disables incremental compilation and strips symbols.
+Rust 1.98 or later supplies algebraic float operations. The `test` profile inherits `release`: optimization level 3, incremental compilation, thin LTO across each crate's codegen units, no debug information, overflow checks or debug assertions. A `debug_assert!` therefore never runs here. Write a check that matters as an always-on test. On x86-64 the configs target x86-64-v3 for AVX2 and FMA. Without those target features, some conversions and rounding operations run one item at a time. `dist` disables incremental compilation and strips symbols.
 
-`[tool.fastws] dev-profile = "quick"` in `pyproject.toml` selects the development and managed correctness-test default. `quick` disables LTO; `lto` retains local ThinLTO. Both inherit the optimization level 2 and incremental settings above and enable cross-crate generic sharing. Cargo keeps independent caches in `target/quick/` and `target/lto/`. The compiler flags, Cargo-scoped bootstrap and tested toolchain are documented in basedpl's DEV.md, "Codegen and rebuilds".
+`[tool.fastws] dev-profile = "release"` in `pyproject.toml` selects `release` for development and managed tests, so one build in `target/release/` serves development, tests and timings. It enables cross-crate generic sharing. The compiler flags, Cargo-scoped bootstrap and tested toolchain are documented in basedpl's DEV.md, "Codegen and rebuilds".
 
 Keep these profiles aligned with basedpl's. Cargo uses the consuming workspace's profiles for dependencies. Concrete function forms compile in rustymath, but their build still uses that workspace's profile and target flags. Incremental builds limit how much code an edit recompiles; debug line tables and inlining across units increase that work.
 
@@ -74,10 +73,9 @@ Both speed tests and basedpl's timing tools take the machine's timing lock exclu
 
 Most of rustymath is generic, so most of its machine code compiles in its callers, chiefly basedpl. Measure a change's effect on build time and code size there, with the tools that basedpl's DEV.md describes under "Codegen and rebuilds":
 
-- Code size: note the id of basedpl's installed build before your change, as for timings. After the change, `BASEDPL_SIZES_DIFF=<old bpl>:<new bpl> cargo test --test units machine_code_growth -- --nocapture`, run in basedpl, compares the two builds' machine code by generic function, rustymath's included. Each `bpl` is a kept build's `~/.cache/fastws/builds/basedpl/<id>/bin/bpl`. `BASEDPL_SIZES=pattern` lists the instances that match a pattern, with their sizes.
-- Rebuild time: wrap one value in the edited function in `std::hint::black_box`, which changes the generated code but not the behaviour. Time basedpl's `cargo build --lib --bins --profile test --timings`, then undo the edit and time the rebuild again. The report in basedpl's `target/cargo-timings/` splits each crate's time into frontend and codegen.
-- rustymath's own build: `cargo build --lib --profile test --timings` in this repo times the code that compiles in rustymath itself, such as concrete function forms.
-- Build time on other targets: `.cargo/config.toml` runs an extra `loop-vectorize` pass before the link step. On 28 October 2026, with `pairs_into` and `triples_into` marked `#[inline(always)]`, that pass took about 530 s for x86-64 on each of Γ's and the factorial's f64 slice forms, against seconds for arm64. This crate then took 18 minutes to build for Linux x86-64. With both helpers at plain `#[inline]`, it builds in about 20 s. `CARGO_INCREMENTAL=0 CC_x86_64_unknown_linux_gnu=clang cargo build -p rustymath --lib --release --target x86_64-unknown-linux-gnu --target-dir /tmp/<prefix>_x86 --timings` times this crate for Linux x86-64 as CI builds it. basedpl's DEV.md, under "Codegen and rebuilds", says how to find a function that stalls a build.
+- Rebuild time: wrap one value in the edited function in `std::hint::black_box`, which changes the generated code but not the behaviour. Time basedpl's `cargo build --lib --bins --release --timings`, then undo the edit and time the rebuild again. The report in basedpl's `target/cargo-timings/` splits each crate's time into frontend and codegen.
+- rustymath's own build: `cargo build --lib --release --timings` in this repo times the code that compiles in rustymath itself, such as concrete function forms.
+- Build time on other targets: on 28 October 2026, with `pairs_into` and `triples_into` marked `#[inline(always)]`, a `loop-vectorize` pass took about 530 s for x86-64 on each of Γ's and the factorial's f64 slice forms, against seconds for arm64. This crate then took 18 minutes to build for Linux x86-64. With both helpers at plain `#[inline]`, it builds in about 20 s. `CARGO_INCREMENTAL=0 CC_x86_64_unknown_linux_gnu=clang cargo build -p rustymath --lib --release --target x86_64-unknown-linux-gnu --target-dir /tmp/<prefix>_x86 --timings` times this crate for Linux x86-64 as CI builds it. basedpl's DEV.md, under "Codegen and rebuilds", says how to find a function that stalls a build.
 
 A generic function compiles once for each combination of types that callers give it, a conversion closure's type included. A loop that is generic over a conversion as well as its item types multiplies its instances. `gather`'s walks show the cost. When their fixed-width row loops took the source type, the result type and the conversion, one basedpl codegen unit held 603 instances of them, about 940 KB of `bpl`, and an edit to them rebuilt basedpl in 16.8 s. With those loops compiled once for each size of item, and conversions in a separate pass (see "Search and gathering"), basedpl's machine code fell by 1.1 MB on 20 October 2026, and the same kind of edit rebuilds basedpl in about 7 s. The fixed-width loops that convert Booleans and integers into `f64` as they write (`Item::cells_from`) add about 17 KB, and leave that rebuild at about 7 s.
 
@@ -88,8 +86,7 @@ A generic function compiles once for each combination of types that callers give
 | `lib.rs`, `float.rs` | Public functions and objects; `Float`, `Native`, fused/unfused arithmetic and sealed implementation traits. |
 | `exp.rs`, `ln.rs`, `trig.rs`, `arc.rs`, `hyperbolic.rs`, `pow.rs`, `parts.rs`, `sqrts.rs` | Elementary scalar functions and specialized forms. |
 | `table.rs`, `dd.rs` | Table-based f64 logarithms/exponentials and double-word arithmetic. |
-| `special.rs`, `lambert.rs`, `complex.rs` | Special functions and complex forms of the same objects. |
-| `vforce.rs` | Sines and cosines over slices through vForce, as `SinCos` on macOS. |
+| `special.rs`, `lambert.rs`, `complex.rs` | Special functions; complex functions, which the facts table's complex formulas call, and the forms of `Abs` and `Angle`, the only complex forms left. |
 | `slice.rs`, `parallel.rs` | Scalar/slice object interfaces, output storage and elementwise scheduling. |
 | `reduce.rs`, `stats.rs` | Folds, scans, axis traversal and statistical summaries. |
 | `facts.rs` | What a planner knows about each function object before it reads an item: the `Range` of its results, from its arguments' ranges by interval rules, whether any result fails, and which argument a constant keeps (`Facts`). Also the one table of which reduction folds each function and which objects take characters, which rustymath, its Python crate and basedpl each expand. |
@@ -122,7 +119,7 @@ Arithmetic objects deliberately accept IEEE NaNs. An integer result that doesn't
 
 Each arity trait's `TOTAL` says whether an object never fails. It is true for an object whose body gives a `Total` output, or a plain integer or Boolean output. `forms!` derives it from the body's type. Basedpl's fusion runs only total objects, because a deferred call mustn't fail.
 
-Each arity trait's `INLINE` says whether an object's slice form is its scalar body in a loop and its scalar forms are `#[inline]`. `forms!` derives it from the attributes and the absence of a `many` body. A tolerant object's scalar forms compute at its `Tolerance` itself, which gives the exact result at 0 without a test, so that loop has no branch for each item. Only the slice forms choose `Exactly` through `with_tolerance!`.
+A tolerant object's scalar forms compute at its `Tolerance` itself, which gives the exact result at 0 without a test, so that loop has no branch for each item. Only the slice forms choose `Exactly` through `with_tolerance!`.
 
 `arities!` gives the public traits one implementation through `Forms`. Keep objects concrete: their forms compile in rustymath instead of being instantiated in every caller. Forms that differ from the free functions, including `Sin`, `Cos`, `Tan`, `Pow` and `Root`, live beside their implementations.
 
@@ -138,7 +135,7 @@ In two loops that ANDed a compound flag for each item, x86-64's loop vectorizer 
 
 Keep these performance rules when changing loops:
 
-- Pass item bodies through `each!`, `two_pass!` or `split!`. They mark closures `#[inline(always)]`; leaving a large body out of line can stop vectorization.
+- Pass item bodies through `each!` or `two_pass!`. They mark closures `#[inline(always)]`; leaving a large body out of line can stop vectorization.
 - Write separate closures for functions selected at runtime. A shared closure can leave the selector inside every iteration. `trig.rs` shows the pattern.
 - Keep `pairs` at `#[inline(never)]`. Inlining a function whose loop runs behind `parallel::split`'s `&dyn` only repeats its setup at every call site.
 - Check code in basedpl as well as in this crate when changing a generic function that it instantiates. The small test crate is not the same compilation context.
@@ -170,7 +167,7 @@ This scheduler covers elementwise forms, folds and matrix products. Scans don't 
 
 `slice::running` chooses the partial-total count for the target and item size. Explicit vector extrema are used where they outperform ordinary loops. On AArch64 and in wasm, f32 running sums scan four-lane vectors through `sum_scan`, which makes `+\` about 1.3 times faster than `grouped`'s groups of four items. Float folds and scans use AArch64's `fmaxnm`/`fminnm` and wasm's `pmax`/`pmin`, one instruction each. AArch64's scans read each item as it is, because `fmaxnm` drops a NaN on either side. Elsewhere a NaN running result stays NaN, so a scan turns each NaN item into `-∞` or `∞` as it reads it. `Folds`' defaults, which x86-64 runs, read each item through a step from `-∞` or `∞`, one instruction there. Wasm tests for NaN and selects, because LLVM compiles that step to two comparisons, an `or` and a select. The test made wasm's `⌈\` and `⌊\` on rising or falling items about 1.2 times faster. A scan's seed is its first running result. Wasm's `max`/`min` give NaN beside NaN and take about eight instructions each on x86-64 hosts. Integer extrema scans skip blocks that cannot change their running result.
 
-`Logical` represents any Boolean dyad as a truth table and scans by composing its two-state maps. `Xor`/`Xnor` use that path too. Lanes of at most 64 consecutive items scan in one call of `mapped`, which restarts each lane inside its word. `SumAs<C>` counts Booleans or sums integers in the caller's chosen total type. The caller must choose a width that holds the totals.
+`Logical` holds a Boolean dyad as a truth table and scans by composing its two-state maps. The Boolean reductions (`Max`/`Or`, `Min`/`And`, `Xor`, `Xnor`) scan through it. `scan_along` runs their lanes of at most 64 consecutive items in one call of `mapped`, which restarts each lane inside its word (`Reduction::short_lanes`). `SumAs<C>` counts Booleans or sums integers in the caller's chosen total type. The caller must choose a width that holds the totals.
 
 `Alternating` implements right folds by subtraction or division. Float/complex pairs sum differences or multiply ratios. Integer subtraction keeps separate totals for even and odd positions. A floating quotient reports failure when its intermediate products or result leave the normal range; basedpl then folds item by item.
 
@@ -180,7 +177,7 @@ This scheduler covers elementwise forms, folds and matrix products. Scans don't 
 
 ### Complex functions and distributions
 
-Complex forms attach to the same objects as real forms. `Abs` and `Angle` return real values; real `Cis` returns complex values. On macOS, vForce implements `SinCos`, in `vforce.rs`. Real `Cis` calls its `vvcosisin`, and the complex slice forms that split into real parts take their sines and cosines from one `vvsincos` call. Most expensive complex slice forms split into vectorized real operations. `Abs`, `Angle` and `Sqrt` keep direct loops. Exceptional magnitudes and branch-cut cases take scalar paths. Inverse circle/hyperbolic functions use Kahan's formulas; complex ln Gamma uses Stirling, recurrence and reflection with SciPy's branch convention.
+Complex functions live in `complex.rs`. The facts table's complex formulas call them, so kernels run them on each item. Only `Abs` and `Angle` keep scalar forms at complex arguments, which basedpl's polar `∧` calls. Exceptional magnitudes and branch-cut cases take their own paths inside each function. Inverse circle/hyperbolic functions use Kahan's formulas; complex ln Gamma uses Stirling, recurrence and reflection with SciPy's branch convention.
 
 Complex errors are measured against a magnitude-based scale, with function-specific scales for ln Gamma, powers, Gamma and binomial. Quarter-turn directions are deliberately exact. See `complex.rs` for that contract rather than applying a separate ulp bound to each component.
 
@@ -188,7 +185,7 @@ Complex errors are measured against a magnitude-based scale, with function-speci
 
 ### Integers, exact numbers and polynomials
 
-`Overflowing` gives wrapped integer operations and fit flags without branching in the hot loops. The integer forms of `Add`, `Subtract`, `Multiply`, `Abs` and `Pow` give that pair as their outcome. `forms!` derives their `WRAPS` constant from it. `Kernels::wraps` reads that constant for the dtype an argument computes in. Every reduction wraps too. A result that doesn't fit fails, with the wrapped result in its slot. The Python API keeps that result, as NumPy does. BPL's exact integers widen instead. `Width::float` and `DType::inexact` take the widest float that an integer may become: `f64` for NumPy's rule, or a session's narrower default float. `DType::common` gives an integer beside a float or complex dtype that dtype, as JAX does, where NumPy widens the float. `convert::int`/`float` use bit-based conversions where target instructions do not vectorize. Check `NATIVE_64` and `SATURATING` before replacing them with casts. `Divisor` turns repeated division by one integer into multiplication and shifts.
+`Overflowing` gives wrapped integer operations and fit flags without branching in the hot loops. Integer kernels (`recipe::IntegerOps`) and folds run them, and `Pow`'s integer forms give the pair as their outcome. Every reduction wraps too. A result that doesn't fit fails, with the wrapped result in its slot. The Python API keeps that result, as NumPy does. BPL's exact integers widen instead. `Width::float` and `DType::inexact` take the widest float that an integer may become: `f64` for NumPy's rule, or a session's narrower default float. `DType::common` gives an integer beside a float or complex dtype that dtype, as JAX does, where NumPy widens the float. `convert::int`/`float` use bit-based conversions where target instructions do not vectorize. Check `NATIVE_64` and `SATURATING` before replacing them with casts. `Divisor` turns repeated division by one integer into multiplication and shifts.
 
 `integer` provides checked gcd, lcm, binomial and power functions. `residue` returns an integer directly, including the dividend for a zero divisor. Objects also have narrow and unsigned forms. `encode`/`decode` handle mixed radix; polynomial decoding handles fields.
 
@@ -286,7 +283,7 @@ Elementary real accuracy checks use a four-ulp bound with an additional allowanc
 
 ## CI and release
 
-`Test` runs on pushes to main and pull requests. It uses `quick` for native correctness tests and an installed `lto` build for Python speed budgets. `Speed` is manual. `Release` runs separately on `v*` tags, builds dist wheels/sdist, publishes `rustymath` then `rustymath-buffer` to crates.io and the Python artifacts to PyPI, and attaches artifacts to the GitHub release. It does not wait for `Test` or run tests itself.
+`Test` runs on pushes to main and pull requests. It uses `release` for native correctness tests and the installed `release` build for Python speed budgets. `Speed` is manual. `Release` runs separately on `v*` tags, builds dist wheels/sdist, publishes `rustymath` then `rustymath-buffer` to crates.io and the Python artifacts to PyPI, and attaches artifacts to the GitHub release. It does not wait for `Test` or run tests itself.
 
 Before each release, run `bpl-tests prerelease` from basedpl's root. It runs rustymath's release checks and saves with basedpl's, as basedpl's DEV.md describes under "Release". Among them is `cargo test --profile checked`. That profile is the test profile with debug assertions on, which adds the standard library's checks in unsafe code. Those checks cost basedpl 12 to 55% per call, too much for the test profile that the budgets measure. The speed test marks itself ignored under debug assertions, so the run checks correctness only.
 

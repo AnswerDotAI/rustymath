@@ -39,5 +39,14 @@ pub fn map<const N: usize>(
         ReadPlan::input(i, args[i].len()).remapped(if args[i].len() == 1 { Mapping::Single } else { Mapping::Linear(1) }, n, Missing::Default)
     });
     let reads = plans.each_ref().map(|plan| Read { sources: &sources, plan });
-    kernel.map(&reads, 0..n, rustymath::operation::Settings::default(), out)
+    kernel.map(&reads, 0..n, rustymath::operation::Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, out)
+}
+
+/// `kernel`'s `n` results on `args`, each of one item or of `n`, or `None` where any result fails.
+pub fn mapped<T: rustymath::buffer::Element, O: rustymath::buffer::Element, const N: usize>(
+    kernel: &rustymath::operation::Kernel, args: [&[T]; N], n: usize
+) -> Option<Vec<O>> {
+    let mut out = rustymath::buffer::Buffer::with_capacity(kernel.result_dtype(), n);
+    rustymath::error::checked(|| map(kernel, args.map(T::view), n, &mut out)).ok()?;
+    O::vec(out)
 }

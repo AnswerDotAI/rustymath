@@ -254,22 +254,27 @@ fn logarithms_accuracy() {
     unary("log10", variants!(log10), rustymath::log10, f64::log10, &[(0.5, 2.0)], &powers);
 }
 
-/// `log2` gives k exactly at 2^k, and `log10` gives k at 10^k, or at the float nearest 10^k where 10^k isn't a float. Each does at every width, fused and unfused. So does `Logb` in base 2 and base 10: in its scalar form, and in its slice form with the base constant, the argument constant or neither.
+/// `log2` gives k exactly at 2^k, and `log10` gives k at 10^k, or at the float nearest 10^k where 10^k isn't a float. Each does at every width, fused and unfused. So does `Logb` in base 2 and base 10: through its formula, and through its kernel with the base constant, the argument constant or neither.
 #[test]
 fn logarithms_exact() {
-    use rustymath::{Arg, Binary, Float, Logb};
+    use rustymath::{Float, Logb, buffer::Element, domain::Variant, facts::{Formula, formula_at}};
     use std::ops::RangeInclusive;
-    fn exact<F: Float + Debug>(twos: RangeInclusive<i32>, tens: RangeInclusive<i32>) where Logb: Binary<F, Out = F> {
+    fn exact<F: Float + Element + Debug>(twos: RangeInclusive<i32>, tens: RangeInclusive<i32>) {
+        let kernel = Logb.resolve(Variant { checked: false, ..Variant::checked(F::DTYPE) }, [F::DTYPE; 2]).unwrap();
+        // The kernel's first result on `bases` and `xs`, where a one-item argument is a constant.
+        let first = |bases: &[F], xs: &[F]| {
+            let mut out = F::buffer(vec![]);
+            crate::support::map(&kernel, [F::view(bases), F::view(xs)], bases.len().max(xs.len()), &mut out).unwrap();
+            F::vec(out).unwrap()[0]
+        };
         // 2^k in two exact factors. `powi` alone gives 0 below 2^-1022, from the reciprocal of a power that overflows.
         let cases = twos.map(|k| (2.0, 2f64.powi(k / 2) * 2f64.powi(k - k / 2), k)).chain(tens.map(|k| (10.0, 10f64.powi(k), k)));
         for (b, x, k) in cases {
-            let (b, x, k) = (F::narrow(b), F::narrow(x), F::narrow(k.into()));
+            let (b, x, k, three) = (F::narrow(b), F::narrow(x), F::narrow(k.into()), F::narrow(3.0));
             let alone = if b == F::narrow(2.0) { [rustymath::fused::log2(x), rustymath::unfused::log2(x)] }
             else { [rustymath::fused::log10(x), rustymath::unfused::log10(x)] };
-            let mut out = Vec::new();
-            assert!(Logb.many(Arg::One(b), Arg::Many(&[x]), 1, &mut out) & Logb.many(Arg::Many(&[b, F::narrow(3.0)]), Arg::One(x), 2, &mut out));
-            assert!(Logb.many(Arg::Many(&[b]), Arg::Many(&[x]), 1, &mut out));
-            assert_eq!([alone[0], alone[1], Logb.one(b, x), out[0], out[1], out[3]], [k; 6], "the logarithm of {x:?} to base {b:?}");
+            let got = [alone[0], alone[1], formula_at(&Logb, [b, x]), first(&[b], &[x, three]), first(&[b, three], &[x]), first(&[b, b], &[x, x])];
+            assert_eq!(got, [k; 6], "the logarithm of {x:?} to base {b:?}");
         }
     }
     exact::<f64>(-1074..=1023, -307..=22);
@@ -545,8 +550,8 @@ fn polygamma_and_beta_accuracy() {
 mod complex {
     use num_complex::Complex;
     use rustymath::{
-        Acos, Acosh, Arg, Asin, Asinh, Atan, Atanh, Binary, Binom, Cos, Cosh, Exp, Gamma, LambertW, Lgamma, Ln, Native, Pow, Sign, Sin, Sinh, Sqrt, Sqrt1mx2,
-        Sqrt1px2, Sqrtx2m1, Tan, Tanh, Unary, divide,
+        Acos, Acosh, Asin, Asinh, Atan, Atanh, Binom, Cos, Cosh, Exp, FUSED, Gamma, LambertW, Lgamma, Ln, Native, Pow, Sign, Sin, Sinh, Sqrt, Sqrt1mx2,
+        Sqrt1px2, Sqrtx2m1, Tan, Tanh, divide, facts::Formula, recipe::NativeOps,
     };
     use std::f64::consts::{FRAC_PI_2, PI};
 
@@ -555,62 +560,43 @@ mod complex {
     /// The bound on each function's error, in ulps of the result's magnitude.
     const BOUND: f64 = 4.0;
 
-    // Concrete widths keep the object bounds out of the test helpers.
-    macro_rules! at_width {
-        ($name:ident, $r:ty) => {
-            mod $name {
-                use super::*;
-                type R = $r;
+    /// `k` at `z`, through the complex formula that a kernel runs on each item.
+    pub(super) fn unary<R: Native>(k: impl Formula<1>, z: Complex<R>) -> Complex<R> { k.complex(&NativeOps::<FUSED>::DEFAULT, [z]).expect("a complex formula") }
 
-                pub(super) fn apply(name: &str, z: &[Complex<R>], sliced: bool) -> Option<Complex<R>> {
-                    fn unary<O: Unary<Complex<R>, Out = Complex<R>>>(object: O, z: &[Complex<R>], sliced: bool) -> Complex<R> {
-                        if !sliced {
-                            return object.one(z[0]);
-                        }
-                        let mut out = Vec::new();
-                        object.many(Arg::Many(z), z.len(), &mut out);
-                        out[0]
-                    }
-                    fn binary<O: Binary<Complex<R>, Out = Complex<R>>>(object: O, z: &[Complex<R>], sliced: bool) -> Complex<R> {
-                        if !sliced {
-                            return object.one(z[0], z[1]);
-                        }
-                        let mut out = Vec::new();
-                        object.many(Arg::Many(&z[..1]), Arg::Many(&z[1..2]), 1, &mut out);
-                        out[0]
-                    }
-                    Some(match name {
-                        "exp" => unary(Exp, z, sliced),
-                        "log" => unary(Ln, z, sliced),
-                        "sqrt" => unary(Sqrt, z, sliced),
-                        "sin" => unary(Sin, z, sliced),
-                        "cos" => unary(Cos, z, sliced),
-                        "tan" => unary(Tan, z, sliced),
-                        "sinh" => unary(Sinh, z, sliced),
-                        "cosh" => unary(Cosh, z, sliced),
-                        "tanh" => unary(Tanh, z, sliced),
-                        "asin" => unary(Asin, z, sliced),
-                        "acos" => unary(Acos, z, sliced),
-                        "atan" => unary(Atan, z, sliced),
-                        "asinh" => unary(Asinh, z, sliced),
-                        "acosh" => unary(Acosh, z, sliced),
-                        "atanh" => unary(Atanh, z, sliced),
-                        "lgamma" => unary(Lgamma, z, sliced),
-                        "gamma" => unary(Gamma, z, sliced),
-                        "pow" => binary(Pow, z, sliced),
-                        "binom" => binary(Binom, z, sliced),
-                        "lambertw" => unary(LambertW, z, sliced),
-                        "sqrt1mx2" => unary(Sqrt1mx2, z, sliced),
-                        "sqrtx2m1" => unary(Sqrtx2m1, z, sliced),
-                        "sqrt1px2" => unary(Sqrt1px2, z, sliced),
-                        _ => return None,
-                    })
-                }
-            }
-        };
+    /// `k` at `z` and `w`, through the complex formula that a kernel runs on each pair of items.
+    fn binary<R: Native>(k: impl Formula<2>, z: Complex<R>, w: Complex<R>) -> Complex<R> {
+        k.complex(&NativeOps::<FUSED>::DEFAULT, [z, w]).expect("a complex formula")
     }
-    at_width!(single, f32);
-    at_width!(double, f64);
+
+    /// The function named `name` at the arguments `z`, or `None` where the name isn't one of these functions.
+    fn apply<R: Native>(name: &str, z: &[Complex<R>]) -> Option<Complex<R>> {
+        Some(match name {
+            "exp" => unary(Exp, z[0]),
+            "log" => unary(Ln, z[0]),
+            "sqrt" => unary(Sqrt, z[0]),
+            "sin" => unary(Sin, z[0]),
+            "cos" => unary(Cos, z[0]),
+            "tan" => unary(Tan, z[0]),
+            "sinh" => unary(Sinh, z[0]),
+            "cosh" => unary(Cosh, z[0]),
+            "tanh" => unary(Tanh, z[0]),
+            "asin" => unary(Asin, z[0]),
+            "acos" => unary(Acos, z[0]),
+            "atan" => unary(Atan, z[0]),
+            "asinh" => unary(Asinh, z[0]),
+            "acosh" => unary(Acosh, z[0]),
+            "atanh" => unary(Atanh, z[0]),
+            "lgamma" => unary(Lgamma, z[0]),
+            "gamma" => unary(Gamma, z[0]),
+            "pow" => binary(Pow, z[0], z[1]),
+            "binom" => binary(Binom, z[0], z[1]),
+            "lambertw" => unary(LambertW, z[0]),
+            "sqrt1mx2" => unary(Sqrt1mx2, z[0]),
+            "sqrtx2m1" => unary(Sqrtx2m1, z[0]),
+            "sqrt1px2" => unary(Sqrt1px2, z[0]),
+            _ => return None,
+        })
+    }
 
     /// Each line of `complex.txt` as its function's name, its arguments and the correctly rounded result.
     fn cases() -> Vec<(String, Vec<Complex<f64>>, Complex<f64>)> {
@@ -627,13 +613,13 @@ mod complex {
     /// The magnitude that a function's error counts in ulps of, as the module doc gives it.
     fn scale(name: &str, args: &[Complex<f64>], want: Complex<f64>) -> f64 {
         let size = |z: Complex<f64>| z.re.hypot(z.im);
-        let lg = |z: Complex<f64>| size(Lgamma.one(z));
+        let lg = |z: Complex<f64>| size(unary(Lgamma, z));
         let exponentiated = |exponent: f64| size(want) * (exponent.max(2.0) + 1.0);
         let one = c(1.0, 0.0);
         match name {
             "lgamma" => size(want).max(2.0), "gamma" => exponentiated(lg(args[0])),
             "binom" => exponentiated(lg(args[0] + one) + lg(args[1] + one) + lg(args[0] - args[1] + one)),
-            "pow" => exponentiated(size(args[1] * Ln.one(args[0]))), _ => size(want)
+            "pow" => exponentiated(size(args[1] * unary(Ln, args[0]))), _ => size(want)
         }
     }
 
@@ -661,17 +647,15 @@ mod complex {
     #[test]
     fn accuracy() {
         let rows = [
-            ("f64 scalar", worst::<f64>(f64::EPSILON, |v| v, |name, z| double::apply(name, z, false))),
-            ("f64 sliced", worst::<f64>(f64::EPSILON, |v| v, |name, z| double::apply(name, z, true))),
-            ("f32 scalar", worst::<f32>(f32::EPSILON.into(), |v| v as f32, |name, z| single::apply(name, z, false))),
-            ("f32 sliced", worst::<f32>(f32::EPSILON.into(), |v| v as f32, |name, z| single::apply(name, z, true))),
+            ("f64", worst::<f64>(f64::EPSILON, |v| v, apply::<f64>)),
+            ("f32", worst::<f32>(f32::EPSILON.into(), |v| v as f32, apply::<f32>)),
         ];
         let over: Vec<_> = rows.iter().flat_map(|(how, r)| r.iter().filter(|(_, e, _)| *e > BOUND).map(move |(n, e, a)| (*how, n, *e, a))).collect();
         if std::env::var("RUSTYMATH_COMPLEX").is_ok() { for (how, r) in &rows { for (n, e, a) in r { println!("{how} {n} {e:.2} {a:?}"); } } }
         assert!(over.is_empty(), "{over:#?}");
     }
 
-    /// C99's values on the branch cuts, where the sign of a zero part chooses the side, and exact real or imaginary results on the axes. The composite square roots take the side that a zero's sign points to too. Slice forms run on several copies, so they reach their vector loops.
+    /// C99's values on the branch cuts, where the sign of a zero part chooses the side, and exact real or imaginary results on the axes. The composite square roots take the side that a zero's sign points to too.
     #[test]
     fn cuts_and_axes() {
         let k = |re: f64, im: f64| c(re, im);
@@ -688,30 +672,28 @@ mod complex {
         ];
         let close = |g: f64, w: f64, e: f64| (g - w).abs() <= 4.0 * e * w.abs().max(1.0) && g.is_sign_negative() == w.is_sign_negative();
         for (name, z, want) in cases {
-            for sliced in [false, true] {
-                let got = double::apply(name, &[z; 17], sliced).unwrap();
-                assert!(close(got.re, want.re, f64::EPSILON) && close(got.im, want.im, f64::EPSILON), "{name}({z}) gave {got}, not {want}");
-                let got = single::apply(name, &[c(z.re as f32, z.im as f32); 17], sliced).unwrap();
-                let e = f32::EPSILON.into();
-                assert!(close(got.re.into(), want.re, e) && close(got.im.into(), want.im, e), "f32 {name}({z}) gave {got}, not {want}");
-            }
+            let got = apply::<f64>(name, &[z]).unwrap();
+            assert!(close(got.re, want.re, f64::EPSILON) && close(got.im, want.im, f64::EPSILON), "{name}({z}) gave {got}, not {want}");
+            let got = apply::<f32>(name, &[c(z.re as f32, z.im as f32)]).unwrap();
+            let e = f32::EPSILON.into();
+            assert!(close(got.re.into(), want.re, e) && close(got.im.into(), want.im, e), "f32 {name}({z}) gave {got}, not {want}");
         }
         for x in [0.5, 3.0, -2.0, 700.0, 1e-300] {
             for name in ["exp", "sin", "cos", "sinh", "cosh", "tanh", "tan"] {
-                assert_eq!(double::apply(name, &[k(x, 0.0)], false).unwrap().im, 0.0, "{name}({x})");
+                assert_eq!(apply::<f64>(name, &[k(x, 0.0)]).unwrap().im, 0.0, "{name}({x})");
             }
             if x > 0.0 {
-                for name in ["log", "sqrt"] { assert_eq!(double::apply(name, &[k(x, 0.0)], false).unwrap().im, 0.0, "{name}({x})"); }
+                for name in ["log", "sqrt"] { assert_eq!(apply::<f64>(name, &[k(x, 0.0)]).unwrap().im, 0.0, "{name}({x})"); }
             }
-            for name in ["sin", "sinh", "tan", "tanh"] { assert_eq!(double::apply(name, &[k(0.0, x)], false).unwrap().re, 0.0, "{name}({x}i)"); }
+            for name in ["sin", "sinh", "tan", "tanh"] { assert_eq!(apply::<f64>(name, &[k(0.0, x)]).unwrap().re, 0.0, "{name}({x}i)"); }
         }
-        assert_eq!(Pow.one(k(1.0, 1.0), k(0.0, 0.0)), k(1.0, 0.0));
-        assert_eq!(Pow.one(k(-8.0, 0.0), k(3.0, 0.0)), k(-512.0, 0.0));
-        assert_eq!(Pow.one(k(0.0, 0.0), k(2.0, 5.0)), k(0.0, 0.0));
-        assert_eq!(Sign.one(k(f64::INFINITY, 3.0)), k(1.0, 0.0));
-        assert_eq!(Sign.one(k(-0.0, 0.0)), k(-0.0, 0.0));
-        assert!(Lgamma.one(k(-3.0, 0.0)).re.is_nan());
-        assert_eq!(Binom.one(k(2.0, 0.0), k(3.0, 0.0)), k(0.0, 0.0));
+        assert_eq!(binary(Pow, k(1.0, 1.0), k(0.0, 0.0)), k(1.0, 0.0));
+        assert_eq!(binary(Pow, k(-8.0, 0.0), k(3.0, 0.0)), k(-512.0, 0.0));
+        assert_eq!(binary(Pow, k(0.0, 0.0), k(2.0, 5.0)), k(0.0, 0.0));
+        assert_eq!(unary(Sign, k(f64::INFINITY, 3.0)), k(1.0, 0.0));
+        assert_eq!(unary(Sign, k(-0.0, 0.0)), k(-0.0, 0.0));
+        assert!(unary(Lgamma, k(-3.0, 0.0)).re.is_nan());
+        assert_eq!(binary(Binom, k(2.0, 0.0), k(3.0, 0.0)), k(0.0, 0.0));
     }
 
     /// A real part of z too small to change 1 ± z still changes the smaller part of each composite square root, by first order in that real part. Complex-step differentiation reads derivatives from such a part. At magnitudes near 64-bit floats' limits, a tiny part of z still gives the result's tiny part, without underflow.
@@ -725,14 +707,12 @@ mod complex {
         ];
         let close = |g: f64, w: f64, eps: f64| (g - w).abs() <= 4.0 * eps * w.abs();
         for (name, z, want, narrow) in cases {
-            for sliced in [false, true] {
-                let got = double::apply(name, &[z; 17], sliced).unwrap();
-                assert!(close(got.re, want.re, f64::EPSILON) && close(got.im, want.im, f64::EPSILON), "{name}({z}) gave {got}, not {want}");
-                if !narrow { continue; }
-                let got = single::apply(name, &[c(z.re as f32, z.im as f32); 17], sliced).unwrap();
-                let eps = f32::EPSILON.into();
-                assert!(close(got.re.into(), want.re, eps) && close(got.im.into(), want.im, eps), "f32 {name}({z}) gave {got}, not {want}");
-            }
+            let got = apply::<f64>(name, &[z]).unwrap();
+            assert!(close(got.re, want.re, f64::EPSILON) && close(got.im, want.im, f64::EPSILON), "{name}({z}) gave {got}, not {want}");
+            if !narrow { continue; }
+            let got = apply::<f32>(name, &[c(z.re as f32, z.im as f32)]).unwrap();
+            let eps = f32::EPSILON.into();
+            assert!(close(got.re.into(), want.re, eps) && close(got.im.into(), want.im, eps), "f32 {name}({z}) gave {got}, not {want}");
         }
     }
 
@@ -748,30 +728,23 @@ mod complex {
         assert!(z.re.is_nan() && z.im.is_nan(), "{z}");
     }
 
-    /// e^(iy) at the float nearest kπ/2 is exactly i^k, through the scalar and slice forms of `Exp` and of the `Pow`s that compute through it. A part the quarter turn makes 0 stays 0 where e^x overflows, and NaN in x still gives NaN.
+    /// e^(iy) at the float nearest kπ/2 is exactly i^k, through `Exp`'s complex formula and `Pow`'s, which computes through it. A part the quarter turn makes 0 stays 0 where e^x overflows, and NaN in x still gives NaN.
     #[test]
     fn quarter_turns() {
-        fn check<R: Native + std::fmt::Debug>(big: f64) where Exp: Unary<Complex<R>, Out = Complex<R>>, Pow: Binary<Complex<R>, Out = Complex<R>> {
+        fn check<R: Native + std::fmt::Debug>(big: f64) {
             let q = R::narrow(FRAC_PI_2);
             let (zero, one) = (R::zero(), R::one());
             let turns = [c(one, zero), c(zero, one), c(-one, zero), c(zero, -one)];
-            let sliced = |z: Complex<R>| {
-                let mut out = Vec::new();
-                Exp.many(Arg::Many(&[z]), 1, &mut out);
-                out[0]
-            };
             for k in -8i32..=8 {
                 let (z, want) = (c(zero, R::narrow(k as f64) * q), turns[k.rem_euclid(4) as usize]);
-                assert_eq!((Exp.one(z), sliced(z)), (want, want), "k = {k}");
+                assert_eq!(unary(Exp, z), want, "k = {k}");
             }
             let (above, nan) = (c(R::narrow(big), q), c(R::nan(), q));
-            assert_eq!((Exp.one(above), sliced(above)), (c(zero, R::infinity()), c(zero, R::infinity())));
-            assert!(Exp.one(nan).re.is_nan() && sliced(nan).re.is_nan());
+            assert_eq!(unary(Exp, above), c(zero, R::infinity()));
+            assert!(unary(Exp, nan).re.is_nan());
             let (minus, half, three) = (c(-one, zero), c(R::narrow(0.5), zero), c(R::narrow(1.5), zero));
             for (z, w, want) in [(minus, half, turns[1]), (minus, three, turns[3]), (turns[1], c(one + one, zero), turns[2])] {
-                let mut out = Vec::new();
-                Pow.many(Arg::Many(&[z]), Arg::Many(&[w]), 1, &mut out);
-                assert_eq!((Pow.one(z, w), out[0]), (want, want), "{z:?}^{w:?}");
+                assert_eq!(binary(Pow, z, w), want, "{z:?}^{w:?}");
             }
         }
         check::<f64>(800.0);
@@ -781,7 +754,8 @@ mod complex {
 
 mod lambert {
     use num_complex::Complex;
-    use rustymath::{LambertW, Unary, lambertw};
+    use super::complex::unary;
+    use rustymath::{LambertW, lambertw};
 
     #[test]
     fn special_values() {
@@ -792,12 +766,13 @@ mod lambert {
         assert_eq!((lambertw(-0.36787944117144233f64), lambertw(-0.36787945f32)), (-1.0, -1.0));
         assert_eq!(lambertw(1.0f64), 0.5671432904097838);
         let c = |re: f64, im: f64| Complex::new(re, im);
-        assert_eq!(LambertW.one(c(0.0, -0.0)).im.to_bits(), (-0.0f64).to_bits());
+        let w = |z: Complex<f64>| unary(LambertW, z);
+        assert_eq!(w(c(0.0, -0.0)).im.to_bits(), (-0.0f64).to_bits());
         // Each side of the cut along the real axis below -1/e, by the sign of the imaginary part's zero.
-        let (above, below) = (LambertW.one(c(-2.0, 0.0)), LambertW.one(c(-2.0, -0.0)));
+        let (above, below) = (w(c(-2.0, 0.0)), w(c(-2.0, -0.0)));
         assert!(above.im > 0.0 && below == above.conj());
-        assert!(LambertW.one(c(f64::NAN, 1.0)).re.is_nan());
-        assert_eq!(LambertW.one(c(f64::NEG_INFINITY, 0.0)), c(f64::INFINITY, std::f64::consts::PI));
+        assert!(w(c(f64::NAN, 1.0)).re.is_nan());
+        assert_eq!(w(c(f64::NEG_INFINITY, 0.0)), c(f64::INFINITY, std::f64::consts::PI));
     }
 }
 

@@ -1,6 +1,6 @@
 //! Probability distributions. Each has a density, a cumulative distribution, a quantile function and a sampler. The first three are also function objects, `Pdf`, `Cdf` and `Quantile`, which hold the distribution. Their slice forms choose the distribution's formulas once, outside the loop, so the loops of the closed-form distributions vectorize. Their one-item forms run the slice forms on one item. An item of a slice form fails where its result is NaN and its argument isn't, as for a quantile of p outside 0 to 1. A discrete distribution's density is its mass at a whole x, and its quantile function and sampler give whole numbers.
 use crate::{
-    Arg, Atan, Erfc, Erfcinv, Float, Ln, Log1p, Pow, Root, Tan, Unary, betainc, betaincinv, cos, erfcinv, exp, expm1, facts::formula_at,
+    Arg, Atan, Erfc, Erfcinv, Float, Ln, Log1p, Unary, betainc, betaincinv, cos, erfcinv, exp, expm1,
     gammainc, gammaincc, gammaincinv, lgamma, ln, log1p, pow, random::Items, sin, slice::{CHUNK, kept, written}
 };
 use rand::{Rng, distr::{Distribution as _, Open01, StandardUniform}};
@@ -55,7 +55,7 @@ trait Formulas {
     fn pdf(&self, x: f64) -> f64;
     fn cdf(&self, x: f64) -> f64;
     fn quantile(&self, p: f64) -> f64;
-    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64;
+    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { self.quantile(open(rng)) }
     /// The words that one attempt of a draw reads, which an item packs before its region's (`random::Items`).
     fn words(&self) -> usize { 1 }
     fn samples(&self, items: &mut Items, out: &mut [f64]) { for o in out { *o = self.sample(&mut items.item()); } }
@@ -127,16 +127,11 @@ macro_rules! native_law {
         impl crate::facts::Formula<1> for $object {
             fn supports(&self, dtype: crate::buffer::DType) -> bool { matches!(dtype, crate::buffer::DType::Float(_)) }
             const FAILS_NAN: bool = true;
-            $(fn emit_valid<F: Float, O: crate::recipe::Ops<F> + ?Sized>(&self, _: crate::facts::Variant, o: &O, [p]: [O::V; 1], _: O::V) -> Option<(crate::error::Kind, O::B)> { Some((crate::error::Kind::Domain, $valid(o, p))) })?
+            $(fn emit_valid<F: Float, O: crate::recipe::Ops<F> + ?Sized>(&self, _: crate::domain::Variant, o: &O, [p]: [O::V; 1], _: O::V) -> Option<(crate::error::Kind, O::B)> { Some((crate::error::Kind::Domain, $valid(o, p))) })?
             fn real<F: crate::float::Native>(&self, _: &crate::recipe::NativeOps<{ crate::FUSED }>, [x]: [F; 1]) -> Option<F> {
                 Some(F::narrow(if F::WIDE { self.one(x.wide()) } else { f64::from(self.one(x.wide() as f32)) }))
             }
-            fn native_slices(&self) -> Option<crate::facts::NativeSlices<Self, 1>> {
-                Some(crate::facts::NativeSlices {
-                    single: |k, x, n, out| Unary::<f32>::slice(k, x, n, out),
-                    double: |k, x, n, out| Unary::<f64>::slice(k, x, n, out),
-                })
-            }
+            fn native_slices(&self) -> Option<crate::facts::NativeSlices<Self, 1>> { Some(crate::facts::NativeSlices::unary()) }
         }
     )+};
 }
@@ -187,8 +182,8 @@ fn composed<F: Float>(
 /// The values of `g`'s slice form at a block's arguments, for [`composed`].
 fn through<F: Float, G: Unary<F, Out = F>>(g: G) -> impl Fn(&mut [F], &mut [MaybeUninit<F>]) { move |a, v| { g.slice([Arg::Many(a)], a.len(), v); } }
 
-/// The values of the shared `Pow` formula, each argument of a block raised to `k`, for [`composed`].
-fn raised<F: Float>(k: F) -> impl Fn(&mut [F], &mut [MaybeUninit<F>]) { move |a, v| { each!([Arg::Many(a)], a.len(), v, |[x]| formula_at(&Pow, [x, k])); } }
+/// Each argument of a block raised to `k`, with `k`'s route chosen once (`pow::powers`), for [`composed`].
+fn raised<F: Float>(k: F) -> impl Fn(&mut [F], &mut [MaybeUninit<F>]) { let e = crate::pow::Exponent::of(k.wide()); move |a, v| crate::pow::powers(e, k, a, v) }
 
 impl Distribution {
     /// The density at x, or for a discrete distribution the probability of x.
@@ -470,13 +465,12 @@ impl Formulas for Cauchy {
         composed(p, n, out, move |p| {
             pi * if p < low { p } else if p > high { F::one() - p } else { p - half }
         }, |a, v| {
-            each!([Arg::Many(a)], a.len(), v, |[x]| formula_at(&Tan, [x]));
+            each!([Arg::Many(a)], a.len(), v, |[x]| F::from_working(crate::trig::formula(&crate::recipe::NativeOps::<{ crate::FUSED }>::DEFAULT, F::working(x), crate::trig::Kind::Tan)));
         }, move |p, t| {
             let (num, den) = if p < low { (-scale, t) } else if p > high { (scale, t) } else { (scale * t, F::one()) };
             location + num / den
         })
     }
-    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { self.quantile(open(rng)) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -583,7 +577,6 @@ impl Formulas for Laplace {
             r + r
         }, through(Ln), move |p, l| if p < half { location + scale * l } else { location - scale * l })
     }
-    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { self.quantile(open(rng)) }
 }
 
 /// The logistic distribution. Its formulas use e^-|z|, which can't overflow, so its tails stay exact.
@@ -616,7 +609,6 @@ impl Formulas for Logistic {
         let (location, scale) = (F::narrow(self.location), F::narrow(self.scale));
         composed(p, n, out, |p| p / (F::one() - p), through(Ln), move |_, l| location + scale * l)
     }
-    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { self.quantile(open(rng)) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -709,7 +701,7 @@ impl Formulas for Weibull {
         composed(p, n, out, |p| -p, move |a, v| {
             Log1p.slice([Arg::Many(a)], a.len(), v);
             for (x, &l) in a.iter_mut().zip(written(v).iter()) { *x = -l; }
-            each!([Arg::Many(a)], a.len(), v, |[x]| formula_at(&Root, [degree, x]));
+            crate::pow::roots(degree, a, v);
         }, move |_, w| scale * w)
     }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { self.scale * pow(-ln(open(rng)), 1.0 / self.shape) }

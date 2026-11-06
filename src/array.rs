@@ -187,10 +187,10 @@ impl Array {
         let len = next.layout.count();
         let x = source.remapped(Mapping::from(next.steps), len);
         let y = source.remapped(Mapping::from(previous.steps), len);
-        let variant = crate::facts::Variant { dtype: source.dtype(), checked: true, wrapping: true };
+        let variant = crate::domain::Variant { dtype: source.dtype(), checked: true, wrapping: true };
         let k = if source.dtype() == DType::Boolean { Kernel::new(crate::reduce::Xor, variant) } else { Kernel::new(crate::Subtract, variant) };
         let mut buffer = Buffer::with_capacity(source.dtype(), len);
-        k.map(&[x.read(), y.read()], 0..len, Settings::default(), &mut buffer)?;
+        k.map(&[x.read(), y.read()], 0..len, Settings { tolerance: crate::tolerant::Tolerance::EXACT }, &mut buffer)?;
         Self::new(next.layout, buffer)
     }
     fn updated(&self, combine: Option<&Kernel>, plan: &crate::structure::Plan, source: &Self) -> Result<Buffer, Error> {
@@ -201,7 +201,7 @@ impl Array {
         let source = source.view().remapped(agreement.right, agreement.len);
         let positions = ReadPlan::input(0, self.len()).remapped(Mapping::from(plan.steps.clone()), agreement.len, Missing::Default);
         let mut buffer = Buffer::with_capacity(self.dtype(), self.len());
-        crate::operation::at(combine, WriteRoot::Read(root.read()), source.read(), Positions::Route(&positions, 0), true, Settings::default(), &mut buffer)?;
+        crate::operation::at(combine, WriteRoot::Read(root.read()), source.read(), Positions::Route(&positions, 0), true, Settings { tolerance: crate::tolerant::Tolerance::EXACT }, &mut buffer)?;
         Ok(buffer)
     }
     /// Writes a broadcast source into a selection. Checks finish before replacing the array's storage.
