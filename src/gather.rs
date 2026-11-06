@@ -55,66 +55,32 @@ pub fn repeat<S: Copy, D: Copy>(out: &mut Vec<D>, items: &[S], counts: &[i64], t
     })
 }
 
-/// Appends `item(j)` for each position `j` whose count in `mask` is 1, in order. Every count is 0 or 1, and `total` of them are 1. It suits items read from a slice: where a block of counts holds both 0s and 1s, `written` reads every item in order.
+/// Appends `position(j)` for each position `j` whose count in `mask` is 1, in order. Every count is 0 or 1, and `total` of them are 1. Long runs cost little: a block of 64 counts that are all 0 is skipped, and one whose counts are all 1 is written in one loop. In a block that mixes both, `selected` computes only the selected items. Each count is read by its low bit, which writes every slot whatever the counts hold.
 #[inline]
-pub fn compress<M: Key, D: Copy>(out: &mut Vec<D>, mask: &[M], total: usize, item: impl Fn(usize) -> D) { kept::<false, M, D>(out, mask, total, item) }
-
-/// Appends `position(j)` for each position `j` whose count in `mask` is 1, in order. Every count is 0 or 1, and `total` of them are 1. It suits items computed from `j`: where a block of counts holds both 0s and 1s, `selected` computes only the selected items.
-#[inline]
-pub fn positions<M: Key, D: Copy>(out: &mut Vec<D>, mask: &[M], total: usize, position: impl Fn(usize) -> D) { kept::<true, M, D>(out, mask, total, position) }
-
-/// `compress`, or `positions` with `TABLE`. Long runs cost little: a block of 64 counts that are all 0 is skipped, and one whose counts are all 1 is copied. Without `TABLE`, consecutive blocks that mix both go through `written` in one pass. Each count is read by its low bit, which writes every slot whatever the counts hold.
-#[inline(always)]
-fn kept<const TABLE: bool, M: Key, D: Copy>(out: &mut Vec<D>, mask: &[M], total: usize, item: impl Fn(usize) -> D) {
+pub fn positions<M: Key, D: Copy>(out: &mut Vec<D>, mask: &[M], total: usize, position: impl Fn(usize) -> D) {
     crate::slice::appended(out, total, |d| {
-        // `k` slots are written. Without `TABLE`, the mixed blocks from position `from`, holding `mixed` counts of 1, wait for one pass.
-        let (mut k, mut from, mut mixed) = (0, 0, 0);
+        // `k` slots are written.
+        let mut k = 0;
         for (start, m) in (0..).step_by(64).zip(mask.chunks(64)) {
             // A block's count is at most 64, which fits in a byte. Byte additions vectorize in the widest lanes.
             let mut n = 0u8;
             for x in m { n += x.key() as u8 & 1 }
             let n = usize::from(n);
-            if !TABLE && 0 < n && n < m.len() { mixed += n; continue; }
-            if mixed > 0 { written(&mut d[k..], &mask[from..start], |j| item(from + j)) }
-            (k, mixed, from) = (k + mixed, 0, start + m.len());
-            if n == m.len() { let run = &mut d[k..k + n]; for j in 0..n { run[j].write(item(start + j)); } }
-            else if TABLE {
+            if n == m.len() { let run = &mut d[k..k + n]; for j in 0..n { run[j].write(position(start + j)); } }
+            else if n > 0 {
                 let (blocks, rest) = m.as_chunks::<8>();
                 let mut at = k;
                 for (b, block) in blocks.iter().enumerate() {
                     let start = start + 8 * b;
-                    at = selected(d, at, mask_bits(block), |i| item(start + usize::from(i)));
+                    at = selected(d, at, mask_bits(block), |i| position(start + usize::from(i)));
                 }
                 let (start, last) = (start + 8 * blocks.len(), mask_bits(rest));
-                selected(d, at, last, |i| item(start + usize::from(i)));
+                selected(d, at, last, |i| position(start + usize::from(i)));
             }
             k += n;
         }
-        if mixed > 0 { written(&mut d[k..], &mask[from..], |j| item(from + j)) }
-        assert_eq!(k + mixed, total, "`total` counts must be 1");
+        assert_eq!(k, total, "`total` counts must be 1");
     })
-}
-
-/// Writes `item(j)` into `d`, in order, for each position `j` whose count in `mask` is 1. `d` holds at least as many slots as the counts add up to. Each item is written where it goes if its count is 1, and the next item writes over it if its count is 0, so the loop has no branch on the counts. It takes four counts at a time, so that one addition moves on past all four.
-// Out of line: inlined into `kept`'s loop over blocks, the loop below ran out of x86-64's 16 registers and reloaded six values from the stack for every four counts.
-#[inline(never)]
-fn written<M: Key, D: Copy>(d: &mut [MaybeUninit<D>], mask: &[M], item: impl Fn(usize) -> D) {
-    let count = |m: M| (m.key() & 1) as usize;
-    let (mut j, mut k) = (0, 0);
-    for m in mask.as_chunks::<4>().0 {
-        let Some(w) = d.get_mut(k..k + 4) else { break };
-        let (a, b, c) = (count(m[0]), count(m[1]), count(m[2]));
-        w[0].write(item(j));
-        w[a & 3].write(item(j + 1));
-        w[(a + b) & 3].write(item(j + 2));
-        w[(a + b + c) & 3].write(item(j + 3));
-        k += a + b + c + count(m[3]);
-        j += 4;
-    }
-    for (j, &n) in mask.iter().enumerate().skip(j) {
-        if k < d.len() { d[k].write(item(j)); }
-        k += count(n);
-    }
 }
 
 /// For each mask of 8 bits, the positions of its set bits in ascending order, then zeros.
@@ -312,41 +278,6 @@ fn windows_into<const L: usize, U: Unit>(out: &mut [U], items: &[U], o: usize, s
             // SAFETY: as above.
             unsafe { cell.each_move::<L, U>(o, step, m, |item, at| (from.add(item), to.add(at))) }
         }
-    }
-}
-
-/// Appends `rows` rows to `out`, each holding a lane of `left`, then a lane of `right`, as two arrays joined along an axis lay out their lanes: lane `r` of a side whose lanes hold `n` items is its items from `r × n` up to `(r + 1) × n`. Rows go in order, straight into `out`'s spare capacity: each result item is written once, with no fill first. Where both sides' lanes hold one length of at most `RUN` items, each row moves as one block of units. Other lanes copy as slices.
-pub fn interleave<T: Item>(out: &mut Vec<T>, [left, right]: [&[T]; 2], [m, n]: [usize; 2], rows: usize) {
-    assert!(left.len() == rows * m && right.len() == rows * n, "each side holds one lane for every row");
-    let (left, right) = (units(left), units(right));
-    crate::slice::appended(out, rows * (m + n), |slots| {
-        // SAFETY: each unit written below is a unit of an item, read through `units`.
-        let slots = unsafe { written_as::<MaybeUninit<T>, MaybeUninit<T::Unit>>(slots) };
-        if m == n && (1..=RUN).contains(&n) { runs!(n, L => lane_pairs::<L, T::Unit>(slots, left, right)) } else { lane_slices(slots, left, right, m, n) }
-    })
-}
-
-/// [`interleave`]'s rows where both sides' lanes hold `L` units: each lane moves as one block of `L` units.
-#[inline]
-fn lane_pairs<const L: usize, U: Unit>(slots: &mut [MaybeUninit<U>], left: &[U], right: &[U]) {
-    let (a, b, mut to) = (left.as_ptr().cast::<[U; L]>(), right.as_ptr().cast::<[U; L]>(), slots.as_mut_ptr().cast::<[U; L]>());
-    for r in 0..left.len() / L {
-        // SAFETY: each side holds `left.len() / L` lanes of `L` units, and `slots` holds a row of two lanes for each.
-        unsafe {
-            to.write(a.add(r).read());
-            to.add(1).write(b.add(r).read());
-            to = to.add(2)
-        }
-    }
-}
-
-/// [`interleave`]'s rows where the sides' lanes differ in length or are long: each lane copies as a slice.
-fn lane_slices<U: Unit>(slots: &mut [MaybeUninit<U>], left: &[U], right: &[U], m: usize, n: usize) {
-    if m + n == 0 { return; }
-    for (r, row) in slots.chunks_exact_mut(m + n).enumerate() {
-        let (to_left, to_right) = row.split_at_mut(m);
-        for (slot, &u) in to_left.iter_mut().zip(&left[r * m..][..m]) { slot.write(u); }
-        for (slot, &u) in to_right.iter_mut().zip(&right[r * n..][..n]) { slot.write(u); }
     }
 }
 
@@ -598,16 +529,16 @@ pub enum Steps {
 
 /// Index values that a table reads as positions along an axis, converting each one as it reads it, so that the values aren't first copied into a list of offsets. [`Table::indices`] takes them.
 pub trait IndexSource: Send + Sync {
-    /// The index values, as Booleans, integers, or floats that are whole numbers.
+    /// The index values, as Booleans, integers, or floats within the default tolerance of whole numbers ([`IndexValue`]).
     fn view(&self) -> View<'_>;
 }
 impl IndexSource for crate::buffer::Buffer { fn view(&self) -> View<'_> { self.view() } }
 
-/// A value that names a position along an axis: a Boolean, an integer, or a float that is a whole number.
+/// A value that names a position along an axis: a Boolean, an integer, or a float within the default tolerance of a whole number. This is the one rule for float index values; [`crate::structure::float_position`] reads it.
 pub trait IndexValue: Copy {
     /// The position the value names, where a negative one counts back from the end.
     fn position(self) -> i64;
-    /// Whether the value is a whole number, as every Boolean and integer is.
+    /// Whether the value names a position: every Boolean and integer does, and a float equal to a whole number within the default tolerance.
     #[inline(always)]
     fn whole(self) -> bool { true }
     /// The least and greatest positions that `values` name, which mean nothing where `values` is empty, and whether every value is a whole number.
@@ -631,9 +562,9 @@ macro_rules! index_values {
             fn bounds(values: &[Self]) -> (i64, i64, bool) { let (lo, hi) = values.iter().fold((<$t>::MAX, <$t>::MIN), |(lo, hi), &i| (lo.min(i), hi.max(i))); (lo.into(), hi.into(), true) }
         })*
         $(impl IndexValue for $f {
-            #[inline(always)] fn position(self) -> i64 { crate::float::Float::wide(self) as i64 }
-            // Only a whole number converts to an integer and back unchanged: a fraction, a NaN or an infinity doesn't.
-            #[inline(always)] fn whole(self) -> bool { let x = crate::float::Float::wide(self); x as i64 as f64 == x }
+            #[inline(always)] fn position(self) -> i64 { crate::tolerant::Tolerant::nearest_whole(crate::tolerant::Tolerance::DEFAULT, crate::float::Float::wide(self)).0 as i64 }
+            // A NaN or an infinity equals no whole number within tolerance.
+            #[inline(always)] fn whole(self) -> bool { crate::tolerant::Tolerant::nearest_whole(crate::tolerant::Tolerance::DEFAULT, crate::float::Float::wide(self)).1 }
         })*
     };
 }
@@ -1079,6 +1010,19 @@ impl Steps {
         }
         Some(offset)
     }
+    /// An offset that no item of `steps` passes from `base`: `base` plus each entry's furthest offset, where a fill reaches none and a padded entry stops at the end of its axis. Only a table's entry reads its offsets to find it. `None` where an entry has no items, so the walk reads nothing.
+    pub fn furthest(base: usize, steps: &[impl std::borrow::Borrow<Self>]) -> Option<usize> {
+        steps.iter().try_fold(base, |at, s| {
+            let furthest = match *s.borrow() {
+                ref s if s.len() == 0 => return None,
+                Self::Stride { start, len, step } => start.wrapping_add_signed(step.max(0) * (len - 1) as isize),
+                Self::Padded { size, stride, .. } => size.saturating_sub(1) * stride,
+                Self::Rotated { len, stride, .. } => (len - 1) * stride,
+                Self::Table(ref t) => (0..t.len()).filter_map(|j| t.get(j)).max().unwrap_or(0),
+            };
+            Some(at + furthest)
+        })
+    }
     /// The first source offset and stride of items `start..start + n`, where they form one regular run. Singleton axes disappear and neighbouring strides can form one run. Padded and rotated reads must stay within their valid, unwrapped part.
     #[inline]
     pub fn run(base: usize, steps: &[impl std::borrow::Borrow<Self>], start: usize, n: usize) -> Option<(usize, isize)> {
@@ -1130,7 +1074,7 @@ impl Steps {
     pub fn fills(&self) -> bool { match self { Self::Padded { edge, .. } => *edge == Edge::Fill, Self::Table(t) => t.fills(), _ => false } }
     /// This entry's first offset and step, where it reads its whole axis as one regular run with no fill: a `Stride`, or a `Rotated` entry that doesn't rotate.
     pub fn affine(&self) -> Option<(usize, isize)> { match *self { Self::Stride { start, step, .. } => Some((start, step)), _ => None } }
-    /// Whether a walk through `tables` reads offsets 0, 1, 2 and so on, in order. A copy through such tables of a source with as many items as the walk reads is the source unchanged. Only `Stride` entries that start at 0 qualify.
+    /// Whether a walk through `tables` reads offsets 0, 1, 2 and so on, in order. A copy through such tables of a source with as many items as the walk reads is the source unchanged. Only `Stride` entries that start at 0 qualify, and tables whose offsets run 0, 1, 2 and so on at their axis's stride.
     pub fn in_order(tables: &[Self]) -> bool {
         let mut stride = 1;
         tables.iter().rev().all(|s| match *s {
@@ -1138,6 +1082,11 @@ impl Steps {
                 let ordered = len <= 1 || step == stride as isize;
                 stride *= len;
                 ordered
+            }
+            Self::Table(ref t) => {
+                let (mut j, at) = (0, stride);
+                stride *= t.len();
+                t.all(|o| { let ordered = o == Some(j * at); j += 1; ordered })
             }
             _ => false,
         })
@@ -1399,36 +1348,6 @@ unsafe fn written_as<A, B>(items: &mut [A]) -> &mut [B] {
     unsafe { std::slice::from_raw_parts_mut(items.as_mut_ptr().cast(), items.len()) }
 }
 
-/// The sizes, in bytes, of the runs that [`copied`] copies with a loop of its own, on x86-64 Linux with glibc alone. In this range glibc's `memcpy` copies with `rep movsb`, which Zen 3 and Zen 4 run many times slower when the destination sits a little past the source modulo 4 KB (glibc bug 30994, fixed in glibc 2.40). Below it `memcpy` copies with vector loops, and above it with vector loops whose stores bypass the cache. Elsewhere the range is empty: on this Mac, Apple's `memmove` copies about a third faster than the loop.
-const OWN_COPY: std::ops::Range<usize> = if cfg!(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu")) { 4 << 10..1 << 20 } else { 0..0 };
-
-/// Appends the items of `s` to `d`. A run whose size is in [`OWN_COPY`] copies in 64-byte blocks, stored where the destination's cache lines start. Other runs copy with `memcpy`.
-pub(crate) fn copied<T: Item>(d: &mut Vec<T>, s: &[T]) {
-    let bytes = size_of_val(s);
-    if !OWN_COPY.contains(&bytes) { return d.extend_from_slice(s); }
-    crate::slice::appended(d, s.len(), |slots| {
-        // SAFETY: an `Item` has no padding, so every byte of `s` is initialized, and `slots` holds the same number of bytes.
-        let (to, from) = unsafe {
-            (std::slice::from_raw_parts_mut(slots.as_mut_ptr().cast::<MaybeUninit<u8>>(), bytes), std::slice::from_raw_parts(s.as_ptr().cast::<u8>(), bytes))
-        };
-        let bytewise = |to: &mut [MaybeUninit<u8>], from: &[u8]| {
-            for (slot, &byte) in to.iter_mut().zip(from) { slot.write(byte); }
-        };
-        // The blocks start where the destination's cache lines start, so that no store splits across two lines.
-        let head = to.as_ptr().align_offset(64);
-        let ((head_to, to), (head_from, from)) = (to.split_at_mut(head), from.split_at(head));
-        bytewise(head_to, head_from);
-        let ((blocks, tail), (sources, rest)) = (to.as_chunks_mut::<64>(), from.as_chunks::<64>());
-        for (block, source) in blocks.iter_mut().zip(sources) {
-            *block = source.map(MaybeUninit::new);
-            // SAFETY: no instructions. LLVM must assume that they read and write memory, so it keeps the loop instead of a call of `memcpy`.
-            #[cfg(target_arch = "x86_64")]
-            unsafe { std::arch::asm!("", options(nostack, preserves_flags)) }
-        }
-        bytewise(tail, rest);
-    })
-}
-
 /// Writes `items` into `out`, each converted by `conv`, as [`windows_into`] writes units: one cell at each start along a stride of `step` from `at`, with its items where `rest` reaches. Gives `false` where `rest` isn't a short cell (`short_cells`). Only the sources that [`Item::cells_into_f64`] names call it, so its loops compile for those pairs alone.
 fn converted_cells<S: Copy, D, C: Convert<S, D>>(out: &mut [D], items: &[S], conv: &C, at: usize, step: isize, rest: &[Cow<'_, Steps>]) -> bool {
     fn cells<const L: usize, S: Copy, D, C: Convert<S, D>>(out: &mut [D], items: &[S], conv: &C, at: usize, step: isize, cell: &Cell) {
@@ -1559,7 +1478,7 @@ fn walk_axis<T: Item>(d: &mut Vec<T>, s: &[T], fill: T, base: usize, axis: &Step
         if let Steps::Stride { start: b, len: n, step: 1 } = **inner {
             if n > RUN {
                 d.reserve(axis.len() * n);
-                axis.for_each(|_, o| match o { Some(o) => copied(d, &s[base + b + o..][..n]), None => d.extend(std::iter::repeat_n(fill, n)) });
+                axis.for_each(|_, o| match o { Some(o) => d.extend_from_slice(&s[base + b + o..][..n]), None => d.extend(std::iter::repeat_n(fill, n)) });
                 return;
             }
         }
@@ -1589,7 +1508,7 @@ fn walk_axis<T: Item>(d: &mut Vec<T>, s: &[T], fill: T, base: usize, axis: &Step
     // Each loop gets the source from `base` onwards by value, so that the compiler keeps its bounds in registers. A padded axis whose positions all lie outside an empty source reads nothing from it, whatever its base.
     let s = s.get(base..).unwrap_or_default();
     match *axis {
-        Steps::Stride { start, len, step: 1 } => copied(d, &s[start..start + len]),
+        Steps::Stride { start, len, step: 1 } => d.extend_from_slice(&s[start..start + len]),
         Steps::Stride { start, len, step: -1 } => d.extend(s[start + 1 - len..=start].iter().rev().copied()),
         Steps::Stride { start, len, step: 0 } => d.extend(std::iter::repeat_n(s[start], len)),
         Steps::Stride { start, len, step } => {

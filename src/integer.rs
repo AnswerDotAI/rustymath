@@ -2,7 +2,7 @@
 //!
 //! `Gcd`, `Lcm`, `Binom`, `Pow` and `Residue` also take the narrower integer types of compact buffers, `u8`, `i16` and `i32`, which they compute through these functions. A result that doesn't fit its type fails. `FloorDivide` divides each integer type exactly, gives a zero divisor the type's limit of the dividend's sign, and fails on an overflowing quotient. `Pow` floors a negative power. The tolerant comparisons, [`Floor`] and [`Ceil`] take each of these integer types exactly, ignoring the tolerance. [`Abs`] and [`Sign`] take them through the integer arithmetic of the `arith` module, and `Abs` of a signed type's least value fails. `Floor`, `Ceil` and `Abs` keep Booleans as they are.
 use crate::{
-    Abs, Arg, Binom, Pow, WrappingPow, convert::{self, WIDE_LIMIT}, float::sealed::Core,
+    Abs, Arg, Binom, Pow, convert::{self, WIDE_LIMIT}, float::sealed::Core,
     tolerant::{Ceil, Equal, Floor, FloorDivide, Gcd, Greater, GreaterEqual, Lcm, Less, LessEqual, NotEqual, Residue}
 };
 use strength_reduce::StrengthReducedU64;
@@ -231,11 +231,8 @@ pub fn encode(bases: &[i64], values: &[i64]) -> Option<Vec<i64>> {
     })
 }
 
-/// The value of each cell of `bases.len()` digits in `digits`, in the mixed radix of `bases`, as APL's `⊥` gives it. The first base is never used. `None` where a step isn't an `i64`.
-pub fn decode(bases: &[i64], digits: &[i64]) -> Option<Vec<i64>> { decoded(bases, digits, |v, b, d| v.checked_mul(b)?.checked_add(d)) }
-
-/// [`decode`] with each step wrapped to 64 bits, as integers that wrap compute it. Wrapping a value to a narrower width then gives what wrapping each step at that width gives.
-pub fn decode_wrapped(bases: &[i64], digits: &[i64]) -> Vec<i64> {
+/// The value of each cell of `bases.len()` digits in `digits`, in the mixed radix of `bases`, as APL's `⊥` gives it, with each step wrapped to 64 bits, as BPL's integer `⊥` wraps at `i64`. The first base is never used. Wrapping a value to a narrower width then gives what wrapping each step at that width gives.
+pub fn decode(bases: &[i64], digits: &[i64]) -> Vec<i64> {
     decoded(bases, digits, |v, b, d| Some(v.wrapping_mul(b).wrapping_add(d))).expect("a wrapped step always fits")
 }
 
@@ -251,7 +248,6 @@ forms!(#[inline] Gcd at bool: |_, [x, y]| x | y);
 forms!(#[inline] Lcm at bool: |_, [x, y]| x & y);
 forms!(#[inline] Binom at i64: |_, [n, k]| binom(n, k));
 forms!(#[inline] Pow at i64: |_, [x, y]| wrapped_power(x, y, i64::MAX));
-forms!(#[inline] WrappingPow at i64: |_, [x, y]| wrapped_power(x, y, i64::MAX).0);
 forms!(
     #[inline] Residue at i64: |_, [x, y]| residue(x, y), many |_, [x, y], n, out| if let Arg::One(d) = x && let Some(m) = mask(d) {
         each!([y], n, out, |[y]| y & m)
@@ -271,7 +267,6 @@ macro_rules! narrower {
         forms!(#[inline] Lcm at $t: |_, [x, y]| lcm(x.into(), y.into()).and_then(|r| <$t>::try_from(r).ok()));
         forms!(#[inline] Binom at $t: |_, [n, k]| binom(n.into(), k.into()).and_then(|r| <$t>::try_from(r).ok()));
         forms!(#[inline] Pow at $t: |_, [x, y]| { let (p, exact) = wrapped_power(x.into(), y.into(), <$t>::MAX.into()); (p as $t, exact && <$t>::try_from(p).is_ok()) });
-        forms!(#[inline] WrappingPow at $t: |_, [x, y]| wrapped_power(x.into(), y.into(), <$t>::MAX.into()).0 as $t);
         forms!(
             #[inline] Residue at $t: |_, [x, y]| residue(x.into(), y.into()) as $t,
             many |_, [x, y], n, out| if let Arg::One(d) = x && let Some(m) = mask(d.into()) {
@@ -287,7 +282,7 @@ macro_rules! narrower {
     )+};
 }
 narrower!(u8, i16, i32);
-/// Floor division at each integer type, from the formula that the kernels run (`facts::integer_at`). A zero divisor gives the type's limit of the dividend's sign, and 0 for 0 ÷ 0. A quotient that doesn't fit the type, the least value divided by -1, fails.
+// Floor division at each integer type, from the formula that the kernels run (`facts::integer_at`). A zero divisor gives the type's limit of the dividend's sign, and 0 for 0 ÷ 0. A quotient that doesn't fit the type, the least value divided by -1, fails.
 forms!(#[inline] FloorDivide at u8, i16, i32, i64: |k, [x, y]| crate::facts::integer_at(k, [x, y]));
 
 /// Each comparison's exact forms, which give Booleans: at each integer type of compact buffers, and at Booleans, where `false` orders before `true`. Characters compare as their code points, through these forms at `i32` ([`characters`](crate::characters)).

@@ -6,7 +6,8 @@ use pyo3::pyclass::CompareOp;
 use pyo3::types::{PyComplex, PyTuple};
 use pyo3::{IntoPyObjectExt, ffi, prelude::*};
 use rustymath::array::Array as Core;
-use rustymath::buffer::{Buffer, Element, FloatWidth, Items, View};
+use rustymath::buffer::{Buffer, DType, Element, FloatWidth, Items, View};
+use rustymath::tolerant::Exactly;
 use rustymath::layout::Layout;
 use rustymath_buffer::{item, lend, nested, py_err};
 use std::ffi::c_int;
@@ -185,10 +186,14 @@ array_methods! { folds [sum, prod, max, min, all, any, mean] scans [cumsum, cump
         let items = self.core.view().cast(self.core.dtype()).map_err(py_err)?;
         nested(py, self.core.layout().shape(), &|i| item(py, items.view(), i))
     }
-    /// A copy at `dtype`, a name such as `"float64"`, keeping keys and names. Items convert as `Buffer::cast` converts them: floats to integers truncate toward zero, a value that doesn't fit raises `OverflowError`, and a complex number with an imaginary part, or any conversion to or from characters, raises `ValueError`.
+    /// A copy at `dtype`, a name such as `"float64"`, keeping keys and names. An integer `dtype` converts as BPL's `ₓ` converts (`Buffer::floored`): a float takes its floor and saturates at the integer's range, NaN giving 0, and an integer wraps to the width. Other targets convert as `Buffer::cast` converts them: a complex number with an imaginary part, or any conversion to or from characters, raises `ValueError`.
     fn astype(&self, py: Python<'_>, dtype: &str) -> PyResult<Array> {
         let to = crate::convert::dtype(dtype)?;
-        let buffer = released(py, || self.core.view().cast(to).map(|items| match items { Items::Borrowed(v) => Buffer::copied(v, 0..v.len()), Items::Owned(b) => b })).map_err(py_err)?;
+        let view = self.core.view();
+        let buffer = released(py, || match to {
+            DType::Integer(_) => view.cast(self.core.dtype()).and_then(|items| Buffer::floored(items.view(), to, Exactly)),
+            _ => view.cast(to).map(|items| match items { Items::Borrowed(v) => Buffer::copied(v, 0..v.len()), Items::Owned(b) => b }),
+        }).map_err(py_err)?;
         Ok(Array::new(Core::new(self.core.layout().clone(), buffer).map_err(py_err)?))
     }
     /// Compact items without retaining a larger base allocation. Small views otherwise keep their whole base alive. Keys and names are preserved.

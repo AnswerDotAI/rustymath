@@ -90,7 +90,7 @@ pub(crate) fn bitwise_with<T: Clone>(table: u8, x: T, y: T, ones: T, and: impl F
 
 /// [`bitwise`] with the truth table it holds, as a function object. One argument is the second, with 0 as the first. Booleans and the signed types hold every result, because each leading sign bit takes the same entry of the table. An unsigned byte computes at `i64`, where its leading zeros can become ones, and fails where the result doesn't fit.
 ///
-/// Its kernels (`facts::Formula`) also take `f64` arguments that hold whole numbers, as those integers, and give `i64` results. Any other float fails. BPL's `ᵇ` and the Python wrapper's `bitwise_and`, `bitwise_or` and `bitwise_xor` run them.
+/// A float argument computes at `i64`, as the whole number it equals within the default tolerance (`operation::with_projected`). Any other float is DOMAIN. BPL's `ᵇ` and the Python wrapper's `bitwise_and`, `bitwise_or`, `bitwise_xor` and `bitwise_not` run its kernels.
 #[derive(Clone, Copy, Debug)]
 pub struct Bitwise(pub u8);
 forms!(#[inline] Bitwise at bool, i16, i32, i64: |k, [x, y]| bitwise(k.0, x, y));

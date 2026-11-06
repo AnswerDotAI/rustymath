@@ -92,10 +92,6 @@ impl Exponent {
 #[derive(Clone, Copy, Debug)]
 pub struct Pow;
 #[derive(Clone, Copy, Debug)]
-pub struct WrappingPow;
-#[derive(Clone, Copy, Debug)]
-pub struct WholePow;
-#[derive(Clone, Copy, Debug)]
 pub struct RealPow;
 
 pub(crate) fn real_formula<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, y: O::V) -> O::V {

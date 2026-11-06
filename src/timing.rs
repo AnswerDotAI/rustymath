@@ -41,6 +41,10 @@ const CI_CPU: &str = "AMD Ryzen 9 7950X3D 16-Core Processor";
 /// The CPU of the development Mac, on which the macOS budgets were set.
 const DEV_CPU: &str = "Apple M5 Max";
 
+/// The CPU of Syd1, the Linux machine where the integration runs build and time both projects. It checks no budgets.
+#[cfg(not(target_arch = "wasm32"))]
+const SYD1_CPU: &str = "Intel(R) Xeon(R) Silver 4216 CPU @ 2.10GHz";
+
 /// The copy times of the machines that run the speed tests in native builds, for copies whose source and destination fit in `CACHED_BYTES`: the CPU's name as [`cpu`] reads it, an item's size in bytes, the number of items, and the time for each item in seconds. Each is at the slower end of what that machine's copy normally takes, which is the copy that the expected costs in the budget files assume. On CI's runner, a copy measured beside each case varied more than 3 times between cases, while every function's own time varied at most 1.18 times. A stored time keeps that noise out of every cost.
 #[cfg(not(target_arch = "wasm32"))]
 pub const COPIES: &[(&str, usize, usize, f64)] = &[
@@ -69,6 +73,11 @@ pub const COPIES: &[(&str, usize, usize, f64)] = &[
     ("AMD EPYC 9V45 96-Core Processor", 8, 1_048_576, 0.12e-9),
     ("AMD EPYC 9V74 80-Core Processor", 8, 65_536, 0.21e-9),
     ("AMD EPYC 9V74 80-Core Processor", 8, 1_048_576, 0.24e-9),
+    // Syd1, 6 November 2026, from copies timed after `warm` under the timing lock, through Python's `Timing.copy` at sizes just past each one and `Timing.footprint`. 8-byte items at 65,536: 0.305 to 0.317 ns, and 0.53 ns when the copy and its gap, 1 MiB, spill from the L2 cache of that size; basedpl's speed runs measured 0.33 to 0.42 ns, and the pre-rewrite baseline 0.423. 4-byte items: 0.089 to 0.138 ns. 16-byte items: 1.22 to 1.26 ns, timed as twice as many 8-byte items, the same bytes and negations. 1,048,576 8-byte items: 0.629 to 0.658 ns.
+    (SYD1_CPU, 8, 65_536, 0.42e-9),
+    (SYD1_CPU, 4, 65_536, 0.14e-9),
+    (SYD1_CPU, 16, 65_536, 1.26e-9),
+    (SYD1_CPU, 8, 1_048_576, 0.66e-9),
 ];
 
 /// [`COPIES`] for the browser build, whose copy runs under the JavaScript engine that runs the build.

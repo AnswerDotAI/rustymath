@@ -3,7 +3,7 @@ use crate::agreement::{Agreement, Mapping};
 use crate::error::{Error, Kind};
 use crate::gather::{IndexSource, IndexValue, Steps, Table, Writes};
 use crate::layout::{Keys, Lanes, Layout, agreed, generated_len, names_conflict, shown, strides};
-use crate::{buffer::View, float::Float, tolerant::{Tolerance, Tolerant}};
+use crate::{buffer::View, float::Float};
 use std::{borrow::Cow, sync::Arc};
 
 /// A structural result's layout, and the steps that read its items from the argument. The steps' lengths multiply to the result's item count, outermost first. One entry can cover several result axes.
@@ -478,13 +478,9 @@ macro_rules! index_view {
         }
     };
 }
-use index_view;
 
-/// The whole number that a float index value equals within the default tolerance, or `None` for a NaN or a value that isn't whole, which reads the fill.
-pub fn float_position<F: Float>(y: F) -> Option<i64> {
-    if y.is_nan() { return None; }
-    match Tolerance::DEFAULT.nearest_whole(y) { (n, true) => Some(n.wide() as i64), _ => None }
-}
+/// The whole number that a float index value names ([`crate::gather::IndexValue`]: within the default tolerance), or `None` for a NaN or a value that isn't whole, which reads the fill.
+pub fn float_position<F: crate::gather::IndexValue>(y: F) -> Option<i64> { y.whole().then(|| y.position()) }
 
 /// The signed position that each index value gives, before any axis applies: integers as they are, and floats as `float_position` reads them, with `None` for a NaN or a value that isn't whole. Items that aren't real numbers have no position. [`positions`] reads the values and checks them against an axis in one pass.
 pub fn signed_positions(view: View<'_>) -> Vec<Option<i64>> {
@@ -528,24 +524,12 @@ impl Edge {
         };
         usize::try_from(q).ok().filter(|&q| q < n as usize)
     }
-    /// The position on an axis of `n` items that each index value in `view` reads (`position`), in one pass: integers as they are, and floats as `float_position` reads them, where NaN reads the fill. A value that isn't a whole number is a Domain error.
+    /// The position on an axis of `n` items that each index value in `view` reads (`position`): integers as they are, and floats as `float_position` reads them. A NaN, or a float that isn't a whole number, reads the fill.
     pub fn positions(self, view: View<'_>, n: usize) -> Result<Edged, Error> {
         index_view!(view, |ix| Ok(self.mapped(n, false, ix.iter().map(|&i| Some(i.into())))), |x| {
-            // One branch-free pass finds the NaNs and any value that isn't exactly whole, which `float_position` then reads within tolerance.
-            let (whole, nan) = x.iter().fold((true, false), |(w, f), &y| {
-                let y = y.wide();
-                (w & (y.is_nan() | (y as i64 as f64 == y)), f | y.is_nan())
-            });
-            if whole {
-                return Ok(self.mapped(
-                    n, nan, x.iter().map(|&y| {
-                        let y = y.wide();
-                        (!y.is_nan()).then_some(y as i64)
-                    }),
-                ));
-            }
             let signed: Vec<_> = x.iter().map(|&y| float_position(y)).collect();
-            Ok(self.mapped(n, nan, signed.into_iter()))
+            let unread = signed.iter().any(Option::is_none);
+            Ok(self.mapped(n, unread, signed.into_iter()))
         })
     }
     /// What [`Edge::positions`] gives for `signed` positions, each `None` for a NaN, where `nan` says whether any is. Where `Fill` or an empty axis reads the fill for some position, or a position is NaN, the result is floats.

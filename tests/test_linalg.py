@@ -174,8 +174,8 @@ def test_linalg(kind):
     assert count([0.3, 1.0], [0.1 + 0.2, 1.0]) == 2 and count([[0.3 + 1j]], [[0.1 + 0.2 + 1j]]) == 1
     # NumPy's ufuncs aren't rustymath's functions.
     with pytest.raises(ValueError): la.inner(np.add, np.multiply)
-    # An integer product that doesn't fit int64 raises: 2^62 times 4 is 2^64.
-    with pytest.raises(OverflowError): rm.matmul([[2**62]], [[4]])
+    # An integer product wraps at int64, as BPL's `+.×` does: 2^62 times 4 is 2^64, which wraps to 0.
+    assert rm.matmul([[2**62]], [[4]]).tolist() == [[0]]
     # A matrix that can't be factored gives NaN, with no warning.
     for f, x in (la.cholesky, -np.eye(2)), (la.eig, [[1., np.nan], [0, 1]]):
         with np.errstate(all='raise'): assert np.isnan(A(f(np.array(x))[0])).all()

@@ -5,6 +5,7 @@ use rustymath::{
     array::Array as Core, buffer::{Buffer, DType, Element, FloatWidth, Source}, layout::{Layout, generated_len}, with_dtype, with_float_width, with_width
 };
 use rustymath_buffer::py_err;
+use rustymath::tolerant::Exactly;
 
 /// A shape given as one length or a sequence of lengths, checked against the shared allocation limits.
 pub fn shape(size: &Bound<'_, PyAny>) -> PyResult<Vec<usize>> {
@@ -19,7 +20,7 @@ fn cast(py: Python<'_>, core: Core, dtype: Option<&str>) -> PyResult<Array> {
     let Some(dtype) = dtype else { return Ok(Array::new(core)) };
     let (layout, buffer) = core.into_compact();
     let dtype = convert::dtype(dtype)?;
-    let buffer = if buffer.dtype() == dtype { buffer } else { released(py, || Buffer::cast(buffer.view(), dtype)).map_err(py_err)? };
+    let buffer = if buffer.dtype() == dtype { buffer } else { released(py, || Buffer::floored(buffer.view(), dtype, Exactly)).map_err(py_err)? };
     Ok(Array::new(Core::new(layout, buffer).map_err(py_err)?))
 }
 

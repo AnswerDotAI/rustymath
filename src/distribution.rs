@@ -126,7 +126,7 @@ macro_rules! native_law {
     ($( $object:ident $(valid $valid:ident)? ),+) => {$(
         impl crate::facts::Formula<1> for $object {
             fn supports(&self, dtype: crate::buffer::DType) -> bool { matches!(dtype, crate::buffer::DType::Float(_)) }
-            fn fails_nan(&self) -> bool { true }
+            const FAILS_NAN: bool = true;
             $(fn emit_valid<F: Float, O: crate::recipe::Ops<F> + ?Sized>(&self, _: crate::facts::Variant, o: &O, [p]: [O::V; 1], _: O::V) -> Option<(crate::error::Kind, O::B)> { Some((crate::error::Kind::Domain, $valid(o, p))) })?
             fn real<F: crate::float::Native>(&self, _: &crate::recipe::NativeOps<{ crate::FUSED }>, [x]: [F; 1]) -> Option<F> {
                 Some(F::narrow(if F::WIDE { self.one(x.wide()) } else { f64::from(self.one(x.wide() as f32)) }))
@@ -210,6 +210,9 @@ fn checked(parameters: &[f64], ok: bool, message: &'static str) -> Result<(), In
     if !parameters.iter().all(|p| p.is_finite()) { Err(Invalid("distribution parameters must be finite")) } else if ok { Ok(()) } else { Err(Invalid(message)) }
 }
 
+/// The largest binomial trial count or Poisson rate: f64 holds every whole number up to it. Past it, `btrd`'s ratio walk (`i += 1.0`) and `least`'s halving stop advancing.
+const WHOLE: u64 = 1 << 53;
+
 impl Distribution {
     /// The normal distribution with this mean and standard deviation.
     pub fn normal(mean: f64, sd: f64) -> Result<Self, Invalid> {
@@ -285,11 +288,13 @@ impl Distribution {
     /// The binomial distribution of the successes in n trials, each with probability p.
     pub fn binomial(n: u64, p: f64) -> Result<Self, Invalid> {
         checked(&[p], (0.0..=1.0).contains(&p), "the probability must be from 0 to 1")?;
+        if n > WHOLE { return Err(Invalid("binomial trials exceed the sampler's whole-number range")); }
         Ok(Self(Law::Binomial(Binomial { n: n as f64, p })))
     }
     /// The Poisson distribution with this rate.
     pub fn poisson(rate: f64) -> Result<Self, Invalid> {
         checked(&[rate], rate >= 0.0, "the rate must not be negative")?;
+        if rate > WHOLE as f64 { return Err(Invalid("the Poisson rate exceeds the sampler's whole-number range")); }
         Ok(Self(Law::Poisson(Poisson { rate })))
     }
 }

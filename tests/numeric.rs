@@ -236,10 +236,10 @@ mod integer {
         assert_eq!(sum_bounds([i64::MIN, i64::MAX], 2, None, false), None);
         // Hours, minutes and seconds; a base of 0 that takes what remains; and a quotient that leaves `i64`.
         assert_eq!((encode(&[24, 60, 60], &[3661, 86399]), encode(&[0, 10], &[123])), (Some(vec![1, 1, 1, 23, 59, 59]), Some(vec![12, 3])));
-        assert_eq!((encode(&[-1], &[i64::MIN]), decode(&[24, 60, 60], &[1, 1, 1, 23, 59, 59])), (Some(vec![0]), Some(vec![3661, 86399])));
+        assert_eq!((encode(&[-1], &[i64::MIN]), decode(&[24, 60, 60], &[1, 1, 1, 23, 59, 59])), (Some(vec![0]), vec![3661, 86399]));
         assert_eq!(encode(&[7, -1], &[i64::MIN, 5]), Some(vec![1, 0, 2, 0]));
         assert_eq!(encode(&[0, -1], &[i64::MIN]), None);
-        assert_eq!(decode(&[1, 1 << 62], &[2, 0]), None);
+        assert_eq!(decode(&[1, 1 << 62], &[2, 0]), vec![i64::MIN]);
         let fit = |v: i128| i64::try_from(v).ok();
         for &x in &samples() {
             for &y in &samples() {
@@ -263,9 +263,6 @@ mod integer {
             }
         }
         assert_eq!([power(0, 0), power(0, -1), power(-1, i64::MIN), power(-2, 63), power(2, 63)], [Some(1), Some(i64::MAX), Some(1), Some(i64::MIN), None]);
-        for (x, y, result) in [(2, -1, Some(0)), (-2, -1, Some(-1)), (0, -1, Some(i16::MAX)), (200, 2, Some(-25536)), (-1, -3, Some(-1))] {
-            assert_eq!(Binary::<i16>::checked(&rustymath::WrappingPow, x, y), result);
-        }
     }
 
     #[test]

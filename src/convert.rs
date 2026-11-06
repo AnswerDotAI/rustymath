@@ -45,7 +45,7 @@ impl Conversion {
     pub fn map(
         self, input: crate::agreement::Read<'_>, range: std::ops::Range<usize>, checked: bool, output: &mut crate::buffer::Buffer
     ) -> Result<(), crate::error::Error> {
-        use crate::buffer::{Buffer, DType, Element, FloatWidth, Floats};
+        use crate::buffer::{Buffer, DType, FloatWidth, Floats};
         use crate::error::{Error, Kind};
         if self.kind == ConversionKind::Cast && !matches!((self.input, self.output), (DType::Integer(_), DType::Integer(_))) {
             return input.read_into(range, self.output, checked, output);
@@ -55,9 +55,7 @@ impl Conversion {
         *output = match (self.kind, values, self.output) {
             (ConversionKind::Cast, _, _) => Buffer::cast_results(values, self.output, checked)?,
             (ConversionKind::Keep, _, _) => Buffer::kept(values, self.output)?,
-            (ConversionKind::Truncate, crate::buffer::View::Floats(values), DType::Integer(width)) => {
-                with_width!(width, I => I::buffer(with_floats!(values, |values| values.iter().map(|&x| saturated::<I, _>(x)).collect())))
-            }
+            (ConversionKind::Truncate, crate::buffer::View::Floats(_), DType::Integer(_)) => Buffer::cast_results(values, self.output, false)?,
             (ConversionKind::Bits, crate::buffer::View::Floats(Floats::F32(values)), DType::Integer(crate::buffer::Width::I64)) => {
                 Buffer::Integers(crate::buffer::IntBuf::I64(values.iter().map(|x| i64::from(x.to_bits())).collect()))
             }
@@ -96,6 +94,9 @@ pub fn int<I: Int, F: Float>(x: F) -> Option<I> { if <F::Working as Core>::WIDE 
 /// `x` as an integer of type `I`, as Rust's `as` converts a float: NaN gives 0, a fraction gives the integer toward 0, and a value past `I`'s range gives its largest or smallest value. A type that fits an `i32` converts in vector form on every target, where `as` would convert one item at a time, as it does from an `f64` on AArch64 and from any float on x86-64.
 #[inline(always)]
 pub fn saturated<I: Int, F: Float>(x: F) -> I { if <F::Working as Core>::WIDE { I::saturated_f64(x.wide()) } else { I::saturated_f32(x.wide() as f32) } }
+/// The floor of `x` within `t` as an integer of type `I`, saturated at `I`'s range as [`saturated`] saturates: NaN gives 0. The one float-to-integer rule for conversions that change a number's domain: BPL's `ₓ` marks and Python's `astype` and integer `dtype=`.
+#[inline(always)]
+pub fn floored<I: Int, F: Float>(x: F, t: impl crate::tolerant::Tolerant) -> I { saturated(t.floor(x)) }
 
 /// `i` as the nearest float of type `F`.
 #[inline(always)]

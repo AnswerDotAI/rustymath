@@ -112,10 +112,13 @@ pub trait Ops<F: Float> {
     #[inline(always)]
     fn one_where(&self, m: Self::B) -> Self::V { self.select(m, self.number(F::one()), self.number(F::zero())) }
     /// `v` where it's one number that every item shares, known before any item is read, such as the 3 of `x^3`. A recipe can pick a cheaper formula by it. `None` where `v` varies by item.
+    #[inline(always)]
     fn constant(&self, _v: Self::V) -> Option<F> { None }
     /// Whether values are integers, as a compiler's values at an integer type are. A recipe for an integer object asks before taking an integer-only step (`Binary::BitAnd`). Floats never are.
+    #[inline(always)]
     fn integral(&self) -> bool { false }
     /// Captured tolerance; recording backends return its runtime setting slot.
+    #[inline(always)]
     fn tolerance(&self, fallback: F) -> Self::V { self.number(fallback) }
     /// The sign of `x`, as [`sign`] gives it.
     #[inline(always)]
@@ -343,6 +346,7 @@ pub fn floor<F: Float, O: Ops<F> + ?Sized>(o: &O, t: O::V, y: O::V) -> O::V {
     o.floor(raised)
 }
 
+#[inline(always)]
 pub(crate) fn integer_floor_divide<F: Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, y: O::V) -> O::V {
     let q = o.divide(x, y);
     let r = o.subtract(x, o.multiply(q, y));

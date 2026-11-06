@@ -18,7 +18,6 @@ use rustymath_buffer::py_err;
 pub fn missing(function: &str, dtype: DType) -> PyErr { py_err(Error::new(Kind::Domain, format!("{function} doesn't take {}", dtype.name()))) }
 
 pub(crate) fn comparison(mathish: bool) -> Tolerance { if mathish { Tolerance::DEFAULT } else { Tolerance::EXACT } }
-pub(crate) fn mathish_at(dtype: Option<DType>) -> bool { matches!(dtype, Some(DType::Float(FloatWidth::F64) | DType::Complex(ComplexWidth::F64))) }
 
 /// An axis, given as a position, negative from the end, or as an axis name.
 #[derive(FromPyObject)]
@@ -62,10 +61,10 @@ fn computes<K: rustymath::facts::Formula<N>, const N: usize>(function: &str, obj
     }.ok_or_else(|| missing(function, dtype))
 }
 pub(crate) fn select<K: rustymath::facts::Formula<N>, const N: usize>(
-    function: &str, object: K, dtype: DType, types: [DType; N], mathish: bool, wrapping: bool, only: Option<&[DType]>
+    function: &str, object: K, dtype: DType, types: [DType; N], wrapping: bool, only: Option<&[DType]>
 ) -> PyResult<rustymath::operation::Kernel> {
     let dtype = if only.is_some() { computes(function, &object, dtype, only)? } else { dtype };
-    let mut kernel = object.resolve(rustymath::facts::Variant { dtype, checked: true, mathish, wrapping }, types).map_err(py_err)?;
+    let mut kernel = object.resolve(rustymath::facts::Variant { dtype, checked: true, wrapping }, types).map_err(py_err)?;
     kernel.variant.checked = kernel.variant.dtype.is_integral();
     Ok(kernel)
 }
@@ -111,7 +110,7 @@ fn totals<K: rustymath::facts::Formula<2>>(
         let next = axis.map_or(Layout::EMPTY, |a| layout.axes((0..layout.shape().len()).filter(|&i| i != a)));
         let flat = [view.len()];
         let shape = axis.map_or(flat.as_slice(), |_| layout.shape());
-        let kernel = select(function, object.clone(), view.dtype(), [view.dtype(); 2], false, true, only)?;
+        let kernel = select(function, object.clone(), view.dtype(), [view.dtype(); 2], true, only)?;
         let mut buffer = Buffer::with_capacity(kernel.fold_dtype(view.dtype(), shape[axis.unwrap_or(0)], None), next.count());
         kernel.fold_read(
                 shape, axis.unwrap_or(0), rustymath::operation::Seed::Identity, rustymath::operation::Direction::Right,
@@ -139,7 +138,7 @@ fn scan<'py, K: rustymath::facts::Formula<2>>(
     let x = one(x)?;
     let view = x.view();
     let (dims, layout, _) = along_axis(x.layout(), view.len(), axis)?;
-    let kernel = select(function, object, view.dtype(), [view.dtype(); 2], false, true, only)?;
+    let kernel = select(function, object, view.dtype(), [view.dtype(); 2], true, only)?;
     let mut buffer = Buffer::with_capacity(kernel.scan_dtype(), view.len());
     released(py, || {
         kernel.scan(
@@ -186,6 +185,8 @@ macro_rules! functions {
     (@affected $ct:tt, $mathish:tt; $($rest:tt)*) => { functions!(@define true; $($rest)*); };
     (@add [], []; $m:ident, $f:path) => {};
     (@add $ct:tt, $mathish:tt; $m:ident, $f:path) => { $m.add_function(wrap_pyfunction!($f, $m)?)?; };
+    (@on [], [], $on:ident) => { _ };
+    (@on $ct:tt, $mathish:tt, $on:ident) => { $on };
     (@define $on:expr; $(#[doc = $($doc:tt)+])+ $name:ident($($x:ident),+ $(; $ct:ident)?) = $k:expr $(=> $mathish:expr)? $(, only $only:expr)? $(, wrapping $wrapping:expr)?) => {
         $(#[doc = $($doc)+])+
         #[pyfunction]
@@ -194,40 +195,38 @@ macro_rules! functions {
             let call = functions!(@convert [$($x),+])?;
             let dtype = call_dtype(&call);
             let types: [DType; { functions!(@arity [$($x),+]) }] = ::std::array::from_fn(|i| call.args[i].view().dtype());
-            let mode = functions!(@mode [$($x),+], [$($ct)?], $on, $k, dtype, None$(.or(Some($only)))?);
-            functions!(@object [$($ct)?], [$($mathish)?], mode, $k, |k| {
-                let kernel = select::<_, { functions!(@arity [$($x),+]) }>(stringify!($name), k, dtype, types, mode, false$(|| $wrapping)?, None$(.or(Some($only)))?)?;
+            functions!(@object [$($ct)?], [$($mathish)?], functions!(@mode [$($x),+], [$($ct)?], $on, $k, dtype, None$(.or(Some($only)))?), $k, |k| {
+                let kernel = select::<_, { functions!(@arity [$($x),+]) }>(stringify!($name), k, dtype, types, false$(|| $wrapping)?, None$(.or(Some($only)))?)?;
                 apply(py, &kernel, &call)
             })
         }
     };
     (@native $name:ident, [$x:ident, $y:ident], [$($ct:ident)?], [$($mathish:expr)?], $k:expr $(, only $only:expr)? $(, wrapping $wrapping:expr)?) => {
-        Some((stringify!($name), NativeBinary { kernel: |dtype, on| {
-            let mode = functions!(@mode [$x, $y], [$($ct)?], on, $k, dtype, None$(.or(Some($only)))?);
-            functions!(@object [$($ct)?], [$($mathish)?], mode, $k, |k| {
-                select::<_, 2>(stringify!($name), k, dtype, [dtype; 2], mode, false$(|| $wrapping)?, None$(.or(Some($only)))?)
+        Some((stringify!($name), NativeBinary { kernel: |dtype, functions!(@on [$($ct)?], [$($mathish)?], on)| {
+            functions!(@object [$($ct)?], [$($mathish)?], functions!(@mode [$x, $y], [$($ct)?], on, $k, dtype, None$(.or(Some($only)))?), $k, |k| {
+                select::<_, 2>(stringify!($name), k, dtype, [dtype; 2], false$(|| $wrapping)?, None$(.or(Some($only)))?)
             })
         } }))
     };
     (@native $name:ident, [$($x:ident),+], $($rest:tt)*) => { None };
     (@slopes $name:ident, [$x:ident], [$($ct:ident)?], [$($mathish:expr)?], $k:expr $(, only $only:expr)?) => {
-        |py, args, r, on| {
+        |py, args, r, functions!(@on [$($ct)?], [$($mathish)?], on)| {
             let [x] = args else { return Err(PyValueError::new_err(concat!(stringify!($name), " takes one argument"))) };
             functions!(@object [$($ct)?], [$($mathish)?], on, $k, |k| {
                 let call = convert(&[x, r])?;
-                let kernel = select::<_, 2>(stringify!($name), rustymath::derivative::Slope(k), call_dtype(&call), [call_dtype(&call); 2], on, false, None$(.or(Some($only)))?)?;
+                let kernel = select::<_, 2>(stringify!($name), rustymath::derivative::Slope(k), call_dtype(&call), [call_dtype(&call); 2], false, None$(.or(Some($only)))?)?;
                 Ok(vec![apply(py, &kernel, &call)?])
             })
         }
     };
     (@slopes $name:ident, [$x:ident, $y:ident], [$($ct:ident)?], [$($mathish:expr)?], $k:expr $(, only $only:expr)?) => {
-        |py, args, r, on| {
+        |py, args, r, functions!(@on [$($ct)?], [$($mathish)?], on)| {
             let [x, y] = args else { return Err(PyValueError::new_err(concat!(stringify!($name), " takes two arguments"))) };
             functions!(@object [$($ct)?], [$($mathish)?], on, $k, |k| {
                 let call = convert(&[x, y, r])?;
                 let dtype = call_dtype(&call);
-                let kernels = [select::<_, 3>(stringify!($name), rustymath::derivative::Slope::<_, 0>(k.clone()), dtype, [dtype; 3], on, false, None$(.or(Some($only)))?)?,
-                    select::<_, 3>(stringify!($name), rustymath::derivative::Slope::<_, 1>(k), dtype, [dtype; 3], on, false, None$(.or(Some($only)))?)?];
+                let kernels = [select::<_, 3>(stringify!($name), rustymath::derivative::Slope::<_, 0>(k.clone()), dtype, [dtype; 3], false, None$(.or(Some($only)))?)?,
+                    select::<_, 3>(stringify!($name), rustymath::derivative::Slope::<_, 1>(k), dtype, [dtype; 3], false, None$(.or(Some($only)))?)?];
                 kernels.iter().map(|kernel| apply(py, kernel, &call)).collect()
             })
         }
@@ -235,7 +234,7 @@ macro_rules! functions {
     (@slopes $name:ident, [$($x:ident),+], $($rest:tt)*) => { |_, _, _, _| Err(PyValueError::new_err(concat!(stringify!($name), " has no derivative"))) };
     (@mode [$($x:ident),+], [$($ct:ident)?], $on:expr, $ordinary:expr, $dtype:expr, $only:expr) => { $on && $dtype != DType::Character && {
         $(let $ct = Tolerance::EXACT;)?
-        mathish_at(Some(computes::<_, { functions!(@arity [$($x),+]) }>("function", &$ordinary, $dtype, $only)?))
+        computes::<_, { functions!(@arity [$($x),+]) }>("function", &$ordinary, $dtype, $only)?.mathish()
     }};
     (@object [$($ct:ident)?], [], $mode:expr, $ordinary:expr, |$k:ident| $body:block) => {{
         $(let $ct = comparison($mode);)?
@@ -260,11 +259,11 @@ const COMPLEX: &[DType] = &[DType::Complex(ComplexWidth::F32), DType::Complex(Co
 const INEXACT: &[DType] = &[REAL[0], REAL[1], REAL[2], COMPLEX[0], COMPLEX[1]];
 
 functions! {
-    /// Bitwise AND, logical for Booleans. A whole float computes as the integer it holds; any other float fails.
+    /// Bitwise AND, logical for Booleans. A float computes at int64, as the whole number it equals within the default tolerance, 1e-14. Any other float fails.
     bitwise_and(x, y) = rustymath::Bitwise(8);
-    /// Bitwise OR, logical for Booleans. A whole float computes as the integer it holds; any other float fails.
+    /// Bitwise OR, logical for Booleans. A float computes at int64, as the whole number it equals within the default tolerance, 1e-14. Any other float fails.
     bitwise_or(x, y) = rustymath::Bitwise(14);
-    /// Bitwise XOR, logical for Booleans. A whole float computes as the integer it holds; any other float fails.
+    /// Bitwise XOR, logical for Booleans. A float computes at int64, as the whole number it equals within the default tolerance, 1e-14. Any other float fails.
     bitwise_xor(x, y) = rustymath::Bitwise(6);
     /// Bitwise complement, logical negation for Booleans, as BPL's `~ᵇ` gives it: an unsigned byte's complement is an `i64`.
     bitwise_not(x) = rustymath::Bitwise(1);
@@ -770,7 +769,7 @@ pub(crate) fn histogram<'py>(
 #[pyo3(signature = (x, decimals=0))]
 pub(crate) fn round<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, decimals: i32) -> PyResult<Bound<'py, PyAny>> {
     let call = convert(&[x])?;
-    let kernel = select::<_, 1>("round", rustymath::Round::new(decimals), call_dtype(&call), [call_dtype(&call); 1], false, false, None)?;
+    let kernel = select::<_, 1>("round", rustymath::Round::new(decimals), call_dtype(&call), [call_dtype(&call); 1], false, None)?;
     apply(py, &kernel, &call)
 }
 

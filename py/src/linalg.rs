@@ -286,16 +286,12 @@ pub fn inner(f: NativeFunction<'_>, g: NativeFunction<'_>, [left, right]: [Array
     let plan = linalg::ProductPlan::matrices([left.layout(), right.layout()], 0).map_err(named)?;
     let dtype = left.dtype();
     let compute = match dtype { DType::Integer(_) => I64, DType::Float(FloatWidth::F16) => DType::Float(FloatWidth::F32), d => d };
-    let mut map = (native_binary(g.0)?.kernel)(compute, g.1)?;
-    let mut fold = (native_binary(f.0)?.kernel)(map.result_dtype(), f.1)?;
+    let map = (native_binary(g.0)?.kernel)(compute, g.1)?;
+    let fold = (native_binary(f.0)?.kernel)(map.result_dtype(), f.1)?;
     let shape = plan.iteration.shape();
     let len = rustymath::layout::count(&shape[shape.len() - plan.contracted..]);
     if len == 0 && fold.fold().is_none() { return Err(named(Error::new(Kind::Length, "no identity for an empty contraction"))); }
-    let wrapping = map.variant.wrapping;
-    map.variant.wrapping = false;
     let native = map.product_dtype(&fold, dtype);
-    if native.is_some() { fold.variant.wrapping = false; }
-    else { map.variant.wrapping = wrapping; }
     let total = native.unwrap_or_else(|| fold.fold_dtype(map.result_dtype(), len, None));
     let store = match total { DType::Integer(_) => I64, DType::Float(_) if dtype == DType::Float(FloatWidth::F16) => dtype, d => d };
     let mut output = Buffer::with_capacity(store, plan.layout.count());
@@ -303,7 +299,7 @@ pub fn inner(f: NativeFunction<'_>, g: NativeFunction<'_>, [left, right]: [Array
     Core::new(plan.layout, output).map_err(named)
 }
 
-/// The matrix product of `x1` and `x2`. A vector on the left acts as one row, and a vector on the right as one column, and the result leaves that axis out. Booleans give whether some `k` has both `x1[i, k]` and `x2[k, j]`. Integers compute in int64, and raise `OverflowError` for a result that doesn't fit.
+/// The matrix product of `x1` and `x2`. A vector on the left acts as one row, and a vector on the right as one column, and the result leaves that axis out. Booleans give whether some `k` has both `x1[i, k]` and `x2[k, j]`. Integers compute in int64 and wrap at its range, as BPL's `+.×` does.
 #[pyfunction]
 pub fn matmul<'py>(py: Python<'py>, x1: &Bound<'py, PyAny>, x2: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     product(py, ("add", false), ("multiply", false), x1, x2, Some("matmul"))

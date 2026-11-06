@@ -29,7 +29,7 @@ macro_rules! buffers {
             /// Copies `range` of `source` when it has this buffer's element type, and gives whether it could.
             pub fn extend_from(&mut self, source: $view<'_>, range: std::ops::Range<usize>) -> bool {
                 match (self, source) {
-                    $((Self::$variant(d), $view::$variant(s)) => crate::gather::copied(d, &s[range]),)+
+                    $((Self::$variant(d), $view::$variant(s)) => d.extend_from_slice(&s[range]),)+
                     #[allow(unreachable_patterns)]
                     _ => return false,
                 }
@@ -268,6 +268,9 @@ impl DType {
     /// Whether items of this dtype are whole numbers: Booleans and integers.
     #[inline]
     pub fn is_integral(self) -> bool { matches!(self, Self::Boolean | Self::Integer(_)) }
+    /// Whether Mathish forms (`tolerant::MathishFloorDivide` and the rest) apply to a call that computes at this dtype: 64-bit floats and complex numbers with 64-bit parts.
+    #[inline]
+    pub fn mathish(self) -> bool { matches!(self, Self::Float(FloatWidth::F64) | Self::Complex(ComplexWidth::F64)) }
     /// Whether items of this dtype are real numbers: Booleans, integers and floats.
     #[inline]
     pub fn is_real(self) -> bool { matches!(self, Self::Boolean | Self::Integer(_) | Self::Float(_)) }
@@ -297,14 +300,15 @@ impl DType {
             Self::Character => return None
         })
     }
-    /// The dtype that an argument of this dtype computes in, for a function with a kernel at each dtype where `has` holds. That's this dtype where it has a kernel. Otherwise it's the first with a kernel of these: for a Boolean or an integer, integers of `int` or of this dtype's width, whichever is wider, then floats of `float`; for a float or a complex number, the dtype that [`DType::inexact`] gives it; then each wider float, and each complex dtype whose parts are at least as wide. `int` and `float` are the caller's policy for exact numbers. NumPy's is `i64` and the float that `inexact` gives under `f64`. `None` where no dtype on the way has a kernel.
+    /// The dtype that an argument of this dtype computes in, for a function with a kernel at each dtype where `has` holds. That's this dtype where it has a kernel. Otherwise it's the first with a kernel of these: for a Boolean or an integer, integers of `int` or of this dtype's width, whichever is wider, then floats of `float`; for a float or a complex number, the dtype that [`DType::inexact`] gives it; then each wider float, and each complex dtype whose parts are at least as wide; and last, for a float, integers of `int`, which compute it as the whole number it holds (`operation::whole_numbers`). `int` and `float` are the caller's policy for exact numbers. NumPy's is `i64` and the float that `inexact` gives under `f64`. `None` where no dtype on the way has a kernel.
     pub fn computes_in(self, int: Width, float: FloatWidth, has: impl Fn(DType) -> bool) -> Option<DType> {
         if has(self) { return Some(self); }
-        let (integer, float) = match self {
-            Self::Boolean => (Some(Self::Integer(int)), Self::Float(float)), Self::Integer(w) => (Some(Self::Integer(w.join(int))), Self::Float(float)),
-            _ => (None, self.inexact(float)?.0)
+        let (integer, float, whole) = match self {
+            Self::Boolean => (Some(Self::Integer(int)), Self::Float(float), None), Self::Integer(w) => (Some(Self::Integer(w.join(int))), Self::Float(float), None),
+            Self::Float(_) => (None, self.inexact(float)?.0, Some(Self::Integer(int))),
+            _ => (None, self.inexact(float)?.0, None)
         };
-        integer.into_iter().chain(Self::ALL.into_iter().filter(|&d| float.widens_to(d))).find(|&d| has(d))
+        integer.into_iter().chain(Self::ALL.into_iter().filter(|&d| float.widens_to(d))).chain(whole).find(|&d| has(d))
     }
     /// The dtype that arguments of this dtype and `other` promote to: the higher kind, wide enough for both. A Boolean takes the other dtype. An integer beside a float or complex dtype takes that dtype, as in JAX, where NumPy widens the float to hold every integer exactly. A float beside a complex dtype takes parts at least as wide. `None` for characters beside numbers.
     pub fn common(self, other: DType) -> Option<DType> {
@@ -456,10 +460,10 @@ impl Buffer {
     /// Copies `range` of `source` when it has this buffer's dtype, and gives whether it could. Integers of another width don't copy.
     pub fn extend_from(&mut self, source: View<'_>, range: std::ops::Range<usize>) -> bool {
         match (self, source) {
-            (Self::Booleans(d), View::Booleans(s)) => crate::gather::copied(d, &s[range]),
+            (Self::Booleans(d), View::Booleans(s)) => d.extend_from_slice(&s[range]),
             (Self::Integers(d), View::Integers(s)) => return d.extend_from(s, range), (Self::Floats(d), View::Floats(s)) => return d.extend_from(s, range),
             (Self::Complexes(d), View::Complexes(s)) => return d.extend_from(s, range),
-            (Self::Characters(d), View::Characters(s)) => crate::gather::copied(d, &s[range]), _ => return false
+            (Self::Characters(d), View::Characters(s)) => d.extend_from_slice(&s[range]), _ => return false
         }
         true
     }
@@ -804,8 +808,7 @@ impl Buffer {
     pub fn cast_mapped(view: View<'_>, mapping: &crate::agreement::Mapping, n: usize, dtype: DType) -> Result<Self, Error> {
         use crate::agreement::{Binding, Missing, Read, ReadPlan};
         let mut sources = vec![Binding::full(view)];
-        let missing = if view.dtype() == DType::Character { sources.push(Binding::full(View::Characters(&[' ']))); Missing::Scalar(1) }
-        else { Missing::Default };
+        let missing = Missing::prototype(view.dtype(), &mut sources);
         let plan = ReadPlan::copy(0, view.len(), mapping.clone(), n, missing);
         let mut output = Self::with_capacity(dtype, n);
         Read { sources: &sources, plan: &plan }.read_into(0..n, dtype, true, &mut output)?;
@@ -814,6 +817,16 @@ impl Buffer {
 }
 
 impl Buffer {
+    /// The items of `view` as integers of `dtype`, as BPL's `ₓ` marks and Python's `astype` convert them: a float takes its floor within `t` and saturates at the range, NaN giving 0 ([`crate::convert::floored`]); an integer wraps to the width; a Boolean gives 0 or 1. Other items and targets convert as [`Buffer::cast`] converts them.
+    pub fn floored(view: View<'_>, dtype: DType, t: impl crate::tolerant::Tolerant) -> Result<Self, Error> {
+        match (view, dtype) {
+            (View::Floats(values), DType::Integer(width)) => {
+                Ok(with_width!(width, I => I::buffer(with_floats!(values, |values| values.iter().map(|&x| crate::convert::floored::<I, _>(x, t)).collect()))))
+            }
+            (View::Integers(_) | View::Booleans(_), DType::Integer(_)) => Self::cast_results(view, dtype, false),
+            _ => Self::cast(view, dtype),
+        }
+    }
     pub fn cast_results(view: View<'_>, dtype: DType, checked: bool) -> Result<Self, Error> {
         match (view, dtype) {
             (View::Floats(values), DType::Integer(width)) => {
@@ -827,7 +840,7 @@ impl Buffer {
                 let items = (0..view.len()).map(|i| {
                     let value = integer(view, i).ok().and_then(|x| u32::try_from(x).ok()).and_then(char::from_u32);
                     match value {
-                        Some(value) => Ok(value), None if checked => Err(Error::new(Kind::Domain, "result is not a Unicode character")), None => Ok(' ')
+                        Some(value) => Ok(value), None if checked => Err(Error::new(Kind::Domain, "result is not a Unicode character")), None => Ok(char::FILL)
                     }
                 }).collect::<Result<Vec<_>, _>>()?;
                 Ok(Self::Characters(items))

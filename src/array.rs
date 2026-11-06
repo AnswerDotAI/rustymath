@@ -31,14 +31,10 @@ impl<'a> ArrayView<'a> {
     pub fn with_layout<'b>(&self, layout: &'b Layout) -> Result<ArrayView<'b>, Error> where 'a: 'b {
         ArrayView::new(layout, self.sources.clone(), self.plan.clone())
     }
-    /// Composes a call's positional read. A character prototype is an ordinary scalar source, so projecting the sources to codes keeps its space.
+    /// Composes a call's positional read. Missing positions read the prototype (`Missing::prototype`).
     pub fn remapped(&self, mapping: Mapping, items: usize) -> Self {
         let mut sources = self.sources.clone();
-        let missing = if self.dtype() == DType::Character {
-            let source = sources.len();
-            sources.push(Binding::full(View::Characters(&[' '])));
-            Missing::Scalar(source)
-        } else { Missing::Default };
+        let missing = Missing::prototype(self.dtype(), &mut sources);
         Self { layout: self.layout, sources, plan: self.plan.remapped(mapping, items, missing) }
     }
     pub fn contiguous(&self) -> Option<View<'a>> {
@@ -112,7 +108,7 @@ impl Array {
                 if fill.len() != 1 { return Err(Error::new(Kind::Length, "a fill must contain one item")); }
                 Some(Arc::new(Buffer::kept(fill.view(), self.dtype())?))
             }
-            None if self.dtype() == DType::Character => Some(Arc::new(Buffer::Characters(vec![' ']))),
+            None if self.dtype() == DType::Character => Some(Arc::new(Buffer::Characters(vec![char::FILL]))),
             None => None,
         };
         let missing = fill.map_or(Missing::Default, |fill| {
@@ -191,7 +187,7 @@ impl Array {
         let len = next.layout.count();
         let x = source.remapped(Mapping::from(next.steps), len);
         let y = source.remapped(Mapping::from(previous.steps), len);
-        let variant = crate::facts::Variant { dtype: source.dtype(), checked: true, mathish: false, wrapping: true };
+        let variant = crate::facts::Variant { dtype: source.dtype(), checked: true, wrapping: true };
         let k = if source.dtype() == DType::Boolean { Kernel::new(crate::reduce::Xor, variant) } else { Kernel::new(crate::Subtract, variant) };
         let mut buffer = Buffer::with_capacity(source.dtype(), len);
         k.map(&[x.read(), y.read()], 0..len, Settings::default(), &mut buffer)?;

@@ -174,8 +174,7 @@ impl Product { pub fn compares_exactly(self) -> bool { matches!(self, Self::Plus
 /// Layout and reads of an inner product. Contracted axes follow output axes in `iteration`.
 #[derive(Clone, Debug)]
 pub struct ProductPlan {
-    pub layout: crate::layout::Layout, pub iteration: crate::layout::Layout, pub mappings: [Mapping; 2], pub contracted: usize,
-    pub matrix: Option<MatrixProduct>
+    pub layout: crate::layout::Layout, pub iteration: crate::layout::Layout, pub mappings: [Mapping; 2], pub contracted: usize
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -196,20 +195,25 @@ impl ProductPlan {
         let rank = iteration.shape().len();
         if contracted > rank { return Err(Error::new(crate::error::Kind::Rank, "too many contracted axes")); }
         let layout = iteration.axes(0..rank - contracted);
-        Ok(Self { layout, iteration, mappings, contracted, matrix: None })
+        Ok(Self { layout, iteration, mappings, contracted })
     }
 
+    /// The matrix product that runs this plan, from the iteration axes each operand steps along: its read's steps where the read reaches its items positionally, and otherwise its `mappings` entry's, which says which items it reads. An axis of one item that neither steps along takes the class of the axis before it. `None` where the axes don't fall into frames, rows and columns, in that order.
     pub fn matrix_for(&self, inputs: [crate::agreement::Read<'_>; 2]) -> Option<MatrixProduct> {
-        if self.matrix.is_some() { return self.matrix; }
         let shape = self.iteration.shape();
         let mut owners = vec![0; shape.len() - self.contracted];
         for (side, input) in inputs.iter().enumerate() {
             let plan = input.plan.remapped(self.mappings[side].clone(), self.iteration.count(), crate::agreement::Missing::Invalid);
-            let (_, map) = crate::agreement::Read { sources: input.sources, plan: &plan }.positional(shape)?;
+            let map = crate::agreement::Read { sources: input.sources, plan: &plan }.positional(shape).map_or_else(|| self.mappings[side].clone(), |(_, map)| map);
             let (_, steps) = map.affine(shape)?;
             for (axis, owner) in owners.iter_mut().enumerate() { if steps[axis] != 0 { *owner |= 1 << side; } }
         }
-        for owner in &mut owners { if *owner == 0 { *owner = 3; } }
+        // An axis of one item adds nothing to any size, so any class that keeps the order serves.
+        let mut last = 3;
+        for (owner, &len) in owners.iter_mut().zip(shape) {
+            if *owner == 0 { *owner = if len == 1 { last } else { 3 }; }
+            last = *owner;
+        }
         MatrixProduct::of(shape, &owners)
     }
     pub fn dot([left, right]: [&crate::layout::Layout; 2]) -> Result<Self, Error> {
@@ -272,10 +276,7 @@ impl ProductPlan {
             for (p, &a) in contracted[i].iter().enumerate() { axes[a] = first + p; }
             Mapping::new(inputs[i], &axes, &iteration, items)
         });
-        let mut owners = vec![0u8; first];
-        for (side, axes) in destinations.iter().enumerate() { for &axis in axes { owners[axis] |= 1 << side; } }
-        let matrix = MatrixProduct::of(iteration.shape(), &owners);
-        Ok(Self { layout, iteration, mappings, contracted: pairs.len(), matrix })
+        Ok(Self { layout, iteration, mappings, contracted: pairs.len() })
     }
 }
 

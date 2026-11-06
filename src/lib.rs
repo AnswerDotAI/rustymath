@@ -65,7 +65,7 @@ pub use float::{FUSED, Float, Native};
 pub use hyperbolic::{RealAcosh, RealAtanh};
 pub use ln::{Ln, Log1p, Log2, Log10, Logb, MathishLogb, RealLn};
 pub use parts::{Abs, Angle, Choose, Clip, Conj, Imag, Isfinite, Isinf, Isnan, Real, Rint, Round, Scale, Sign, Trunc};
-pub use pow::{Exponent, Pow, RealPow, Root, WholePow, WrappingPow};
+pub use pow::{Exponent, Pow, RealPow, Root};
 pub use slice::{Arg, Binary, CHUNK, Flipped, KernelItem, Results, Ternary, Unary, Wrapped, choose, pairs};
 pub use special::{BetaincAt, Erfc, Erfcinv, Erfinv};
 pub use sqrts::{RealSqrt, RealSqrt1mx2, RealSqrtm1mx2, RealSqrtx2m1, Sqrt};

@@ -37,20 +37,28 @@ impl Positions<'_> {
     }
 }
 
+/// How a kernel reads its inputs before its formula runs (`Kernel::projection`, `with_projected`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Projection {
+    /// As they are.
+    AsIs,
+    /// Characters as their codes, under a code policy, and floats as whole numbers.
+    Codes,
+    /// Floats as the whole numbers they stand for, where the kernel computes at an integral dtype from float arguments.
+    Wholes,
+}
+
 /// A write's logical root, or storage transferred by its final reader.
 pub enum WriteRoot<'a> { Read(crate::agreement::Read<'a>), Owned(Buffer) }
 impl WriteRoot<'_> {
-    fn len(&self) -> usize { match self { Self::Read(read) => read.plan.len(), Self::Owned(buffer) => buffer.len() } }
-    fn initialize(self, dtype: DType, checked: bool, codes: bool, output: &mut Buffer) -> Result<(), Error> {
-        match self {
-            Self::Read(read) if codes => with_codes(&[read], None, |reads| reads[0].read_into(0..read.plan.len(), dtype, checked, output)),
-            Self::Read(read) => read.read_into(0..read.plan.len(), dtype, checked, output),
-            Self::Owned(buffer) if buffer.dtype() == dtype => { *output = buffer; Ok(()) }
-            Self::Owned(buffer) => {
-                let view = if codes { crate::characters::as_codes(buffer.view()) } else { buffer.view() };
-                *output = Buffer::cast_results(view, dtype, checked)?;
-                Ok(())
-            }
+    /// The written array's starting items, read at `dtype` as the combining kernel reads its inputs (`Kernel::projection`).
+    fn initialize(self, dtype: DType, checked: bool, projection: Projection, output: &mut Buffer) -> Result<(), Error> {
+        match (self, projection) {
+            (Self::Read(read), Projection::AsIs) => read.read_into(0..read.plan.len(), dtype, checked, output),
+            (Self::Read(read), projection) => with_projected(&[read], None, projection, |reads| reads[0].read_into(0..read.plan.len(), dtype, checked, output)),
+            (Self::Owned(buffer), _) if buffer.dtype() == dtype => { *output = buffer; Ok(()) }
+            (Self::Owned(buffer), Projection::AsIs) => { *output = Buffer::cast_results(buffer.view(), dtype, checked)?; Ok(()) }
+            (Self::Owned(buffer), projection) => { *output = with_projected_view(buffer.view(), projection, |view| Buffer::cast_results(view, dtype, checked))??; Ok(()) }
         }
     }
 }
@@ -83,7 +91,7 @@ pub type Pieces<'a> = dyn Fn(std::ops::Range<usize>, &mut dyn FnMut(usize, Piece
 /// One resolved mathematical definition and its captured numerical policies.
 #[derive(Clone)]
 pub struct Kernel {
-    pub variant: crate::facts::Variant, result: DType, boolean_inputs: bool, repair: bool, raising: bool,
+    pub variant: crate::facts::Variant, result: DType, boolean_inputs: bool, repair: bool, raising: bool, wholes: bool,
     policy: Option<crate::characters::Policy>, definition: std::sync::Arc<dyn Application>
 }
 
@@ -144,7 +152,7 @@ trait Application: Send + Sync {
         &self, variant: crate::facts::Variant, dims: [usize; 3], seed: Option<crate::agreement::Read<'_>>, flip: bool, settings: Settings,
         input: crate::agreement::Read<'_>, output: &mut Buffer) -> Result<(), Error>;
     fn at(
-        &self, variant: crate::facts::Variant, root: WriteRoot<'_>, values: crate::agreement::Read<'_>, ids: Positions<'_>, checked: bool, codes: bool,
+        &self, variant: crate::facts::Variant, root: WriteRoot<'_>, values: crate::agreement::Read<'_>, ids: Positions<'_>, checked: bool, projection: Projection,
         settings: Settings, output: &mut Buffer
     ) -> Result<(), Error>;
     fn scan(
@@ -160,7 +168,7 @@ impl<K: crate::facts::Formula<N>, const N: usize> Application for Definition<K, 
         if args.len() != N { return Err(Error::new(Kind::Length, "scalar operand count changed")); }
         self.object.exact(std::array::from_fn(|i| &args[i]))
     }
-    fn has_exact(&self) -> bool { self.object.has_exact() }
+    fn has_exact(&self) -> bool { K::HAS_EXACT }
     fn integer(&self, variant: crate::facts::Variant, args: &[i64]) -> Result<i64, Error> {
         let x: [i64; N] = args.try_into().map_err(|_| Error::new(Kind::Length, "scalar operand count changed"))?;
         let width = match variant.dtype {
@@ -198,10 +206,10 @@ impl<K: crate::facts::Formula<N>, const N: usize> Application for Definition<K, 
     }
     fn arity(&self) -> usize { N }
     fn inputs(&self) -> &[crate::facts::Range] { &self.inputs }
-    fn integer_formula(&self) -> bool { self.object.integer_formula() }
+    fn integer_formula(&self) -> bool { K::INTEGER_FORMULA }
     fn may_raise(&self, variant: crate::facts::Variant, ranges: &[crate::facts::Range]) -> bool {
         if variant.dtype == DType::Boolean && ranges.iter().all(|r| r.within(0.0, 1.0)) { return boolean_raises(&self.object, variant); }
-        if matches!(variant.dtype, DType::Complex(_)) || variant.dtype.is_integral() && !self.object.integer_formula() { return true; }
+        if matches!(variant.dtype, DType::Complex(_)) || variant.dtype.is_integral() && !K::INTEGER_FORMULA { return true; }
         let Ok(args) = ranges.try_into() else { return true; };
         // A float result raises only outside the domain that the formula declares (`Formula::domain`): range arithmetic can't show that a result isn't NaN.
         if matches!(variant.dtype, DType::Float(_)) && self.object.domain(variant.dtype, args).is_some() { return false; }
@@ -233,7 +241,7 @@ impl<K: crate::facts::Formula<N>, const N: usize> Application for Definition<K, 
     fn range(&self, x: &[crate::facts::Range]) -> crate::facts::Range { x.try_into().map_or(crate::facts::Range::ANY, |x| self.object.range(x)) }
     fn ordered_kinds(&self, classes: [i32; 2]) -> Option<crate::characters::ByKinds> {
         if N != 2 || self.object.character_rule() != Some(crate::characters::Rule::Ordered) { return None; }
-        Some(crate::characters::ByKinds::ordered(classes, self.object.ordered_kinds(classes)?, self.object.boolean()))
+        Some(crate::characters::ByKinds::ordered(classes, self.object.ordered_kinds(classes)?, K::BOOLEAN))
     }
     fn identity(&self) -> Option<f64> { self.object.identity().last().copied().flatten() }
     fn kept(&self, constants: &[Option<f64>]) -> Option<usize> {
@@ -264,9 +272,9 @@ impl<K: crate::facts::Formula<N>, const N: usize> Application for Definition<K, 
         adjacent_formula::<K, N>(&self.object, variant, dims, seed, flip, settings, input, output)
     }
     fn at(
-        &self, variant: crate::facts::Variant, root: WriteRoot<'_>, values: crate::agreement::Read<'_>, ids: Positions<'_>, checked: bool, codes: bool,
+        &self, variant: crate::facts::Variant, root: WriteRoot<'_>, values: crate::agreement::Read<'_>, ids: Positions<'_>, checked: bool, projection: Projection,
         settings: Settings, output: &mut Buffer
-    ) -> Result<(), Error> { at_formula(&self.object, variant, root, values, ids, checked, codes, settings, output) }
+    ) -> Result<(), Error> { at_formula(&self.object, variant, root, values, ids, checked, projection, settings, output) }
     fn scan(
         &self, variant: crate::facts::Variant, dims: [usize; 3], seed: Seed<'_>, direction: Direction, settings: Settings, input: crate::agreement::Read<'_>,
         output: &mut Buffer) -> Result<(), Error> { scan_formula(&self.object, variant, dims, seed, direction, settings, input, output) }
@@ -297,50 +305,14 @@ impl Kernel {
         if real_part && let DType::Complex(width) = kernel.result { kernel.result = DType::Float(width.into()); }
         Ok(Some(kernel))
     }
-    pub fn unary(op: crate::recipe::Unary, variant: crate::facts::Variant) -> Option<Self> {
-        use crate::recipe::Unary::*;
-        macro_rules! kernel {
-            ($object:expr) => {
-                crate::facts::Formula::kernel(&$object, variant)
-            };
-        }
-        match op {
-            Negate => kernel!(crate::Negate), Magnitude => kernel!(crate::Abs), Sqrt => kernel!(crate::Sqrt),
-            Floor => kernel!(crate::tolerant::Floor(crate::tolerant::Tolerance::EXACT)), Ln => kernel!(crate::Ln), Sin => kernel!(crate::Sin),
-            Cos => kernel!(crate::Cos), Sinh => kernel!(crate::Sinh), Cosh => kernel!(crate::Cosh), Sqrt1mx2 => kernel!(crate::Sqrt1mx2),
-            Sqrt1px2 => kernel!(crate::Sqrt1px2), Digamma => kernel!(crate::Digamma), Exp => kernel!(crate::Exp), Lgamma => kernel!(crate::Lgamma),
-            Not => kernel!(crate::facts::Complement)
-        }
-    }
-    pub fn binary(op: crate::recipe::Binary, variant: crate::facts::Variant) -> Option<Self> {
-        use crate::recipe::Binary::*;
-        macro_rules! kernel {
-            ($object:expr) => {
-                crate::facts::Formula::kernel(&$object, variant)
-            };
-        }
-        match op {
-            Add => kernel!(crate::Add), Subtract => kernel!(crate::Subtract), Multiply => kernel!(crate::Multiply), Divide => kernel!(crate::Divide),
-            Power => kernel!(crate::Pow), Larger => kernel!(crate::reduce::Maximum), Smaller => kernel!(crate::reduce::Minimum), Binom => kernel!(crate::Binom),
-            BinomDn => kernel!(crate::BinomDn), BinomDk => kernel!(crate::BinomDk), Polygamma => kernel!(crate::Polygamma), BitAnd => kernel!(crate::BitAnd)
-        }
-    }
-    pub fn compare(op: crate::recipe::Cmp, variant: crate::facts::Variant) -> Option<Self> {
-        crate::facts::Formula::kernel(&crate::facts::Comparison(op), variant)
-    }
-    pub fn integer(op: crate::recipe::Integer, variant: crate::facts::Variant) -> Option<Self> {
-        crate::facts::Formula::kernel(&crate::facts::IntegerOperation(op), variant)
-    }
-    pub fn integer_compare(op: crate::recipe::Cmp, variant: crate::facts::Variant) -> Option<Self> {
-        crate::facts::Formula::kernel(&crate::facts::IntegerComparison(op), variant)
-    }
     pub fn new<K: crate::facts::Formula<N>, const N: usize>(object: K, variant: crate::facts::Variant) -> Self { Self::typed(object, variant, [variant.dtype; N]) }
     /// The kernel for arguments of `types`, whose values bound the errors it can raise (`may_raise`).
     fn typed<K: crate::facts::Formula<N>, const N: usize>(object: K, variant: crate::facts::Variant, types: [DType; N]) -> Self {
         let result = object.result_dtype(variant.dtype);
         let definition: std::sync::Arc<dyn Application> = std::sync::Arc::new(Definition::<K, N> { object, inputs: types.map(Range::of_dtype) });
         let raising = definition.may_raise(variant, definition.inputs());
-        Self { repair: true, raising, result, policy: None, boolean_inputs: types.iter().all(|&d| d == DType::Boolean), variant, definition }
+        let wholes = variant.dtype.is_integral() && types.iter().any(|d| matches!(d, DType::Float(_)));
+        Self { repair: true, raising, result, policy: None, boolean_inputs: types.iter().all(|&d| d == DType::Boolean), wholes, variant, definition }
     }
     pub fn try_resolve<K: crate::facts::Formula<N>, const N: usize>(object: K, mut variant: crate::facts::Variant, types: [DType; N]) -> Result<Option<Self>, Error> {
         use crate::characters::{ByKinds, Policy};
@@ -360,7 +332,7 @@ impl Kernel {
                 result
             }
             None => {
-                if object.boolean() && variant.dtype.is_integral() {
+                if K::BOOLEAN && variant.dtype.is_integral() {
                     let Some(dtype) = types.into_iter().try_fold(DType::Boolean, DType::common) else { return Ok(None); };
                     variant.dtype = dtype;
                 }
@@ -425,10 +397,10 @@ impl Kernel {
         x: &[crate::facts::Slot]) -> Option<crate::facts::Slot> { self.definition.repair_predicate(ops, x) }
     pub fn repair_routine(&self) -> Option<crate::facts::Repair> { if self.repair { self.definition.repair_routine() } else { None } }
     /// Whether checked execution can record a numeric data error, for arguments that hold any values of their types.
-    pub fn may_raise(&self) -> bool { self.variant.checked && (self.result == DType::Character || self.raising) }
+    pub fn may_raise(&self) -> bool { self.variant.checked && (self.result == DType::Character || self.wholes || self.raising) }
     /// Whether checked execution can record a numeric data error where each argument holds values of its type within its range in `narrowed`, such as a constant's own value or the nonnegative numbers.
     pub fn may_raise_on(&self, narrowed: &[Range]) -> bool {
-        self.variant.checked && (self.result == DType::Character || self.definition.may_raise(self.variant, &self.points(narrowed)))
+        self.variant.checked && (self.result == DType::Character || self.wholes || self.definition.may_raise(self.variant, &self.points(narrowed)))
     }
     /// Whether every result is nonnegative where each argument holds values of its type within its range in `narrowed`. A fold by a dyadic formula keeps the fact where `nonnegative_on(&[Range::NONNEGATIVE; 2])` holds.
     pub fn nonnegative_on(&self, narrowed: &[Range]) -> bool { self.range(&self.points(narrowed)).lo >= 0.0 }
@@ -480,6 +452,26 @@ impl Kernel {
         if matches!(self.policy, Some(crate::characters::Policy::Kinds(_))) { return None; }
         self.definition.product(variant, fold.fold(), boolean_inputs, wanted, settings)
     }
+    /// How this kernel reads its inputs (`with_projected`): characters as codes under a code policy, floats as whole numbers where it computes at an integral dtype from float arguments, and otherwise as they are.
+    fn projection(&self) -> Projection {
+        match self.policy { Some(crate::characters::Policy::Codes { .. }) => Projection::Codes, None if self.wholes => Projection::Wholes, _ => Projection::AsIs }
+    }
+    /// `call` on `inputs` and `seed`'s read as this kernel reads them (`projection`): over `range`, or over the whole of each read where `None`. `range` applies to every read, so a call with a seed passes `None`.
+    fn projected<R>(
+        &self, inputs: &[crate::agreement::Read<'_>], range: Option<std::ops::Range<usize>>, seed: Seed<'_>,
+        call: impl FnOnce(&[crate::agreement::Read<'_>], Seed<'_>) -> Result<R, Error>
+    ) -> Result<R, Error> {
+        let projection = self.projection();
+        if projection == Projection::AsIs { return call(inputs, seed); }
+        let mut all = inputs.to_vec();
+        match seed { Seed::Initial(r) | Seed::Tail(r) => all.push(r), Seed::Identity => {} }
+        with_projected(&all, range, projection, |projected| {
+            let seed = match seed {
+                Seed::Initial(_) => Seed::Initial(projected[inputs.len()]), Seed::Tail(_) => Seed::Tail(projected[inputs.len()]), Seed::Identity => Seed::Identity
+            };
+            call(&projected[..inputs.len()], seed)
+        })
+    }
     pub fn map(&self, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, output: &mut Buffer) -> Result<(), Error> {
         use crate::characters::{ByKinds, Policy};
         if inputs.len() != self.arity() { return Err(Error::new(Kind::Length, "kernel operand count changed")); }
@@ -491,33 +483,39 @@ impl Kernel {
                 let side = usize::from(side == ByKinds::Right);
                 inputs[side].read_into(range, self.result, self.variant.checked, output)?;
             }
-            Some(Policy::Codes { .. }) => {
-                with_codes(inputs, Some(range.clone()), |inputs| self.definition.map(self.variant, inputs, range, settings, self.repair, self.may_raise(), output))?
-            }
-            None => self.definition.map(self.variant, inputs, range, settings, self.repair, self.may_raise(), output)?,
+            _ => self.projected(inputs, Some(range.clone()), Seed::Identity, |inputs, _| self.definition.map(self.variant, inputs, range, settings, self.repair, self.may_raise(), output))?,
         }
         finish(output, wanted, self.variant)
     }
     pub fn fold_pieces(
         &self, dims: [usize; 3], seed: Seed<'_>, direction: Direction, settings: Settings, pieces: &Pieces<'_>, output: &mut Buffer) -> Result<(), Error> {
         let dtype = output.dtype();
-        if matches!(self.policy, Some(crate::characters::Policy::Codes { .. })) {
-            let projected = |range, f: &mut dyn FnMut(usize, Piece<'_>)| {
-                pieces(range, &mut |range, piece| match piece {
-                    Piece::Items(view) => f(range, Piece::Items(crate::characters::as_codes(view))), Piece::Total(total) => f(range, Piece::Total(total))
-                })
-            };
-            with_code_inputs(&[], seed, |_, seed| self.definition.fold_pieces(self.variant, dims, seed, direction, settings, &projected, output))?;
-        } else { self.definition.fold_pieces(self.variant, dims, seed, direction, settings, pieces, output)?; }
+        match self.projection() {
+            projection @ (Projection::Codes | Projection::Wholes) => {
+                let projected = |range, f: &mut dyn FnMut(usize, Piece<'_>)| {
+                    pieces(range, &mut |range, piece| match piece {
+                        Piece::Items(view) => {
+                            let n = view.len();
+                            // A piece that isn't whole numbers records its error, and the fold reads zeros in its place.
+                            if let Err(error) = with_projected_view(view, projection, |view| f(range, Piece::Items(view))) {
+                                crate::error::record(error);
+                                f(range, Piece::Items(View::Integers(crate::buffer::Ints::I64(&vec![0; n]))));
+                            }
+                        }
+                        Piece::Total(total) => f(range, Piece::Total(total))
+                    })
+                };
+                crate::error::checked(|| self.projected(&[], None, seed, |_, seed| self.definition.fold_pieces(self.variant, dims, seed, direction, settings, &projected, output)))?;
+            }
+            Projection::AsIs => self.definition.fold_pieces(self.variant, dims, seed, direction, settings, pieces, output)?,
+        }
         finish(output, dtype, self.variant)
     }
     pub fn scan(
         &self, dims: [usize; 3], seed: Seed<'_>, direction: Direction, settings: Settings, input: crate::agreement::Read<'_>, output: &mut Buffer
     ) -> Result<(), Error> {
         let dtype = output.dtype();
-        if matches!(self.policy, Some(crate::characters::Policy::Codes { .. })) {
-            with_code_inputs(&[input], seed, |inputs, seed| self.definition.scan(self.variant, dims, seed, direction, settings, inputs[0], output))?;
-        } else { self.definition.scan(self.variant, dims, seed, direction, settings, input, output)?; }
+        self.projected(&[input], None, seed, |inputs, seed| self.definition.scan(self.variant, dims, seed, direction, settings, inputs[0], output))?;
         finish(output, dtype, self.variant)
     }
     /// Each item of `input`, an array of shape `dims`, combined with the item a row before it along the middle axis, and each lane's first row with `seed`, or kept as it is without one, as an inverse scan runs: `flip` swaps the arguments, so the earlier item comes second. The results take `output`'s dtype, so a comparison's 0s and 1s and an unseeded first row keep the items' type where the caller asks for it.
@@ -525,23 +523,17 @@ impl Kernel {
         &self, dims: [usize; 3], seed: Option<crate::agreement::Read<'_>>, flip: bool, settings: Settings, input: crate::agreement::Read<'_>, output: &mut Buffer
     ) -> Result<(), Error> {
         let dtype = output.dtype();
-        if matches!(self.policy, Some(crate::characters::Policy::Codes { .. })) {
-            with_code_inputs(&[input], seed.map_or(Seed::Identity, Seed::Initial), |inputs, seed| {
-                let seed = match seed { Seed::Initial(read) | Seed::Tail(read) => Some(read), Seed::Identity => None };
-                self.definition.adjacent(self.variant, dims, seed, flip, settings, inputs[0], output)
-            })?;
-        } else { self.definition.adjacent(self.variant, dims, seed, flip, settings, input, output)?; }
+        self.projected(&[input], None, seed.map_or(Seed::Identity, Seed::Initial), |inputs, seed| {
+            let seed = match seed { Seed::Initial(read) | Seed::Tail(read) => Some(read), Seed::Identity => None };
+            self.definition.adjacent(self.variant, dims, seed, flip, settings, inputs[0], output)
+        })?;
         finish(output, dtype, self.variant)
     }
     pub fn fold_read(
         &self, shape: &[usize], axis: usize, seed: Seed<'_>, direction: Direction, settings: Settings, input: crate::agreement::Read<'_>, output: &mut Buffer
     ) -> Result<(), Error> {
         let dtype = output.dtype();
-        if matches!(self.policy, Some(crate::characters::Policy::Codes { .. })) {
-            with_code_inputs(&[input], seed, |inputs, seed| {
-                self.definition.fold_read(self.variant, shape, axis, seed, direction, settings, inputs[0], output)
-            })?;
-        } else { self.definition.fold_read(self.variant, shape, axis, seed, direction, settings, input, output)?; }
+        self.projected(&[input], None, seed, |inputs, seed| self.definition.fold_read(self.variant, shape, axis, seed, direction, settings, inputs[0], output))?;
         finish(output, dtype, self.variant)
     }
 }
@@ -592,9 +584,7 @@ pub fn product(
     use crate::agreement::{Missing, Read};
     let dtype = output.dtype();
     if let Some(native) = map.native_product(map.variant, fold, map.boolean_inputs, Some(dtype), settings) {
-        let ran = if matches!(map.policy, Some(crate::characters::Policy::Codes { .. })) {
-            with_codes(&inputs, None, |inputs| (native.run)(map.variant, [inputs[0], inputs[1]], plan, output))?
-        } else { (native.run)(map.variant, inputs, plan, output)? };
+        let ran = map.projected(&inputs, None, Seed::Identity, |inputs, _| (native.run)(map.variant, [inputs[0], inputs[1]], plan, output))?;
         if ran {
             return finish(output, dtype, crate::facts::Variant { checked: map.variant.checked || fold.variant.checked, ..map.variant });
         }
@@ -671,7 +661,7 @@ fn product_result<T: Element, P: crate::linalg::Inner<T>>(variant: crate::facts:
 fn product_typed<T: crate::buffer::Cast, P: crate::linalg::Inner<T>>(
     pair: P, variant: crate::facts::Variant, inputs: [crate::agreement::Read<'_>; 2], plan: &crate::linalg::ProductPlan, output: &mut Buffer
 ) -> Result<bool, Error> where P::Out: crate::buffer::Cast {
-    use crate::agreement::{Mapping, Missing, Read, Walked};
+    use crate::agreement::{Mapping, Missing, Read};
     use crate::gather::Steps;
     use crate::linalg::{Mapped, Orientation};
     let Some(matrix) = plan.matrix_for(inputs) else { return Ok(false); };
@@ -685,83 +675,100 @@ fn product_typed<T: crate::buffer::Cast, P: crate::linalg::Inner<T>>(
         let left = expanded[0].remapped(Mapping::Steps { base, steps: vec![Steps::along(m, n * k), Steps::along(k, 1)].into() }, m * k, Missing::Invalid);
         let right = expanded[1].remapped(Mapping::Steps { base, steps: vec![Steps::along(k, 1), Steps::along(n, k)].into() }, k * n, Missing::Invalid);
         let reads = [Read { sources: inputs[0].sources, plan: &left }, Read { sources: inputs[1].sources, plan: &right }];
+        let (mut a_items, mut b_items) = (Vec::new(), Vec::new());
         if T::DTYPE.is_integral() {
-            let (mut a, mut b) = (Vec::new(), Vec::new());
-            let a = reads[0].part::<T>(0..m * k, variant.checked, &mut a)?;
-            let b = reads[1].part::<T>(0..k * n, variant.checked, &mut b)?;
-            let a = match a { Arg::One(x) => std::borrow::Cow::Owned(vec![x; m * k]), Arg::Many(x) => std::borrow::Cow::Borrowed(x) };
-            let b = match b { Arg::One(x) => std::borrow::Cow::Owned(vec![x; k * n]), Arg::Many(x) => std::borrow::Cow::Borrowed(x) };
+            let a = read_all::<T>(&reads[0], m * k, variant.checked, &mut a_items)?;
+            let b = read_all::<T>(&reads[1], k * n, variant.checked, &mut b_items)?;
             let start = result.len();
             result.resize(start + m * n, P::Out::default());
             if !pair.checked_into(&a, &b, matrix.size, &mut result[start..]) {
                 return if variant.checked { Err(Error::new(Kind::Overflow, "product does not fit its integer result")) } else { Ok(false) };
             }
         } else {
-            let (Some((av, am)), Some((bv, bm))) = (reads[0].positional(&[m, k]), reads[1].positional(&[k, n])) else { return Ok(false); };
-            let (Some(a), Some(b)) = (T::of(av), T::of(bv)) else { return Ok(false); };
-            let (am, bm) = (Walked::from(am), Walked::from(bm));
-            result.extend(pair.inner_mapped(Mapped { data: a, mapping: &am }, Mapped { data: b, mapping: &bm }, [Orientation::Normal; 2], matrix.size));
+            let (a, am) = matrix_items::<T>(&reads[0], [m, k], variant.checked, &mut a_items)?;
+            let (b, bm) = matrix_items::<T>(&reads[1], [k, n], variant.checked, &mut b_items)?;
+            result.extend(pair.inner_mapped(Mapped { data: &a[..], mapping: &am }, Mapped { data: &b[..], mapping: &bm }, [Orientation::Normal; 2], matrix.size));
         }
     }
     *output = P::Out::buffer(result);
     Ok(true)
 }
 
+/// The `len` items that `read` reads, as one slice: `scratch` holds them where the read copies them.
+fn read_all<'a, T: crate::buffer::Cast>(read: &'a crate::agreement::Read<'_>, len: usize, checked: bool, scratch: &'a mut Vec<T>) -> Result<std::borrow::Cow<'a, [T]>, Error> {
+    Ok(match read.part::<T>(0..len, checked, scratch)? { Arg::One(x) => std::borrow::Cow::Owned(vec![x; len]), Arg::Many(x) => std::borrow::Cow::Borrowed(x) })
+}
+
+/// The items of `read`, a matrix of `shape`, with the walk that reaches each one: the read's source where the read is positional, and otherwise its items read once (`read_all`).
+fn matrix_items<'a, T: crate::buffer::Cast>(
+    read: &'a crate::agreement::Read<'_>, shape: [usize; 2], checked: bool, scratch: &'a mut Vec<T>
+) -> Result<(std::borrow::Cow<'a, [T]>, crate::agreement::Walked<'static>), Error> {
+    use crate::agreement::{Mapping, Walked};
+    if let Some((view, mapping)) = read.positional(&shape) && let Some(data) = T::of(view) { return Ok((std::borrow::Cow::Borrowed(data), Walked::from(mapping))); }
+    Ok((read_all(read, shape[0] * shape[1], checked, scratch)?, Walked::from(Mapping::Linear(1))))
+}
+
 pub fn at(
     combine: Option<&Kernel>, root: WriteRoot<'_>, values: crate::agreement::Read<'_>, ids: Positions<'_>, checked: bool, settings: Settings,
     output: &mut Buffer) -> Result<(), Error> {
-    let (wanted, len, n) = (output.dtype(), root.len(), ids.len());
+    let (wanted, n) = (output.dtype(), ids.len());
     if values.plan.len() != 1 && values.plan.len() != n { return Err(Error::new(Kind::Length, "write values do not match positions")); }
-    let codes = combine.is_some_and(|kernel| matches!(kernel.policy, Some(crate::characters::Policy::Codes { .. })));
+    let projection = combine.map_or(Projection::AsIs, Kernel::projection);
     match combine {
         None => {
-            root.initialize(wanted, checked, false, output)?;
+            root.initialize(wanted, checked, Projection::AsIs, output)?;
             with_dtype!(wanted, T => at_typed::<T>(values, ids, checked, None::<fn(T, T) -> (T, Option<Kind>)>, output))?;
         },
-        Some(kernel) if codes => with_codes(&[values], None, |inputs| kernel.definition.at(kernel.variant, root, inputs[0], ids, checked, true, settings, output))?,
-        Some(kernel) => kernel.definition.at(kernel.variant, root, values, ids, checked, false, settings, output)?,
+        Some(kernel) => kernel.projected(&[values], None, Seed::Identity, |inputs, _| kernel.definition.at(kernel.variant, root, inputs[0], ids, checked, projection, settings, output))?,
     }
     finish(output, wanted, crate::facts::Variant { checked, ..crate::facts::Variant::checked(wanted) })
 }
 
-fn with_code_inputs<R>(
-    inputs: &[crate::agreement::Read<'_>], seed: Seed<'_>, call: impl FnOnce(&[crate::agreement::Read<'_>], Seed<'_>) -> Result<R, Error>) -> Result<R, Error> {
-    let mut all = inputs.to_vec();
-    match seed { Seed::Initial(r) | Seed::Tail(r) => all.push(r), Seed::Identity => {} }
-    with_codes(&all, None, |projected| {
-        let seed = match seed {
-            Seed::Initial(_) => Seed::Initial(projected[inputs.len()]), Seed::Tail(_) => Seed::Tail(projected[inputs.len()]), Seed::Identity => Seed::Identity
-        };
-        call(&projected[..inputs.len()], seed)
-    })
+/// The magnitude below which every whole float converts to an `i64`.
+const I64_LIMIT: f64 = 9_223_372_036_854_775_808.0;
+
+/// `values` as the whole numbers they equal within the default tolerance (`tolerant::wholes`), as an integer computation reads float arguments whatever the Mathish setting. A fraction, or a magnitude of 2⁶³ or more, is DOMAIN.
+pub fn whole_numbers<F: crate::Float>(values: &[F]) -> Result<Vec<i64>, Error> {
+    crate::tolerant::wholes(crate::tolerant::Tolerance::DEFAULT, values, I64_LIMIT).map(|(numbers, _)| numbers)
+        .ok_or_else(|| Error::new(Kind::Domain, "an integer computation's float argument must be a whole number"))
 }
 
-fn with_codes<R>(
-    inputs: &[crate::agreement::Read<'_>], range: Option<std::ops::Range<usize>>, call: impl FnOnce(&[crate::agreement::Read<'_>]) -> Result<R, Error>
+/// `f` on `view` as an integer computation reads it (`with_projected`): characters as their codes under `Projection::Codes`, and floats as whole numbers (`whole_numbers`).
+fn with_projected_view<R>(view: View<'_>, projection: Projection, f: impl FnOnce(View<'_>) -> R) -> Result<R, Error> {
+    let view = if projection == Projection::Codes { crate::characters::as_codes(view) } else { view };
+    if !matches!(view.dtype(), DType::Float(_)) { return Ok(f(view)); }
+    let mut floats = Vec::new();
+    <f64 as crate::buffer::Cast>::extend_cast(view, view.len(), true, &mut floats)?;
+    Ok(f(View::Integers(crate::buffer::Ints::I64(&whole_numbers(&floats)?))))
+}
+
+/// `call` on `inputs` as an integer computation reads them: characters as their codes under `Projection::Codes`, and floats as the whole numbers they stand for (`whole_numbers`), as `i64`, over `range`, or over the whole of each input where `None`.
+fn with_projected<R>(
+    inputs: &[crate::agreement::Read<'_>], range: Option<std::ops::Range<usize>>, projection: Projection, call: impl FnOnce(&[crate::agreement::Read<'_>]) -> Result<R, Error>
 ) -> Result<R, Error> {
-    use crate::{agreement::{Binding, Read, ReadPlan}, buffer::FloatBuf, tolerant::{Tolerance, Tolerant}};
-    let sources: Vec<Vec<_>> = inputs.iter().map(|r| r.sources.iter().map(|s| s.as_codes()).collect()).collect();
+    use crate::{agreement::{Binding, Read, ReadPlan}, buffer::{FloatBuf, IntBuf}};
+    let codes = projection == Projection::Codes;
+    let sources: Vec<Vec<_>> = if codes { inputs.iter().map(|r| r.sources.iter().map(|s| s.as_codes()).collect()).collect() } else { Vec::new() };
     // Character reads keep their registered character sources, including empty buffers.
-    let code_plans = inputs.iter().map(|read| {
-        let mut characters = false;
-        read.plan.try_for_each_source(&mut |source, _| {
-            characters |= read.sources.get(source).is_some_and(|binding| binding.view.dtype() == DType::Character);
-            Ok::<_, Error>(())
-        })?;
-        Ok(read.plan.as_codes(characters))
-    }).collect::<Result<Vec<_>, Error>>()?;
-    let mut projected: Vec<_> = sources.iter().zip(&code_plans).map(|(sources, plan)| Read { sources, plan }).collect();
+    let code_plans = if !codes { Vec::new() } else {
+        inputs.iter().map(|read| {
+            let mut characters = false;
+            read.plan.try_for_each_source(&mut |source, _| {
+                characters |= read.sources.get(source).is_some_and(|binding| binding.view.dtype() == DType::Character);
+                Ok::<_, Error>(())
+            })?;
+            Ok(read.plan.as_codes(characters))
+        }).collect::<Result<Vec<_>, Error>>()?
+    };
+    let mut projected: Vec<Read<'_>> = if codes { sources.iter().zip(&code_plans).map(|(sources, plan)| Read { sources, plan }).collect() } else { inputs.to_vec() };
     if projected.iter().all(|r| r.sources.iter().all(|s| !matches!(s.view.dtype(), DType::Float(_)))) { return call(&projected); }
     let converted = projected.iter().map(|read| {
         if !read.sources.iter().any(|s| matches!(s.view.dtype(), DType::Float(_))) { return Ok(None); }
         let range = range.clone().unwrap_or(0..read.plan.len());
-        let mut buffer = Buffer::with_capacity(DType::Float(FloatWidth::F64), range.len());
-        read.read_into(range.clone(), buffer.dtype(), true, &mut buffer)?;
-        if let Buffer::Floats(FloatBuf::F64(values)) = &mut buffer {
-            for x in values { *x = Tolerance::DEFAULT.whole(*x).ok_or_else(|| Error::new(Kind::Domain, "a character offset must be a whole number"))?; }
-        }
-        let buffer = Buffer::kept(buffer.view(), DType::Integer(Width::I64))?;
-        Ok(Some((range.start, buffer)))
+        let mut floats = Buffer::with_capacity(DType::Float(FloatWidth::F64), range.len());
+        read.read_into(range.clone(), floats.dtype(), true, &mut floats)?;
+        let Buffer::Floats(FloatBuf::F64(values)) = &floats else { unreachable!("a read into 64-bit floats gives them") };
+        Ok(Some((range.start, Buffer::Integers(IntBuf::I64(whole_numbers(values)?)))))
     }).collect::<Result<Vec<_>, Error>>()?;
     let bindings = converted.iter().zip(inputs)
         .map(|(buffer, read)| buffer.as_ref().map(|(start, b)| Binding::window(b.view(), *start, read.plan.len())).transpose()).collect::<Result<Vec<_>, _>>()?;
@@ -835,7 +842,7 @@ macro_rules! with_binary_body {
 }
 
 fn at_formula<K: crate::facts::Formula<N>, const N: usize>(
-    object: &K, variant: crate::facts::Variant, root: WriteRoot<'_>, values: crate::agreement::Read<'_>, ids: Positions<'_>, checked: bool, codes: bool,
+    object: &K, variant: crate::facts::Variant, root: WriteRoot<'_>, values: crate::agreement::Read<'_>, ids: Positions<'_>, checked: bool, projection: Projection,
     settings: Settings, output: &mut Buffer
 ) -> Result<(), Error> {
     if const { N != 2 } { return Err(Error::new(Kind::Length, "a modified write needs a binary function")); }
@@ -844,7 +851,7 @@ fn at_formula<K: crate::facts::Formula<N>, const N: usize>(
         native_reduction!(fold, variant.dtype, variant.fails_on_overflow(), |R, T| {
             type S = <R as crate::reduce::Reduction<T>>::Total;
             if S::DTYPE == variant.dtype || S::DTYPE == working {
-                root.initialize(S::DTYPE, checked, codes, output)?;
+                root.initialize(S::DTYPE, checked, projection, output)?;
                 return at_typed::<S>(values, ids, checked, Some(|x, y| {
                     let (value, ok) = <R as crate::reduce::Reduction<T>>::chain(x, y);
                     (value, (!ok && variant.fails_on_overflow()).then_some(Kind::Overflow))
@@ -854,7 +861,7 @@ fn at_formula<K: crate::facts::Formula<N>, const N: usize>(
         });
     }
     with_binary_body!(object, variant, settings, |T, apply| {
-        root.initialize(T::DTYPE, checked, codes, output)?;
+        root.initialize(T::DTYPE, checked, projection, output)?;
         at_typed::<T>(values, ids, checked, Some(apply), output)
     })
 }
@@ -937,7 +944,7 @@ fn complex_value<K, F, const N: usize>(
     object: &K, variant: crate::facts::Variant, ops: &crate::recipe::NativeOps<{ crate::FUSED }>, x: [num_complex::Complex<F>; N]
 ) -> (num_complex::Complex<F>, Option<Kind>) where K: crate::facts::Formula<N>, F: crate::float::Native {
     let Some(result) = object.complex(ops, x) else { return (num_complex::Complex::new(F::zero(), F::zero()), variant.checked.then_some(Kind::Domain)); };
-    let valid = !variant.checked || !object.fails_nan() || crate::facts::nan_valid(ops, x.into_iter().flat_map(|x| [x.re, x.im]), [result.re, result.im]);
+    let valid = !variant.checked || !K::FAILS_NAN || crate::facts::nan_valid(ops, x.into_iter().flat_map(|x| [x.re, x.im]), [result.re, result.im]);
     (result, (!valid).then_some(Kind::Domain))
 }
 
@@ -949,22 +956,22 @@ fn map_real<K, F, Dst, const N: usize>(
     judge: crate::facts::Variant, output: &mut Buffer) -> Result<(), Error> where K: crate::facts::Formula<N>, F: crate::float::Native + crate::buffer::Cast + Source<Dst>,
     Dst: Element + crate::Float {
     let ops = crate::recipe::NativeOps::<{ crate::FUSED }> { tolerance: settings.tolerance };
-    if const { K::BOOLEAN } {
-        return map_values::<F, bool, N>(inputs, range, variant.checked, output, &|x| {
-            let (value, error) = real_value(object, judge, &ops, x, false);
-            (value != F::zero(), error)
-        });
-    }
-    let body = |x| object.real(&ops, x).expect("a resolved object has a real body");
-    if repair && let Some(repair) = crate::facts::Formula::repair_routine(object) {
+    if !K::BOOLEAN && repair && let Some(repair) = crate::facts::Formula::repair_routine(object) {
+        let body = |x| object.real(&ops, x).expect("a resolved object has a real body");
         return map_blocks::<F, Dst, N>(inputs, range, variant.checked, output, &|args, n, out| {
             let needs = |x| object.emit_repair(&ops, x).unwrap_or(false);
             let ok = crate::slice::two_pass(args, n, out, |x| (!needs(x)).then(|| body(x)), |x| if needs(x) { repair.apply(x[0]) } else { body(x) });
-            if judge.checked && object.fails_nan() && !ok { Err(Kind::Domain) } else { Ok(()) }
+            if judge.checked && K::FAILS_NAN && !ok { Err(Kind::Domain) } else { Ok(()) }
         });
     }
-    map_values::<F, Dst, N>(inputs, range, variant.checked, output, &|x| {
-        let (result, error) = real_value(object, judge, &ops, x, false);
+    if const { K::BOOLEAN } {
+        return map_values::<F, bool, N>(inputs, range, variant.checked, judge.checked, output, &|checked, x| {
+            let (value, error) = real_value(object, crate::facts::Variant { checked, ..judge }, &ops, x, false);
+            (value != F::zero(), error)
+        });
+    }
+    map_values::<F, Dst, N>(inputs, range, variant.checked, judge.checked, output, &|checked, x| {
+        let (result, error) = real_value(object, crate::facts::Variant { checked, ..judge }, &ops, x, false);
         (Source::<Dst>::read(result), error)
     })
 }
@@ -974,19 +981,19 @@ fn map_integer<K, I, const N: usize>(
     output: &mut Buffer) -> Result<(), Error>
 where K: crate::facts::Formula<N>, I: crate::recipe::Overflowing {
     let ops = crate::recipe::IntegerOps::<I>::new(variant);
-    let apply = |x| integer_value(object, judge, &ops, x);
+    let apply = |checked, x| integer_value(object, crate::facts::Variant { checked, ..judge }, &ops, x);
     if const { K::BOOLEAN } {
-        return map_values::<I, bool, N>(inputs, range, variant.checked, output, &|x| {
-            let (x, e) = apply(x);
+        return map_values::<I, bool, N>(inputs, range, variant.checked, judge.checked, output, &|checked, x| {
+            let (x, e) = apply(checked, x);
             (Into::<i64>::into(x) != 0, e)
         });
     }
-    map_values::<I, I, N>(inputs, range, variant.checked, output, &apply)
+    map_values::<I, I, N>(inputs, range, variant.checked, judge.checked, output, &apply)
 }
 
 /// A function of Booleans by its truth table (`Formula::truth_table`): bit `2x+y` of the table, or bit `x` for one argument, gives its result. A function with a table gives it for every Boolean argument, so no item checks its validity.
 fn map_truth<const N: usize>(table: u8, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, output: &mut Buffer) -> Result<(), Error> {
-    map_values::<bool, bool, N>(inputs, range, false, output, &|x| (crate::facts::truth_bit(table, x), None))
+    map_values::<bool, bool, N>(inputs, range, false, false, output, &|_, x| (crate::facts::truth_bit(table, x), None))
 }
 
 fn map_complex<K, F, const N: usize>(
@@ -994,29 +1001,31 @@ fn map_complex<K, F, const N: usize>(
     judge: crate::facts::Variant, output: &mut Buffer
 ) -> Result<(), Error> where K: crate::facts::Formula<N>, F: crate::float::Native + crate::buffer::Cast, num_complex::Complex<F>: crate::buffer::Cast {
     let ops = crate::recipe::NativeOps::<{ crate::FUSED }> { tolerance: settings.tolerance };
-    let apply = |x| complex_value(object, judge, &ops, x);
+    let apply = |checked, x| complex_value(object, crate::facts::Variant { checked, ..judge }, &ops, x);
     if const { K::BOOLEAN } {
-        map_values::<num_complex::Complex<F>, bool, N>(inputs, range, variant.checked, output, &|x| {
-            let (x, e) = apply(x);
+        map_values::<num_complex::Complex<F>, bool, N>(inputs, range, variant.checked, judge.checked, output, &|checked, x| {
+            let (x, e) = apply(checked, x);
             (x.re != F::zero(), e)
         })
     } else if output.dtype().is_real() {
-        map_values::<num_complex::Complex<F>, F, N>(inputs, range, variant.checked, output, &|x| {
-            let (x, e) = apply(x);
+        map_values::<num_complex::Complex<F>, F, N>(inputs, range, variant.checked, judge.checked, output, &|checked, x| {
+            let (x, e) = apply(checked, x);
             (x.re, e)
         })
-    } else { map_values::<num_complex::Complex<F>, num_complex::Complex<F>, N>(inputs, range, variant.checked, output, &apply) }
+    } else { map_values::<num_complex::Complex<F>, num_complex::Complex<F>, N>(inputs, range, variant.checked, judge.checked, output, &apply) }
 }
 
+/// `apply` on each item of `inputs` over `range`, written to `output`. `apply` takes whether to judge each result's validity, and gives the result with any error kind it found. `judged` picks one of two loops for each block, and each loop passes its choice to `apply` as a constant. The unjudged loop then has no per-item test, and the judged loop gathers every item's verdict into one flag. Where an item fails, the block finds the first failing item again and gives its error.
 fn map_values<F: crate::buffer::Cast, O: Element, const N: usize>(
-    inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, checked: bool, output: &mut Buffer,
-    apply: &(impl Fn([F; N]) -> (O, Option<Kind>) + Sync)) -> Result<(), Error> {
+    inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, checked: bool, judged: bool, output: &mut Buffer,
+    apply: &(impl Fn(bool, [F; N]) -> (O, Option<Kind>) + Sync)) -> Result<(), Error> {
     map_blocks(inputs, range, checked, output, &|args, n, out| {
-        let ok = crate::slice::mapped(&args, n, out, #[inline(always)] |x| {
-            let (r, error) = apply(x);
-            (r, error.is_none())
-        });
-        if !ok && checked { for i in 0..n { if let Some(kind) = apply(std::array::from_fn(|j| args[j].nth(i))).1 { return Err(kind); } } }
+        let ok = if judged {
+            crate::slice::mapped(&args, n, out, #[inline(always)] |x| { let (r, error) = apply(true, x); (r, error.is_none()) })
+        } else {
+            crate::slice::mapped(&args, n, out, #[inline(always)] |x| (apply(false, x).0, true))
+        };
+        if !ok { for i in 0..n { if let Some(kind) = apply(true, std::array::from_fn(|j| args[j].nth(i))).1 { return Err(kind); } } }
         Ok(())
     })
 }
