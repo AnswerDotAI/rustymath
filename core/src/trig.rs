@@ -47,6 +47,7 @@ pub(crate) fn cos<R: Native, const FUSED: bool>(x: R) -> R { scalar::<R, FUSED>(
 #[inline]
 pub(crate) fn tan<R: Native, const FUSED: bool>(x: R) -> R { scalar::<R, FUSED>(x, Kind::Tan) }
 
+#[inline]
 pub(crate) fn formula<F: Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, kind: Kind) -> O::V {
     let zero = o.number(F::zero());
     let finite = o.less(o.magnitude(x), o.number(F::infinity()));

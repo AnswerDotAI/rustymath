@@ -9,16 +9,19 @@ pub(crate) fn cosh<R: Native, const FUSED: bool>(x: R) -> R { cosh_formula(&crat
 #[inline]
 pub(crate) fn tanh<R: Native, const FUSED: bool>(x: R) -> R { tanh_formula(&crate::recipe::NativeOps::<FUSED>::DEFAULT, x) }
 
+#[inline]
 pub(crate) fn sinh_formula<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, x: O::V) -> O::V {
     let one = o.number(F::one());
     let h = crate::exp::minus_one_formula(o, o.magnitude(x), o.negate(one));
     let result = o.multiply(h, o.add(one, o.divide(one, o.add(o.add(h, h), one))));
     o.select(o.less(x, o.number(F::zero())), o.negate(result), result)
 }
+#[inline]
 pub(crate) fn cosh_formula<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, x: O::V) -> O::V {
     let e = crate::exp::scaled_formula(o, o.magnitude(x), o.number(-F::one()));
     o.add(e, o.divide(o.number(F::narrow(0.25)), e))
 }
+#[inline]
 pub(crate) fn tanh_formula<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, x: O::V) -> O::V {
     let top = o.number(F::narrow(if o.width() == crate::buffer::FloatWidth::F64 { 20.0 } else { 9.0 }));
     let a = o.magnitude(x);

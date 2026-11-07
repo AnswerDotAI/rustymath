@@ -258,6 +258,7 @@ const CBRT_MAGIC: [f64; 2] = [1499661097332631.0, 2773273.0];
 #[inline(always)]
 pub(crate) fn cbrt<R: Native, const FUSED: bool>(x: R) -> R { cbrt_formula(&crate::recipe::NativeOps::<FUSED>::DEFAULT, x) }
 
+#[inline]
 pub(crate) fn cbrt_formula<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, x: O::V) -> O::V {
     use crate::{buffer::FloatWidth, recipe::Integer};
     let c = |x| o.number(F::narrow(x));

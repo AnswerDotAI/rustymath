@@ -232,6 +232,7 @@ pub(crate) fn formula<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O,
     log_with(o, x, (crate::recipe::ln2(o), o.number(F::one())))
 }
 
+#[inline]
 pub(crate) fn log1p_formula<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, x: O::V) -> O::V {
     let (zero, one) = (o.number(F::zero()), o.number(F::one()));
     let u = o.add(x, one);

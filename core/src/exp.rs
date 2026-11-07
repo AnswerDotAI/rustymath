@@ -102,10 +102,12 @@ fn minus_one_with<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, r: 
     o.multiply_add(o.multiply(r, h), scale, o.subtract(scale, o.number(F::one())))
 }
 
+#[inline]
 pub(crate) fn scaled_formula<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, x: O::V, scale: O::V) -> O::V {
     parts_with(o, x, o.number(-F::zero()), scale)
 }
 
+#[inline]
 pub(crate) fn minus_one_formula<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, x: O::V, scale: O::V) -> O::V {
     let (low, top) = if o.width() == crate::buffer::FloatWidth::F64 { (-40.0, 1023.0) } else { (-18.0, 127.0) };
     let low = o.number(F::narrow(low));
