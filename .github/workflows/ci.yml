@@ -50,7 +50,7 @@ jobs:
       - id: auth
         uses: rust-lang/crates-io-auth-action@v1
       - run: |
-          for crate in rustymath-core rustymath-kernels rustymath rustymath-buffer; do
+          for crate in rustymath-core rustymath-kernels rustymath-timing rustymath rustymath-buffer; do
             cargo publish -p "$crate" --no-verify
           done
         env:
