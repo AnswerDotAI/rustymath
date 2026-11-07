@@ -8,6 +8,7 @@ pub(crate) enum Kind { Sin, Cos, Tan }
 impl Kind {
     fn scale(self) -> f64 { if self == Self::Tan { 2.0 * FRAC_1_PI } else { FRAC_1_PI } }
     fn offset(self) -> f64 { if self == Self::Cos { 0.5 } else { 0.0 } }
+    #[inline]
     pub(crate) fn predicate<F: Float, O: Ops<F> + ?Sized>(self, o: &O, x: O::V) -> O::B {
         let a = o.magnitude(x);
         let limit = o.number(F::narrow(if o.width() == FloatWidth::F64 { 8388608.0 } else { 1048576.0 }));
@@ -70,6 +71,7 @@ const PI_FUSED_32: [f64; 3] = [3.141592502593994, 1.5099578831723193e-7, 1.07806
 const PI_SPLIT_64: [f64; 4] = [3.141592651605606, 1.9841871583270443e-9, 1.03403659577805e-18, 5.807711947958721e-28];
 const PI_SPLIT_32: [f64; 2] = [3.141592651605606, 1.984187159361081e-9];
 
+#[inline]
 fn reduce_fused<F: Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, kind: Kind) -> (O::V, O::V) {
     let shift = crate::recipe::rounding_shift(o);
     let z = if kind.offset() == 0.0 { o.multiply_add(x, o.number(F::narrow(kind.scale())), shift) }
@@ -81,6 +83,7 @@ fn reduce_fused<F: Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, kind: Kind) -> (O:
     (r, n)
 }
 
+#[inline]
 fn reduce_split<F: Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, kind: Kind) -> (O::V, O::V) {
     let wide = o.widen(x);
     let z = o.wide_multiply_add(wide, o.wide_number(kind.scale()), o.wide_number(kind.offset()));
@@ -99,6 +102,7 @@ const SIN_64: [f64; 7] = [
     -0.1666666666666606,
 ];
 const SIN_32: [f64; 4] = [2.6105958568223286e-6, -0.00019811994570773095, 0.00833310279995203, -0.16666661202907562];
+#[inline]
 fn sine<F: Float, O: Ops<F> + ?Sized>(o: &O, r: O::V) -> O::V {
     let r2 = o.multiply(r, r);
     let p = crate::recipe::horner(o, r2, if o.width() == FloatWidth::F64 { &SIN_64 } else { &SIN_32 });
@@ -110,6 +114,7 @@ const TAN_64: [f64; 9] = [
     0.13333333333289177, 0.33333333333333504,
 ];
 const TAN_32: [f64; 4] = [0.025565408170223236, 0.053473446518182755, 0.13335898518562317, 0.33333292603492737];
+#[inline]
 fn tangent<F: Float, O: Ops<F> + ?Sized>(o: &O, r: O::V, odd: O::B) -> O::V {
     let u = o.multiply(r, o.number(F::narrow(0.5)));
     let u2 = o.multiply(u, u);
