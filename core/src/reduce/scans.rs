@@ -165,14 +165,16 @@ fn pack(block: &[bool; 64]) -> u64 {
     bits
 }
 
-/// Writes the 64 bits of `r` to `out` as Booleans, the lowest bit first. Each byte of `r` becomes 8 bytes of 0 or 1, bit `j` in byte `j`, through one multiplication, two masks, an add and a shift that's the same for every byte. LLVM compiles a test of bit `j` in byte `j` to a different shift for each byte, which wasm's SIMD can only emulate.
+/// Expands the 64 bits of `r` into Boolean bytes, the lowest bit first, then converts that block into `out`. Each byte of `r` becomes 8 bytes of 0 or 1, bit `j` in byte `j`, through one multiplication, two masks, an add and a shift that's the same for every byte. LLVM compiles a test of bit `j` in byte `j` to a different shift for each byte, which wasm's SIMD can only emulate.
 #[inline(always)]
 fn unpack<S>(r: u64, out: &mut [std::mem::MaybeUninit<S>; 64]) where bool: Source<S> {
-    for (k, lanes) in out.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+    let mut block = [false; 64];
+    for (k, lanes) in block.as_chunks_mut::<8>().0.iter_mut().enumerate() {
         let bits = (r >> (8 * k) & 0xff).wrapping_mul(0x0101_0101_0101_0101) & 0x8040_2010_0804_0201;
         let bytes = ((bits + 0x7f7f_7f7f_7f7f_7f7f) >> 7 & 0x0101_0101_0101_0101).to_le_bytes();
-        *lanes = std::array::from_fn(|j| std::mem::MaybeUninit::new(Source::<S>::read(bytes[j] != 0)));
+        *lanes = std::array::from_fn(|j| bytes[j] != 0);
     }
+    crate::slice::pairs_into(Arg::Many(&block), Arg::One(()), 64, out, |b, ()| (b.read(), true));
 }
 
 /// The results of 64 items, bit by bit, from the running result `carry`, where item `k`'s map is `r ↦ (s ∧ r) ≠ t` for bit `k` of `s` and `t`. Each step composes each bit's map with the map it holds from the bits before it. A bit with none before it takes the identity map, whose `s` is 1 and whose `t` is 0.

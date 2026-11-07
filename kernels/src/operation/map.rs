@@ -5,13 +5,21 @@ mod complex;
 mod integer;
 mod real;
 use {complex::*, integer::*, real::map_real};
+mod io;
+pub use io::MapOutput;
+use io::OutputItem;
+pub(super) use io::{Inputs, Output};
 pub(super) fn map_formula<K: crate::facts::Formula<N>, const N: usize>(
-    object: &K, variant: crate::domain::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, repair: bool,
-    judged: bool, output: &mut Buffer) -> Result<(), Error> {
+    object: &K, variant: crate::domain::Variant, inputs: Inputs<'_, '_>, range: std::ops::Range<usize>, settings: Settings, repair: bool, judged: bool,
+    output: &mut Output<'_, '_>) -> Result<(), Error> {
     if inputs.len() != N { return Err(Error::new(Kind::Length, "kernel operand count changed")); }
     let ops = settings.ops();
     crate::events::taken(crate::events::Route::VectorKernel, range.len());
-    report_maps(inputs.iter().map(|read| read.plan), range.clone());
+    match inputs {
+        Inputs::Mapped(reads) => report_maps(reads.iter().map(|read| read.plan), range.clone()),
+        Inputs::Ready(views) if range.len() > 1 && views.iter().any(|v| v.len() == 1) => crate::events::taken(crate::events::Route::MappedKernel, range.len()),
+        _ => {}
+    }
     // A kernel whose arguments' types can't make an error judges no item: `judge` is `variant` unchecked. Reads and `IntegerOps` keep `variant`, so an argument that doesn't convert, or an overflow that `IntegerOps::result` reports, still fails.
     let judge = crate::domain::Variant { checked: variant.checked && judged, ..variant };
     let slices = object.native_slices();
@@ -41,10 +49,10 @@ pub(super) fn map_formula<K: crate::facts::Formula<N>, const N: usize>(
             Some(table) => map_truth::<N>(table, inputs, range, output), None => map_integer::<K, u8, N>(object, variant, inputs, range, judge, output)
         },
         DType::Integer(width) => with_width!(width, I => map_integer::<K, I, N>(object, variant, inputs, range, judge, output)),
-        DType::Complex(crate::buffer::ComplexWidth::F32) if K::REAL_COMPLEX && real_inputs(inputs) => {
+        DType::Complex(crate::buffer::ComplexWidth::F32) if K::REAL_COMPLEX && inputs.real() => {
             map_real_complex::<K, f32, N>(object, variant, inputs, range, &ops, output)
         }
-        DType::Complex(crate::buffer::ComplexWidth::F64) if K::REAL_COMPLEX && real_inputs(inputs) => {
+        DType::Complex(crate::buffer::ComplexWidth::F64) if K::REAL_COMPLEX && inputs.real() => {
             map_real_complex::<K, f64, N>(object, variant, inputs, range, &ops, output)
         }
         DType::Complex(crate::buffer::ComplexWidth::F32) => {
@@ -58,30 +66,25 @@ pub(super) fn map_formula<K: crate::facts::Formula<N>, const N: usize>(
 }
 
 /// `slice`, a formula's slice form at `T` (`NativeSlices`), on each block of `inputs` over `range`, with `valid` turning each block's validity into its result. `None` where the formula has no form at `T`.
-fn sliced<K: Sync, T: crate::buffer::Cast + Element, const N: usize>(
-    object: &K, ops: &NativeOps<{ FUSED }>, slice: Option<crate::facts::Slice<K, T, N>>, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>,
-    checked: bool, valid: &(dyn Fn(bool) -> Result<(), Kind> + Sync), output: &mut Buffer) -> Option<Result<(), Error>> {
+fn sliced<K: Sync, T: crate::buffer::Cast + OutputItem, const N: usize>(
+    object: &K, ops: &NativeOps<{ FUSED }>, slice: Option<crate::facts::Slice<K, T, N>>, inputs: Inputs<'_, '_>, range: std::ops::Range<usize>, checked: bool,
+    valid: &(dyn Fn(bool) -> Result<(), Kind> + Sync), output: &mut Output<'_, '_>) -> Option<Result<(), Error>> {
     let slice = slice?;
     Some(map_blocks::<T, T, N>(inputs, range, checked, output, &|args, n, out| valid(slice(object, ops, args, n, out))))
 }
 
 /// A function of Booleans by its truth table (`Formula::truth_table`): bit `2x+y` of the table, or bit `x` for one argument, gives its result. A function with a table gives it for every Boolean argument, so no item checks its validity.
-fn map_truth<const N: usize>(table: u8, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, output: &mut Buffer) -> Result<(), Error> {
+fn map_truth<const N: usize>(table: u8, inputs: Inputs<'_, '_>, range: std::ops::Range<usize>, output: &mut Output<'_, '_>) -> Result<(), Error> {
     let value = |x: [bool; N]| match N {
         1 => crate::bitwise(table, false, x[0]), 2 => crate::bitwise(table, x[0], x[1]), _ => crate::facts::truth_bit(table, x)
     };
     map_values::<bool, bool, N>(inputs, range, false, false, output, value, |_, _| None)
 }
 
-/// Whether no source of `inputs` holds complex items, so that a formula's complex results from real arguments (`Formula::real_complex`) can read them as reals.
-fn real_inputs(inputs: &[crate::agreement::Read<'_>]) -> bool {
-    inputs.iter().all(|read| read.sources.iter().all(|b| !matches!(b.view.dtype(), DType::Complex(_))))
-}
-
 /// `apply` on each item of `inputs` over `range`, written to `output` through `map_written`.
 #[inline]
-fn map_values<F: crate::buffer::Cast, O: Element, const N: usize>(
-    inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, checked: bool, judged: bool, output: &mut Buffer, apply: impl Fn([F; N]) -> O + Sync,
+fn map_values<F: crate::buffer::Cast, O: OutputItem, const N: usize>(
+    inputs: Inputs<'_, '_>, range: std::ops::Range<usize>, checked: bool, judged: bool, output: &mut Output<'_, '_>, apply: impl Fn([F; N]) -> O + Sync,
     kind: impl Fn([F; N], O) -> Option<Kind> + Sync) -> Result<(), Error> {
     map_written(inputs, range, checked, judged, output, |args, n, out| {
         crate::slice::mapped(args, n, out, #[inline(always)] |x| (apply(x), true));
@@ -90,8 +93,8 @@ fn map_values<F: crate::buffer::Cast, O: Element, const N: usize>(
 
 /// Each block of `inputs` over `range` as `write` writes all `n` of its slots, to `output`. Where `judged`, `kind` judges each stored result against its arguments: `None` for a valid result, otherwise its error kind. No body runs twice, because a resolved object's body gives a result for every item.
 #[inline]
-fn map_written<F: crate::buffer::Cast, O: Element, const N: usize>(
-    inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, checked: bool, judged: bool, output: &mut Buffer,
+fn map_written<F: crate::buffer::Cast, O: OutputItem, const N: usize>(
+    inputs: Inputs<'_, '_>, range: std::ops::Range<usize>, checked: bool, judged: bool, output: &mut Output<'_, '_>,
     write: impl Fn(&[Arg<'_, F>; N], usize, &mut [std::mem::MaybeUninit<O>]) + Sync, kind: impl Fn([F; N], O) -> Option<Kind> + Sync) -> Result<(), Error> {
     map_blocks(inputs, range, checked, output, &|args, n, out| {
         write(&args, n, out);
@@ -104,41 +107,32 @@ fn map_written<F: crate::buffer::Cast, O: Element, const N: usize>(
 }
 
 /// `apply` on `inputs` over `range`, written to `output`: by rows where `by_rows` reads them so, and otherwise a part at a time. Where an input reads through scratch, not in place (`Read::in_place`), the part runs `CHUNK` items at a time to keep that scratch in cache.
-fn map_blocks<F: crate::buffer::Cast, O: Element, const N: usize>(
-    inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, checked: bool, output: &mut Buffer,
+fn map_blocks<F: crate::buffer::Cast, O: OutputItem, const N: usize>(
+    inputs: Inputs<'_, '_>, range: std::ops::Range<usize>, checked: bool, output: &mut Output<'_, '_>,
     apply: &(dyn Fn([Arg<'_, F>; N], usize, &mut [std::mem::MaybeUninit<O>]) -> Result<(), Kind> + Sync)) -> Result<(), Error> {
-    if output.dtype() != O::DTYPE { *output = Buffer::with_capacity(O::DTYPE, range.len()); }
-    let values = O::vec_mut(output).expect("kernel output has its selected dtype");
-    values.clear();
     let recorded =
         |result: Result<(), Kind>| result.map_err(|kind| crate::error::record(Error::new(kind, "numerical kernel argument is outside its domain"))).is_ok();
-    if let Some((len, rows)) = by_rows::<F>(inputs) {
-        crate::parallel::extended(values, range.len(), crate::CHUNK, &|part, slots| unsafe {
-            slots.fill(part.len(), |out| recorded(fill_rows(&rows, len, part.start + range.start, out, apply)))
-        });
-        return Ok(());
+    if let Inputs::Mapped(reads) = inputs && let Some((len, rows)) = by_rows::<F>(reads) {
+        return output
+            .write(range.len(), &|part, slots| unsafe { slots.fill(part.len(), |out| recorded(fill_rows(&rows, len, part.start + range.start, out, apply))) });
     }
-    crate::parallel::extended(values, range.len(), crate::CHUNK, &|part, slots| {
+    output.write(range.len(), &|part, slots| {
         let part = part.start + range.start..part.end + range.start;
-        let len = if inputs.iter().all(|input| input.in_place::<F>(&part)) { part.len().max(1) } else { crate::CHUNK };
+        let len = if inputs.in_place::<F>(&part) { part.len().max(1) } else { crate::CHUNK };
         let mut scratch: [Vec<F>; N] = std::array::from_fn(|_| Vec::new());
         part.clone().step_by(len).fold(true, |ok, at| {
             let run = at..(at + len).min(part.end);
             let n = run.len();
-            let mut args = [Arg::Many(&[]); N];
-            for ((arg, input), scratch) in args.iter_mut().zip(inputs).zip(scratch.iter_mut()) {
-                match input.part::<F>(run.clone(), checked, scratch) {
-                    Ok(read) => *arg = read,
-                    Err(error) => {
-                        crate::error::record(error);
-                        return unsafe { slots.fill(n, |out| { for slot in out { slot.write(O::FILL); } false }) } & ok;
-                    }
+            let args = match inputs.part::<F, N>(run, checked, &mut scratch) {
+                Ok(args) => args,
+                Err(error) => {
+                    crate::error::record(error);
+                    return unsafe { slots.fill(n, |out| { for slot in out { slot.write(O::FILL); } false }) } & ok;
                 }
-            }
+            };
             (unsafe { slots.fill(n, |out| recorded(apply(args, n, out))) }) & ok
         })
-    });
-    Ok(())
+    })
 }
 
 /// Rows shorter than this can read slower than blocks, which share each call's cost among more items.
@@ -172,4 +166,12 @@ fn fill_rows<F: Copy, O, const N: usize>(
         (done, r, at) = (done + n, r + 1, 0);
     }
     result
+}
+
+pub(super) fn copied(inputs: Inputs<'_, '_>, range: std::ops::Range<usize>, checked: bool, output: &mut Output<'_, '_>) -> Result<(), Error> {
+    with_dtype!(output.dtype, T => map_values::<T, T, 1>(inputs, range, checked, false, output, |x| x[0], |_, _| None))
+}
+
+pub(super) fn constant(value: bool, n: usize, output: &mut Output<'_, '_>) -> Result<(), Error> {
+    output.write::<bool>(n, &|part, slots| slots.pairs(Arg::One(value), Arg::One(()), part.len(), |x, ()| (x, true)))
 }

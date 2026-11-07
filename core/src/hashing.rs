@@ -1,8 +1,8 @@
-//! The hash maps and sets rustymath uses. `Hashing` is foldhash's fast `RandomState`, hashbrown's default hasher, with `hash_one` marked `#[inline(always)]`. hashbrown 0.17 hashes every key through `BuildHasher::hash_one`, and core's default body for it has no inline hint, so incremental builds can call it out of line on every lookup.
+//! The hash maps and sets rustymath uses. `Hashing` is foldhash's fast hasher with its fixed seed (`FixedState`), with `hash_one` marked `#[inline(always)]`. With one seed in every process, maps hash and iterate alike between runs, and instruction counts repeat. hashbrown 0.17 hashes every key through `BuildHasher::hash_one`, and core's default body for it has no inline hint, so incremental builds can call it out of line on every lookup.
 use std::hash::{BuildHasher, Hash, Hasher};
 
 #[derive(Clone, Default, Debug)]
-pub struct Hashing(foldhash::fast::RandomState);
+pub struct Hashing(foldhash::fast::FixedState);
 
 impl BuildHasher for Hashing {
     type Hasher = foldhash::fast::FoldHasher<'static>;

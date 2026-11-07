@@ -1,8 +1,8 @@
 use super::*;
 
 pub(super) fn map_integer<K, I, const N: usize>(
-    object: &K, variant: crate::domain::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, judge: crate::domain::Variant,
-    output: &mut Buffer) -> Result<(), Error> where K: crate::facts::Formula<N>, I: crate::recipe::Overflowing {
+    object: &K, variant: crate::domain::Variant, inputs: Inputs<'_, '_>, range: std::ops::Range<usize>, judge: crate::domain::Variant,
+    output: &mut Output<'_, '_>) -> Result<(), Error> where K: crate::facts::Formula<N>, I: crate::recipe::Overflowing + OutputItem {
     let ops = crate::recipe::IntegerOps::<I>::new(variant);
     let value = |x| object.integer(&ops, x).unwrap_or(I::FILL);
     if const { K::BOOLEAN } {

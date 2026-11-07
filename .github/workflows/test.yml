@@ -15,6 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
       # The repository has no `Cargo.lock`. Creating one first makes rust-cache's key change when a dependency publishes a new version.
       - run: cargo generate-lockfile
       - uses: Swatinem/rust-cache@v2
@@ -25,8 +26,8 @@ jobs:
           python-version: '3.12'
       - run: pip install -e '.[dev]'
       - run: cargo develop
-      - run: cargo test --release
-      - run: pytest -q
+      - run: cargo nextest run --cargo-profile release -E 'not binary(speed)'
+      - run: pytest -q --ignore=tests/test_speed.py
         if: ${{ !cancelled() }}
       - run: nbdev-test
         if: ${{ !cancelled() }}

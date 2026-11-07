@@ -125,19 +125,26 @@ pub trait Inner<T> {
     fn checked_into(&self, a: &[T], b: &[T], size: [usize; 3], out: &mut [Self::Out]) -> bool { self.inner_into(a, b, size, out); true }
     /// `inner` of the matrices that `a` and `b` give in the orientations given, with `size` `[m, k, n]` for those matrices. A transposed `a` holds a `k`×`m` matrix, row-major, and gives its `m`×`k` transpose. This default copies a transposed operand into its orientation. Float and complex `PlusTimes` read it in place.
     fn inner_ops(&self, a: &[T], b: &[T], [oa, ob]: [Orientation; 2], [m, k, n]: [usize; 3]) -> Vec<Self::Out> where T: Copy {
-        fn oriented<T: Copy>(x: &[T], o: Orientation, [rows, cols]: [usize; 2]) -> std::borrow::Cow<'_, [T]> {
-            match o {
-                Orientation::Normal => std::borrow::Cow::Borrowed(x),
-                Orientation::Transpose => (0..rows * cols).map(|ij| x[ij % cols * rows + ij / cols]).collect(),
-            }
-        }
         self.inner(&oriented(a, oa, [m, k]), &oriented(b, ob, [k, n]), [m, k, n])
     }
-    /// `inner_ops` of operands whose items come through mappings, as [`Mapped`] describes. This default reads each operand whole, then calls `inner_ops`. Float and complex `PlusTimes` read an operand that isn't held in order one block of its stored rows at a time and multiply each block as it's read. Only one block of that operand then exists at once.
-    fn inner_mapped(&self, a: Mapped<'_, T>, b: Mapped<'_, T>, orientations: [Orientation; 2], size @ [m, k, n]: [usize; 3]) -> Vec<Self::Out> where T: Element
+    /// `inner_mapped_into`'s results, as a new row-major matrix.
+    fn inner_mapped(&self, a: Mapped<'_, T>, b: Mapped<'_, T>, orientations: [Orientation; 2], size @ [m, _, n]: [usize; 3]) -> Vec<Self::Out> where T: Element
     {
+        let mut out = filled(m * n, Self::Out::default());
+        self.inner_mapped_into(a, b, orientations, size, &mut out);
+        out
+    }
+    /// `inner_into` of operands whose items come through mappings, as [`Mapped`] describes. This default reads each operand whole and copies transposed operands into their orientations. Float and complex `PlusTimes` read an operand that isn't held in order one block of its stored rows at a time and multiply each block as it's read. Only one block of that operand then exists at once.
+    fn inner_mapped_into(&self, a: Mapped<'_, T>, b: Mapped<'_, T>, [oa, ob]: [Orientation; 2], size @ [m, k, n]: [usize; 3], out: &mut [Self::Out]) where
+        T: Element {
         let (mut ab, mut bb) = (Vec::new(), Vec::new());
-        self.inner_ops(a.read(0, m * k, &mut ab), b.read(0, k * n, &mut bb), orientations, size)
+        self.inner_into(&oriented(a.read(0, m * k, &mut ab), oa, [m, k]), &oriented(b.read(0, k * n, &mut bb), ob, [k, n]), size, out)
+    }
+}
+
+fn oriented<T: Copy>(x: &[T], o: Orientation, [rows, cols]: [usize; 2]) -> std::borrow::Cow<'_, [T]> {
+    match o {
+        Orientation::Normal => std::borrow::Cow::Borrowed(x), Orientation::Transpose => (0..rows * cols).map(|ij| x[ij % cols * rows + ij / cols]).collect()
     }
 }
 
@@ -838,11 +845,11 @@ const TAIL_STRIP: usize = 8;
 /// The fewest adjacent rows of `a` that [`by_columns`] reads at once. Shorter runs cost more in loop overhead than gathering saves.
 const COLUMN_RUN: usize = 64;
 
-/// `+.×` of `a` and a vector `b`, where each row of `a` starts one item after the row before it in storage, as the windows of a vector or a single-channel image do. Each column of `a` is then a run of storage, which [`scaled_runs`] reads where it lies and scales by its item of `b`. `a` is never gathered. `None` where it doesn't split into entries for its rows and entries for its columns, or where its rows aren't adjacent in runs of at least [`COLUMN_RUN`]. The loop reads a fill as 0, the item type's own fill.
-fn by_columns<T: Tiled + Element>(a: Mapped<'_, T>, b: Mapped<'_, T>, oa: Orientation, [m, k]: [usize; 2]) -> Option<Vec<T>> {
+/// `+.×` of `a` and a vector `b`, where each row of `a` starts one item after the row before it in storage, as the windows of a vector or a single-channel image do. Each column of `a` is then a run of storage, which [`scaled_runs`] reads where it lies and scales by its item of `b`. `a` is never gathered. `false` where it doesn't split into entries for its rows and entries for its columns, or where its rows aren't adjacent in runs of at least [`COLUMN_RUN`]. The loop reads a fill as 0, the item type's own fill.
+fn by_columns<T: Tiled + Element>(a: Mapped<'_, T>, b: Mapped<'_, T>, oa: Orientation, [m, k]: [usize; 2], c: &mut [T]) -> bool {
     use crate::gather::Steps;
-    let Mapping::Steps { base, steps } = &**a.mapping else { return None };
-    if m * k == 0 { return None; }
+    let Mapping::Steps { base, steps } = &**a.mapping else { return false };
+    if m * k == 0 { return false; }
     // The entries of the stored matrix's leading axis come first, and give its first `lead` items.
     let lead = if oa == Orientation::Normal { m } else { k };
     let (mut split, mut size) = (0, 1);
@@ -850,26 +857,27 @@ fn by_columns<T: Tiled + Element>(a: Mapped<'_, T>, b: Mapped<'_, T>, oa: Orient
         size *= steps[split].len();
         split += 1;
     }
-    if size != lead { return None; }
+    if size != lead { return false; }
     let (outer, inner) = steps.split_at(split);
     let (rows, cols) = if oa == Orientation::Normal { (outer, inner) } else { (inner, outer) };
-    let Steps::Stride { step: 1, len: width, .. } = *rows.iter().rev().find(|s| s.len() > 1)? else { return None };
-    if width < COLUMN_RUN { return None; }
+    let Some(&Steps::Stride { step: 1, len: width, .. }) = rows.iter().rev().find(|s| s.len() > 1) else { return false };
+    if width < COLUMN_RUN { return false; }
     let mut whole = Vec::new();
     let weights = b.read(0, k, &mut whole);
     let columns: Vec<(T, usize)> = (0..k).filter_map(|p| Some((weights[p], Steps::reach(0, cols, p)?))).collect();
-    let mut c = filled(m, T::zero());
-    parallel::split(&mut c, COLUMN_ROWS, &|first, part| {
+    parallel::split(c, COLUMN_ROWS, &|first, part| {
         let mut r = first;
         while r < first + part.len() {
             let len = (width - r % width).min(COLUMN_ROWS).min(first + part.len() - r);
-            // A row whose outer entries give a fill reads only fills, and its result stays 0.
-            if let Some(at) = Steps::reach(*base, rows, r) { scaled_runs(&mut part[r - first..r - first + len], a.data, at, &columns, true) }
+            // A row whose outer entries give a fill reads only fills.
+            let out = &mut part[r - first..r - first + len];
+            if let Some(at) = Steps::reach(*base, rows, r) { scaled_runs(out, a.data, at, &columns, true) }
+            else { out.fill(T::zero()) }
             r += len;
         }
         true
     });
-    Some(c)
+    true
 }
 
 /// For adjacent rows of a matrix whose first row starts at `data[at]` and each next row one item later, adds to each of `out`'s results the sum over `columns` of each column's weight times the row's item at the column's offset. Where `start` is true, it writes the sums in place of `out`'s results. Strips of [`COLUMN_STRIP`] results, then of [`TAIL_STRIP`], stay in registers while every column adds into them ([`scaled_strips`]). The rest take one result at a time.
@@ -948,13 +956,13 @@ fn narrow_sums<T: Tiled>(out: &mut [T], data: &[T], ld: usize, w: &[T]) {
     for (t, y) in out.iter_mut().enumerate() { *y = (acc[0][t] + acc[2][t]) + (acc[1][t] + acc[3][t]) }
 }
 
-/// `+.×` of mapped operands on the tiled kernels, for [`Inner::inner_mapped`]. An operand whose mapping reads it at positive strides, one of them 1, is used where it lies, row by row or as a transpose. Any other operand is read a block of its stored rows at a time, and each block's product goes straight into the result. Where `a`'s stored rows are the result's rows, and the product runs on one thread or `b` has at most [`PIECE_MATRIX`] items, the result's rows split into one piece for each thread. Each thread multiplies its piece's rows itself, reading them in blocks that hold at least [`BLOCK_ITEMS`] items and at least as many as `b`. Otherwise an operand of up to [`WHOLE_ITEMS`] items is read whole, and a larger one in blocks of at least that many. Each block is gathered across threads and multiplied in one threaded call. Rows along the contraction add into the whole result, as [`contracted`] reads them. Blocks of the result's columns hold at least as many items as the result. Where neither operand can be used where it lies, `b` is read whole. A vector `b` beside an `a` whose rows are adjacent in storage goes to [`by_columns`], which reads `a` where it lies. Reading an operand larger than the result through its map, by blocks or by columns, records the route `mapped product`.
-fn blocked<T: Tiled + Element>(a: Mapped<'_, T>, b: Mapped<'_, T>, [oa, ob]: [Orientation; 2], [m, k, n]: [usize; 3]) -> Vec<T> {
+/// `+.×` of mapped operands on the tiled kernels, for [`Inner::inner_mapped_into`]. An operand whose mapping reads it at positive strides, one of them 1, is used where it lies, row by row or as a transpose. Any other operand is read a block of its stored rows at a time, and each block's product goes straight into the result. Where `a`'s stored rows are the result's rows, and the product runs on one thread or `b` has at most [`PIECE_MATRIX`] items, the result's rows split into one piece for each thread. Each thread multiplies its piece's rows itself, reading them in blocks that hold at least [`BLOCK_ITEMS`] items and at least as many as `b`. Otherwise an operand of up to [`WHOLE_ITEMS`] items is read whole, and a larger one in blocks of at least that many. Each block is gathered across threads and multiplied in one threaded call. Rows along the contraction add into the whole result, as [`contracted`] reads them. Blocks of the result's columns hold at least as many items as the result. Where neither operand can be used where it lies, `b` is read whole. A vector `b` beside an `a` whose rows are adjacent in storage goes to [`by_columns`], which reads `a` where it lies. Reading an operand larger than the result through its map, by blocks or by columns, records the route `mapped product`.
+fn blocked<T: Tiled + Element>(a: Mapped<'_, T>, b: Mapped<'_, T>, [oa, ob]: [Orientation; 2], [m, k, n]: [usize; 3], c: &mut [T]) {
+    assert_eq!(c.len(), m * n);
+    if m == 0 || k == 0 || n == 0 { c.fill(T::zero()); return; }
     let (ma, mb) = (a.matrix(oa, [m, k]), b.matrix(ob, [k, n]));
-    if let (Some(a), Some(b)) = (ma, mb) { return T::multiply(a, b, [m, k, n]); }
-    if ma.is_none() && n == 1 && let Some(c) = by_columns(a, b, oa, [m, k]) { crate::events::taken(crate::events::Route::MappedProduct, m * k); return c; }
-    let mut c = filled(m * n, T::zero());
-    if m == 0 || k == 0 || n == 0 { return c; }
+    if let (Some(a), Some(b)) = (ma, mb) { return T::gemm(c, n, a, b, [m, k, n], T::one(), T::zero()); }
+    if ma.is_none() && n == 1 && by_columns(a, b, oa, [m, k], c) { crate::events::taken(crate::events::Route::MappedProduct, m * k); return; }
     let read = if ma.is_none() { m * k } else { k * n };
     if read > m * n { crate::events::taken(crate::events::Route::MappedProduct, read); }
     let (one, zero) = (T::one(), T::zero());
@@ -966,7 +974,7 @@ fn blocked<T: Tiled + Element>(a: Mapped<'_, T>, b: Mapped<'_, T>, [oa, ob]: [Or
                 Orientation::Normal => {
                     let (rows, least) =
                         if parallel::threads() == 1 || k * n <= PIECE_MATRIX { (m.div_ceil(parallel::threads()), k * n) } else { (m, WHOLE_ITEMS) };
-                    parallel::pieces_of(&mut c, rows * n, usize::MAX, &|start, part| {
+                    parallel::pieces_of(c, rows * n, usize::MAX, &|start, part| {
                         let from = start / n;
                         blocks(a, from..from + part.len() / n, k, least, |first, len, block| {
                             T::gemm(&mut part[(first - from) * n..], n, Matrix::rows(block, k), b, [len, k, n], one, zero)
@@ -974,21 +982,20 @@ fn blocked<T: Tiled + Element>(a: Mapped<'_, T>, b: Mapped<'_, T>, [oa, ob]: [Or
                         true
                     });
                 }
-                Orientation::Transpose => contracted(a, [k, m], &mut c, &|first, len, part, c, beta| {
+                Orientation::Transpose => contracted(a, [k, m], c, &|first, len, part, c, beta| {
                     T::gemm(c, n, Matrix::oriented(part, oa, [m, len]), b.offset(first, 0), [m, len, n], one, beta)
                 }),
             }
         }
         Some(a) => match ob {
             Orientation::Normal => {
-                contracted(b, [k, n], &mut c, &|first, len, part, c, beta| T::gemm(c, n, a.offset(0, first), Matrix::rows(part, n), [m, len, n], one, beta))
+                contracted(b, [k, n], c, &|first, len, part, c, beta| T::gemm(c, n, a.offset(0, first), Matrix::rows(part, n), [m, len, n], one, beta))
             }
             Orientation::Transpose => {
                 blocks(b, 0..n, k, m * n, |first, len, block| T::gemm(&mut c[first..], n, a, Matrix::oriented(block, ob, [k, len]), [m, k, len], one, zero))
             }
         },
     }
-    c
 }
 
 /// `c = beta c` for the items of `c` in `part`, where `c` is an `m`×`n` matrix whose rows start `ldc` items apart. A zero `beta` writes zeros, whatever `c` held.
@@ -1123,7 +1130,7 @@ macro_rules! tiled {
                 if m * k * n <= DIRECT_WORK { return direct::<$t, $t, PlusTimes>(a, b, [m, k, n], c) }
                 <$t>::gemm(c, n, Matrix::rows(a, k), Matrix::rows(b, n), [m, k, n], <$t>::one(), <$t>::zero())
             }
-            fn inner_mapped(&self, a: Mapped<'_, $t>, b: Mapped<'_, $t>, orientations: [Orientation; 2], size: [usize; 3]) -> Vec<$t> { blocked(a, b, orientations, size) }
+            fn inner_mapped_into(&self, a: Mapped<'_, $t>, b: Mapped<'_, $t>, orientations: [Orientation; 2], size: [usize; 3], out: &mut [$t]) { blocked(a, b, orientations, size, out) }
         }
     )+};
 }

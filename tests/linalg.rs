@@ -145,9 +145,10 @@ mod products {
             let stored = expanded_items(&Walked::from(&mapping), data, 0, m * k, &mut buf).to_vec();
             let a = if o == Orientation::Normal { stored } else { transpose(&stored, k, m) };
             let b: Vec<f64> = (0..k).map(|i| (i * 5 % 13) as f64 - 6.0).collect();
-            let got = PlusTimes.inner_mapped(
+            let mut got = vec![f64::NAN; m];
+            PlusTimes.inner_mapped_into(
                 Mapped { data, mapping: &Walked::from(&mapping) }, Mapped { data: &b, mapping: &Walked::from(&Mapping::Linear(1)) }, [o, Orientation::Normal],
-                [m, k, 1]);
+                [m, k, 1], &mut got);
             assert_eq!(got, PlusTimes.inner(&a, &b, [m, k, 1]));
         };
         let x: Vec<f64> = (0..300).map(|i| (i * 7 % 17) as f64 - 8.0).collect();
@@ -166,6 +167,11 @@ mod products {
             let expected = folded(&a64, &b64, size, 0.0, |s, x, y| s + x * y);
             let mut into = vec![1.0; m * n];
             PlusTimes.inner_into(&a64, &b64, size, &mut into);
+            assert_eq!(into, expected);
+            into.fill(f64::NAN);
+            let linear = rustymath::agreement::Walked::from(&rustymath::agreement::Mapping::Linear(1));
+            PlusTimes.inner_mapped_into(
+                Mapped { data: &a64, mapping: &linear }, Mapped { data: &b64, mapping: &linear }, [Orientation::Normal; 2], size, &mut into);
             assert_eq!(into, expected);
             assert_eq!(PlusTimes.inner(&a64, &b64, size), expected);
             assert_eq!(PlusTimes.inner(&a32, &b32, size), folded(&a32, &b32, size, 0.0, |s, x, y| s + x * y));
@@ -617,11 +623,20 @@ mod factor {
         blocked::<f32>(4.0 * f32::EPSILON as f64);
     }
 
-    /// The `m`×`n` matrix U diag(s) Vᵀ, with orthonormal U and V from fixed seeds and the singular values `s`.
-    pub(super) fn with_spectrum(m: usize, n: usize, s: &[f64]) -> Vec<f64> {
-        let (u, v) = (qr(&random::<f64>(m, n, 3), [m, n]).0, qr(&random::<f64>(n, n, 5), [n, n]).0);
-        let us: Vec<f64> = (0..m * n).map(|k| u[k] * s[k % n]).collect();
-        PlusTimes.inner(&us, &transpose(&v, n, n), [m, n, n])
+    /// Orthonormal `m`×`n` U and `n`×`n` Vᵀ, from fixed seeds, for matrices of known singular values. A test that builds several matrices of one size factors them once.
+    pub(super) struct Bases { m: usize, n: usize, u: Vec<f64>, vt: Vec<f64> }
+
+    impl Bases {
+        pub(super) fn new(m: usize, n: usize) -> Self {
+            let (u, v) = (qr(&random::<f64>(m, n, 3), [m, n]).0, qr(&random::<f64>(n, n, 5), [n, n]).0);
+            Self { m, n, u, vt: transpose(&v, n, n) }
+        }
+
+        /// The `m`×`n` matrix U diag(s) Vᵀ, whose singular values are `s`.
+        pub(super) fn with_spectrum(&self, s: &[f64]) -> Vec<f64> {
+            let us: Vec<f64> = (0..self.m * self.n).map(|k| self.u[k] * s[k % self.n]).collect();
+            PlusTimes.inner(&us, &self.vt, [self.m, self.n, self.n])
+        }
     }
 
     /// QR, least squares and the SVD of tall matrices, with condition numbers from 1 to `worst`, which Cholesky QR factors, and `beyond`, which falls back to Householder QR. Each matrix's singular values run from 1 down to 1/condition. Its first item is positive, so R's first item is positive on the Cholesky path and negative on Householder's.
@@ -630,10 +645,10 @@ mod factor {
         let quartic = T::narrow(2f64.powi((T::max_value().log2().wide() / 4.0) as i32 + 6));
         let times = |x: &[T], c: T| x.iter().map(|&v| v * c).collect::<Vec<T>>();
         for (m, n) in [(4000, 20), (8000, 60)] {
-            let bound = tolerance * n as f64;
+            let (bound, bases) = (tolerance * n as f64, Bases::new(m, n));
             for condition in [1.0, worst.sqrt(), worst, beyond] {
                 let s: Vec<f64> = (0..n).map(|j| condition.powf(-(j as f64) / (n - 1) as f64)).collect();
-                let mut aw = with_spectrum(m, n, &s);
+                let mut aw = bases.with_spectrum(&s);
                 if aw[0] < 0.0 { aw[..n].iter_mut().for_each(|x| *x = -*x) }
                 let a: Vec<T> = aw.iter().map(|&x| T::narrow(x)).collect();
                 let (aw, at) = (wide(&a), format!("{m}×{n}, condition {condition:e}"));
@@ -676,18 +691,18 @@ mod factor {
     }
 
     #[test]
-    fn tall_matrices() {
-        tall::<f64>(4.0 * f64::EPSILON, 1e7, 1e12);
-        tall::<f32>(4.0 * f32::EPSILON as f64, 1e2, 1e12);
-    }
+    fn tall_matrices_at_f64() { tall::<f64>(4.0 * f64::EPSILON, 1e7, 1e12); }
 
-    /// A tall matrix 520 columns wide takes the Cholesky path, with the same accuracy as the narrow ones in `tall_matrices`.
+    #[test]
+    fn tall_matrices_at_f32() { tall::<f32>(4.0 * f32::EPSILON as f64, 1e2, 1e12); }
+
+    /// A tall matrix 520 columns wide takes the Cholesky path, with the same accuracy as the narrow ones in `tall_matrices_at_f64`.
     #[test]
     fn tall_wide_matrices() {
         let (m, n) = (8320, 520);
         let bound = 4.0 * f64::EPSILON * n as f64;
         let s: Vec<f64> = (0..n).map(|j| 1e3f64.powf(-(j as f64) / (n - 1) as f64)).collect();
-        let mut a = with_spectrum(m, n, &s);
+        let mut a = Bases::new(m, n).with_spectrum(&s);
         if a[0] < 0.0 { a[..n].iter_mut().for_each(|x| *x = -*x) }
         let (q, r) = qr(&a, [m, n]);
         assert!(r[0] > 0.0, "wide tall qr takes the Cholesky path");
@@ -707,8 +722,9 @@ mod factor {
         let bound = tolerance * n as f64;
         let fast: Vec<f64> = (0..n).map(|j| 0.5f64.powi(j as i32)).collect();
         let slow: Vec<f64> = (0..n).map(|j| 1.0 / (1 + j) as f64).collect();
+        let bases = Bases::new(m, n);
         for (decay, s) in [("fast", fast), ("slow", slow)] {
-            let tall: Vec<T> = with_spectrum(m, n, &s).iter().map(|&x| T::narrow(x)).collect();
+            let tall: Vec<T> = bases.with_spectrum(&s).iter().map(|&x| T::narrow(x)).collect();
             // The wide case works on a view of the conjugate transpose.
             for (a, [m, n]) in [(transpose(&tall, m, n), [n, m]), (tall, [m, n])] {
                 let f = truncated_svd(&a, [m, n], k);

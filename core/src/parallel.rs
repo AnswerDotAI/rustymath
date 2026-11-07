@@ -1,7 +1,12 @@
 //! Splitting work across threads. [`pieces`] cuts a call's items into pieces of the sizes its caller gives, and [`ranges`] into as many pieces as the time of its first unit justifies. The pieces run on a Rayon pool with Rayon's default number of threads: `RAYON_NUM_THREADS` where it's set, and otherwise one for each core. [`set_threads`] changes that number for the whole process. A call made on one of a pool's threads, such as a function that another call's piece runs, doesn't split again. In the browser build, which has no threads, every call runs its pieces in turn on the calling thread.
 use crate::slice::{Arg, CHUNK};
-use crate::{error::Error, interrupt::check, timing::Instant};
+use crate::{error::Error, interrupt::check};
+/// The clock that `parallel`'s rounds and the speed tests' timings read: the browser's in a browser build, where `std::time::Instant` panics.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub use std::time::Instant;
 use std::{mem::MaybeUninit, ops::Range, sync::atomic::{AtomicUsize, Ordering::Relaxed}, time::Duration};
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub use web_time::Instant;
 
 /// The number of threads that calls split across, for the whole process, or 0 for the default pool's number.
 static THREADS: AtomicUsize = AtomicUsize::new(0);
@@ -129,10 +134,14 @@ fn each_cell<S: Default>(count: usize, write: impl Fn(usize, &mut S) -> bool + S
     for first in (timed..count).step_by(round) {
         check()?;
         let cells = round.min(count - first);
-        ok &= pieces(cells, cells.div_ceil(threads * PIECES).max(least).max(1), usize::MAX, &|range| {
-            let mut scratch = S::default();
-            range.map(|c| first + c).fold(true, |ok, i| write(i, &mut scratch) & ok)
-        });
+        if threads == 1 {
+            ok &= (first..first + cells).fold(true, |ok, i| write(i, &mut scratch) & ok);
+        } else {
+            ok &= pieces(cells, cells.div_ceil(threads * PIECES).max(least).max(1), usize::MAX, &|range| {
+                let mut scratch = S::default();
+                range.map(|c| first + c).fold(true, |ok, i| write(i, &mut scratch) & ok)
+            });
+        }
     }
     Ok(ok)
 }

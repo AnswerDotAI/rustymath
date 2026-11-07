@@ -1,9 +1,9 @@
 use super::*;
 
 pub(super) fn map_real<K, F, Dst, const N: usize>(
-    object: &K, variant: crate::domain::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, ops: &NativeOps<{ FUSED }>, repair: bool,
-    judge: crate::domain::Variant, output: &mut Buffer) -> Result<(), Error> where K: crate::facts::Formula<N>,
-    F: crate::Native + crate::buffer::Cast + Source<Dst> + crate::tolerant::Banded, Dst: Element + crate::Float {
+    object: &K, variant: crate::domain::Variant, inputs: Inputs<'_, '_>, range: std::ops::Range<usize>, ops: &NativeOps<{ FUSED }>, repair: bool,
+    judge: crate::domain::Variant, output: &mut Output<'_, '_>) -> Result<(), Error> where K: crate::facts::Formula<N>,
+    F: crate::Native + crate::buffer::Cast + Source<Dst> + crate::tolerant::Banded, Dst: OutputItem + crate::Float {
     if !K::BOOLEAN && repair && object.repair_routine().is_some() {
         return map_blocks::<F, Dst, N>(inputs, range, variant.checked, output, &|args, n, out| {
             let ok = crate::facts::real_slice(object, ops, args, n, out);

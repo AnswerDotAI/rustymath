@@ -16,6 +16,7 @@ native = ["rustymath/default"]
 [dependencies]
 rustymath.workspace = true
 rustymath-buffer.workspace = true
+rustymath-timing.workspace = true
 pyo3 = { workspace = true, features = ["extension-module", "num-bigint"] }
 num-bigint = ">=0.4.6, <0.5"
 num-rational = ">=0.4.2, <1"

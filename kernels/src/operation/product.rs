@@ -129,12 +129,12 @@ fn product_typed<T: crate::buffer::Cast, P: crate::linalg::Inner<T>>(
     let mut result = Vec::with_capacity(plan.layout.count());
     let overflow = || if variant.checked { Err(Error::new(Kind::Overflow, "product does not fit its integer result")) } else { Ok(false) };
     let mut multiply = |a: Mapped<'_, T>, b: Mapped<'_, T>| -> Result<bool, Error> {
+        let start = result.len();
+        result.resize(start + m * n, P::Out::default());
         if T::DTYPE.is_integral() {
             let (mut ab, mut bb) = (Vec::new(), Vec::new());
-            let start = result.len();
-            result.resize(start + m * n, P::Out::default());
             if !pair.checked_into(a.read(0, m * k, &mut ab), b.read(0, k * n, &mut bb), matrix.size, &mut result[start..]) { return overflow(); }
-        } else { result.extend(pair.inner_mapped(a, b, [Orientation::Normal; 2], matrix.size)); }
+        } else { pair.inner_mapped_into(a, b, [Orientation::Normal; 2], matrix.size, &mut result[start..]); }
         Ok(true)
     };
     if let [Some((a, a0, a_steps)), Some((b, b0, b_steps))] = &walks {

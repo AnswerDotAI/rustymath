@@ -88,8 +88,8 @@ trait Application: Send + Sync {
     ) -> Option<NativeProduct>;
     /// `judged`: whether each item's result is checked for errors, which a kernel skips where its arguments' types can't make one (`Kernel::may_raise`).
     fn map(
-        &self, variant: crate::domain::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, repair: bool,
-        judged: bool, output: &mut Buffer) -> Result<(), Error>;
+        &self, variant: crate::domain::Variant, inputs: Inputs<'_, '_>, range: std::ops::Range<usize>, settings: Settings, repair: bool, judged: bool,
+        output: &mut Output<'_, '_>) -> Result<(), Error>;
     /// `route`, an ordered walk by this binary formula's per-item kernels at `variant`'s computing type (`binary_formula`).
     fn binary(&self, variant: crate::domain::Variant, settings: Settings, route: Route<'_>, output: &mut Buffer) -> Result<(), Error>;
 }
@@ -174,8 +174,8 @@ impl<K: crate::facts::Formula<N>, const N: usize> Application for Definition<K, 
         &self, variant: crate::domain::Variant, fold: Option<crate::reduce::Reduce>, boolean_inputs: bool, wanted: Option<DType>, settings: Settings
     ) -> Option<NativeProduct> { product_for::<K, N>(&self.object, variant, fold, boolean_inputs, wanted, settings) }
     fn map(
-        &self, variant: crate::domain::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, repair: bool,
-        judged: bool, output: &mut Buffer) -> Result<(), Error> { map_formula::<K, N>(&self.object, variant, inputs, range, settings, repair, judged, output) }
+        &self, variant: crate::domain::Variant, inputs: Inputs<'_, '_>, range: std::ops::Range<usize>, settings: Settings, repair: bool, judged: bool,
+        output: &mut Output<'_, '_>) -> Result<(), Error> { map_formula::<K, N>(&self.object, variant, inputs, range, settings, repair, judged, output) }
     fn binary(&self, variant: crate::domain::Variant, settings: Settings, route: Route<'_>, output: &mut Buffer) -> Result<(), Error> {
         binary_formula::<K, N>(&self.object, variant, settings, route, output)
     }
@@ -427,21 +427,43 @@ impl Kernel {
         })
     }
     pub fn map(&self, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, output: &mut Buffer) -> Result<(), Error> {
+        output.clear();
+        self.mapping(Inputs::Mapped(inputs), range, settings, MapOutput::Buffer(output))
+    }
+
+    /// Appends n results from ready inputs into output. A one-item view broadcasts; every other view contains n items.
+    pub fn map_ready(&self, inputs: &[View<'_>], n: usize, settings: Settings, mut output: MapOutput<'_, '_>) -> Result<(), Error> {
+        if inputs.iter().any(|v| v.len() != 1 && v.len() != n) { output.fill(n); return Err(Error::new(Kind::Length, "ready kernel input length changed")); }
+        self.mapping(Inputs::Ready(inputs), 0..n, settings, output)
+    }
+
+    fn mapping(&self, inputs: Inputs<'_, '_>, range: std::ops::Range<usize>, settings: Settings, mut target: MapOutput<'_, '_>) -> Result<(), Error> {
         use crate::characters::{ByKinds, Policy};
-        if inputs.len() != self.arity() { return Err(Error::new(Kind::Length, "kernel operand count changed")); }
-        let wanted = output.dtype();
-        if output.dtype() != self.result { *output = Buffer::with_capacity(self.result, range.len()); }
-        match self.policy {
-            Some(Policy::Kinds(ByKinds::Truth(value))) => *output = Buffer::Booleans(vec![value; range.len()]),
-            Some(Policy::Kinds(side)) => {
-                let side = usize::from(side == ByKinds::Right);
-                inputs[side].read_into(range, self.result, self.variant.checked, output)?;
+        if inputs.len() != self.arity() { target.fill(range.len()); return Err(Error::new(Kind::Length, "kernel operand count changed")); }
+        if range.is_empty() { return Ok(()); }
+        let mut output = Output { target, dtype: self.result, checked: self.variant.fails_on_overflow() };
+        crate::error::checked(|| match self.policy {
+            Some(Policy::Kinds(ByKinds::Truth(value))) => map::constant(value, range.len(), &mut output),
+            Some(Policy::Kinds(side)) => map::copied(inputs.selected(usize::from(side == ByKinds::Right)), range, self.variant.checked, &mut output),
+            _ => {
+                let apply = |inputs: Inputs<'_, '_>, output: &mut Output<'_, '_>| {
+                    self.definition.map(self.variant, inputs, range.clone(), settings, self.repair, self.may_raise(), output)
+                };
+                match inputs {
+                    Inputs::Mapped(reads) => {
+                        self.projected(reads, Some(range.clone()), Seed::Identity, settings, |reads, _| apply(Inputs::Mapped(reads), &mut output))
+                    }
+                    Inputs::Ready(_) if self.projection(settings) == Projection::AsIs => apply(inputs, &mut output),
+                    Inputs::Ready(views) => {
+                        let projected = match views.iter().map(|&v| projected_view(v, self.projection(settings))).collect::<Result<Vec<_>, _>>() {
+                            Ok(projected) => projected, Err(error) => { output.target.fill(range.len()); return Err(error); }
+                        };
+                        let views: Vec<_> = projected.iter().map(|v| v.view()).collect();
+                        apply(Inputs::Ready(&views), &mut output)
+                    }
+                }
             }
-            _ => self.projected(inputs, Some(range.clone()), Seed::Identity, settings, |inputs, _| {
-                self.definition.map(self.variant, inputs, range, settings, self.repair, self.may_raise(), output)
-            })?,
-        }
-        finish(output, wanted, self.variant)
+        })
     }
     pub fn fold_pieces(
         &self, dims: [usize; 3], seed: Seed<'_>, direction: Direction, settings: Settings, pieces: &Pieces<'_>, output: &mut Buffer) -> Result<(), Error> {
@@ -598,12 +620,17 @@ pub fn whole_numbers<F: crate::Float>(t: crate::tolerant::Tolerance, values: &[F
 }
 
 /// `f` on `view` as an integer computation reads it (`with_projected`): characters as their codes under `Projection::Codes`, and floats as the whole numbers they equal within the projection's tolerance (`whole_numbers`).
-fn with_projected_view<R>(view: View<'_>, projection: Projection, f: impl FnOnce(View<'_>) -> R) -> Result<R, Error> {
+fn projected_view(view: View<'_>, projection: Projection) -> Result<crate::buffer::Items<'_>, Error> {
+    use crate::buffer::{IntBuf, Items};
     let view = if matches!(projection, Projection::Codes(_)) { crate::characters::as_codes(view) } else { view };
-    let Some(t) = projection.wholes().filter(|_| matches!(view.dtype(), DType::Float(_))) else { return Ok(f(view)) };
+    let Some(t) = projection.wholes().filter(|_| matches!(view.dtype(), DType::Float(_))) else { return Ok(Items::Borrowed(view)) };
     let mut floats = Vec::new();
     <f64 as crate::buffer::Cast>::extend_cast(view, view.len(), true, &mut floats)?;
-    Ok(f(View::Integers(crate::buffer::Ints::I64(&whole_numbers(t, &floats)?))))
+    Ok(Items::Owned(Buffer::Integers(IntBuf::I64(whole_numbers(t, &floats)?))))
+}
+
+fn with_projected_view<R>(view: View<'_>, projection: Projection, f: impl FnOnce(View<'_>) -> R) -> Result<R, Error> {
+    Ok(f(projected_view(view, projection)?.view()))
 }
 
 /// `call` on `inputs` as an integer computation reads them: characters as their codes under `Projection::Codes`, and floats as the whole numbers they equal within the projection's tolerance (`whole_numbers`), as `i64`, over `range`, or over the whole of each input where `None`.
@@ -815,5 +842,5 @@ mod binary;
 mod fold;
 mod map;
 mod product;
-pub use {at::*, product::*};
-use {binary::*, fold::*, map::map_formula};
+pub use {at::*, map::MapOutput, product::*};
+use {binary::*, fold::*, map::{Inputs, Output, map_formula}};

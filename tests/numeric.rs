@@ -5,7 +5,7 @@ mod timing {
     /// The nesting rules for shared and exclusive holds, on a lock file of the test's own, which no build or timing holds.
     #[test]
     fn hold_modes_and_lifetimes() {
-        use rustymath::timing::hold_at;
+        use rustymath_timing::hold_at;
         use std::io::ErrorKind::InvalidInput;
         let path = std::env::temp_dir().join(format!("rustymath-timing-{}.lock", std::process::id()));
         let lock = path.to_str().unwrap();
@@ -23,7 +23,7 @@ mod timing {
     /// A budget is the expected cost times its multiplier, rounded up, and a `held` or `busy` line raises one column's budget to the budget for the cost it gives, or to twice a cost marked as an estimate. Only a gap's hold goes stale, once a cost is within 90% of the rule budget.
     #[test]
     fn budgets_follow_the_rule_and_holds() {
-        use rustymath::timing;
+        use rustymath_timing as timing;
         assert_eq!([0.2, 0.27, 15.6, 142.0, 12682.0].map(|c| timing::budget("f64", c, false)), [0.5, 0.54, 32.0, 220.0, 17000.0]);
         assert_eq!((timing::budget("f64", 60.0, true), timing::budget("widths", 0.72, false)), (120.0, 0.97));
         let text = "[f64]\n# 2 copies: one read and one write.\n# held linux 15.6: the cause isn't known yet\nExp\t4\t4\n# busy macos 2.7: a busy host\nLog\t4\t4\n# held linux ~60: no run has measured it\nSin\t4\t4\n";
@@ -35,6 +35,21 @@ mod timing {
         assert!(budget(0, 1).stale(3.6) && !budget(0, 1).stale(3.7) && !budget(1, 0).stale(1.0));
         for bad in ["# held linux: no cost", "# held linux 15.6", "# held linux 1 linux 2: twice"] {
             assert!(timing::cases(&format!("[f64]\n{bad}\nExp\t4\t4\n")).is_err(), "{bad}");
+        }
+    }
+
+    /// A `-` budget is no budget in its column. Counts follow the budgets, one field for each measure, and a count fails above its margin times the count recorded, with one more byte for each item for bytes allocated.
+    #[test]
+    fn counts_follow_budgets() {
+        use rustymath_timing::{self as timing, COUNT_MARGIN};
+        let cases = timing::cases("[f64]\nExp\t4\t-\tinstructions linux 2.5 macos 2\tallocated linux 0\n").unwrap();
+        let case = &cases[0];
+        assert_eq!(timing::Budget::of(case.section, &case.budgets, &case.holds, Some(1)), None);
+        let instructions = case.count("instructions", Some(1)).unwrap();
+        assert!(!instructions.over(3.1, COUNT_MARGIN) && instructions.over(3.2, COUNT_MARGIN) && instructions.over(2.6, 1.0));
+        assert!(!case.count("allocated", Some(1)).unwrap().over(1.0, COUNT_MARGIN) && case.count("allocated", Some(0)).is_none());
+        for bad in ["Exp\t4\tinstructions linux", "Exp\tinstructions linux 2\t4", "Exp\t4\tinstructions linux 1 linux 2", "Exp\t4\tinstructions mars 2"] {
+            assert!(timing::cases(&format!("[f64]\n{bad}\n")).is_err(), "{bad}");
         }
     }
 }
@@ -560,6 +575,32 @@ mod operation {
     }
 
     #[test]
+    fn ready_maps_append_direct_converted_and_failed_results() {
+        use rustymath::{Add, Sqrt, operation::MapOutput, parallel::Slots, tolerant::{Less, Tolerance}};
+        let settings = Settings { tolerance: Tolerance::EXACT };
+        let float = f64::DTYPE;
+        let add = Kernel::resolve(Add, Variant::checked(float), [float; 2]).unwrap();
+        let mut values = vec![10.];
+        Slots::append(&mut values, 3, |slots| add.map_ready(&[f64::view(&[1.]), f64::view(&[2., 3., 4.])], 3, settings, MapOutput::F64(slots))).unwrap();
+        assert_eq!(values, [10., 3., 4., 5.]);
+        let less = Kernel::resolve(Less(Tolerance::EXACT), Variant::checked(float), [float; 2]).unwrap();
+        Slots::append(&mut values, 3, |slots| less.map_ready(&[f64::view(&[3.]), f64::view(&[2., 3., 4.])], 3, settings, MapOutput::F64(slots))).unwrap();
+        assert_eq!(values, [10., 3., 4., 5., 0., 0., 1.]);
+        let complex = num_complex::Complex64::DTYPE;
+        let sqrt = Kernel::resolve(Sqrt, Variant::checked(complex), [complex]).unwrap();
+        let result = Slots::append(&mut values, 1, |slots| {
+            sqrt.map_ready(&[num_complex::Complex64::view(&[num_complex::Complex64::new(-1., 0.)])], 1, settings, MapOutput::F64(slots))
+        });
+        assert!(result.is_err());
+        assert_eq!(values.len(), 8);
+        let ints = Kernel::resolve(Add, Variant::checked(i64::DTYPE), [float; 2]).unwrap();
+        let inputs = [f64::view(&[f64::NAN]), f64::view(&[1.])];
+        Slots::append(&mut values, 0, |slots| ints.map_ready(&inputs, 0, settings, MapOutput::F64(slots))).unwrap();
+        assert!(Slots::append(&mut values, 1, |slots| ints.map_ready(&inputs, 1, settings, MapOutput::F64(slots))).is_err());
+        assert_eq!(values.len(), 9);
+    }
+
+    #[test]
     fn native_operations_use_input_kinds_and_run_settings() {
         use rustymath::{Add, Binary, Binom, Bitwise, Exp, Subtract, tolerant::{Residue, Tolerance}};
         let (small, wide) = (DType::Integer(Width::I16), DType::Integer(Width::I64));
@@ -712,45 +753,58 @@ mod operation {
             assert_eq!(out.dtype(), if len < 2 { dtype } else { DType::Boolean });
             assert_eq!(i64::vec(Buffer::cast_results(out.view(), dtype, true).unwrap()).unwrap(), [expected]);
         }
+        for inner in [1, 2] {
+            let outer = rustymath::CHUNK / 3 + 1;
+            let data: Vec<i64> = (0..outer * 3 * inner).map(|i| [3, 2, 1][i / inner % 3]).collect();
+            let input = [Binding::full(i64::view(&data))];
+            let plan = ReadPlan::input(0, data.len());
+            for (direction, expected) in [(Direction::Right, false), (Direction::Left, true)] {
+                let mut out = Buffer::with_capacity(DType::Boolean, outer * inner);
+                less.fold_read(
+                    &[outer, 3, inner], Some(1), Seed::Identity, direction, Settings { tolerance: Tolerance::EXACT }, Read { sources: &input, plan: &plan },
+                    &mut out).unwrap();
+                assert_eq!(bool::of(out.view()).unwrap(), vec![expected; outer * inner]);
+            }
+        }
         let plan = ReadPlan::input(0, 3);
         let read = Read { sources: &input, plan: &plan };
         let mut out = Buffer::with_capacity(less.scan_dtype(false), 3);
         less.scan([1, 3, 1], Seed::Identity, Direction::Left, Settings { tolerance: rustymath::tolerant::Tolerance::EXACT }, read, &mut out).unwrap();
         assert_eq!(i64::vec(out).unwrap(), [3, 0, 1]);
         // Packed comparisons keep raw seeds and numeric heads across word and read-chunk boundaries.
-        for (dtype, tolerance) in [i64::DTYPE, f32::DTYPE, f64::DTYPE].into_iter().flat_map(|dtype| [Tolerance::EXACT, Tolerance::DEFAULT].map(|t| (dtype, t)))
-        {
-            let less = Kernel::resolve(Less(tolerance), Variant::checked(dtype), [dtype; 2]).unwrap();
-            let raw = Buffer::cast_results(i64::view(&[7]), dtype, true).unwrap();
-            let seed = [Binding::full(raw.view())];
-            for len in [0, 1, 63, 64, 65, 5000] {
-                let data: Vec<f64> = (0..len).map(|i| [-2., -1e-20, 0., 1., 1. + 1e-15, 1. + 1e-13, 2.][i % 7]).collect();
-                let typed = Buffer::cast_results(f64::view(&data), dtype, true).unwrap();
-                let data = f64::vec(Buffer::cast_results(typed.view(), f64::DTYPE, true).unwrap()).unwrap();
-                let input = [Binding::full(typed.view())];
-                let plan = ReadPlan::input(0, len);
-                for initial in [None, Some(7.)] {
-                    for direction in [Direction::Left, Direction::Right] {
-                        let mut ordered = data.clone();
-                        if direction == Direction::Right { ordered.reverse(); }
-                        let (mut carry, mut expected) = (initial, Vec::new());
-                        for x in ordered {
-                            let value = carry.map_or(x, |c| {
-                                u8::from(if direction == Direction::Left { Less(tolerance).one(c, x) } else { Less(tolerance).one(x, c) }) as f64
-                            });
-                            expected.push(value);
-                            carry = Some(value);
+        for (dtype, tolerance) in
+            [i16::DTYPE, i64::DTYPE, f32::DTYPE, f64::DTYPE].into_iter().flat_map(|dtype| [Tolerance::EXACT, Tolerance::DEFAULT].map(|t| (dtype, t))) {
+                let less = Kernel::resolve(Less(tolerance), Variant::checked(dtype), [dtype; 2]).unwrap();
+                let raw = Buffer::cast_results(i64::view(&[7]), dtype, true).unwrap();
+                let seed = [Binding::full(raw.view())];
+                for len in [0, 1, 63, 64, 65, 5000] {
+                    let data: Vec<f64> = (0..len).map(|i| [-2., -1e-20, 0., 1., 1. + 1e-15, 1. + 1e-13, 2.][i % 7]).collect();
+                    let typed = Buffer::cast_results(f64::view(&data), dtype, true).unwrap();
+                    let data = f64::vec(Buffer::cast_results(typed.view(), f64::DTYPE, true).unwrap()).unwrap();
+                    let input = [Binding::full(typed.view())];
+                    let plan = ReadPlan::input(0, len);
+                    for initial in [None, Some(7.)] {
+                        for direction in [Direction::Left, Direction::Right] {
+                            let mut ordered = data.clone();
+                            if direction == Direction::Right { ordered.reverse(); }
+                            let (mut carry, mut expected) = (initial, Vec::new());
+                            for x in ordered {
+                                let value = carry.map_or(x, |c| {
+                                    u8::from(if direction == Direction::Left { Less(tolerance).one(c, x) } else { Less(tolerance).one(x, c) }) as f64
+                                });
+                                expected.push(value);
+                                carry = Some(value);
+                            }
+                            if direction == Direction::Right { expected.reverse(); }
+                            let seed = if initial.is_some() { Seed::Initial(Read { sources: &seed, plan: &scalar }) } else { Seed::Identity };
+                            let mut out = Buffer::with_capacity(less.scan_dtype(initial.is_some()), len);
+                            less.scan([1, len, 1], seed, direction, Settings { tolerance }, Read { sources: &input, plan: &plan }, &mut out).unwrap();
+                            assert_eq!(out.dtype(), if initial.is_some() { DType::Boolean } else { dtype });
+                            assert_eq!(f64::vec(Buffer::cast_results(out.view(), f64::DTYPE, true).unwrap()).unwrap(), expected);
                         }
-                        if direction == Direction::Right { expected.reverse(); }
-                        let seed = if initial.is_some() { Seed::Initial(Read { sources: &seed, plan: &scalar }) } else { Seed::Identity };
-                        let mut out = Buffer::with_capacity(less.scan_dtype(initial.is_some()), len);
-                        less.scan([1, len, 1], seed, direction, Settings { tolerance }, Read { sources: &input, plan: &plan }, &mut out).unwrap();
-                        assert_eq!(out.dtype(), if initial.is_some() { DType::Boolean } else { dtype });
-                        assert_eq!(f64::vec(Buffer::cast_results(out.view(), f64::DTYPE, true).unwrap()).unwrap(), expected);
                     }
                 }
             }
-        }
         let sum = Kernel::resolve(Add, Variant::checked(DType::Integer(Width::I16)), [DType::Integer(Width::I16); 2]).unwrap();
         let narrow = [Binding::full(i16::view(&[3]))];
         let mut out = Buffer::with_capacity(sum.fold_dtype(DType::Integer(Width::I16), 1, None), 1);
