@@ -183,7 +183,10 @@ fn composed<F: Float>(
 fn through<F: Float, G: Unary<F, Out = F>>(g: G) -> impl Fn(&mut [F], &mut [MaybeUninit<F>]) { move |a, v| { g.slice([Arg::Many(a)], a.len(), v); } }
 
 /// Each argument of a block raised to `k`, with `k`'s route chosen once (`pow::powers`), for [`composed`].
-fn raised<F: Float>(k: F) -> impl Fn(&mut [F], &mut [MaybeUninit<F>]) { let e = crate::pow::Exponent::of(k.wide()); move |a, v| crate::pow::powers(e, k, a, v) }
+fn raised<F: Float>(k: F) -> impl Fn(&mut [F], &mut [MaybeUninit<F>]) {
+    let e = crate::pow::Exponent::of(k.wide(), crate::FUSED);
+    move |a, v| crate::pow::powers(e, k, a, v)
+}
 
 impl Distribution {
     /// The density at x, or for a discrete distribution the probability of x.

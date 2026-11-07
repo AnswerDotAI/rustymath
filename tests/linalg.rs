@@ -26,7 +26,8 @@ mod products {
             let seed = if tail.is_some() { Seed::Tail(Read { sources: &sources, plan: &tail_plan }) } else { Seed::Identity };
             let mut out = Buffer::with_capacity(kernel.result_dtype(), dims[0] * dims[2]);
             error::checked(|| {
-                kernel.fold_read(&dims, 1, seed, Direction::Right, Settings { tolerance: Tolerance::EXACT }, Read { sources: &sources, plan: &plan }, &mut out)
+                kernel.fold_read(
+                    &dims, Some(1), seed, Direction::Right, Settings { tolerance: Tolerance::EXACT }, Read { sources: &sources, plan: &plan }, &mut out)
             })?;
             Ok(out)
         }

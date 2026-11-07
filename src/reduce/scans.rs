@@ -208,3 +208,39 @@ fn mapped(n: usize, mut carry: bool, maps: impl Fn(usize) -> (u64, u64), out: &m
         }
     });
 }
+
+/// Appends a Boolean-valued scan of long consecutive lanes, keeping an unseeded lane's first item as it is. Comparisons at carries 0 and 1 make independent two-state maps, whose packed words compose through `mapped`. A failed speculative comparison leaves `out` unchanged and declines, so the ordered runner checks only steps the scan actually takes.
+pub(crate) fn comparison_scan<T: Element + PartialEq>(
+    data: &[T], len: usize, start: Option<T>, step: impl Fn(T, T) -> (T, Option<Kind>) + Copy, out: &mut Vec<T>) -> bool where bool: Source<T> {
+    if len < SHORT_LANE { return false; }
+    let (zero, one, before) = (false.read(), true.read(), out.len());
+    let (mut low, mut high, mut bits) = (Vec::new(), Vec::new(), Vec::new());
+    for lane in data.chunks(len) {
+        let (first, used) = match start { Some(seed) => (step(seed, lane[0]), 1), None => { out.push(lane[0]); (step(lane[0], lane[1]), 2) } };
+        let (first, failed) = first;
+        if failed.is_some() { out.truncate(before); return false; }
+        out.push(first);
+        let rest = &lane[used..];
+        low.clear();
+        high.clear();
+        bits.clear();
+        let transitions = |carry, dest: &mut Vec<bool>| {
+            appended(dest, rest.len(), |slots| {
+                let mut valid = true;
+                for (&x, slot) in rest.iter().zip(slots) {
+                    let (value, failed) = step(carry, x);
+                    slot.write(value != zero);
+                    valid &= failed.is_none();
+                }
+                valid
+            })
+        };
+        if !(transitions(zero, &mut low) & transitions(one, &mut high)) { out.truncate(before); return false; }
+        mapped(rest.len(), first != zero, |at| {
+            let (l, h) = (packed(&low, at), packed(&high, at));
+            (l ^ h, l)
+        }, &mut bits);
+        out.extend(bits.iter().copied().map(Source::<T>::read));
+    }
+    true
+}

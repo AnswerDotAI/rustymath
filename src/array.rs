@@ -2,9 +2,9 @@
 use crate::agreement::{Agreement, Binding, Mapping, Missing, Read, ReadPlan, ReadRoute};
 use crate::buffer::{Buffer, DType, Element, Items, View};
 use crate::error::{Error, Kind};
-use crate::gather::Steps;
+use crate::gather::{Steps, Writes};
 use crate::layout::{Keys, Lanes, Layout, element_count};
-use crate::operation::{Kernel, Positions, Settings, WriteRoot};
+use crate::operation::{Kernel, Settings, WriteRoot};
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -199,10 +199,9 @@ impl Array {
         if agreement.layout.shape() != plan.layout.shape() { return Err(Error::new(Kind::Length, "assignment must fit the selected layout")); }
         let root = self.view();
         let source = source.view().remapped(agreement.right, agreement.len);
-        let positions = ReadPlan::input(0, self.len()).remapped(Mapping::from(plan.steps.clone()), agreement.len, Missing::Default);
         let mut buffer = Buffer::with_capacity(self.dtype(), self.len());
         crate::operation::at(
-            combine, WriteRoot::Read(root.read()), source.read(), Positions::Route(&positions, 0), true,
+            combine, WriteRoot::Read(root.read()), source.read(), Writes::Walk { base: 0, steps: &plan.steps }, true,
             Settings { tolerance: crate::tolerant::Tolerance::EXACT }, &mut buffer)?;
         Ok(buffer)
     }

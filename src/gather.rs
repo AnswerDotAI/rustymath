@@ -283,11 +283,11 @@ fn windows_into<const L: usize, U: Unit>(out: &mut [U], items: &[U], o: usize, s
     }
 }
 
-/// Replaces the item of `out` at each offset with the matching one of `items`, converted by `conv`, or with the only one when `items` holds one. A later offset wins. A [`Steps::FILL`] offset writes nothing.
+/// Replaces the item of `out` at each offset with the matching one of `items`, converted by `conv`, or with the only one when `items` holds one. A later offset wins. An out-of-range offset, including [`Steps::FILL`], writes nothing.
 #[inline]
 pub fn scatter<S: Copy, D>(out: &mut [D], offsets: &[usize], items: &[S], conv: impl Convert<S, D>) {
     let items = Arg::of(items);
-    for (k, &o) in offsets.iter().enumerate() { if o != Steps::FILL { out[o] = conv.one(items.nth(k)) } }
+    for (k, &o) in offsets.iter().enumerate() { if let Some(slot) = out.get_mut(o) { *slot = conv.one(items.nth(k)) } }
 }
 /// Replaces the items of `out` that `steps` reach from `base`, in the order that [`walk`] reads them, with the matching ones of `items`, converted by `conv`, or with the only one when `items` holds one. `items` holds one item for each position the steps reach, or one item. A fill position writes nothing. A conversion other than [`Same`] converts a block of items at a time, whole rows of the first axis up to about `CHUNK` items, then writes that block while it's still in cache. Where `D` has a fixed-width loop that converts from `S` ([`Item::cells_from`]), short cells along a stride convert as they write instead, with no separate pass. The walk's fixed-width loops then move items as [`Unit`]s, so they compile once for each size of item, whatever the types and conversion. Rows longer than `RUN` write along a slice each. Short cells write through one table of their offsets, as [`walk`] reads them. Cells that a table of starts picks, each reaching items a stride apart, as columns' do, must be disjoint or identical. They write in blocks of 8 cells, row by row, so each block's writes share the lines they touch, as [`walk`]'s reads do. A later identical cell wins. Other steps write in [`walk`]'s order.
 pub fn scatter_walk<S: Item, D: Item>(out: &mut [D], items: &[S], base: usize, steps: &[Steps], conv: impl Convert<S, D>) {
@@ -467,7 +467,7 @@ impl<'a> Writes<'a> {
     pub fn write<S: Item, D: Item>(self, out: &mut [D], items: &[S], conv: impl Convert<S, D>) {
         match self { Self::Offsets(offsets) => scatter(out, offsets, items, conv), Self::Walk { base, steps } => scatter_walk(out, items, base, steps, conv) }
     }
-    /// Combines the matching item of `values`, or its only item, into the item of `out` at each write by `f`, in order, as `out[o] = f(out[o], y).0`. A place that repeats combines again. With addition, this is the transpose of a gather that reads a position more than once. It gives the last failure that `f` reports.
+    /// Combines the matching item of `values`, or its only item, into the item of `out` at each write by `f`, in order, as `out[o] = f(out[o], y).0`. An out-of-range position writes nothing; a place that repeats combines again. With addition, this is the transpose of a gather that reads a position more than once. It gives the last failure that `f` reports.
     pub fn combine<D: Copy, S: Copy, E: Copy>(self, out: &mut [D], values: Arg<'_, S>, f: impl Fn(D, S) -> (D, Option<E>)) -> Option<E> {
         let mut failed = None;
         self.runs_while(&mut |k, run| {
@@ -482,9 +482,9 @@ impl<'a> Writes<'a> {
 fn combine_run<D: Copy, S: Copy, E: Copy>(out: &mut [D], run: &[usize], values: Arg<'_, S>, f: &impl Fn(D, S) -> (D, Option<E>)) -> Option<E> {
     let mut failed = None;
     for (j, &o) in run.iter().enumerate() {
-        if o != Steps::FILL {
-            let (r, e) = f(out[o], values.nth(j));
-            out[o] = r;
+        if let Some(slot) = out.get_mut(o) {
+            let (r, e) = f(*slot, values.nth(j));
+            *slot = r;
             failed = e.or(failed)
         }
     }

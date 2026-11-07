@@ -1,10 +1,12 @@
-//! Complex functions at `Complex<f32>` and `Complex<f64>`: the exponential and logarithm, square root and powers, the circle and hyperbolic functions and their inverses, ln Γ and Γ, binomial coefficients, the magnitude and angle, and the sign z/|z|. Each computes at its own width. The facts table's complex formulas call them, as kernels run them on each item.
+//! Complex functions at `Complex<f32>` and `Complex<f64>`: the exponential and logarithm, square root and powers, the circle and hyperbolic functions and their inverses, ln Γ and Γ, binomial coefficients, the magnitude and angle, and the sign z/|z|. Each computes at its own width. The facts table calls their scalar bodies or bulk bodies that run real-array kernels over the parts.
 //!
 //! Their error counts in ulps of the result's magnitude: |f(z) - exact| is within 4 ulps of |exact|. A part much smaller than the other can carry most of that error. ln Γ counts in ulps of the larger of its magnitude and 2. The functions that exponentiate a logarithm count in ulps of their magnitude times one more than the exponent's magnitude, or than 2 where that is smaller: |w ln z| for powers, and |ln Γ| for Γ and binomial coefficients. Branch cuts follow C99's Annex G: the sign of a zero part chooses the side of a cut. The inverse functions use the formulas from Kahan's "Branch Cuts for Complex Elementary Functions" (1987), built on the complex square root, which keep their digits near the branch points.
 //!
 //! `exp` and the powers that compute through it give an exact direction at the float nearest a whole number of quarter turns. e^(iπ/2) is then exactly i, where the exponential of that float has a real part of about 6e-17. These results lie outside the error bound.
 use crate::{Native, arc, exp as e, float::ln2, hyperbolic, ln as l, pow as p, special, trig};
 use num_complex::Complex;
+
+pub(crate) mod bulk;
 
 #[inline(always)]
 fn c<R>(re: R, im: R) -> Complex<R> { Complex::new(re, im) }

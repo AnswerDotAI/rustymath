@@ -4,6 +4,7 @@
 use crate::buffer::{Buffer, DType, Element, FloatWidth, Source, View, Width};
 use crate::domain::Range;
 use crate::error::{Error, Kind};
+use crate::gather::Writes;
 use crate::reduce::native_reduction;
 use crate::slice::Arg;
 
@@ -23,27 +24,6 @@ pub enum Seed<'a> { Identity, Initial(crate::agreement::Read<'a>), Tail(crate::a
 impl<'a> Seed<'a> {
     /// The seed's items, or `None` for the identity.
     pub fn read(self) -> Option<crate::agreement::Read<'a>> { match self { Self::Initial(read) | Self::Tail(read) => Some(read), Self::Identity => None } }
-}
-
-/// Write positions: numeric indices, the addresses of a selection's root source, or flat offsets. A write skips an invalid position: one outside the array, an invalid route position, or a [`crate::gather::Steps::FILL`] offset, as in [`crate::gather::Writes`].
-#[derive(Clone, Copy)]
-pub enum Positions<'a> { Indices(crate::agreement::Read<'a>, DType), Route(&'a crate::agreement::ReadPlan, usize), Offsets(&'a [usize]) }
-
-impl Positions<'_> {
-    pub fn len(self) -> usize {
-        match self { Self::Indices(read, _) => read.plan.len(), Self::Route(plan, _) => plan.len(), Self::Offsets(offsets) => offsets.len() }
-    }
-    /// The positions that `range` of these writes target in an array of `size` items. A position outside the array, an invalid route position and a `FILL` offset all give `FILL`, which writes nothing. Index values here are a mask's Booleans (`choose`), and a float among them must be exactly whole.
-    pub fn chunk(self, range: std::ops::Range<usize>, size: usize, scratch: &mut Buffer) -> Result<Vec<usize>, Error> {
-        use crate::{agreement::Run, gather::Steps};
-        match self {
-            Self::Indices(read, dtype) => crate::structure::positions(read.part_view(range, dtype, false, scratch)?, size, crate::tolerant::Tolerance::EXACT),
-            Self::Route(plan, root) => Ok(range.map(|i| match plan.at(i) {
-                Run::Source { source, first, .. } if source == root && first < size => first, _ => Steps::FILL
-            }).collect()),
-            Self::Offsets(offsets) => Ok(offsets[range].iter().map(|&o| if o < size { o } else { Steps::FILL }).collect()),
-        }
-    }
 }
 
 /// How a kernel reads its inputs before its formula runs (`Kernel::projection`, `with_projected`).
@@ -548,15 +528,17 @@ impl Kernel {
         })?;
         finish(output, dtype, self.variant)
     }
-    /// Folds along `axis` of `input`, an array of `shape`, into `output`. A returned order reads `output` in the result's order, for folds that stay in their source's order (`Buffer::ordered`).
+    /// Folds along `axis` of `input`, an array of `shape`, or all its items for `None`, into `output`. Whole-array commutative folds may read a contiguous block in storage order; ordered folds retain logical order. A returned order reads `output` in the result's order, for folds that stay in their source's order (`Buffer::ordered`).
     pub fn fold_read(
-        &self, shape: &[usize], axis: usize, seed: Seed<'_>, direction: Direction, settings: Settings, input: crate::agreement::Read<'_>, output: &mut Buffer
-    ) -> Result<Option<Vec<crate::gather::Steps>>, Error> {
+        &self, shape: &[usize], axis: Option<usize>, seed: Seed<'_>, direction: Direction, settings: Settings, input: crate::agreement::Read<'_>,
+        output: &mut Buffer) -> Result<Option<Vec<crate::gather::Steps>>, Error> {
         let dtype = output.dtype();
         let variant = self.fold_variant(&seed);
         let order = self.projected(&[input], None, seed, settings, |inputs, seed| {
             let input = inputs[0];
             if let Some(fold) = self.definition.reduction(variant) { return fold.run_read(variant, shape, axis, seed, input, output); }
+            let flat = [crate::layout::count(shape)];
+            let (shape, axis) = axis.map_or((flat.as_slice(), 0), |axis| (shape, axis));
             if let Some(fold) = self.alternated(seed, direction) && let Some(buffer) = fold.inverse_read(variant, shape, axis, input)? {
                 *output = buffer;
                 return Ok(None);
@@ -609,7 +591,8 @@ fn choose_typed<T: crate::buffer::Cast>(
                 }
             }
             let mut indices = Buffer::with_capacity(selector.1, 0);
-            let positions = Positions::Indices(selector.0, selector.1).chunk(part(selector.0), choices.len(), &mut indices);
+            let positions = selector.0.part_view(part(selector.0), selector.1, false, &mut indices)
+                .and_then(|view| crate::structure::positions(view, choices.len(), crate::tolerant::Tolerance::EXACT));
             match positions.and_then(|positions| args.map(|args| (positions, args))) {
                 Ok((positions, args)) => slots.fill(range.len(), |out| {
                     for (i, slot) in out.iter_mut().enumerate() {
@@ -837,5 +820,6 @@ mod binary;
 mod fold;
 mod map;
 mod product;
+pub(crate) use map::real_slice;
 pub use {at::*, product::*};
-use {binary::*, fold::*, map::*};
+use {binary::*, fold::*, map::map_formula};

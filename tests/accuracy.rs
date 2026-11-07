@@ -67,7 +67,6 @@ fn worst<A: Input, T: Measured>(n: u64, input: impl Fn(u64) -> A, f: impl Fn(A) 
     (0..n).map(|i| { let x = input(i); (error(x, f(x), reference(x)), x) }).max_by_key(|&(e, _)| e).unwrap()
 }
 
-fn power_scale(result: f64) -> f64 { if !result.is_finite() || result == 0.0 { 1.0 } else { 1.0 + 4.0 * result.abs().ln().abs() } }
 fn scaled_error(error: u64, scale: f64) -> u64 { if scale == 0.0 { 0 } else if error == u64::MAX { error } else { (error as f64 / scale).ceil() as u64 } }
 
 fn worst_scaled<A: Input, T: Measured + Into<f64>>(
@@ -209,6 +208,8 @@ fn binary(
         }
         if !extra.is_empty() {
             check_libm(&format!("f64 {name} at extra pairs, {how}"), worst_scaled(extra.len() as u64, |i| extra[i as usize], wide, wide_libm, scale));
+            let pair = |i: u64| { let (x, y) = extra[i as usize]; (x as f32, y as f32) };
+            check(&format!("f32 {name} at extra pairs, {how}"), worst_scaled(extra.len() as u64, pair, narrow, narrow_libm, scale));
         }
         check_cases_scaled(&format!("CORE-MATH {name}, {how}"), &hard, wide, scale);
         for (source, text) in VECTORS {
@@ -219,6 +220,18 @@ fn binary(
     let pair16 = |i: u64| { let r = random(i); (f16::from_bits(r as u16), f16::from_bits((r >> 16) as u16)) };
     let half_libm = |(x, y): (f16, f16)| f16::from_f64(libm(x.into(), y.into()));
     check(&format!("f16 {name} at scattered pairs"), worst(1 << 16, pair16, |(x, y)| f16(x, y), half_libm));
+}
+
+fn check_kernel_cases<F: Measured + rustymath::buffer::Element>(name: &str, object: impl rustymath::facts::Formula<2>, cases: &[((F, F), F)], bound: u64) where
+    (F, F): Input {
+    use rustymath::{domain::Variant, operation::Kernel};
+    if cases.is_empty() { return; }
+    let kernel = Kernel::new(object, Variant { checked: false, ..Variant::checked(F::DTYPE) });
+    let (xs, ys): (Vec<_>, Vec<_>) = cases.iter().map(|&((x, y), _)| (x, y)).unzip();
+    let got = support::mapped::<F, F, 2>(&kernel, [&xs, &ys], cases.len()).expect("real kernel results");
+    assert_eq!(got.len(), cases.len(), "{name}");
+    let worst = cases.iter().zip(got).map(|(&(x, want), got)| (error(x, got, want), x)).max_by_key(|&(e, _)| e).unwrap();
+    within(name, bound, worst);
 }
 
 /// The platform libm's inverse hyperbolic functions. Rust's standard library computes these with formulas of its own, and its `acosh` loses most of its accuracy near 1.
@@ -324,7 +337,34 @@ fn pow_accuracy() {
     let halves = [0.3, 1.7, 3.14159, 123.456, 1e10, 1e-10].into_iter().flat_map(|x| [0.5, 1.5].into_iter().flat_map(move |h| [(x, h), (x, -h)]));
     let exact: Vec<(f64, f64)> = (2..=12).flat_map(|b| (-30..=60).map(move |k| (b as f64, k as f64))).chain(wholes).chain(halves).collect();
     let near = [((0.5, 2.0), (-1000.0, 1000.0)), ((1.2, 1.5), (1500.0, 2700.0)), ((0.0, 4.0), (-30.0, 30.0)), ((-8.0, 0.0), (-20.0, 20.0))];
-    binary("pow", variants!(pow, 2).into_iter().chain([POW_ONE]), rustymath::pow, f64::powf, &near, &exact, power_scale);
+    binary("pow", variants!(pow, 2).into_iter().chain([POW_ONE]), rustymath::pow, f64::powf, &near, &exact, |_| 1.0);
+    for (source, text) in [("CORE-MATH", CORE_MATH)].into_iter().chain(VECTORS) {
+        check_kernel_cases(&format!("{source} pow kernel"), rustymath::Pow, &vectors::<(f64, f64), f64>(text, "pow"), BOUND);
+        check_kernel_cases(&format!("{source} powf kernel"), rustymath::Pow, &vectors::<(f32, f32), f32>(text, "powf"), BOUND);
+    }
+    let sampled = near.into_iter().flat_map(|(xs, ys)| (0..SAMPLES).map(move |i| (uniform(2 * i, xs), uniform(2 * i + 1, ys))));
+    let pairs: Vec<_> = sampled.chain(exact).collect();
+    let wide: Vec<_> = pairs.iter().map(|&(x, y)| ((x, y), x.powf(y))).collect();
+    check_kernel_cases("f64 pow kernel at sampled and extra pairs", rustymath::Pow, &wide, BOUND + LIBM);
+    let narrow: Vec<_> = pairs.into_iter().map(|(x, y)| {
+        let (x, y) = (x as f32, y as f32);
+        ((x, y), f64::from(x).powf(f64::from(y)) as f32)
+    }).collect();
+    check_kernel_cases("f32 pow kernel at sampled and extra pairs", rustymath::Pow, &narrow, BOUND);
+    fn constants<F: Measured + rustymath::Float + rustymath::buffer::Element>(pairs: &[(F, F)], bound: u64) where (F, F): Input {
+        use rustymath::{domain::Variant, operation::Kernel};
+        let kernel = Kernel::new(rustymath::Pow, Variant { checked: false, ..Variant::checked(F::DTYPE) });
+        for &(x, y) in pairs {
+            let xs = [x, x * F::narrow(0.5)];
+            let got = support::mapped::<F, F, 2>(&kernel, [&xs, &[y]], xs.len()).expect("constant power kernel");
+            assert_eq!(got.len(), xs.len());
+            let worst =
+                xs.into_iter().zip(got).map(|(x, got)| (error((x, y), got, F::narrow(x.wide().powf(y.wide()))), (x, y))).max_by_key(|&(e, _)| e).unwrap();
+            within("constant power kernel", bound, worst);
+        }
+    }
+    constants(&[(1e10f32, -4.0), (1e28, -1.5)], BOUND);
+    constants(&[(1e80f64, -4.0), (1e210, -1.5)], BOUND + LIBM);
 }
 
 #[test]
@@ -342,14 +382,27 @@ fn root_accuracy() {
             check_libm(&format!("f64 root {n} at scattered inputs, {how}"), worst(SAMPLES, |i| scattered(i).abs(), |y| wide((n, y)), |y| y.powf(1.0 / n)));
             check(&format!("f32 root {n}, {how}"), worst(1 << 16, |i| spread32(i).abs(), |y| narrow((n as f32, y)), |y| f64::from(y).powf(1.0 / n) as f32));
         }
+        let wide: Vec<_> = (0..SAMPLES).map(|i| { let y = scattered(i).abs(); ((n, y), y.powf(1.0 / n)) }).collect();
+        check_kernel_cases(&format!("f64 root {n} kernel"), rustymath::Root, &wide, BOUND + LIBM);
+        let narrow: Vec<_> = (0..1 << 16).map(|i| {
+            let y = spread32(i).abs();
+            ((n as f32, y), f64::from(y).powf(1.0 / n) as f32)
+        }).collect();
+        check_kernel_cases(&format!("f32 root {n} kernel"), rustymath::Root, &narrow, BOUND);
     }
     let fifths: Vec<f64> = (-100..=100).map(|k: i32| (k as f64).powi(5)).collect();
     for (wide, _, how) in variants!(root, 2).into_iter().chain([ROOT_ONE]) {
         check_libm(&format!("f64 root 3, {how}"), worst(SAMPLES, scattered, |y| wide((3.0, y)), f64::cbrt));
         check(
             &format!("f64 root 5 of fifth powers, {how}"),
-            worst_scaled(fifths.len() as u64, |i| fifths[i as usize], |y| wide((5.0, y)), |y| y.signum() * y.abs().powf(0.2).round(), power_scale));
+            worst_scaled(fifths.len() as u64, |i| fifths[i as usize], |y| wide((5.0, y)), |y| y.signum() * y.abs().powf(0.2).round(), |_| 1.0));
     }
+    let thirds: Vec<_> = (0..SAMPLES).map(|i| { let y = scattered(i); ((3.0, y), y.cbrt()) }).collect();
+    check_kernel_cases("f64 root 3 kernel", rustymath::Root, &thirds, BOUND + LIBM);
+    let fifths: Vec<_> = fifths.into_iter().map(|y| ((5.0, y), y.signum() * y.abs().powf(0.2).round())).collect();
+    check_kernel_cases("f64 root 5 kernel", rustymath::Root, &fifths, BOUND);
+    let fifths: Vec<_> = fifths.into_iter().filter(|&((_, y), _)| y as f32 as f64 == y).map(|((n, y), w)| ((n as f32, y as f32), w as f32)).collect();
+    check_kernel_cases("f32 root 5 kernel", rustymath::Root, &fifths, BOUND);
 }
 
 /// Constant whole powers and square/cube-root shortcuts retain exactly representable results. The cases are whole powers below 2^53, or 2^24 at f32, of the first 3,000 bases and 1,000 random ones for each exponent, cubes of floats with up to 17 significant bits at several scales, and whole roots of whole powers.
@@ -551,7 +604,7 @@ mod complex {
     use num_complex::Complex;
     use rustymath::{
         Acos, Acosh, Asin, Asinh, Atan, Atanh, Binom, Cos, Cosh, Exp, FUSED, Gamma, LambertW, Lgamma, Ln, Native, Pow, Sign, Sin, Sinh, Sqrt, Sqrt1mx2,
-        Sqrt1px2, Sqrtx2m1, Tan, Tanh, divide, facts::Formula, recipe::NativeOps,
+        Sqrt1px2, Sqrtx2m1, Tan, Tanh, buffer::Element, divide, domain::Variant, facts::Formula, operation::Kernel, recipe::NativeOps,
     };
     use std::f64::consts::{FRAC_PI_2, PI};
 
@@ -560,23 +613,39 @@ mod complex {
     /// The bound on each function's error, in ulps of the result's magnitude.
     const BOUND: f64 = 4.0;
 
-    /// `k` at `z`, through the complex formula that a kernel runs on each item.
+    /// `k` at `z`, through its scalar complex formula.
     pub(super) fn unary<R: Native>(k: impl Formula<1>, z: Complex<R>) -> Complex<R> { k.complex(&NativeOps::<FUSED>::DEFAULT, [z]).expect("a complex formula") }
 
-    /// `k` at `z` and `w`, through the complex formula that a kernel runs on each pair of items.
+    /// `k` at `z` and `w`, through its scalar complex formula.
     fn binary<R: Native>(k: impl Formula<2>, z: Complex<R>, w: Complex<R>) -> Complex<R> {
         k.complex(&NativeOps::<FUSED>::DEFAULT, [z, w]).expect("a complex formula")
     }
 
-    /// The function named `name` at the arguments `z`, or `None` where the name isn't one of these functions.
-    fn apply<R: Native>(name: &str, z: &[Complex<R>]) -> Option<Complex<R>> {
+    fn evaluate<R: Native, const N: usize>(k: impl Formula<N>, args: [&[Complex<R>]; N], bulk: bool) -> Vec<Complex<R>> where Complex<R>: Element {
+        let n = args.iter().map(|a| a.len()).max().unwrap();
+        if bulk {
+            let kernel = Kernel::new(k, Variant::checked(Complex::<R>::DTYPE));
+            crate::support::mapped(&kernel, args, n).expect("valid complex array results")
+        } else {
+            (0..n).map(|i| k.complex(&NativeOps::<FUSED>::DEFAULT, args.map(|a| a[if a.len() == 1 { 0 } else { i }])).expect("a complex formula")).collect()
+        }
+    }
+
+    fn apply<R: Native>(name: &str, z: &[Complex<R>]) -> Option<Complex<R>> where Complex<R>: Element {
+        apply_many(name, &z.iter().map(|&z| vec![z]).collect::<Vec<_>>(), true).map(|v| v[0])
+    }
+
+    /// One function table serves scalar and array checks against the same references.
+    fn apply_many<R: Native>(name: &str, z: &[Vec<Complex<R>>], bulk: bool) -> Option<Vec<Complex<R>>> where Complex<R>: Element {
         Some(match name {
-            "exp" => unary(Exp, z[0]), "log" => unary(Ln, z[0]), "sqrt" => unary(Sqrt, z[0]), "sin" => unary(Sin, z[0]), "cos" => unary(Cos, z[0]),
-            "tan" => unary(Tan, z[0]), "sinh" => unary(Sinh, z[0]), "cosh" => unary(Cosh, z[0]), "tanh" => unary(Tanh, z[0]), "asin" => unary(Asin, z[0]),
-            "acos" => unary(Acos, z[0]), "atan" => unary(Atan, z[0]), "asinh" => unary(Asinh, z[0]), "acosh" => unary(Acosh, z[0]),
-            "atanh" => unary(Atanh, z[0]), "lgamma" => unary(Lgamma, z[0]), "gamma" => unary(Gamma, z[0]), "pow" => binary(Pow, z[0], z[1]),
-            "binom" => binary(Binom, z[0], z[1]), "lambertw" => unary(LambertW, z[0]), "sqrt1mx2" => unary(Sqrt1mx2, z[0]), "sqrtx2m1" => unary(Sqrtx2m1, z[0]),
-            "sqrt1px2" => unary(Sqrt1px2, z[0]), _ => return None
+            "exp" => evaluate(Exp, [&z[0]], bulk), "log" => evaluate(Ln, [&z[0]], bulk), "sqrt" => evaluate(Sqrt, [&z[0]], bulk),
+            "sin" => evaluate(Sin, [&z[0]], bulk), "cos" => evaluate(Cos, [&z[0]], bulk), "tan" => evaluate(Tan, [&z[0]], bulk),
+            "sinh" => evaluate(Sinh, [&z[0]], bulk), "cosh" => evaluate(Cosh, [&z[0]], bulk), "tanh" => evaluate(Tanh, [&z[0]], bulk),
+            "asin" => evaluate(Asin, [&z[0]], bulk), "acos" => evaluate(Acos, [&z[0]], bulk), "atan" => evaluate(Atan, [&z[0]], bulk),
+            "asinh" => evaluate(Asinh, [&z[0]], bulk), "acosh" => evaluate(Acosh, [&z[0]], bulk), "atanh" => evaluate(Atanh, [&z[0]], bulk),
+            "lgamma" => evaluate(Lgamma, [&z[0]], bulk), "gamma" => evaluate(Gamma, [&z[0]], bulk), "pow" => evaluate(Pow, [&z[0], &z[1]], bulk),
+            "binom" => evaluate(Binom, [&z[0], &z[1]], bulk), "lambertw" => evaluate(LambertW, [&z[0]], bulk), "sqrt1mx2" => evaluate(Sqrt1mx2, [&z[0]], bulk),
+            "sqrtx2m1" => evaluate(Sqrtx2m1, [&z[0]], bulk), "sqrt1px2" => evaluate(Sqrt1px2, [&z[0]], bulk), _ => return None
         })
     }
 
@@ -605,33 +674,61 @@ mod complex {
         }
     }
 
-    /// The worst error of each function that `f` computes, in ulps of its scale, over the cases whose arguments and result are finite and normal at `R`.
-    fn worst<R: Native>(eps: f64, narrow: impl Fn(f64) -> R, f: impl Fn(&str, &[Complex<R>]) -> Option<Complex<R>>) -> Vec<(String, f64, Vec<Complex<f64>>)> {
-        let mut out: Vec<(String, f64, Vec<Complex<f64>>)> = Vec::new();
+    /// Scalar and array errors use the same finite, normal reference cases and magnitude scale.
+    fn worst<R: Native>(eps: f64, narrow: impl Fn(f64) -> R, bulk: bool) -> Vec<(String, f64, Vec<Complex<f64>>)> where Complex<R>: Element {
+        let mut out = Vec::new();
         let fits = |v: f64| v.is_finite() && narrow(v).wide() == v;
         let normal = |v: f64| v == 0.0 || (v.abs() >= R::min_positive_value().wide() && v.abs() <= R::max_value().wide());
-        for (name, args, want) in cases() {
-            if !args.iter().all(|z| fits(z.re) && fits(z.im)) || !(normal(want.re) && normal(want.im)) || !(want.re.is_finite() && want.im.is_finite()) {
-                continue;
-            }
-            let Some(got) = f(&name, &args.iter().map(|z| c(narrow(z.re), narrow(z.im))).collect::<Vec<_>>()) else { continue };
-            let d = (got.re.wide() - want.re).hypot(got.im.wide() - want.im);
-            let s = scale(&name, &args, want);
-            let err = if s == 0.0 { if d == 0.0 { 0.0 } else { f64::INFINITY } } else { d / (s * eps) };
-            let err = if err.is_nan() { f64::INFINITY } else { err };
-            match out.iter_mut().find(|(n, _, _)| *n == name) {
-                Some(row) => { if err > row.1 { *row = (name, err, args) } } None => out.push((name, err, args))
-            }
+        let mut cases = cases();
+        cases.retain(|(_, args, want)| {
+            args.iter().all(|z| fits(z.re) && fits(z.im)) && normal(want.re) && normal(want.im) && want.re.is_finite() && want.im.is_finite()
+        });
+        cases.sort_by(|a, b| a.0.cmp(&b.0));
+        for group in cases.chunk_by(|a, b| a.0 == b.0) {
+            let name = &group[0].0;
+            let count = if bulk && name == "exp" { group.len().max(rustymath::CHUNK + 1) } else { group.len() };
+            let group = group.iter().cycle().take(count).collect::<Vec<_>>();
+            let inputs = (0..group[0].1.len()).map(|i| group.iter().map(|(_, a, _)| c(narrow(a[i].re), narrow(a[i].im))).collect()).collect::<Vec<_>>();
+            let got = apply_many(name, &inputs, bulk).expect("a reference function");
+            assert_eq!(got.len(), group.len(), "{name}");
+            let worst = group.iter().zip(got).map(|((_, args, want), got)| {
+                let d = (got.re.wide() - want.re).hypot(got.im.wide() - want.im);
+                let s = scale(name, args, *want);
+                let err = if s == 0.0 { if d == 0.0 { 0.0 } else { f64::INFINITY } } else { d / (s * eps) };
+                (if err.is_nan() { f64::INFINITY } else { err }, args)
+            }).max_by(|a, b| a.0.total_cmp(&b.0)).unwrap();
+            out.push((name.clone(), worst.0, worst.1.clone()));
         }
         out
     }
 
+    fn bulk_edges<R: Native>() where Complex<R>: Element {
+        let real = |x| c(R::narrow(x), R::zero());
+        assert!(evaluate::<R, 1>(Exp, [&[]], true).is_empty());
+        let n = rustymath::CHUNK + 1;
+        let bases = [real(0.0), real(2.0), real(-2.0)].into_iter().cycle().take(n).collect::<Vec<_>>();
+        for (exponent, values) in [(0.0, [1.0, 1.0, 1.0]), (1.0, [0.0, 2.0, -2.0]), (2.0, [0.0, 4.0, 4.0]), (-1.0, [f64::INFINITY, 0.5, -0.5])] {
+            let got = evaluate(Pow, [&bases, &[real(exponent)]], true);
+            assert!(got.iter().zip(values.into_iter().cycle()).all(|(&g, w)| g == real(w)), "broadcast exponent {exponent}");
+        }
+        let exponents = [0.0, 1.0, 2.0, -1.0].into_iter().cycle().take(n).map(real).collect::<Vec<_>>();
+        let got = evaluate(Pow, [&[real(-2.0)], &exponents], true);
+        assert!(got.iter().zip([1.0, -2.0, 4.0, -0.5].into_iter().cycle()).all(|(&g, w)| g == real(w)), "broadcast base");
+    }
+
     #[test]
     fn accuracy() {
-        let rows = [("f64", worst::<f64>(f64::EPSILON, |v| v, apply::<f64>)), ("f32", worst::<f32>(f32::EPSILON.into(), |v| v as f32, apply::<f32>))];
-        let over: Vec<_> = rows.iter().flat_map(|(how, r)| r.iter().filter(|(_, e, _)| *e > BOUND).map(move |(n, e, a)| (*how, n, *e, a))).collect();
+        let mut rows = Vec::new();
+        for bulk in [false, true] {
+            let how = if bulk { "kernel" } else { "scalar" };
+            rows.push((format!("f64 {how}"), worst::<f64>(f64::EPSILON, |v| v, bulk)));
+            rows.push((format!("f32 {how}"), worst::<f32>(f32::EPSILON.into(), |v| v as f32, bulk)));
+        }
+        let over: Vec<_> = rows.iter().flat_map(|(how, r)| r.iter().filter(|(_, e, _)| *e > BOUND).map(move |(n, e, a)| (how, n, *e, a))).collect();
         if std::env::var("RUSTYMATH_COMPLEX").is_ok() { for (how, r) in &rows { for (n, e, a) in r { println!("{how} {n} {e:.2} {a:?}"); } } }
         assert!(over.is_empty(), "{over:#?}");
+        bulk_edges::<f64>();
+        bulk_edges::<f32>();
     }
 
     /// C99's values on the branch cuts, where the sign of a zero part chooses the side, and exact real or imaginary results on the axes. The composite square roots take the side that a zero's sign points to too.

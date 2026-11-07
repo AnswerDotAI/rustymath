@@ -5,7 +5,7 @@ pub(super) enum Route<'a> {
     Fold { dims: [usize; 3], seed: Seed<'a>, direction: Direction, pieces: &'a Pieces<'a> },
     Scan { dims: [usize; 3], seed: Seed<'a>, direction: Direction, input: crate::agreement::Read<'a> },
     Adjacent { dims: [usize; 3], seed: Option<crate::agreement::Read<'a>>, flip: bool, input: crate::agreement::Read<'a> },
-    At { root: WriteRoot<'a>, values: crate::agreement::Read<'a>, ids: Positions<'a>, checked: bool, projection: Projection },
+    At { root: WriteRoot<'a>, values: crate::agreement::Read<'a>, ids: Writes<'a>, checked: bool, projection: Projection },
 }
 
 /// `route` by `object`'s per-item kernels at `variant`'s computing type: `paired` for each row or block, `folded` for each lane of a fold, `chained` for each lane of a scan, and `Writes::combine` for each chunk of writes. Everything around them is generic over the item type only.
@@ -27,6 +27,9 @@ pub(super) fn binary_formula<K: crate::facts::Formula<N>, const N: usize>(
                 let step = step(direction == Direction::Right);
                 let (lane, block) = (chained(step), paired(step));
                 crate::reduce::scan_read::<T, T>(dims, seed, direction, variant.checked, input, output, &|items, dims, seed, out| {
+                    if K::BOOLEAN && dims[2] == 1 && crate::reduce::comparison_scan(items, dims[1], seed.map(|s| s[0]), step, out) {
+                        return Ok(());
+                    }
                     crate::reduce::ordered_scan(items, dims, seed, out, &lane, &block)
                         .map_or(Ok(()), |kind| Err(Error::new(kind, "ordered scan is outside the function's domain")))
                 })

@@ -65,7 +65,7 @@ pub fn power_slope<F: Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, y: O::V, r: O::
         Some((c, _)) if c == F::one() => one,
         Some((c, _)) if c == F::zero() => zero,
         Some((_, k))
-            if match Exponent::of(k.wide()) { Exponent::General => false, Exponent::Halves { .. } => halves, Exponent::Whole { .. } => true } =>
+            if match Exponent::of(k.wide(), o.fused()) { Exponent::General => false, Exponent::Halves { .. } => halves, Exponent::Whole { .. } => true } =>
         { o.multiply(y, o.power(k, x)) }
         route => {
             let at_zero = o.equal(x, zero);

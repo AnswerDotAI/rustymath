@@ -1118,13 +1118,27 @@ mod gather {
             let mut summed = vec![0; scattered.len()];
             Writes::Walk { base: 0, steps: &tables }.combine(&mut summed, rustymath::Arg::Many(&u), |a, x| (a + x, None::<()>));
             assert_eq!(summed, scattered, "{tables:?}");
+            let Some((order, terms)) = Walk::new(&tables, shape, source).and_then(|w| w.transpose_windows(source)) else { return false };
+            let axes = rustymath::search::inverse_permutation(order.iter().copied());
+            let moved = read(&u, 0, &rustymath::structure::transpose_steps(shape, &axes).unwrap());
+            summed.fill(0);
+            for term in terms {
+                let (base, steps) = term.to_walk(source);
+                let mut items = vec![];
+                walk(&mut items, &moved, base, &steps, 0, Same);
+                for (sum, item) in summed.iter_mut().zip(items) { *sum += item; }
+            }
+            assert_eq!(summed, scattered, "{tables:?}");
+            true
         };
         for (s, start) in [(1, 0), (1, 2), (2, 0), (2, 1), (3, 0), (3, 2), (4, 1)] {
             let frames = (17 - start) / s + 1;
-            check(&[20], &[frames, 3], vec![Steps::Stride { start, len: frames, step: s as isize }, along(3, 1)]);
+            assert_eq!(check(&[20], &[frames, 3], vec![Steps::Stride { start, len: frames, step: s as isize }, along(3, 1)]), s == 1 && start == 0);
         }
-        check(&[20], &[6, 3], vec![along(6, 3), along(3, 2)]);
-        check(&[10, 12], &[4, 4, 3, 2], vec![along(4, 24), along(4, 3), along(3, 12), along(2, 1)]);
+        assert!(!check(&[20], &[6, 3], vec![along(6, 3), along(3, 2)]));
+        assert!(!check(&[10, 12], &[4, 4, 3, 2], vec![along(4, 24), along(4, 3), along(3, 12), along(2, 1)]));
+        assert!(check(&[20], &[2, 19], vec![along(2, 1), along(19, 1)]));
+        assert!(check(&[5, 6, 2], &[3, 4, 3, 3, 2], vec![along(3, 12), along(4, 2), along(3, 12), along(3, 2), along(2, 1)]));
     }
     /// Index arrays pair by broadcasting and take the place of the first one, while a range keeps its axis in place. With one index array, pairing is the cross product.
     #[test]

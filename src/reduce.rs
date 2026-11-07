@@ -2,7 +2,7 @@
 use crate::error::{Error, Kind};
 pub use crate::slice::running;
 use crate::{
-    Arg, Float, Native, agreement::{Mapping, Read, Walked, expanded_items}, arith::Overflowing, buffer::{Buffer, Cast, Element, View},
+    Arg, Float, Native, agreement::{Mapping, Read, Walked, expanded_items}, arith::Overflowing, buffer::{Buffer, Cast, Element, Source, View},
     float::sealed::{Core, Folds}, gather::Steps, layout::Lanes, linalg::Scalar, operation::{Piece as InputPiece, Pieces, Seed}, parallel,
     slice::{CHUNK, appended, written}
 };

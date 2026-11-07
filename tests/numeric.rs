@@ -559,8 +559,8 @@ mod operation {
     }
 
     #[test]
-    fn native_operations_use_input_kinds() {
-        use rustymath::{Add, Binom, Exp, Subtract};
+    fn native_operations_use_input_kinds_and_run_settings() {
+        use rustymath::{Add, Binary, Binom, Bitwise, Exp, Subtract, tolerant::{Residue, Tolerance}};
         let (small, wide) = (DType::Integer(Width::I16), DType::Integer(Width::I64));
         let exp = Exp.resolve(Variant::checked(wide), [wide]).unwrap();
         let mut out = Buffer::with_capacity(exp.result_dtype(), 2);
@@ -597,9 +597,26 @@ mod operation {
         let scalar = ReadPlan::input(0, 1);
         let seed = Read { sources: &seed, plan: &scalar };
         let mut out = Buffer::with_capacity(small, 1);
-        subtract.fold_read(&[3], 0, Seed::Tail(seed), Direction::Right, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, read, &mut out)
+        subtract.fold_read(&[3], Some(0), Seed::Tail(seed), Direction::Right, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, read, &mut out)
             .unwrap();
         assert_eq!(i16::vec(out).unwrap(), [-89]);
+        let dtype = f64::DTYPE;
+        let residue = Residue(Tolerance::EXACT).resolve(Variant::checked(dtype), [dtype; 2]).unwrap();
+        let values = [[3.], [3. - 1e-14]];
+        let bindings = values.each_ref().map(|x| Binding::full(f64::view(x)));
+        let reads = bindings.each_ref().map(|x| Read { sources: std::slice::from_ref(x), plan: &scalar });
+        assert_ne!(Residue(Tolerance::EXACT).one(3., values[1][0]), Residue(Tolerance::DEFAULT).one(3., values[1][0]));
+        for tolerance in [Tolerance::EXACT, Tolerance::DEFAULT] {
+            let mut out = Buffer::with_capacity(dtype, 1);
+            residue.map(&reads, 0..1, Settings { tolerance }, &mut out).unwrap();
+            assert_eq!(f64::vec(out).unwrap(), [Residue(tolerance).one(3., values[1][0])]);
+        }
+        for table in 0..16 {
+            let kernel = Bitwise(table).resolve(Variant::checked(DType::Boolean), [DType::Boolean; 2]).unwrap();
+            let mut out = Buffer::with_capacity(DType::Boolean, 4);
+            crate::support::map(&kernel, [bool::view(&[false, false, true, true]), bool::view(&[false, true, false, true])], 4, &mut out).unwrap();
+            assert_eq!(bool::vec(out).unwrap(), (0..4).map(|i| table >> i & 1 != 0).collect::<Vec<_>>());
+        }
     }
 
     #[test]
@@ -614,8 +631,8 @@ mod operation {
             let input = view(&layout, data.view(), &mapping);
             let mut out = Buffer::with_capacity(kernel.fold_dtype(data.dtype(), shape[axis], None), 0);
             let order = kernel.fold_read(
-                    shape, axis, Seed::Identity, Direction::Right, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, input.read(), &mut out)
-                .unwrap();
+                    shape, Some(axis), Seed::Identity, Direction::Right, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, input.read(), &mut out
+                ).unwrap();
             out.ordered(order)
         };
         let mut data = vec![0.; 128];
@@ -682,7 +699,7 @@ mod operation {
             let read = Read { sources: &input, plan: &plan };
             let seed = if initial { Seed::Tail(Read { sources: &seed, plan: &scalar }) } else { Seed::Identity };
             let mut out = Buffer::with_capacity(less.fold_dtype(dtype, len, initial.then_some(dtype)), 1);
-            less.fold_read(&[len], 0, seed, Direction::Right, Settings { tolerance: rustymath::tolerant::Tolerance::EXACT }, read, &mut out).unwrap();
+            less.fold_read(&[len], Some(0), seed, Direction::Right, Settings { tolerance: rustymath::tolerant::Tolerance::EXACT }, read, &mut out).unwrap();
             assert_eq!(out.dtype(), if len < 2 { dtype } else { DType::Boolean });
             assert_eq!(i64::vec(Buffer::cast_results(out.view(), dtype, true).unwrap()).unwrap(), [expected]);
         }
@@ -691,11 +708,35 @@ mod operation {
         let mut out = Buffer::with_capacity(less.scan_dtype(false), 3);
         less.scan([1, 3, 1], Seed::Identity, Direction::Left, Settings { tolerance: rustymath::tolerant::Tolerance::EXACT }, read, &mut out).unwrap();
         assert_eq!(i64::vec(out).unwrap(), [3, 0, 1]);
+        // Packed comparisons keep raw seeds and numeric heads across word and read-chunk boundaries.
+        for len in [63, 64, 65, 5000] {
+            let data: Vec<i64> = (0..len).map(|i| (i % 5) as i64 - 2).collect();
+            let input = [Binding::full(i64::view(&data))];
+            let plan = ReadPlan::input(0, len);
+            for initial in [None, Some(7)] {
+                for direction in [Direction::Left, Direction::Right] {
+                    let mut ordered = data.clone();
+                    if direction == Direction::Right { ordered.reverse(); }
+                    let (mut carry, mut expected) = (initial, Vec::new());
+                    for x in ordered {
+                        let value = carry.map_or(x, |c| i64::from(if direction == Direction::Left { c < x } else { x < c }));
+                        expected.push(value);
+                        carry = Some(value);
+                    }
+                    if direction == Direction::Right { expected.reverse(); }
+                    let seed = if initial.is_some() { Seed::Initial(Read { sources: &seed, plan: &scalar }) } else { Seed::Identity };
+                    let mut out = Buffer::with_capacity(less.scan_dtype(initial.is_some()), len);
+                    less.scan([1, len, 1], seed, direction, Settings { tolerance: Tolerance::EXACT }, Read { sources: &input, plan: &plan }, &mut out).unwrap();
+                    assert_eq!(out.dtype(), if initial.is_some() { DType::Boolean } else { dtype });
+                    assert_eq!(i64::vec(Buffer::cast_results(out.view(), dtype, true).unwrap()).unwrap(), expected);
+                }
+            }
+        }
         let sum = Add.resolve(Variant::checked(DType::Integer(Width::I16)), [DType::Integer(Width::I16); 2]).unwrap();
         let narrow = [Binding::full(i16::view(&[3]))];
         let mut out = Buffer::with_capacity(sum.fold_dtype(DType::Integer(Width::I16), 1, None), 1);
         sum.fold_read(
-            &[1], 0, Seed::Identity, Direction::Right, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT },
+            &[1], Some(0), Seed::Identity, Direction::Right, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT },
             Read { sources: &narrow, plan: &scalar }, &mut out).unwrap();
         assert_eq!(i64::vec(out).unwrap(), [3]);
     }

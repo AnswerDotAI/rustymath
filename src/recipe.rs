@@ -191,7 +191,7 @@ pub trait Ops<F: Float> {
     /// `1 ÷ x`, as [`reciprocal`] gives it.
     fn reciprocal(&self, x: Self::V) -> Self::V { reciprocal(self, x) }
     /// `x` raised to `k`, a constant that `Exponent::of` routes off the general route, as [`power`] gives it.
-    fn power(&self, k: F, x: Self::V) -> Self::V { power(self, Exponent::of(k.wide()), x).expect("an exponent off the general route") }
+    fn power(&self, k: F, x: Self::V) -> Self::V { power(self, Exponent::of(k.wide(), self.fused()), x).expect("an exponent off the general route") }
     /// The real part of `x^y` through the existing power formula.
     fn real_power(&self, x: Self::V, y: Self::V) -> Self::V { crate::pow::real_formula(self, x, y) }
     /// The partial in `x` of `x^y = r`; `halves` permits constant half-integer powers.
@@ -317,7 +317,8 @@ impl<F: Float, const FUSED: bool> Ops<F> for NativeOps<FUSED> {
         match op {
             Binary::Add => x + y, Binary::Subtract => x - y, Binary::Multiply => x * y, Binary::Divide => x / y, Binary::Larger => { if x > y { x } else { y } }
             Binary::Smaller => { if x < y { x } else { y } } Binary::Binom => crate::binom(x, y), Binary::BinomDn => crate::binom_dn(x, y),
-            Binary::Power => crate::pow::formula(self, x, y), Binary::BinomDk => crate::binom_dk(x, y), Binary::Polygamma => crate::polygamma(x, y),
+            Binary::Power => F::from_working(crate::pow::pow::<F::Working, FUSED>(x.working(), y.working())), Binary::BinomDk => crate::binom_dk(x, y),
+            Binary::Polygamma => crate::polygamma(x, y),
             Binary::BitAnd => unreachable!("floats take no bitwise and: a recipe asks for one only where `Ops::integral` holds")
         }
     }
@@ -512,17 +513,16 @@ pub fn sign<F: Float, O: Ops<F> + ?Sized>(o: &O, x: O::V) -> O::V {
     o.select(above, one, o.select(below, minus, x))
 }
 
-/// `x` raised to a power that `e` routes off the general route: a whole exponent up to `MULTIPLIED` through [`multiplied`], a larger one through [`whole`], and halves as [`multiplied`] of `root2` of `x`. `None` for `Exponent::General`.
+/// `x` raised to an exponent admitted by `e`. Large and negative powers use [`whole`]; small positive powers use [`multiplied`]. Halves first take `root2`. `None` for `Exponent::General`.
 #[inline(always)]
 pub fn power<F: Float, O: Ops<F> + ?Sized>(o: &O, e: Exponent, x: O::V) -> Option<O::V> {
-    match e {
-        Exponent::Whole { m, negative } if !o.integral() && m > crate::pow::MULTIPLIED => Some(whole(o, m, negative, x)),
-        Exponent::Whole { m, negative } => Some(multiplied(o, m, negative, x)),
-        Exponent::Halves { m, negative } => Some(multiplied(o, m, negative, root2(o, x))), Exponent::General => None
-    }
+    let (m, negative, x) = match e {
+        Exponent::Whole { m, negative } => (m, negative, x), Exponent::Halves { m, negative } => (m, negative, root2(o, x)), Exponent::General => return None
+    };
+    Some(if !o.integral() && (m > crate::pow::MULTIPLIED || (negative && m > 1)) { whole(o, m, negative, x) } else { multiplied(o, m, negative, x) })
 }
 
-/// x^m, or x^-m where `negative`, for a whole m up to `MULTIPLIED`: single words, squaring from m's lowest set bit, so x^6 is x²·x⁴, then the reciprocal for a negative power. A rounding at the step that gives x^k carries into x^m about m/k times. x^7, x^8, x^-5 to x^-8 and, through halves, 1/√x^3 pass 4 ulps (rustymath's accuracy page). A result that the float holds exactly comes out exactly. Where x^m overflows, x^-m is 0, though the true result can be a subnormal.
+/// Positive powers up to `MULTIPLIED`, squaring from m's lowest set bit, and the reciprocal for m = 1. A rounding at the step that gives x^k carries into x^m about m/k times. A result that the float holds exactly comes out exactly.
 #[inline(always)]
 fn multiplied<F: Float, O: Ops<F> + ?Sized>(o: &O, m: u32, negative: bool, x: O::V) -> O::V {
     let (mut base, mut k) = (x, m);
@@ -542,7 +542,7 @@ fn multiplied<F: Float, O: Ops<F> + ?Sized>(o: &O, m: u32, negative: bool, x: O:
 /// A power that [`whole`] has part computed: `h + l` in double words, or `h` alone where `l` is `None`.
 pub(crate) type Word<V> = (V, Option<V>);
 
-/// x^m, or x^-m where `negative`, for a whole m from `MULTIPLIED` + 1 to `COMPENSATED`, which `Exponent::of` routes here only where the target fuses multiply-add. It raises [`base`] by squaring and multiplying from m's highest set bit, with a [`step`] for each lower bit. A result that the float holds exactly comes out exactly.
+/// Powers admitted for fused multiply-add. Negative powers start with the reciprocal and its rounding error, avoiding an overflowing positive power whose reciprocal is still representable. Raises [`base`] by squaring and multiplying from m's highest set bit, with a [`step`] for each lower bit. A result that the float holds exactly comes out exactly.
 #[inline(always)]
 pub(crate) fn whole<F: Float, O: Ops<F> + ?Sized>(o: &O, m: u32, negative: bool, x: O::V) -> O::V {
     let (b, mut error) = base(o, negative, x);

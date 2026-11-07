@@ -5,8 +5,8 @@ use crate::float::sealed::Core;
 use crate::pow::parity;
 use crate::recipe::{NativeOps, Ops};
 use crate::reduce::{Maximum, Minimum, Product, Reduce, Reduction};
-use crate::tolerant::{Tolerance, Tolerant, TolerantComplex, lcm_from_gcd};
-use crate::{Betainc, BetaincAt, FUSED, Flipped, Float, Native};
+use crate::tolerant::{Residue, Tolerance, Tolerant, TolerantComplex, lcm_from_gcd};
+use crate::{Betainc, BetaincAt, Binary, FUSED, Flipped, Float, Native, Unary};
 use num_complex::Complex;
 use num_traits::{One, Signed, Zero};
 use std::f64::consts::PI;
@@ -189,28 +189,44 @@ impl Op {
         self.visit(arity, Of(dtype))
     }
 }
-/// A formula's slice forms (`Unary::slice`, `Binary::slice`), at each item type that has one. `map_formula` runs a variant's blocks through the form at its dtype, or at `f32` for `f16`. At a dtype with no form, the formula's item bodies (`Formula::real`, `Formula::integer`) run instead.
+/// A formula's native slice bodies. Real and integer variants run the body at their dtype (f32 for f16). Complex variants keep the real-input shortcut and final validity check at the map boundary; an absent body uses the scalar formula.
 pub struct NativeSlices<K, const N: usize> {
-    pub single: Option<Slice<K, f32, N>>, pub double: Option<Slice<K, f64, N>>, pub byte: Option<Slice<K, u8, N>>, pub short: Option<Slice<K, i16, N>>,
-    pub int: Option<Slice<K, i32, N>>, pub long: Option<Slice<K, i64, N>>
+    pub(crate) single: Option<Slice<K, f32, N>>, pub(crate) double: Option<Slice<K, f64, N>>, pub(crate) byte: Option<Slice<K, u8, N>>,
+    pub(crate) short: Option<Slice<K, i16, N>>, pub(crate) int: Option<Slice<K, i32, N>>, pub(crate) long: Option<Slice<K, i64, N>>,
+    pub(crate) complex_single: Option<Slice<K, num_complex::Complex32, N, ()>>, pub(crate) complex_double: Option<Slice<K, num_complex::Complex64, N, ()>>
 }
-/// A slice form writes `n` results of type `T` from `N` arguments and gives whether every item is valid.
-pub type Slice<K, T, const N: usize> = fn(&K, [crate::Arg<'_, T>; N], usize, &mut [std::mem::MaybeUninit<T>]) -> bool;
-impl<K, const N: usize> NativeSlices<K, N> { const NONE: Self = Self { single: None, double: None, byte: None, short: None, int: None, long: None }; }
-impl<K> NativeSlices<K, 1> where K: crate::Unary<f32, Out = f32> + crate::Unary<f64, Out = f64> {
-    pub(crate) fn unary() -> Self { Self { single: Some(<K as crate::Unary<f32>>::slice), double: Some(<K as crate::Unary<f64>>::slice), ..Self::NONE } }
+/// A slice form takes the item body's run context and writes all `n` results. Real and integer forms return their validity; complex forms leave validation to `complex_valid` at the map boundary.
+pub type Slice<K, T, const N: usize, R = bool> = fn(&K, &NativeOps<{ FUSED }>, [crate::Arg<'_, T>; N], usize, &mut [std::mem::MaybeUninit<T>]) -> R;
+impl<K, const N: usize> NativeSlices<K, N> {
+    const NONE: Self = Self { single: None, double: None, byte: None, short: None, int: None, long: None, complex_single: None, complex_double: None };
+    fn with_complex(self, single: Slice<K, num_complex::Complex32, N, ()>, double: Slice<K, num_complex::Complex64, N, ()>) -> Self {
+        Self { complex_single: Some(single), complex_double: Some(double), ..self }
+    }
+}
+impl<K> NativeSlices<K, 1> where K: Unary<f32, Out = f32> + Unary<f64, Out = f64> {
+    pub(crate) fn unary() -> Self {
+        Self { single: Some(|k, _, x, n, out| Unary::<f32>::slice(k, x, n, out)), double: Some(|k, _, x, n, out| Unary::<f64>::slice(k, x, n, out)),
+            ..Self::NONE }
+    }
 }
 impl NativeSlices<crate::Pow, 2> {
-    fn power() -> Self { Self { single: Some(crate::pow::power_slice::<f32>), double: Some(crate::pow::power_slice::<f64>), ..Self::NONE } }
+    fn power() -> Self {
+        Self { single: Some(|k, _, x, n, out| crate::pow::power_slice::<f32>(k, x, n, out)),
+            double: Some(|k, _, x, n, out| crate::pow::power_slice::<f64>(k, x, n, out)), ..Self::NONE }
+    }
 }
 impl NativeSlices<crate::Root, 2> {
-    fn root() -> Self { Self { single: Some(crate::pow::root_slice::<f32>), double: Some(crate::pow::root_slice::<f64>), ..Self::NONE } }
+    fn root() -> Self {
+        Self { single: Some(|k, _, x, n, out| crate::pow::root_slice::<f32>(k, x, n, out)),
+            double: Some(|k, _, x, n, out| crate::pow::root_slice::<f64>(k, x, n, out)), ..Self::NONE }
+    }
 }
-impl<K> NativeSlices<K, 2> where K: crate::Binary<u8, Out = u8> + crate::Binary<i16, Out = i16> + crate::Binary<i32, Out = i32> + crate::Binary<i64, Out = i64>
-{
-    fn integers() -> Self {
-        Self { byte: Some(<K as crate::Binary<u8>>::slice), short: Some(<K as crate::Binary<i16>>::slice), int: Some(<K as crate::Binary<i32>>::slice),
-            long: Some(<K as crate::Binary<i64>>::slice), ..Self::NONE }
+impl NativeSlices<Residue, 2> {
+    fn residue() -> Self {
+        Self { single: Some(|k, o, x, n, out| Binary::<f32>::slice(&Residue(native_tolerance(o.tolerance, k.0)), x, n, out)),
+            double: Some(|k, o, x, n, out| Binary::<f64>::slice(&Residue(native_tolerance(o.tolerance, k.0)), x, n, out)),
+            byte: Some(|k, _, x, n, out| Binary::<u8>::slice(k, x, n, out)), short: Some(|k, _, x, n, out| Binary::<i16>::slice(k, x, n, out)),
+            int: Some(|k, _, x, n, out| Binary::<i32>::slice(k, x, n, out)), long: Some(|k, _, x, n, out| Binary::<i64>::slice(k, x, n, out)), ..Self::NONE }
     }
 }
 
@@ -316,6 +332,7 @@ macro_rules! objects {
         $(integers $integer:ident;)?
         $(native_integer |$nik:pat_param, $nio:tt, $nix:tt| $native_integer:expr;)?
         $(native_complex |$nfk:pat_param, $nfo:tt, $nfx:tt| $native_complex:expr;)?
+        $(complex_slices $complex_slices:ident;)?
         $(native_real |$nrk:pat_param, $nro:tt, $nrx:tt| $native_real:expr;)?
         $(real_complex |$rck:pat_param, $rco:tt, $rcx:tt| $real_complex:expr;)?
         $(slices $slices:ident;)?
@@ -359,7 +376,10 @@ macro_rules! objects {
             $(#[inline(always)] fn complex<F: crate::float::Native>(&self, $nfo: &crate::recipe::NativeOps<{ crate::FUSED }>, $nfx: [num_complex::Complex<F>; $n]) -> Option<num_complex::Complex<F>> { let $nfk = self; $native_complex })?
             $(#[inline(always)] fn real<F: crate::float::Native>(&self, $nro: &crate::recipe::NativeOps<{ crate::FUSED }>, $nrx: [F; $n]) -> Option<F> { let $nrk = self; $native_real })?
             $(const REAL_COMPLEX: bool = true; #[inline(always)] fn real_complex<F: crate::float::Native>(&self, $rco: &crate::recipe::NativeOps<{ crate::FUSED }>, $rcx: [F; $n]) -> Option<num_complex::Complex<F>> { let $rck = self; $real_complex })?
-            $(fn native_slices(&self) -> Option<NativeSlices<Self, $n>> { Some(NativeSlices::$slices()) })?
+            fn native_slices(&self) -> Option<NativeSlices<Self, $n>> {
+                None $(.or_else(|| Some(NativeSlices::$slices())))?
+                    $(.or_else(|| Some(NativeSlices::NONE)).map(|s| s.with_complex(crate::complex::bulk::$complex_slices, crate::complex::bulk::$complex_slices)))?
+            }
         }
     )+};
 }
@@ -378,11 +398,11 @@ objects!(1:
     crate::Rint { native_integer |_, _, [x]| Some(x); native_complex |_, _, [x]| Some(num_complex::Complex::new(x.re.round_ties_even(), x.im.round_ties_even())); native_real |_, _, [x]| Some(x.round_ties_even()); }
     crate::Scale { formula |k, o, [x]| Some(o.multiply(x, o.number(F::narrow(k.0)))); }
     crate::Round { native_integer |k, o, [x]| { let wide = crate::parts::rounded_wide(Into::<i64>::into(x).into(), k.scale); Some(o.result(crate::integer::overflowed(o.variant, i64::try_from(wide).ok(), || wide as i64))) }; native_complex |k, _, [x]| Some(num_complex::Complex::new(crate::parts::rounded(x.re, k.scale), crate::parts::rounded(x.im, k.scale))); native_real |k, _, [x]| Some(crate::parts::rounded(x, k.scale)); }
-    crate::Sqrt { range [x] => exact(x.lo.max(0.0).sqrt(), x.hi.sqrt()); domain _, [x] => inside([x], [Range::NONNEGATIVE]); formula |_, o, [x]| Some(o.sqrt(x)); slope |o, _, r| o.reciprocal(o.add(r, r)); native_complex |_, _, [x]| Some(crate::complex::sqrt::<F, { crate::FUSED }>(x)); real_complex |_, o, [x]| { let r = o.sqrt(o.magnitude(x)); Some(if x < F::zero() { num_complex::Complex::new(F::zero(), r) } else { num_complex::Complex::new(r, F::zero()) }) }; checks nan; }
+    crate::Sqrt { range [x] => exact(x.lo.max(0.0).sqrt(), x.hi.sqrt()); domain _, [x] => inside([x], [Range::NONNEGATIVE]); formula |_, o, [x]| Some(o.sqrt(x)); slope |o, _, r| o.reciprocal(o.add(r, r)); native_complex |_, _, [x]| Some(crate::complex::sqrt::<F, { crate::FUSED }>(x)); complex_slices sqrt; real_complex |_, o, [x]| { let r = o.sqrt(o.magnitude(x)); Some(if x < F::zero() { num_complex::Complex::new(F::zero(), r) } else { num_complex::Complex::new(r, F::zero()) }) }; checks nan; }
     crate::Cbrt { range [x] => increasing(x, f64::cbrt); formula |_, o, [x]| Some(crate::pow::cbrt_formula(o, x)); slope |o, _, r| o.reciprocal(o.multiply(o.number(F::narrow(3.0)), o.multiply(r, r))); }
-    crate::Exp { range [x] => increasing(x, f64::exp).meet(Range::NONNEGATIVE); formula |_, o, [x]| Some(crate::exp::formula(o, x)); slope |_, _, r| r; native_complex |_, _, [x]| Some(crate::complex::exp::<F, { crate::FUSED }>(x)); }
+    crate::Exp { range [x] => increasing(x, f64::exp).meet(Range::NONNEGATIVE); formula |_, o, [x]| Some(crate::exp::formula(o, x)); slope |_, _, r| r; native_complex |_, _, [x]| Some(crate::complex::exp::<F, { crate::FUSED }>(x)); complex_slices exp; }
     crate::Expm1 { range [x] => increasing(x, f64::exp_m1); formula |_, o, [x]| Some(crate::exp::minus_one_formula(o, x, o.number(F::zero()))); slope |o, _, r| o.add(r, o.number(F::one())); native_complex |_, _, [x]| Some(crate::complex::exp::<F, { crate::FUSED }>(x) - Complex::new(F::one(), F::zero())); }
-    crate::Ln { range [x] => increasing(x, |v| if v < 0.0 { f64::NEG_INFINITY } else { v.ln() }); domain _, [x] => inside([x], [Range::NONNEGATIVE]); formula |_, o, [x]| Some(crate::ln::formula(o, x)); slope |o, x, _| o.reciprocal(x); native_complex |_, _, [x]| Some(crate::complex::ln::<F, { crate::FUSED }>(x)); real_complex |_, o, [x]| Some(num_complex::Complex::new(crate::ln::formula(o, o.magnitude(x)), if x < F::zero() { F::narrow(PI) } else { F::zero() })); checks nan; }
+    crate::Ln { range [x] => increasing(x, |v| if v < 0.0 { f64::NEG_INFINITY } else { v.ln() }); domain _, [x] => inside([x], [Range::NONNEGATIVE]); formula |_, o, [x]| Some(crate::ln::formula(o, x)); slope |o, x, _| o.reciprocal(x); native_complex |_, _, [x]| Some(crate::complex::ln::<F, { crate::FUSED }>(x)); complex_slices ln; real_complex |_, o, [x]| Some(num_complex::Complex::new(crate::ln::formula(o, o.magnitude(x)), if x < F::zero() { F::narrow(PI) } else { F::zero() })); checks nan; }
     crate::Log2 { range [x] => increasing(x, f64::log2); domain _, [x] => inside([x], [Range::NONNEGATIVE]); formula |_, o, [x]| Some(crate::ln::log_with(o, x, crate::ln::base2(o))); slope |o, x, _| o.divide(o.number(F::narrow(std::f64::consts::LOG2_E)), x); slices unary; checks nan; }
     crate::Log10 { range [x] => increasing(x, f64::log10); domain _, [x] => inside([x], [Range::NONNEGATIVE]); formula |_, o, [x]| Some(crate::ln::log_with(o, x, crate::ln::base10(o))); slope |o, x, _| o.divide(o.number(F::narrow(std::f64::consts::LOG10_E)), x); slices unary; checks nan; }
     crate::RealLn { range [x] => increasing(x.magnitude(), f64::ln); output real; formula |_, o, [x]| Some(crate::ln::formula(o, o.magnitude(x))); slope |o, x, _| o.reciprocal(x); native_complex |_, _, [x]| Some(crate::complex::ln::<F, { crate::FUSED }>(x)); }
@@ -444,27 +464,28 @@ objects!(1:
     crate::RealSqrtm1mx2 { range _ => exact(0.0, 0.0); output real; slope |o, _, _| o.number(F::zero()); native_complex |k, _, [x]| Some(crate::complex::sqrtm1mx2::<F, { crate::FUSED }>(x, k.0)); native_real |_, _, [x]| Some(if x.is_nan() { x } else { F::zero() }); }
     crate::sqrts::Sqrtm1mx2 { output complex; native_complex |k, _, [x]| Some(crate::complex::sqrtm1mx2::<F, { crate::FUSED }>(x, k.0)); }
     crate::Log1p { range [x] => increasing(x, |v| if v < -1.0 { f64::NEG_INFINITY } else { v.ln_1p() }); domain _, [x] => inside([x], [exact(-1.0, f64::INFINITY)]); formula |_, o, [x]| Some(crate::ln::log1p_formula(o, x)); slope |o, x, _| o.reciprocal(o.add(o.number(F::one()), x)); native_complex |_, _, [x]| Some(crate::complex::ln1p::<F, { crate::FUSED }>(x)); checks nan; }
-    crate::Sinh { range [x] => increasing(x, f64::sinh); formula |_, o, [x]| Some(crate::hyperbolic::sinh_formula(o, x)); slope |o, x, _| o.cosh(x); native_complex |_, _, [x]| Some(crate::complex::sinh::<F, { crate::FUSED }>(x)); }
-    crate::Cosh { range [x] => even(x, f64::cosh).meet(Range::NONNEGATIVE); formula |_, o, [x]| Some(crate::hyperbolic::cosh_formula(o, x)); slope |o, x, _| o.sinh(x); native_complex |_, _, [x]| Some(crate::complex::cosh::<F, { crate::FUSED }>(x)); }
-    crate::Tanh { range [x] => increasing(x, f64::tanh); formula |_, o, [x]| Some(crate::hyperbolic::tanh_formula(o, x)); slope |o, _, r| o.subtract(o.number(F::one()), o.multiply(r, r)); native_complex |_, _, [x]| Some(crate::complex::tanh::<F, { crate::FUSED }>(x)); }
-    crate::Asinh { range [x] => increasing(x, f64::asinh); slope |o, x, _| o.reciprocal(o.sqrt1px2(x)); native_complex |_, _, [x]| Some(crate::complex::asinh::<F, { crate::FUSED }>(x)); native_real |_, _, [x]| Some(crate::hyperbolic::asinh::<F, { crate::FUSED }>(x)); }
+    crate::Sinh { range [x] => increasing(x, f64::sinh); formula |_, o, [x]| Some(crate::hyperbolic::sinh_formula(o, x)); slope |o, x, _| o.cosh(x); native_complex |_, _, [x]| Some(crate::complex::sinh::<F, { crate::FUSED }>(x)); complex_slices sinh; }
+    crate::Cosh { range [x] => even(x, f64::cosh).meet(Range::NONNEGATIVE); formula |_, o, [x]| Some(crate::hyperbolic::cosh_formula(o, x)); slope |o, x, _| o.sinh(x); native_complex |_, _, [x]| Some(crate::complex::cosh::<F, { crate::FUSED }>(x)); complex_slices cosh; }
+    crate::Tanh { range [x] => increasing(x, f64::tanh); formula |_, o, [x]| Some(crate::hyperbolic::tanh_formula(o, x)); slope |o, _, r| o.subtract(o.number(F::one()), o.multiply(r, r)); native_complex |_, _, [x]| Some(crate::complex::tanh::<F, { crate::FUSED }>(x)); complex_slices tanh; }
+    crate::Asinh { range [x] => increasing(x, f64::asinh); slope |o, x, _| o.reciprocal(o.sqrt1px2(x)); native_complex |_, _, [x]| Some(crate::complex::asinh::<F, { crate::FUSED }>(x)); complex_slices asinh; native_real |_, _, [x]| Some(crate::hyperbolic::asinh::<F, { crate::FUSED }>(x)); }
     // sinh(acosh x) is √(x² - 1).
-    crate::Acosh { range [x] => increasing(x, |v| v.max(1.0).acosh()).meet(Range::NONNEGATIVE); domain _, [x] => inside([x], [exact(1.0, f64::INFINITY)]); slope |o, _, r| o.reciprocal(o.sinh(r)); native_complex |_, _, [x]| Some(crate::complex::acosh::<F, { crate::FUSED }>(x)); native_real |_, _, [x]| Some(crate::hyperbolic::acosh::<F, { crate::FUSED }>(x)); checks nan; }
-    crate::Atanh { range [x] => increasing(x, |v| v.clamp(UNIT.0, UNIT.1).atanh()); domain _, [x] => inside([x], [exact(UNIT.0, UNIT.1)]); slope |o, x, _| o.reciprocal(o.subtract(o.number(F::one()), o.multiply(x, x))); native_complex |_, _, [x]| Some(crate::complex::atanh::<F, { crate::FUSED }>(x)); native_real |_, _, [x]| Some(crate::hyperbolic::atanh::<F, { crate::FUSED }>(x)); checks nan; }
+    crate::Acosh { range [x] => increasing(x, |v| v.max(1.0).acosh()).meet(Range::NONNEGATIVE); domain _, [x] => inside([x], [exact(1.0, f64::INFINITY)]); slope |o, _, r| o.reciprocal(o.sinh(r)); native_complex |_, _, [x]| Some(crate::complex::acosh::<F, { crate::FUSED }>(x)); complex_slices acosh; native_real |_, _, [x]| Some(crate::hyperbolic::acosh::<F, { crate::FUSED }>(x)); checks nan; }
+    crate::Atanh { range [x] => increasing(x, |v| v.clamp(UNIT.0, UNIT.1).atanh()); domain _, [x] => inside([x], [exact(UNIT.0, UNIT.1)]); slope |o, x, _| o.reciprocal(o.subtract(o.number(F::one()), o.multiply(x, x))); native_complex |_, _, [x]| Some(crate::complex::atanh::<F, { crate::FUSED }>(x)); complex_slices atanh; native_real |_, _, [x]| Some(crate::hyperbolic::atanh::<F, { crate::FUSED }>(x)); checks nan; }
     crate::RealAtanh { output real; slope |o, x, _| o.reciprocal(o.subtract(o.number(F::one()), o.multiply(x, x))); native_complex |_, _, [x]| Some(crate::complex::atanh::<F, { crate::FUSED }>(x)); native_real |_, _, [x]| Some(crate::hyperbolic::atanh::<F, { crate::FUSED }>(if x.abs() > F::one() { F::one()/x } else { x })); }
-    crate::Sin { range _ => exact(UNIT.0, UNIT.1).loose(); formula |_, o, [x]| Some(crate::trig::formula(o, x, crate::trig::Kind::Sin)); slope |o, x, _| o.cos(x); repair crate::trig::Kind::Sin; native_complex |_, _, [x]| Some(crate::complex::sin::<F, { crate::FUSED }>(x)); }
-    crate::Cos { range _ => exact(UNIT.0, UNIT.1).loose(); formula |_, o, [x]| Some(crate::trig::formula(o, x, crate::trig::Kind::Cos)); slope |o, x, _| o.negate(o.sin(x)); repair crate::trig::Kind::Cos; native_complex |_, _, [x]| Some(crate::complex::cos::<F, { crate::FUSED }>(x)); }
-    crate::Tan { formula |_, o, [x]| Some(crate::trig::formula(o, x, crate::trig::Kind::Tan)); slope |o, _, r| o.add(o.number(F::one()), o.multiply(r, r)); repair crate::trig::Kind::Tan; native_complex |_, _, [x]| Some(crate::complex::tan::<F, { crate::FUSED }>(x)); }
-    crate::Asin { range [x] => increasing(x, |v| v.clamp(UNIT.0, UNIT.1).asin()); domain _, [x] => inside([x], [exact(UNIT.0, UNIT.1)]); slope |o, x, _| o.reciprocal(o.sqrt1mx2(x)); native_complex |_, _, [x]| Some(crate::complex::asin::<F, { crate::FUSED }>(x)); native_real |_, _, [x]| Some(crate::arc::asin::<F, { crate::FUSED }>(x)); checks nan; }
-    crate::Acos { range [x] => decreasing(x, |v| v.clamp(UNIT.0, UNIT.1).acos()).meet(Range::NONNEGATIVE); domain _, [x] => inside([x], [exact(UNIT.0, UNIT.1)]); slope |o, x, _| o.negate(o.reciprocal(o.sqrt1mx2(x))); native_complex |_, _, [x]| Some(crate::complex::acos::<F, { crate::FUSED }>(x)); native_real |_, _, [x]| Some(crate::arc::acos::<F, { crate::FUSED }>(x)); checks nan; }
-    crate::Atan { range [x] => increasing(x, f64::atan); slope |o, x, _| o.reciprocal(o.add(o.number(F::one()), o.multiply(x, x))); native_complex |_, _, [x]| Some(crate::complex::atan::<F, { crate::FUSED }>(x)); native_real |_, _, [x]| Some(crate::arc::atan::<F, { crate::FUSED }>(x)); }
-    crate::Sqrt1mx2 { range [x] => decreasing(x.magnitude(), |v| (1.0 - v.min(1.0) * v.min(1.0)).sqrt()).meet(Range::NONNEGATIVE); domain _, [x] => inside([x], [exact(UNIT.0, UNIT.1)]); slope |o, x, r| o.negate(o.divide(x, r)); native_complex |_, _, [x]| Some(crate::complex::sqrt1mx2::<F, { crate::FUSED }>(x)); native_real |_, _, [x]| Some(crate::sqrts::sqrt1mx2::<F, { crate::FUSED }>(x)); }
-    crate::Sqrt1px2 { range [x] => even(x, |v| (1.0 + v * v).sqrt()).meet(Range::NONNEGATIVE); slope |o, x, r| o.divide(x, r); native_complex |_, _, [x]| Some(crate::complex::sqrt1px2::<F, { crate::FUSED }>(x)); native_real |_, _, [x]| Some(crate::sqrts::sqrt1px2::<F, { crate::FUSED }>(x)); }
+    crate::Sin { range _ => exact(UNIT.0, UNIT.1).loose(); formula |_, o, [x]| Some(crate::trig::formula(o, x, crate::trig::Kind::Sin)); slope |o, x, _| o.cos(x); repair crate::trig::Kind::Sin; native_complex |_, _, [x]| Some(crate::complex::sin::<F, { crate::FUSED }>(x)); complex_slices sin; }
+    crate::Cos { range _ => exact(UNIT.0, UNIT.1).loose(); formula |_, o, [x]| Some(crate::trig::formula(o, x, crate::trig::Kind::Cos)); slope |o, x, _| o.negate(o.sin(x)); repair crate::trig::Kind::Cos; native_complex |_, _, [x]| Some(crate::complex::cos::<F, { crate::FUSED }>(x)); complex_slices cos; }
+    crate::Tan { formula |_, o, [x]| Some(crate::trig::formula(o, x, crate::trig::Kind::Tan)); slope |o, _, r| o.add(o.number(F::one()), o.multiply(r, r)); repair crate::trig::Kind::Tan; native_complex |_, _, [x]| Some(crate::complex::tan::<F, { crate::FUSED }>(x)); complex_slices tan; }
+    crate::Asin { range [x] => increasing(x, |v| v.clamp(UNIT.0, UNIT.1).asin()); domain _, [x] => inside([x], [exact(UNIT.0, UNIT.1)]); slope |o, x, _| o.reciprocal(o.sqrt1mx2(x)); native_complex |_, _, [x]| Some(crate::complex::asin::<F, { crate::FUSED }>(x)); complex_slices asin; native_real |_, _, [x]| Some(crate::arc::asin::<F, { crate::FUSED }>(x)); checks nan; }
+    crate::Acos { range [x] => decreasing(x, |v| v.clamp(UNIT.0, UNIT.1).acos()).meet(Range::NONNEGATIVE); domain _, [x] => inside([x], [exact(UNIT.0, UNIT.1)]); slope |o, x, _| o.negate(o.reciprocal(o.sqrt1mx2(x))); native_complex |_, _, [x]| Some(crate::complex::acos::<F, { crate::FUSED }>(x)); complex_slices acos; native_real |_, _, [x]| Some(crate::arc::acos::<F, { crate::FUSED }>(x)); checks nan; }
+    crate::Atan { range [x] => increasing(x, f64::atan); slope |o, x, _| o.reciprocal(o.add(o.number(F::one()), o.multiply(x, x))); native_complex |_, _, [x]| Some(crate::complex::atan::<F, { crate::FUSED }>(x)); complex_slices atan; native_real |_, _, [x]| Some(crate::arc::atan::<F, { crate::FUSED }>(x)); }
+    crate::Sqrt1mx2 { range [x] => decreasing(x.magnitude(), |v| (1.0 - v.min(1.0) * v.min(1.0)).sqrt()).meet(Range::NONNEGATIVE); domain _, [x] => inside([x], [exact(UNIT.0, UNIT.1)]); slope |o, x, r| o.negate(o.divide(x, r)); native_complex |_, _, [x]| Some(crate::complex::sqrt1mx2::<F, { crate::FUSED }>(x)); complex_slices sqrt1mx2; native_real |_, _, [x]| Some(crate::sqrts::sqrt1mx2::<F, { crate::FUSED }>(x)); }
+    crate::Sqrt1px2 { range [x] => even(x, |v| (1.0 + v * v).sqrt()).meet(Range::NONNEGATIVE); slope |o, x, r| o.divide(x, r); native_complex |_, _, [x]| Some(crate::complex::sqrt1px2::<F, { crate::FUSED }>(x)); complex_slices sqrt1px2; native_real |_, _, [x]| Some(crate::sqrts::sqrt1px2::<F, { crate::FUSED }>(x)); }
     crate::Sqrtx2m1 {
         range [x] => increasing(x, |v| v.signum() * (v * v - 1.0).max(0.0).sqrt());
         domain _, [x] => inside([x], [if x.lo >= 1.0 { exact(1.0, f64::INFINITY) } else { exact(f64::NEG_INFINITY, -1.0) }]);
         slope |o, x, r| o.divide(x, r);
         native_complex |_, _, [x]| Some(crate::complex::sqrtx2m1::<F, { crate::FUSED }>(x));
+        complex_slices sqrtx2m1;
         native_real |_, _, [x]| Some(crate::sqrts::sqrtx2m1::<F, { crate::FUSED }>(x)); checks nan;
     }
     crate::Reciprocal { range [x] => quotient(Range::of(Some(1.0)), x).loose(); formula |_, o, [x]| Some(if o.integral() { crate::recipe::integer_floor_divide(o, o.number(F::one()), x) } else { crate::recipe::reciprocal(o, x) }); slope |o, _, r| o.negate(o.multiply(r, r)); integers arithmetic; native_complex |_, _, [x]| Some(crate::complex::divide::<F>(num_complex::Complex::new(F::one(), F::zero()), x)); exact |_, [x]| crate::exact::divide(&num_rational::BigRational::one(), x, false); }
@@ -498,7 +519,7 @@ objects!(1:
     crate::tolerant::Floor { formula |k, o, [x]| Some(crate::with_tolerance!(k.0, |t| t.floor_in(o, x))); slope |o, _, _| o.number(F::zero()); integers formula; native_complex |k, o, [x]| Some(crate::tolerant::TolerantComplex::complex_floor(native_tolerance(o.tolerance, k.0), x)); exact |_, [x]| Ok(Some(x.floor())); }
     crate::tolerant::Ceil { formula |k, o, [x]| Some(crate::with_tolerance!(k.0, |t| t.ceil_in(o, x))); slope |o, _, _| o.number(F::zero()); integers formula; native_complex |k, o, [x]| Some(crate::tolerant::TolerantComplex::complex_ceil(native_tolerance(o.tolerance, k.0), x)); exact |_, [x]| Ok(Some(x.ceil())); }
     crate::Not { table 1; test |_, o, [x]| Some(o.equal(x, o.number(F::zero()))); integers formula; valid |_, v, o, x, _| truth_valid(v, o, x); }
-    crate::Cis { output complex; native_complex |_, _, [x]| Some(crate::complex::exp::<F, { crate::FUSED }>(num_complex::Complex::new(-x.im, x.re))); real_complex |_, o, [x]| (!crate::trig::Kind::Cos.predicate(o, x)).then(|| { let (c, s) = crate::complex::quarter(x).unwrap_or_else(|| (crate::trig::formula(o, x, crate::trig::Kind::Cos), crate::trig::formula(o, x, crate::trig::Kind::Sin))); num_complex::Complex::new(c, s) }); }
+    crate::Cis { output complex; native_complex |_, _, [x]| Some(crate::complex::exp::<F, { crate::FUSED }>(num_complex::Complex::new(-x.im, x.re))); complex_slices cis; real_complex |_, o, [x]| (!crate::trig::Kind::Cos.predicate(o, x)).then(|| { let (c, s) = crate::complex::quarter(x).unwrap_or_else(|| (crate::trig::formula(o, x, crate::trig::Kind::Cos), crate::trig::formula(o, x, crate::trig::Kind::Sin))); num_complex::Complex::new(c, s) }); }
     crate::LambertW { domain dtype, [x] => crate::lambert::real_domain(dtype, x); native_complex |_, _, [x]| Some(crate::lambert::complex(x)); native_real |_, _, [x]| Some(crate::lambert::lambertw::<F, { crate::FUSED }>(x)); checks nan; }
     crate::Lgamma { slope |o, x, _| o.digamma(x); native_complex |_, _, [x]| Some(crate::complex::lgamma::<F, { crate::FUSED }>(x)); native_real |_, _, [x]| Some(crate::special::lgamma::<F, { crate::FUSED }>(x)); checks nan; }
     // ψ's slope is ψ⁽¹⁾.
@@ -543,12 +564,12 @@ objects!(2:
         range [x, y] => powered(x, y); domain _, [x, y] => if whole(y) { Some([x, y]) } else { inside([x, y], [Range::NONNEGATIVE, Range::ANY]) };
         identity [None, Some(1.0)]; formula |_, o, [x, y]| Some(crate::pow::formula(o, x, y)); shared power;
         native_integer |_, o, [x, y]| Some(I::low(crate::integer::native_power(o.variant, x.into(), y.into())));
-        native_complex |_, _, [x, y]| Some(crate::complex::pow::<F, { crate::FUSED }>(x, y)); slices power; exact |_, [x, y]| crate::exact::power(x, y); checks nan;
+        native_complex |_, _, [x, y]| Some(crate::complex::pow::<F, { crate::FUSED }>(x, y)); complex_slices pow; slices power; exact |_, [x, y]| crate::exact::power(x, y); checks nan;
         valid |_, v, o, x, r| power_valid(v, o, x, r);
     }
     crate::RealPow { range [x, _] => signs([x]); identity [None, Some(1.0)]; output real; formula |_, o, [x, y]| Some(crate::pow::real_formula(o, x, y)); shared real_power; native_complex |_, _, [x, y]| Some(crate::complex::pow::<F, { crate::FUSED }>(x, y)); }
     // The yth root of x, x^(1/y).
-    crate::Root { range [_, y] => signs([y]); domain _, [n, y] => root_domain(n, y); formula |_, o, [n, y]| Some(crate::pow::root_formula(o, n, y)); slopes |o, x, y, r| [o.negate(o.divide(o.multiply(r, o.ln(y)), o.multiply(x, x))), o.divide(r, o.multiply(x, y))]; native_complex |_, _, [n, y]| Some(crate::complex::nth_root::<F, { crate::FUSED }>(n, y)); slices root; exact |_, [n, y]| { if num_traits::Zero::is_zero(n) { return Err(crate::error::Error::new(crate::error::Kind::Domain, "root degree is zero")); } crate::exact::power(y, &n.recip()) }; checks nan; }
+    crate::Root { range [_, y] => signs([y]); domain _, [n, y] => root_domain(n, y); formula |_, o, [n, y]| crate::pow::root_formula(o, n, y); slopes |o, x, y, r| [o.negate(o.divide(o.multiply(r, o.ln(y)), o.multiply(x, x))), o.divide(r, o.multiply(x, y))]; native_complex |_, _, [n, y]| Some(crate::complex::nth_root::<F, { crate::FUSED }>(n, y)); native_real |_, _, [n, y]| Some(crate::pow::root::<F, { crate::FUSED }>(n, y)); slices root; exact |_, [n, y]| { if num_traits::Zero::is_zero(n) { return Err(crate::error::Error::new(crate::error::Kind::Domain, "root degree is zero")); } crate::exact::power(y, &n.recip()) }; checks nan; }
     crate::Logb { domain _, [x, y] => inside([x, y], [Range::NONNEGATIVE; 2]); shared logb; native_complex |_, _, [b, x]| Some(crate::complex::divide(crate::complex::ln::<F, { crate::FUSED }>(x), crate::complex::ln::<F, { crate::FUSED }>(b))); native_real |_, _, [b, x]| Some(crate::ln::logb::<F, { crate::FUSED }>(b, x)); valid |_, _, o, x, r| logarithm_valid(o, x, r); }
     crate::MathishLogb { domain _, [x, y] => inside([x, y], [Range::NONNEGATIVE; 2]); shared logb; native_complex |_, _, [b, x]| { let one = num_complex::Complex::new(F::one(), F::zero()); Some(if b == one && x == one { num_complex::Complex::new(F::zero(), F::zero()) } else { crate::complex::divide(crate::complex::ln::<F, { crate::FUSED }>(x), crate::complex::ln::<F, { crate::FUSED }>(b)) }) }; native_real |_, _, [b, x]| { let r = crate::ln::logb::<F, { crate::FUSED }>(b, x); Some(if (b == F::one()) & (x == F::one()) { F::zero() } else { r }) }; valid |_, _, o, x, r| logarithm_valid(o, x, r); }
     // `y` modulo `x`. Its slope in `x` is minus the quotient's floor, (y - r) ÷ x from the result, and 0 where `x` is 0, where the residue is `y` itself. Integers take a positive power of two that every item shares as a mask (`masked`). Integer kernels run its slice forms (`integer.rs`). Where a whole block shares one divisor, those take a mask or a reciprocal in place of a division.
@@ -565,7 +586,7 @@ objects!(2:
             let t = native_tolerance(o.tolerance, k.0);
             Some(if t.is_exact() { crate::tolerant::exact_residue(x, y) } else { crate::tolerant::Tolerant::residue(t, x, y) })
         };
-        slices integers;
+        slices residue;
         exact |_, [x, y]| Ok(Some(crate::exact::residue(x, y)));
     }
     // C(n, k), with n first.

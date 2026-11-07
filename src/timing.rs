@@ -85,6 +85,9 @@ pub const COPIES: &[(&str, usize, usize, f64)] = &[
     // CI's Ubicloud runner under Node's V8, from the copies that `tests/wasm-speed.mjs` measured in seven runs of 22 October 2026: 0.172 to 0.218 ns at 65,536 items, and 0.196 to 0.249 ns at 1,048,576.
     (CI_CPU, 8, 65_536, 0.22e-9),
     (CI_CPU, 8, 1_048_576, 0.25e-9),
+    // Syd1 under Node/V8, 7 November 2026, released BPL O3/ThinLTO: slow end of the warm copies beside all 388 cases.
+    (SYD1_CPU, 8, 65_536, 0.522e-9),
+    (SYD1_CPU, 8, 1_048_576, 0.767e-9),
 ];
 
 /// This machine's CPU, as its operating system names it: `machdep.cpu.brand_string` on macOS. On Linux, it's the first `model name` in `/proc/cpuinfo`, or else the `CPU implementer` and `CPU part` codes that ARM machines give there in place of a model name, as `CPU implementer 0x41, part 0xd49`. In the browser build, it's the name passed to [`name_cpu`]. `None` without a name.

@@ -49,6 +49,7 @@ mod special;
 mod sqrts;
 pub mod stats;
 pub mod structure;
+mod table;
 pub mod timing;
 pub mod tolerant;
 mod trig;

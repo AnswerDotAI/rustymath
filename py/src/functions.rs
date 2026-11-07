@@ -113,13 +113,12 @@ fn totals(function: &str, op: Op, x: ArrayView<'_>, axis: Option<&Axes>, only: O
         let view = out.as_ref().map_or_else(|| x.clone(), Core::view);
         let layout = view.layout();
         let next = axis.map_or(Layout::EMPTY, |a| layout.axes((0..layout.shape().len()).filter(|&i| i != a)));
-        let flat = [view.len()];
-        let shape = axis.map_or(flat.as_slice(), |_| layout.shape());
+        let shape = layout.shape();
         let kernel = select(function, op, None, view.dtype(), &[view.dtype(); 2], true, only)?;
-        let mut buffer = Buffer::with_capacity(kernel.fold_dtype(view.dtype(), shape[axis.unwrap_or(0)], None), next.count());
-        let order = kernel.fold_read(
-                shape, axis.unwrap_or(0), rustymath::operation::Seed::Identity, rustymath::operation::Direction::Right, settings(false), view.read(),
-                &mut buffer).map_err(py_err)?;
+        let mut buffer = Buffer::with_capacity(kernel.fold_dtype(view.dtype(), axis.map_or(view.len(), |a| shape[a]), None), next.count());
+        let order = kernel
+            .fold_read(shape, axis, rustymath::operation::Seed::Identity, rustymath::operation::Direction::Right, settings(false), view.read(), &mut buffer)
+            .map_err(py_err)?;
         out = Some(Core::new(next, buffer.ordered(order)).map_err(py_err)?);
     }
     Ok(out)
@@ -588,7 +587,8 @@ fn _sliding<'py>(py: Python<'py>, function: NativeFunction<'_>, x: &Bound<'py, P
     let dims = [lanes.outer * (lanes.len + 1 - width), width, lanes.inner];
     let mut buffer = Buffer::with_capacity(kernel.fold_dtype(view.dtype(), width, None), layout.count());
     let order = released(py, || {
-        kernel.fold_read(&dims, 1, rustymath::operation::Seed::Identity, rustymath::operation::Direction::Right, settings(mode), input.read(), &mut buffer)
+        kernel.fold_read(
+            &dims, Some(1), rustymath::operation::Seed::Identity, rustymath::operation::Direction::Right, settings(mode), input.read(), &mut buffer)
     }).map_err(py_err)?;
     give_items(py, layout, buffer.ordered(order), false)
 }

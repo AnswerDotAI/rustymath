@@ -48,7 +48,7 @@ impl Reduce {
         )).unwrap_or_else(|| Err(Error::new(Kind::Domain, "reduction does not support this dtype")))
     }
     pub fn run_read(
-        self, variant: crate::domain::Variant, shape: &[usize], axis: usize, seed: Seed<'_>, input: Read<'_>, output: &mut Buffer
+        self, variant: crate::domain::Variant, shape: &[usize], axis: Option<usize>, seed: Seed<'_>, input: Read<'_>, output: &mut Buffer
     ) -> Result<Option<Vec<Steps>>, Error> {
         native_reduction!(self, variant.dtype, variant.fails_on_overflow(), |R, T| Some(native_read::<T, R>(shape, axis, variant.checked, input).and_then(
             |(buffer, fits, order)| {
@@ -81,7 +81,7 @@ impl Reduce {
     #[inline(never)]
     pub(crate) fn inverse_read(self, variant: crate::domain::Variant, shape: &[usize], axis: usize, input: Read<'_>) -> Result<Option<Buffer>, Error> {
         inverse_result(
-            native_reduction!(@inverse self, variant.dtype, |R, T| Some(native_read::<T, R>(shape, axis, variant.checked, input).map(|(buffer, fits, order)| (buffer.ordered(order), fits)))),
+            native_reduction!(@inverse self, variant.dtype, |R, T| Some(native_read::<T, R>(shape, Some(axis), variant.checked, input).map(|(buffer, fits, order)| (buffer.ordered(order), fits)))),
             crate::layout::count(shape))
     }
 }
@@ -92,34 +92,43 @@ fn inverse_result(result: Option<Result<(Buffer, bool), Error>>, items: usize) -
     Ok(result)
 }
 
-fn native_read<T, R>(shape: &[usize], axis: usize, checked: bool, input: Read<'_>) -> Result<(Buffer, bool, Option<Vec<Steps>>), Error> where T: Cast,
+fn native_read<T, R>(shape: &[usize], axis: Option<usize>, checked: bool, input: Read<'_>) -> Result<(Buffer, bool, Option<Vec<Steps>>), Error> where T: Cast,
     R: Reduction<T>, R::Total: Totals {
-    let dims = Lanes::new(shape, axis)?.dims();
+    let dims = match axis { Some(axis) => Lanes::new(shape, axis)?.dims(), None => [1, crate::layout::count(shape), 1] };
     if let Some((view, mapping)) = input.positional(shape) && let Some(data) = T::of(view) {
-        return crate::error::checked(|| {
-            let slide = if R::COMMUTATIVE {
-                let source = crate::structure::walked_source(&mapping.tables(shape), shape, data.len());
-                match fold_route(&mapping, shape, source.as_deref(), false, &[axis]) {
-                    FoldRoute::Slide(s) => {
-                        let data = &data[s.region.clone()];
-                        let folded = match s.dims[..] {
-                            [outer, len, inner] if s.every[0] == 1 => Some(sliding::<T, R>(data, [outer, len, inner], s.widths[0])),
-                            [outer, len, inner] => {
-                                crate::events::taken(crate::events::Route::SlidingFold, data.len());
-                                Some(along::<T, R>(data, [outer, len, inner]))
-                            }
-                            [a, b, c, d, e] => sliding_2d::<T, R>(data, [a, b, c, d, e], [s.widths[0], s.widths[1]], [s.every[0], s.every[1]]),
-                            _ => unreachable!("a slide folds one axis or two"),
-                        };
-                        folded.map(|(totals, fits)| (totals, fits, Some(s.tables)))
+        if axis.is_none() && R::COMMUTATIVE && let Some(block) = mapping.block(shape) {
+            return crate::error::checked(|| {
+                let (dims, order) = block.fold(None);
+                let (totals, fits) = along::<T, R>(&data[block.range], dims);
+                Ok((R::Total::buffer_of(totals), fits, order))
+            });
+        }
+        if let Some(axis) = axis {
+            return crate::error::checked(|| {
+                let slide = if R::COMMUTATIVE {
+                    let source = crate::structure::walked_source(&mapping.tables(shape), shape, data.len());
+                    match fold_route(&mapping, shape, source.as_deref(), false, &[axis]) {
+                        FoldRoute::Slide(s) => {
+                            let data = &data[s.region.clone()];
+                            let folded = match s.dims[..] {
+                                [outer, len, inner] if s.every[0] == 1 => Some(sliding::<T, R>(data, [outer, len, inner], s.widths[0])),
+                                [outer, len, inner] => {
+                                    crate::events::taken(crate::events::Route::SlidingFold, data.len());
+                                    Some(along::<T, R>(data, [outer, len, inner]))
+                                }
+                                [a, b, c, d, e] => sliding_2d::<T, R>(data, [a, b, c, d, e], [s.widths[0], s.widths[1]], [s.every[0], s.every[1]]),
+                                _ => unreachable!("a slide folds one axis or two"),
+                            };
+                            folded.map(|(totals, fits)| (totals, fits, Some(s.tables)))
+                        }
+                        _ => None,
                     }
-                    _ => None,
-                }
-            } else { None };
-            let (totals, fits, order) = slide.unwrap_or_else(|| along_mapped::<T, R>(data, &mapping, shape, axis));
-            let order = order.filter(|order| !Mapping::walk_in_order(0, order, totals.len()));
-            Ok((R::Total::buffer_of(totals), fits, order))
-        });
+                } else { None };
+                let (totals, fits, order) = slide.unwrap_or_else(|| along_mapped::<T, R>(data, &mapping, shape, axis));
+                let order = order.filter(|order| !Mapping::walk_in_order(0, order, totals.len()));
+                Ok((R::Total::buffer_of(totals), fits, order))
+            });
+        }
     }
     let pieces = |range: Range<usize>, emit: &mut dyn FnMut(usize, InputPiece<'_>)| {
         let mut scratch = Buffer::with_capacity(T::DTYPE, 0);

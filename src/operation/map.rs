@@ -1,66 +1,77 @@
 use super::*;
+use crate::{FUSED, recipe::NativeOps};
 
 mod complex;
 mod integer;
 mod real;
-use {complex::*, integer::*, real::*};
+pub(crate) use real::real_slice;
+use {complex::*, integer::*, real::map_real};
 pub(super) fn map_formula<K: crate::facts::Formula<N>, const N: usize>(
     object: &K, variant: crate::domain::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, repair: bool,
     judged: bool, output: &mut Buffer) -> Result<(), Error> {
     if inputs.len() != N { return Err(Error::new(Kind::Length, "kernel operand count changed")); }
+    let ops = settings.ops();
     crate::events::taken(crate::events::Route::VectorKernel, range.len());
     report_maps(inputs.iter().map(|read| read.plan), range.clone());
     // A kernel whose arguments' types can't make an error judges no item: `judge` is `variant` unchecked. Reads and `IntegerOps` keep `variant`, so an argument that doesn't convert, or an overflow that `IntegerOps::result` reports, still fails.
     let judge = crate::domain::Variant { checked: variant.checked && judged, ..variant };
-    if let Some(slices) = object.native_slices() {
+    let slices = object.native_slices();
+    if let Some(slices) = &slices {
         let valid = |ok: bool| if judge.checked && !ok { Err(Kind::Domain) } else { Ok(()) };
         let blocks = match variant.dtype {
-            DType::Float(FloatWidth::F64) => sliced(object, slices.double, inputs, range.clone(), variant.checked, &valid, output),
-            DType::Float(FloatWidth::F32) => sliced(object, slices.single, inputs, range.clone(), variant.checked, &valid, output),
+            DType::Float(FloatWidth::F64) => sliced(object, &ops, slices.double, inputs, range.clone(), variant.checked, &valid, output),
+            DType::Float(FloatWidth::F32) => sliced(object, &ops, slices.single, inputs, range.clone(), variant.checked, &valid, output),
             DType::Float(FloatWidth::F16) => slices.single.map(|single| {
                 map_blocks::<f32, half::f16, N>(inputs, range.clone(), variant.checked, output, &|args, n, out| {
-                    valid(crate::slice::buffered(n, out, |out| single(object, args, n, out), half::f16::from_f32))
+                    valid(crate::slice::buffered(n, out, |out| single(object, &ops, args, n, out), half::f16::from_f32))
                 })
             }),
-            DType::Integer(Width::U8) => sliced(object, slices.byte, inputs, range.clone(), variant.checked, &valid, output),
-            DType::Integer(Width::I16) => sliced(object, slices.short, inputs, range.clone(), variant.checked, &valid, output),
-            DType::Integer(Width::I32) => sliced(object, slices.int, inputs, range.clone(), variant.checked, &valid, output),
-            DType::Integer(Width::I64) => sliced(object, slices.long, inputs, range.clone(), variant.checked, &valid, output),
+            DType::Integer(Width::U8) => sliced(object, &ops, slices.byte, inputs, range.clone(), variant.checked, &valid, output),
+            DType::Integer(Width::I16) => sliced(object, &ops, slices.short, inputs, range.clone(), variant.checked, &valid, output),
+            DType::Integer(Width::I32) => sliced(object, &ops, slices.int, inputs, range.clone(), variant.checked, &valid, output),
+            DType::Integer(Width::I64) => sliced(object, &ops, slices.long, inputs, range.clone(), variant.checked, &valid, output),
             _ => None,
         };
         if let Some(blocks) = blocks { return blocks; }
     }
     match variant.dtype {
-        DType::Float(FloatWidth::F16) => map_real::<K, f32, half::f16, N>(object, variant, inputs, range, settings, repair, judge, output),
-        DType::Float(FloatWidth::F32) => map_real::<K, f32, f32, N>(object, variant, inputs, range, settings, repair, judge, output),
-        DType::Float(FloatWidth::F64) => map_real::<K, f64, f64, N>(object, variant, inputs, range, settings, repair, judge, output),
+        DType::Float(FloatWidth::F16) => map_real::<K, f32, half::f16, N>(object, variant, inputs, range, &ops, repair, judge, output),
+        DType::Float(FloatWidth::F32) => map_real::<K, f32, f32, N>(object, variant, inputs, range, &ops, repair, judge, output),
+        DType::Float(FloatWidth::F64) => map_real::<K, f64, f64, N>(object, variant, inputs, range, &ops, repair, judge, output),
         DType::Boolean => match object.truth_table() {
             Some(table) => map_truth::<N>(table, inputs, range, output), None => map_integer::<K, u8, N>(object, variant, inputs, range, judge, output)
         },
         DType::Integer(width) => with_width!(width, I => map_integer::<K, I, N>(object, variant, inputs, range, judge, output)),
         DType::Complex(crate::buffer::ComplexWidth::F32) if K::REAL_COMPLEX && real_inputs(inputs) => {
-            map_real_complex::<K, f32, N>(object, variant, inputs, range, settings, output)
+            map_real_complex::<K, f32, N>(object, variant, inputs, range, &ops, output)
         }
         DType::Complex(crate::buffer::ComplexWidth::F64) if K::REAL_COMPLEX && real_inputs(inputs) => {
-            map_real_complex::<K, f64, N>(object, variant, inputs, range, settings, output)
+            map_real_complex::<K, f64, N>(object, variant, inputs, range, &ops, output)
         }
-        DType::Complex(crate::buffer::ComplexWidth::F32) => map_complex::<K, f32, N>(object, variant, inputs, range, settings, judge, output),
-        DType::Complex(crate::buffer::ComplexWidth::F64) => map_complex::<K, f64, N>(object, variant, inputs, range, settings, judge, output),
+        DType::Complex(crate::buffer::ComplexWidth::F32) => {
+            map_complex::<K, f32, N>(object, variant, inputs, range, &ops, slices.and_then(|s| s.complex_single), judge, output)
+        }
+        DType::Complex(crate::buffer::ComplexWidth::F64) => {
+            map_complex::<K, f64, N>(object, variant, inputs, range, &ops, slices.and_then(|s| s.complex_double), judge, output)
+        }
         DType::Character => Err(Error::new(Kind::Domain, "characters are not numerical kernel operands")),
     }
 }
 
 /// `slice`, a formula's slice form at `T` (`NativeSlices`), on each block of `inputs` over `range`, with `valid` turning each block's validity into its result. `None` where the formula has no form at `T`.
 fn sliced<K: Sync, T: crate::buffer::Cast + Element, const N: usize>(
-    object: &K, slice: Option<crate::facts::Slice<K, T, N>>, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, checked: bool,
-    valid: &(dyn Fn(bool) -> Result<(), Kind> + Sync), output: &mut Buffer) -> Option<Result<(), Error>> {
+    object: &K, ops: &NativeOps<{ FUSED }>, slice: Option<crate::facts::Slice<K, T, N>>, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>,
+    checked: bool, valid: &(dyn Fn(bool) -> Result<(), Kind> + Sync), output: &mut Buffer) -> Option<Result<(), Error>> {
     let slice = slice?;
-    Some(map_blocks::<T, T, N>(inputs, range, checked, output, &|args, n, out| valid(slice(object, args, n, out))))
+    Some(map_blocks::<T, T, N>(inputs, range, checked, output, &|args, n, out| valid(slice(object, ops, args, n, out))))
 }
 
 /// A function of Booleans by its truth table (`Formula::truth_table`): bit `2x+y` of the table, or bit `x` for one argument, gives its result. A function with a table gives it for every Boolean argument, so no item checks its validity.
 fn map_truth<const N: usize>(table: u8, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, output: &mut Buffer) -> Result<(), Error> {
-    map_values::<bool, bool, N>(inputs, range, false, false, output, |x| crate::facts::truth_bit(table, x), |_, _| None)
+    let value = |x: [bool; N]| match N {
+        1 => crate::arith::bitwise(table, false, x[0]), 2 => crate::arith::bitwise(table, x[0], x[1]), _ => crate::facts::truth_bit(table, x)
+    };
+    map_values::<bool, bool, N>(inputs, range, false, false, output, value, |_, _| None)
 }
 
 /// Whether no source of `inputs` holds complex items, so that a formula's complex results from real arguments (`Formula::real_complex`) can read them as reals.

@@ -903,6 +903,29 @@ impl Walk {
             match self.read(a, source[a])? { (0, read) => match read[..] { [[n, moves], [w, 1]] => Some([n, w, moves]), _ => None }, _ => None }
         }).collect()
     }
+    /// The transpose of unit-step leading windows as an axis order and copies to sum. The copies read the reordered windows back to the source, with zero at missing positions.
+    pub fn transpose_windows(&self, source: &[usize]) -> Option<(Vec<usize>, Vec<Mapping>)> {
+        let windows = self.windows(source)?;
+        if windows.iter().any(|&[_, _, step]| step != 1) { return None; }
+        let s = windows.len();
+        // Move the shorter of each frame/window pair first, so each term reads the remaining axes forwards.
+        let cells: Vec<usize> = windows.iter().enumerate().map(|(a, &[n, w, _])| if n < w { a } else { s + a }).collect();
+        let order: Vec<usize> = cells.iter().copied().chain((0..self.steps.len()).filter(|r| !cells.contains(r))).collect();
+        let mut to = vec![0; order.len()];
+        for (&r, stride) in order.iter().zip(strides(&order.iter().map(|&r| self.steps[r].len()).collect::<Vec<_>>())) { to[r] = stride; }
+        let mut terms = vec![(0, vec![])];
+        for (a, &len) in source.iter().enumerate() {
+            let entries = if a < s {
+                let cell = cells[a];
+                let frame = if cell == a { s + a } else { a };
+                (0..self.steps[cell].len()).map(|c| (c * to[cell], Steps::clipped(-(c as i128), len, self.steps[frame].len(), to[frame]))).collect()
+            } else { vec![(0, Steps::along(len, to[s + a]))] };
+            terms = terms.into_iter().flat_map(|(base, steps): (usize, Vec<Steps>)| {
+                entries.iter().map(move |(offset, step)| (base + offset, steps.iter().cloned().chain([step.clone()]).collect()))
+            }).collect();
+        }
+        Some((order, terms.into_iter().map(|(base, steps)| Mapping::Steps { base, steps }).collect()))
+    }
 }
 
 /// A fold along one or two axes of a copy whose axes walk windows of its source, run as sliding folds over the source's rows without building the windows ([`crate::reduce::sliding`] and [`crate::reduce::sliding_2d`]). [`Walk`] classifies the copy. Each folded axis is a window's axis that moves one position at a time along its source axis. The copy's other axes along that source axis move by 1, where the windows slide, or by whole windows, where they tile it, as pooling's do. basedpl folds its pending copies of windows this way, and the Python API its views of windows.

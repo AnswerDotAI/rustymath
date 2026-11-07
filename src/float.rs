@@ -6,7 +6,7 @@ use crate::{parallel::Slots, slice::{Arg, Ternary}};
 pub const FUSED: bool = cfg!(any(target_arch = "aarch64", target_feature = "fma"));
 
 /// A float type that rustymath's functions take: `half::f16`, `f32` or `f64`.
-pub trait Float: num_traits::Float + sealed::Sealed + crate::slice::KernelItem {
+pub trait Float: num_traits::Float + sealed::Sealed + crate::slice::KernelItem + crate::buffer::Source<Self> {
     /// The type this float computes in, its working precision: `f32` for `f16`, and the type itself otherwise. A function of an `f16` computes in `f32` and rounds once. Sums keep their running totals in this type.
     type Working: Native;
     /// This float in its working type, which holds it exactly.
