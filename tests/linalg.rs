@@ -15,8 +15,8 @@ mod products {
     #[test]
     fn native_inner_pairs_keep_right_folds_and_bounded_terms() {
         use rustymath::{
-            agreement::{Binding, Missing, Read, ReadPlan}, buffer::{Buffer, Element, View}, domain::Variant, error::{self, Error}, facts::Formula,
-            operation::{Direction, Kernel, Seed, Settings}, tolerant::{Equal, Greater, Tolerance}
+            agreement::{Binding, Missing, Read, ReadPlan}, buffer::{Buffer, Element, View}, domain::Variant, error::{self, Error},
+            operation::{Kernel, Settings}, reduce::{Direction, Seed}, tolerant::{Equal, Greater, Tolerance}
         };
         fn fold(kernel: &Kernel, data: View<'_>, dims: [usize; 3], tail: Option<View<'_>>) -> Result<Buffer, Error> {
             let mut sources = vec![Binding::full(data)];
@@ -35,8 +35,8 @@ mod products {
             ($f:expr, $g:expr, $a:expr, $b:expr, $size:expr) => {{
                 let (f, g, a, b) = ($f, $g, $a, $b);
                 let dtype = a.dtype().common(b.dtype()).unwrap();
-                let gk = g.resolve(Variant::checked(dtype), [a.dtype(), b.dtype()]).unwrap();
-                let fk = f.resolve(Variant::checked(gk.result_dtype()), [gk.result_dtype(); 2]).unwrap();
+                let gk = Kernel::resolve(g, Variant::checked(dtype), [a.dtype(), b.dtype()]).unwrap();
+                let fk = Kernel::resolve(f, Variant::checked(gk.result_dtype()), [gk.result_dtype(); 2]).unwrap();
                 inner_with(
                     a, b, $size, |x, y, agreement| {
                         assert!(agreement.len <= rustymath::CHUNK);
@@ -78,7 +78,7 @@ mod products {
         assert!(inner!(rustymath::Pow, rustymath::Add, f64::view(&[-1., 0.5]), f64::view(&[0., 2., 0., 1.5]), [1, 2, 2]).is_err());
         assert!(inner!(rustymath::Add, rustymath::Multiply, i64::view(&[i64::MAX, 1]), i64::view(&[2, 2]), [1, 2, 1]).is_err());
         assert!(inner!(rustymath::Add, rustymath::Multiply, i64::view(&[]), i64::view(&[2, 2]), [0, 2, 1]).unwrap().is_empty());
-        let sum = rustymath::Add.resolve(Variant::checked(i64::DTYPE), [i64::DTYPE; 2]).unwrap();
+        let sum = Kernel::resolve(rustymath::Add, Variant::checked(i64::DTYPE), [i64::DTYPE; 2]).unwrap();
         assert_eq!(i64::vec(fold(&sum, bool::view(&[true, false]), [1, 2, 1], Some(i64::view(&[7]))).unwrap()).unwrap(), [8]);
         assert!(fold(&sum, i64::view(&[i64::MAX]), [1, 1, 1], Some(i64::view(&[1]))).is_err());
     }

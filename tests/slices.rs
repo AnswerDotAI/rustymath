@@ -50,7 +50,7 @@ mod parallel {
 
 mod forms {
     use half::f16;
-    use rustymath::{reduce::{Maximum, Minimum}, *};
+    use rustymath::{operation::Kernel, reduce::{Maximum, Minimum}, *};
     use std::fmt::Debug;
 
     /// Whether `a` and `b` agree: both NaN, the same value, or finite and nonzero within 8 units in the last place of each other. A scalar form and its slice form can round differently, as `Pow`'s do at f32, where only the scalar form reads tables. Infinities and signs must match exactly, apart from a zero's sign, which can differ between routes: a vector maximum orders `-0` below `0`, where the scalar form gives its second argument on a tie.
@@ -68,7 +68,7 @@ mod forms {
     }
 
     fn check<F: Float + buffer::Element + Debug, K: facts::Formula<A>, const A: usize>(k: &K, name: &str, args: [Arg<'_, F>; A], n: usize) {
-        let kernel = k.resolve(domain::Variant { checked: false, ..domain::Variant::checked(F::DTYPE) }, [F::DTYPE; A]).unwrap();
+        let kernel = Kernel::resolve((*k).clone(), domain::Variant { checked: false, ..domain::Variant::checked(F::DTYPE) }, [F::DTYPE; A]).unwrap();
         let views = args.each_ref().map(|a| {
             F::view(match a { Arg::One(v) => std::slice::from_ref(v), Arg::Many(s) => s })
         });
@@ -826,7 +826,7 @@ mod tolerant {
 
     #[test]
     fn residue_and_gcd() {
-        use rustymath::{buffer::{DType, FloatWidth}, domain::Variant, facts::Formula};
+        use rustymath::{buffer::{DType, FloatWidth}, domain::Variant, operation::Kernel};
         assert_eq!([(3.0, -5.0), (3.0, 5.0), (-3.0, -4.0), (-3.0, 4.0)].map(|(x, y)| T.residue(x, y)), [1.0, 2.0, -1.0, -2.0]);
         let r = [3.12, -1.0, -0.6].map(|y| T.residue(0.5, y));
         assert!((r[0] - 0.12).abs() < 1e-15 && r[1] == 0.0 && (r[2] - 0.4).abs() < 1e-15);
@@ -837,7 +837,7 @@ mod tolerant {
         assert!((Exactly.residue(0.1, 0.3) - 0.1).abs() < 1e-15);
         let (x, y) = (2.2500000000000018, 0.7500000000000007);
         let f64s = DType::Float(FloatWidth::F64);
-        let quotient = FloorDivide(Tolerance::EXACT).resolve(Variant::checked(f64s), [f64s; 2]).unwrap();
+        let quotient = Kernel::resolve(FloorDivide(Tolerance::EXACT), Variant::checked(f64s), [f64s; 2]).unwrap();
         assert_eq!(
             (quotient.real(&[x, y], rustymath::operation::Settings { tolerance: Tolerance::EXACT }).unwrap(), Residue(Tolerance::EXACT).one(y, x)),
             (2.0, x - 2.0 * y)

@@ -36,7 +36,7 @@ module-name = "rustymath._core"
 macos-deployment-target = "15.0"
 
 [tool.uv]
-cache-keys = [{ file = "pyproject.toml" }, { file = "Cargo.toml" }, { file = "py/Cargo.toml" }]
+cache-keys = [{ file = "pyproject.toml" }, { file = "Cargo.toml" }, { file = "core/Cargo.toml" }, { file = "kernels/Cargo.toml" }, { file = "py/Cargo.toml" }]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

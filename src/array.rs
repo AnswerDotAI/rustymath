@@ -5,57 +5,8 @@ use crate::error::{Error, Kind};
 use crate::gather::{Steps, Writes};
 use crate::layout::{Keys, Lanes, Layout, element_count};
 use crate::operation::{Kernel, Settings, WriteRoot};
-use std::borrow::Cow;
+pub use rustymath_core::array::ArrayView;
 use std::sync::Arc;
-
-/// Sources lent for one operation. The plan carries positions, never data or a materialization cache.
-#[derive(Clone)]
-pub struct ArrayView<'a> { layout: &'a Layout, sources: Vec<Binding<'a>>, plan: ReadPlan }
-
-impl<'a> ArrayView<'a> {
-    pub fn new(layout: &'a Layout, sources: Vec<Binding<'a>>, plan: ReadPlan) -> Result<Self, Error> {
-        if layout.count() != plan.len() { return Err(Error::new(Kind::Length, "read plan doesn't fit its layout")); }
-        Ok(Self { layout, sources, plan })
-    }
-    pub fn compact(layout: &'a Layout, storage: View<'a>) -> Self {
-        Self { layout, sources: vec![Binding::full(storage)], plan: ReadPlan::input(0, storage.len()) }
-    }
-    pub fn layout(&self) -> &'a Layout { self.layout }
-    pub fn dtype(&self) -> DType { self.sources[0].view.dtype() }
-    pub fn len(&self) -> usize { self.plan.len() }
-    pub fn is_empty(&self) -> bool { self.plan.is_empty() }
-    pub fn read(&self) -> Read<'_> { Read { sources: &self.sources, plan: &self.plan } }
-    pub fn plan(&self) -> &ReadPlan { &self.plan }
-    pub fn sources(&self) -> &[Binding<'a>] { &self.sources }
-    /// Changes metadata, retaining the logical sequence.
-    pub fn with_layout<'b>(&self, layout: &'b Layout) -> Result<ArrayView<'b>, Error> where 'a: 'b {
-        ArrayView::new(layout, self.sources.clone(), self.plan.clone())
-    }
-    /// Composes a call's positional read. Missing positions read the prototype (`Missing::prototype`).
-    pub fn remapped(&self, mapping: Mapping, items: usize) -> Self {
-        let mut sources = self.sources.clone();
-        let missing = Missing::prototype(self.dtype(), &mut sources);
-        Self { layout: self.layout, sources, plan: self.plan.remapped(mapping, items, missing) }
-    }
-    pub fn contiguous(&self) -> Option<View<'a>> {
-        if self.is_empty() { return Some(self.sources[0].view.slice(0..0)); }
-        let (source, range) = self.plan.contiguous(0..self.len())?;
-        self.sources.get(source)?.borrow(range)
-    }
-    pub fn affine(&self) -> Option<(View<'a>, usize, Vec<isize>)> {
-        let (source, base, strides) = self.plan.affine(self.layout.shape())?;
-        let (view, base) = self.sources.get(source)?.affine(base, &strides, self.layout.shape())?;
-        Some((view, base, strides))
-    }
-    /// Borrows a contiguous read at its dtype, otherwise prepares exactly these logical items.
-    pub fn cast(&self, dtype: DType) -> Result<Items<'a>, Error> {
-        if dtype == self.dtype() && let Some(view) = self.contiguous() { return Ok(Items::Borrowed(view)); }
-        let mut buffer = Buffer::with_capacity(dtype, self.len());
-        self.read().read_into(0..self.len(), dtype, true, &mut buffer)?;
-        Ok(Items::Owned(buffer))
-    }
-    pub fn items<T: Element>(&self) -> Result<Cow<'a, [T]>, Error> { Ok(self.cast(T::DTYPE)?.items()) }
-}
 
 /// A value keeps its sources alive; reading a view never replaces its plan or caches a gathered copy.
 #[derive(Clone, Debug)]
@@ -71,7 +22,7 @@ impl Array {
     pub fn set_names(&mut self, names: Vec<Option<Arc<str>>>) -> Result<(), Error> { self.layout = self.layout.clone().with_names(names)?; Ok(()) }
     pub fn set_keys(&mut self, keys: Vec<Option<Arc<Keys>>>) -> Result<(), Error> { self.layout = self.layout.clone().with_keys(keys)?; Ok(()) }
     pub fn view(&self) -> ArrayView<'_> {
-        ArrayView { layout: &self.layout, sources: self.sources.iter().map(|s| Binding::full(s.view())).collect(), plan: self.plan.clone() }
+        ArrayView::new(&self.layout, self.sources.iter().map(|s| Binding::full(s.view())).collect(), self.plan.clone()).expect("an array's plan fits its layout")
     }
     pub fn dtype(&self) -> DType { self.sources[0].dtype() }
     pub fn len(&self) -> usize { self.plan.len() }
@@ -137,12 +88,12 @@ impl Array {
     /// Joins arrays of one dtype along an axis, retaining the usual layout rules.
     pub fn concatenate(arrays: &[ArrayView<'_>], axis: usize) -> Result<Self, Error> {
         let Some(source) = arrays.first() else { return Err(Error::new(Kind::Length, "concatenate needs an array")) };
-        let mut layout = source.layout.clone();
+        let mut layout = source.layout().clone();
         for view in &arrays[1..] {
             if view.dtype() != source.dtype() { return Err(Error::new(Kind::Domain, "concatenate items must have one dtype")); }
-            layout = crate::structure::catenate(&layout, view.layout, axis)?;
+            layout = crate::structure::catenate(&layout, view.layout(), axis)?;
         }
-        let lanes = arrays.iter().map(|a| Lanes::new(a.layout.shape(), axis)).collect::<Result<Vec<_>, _>>()?;
+        let lanes = arrays.iter().map(|a| Lanes::new(a.layout().shape(), axis)).collect::<Result<Vec<_>, _>>()?;
         let lens: Vec<usize> = lanes.iter().map(|l| l.len * l.inner).collect();
         let (outer, stride) = (lanes[0].outer, lens.iter().sum::<usize>());
         let buffer = with_dtype!(source.dtype(), T => {
@@ -160,8 +111,8 @@ impl Array {
     pub fn choose(condition: ArrayView<'_>, x: ArrayView<'_>, y: ArrayView<'_>) -> Result<Self, Error> {
         if condition.dtype() != DType::Boolean { return Err(Error::new(Kind::Domain, "condition must be Boolean")); }
         if x.dtype() != y.dtype() { return Err(Error::new(Kind::Domain, "chosen items must have one dtype")); }
-        let pair = Agreement::new(x.layout, y.layout)?;
-        let whole = Agreement::onto(&pair.layout, condition.layout)?;
+        let pair = Agreement::new(x.layout(), y.layout())?;
+        let whole = Agreement::onto(&pair.layout, condition.layout())?;
         let x = x.remapped(pair.left, pair.len).remapped(whole.left.clone(), whole.len);
         let y = y.remapped(pair.right, pair.len).remapped(whole.left, whole.len);
         let condition = condition.remapped(whole.right, whole.len);
@@ -170,7 +121,7 @@ impl Array {
         Self::new(whole.layout, buffer)
     }
     pub fn broadcasted(source: ArrayView<'_>, shape: &[usize]) -> Result<Self, Error> {
-        let agreement = Agreement::new(&Layout::from(shape), source.layout)?;
+        let agreement = Agreement::new(&Layout::from(shape), source.layout())?;
         if agreement.layout.shape() != shape { return Err(Error::new(Kind::Length, "source doesn't broadcast to this shape")); }
         let source = source.remapped(agreement.right, agreement.len);
         let buffer = source.cast(source.dtype())?;
@@ -178,7 +129,7 @@ impl Array {
     }
     /// Adjacent differences read two selections through the ordinary kernel. Integer differences wrap at the input width.
     pub fn differences(source: ArrayView<'_>, axis: usize) -> Result<Self, Error> {
-        let layout = source.layout;
+        let layout = source.layout();
         let &size = layout.shape().get(axis).ok_or_else(|| Error::new(Kind::Index, "difference axis is out of range"))?;
         if source.dtype() == DType::Character { return Err(Error::new(Kind::Domain, "differences need numerical items")); }
         let n = size.saturating_sub(1);

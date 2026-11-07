@@ -270,10 +270,10 @@ fn logarithms_accuracy() {
 /// `log2` gives k exactly at 2^k, and `log10` gives k at 10^k, or at the float nearest 10^k where 10^k isn't a float. Each does at every width, fused and unfused. So does `Logb` in base 2 and base 10: through its formula, and through its kernel with the base constant, the argument constant or neither.
 #[test]
 fn logarithms_exact() {
-    use rustymath::{Float, Logb, buffer::Element, domain::Variant, facts::{Formula, formula_at}};
+    use rustymath::{Float, Logb, buffer::Element, domain::Variant, facts::formula_at, operation::Kernel};
     use std::ops::RangeInclusive;
     fn exact<F: Float + Element + Debug>(twos: RangeInclusive<i32>, tens: RangeInclusive<i32>) {
-        let kernel = Logb.resolve(Variant { checked: false, ..Variant::checked(F::DTYPE) }, [F::DTYPE; 2]).unwrap();
+        let kernel = Kernel::resolve(Logb, Variant { checked: false, ..Variant::checked(F::DTYPE) }, [F::DTYPE; 2]).unwrap();
         // The kernel's first result on `bases` and `xs`, where a one-item argument is a constant.
         let first = |bases: &[F], xs: &[F]| {
             let mut out = F::buffer(vec![]);

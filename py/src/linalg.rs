@@ -6,7 +6,6 @@ use rustymath::array::{Array as Core, ArrayView};
 use rustymath::buffer::{Buffer, DType, FloatWidth, Width};
 use rustymath::error::{Error, Kind};
 use rustymath::linalg::{self, Stacked};
-use rustymath::operation::numpy_float;
 use rustymath_buffer::py_err;
 
 use crate::array::give;
@@ -17,7 +16,7 @@ use crate::functions::{NativeFunction, native_binary};
 fn on_stacked<'py, const N: usize, R: Send>(
     py: Python<'py>, args: [&Bound<'py, PyAny>; N], f: impl for<'c> FnOnce(Stacked, [ArrayView<'c>; N]) -> Result<R, Error> + Send) -> PyResult<R> {
     let call = convert(&args)?;
-    let (s, views) = (Stacked::new(numpy_float(call.args[0].view().dtype())), std::array::from_fn(|k| call.args[k].view()));
+    let (s, views) = (Stacked::new(call.args[0].view().dtype().numpy_float()), std::array::from_fn(|k| call.args[k].view()));
     released(py, || f(s, views)).map_err(py_err)
 }
 

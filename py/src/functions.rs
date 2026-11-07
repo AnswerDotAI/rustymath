@@ -58,7 +58,7 @@ fn computes(function: &str, op: Op, arity: usize, dtype: DType, only: Option<&[D
     match only {
         None => op.computing_dtype(arity, dtype),
         Some(allowed) => {
-            dtype.computes_in(rustymath::buffer::Width::I64, rustymath::operation::numpy_float(dtype), |at| allowed.contains(&at) && op.supports(arity, at))
+            dtype.computes_in(rustymath::buffer::Width::I64, dtype.numpy_float(), |at| allowed.contains(&at) && op.supports(arity, at))
         }
     }.ok_or_else(|| missing(function, dtype))
 }
@@ -117,7 +117,7 @@ fn totals(function: &str, op: Op, x: ArrayView<'_>, axis: Option<&Axes>, only: O
         let kernel = select(function, op, None, view.dtype(), &[view.dtype(); 2], true, only)?;
         let mut buffer = Buffer::with_capacity(kernel.fold_dtype(view.dtype(), axis.map_or(view.len(), |a| shape[a]), None), next.count());
         let order = kernel
-            .fold_read(shape, axis, rustymath::operation::Seed::Identity, rustymath::operation::Direction::Right, settings(false), view.read(), &mut buffer)
+            .fold_read(shape, axis, rustymath::reduce::Seed::Identity, rustymath::reduce::Direction::Right, settings(false), view.read(), &mut buffer)
             .map_err(py_err)?;
         out = Some(Core::new(next, buffer.ordered(order)).map_err(py_err)?);
     }
@@ -142,7 +142,7 @@ fn scan<'py>(py: Python<'py>, function: &str, op: Op, x: &Bound<'py, PyAny>, axi
     let (dims, layout, _) = along_axis(x.layout(), view.len(), axis)?;
     let kernel = select(function, op, None, view.dtype(), &[view.dtype(); 2], true, only)?;
     let mut buffer = Buffer::with_capacity(kernel.scan_dtype(false), view.len());
-    released(py, || kernel.scan(dims, rustymath::operation::Seed::Identity, rustymath::operation::Direction::Left, settings(false), view.read(), &mut buffer))
+    released(py, || kernel.scan(dims, rustymath::reduce::Seed::Identity, rustymath::reduce::Direction::Left, settings(false), view.read(), &mut buffer))
         .map_err(py_err)?;
     give_items(py, layout, buffer, false)
 }
@@ -532,9 +532,9 @@ fn logical_scan<'py>(py: Python<'py>, x: &Bound<'py, PyAny>, table: [[bool; 2]; 
     let kernel = rustymath::operation::Kernel::new::<_, 2>(rustymath::Bitwise(code), rustymath::domain::Variant::checked(DType::Boolean));
     let start = start.map(|s| Buffer::Booleans(vec![s]));
     let start = start.as_ref().map(|s| ArrayView::compact(&Layout::EMPTY, s.view()));
-    let seed = start.as_ref().map_or(rustymath::operation::Seed::Identity, |s| rustymath::operation::Seed::Initial(s.read()));
+    let seed = start.as_ref().map_or(rustymath::reduce::Seed::Identity, |s| rustymath::reduce::Seed::Initial(s.read()));
     let mut buffer = Buffer::with_capacity(kernel.scan_dtype(start.is_some()), 0);
-    released(py, || kernel.scan(dims, seed, rustymath::operation::Direction::Left, settings(false), input.read(), &mut buffer)).map_err(py_err)?;
+    released(py, || kernel.scan(dims, seed, rustymath::reduce::Direction::Left, settings(false), input.read(), &mut buffer)).map_err(py_err)?;
     give_items(py, layout, buffer, false)
 }
 
@@ -551,9 +551,9 @@ fn _accumulate<'py>(
     let (dims, layout, _) = along_axis(x.layout(), view.len(), axis)?;
     let (function, mode) = function;
     let kernel = (native_binary(function)?.kernel)(view.dtype(), mode)?;
-    let seed = start.as_ref().map_or(rustymath::operation::Seed::Identity, |s| rustymath::operation::Seed::Initial(s.read()));
+    let seed = start.as_ref().map_or(rustymath::reduce::Seed::Identity, |s| rustymath::reduce::Seed::Initial(s.read()));
     let mut buffer = Buffer::with_capacity(kernel.scan_dtype(start.is_some()), view.len());
-    released(py, || kernel.scan(dims, seed, rustymath::operation::Direction::Left, settings(mode), view.read(), &mut buffer)).map_err(py_err)?;
+    released(py, || kernel.scan(dims, seed, rustymath::reduce::Direction::Left, settings(mode), view.read(), &mut buffer)).map_err(py_err)?;
     give_items(py, layout, buffer, false)
 }
 
@@ -588,7 +588,7 @@ fn _sliding<'py>(py: Python<'py>, function: NativeFunction<'_>, x: &Bound<'py, P
     let mut buffer = Buffer::with_capacity(kernel.fold_dtype(view.dtype(), width, None), layout.count());
     let order = released(py, || {
         kernel.fold_read(
-            &dims, Some(1), rustymath::operation::Seed::Identity, rustymath::operation::Direction::Right, settings(mode), input.read(), &mut buffer)
+            &dims, Some(1), rustymath::reduce::Seed::Identity, rustymath::reduce::Direction::Right, settings(mode), input.read(), &mut buffer)
     }).map_err(py_err)?;
     give_items(py, layout, buffer.ordered(order), false)
 }

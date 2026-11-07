@@ -36,14 +36,14 @@ let mut squares = Vec::new();
 Pow.many(Arg::Many(&[1.5, 2.0, 3.0]), Arg::One(2.0), 3, &mut squares); // squares: [2.25, 4.0, 9.0]
 ```
 
-`facts::Formula` holds an object's numerical and kind rules. `Formula::resolve` selects a working dtype and returns an `operation::Kernel` for callers choosing dtypes at run time. Its `map`, `fold_read`, `fold_pieces` and `scan` methods consume shared `agreement::Read` plans. `Kernel::real`, `complex` and `exact` evaluate scalar arguments through the same object.
+`facts::Formula` holds an object's numerical and kind rules. `Kernel::resolve` selects a working dtype and returns an `operation::Kernel` for callers choosing dtypes at run time. Its `map`, `fold_read`, `fold_pieces` and `scan` methods consume shared `agreement::Read` plans. `Kernel::real`, `complex` and `exact` evaluate scalar arguments through the same object.
 
 ```rust
-use rustymath::{Exp, domain::Variant, facts::Formula, buffer::{DType, FloatWidth, Width}};
+use rustymath::{Exp, domain::Variant, operation::Kernel, buffer::{DType, FloatWidth, Width}};
 
 let double = DType::Float(FloatWidth::F64);
-let exp = Exp.resolve(Variant::checked(double), [DType::Integer(Width::I32)]).unwrap();
-assert_eq!(exp.variant.dtype, double);
+let exp = Kernel::resolve(Exp, Variant::checked(double), [DType::Integer(Width::I32)]).unwrap();
+assert_eq!(exp.variant().dtype, double);
 ```
 
 `Sin`, `Cos` and `Tan` use short reduction and polynomials for their common range. An object's repair predicate marks arguments beyond 2^23 at f64 or 2^20 at f32. Its native slice driver applies the object's scalar repair routine to those items before returning the results. `Kernel::ranged` omits repair when the same predicate is proved false over the supplied ranges.
