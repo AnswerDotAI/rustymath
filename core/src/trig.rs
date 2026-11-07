@@ -6,7 +6,9 @@ use std::f64::consts::FRAC_1_PI;
 pub(crate) enum Kind { Sin, Cos, Tan }
 
 impl Kind {
+    #[inline]
     fn scale(self) -> f64 { if self == Self::Tan { 2.0 * FRAC_1_PI } else { FRAC_1_PI } }
+    #[inline]
     fn offset(self) -> f64 { if self == Self::Cos { 0.5 } else { 0.0 } }
     #[inline]
     pub(crate) fn predicate<F: Float, O: Ops<F> + ?Sized>(self, o: &O, x: O::V) -> O::B {
