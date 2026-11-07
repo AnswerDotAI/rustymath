@@ -1,6 +1,6 @@
 //! Complex slice bodies split into real passes. Rare inputs use the same object's scalar body; the map owner checks only the final complex result.
 use super::*;
-use crate::{Asinh, Atan2, Cos, Cosh, Exp, FUSED, Hypot, Ln, Log1p, Sin, Sinh, buffer::Cast, facts::Formula, recipe::NativeOps, slice::{self, Arg}};
+use crate::{Asinh, Atan2, Cosh, Exp, FUSED, Hypot, Ln, Log1p, Sinh, buffer::Cast, facts::Formula, recipe::NativeOps, slice::{self, Arg}};
 use std::mem::MaybeUninit;
 
 mod trig;
@@ -12,8 +12,30 @@ fn real<K: Formula<N>, R: Native + Cast, const N: usize>(k: K, args: [&[R]; N], 
 }
 
 fn sin_cos<R: Native + Cast>(y: &[R], sin: &mut Vec<R>, cos: &mut Vec<R>) {
-    real(Sin, [y], sin);
-    real(Cos, [y], cos);
+    #[cfg(not(target_os = "macos"))]
+    {
+        use crate::{Cos, Sin};
+        real(Sin, [y], sin);
+        real(Cos, [y], cos);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        #[link(name = "Accelerate", kind = "framework")]
+        unsafe extern "C" {
+            fn vvsincos(sin: *mut f64, cos: *mut f64, y: *const f64, n: *const i32);
+            fn vvsincosf(sin: *mut f32, cos: *mut f32, y: *const f32, n: *const i32);
+        }
+        let n = i32::try_from(y.len()).expect("vForce takes at most `i32::MAX` items");
+        // SAFETY: Native is sealed to f32/f64, WIDE selects that type, and appended provides disjoint slots for every result.
+        unsafe {
+            slice::appended(sin, y.len(), |sin| {
+                slice::appended(cos, y.len(), |cos| {
+                    if R::WIDE { vvsincos(sin.as_mut_ptr().cast(), cos.as_mut_ptr().cast(), y.as_ptr().cast(), &n); }
+                    else { vvsincosf(sin.as_mut_ptr().cast(), cos.as_mut_ptr().cast(), y.as_ptr().cast(), &n); }
+                })
+            });
+        }
+    }
 }
 
 fn split<K: Formula<N>, R: Native + Cast, const N: usize>(
@@ -129,4 +151,3 @@ pub(crate) fn pow<K: Formula<2>, R: Native + Cast>(
         unit | zero | real | (scaled(z).1 != R::zero()) | !finite(r)
     });
 }
-

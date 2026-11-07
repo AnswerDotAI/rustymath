@@ -7,4 +7,3 @@ pub use rustymath_kernels::operation;
 pub mod array;
 pub mod create;
 pub mod linalg;
-

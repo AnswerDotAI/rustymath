@@ -132,8 +132,7 @@ pub(crate) fn integer_compare(op: Cmp, x: u64, y: u64) -> bool {
 #[inline(always)]
 fn shifted(x: u64, count: i64) -> u64 { if count >= 64 { 0 } else if count >= 0 { x << count } else { ((x as i64) >> count.unsigned_abs().min(63)) as u64 } }
 
-/// The named methods of `Ops`, each the operation of its id.
-/// Inline metadata keeps each constant operation id visible across crate boundaries, so native item loops can specialize and vectorize.
+/// The named methods of `Ops`, each the operation of its id. Inline metadata keeps each constant operation id visible across crate boundaries, so native item loops can specialize and vectorize.
 macro_rules! named {
     (unary: $($u:ident $uid:ident),+; binary: $($b:ident $bid:ident),+; compare: $($c:ident $cid:ident),+) => {
         $( #[inline] fn $u(&self, x: Self::V) -> Self::V { self.unary(Unary::$uid, x) } )+

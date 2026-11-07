@@ -24,8 +24,7 @@ pub(super) fn map_complex<K, F, const N: usize>(
 /// A formula's complex results from real arguments (`Formula::real_complex`). An item that it declines takes `Formula::complex` on its arguments as complex numbers.
 pub(super) fn map_real_complex<K, F, const N: usize>(
     object: &K, variant: crate::domain::Variant, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, ops: &NativeOps<{ FUSED }>,
-    output: &mut Buffer) -> Result<(), Error> where K: crate::facts::Formula<N>, F: crate::Native + crate::buffer::Cast, num_complex::Complex<F>: Element
-{
+    output: &mut Buffer) -> Result<(), Error> where K: crate::facts::Formula<N>, F: crate::Native + crate::buffer::Cast, num_complex::Complex<F>: Element {
     map_blocks::<F, num_complex::Complex<F>, N>(inputs, range, variant.checked, output, &|args, n, out| {
         let nan = num_complex::Complex::new(F::nan(), F::nan());
         if !crate::slice::mapped(&args, n, out, #[inline(always)] |x| object.real_complex(ops, x).map_or((nan, false), |z| (z, true))) {
@@ -37,4 +36,3 @@ pub(super) fn map_real_complex<K, F, const N: usize>(
         Ok(())
     })
 }
-

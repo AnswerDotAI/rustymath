@@ -761,20 +761,22 @@ pub fn wholes<F: Float>(t: impl Tolerant, x: &[F], limit: f64) -> Option<(Vec<i6
     const WHOLES: usize = 256;
     let (limit, mut keys, mut exact) = (F::narrow(limit), Vec::with_capacity(x.len()), true);
     for block in x.chunks(WHOLES) {
-        let (fits, whole) = unsafe { crate::slice::appended(&mut keys, block.len(), |slots| {
-            // For an integral `n` below 2^51 in magnitude, the bits of `n + 1.5·2^52` minus the bits of `1.5·2^52` equal `n`. On AVX2 this conversion vectorizes and `as i64` doesn't. A block with a larger item converts each item by `as i64`.
-            const MAGIC: f64 = 6_755_399_441_055_744.0;
-            let (mut fits, mut whole, mut small) = (true, true, true);
-            for (slot, &y) in slots.iter_mut().zip(block) {
-                let n = nearest(y);
-                fits &= n.abs() < limit;
-                whole &= n == y;
-                small &= n.wide().abs() < 2_251_799_813_685_248.0;
-                slot.write(((n.wide() + MAGIC).to_bits() as i64).wrapping_sub(MAGIC.to_bits() as i64));
-            }
-            if !small { for (slot, &y) in slots.iter_mut().zip(block) { slot.write(nearest(y).wide() as i64); } }
-            (fits, whole)
-        }) };
+        let (fits, whole) = unsafe {
+            crate::slice::appended(&mut keys, block.len(), |slots| {
+                // For an integral `n` below 2^51 in magnitude, the bits of `n + 1.5·2^52` minus the bits of `1.5·2^52` equal `n`. On AVX2 this conversion vectorizes and `as i64` doesn't. A block with a larger item converts each item by `as i64`.
+                const MAGIC: f64 = 6_755_399_441_055_744.0;
+                let (mut fits, mut whole, mut small) = (true, true, true);
+                for (slot, &y) in slots.iter_mut().zip(block) {
+                    let n = nearest(y);
+                    fits &= n.abs() < limit;
+                    whole &= n == y;
+                    small &= n.wide().abs() < 2_251_799_813_685_248.0;
+                    slot.write(((n.wide() + MAGIC).to_bits() as i64).wrapping_sub(MAGIC.to_bits() as i64));
+                }
+                if !small { for (slot, &y) in slots.iter_mut().zip(block) { slot.write(nearest(y).wide() as i64); } }
+                (fits, whole)
+            })
+        };
         if !fits || !whole && !block.iter().fold(true, |equal, &y| equal & t.nearest_whole(y).1) { return None; }
         exact &= whole;
     }
@@ -786,4 +788,3 @@ fn scan<F: Float>(t: impl Tolerant, x: &[F], v: F) -> usize {
     let found = match t.range(v) { Some((lo, hi)) => search::first(x, |h| (lo <= h) & (h <= hi)), None => search::first(x, |h: F| h.is_nan()) };
     found.unwrap_or(x.len())
 }
-

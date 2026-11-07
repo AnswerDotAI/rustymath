@@ -65,9 +65,7 @@ pub trait Formula<const N: usize>: Clone + Send + Sync + 'static {
     /// Whether kernels of this formula only map. Modified writes, folds, scans and walks of adjacent items build no code for it: each refuses it at compile time, as it refuses a formula of another arity. A derivative's slope (`derivative::Slope`) only maps.
     const MAP_ONLY: bool = false;
     fn result_dtype(&self, input: DType) -> DType { if Self::BOOLEAN { DType::Boolean } else { input } }
-    fn computing_dtype(&self, input: DType) -> Option<DType> {
-        input.computes_in(crate::buffer::Width::I64, input.numpy_float(), |d| self.supports(d))
-    }
+    fn computing_dtype(&self, input: DType) -> Option<DType> { input.computes_in(crate::buffer::Width::I64, input.numpy_float(), |d| self.supports(d)) }
     fn character_rule(&self) -> Option<crate::characters::Rule> { None }
     fn ordered_kinds(&self, [x, y]: [i32; 2]) -> Option<i32> {
         let ops = crate::recipe::IntegerOps::<i32>::new(Variant::checked(DType::Integer(crate::buffer::Width::I32)));
@@ -103,6 +101,7 @@ pub trait Formula<const N: usize>: Clone + Send + Sync + 'static {
     fn emit_valid<F: crate::Float, O: Ops<F> + ?Sized>(&self, _variant: Variant, o: &O, x: [O::V; N], result: O::V) -> Option<(crate::error::Kind, O::B)> {
         Self::FAILS_NAN.then(|| (crate::error::Kind::Domain, nan_valid(o, x, [result])))
     }
+    #[inline]
     fn real<F: crate::float::Native>(&self, ops: &crate::recipe::NativeOps<{ crate::FUSED }>, x: [F; N]) -> Option<F> {
         if const { Self::BOOLEAN } { self.emit_test(ops, x).map(|x| if x { F::one() } else { F::zero() }) } else { self.emit(ops, x) }
     }
@@ -235,6 +234,19 @@ impl NativeSlices<Residue, 2> {
     }
 }
 
+impl NativeSlices<crate::Logb, 2> {
+    fn logarithm() -> Self {
+        Self { single: Some(|_, o, x, n, out| logarithm_slice::<f32, false>(o, x, n, out)),
+            double: Some(|_, o, x, n, out| logarithm_slice::<f64, false>(o, x, n, out)), ..Self::NONE }
+    }
+}
+impl NativeSlices<crate::MathishLogb, 2> {
+    fn mathish_logarithm() -> Self {
+        Self { single: Some(|_, o, x, n, out| logarithm_slice::<f32, true>(o, x, n, out)),
+            double: Some(|_, o, x, n, out| logarithm_slice::<f64, true>(o, x, n, out)), ..Self::NONE }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Repair { pub single: extern "C" fn(f32) -> f32, pub double: extern "C" fn(f64) -> f64 }
 
@@ -250,6 +262,14 @@ fn logarithm_valid<F: Float, O: Ops<F> + ?Sized>(o: &O, x: [O::V; 2], result: O:
     let zero = o.number(F::zero());
     let nonnegative = o.and(o.less_equal(zero, x[0]), o.less_equal(zero, x[1]));
     Some((crate::error::Kind::Domain, o.or(nonnegative, nan_valid(o, x, [result]))))
+}
+
+fn logarithm_slice<F: Native, const MATHISH: bool>(ops: &NativeOps<{ FUSED }>, args: [Arg<'_, F>; 2], n: usize, out: &mut [std::mem::MaybeUninit<F>]) -> bool {
+    crate::ln::logb_many::<F, MATHISH>(args, n, out) || {
+        // SAFETY: logb_many initializes every output, even when it reports a NaN result.
+        let results = unsafe { crate::slice::written(&mut out[..n]) };
+        crate::slice::judged(&args, results, |x, r| logarithm_valid(ops, x, r).unwrap().1)
+    }
 }
 
 impl Repair {
@@ -583,8 +603,8 @@ objects!(2:
     crate::RealPow { range [x, _] => signs([x]); identity [None, Some(1.0)]; output real; formula |_, o, [x, y]| Some(crate::pow::real_formula(o, x, y)); shared real_power; native_complex |_, _, [x, y]| Some(crate::complex::pow::<F, { crate::FUSED }>(x, y)); }
     // The yth root of x, x^(1/y).
     crate::Root { range [_, y] => signs([y]); domain _, [n, y] => root_domain(n, y); formula |_, o, [n, y]| crate::pow::root_formula(o, n, y); slopes |o, x, y, r| [o.negate(o.divide(o.multiply(r, o.ln(y)), o.multiply(x, x))), o.divide(r, o.multiply(x, y))]; native_complex |_, _, [n, y]| Some(crate::complex::nth_root::<F, { crate::FUSED }>(n, y)); native_real |_, _, [n, y]| Some(crate::pow::root::<F, { crate::FUSED }>(n, y)); slices root; exact |_, [n, y]| { if num_traits::Zero::is_zero(n) { return Err(crate::error::Error::new(crate::error::Kind::Domain, "root degree is zero")); } crate::exact::power(y, &n.recip()) }; checks nan; }
-    crate::Logb { domain _, [x, y] => inside([x, y], [Range::NONNEGATIVE; 2]); shared logb; native_complex |_, _, [b, x]| Some(crate::complex::divide(crate::complex::ln::<F, { crate::FUSED }>(x), crate::complex::ln::<F, { crate::FUSED }>(b))); native_real |_, _, [b, x]| Some(crate::ln::logb::<F, { crate::FUSED }>(b, x)); valid |_, _, o, x, r| logarithm_valid(o, x, r); }
-    crate::MathishLogb { domain _, [x, y] => inside([x, y], [Range::NONNEGATIVE; 2]); shared logb; native_complex |_, _, [b, x]| { let one = num_complex::Complex::new(F::one(), F::zero()); Some(if b == one && x == one { num_complex::Complex::new(F::zero(), F::zero()) } else { crate::complex::divide(crate::complex::ln::<F, { crate::FUSED }>(x), crate::complex::ln::<F, { crate::FUSED }>(b)) }) }; native_real |_, _, [b, x]| { let r = crate::ln::logb::<F, { crate::FUSED }>(b, x); Some(if (b == F::one()) & (x == F::one()) { F::zero() } else { r }) }; valid |_, _, o, x, r| logarithm_valid(o, x, r); }
+    crate::Logb { domain _, [x, y] => inside([x, y], [Range::NONNEGATIVE; 2]); shared logb; native_complex |_, _, [b, x]| Some(crate::complex::divide(crate::complex::ln::<F, { crate::FUSED }>(x), crate::complex::ln::<F, { crate::FUSED }>(b))); native_real |_, _, [b, x]| Some(crate::ln::logb::<F, { crate::FUSED }>(b, x)); slices logarithm; valid |_, _, o, x, r| logarithm_valid(o, x, r); }
+    crate::MathishLogb { domain _, [x, y] => inside([x, y], [Range::NONNEGATIVE; 2]); shared logb; native_complex |_, _, [b, x]| { let one = num_complex::Complex::new(F::one(), F::zero()); Some(if b == one && x == one { num_complex::Complex::new(F::zero(), F::zero()) } else { crate::complex::divide(crate::complex::ln::<F, { crate::FUSED }>(x), crate::complex::ln::<F, { crate::FUSED }>(b)) }) }; native_real |_, _, [b, x]| Some(crate::ln::logb_mode::<F, true>(b, x)); slices mathish_logarithm; valid |_, _, o, x, r| logarithm_valid(o, x, r); }
     // `y` modulo `x`. Its slope in `x` is minus the quotient's floor, (y - r) ÷ x from the result, and 0 where `x` is 0, where the residue is `y` itself. Integers take a positive power of two that every item shares as a mask (`masked`). Integer kernels run its slice forms (`integer.rs`). Where a whole block shares one divisor, those take a mask or a reciprocal in place of a division.
     crate::tolerant::Residue {
         identity [Some(0.0), None];
@@ -748,6 +768,7 @@ fn against<K: crate::tolerant::Banding, F: crate::Float, O: crate::recipe::Ops<F
 }
 
 /// Comparison `k`'s truth value through `o`, as its kernel computes it: against a number that exactly one argument holds (`Ops::constant`) through `against`, and otherwise step by step (`tolerant::Stepped`). Native ops hold every item as a number, so each item compares step by step rather than building the range of floats equal to the other.
+#[inline]
 fn tested<K, F, O>(k: K, t: crate::tolerant::Tolerance, o: &O, x: O::V, y: O::V) -> O::B where K: crate::tolerant::Stepped + crate::tolerant::Banding + Copy,
     F: crate::Float, O: crate::recipe::Ops<F> + ?Sized {
     let side = match (o.constant(x), o.constant(y)) {
@@ -812,8 +833,11 @@ impl<K: Formula<2>> Formula<2> for Flipped<K> {
     fn supports(&self, dtype: DType) -> bool { self.0.supports(dtype) }
     const BOOLEAN: bool = K::BOOLEAN;
     const FAILS_NAN: bool = K::FAILS_NAN;
+    #[inline]
     fn integer<I: crate::recipe::Overflowing>(&self, o: &crate::recipe::IntegerOps<I>, [x, y]: [I; 2]) -> Option<I> { self.0.integer(o, [y, x]) }
+    #[inline]
     fn real<F: crate::float::Native>(&self, o: &crate::recipe::NativeOps<{ crate::FUSED }>, [x, y]: [F; 2]) -> Option<F> { self.0.real(o, [y, x]) }
+    #[inline]
     fn complex<F: crate::float::Native>(
         &self, o: &crate::recipe::NativeOps<{ crate::FUSED }>, [x, y]: [num_complex::Complex<F>; 2]) -> Option<num_complex::Complex<F>> {
         self.0.complex(o, [y, x])

@@ -9,9 +9,11 @@ pub fn trimmed<T: Zero>(c: &[T]) -> &[T] { &c[..c.iter().rposition(|k| !k.is_zer
 /// Appends to `out` the value of the polynomial `c` at each item of `x`, by Horner's rule. An f16 polynomial computes in f32 and rounds each result once.
 pub fn evaluate<F: Float>(c: &[F], x: &[F], out: &mut Vec<F>) {
     let Some((&top, rest)) = trimmed(c).split_last() else { return out.resize(out.len() + x.len(), F::zero()) };
-    unsafe { crate::slice::appended(out, x.len(), |out| {
-        if crate::slice::running(size_of::<F::Working>()) == 16 { blocks::<F, 16>(top, rest, x, out) } else { blocks::<F, 32>(top, rest, x, out) }
-    }) }
+    unsafe {
+        crate::slice::appended(out, x.len(), |out| {
+            if crate::slice::running(size_of::<F::Working>()) == 16 { blocks::<F, 16>(top, rest, x, out) } else { blocks::<F, 32>(top, rest, x, out) }
+        })
+    }
 }
 
 /// `evaluate` through `horner` on blocks of `L` items, as many as `slice::running` gives.
@@ -136,4 +138,3 @@ pub fn fit<F: Float>(x: &[F], y: &[F], degree: usize) -> Vec<F> {
     let y: Vec<f64> = y.iter().map(|y| y.wide()).collect();
     crate::linalg::lstsq(&powers, &y, [x.len(), degree + 1], 1).0.into_iter().map(F::narrow).collect()
 }
-

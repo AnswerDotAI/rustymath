@@ -7,6 +7,7 @@ use crate::error::{Error, Kind};
 use crate::gather::Writes;
 use crate::reduce::{Direction, Piece, Pieces, Seed, native_reduction};
 use crate::slice::Arg;
+use crate::{FUSED, Native, facts::Formula, recipe::NativeOps, tolerant::Banded};
 
 /// Numeric settings rebound for each execution, outside item loops. `tolerance` is the run's comparison tolerance: tolerant objects compare within it, and a kernel reads a float argument as a whole number within it (`Projection::Wholes`). BPL sets it nonzero only under Mathish, and Python only in Mathish mode.
 #[derive(Clone, Copy, Debug)]
@@ -48,7 +49,6 @@ impl WriteRoot<'_> {
         }
     }
 }
-
 
 /// One resolved mathematical definition and its captured numerical policies.
 #[derive(Clone)]
@@ -182,10 +182,8 @@ impl<K: crate::facts::Formula<N>, const N: usize> Application for Definition<K, 
 }
 
 impl Kernel {
-    pub fn resolve<K: crate::facts::Formula<N>, const N: usize>(
-        object: K, variant: crate::domain::Variant, types: [DType; N]) -> Result<Self, Error> {
-        Self::try_resolve(object, variant, types)?
-            .ok_or_else(|| Error::new(Kind::Domain, "function has no numerical body for these arguments"))
+    pub fn resolve<K: crate::facts::Formula<N>, const N: usize>(object: K, variant: crate::domain::Variant, types: [DType; N]) -> Result<Self, Error> {
+        Self::try_resolve(object, variant, types)?.ok_or_else(|| Error::new(Kind::Domain, "function has no numerical body for these arguments"))
     }
 
     pub fn circle(code: i64, inverse: bool, real_part: bool, variant: crate::domain::Variant, types: [DType; 1]) -> Result<Option<Self>, Error> {
@@ -554,29 +552,36 @@ fn choose_typed<T: crate::buffer::Cast>(
             {
                 let mut bits = Vec::new();
                 if let Ok(Arg::Many(mask)) = selector.0.part::<bool>(part(selector.0), checked, &mut bits) && mask.len() == range.len() {
-                    return unsafe { slots.fill(range.len(), |out| {
-                        for (((slot, &m), &n), &y) in out.iter_mut().zip(mask.iter()).zip(no.iter()).zip(yes.iter()) {
-                            slot.write(core::hint::select_unpredictable(m, y, n));
-                        }
-                        true
-                    }) };
+                    return unsafe {
+                        slots.fill(range.len(), |out| {
+                            for (((slot, &m), &n), &y) in out.iter_mut().zip(mask.iter()).zip(no.iter()).zip(yes.iter()) {
+                                slot.write(core::hint::select_unpredictable(m, y, n));
+                            }
+                            true
+                        })
+                    };
                 }
             }
             let mut indices = Buffer::with_capacity(selector.1, 0);
             let positions = selector.0.part_view(part(selector.0), selector.1, false, &mut indices)
                 .and_then(|view| crate::structure::positions(view, choices.len(), crate::tolerant::Tolerance::EXACT));
             match positions.and_then(|positions| args.map(|args| (positions, args))) {
-                Ok((positions, args)) => unsafe { slots.fill(range.len(), |out| {
-                    for (i, slot) in out.iter_mut().enumerate() {
-                        let position = positions[if positions.len() == 1 { 0 } else { i }];
-                        let value = match args.get(position) {
-                            Some(Arg::One(value)) => *value, Some(Arg::Many(values)) => values[if values.len() == 1 { 0 } else { i }], None => T::FILL
-                        };
-                        slot.write(value);
-                    }
-                    true
-                }) },
-                Err(error) => { crate::error::record(error); unsafe { slots.fill(range.len(), |out| { for slot in out { slot.write(T::FILL); } false }) } }
+                Ok((positions, args)) => unsafe {
+                    slots.fill(range.len(), |out| {
+                        for (i, slot) in out.iter_mut().enumerate() {
+                            let position = positions[if positions.len() == 1 { 0 } else { i }];
+                            let value = match args.get(position) {
+                                Some(Arg::One(value)) => *value, Some(Arg::Many(values)) => values[if values.len() == 1 { 0 } else { i }], None => T::FILL
+                            };
+                            slot.write(value);
+                        }
+                        true
+                    })
+                },
+                Err(error) => {
+                    crate::error::record(error);
+                    unsafe { slots.fill(range.len(), |out| { for slot in out { slot.write(T::FILL); } false }) }
+                }
             }
         });
         Ok(())
@@ -641,7 +646,7 @@ fn with_projected<R>(
 }
 
 macro_rules! with_binary_body {
-    ($object:expr, $variant:expr, $settings:expr, |$T:ident, $apply:ident| $body:expr) => {{
+    ($object:expr, $variant:expr, $settings:expr, |$T:ident, $apply:ident, $compare:ident| $body:expr) => {{
         let (object, variant, settings) = ($object, $variant, $settings);
         let ops = settings.ops();
         match variant.dtype {
@@ -650,26 +655,47 @@ macro_rules! with_binary_body {
                 with_width!(width, $T => {
                     let ops = crate::recipe::IntegerOps::<$T>::new(variant);
                     let $apply = { #[inline(always)] |x: $T, y: $T| integer_value(object, variant, &ops, std::array::from_fn(|i| if i == 0 { x } else { y })) };
+                    let $compare = |_: $T, _: &[$T], _: bool, _: &mut Vec<bool>| None;
                     $body
                 })
             },
             DType::Float(FloatWidth::F16 | FloatWidth::F32) => {
                 type $T = f32;
                 let $apply = { #[inline(always)] move |x: $T, y: $T| real_value(object, variant, &ops, std::array::from_fn(|i| if i == 0 { x } else { y }), true) };
+                let $compare = comparison_writer(object, &ops);
                 $body
             },
             DType::Float(FloatWidth::F64) => {
                 type $T = f64;
                 let $apply = { #[inline(always)] move |x: $T, y: $T| real_value(object, variant, &ops, std::array::from_fn(|i| if i == 0 { x } else { y }), true) };
+                let $compare = comparison_writer(object, &ops);
                 $body
             },
             DType::Complex(w) => with_complex_width!(w, $T => {
                 let $apply = { #[inline(always)] move |x: $T, y: $T| complex_value(object, variant, &ops, std::array::from_fn(|i| if i == 0 { x } else { y })) };
+                let $compare = |_: $T, _: &[$T], _: bool, _: &mut Vec<bool>| None;
                 $body
             }),
             DType::Character => Err(Error::new(Kind::Domain, "a numerical body needs code-point inputs for characters")),
         }
     }};
+}
+
+/// Compares a block against a constant carry through the same tolerance bands as an elementwise map.
+fn comparison_writer<K: Formula<N>, F: Native + Banded, const N: usize>(
+    object: &K, ops: &NativeOps<{ FUSED }>) -> impl Fn(F, &[F], bool, &mut Vec<bool>) -> Option<bool> + Copy {
+    let bands = object.bands().and_then(|(t, left, right)| Some((crate::facts::run_tolerance::<F, _>(ops, t)?, left, right)));
+    move |carry, items, flipped, out| {
+        let (t, left, right) = bands?;
+        let (x, y) = (Arg::One(carry), Arg::Many(items));
+        let (x, y) = if flipped { (y, x) } else { (x, y) };
+        let (at, n) = (out.len(), items.len());
+        out.reserve(n);
+        let ok = crate::tolerant::against(t, x, y, n, &mut out.spare_capacity_mut()[..n], left, right, F::banded)?;
+        // SAFETY: `against` writes all `n` slots when it returns `Some`.
+        unsafe { out.set_len(at + n) };
+        Some(ok)
+    }
 }
 
 /// The results of `step` for each pair of items of `xs` and `ys`, written to `out`, in one loop that carries each result's validity as a flag with no branch. A block with a failure finds the first again and gives its kind.

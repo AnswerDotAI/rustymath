@@ -199,12 +199,14 @@ pub fn each<R: Send, S: Default>(count: usize, f: impl Fn(usize, &mut S) -> R + 
 
 /// Appends `n` items to `out`, and gives whether every call of `write` said `true`. `write(range, slots)` fills `slots` with the items in `range`, in order. The calls split across threads as [`split`] splits a call, in units of `unit` items. A call that leaves any of its slots unfilled panics, and `out` keeps its length.
 pub fn extended<B: Copy + Send>(out: &mut Vec<B>, n: usize, unit: usize, write: &(dyn Fn(Range<usize>, &mut Slots<'_, B>) -> bool + Sync)) -> bool {
-    unsafe { crate::slice::appended(out, n, |slots| {
-        split(slots, unit, &|start, slots| {
-            let end = start + slots.len();
-            filled(slots, |slots| write(start..end, slots))
+    unsafe {
+        crate::slice::appended(out, n, |slots| {
+            split(slots, unit, &|start, slots| {
+                let end = start + slots.len();
+                filled(slots, |slots| write(start..end, slots))
+            })
         })
-    }) }
+    }
 }
 
 /// `write`'s result for `slots`, which it fills in order through one [`Slots`]. Panics where it leaves any unfilled.
@@ -229,7 +231,12 @@ impl<B> Slots<'_, B> {
     }
     /// Writes `items` after the items already written, on this thread. Panics where they don't fit.
     pub fn copy(&mut self, items: &[B]) where B: Copy {
-        unsafe { self.fill(items.len(), |slots| { for (slot, &item) in slots.iter_mut().zip(items) { slot.write(item); } true }) };
+        unsafe {
+            self.fill(items.len(), |slots| {
+                for (slot, &item) in slots.iter_mut().zip(items) { slot.write(item); }
+                true
+            })
+        };
     }
     /// `write`'s result for the next `n` slots, which it must fill. They then count as written. Panics where they don't fit.
     ///

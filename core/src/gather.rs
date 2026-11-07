@@ -28,61 +28,65 @@ const CYCLE_BLOCK: usize = 32 << 10;
 /// Appends `item(j)` for each `j` below `len`, as many times as its count. `counts` holds one count for all the items, or one for each item. The counts are nonnegative and sum to `total`. An item with a count of at most 4 writes four copies where its run starts. The items after it overwrite the copies beyond its count. A larger count fills its run. With a count for each item, a group of 4 items whose counts are all at most 4 writes its copies after one check for the whole group. With a check and a taken branch for each item, the loop's cost varied by about a third with where its code was placed.
 #[inline]
 pub fn repeat<D: Copy, C: Key>(out: &mut Vec<D>, len: usize, counts: &[C], total: usize, item: impl Fn(usize) -> D) {
-    unsafe { crate::slice::appended(out, total, |d| {
-        let mut k = 0;
-        let each = |d: &mut [MaybeUninit<D>], k: &mut usize, x: D, n: usize| {
-            let x = MaybeUninit::new(x);
-            match d[*k..].first_chunk_mut::<4>() { Some(w) if n <= 4 => *w = [x; 4], _ => d[*k..*k + n].fill(x) }
-            *k += n;
-        };
-        if let [n] = *counts { for j in 0..len { each(d, &mut k, item(j), n.key() as usize) } } else {
-            let count_groups = counts.as_chunks::<4>().0;
-            for (g, &c) in count_groups.iter().enumerate().take(len / 4) {
-                let j = 4 * g;
-                if k + 16 > total || c[0].key().max(c[1].key()).max(c[2].key()).max(c[3].key()) as u64 > 4 {
-                    for i in 0..4 { each(d, &mut k, item(j + i), c[i].key() as usize) }
-                    continue;
+    unsafe {
+        crate::slice::appended(out, total, |d| {
+            let mut k = 0;
+            let each = |d: &mut [MaybeUninit<D>], k: &mut usize, x: D, n: usize| {
+                let x = MaybeUninit::new(x);
+                match d[*k..].first_chunk_mut::<4>() { Some(w) if n <= 4 => *w = [x; 4], _ => d[*k..*k + n].fill(x) }
+                *k += n;
+            };
+            if let [n] = *counts { for j in 0..len { each(d, &mut k, item(j), n.key() as usize) } } else {
+                let count_groups = counts.as_chunks::<4>().0;
+                for (g, &c) in count_groups.iter().enumerate().take(len / 4) {
+                    let j = 4 * g;
+                    if k + 16 > total || c[0].key().max(c[1].key()).max(c[2].key()).max(c[3].key()) as u64 > 4 {
+                        for i in 0..4 { each(d, &mut k, item(j + i), c[i].key() as usize) }
+                        continue;
+                    }
+                    let w = &mut d[k..k + 16];
+                    let mut o = 0;
+                    for i in 0..4 {
+                        *w[o..].first_chunk_mut::<4>().expect("each count in the group is at most 4") = [MaybeUninit::new(item(j + i)); 4];
+                        o += c[i].key() as usize;
+                    }
+                    k += o;
                 }
-                let w = &mut d[k..k + 16];
-                let mut o = 0;
-                for i in 0..4 {
-                    *w[o..].first_chunk_mut::<4>().expect("each count in the group is at most 4") = [MaybeUninit::new(item(j + i)); 4];
-                    o += c[i].key() as usize;
-                }
-                k += o;
+                for j in len / 4 * 4..len { each(d, &mut k, item(j), counts[j].key() as usize) }
             }
-            for j in len / 4 * 4..len { each(d, &mut k, item(j), counts[j].key() as usize) }
-        }
-        assert_eq!(k, total, "the counts must sum to `total`");
-    }) }
+            assert_eq!(k, total, "the counts must sum to `total`");
+        })
+    }
 }
 
 /// Appends `position(j)` for each position `j` whose count in `mask` is 1, in order. Every count is 0 or 1, and `total` of them are 1. Long runs cost little: a block of 64 counts that are all 0 is skipped, and one whose counts are all 1 is written in one loop. In a block that mixes both, `selected` computes only the selected items. Each count is read by its low bit, which writes every slot whatever the counts hold.
 #[inline]
 pub fn positions<M: Key, D: Copy>(out: &mut Vec<D>, mask: &[M], total: usize, position: impl Fn(usize) -> D) {
-    unsafe { crate::slice::appended(out, total, |d| {
-        // `k` slots are written.
-        let mut k = 0;
-        for (start, m) in (0..).step_by(64).zip(mask.chunks(64)) {
-            // A block's count is at most 64, which fits in a byte. Byte additions vectorize in the widest lanes.
-            let mut n = 0u8;
-            for x in m { n += x.key() as u8 & 1 }
-            let n = usize::from(n);
-            if n == m.len() { let run = &mut d[k..k + n]; for j in 0..n { run[j].write(position(start + j)); } }
-            else if n > 0 {
-                let (blocks, rest) = m.as_chunks::<8>();
-                let mut at = k;
-                for (b, block) in blocks.iter().enumerate() {
-                    let start = start + 8 * b;
-                    at = selected(d, at, mask_bits(block), |i| position(start + usize::from(i)));
+    unsafe {
+        crate::slice::appended(out, total, |d| {
+            // `k` slots are written.
+            let mut k = 0;
+            for (start, m) in (0..).step_by(64).zip(mask.chunks(64)) {
+                // A block's count is at most 64, which fits in a byte. Byte additions vectorize in the widest lanes.
+                let mut n = 0u8;
+                for x in m { n += x.key() as u8 & 1 }
+                let n = usize::from(n);
+                if n == m.len() { let run = &mut d[k..k + n]; for j in 0..n { run[j].write(position(start + j)); } }
+                else if n > 0 {
+                    let (blocks, rest) = m.as_chunks::<8>();
+                    let mut at = k;
+                    for (b, block) in blocks.iter().enumerate() {
+                        let start = start + 8 * b;
+                        at = selected(d, at, mask_bits(block), |i| position(start + usize::from(i)));
+                    }
+                    let (start, last) = (start + 8 * blocks.len(), mask_bits(rest));
+                    selected(d, at, last, |i| position(start + usize::from(i)));
                 }
-                let (start, last) = (start + 8 * blocks.len(), mask_bits(rest));
-                selected(d, at, last, |i| position(start + usize::from(i)));
+                k += n;
             }
-            k += n;
-        }
-        assert_eq!(k, total, "`total` counts must be 1");
-    }) }
+            assert_eq!(k, total, "`total` counts must be 1");
+        })
+    }
 }
 
 /// For each mask of 8 bits, the positions of its set bits in ascending order, then zeros.
@@ -1235,10 +1239,12 @@ pub trait Convert<S: Copy, D> {
     fn one(&self, x: S) -> D;
     /// Appends the items of `s`, converted, in one contiguous pass.
     fn slice(&self, d: &mut Vec<D>, s: &[S]) {
-        unsafe { crate::slice::appended(d, s.len(), |slots| {
-            let slots = &mut slots[..s.len()];
-            for i in 0..s.len() { slots[i].write(self.one(s[i])); }
-        }) }
+        unsafe {
+            crate::slice::appended(d, s.len(), |slots| {
+                let slots = &mut slots[..s.len()];
+                for i in 0..s.len() { slots[i].write(self.one(s[i])); }
+            })
+        }
     }
     /// The items of `s`, converted, in one contiguous pass.
     fn all(&self, s: &[S]) -> Vec<D> {
@@ -1332,14 +1338,16 @@ pub fn interleave<T: Item>(out: &mut Vec<T>, parts: &[(&[T], usize)], rows: usiz
     assert!(parts.iter().all(|&(items, n)| items.len() == rows * n), "each part holds one lane for every row");
     let width = parts.iter().map(|&(_, n)| n).sum::<usize>();
     let parts: Vec<(&[T::Unit], usize)> = parts.iter().map(|&(items, n)| (units(items), n)).collect();
-    unsafe { crate::slice::appended(out, rows * width, |slots| {
-        // SAFETY: each unit written below is a unit of an item, read through `units`.
-        let slots = written_as::<MaybeUninit<T>, MaybeUninit<T::Unit>>(slots);
-        match *parts {
-            [(a, n), (b, m)] if n == m && (1..=RUN).contains(&n) => runs!(n, L => lane_pairs::<L, T::Unit>(slots, [a, b])),
-            _ => lane_items(slots, &parts, width),
-        }
-    }) }
+    unsafe {
+        crate::slice::appended(out, rows * width, |slots| {
+            // SAFETY: each unit written below is a unit of an item, read through `units`.
+            let slots = written_as::<MaybeUninit<T>, MaybeUninit<T::Unit>>(slots);
+            match *parts {
+                [(a, n), (b, m)] if n == m && (1..=RUN).contains(&n) => runs!(n, L => lane_pairs::<L, T::Unit>(slots, [a, b])),
+                _ => lane_items(slots, &parts, width),
+            }
+        })
+    }
 }
 
 /// [`interleave`]'s rows where two parts' lanes hold `L` units: each lane moves as one block, with both sources in registers.
@@ -1534,19 +1542,21 @@ fn walk_axis<T: Item>(d: &mut Vec<T>, s: &[T], fill: T, base: usize, axis: &Step
         Steps::Stride { start, len, step: 0 } => d.extend(std::iter::repeat_n(s[start], len)),
         Steps::Stride { start, len, step } => {
             checked_run(start, len, step, s.len());
-            unsafe { crate::slice::appended(d, len, |slots| {
-                let item = std::convert::identity(
-                    #[inline(always)]
-                    |i: usize, slot: &mut MaybeUninit<T>| {
-                        // SAFETY: both endpoints were checked; every i is within the run.
-                        slot.write(*s.get_unchecked(start.wrapping_add_signed(step * i as isize)));
-                    },
-                );
-                // Fixed blocks expose independent strided loads to SLP.
-                let (blocks, tail) = slots.as_chunks_mut::<4>();
-                for (i, block) in blocks.iter_mut().enumerate() { for (j, slot) in block.iter_mut().enumerate() { item(i * 4 + j, slot); } }
-                for (j, slot) in tail.iter_mut().enumerate() { item(blocks.len() * 4 + j, slot); }
-            }) };
+            unsafe {
+                crate::slice::appended(d, len, |slots| {
+                    let item = std::convert::identity(
+                        #[inline(always)]
+                        |i: usize, slot: &mut MaybeUninit<T>| {
+                            // SAFETY: both endpoints were checked; every i is within the run.
+                            slot.write(*s.get_unchecked(start.wrapping_add_signed(step * i as isize)));
+                        },
+                    );
+                    // Fixed blocks expose independent strided loads to SLP.
+                    let (blocks, tail) = slots.as_chunks_mut::<4>();
+                    for (i, block) in blocks.iter_mut().enumerate() { for (j, slot) in block.iter_mut().enumerate() { item(i * 4 + j, slot); } }
+                    for (j, slot) in tail.iter_mut().enumerate() { item(blocks.len() * 4 + j, slot); }
+                })
+            };
         }
         Steps::Rotated { shift, len, stride } => {
             walk_axis(d, s, fill, 0, &Steps::Stride { start: shift * stride, len: len - shift, step: stride as isize }, &[]);
@@ -1566,11 +1576,13 @@ fn walk_axis<T: Item>(d: &mut Vec<T>, s: &[T], fill: T, base: usize, axis: &Step
         }
         Steps::Table(ref t) => {
             if !t.take_into(d, s) {
-                unsafe { crate::slice::appended(d, t.len(), |slots| {
-                    t.chunks(|j0, run| {
-                        for (slot, &o) in slots[j0..].iter_mut().zip(run) { slot.write(s.get(o).copied().unwrap_or(fill)); }
+                unsafe {
+                    crate::slice::appended(d, t.len(), |slots| {
+                        t.chunks(|j0, run| {
+                            for (slot, &o) in slots[j0..].iter_mut().zip(run) { slot.write(s.get(o).copied().unwrap_or(fill)); }
+                        })
                     })
-                }) }
+                }
             }
         }
     }
@@ -1611,4 +1623,3 @@ fn checked_run(start: usize, len: usize, step: isize, n: usize) {
     let end = start.checked_add_signed(step.checked_mul((len - 1) as isize).expect("stride fits")).expect("run stays in range");
     assert!(start < n && end < n, "run stays in range");
 }
-

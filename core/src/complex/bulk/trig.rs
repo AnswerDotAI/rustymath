@@ -25,15 +25,17 @@ pub(super) fn moduli<R: Native + Cast>(x: &[R], y: &[R], out: &mut Vec<R>) {
 pub(super) fn sqrt_parts<R: Native + Cast>(x: &[R], y: &[R], re: &mut Vec<R>, im: &mut Vec<R>) {
     let mut h = Vec::new();
     moduli(x, y, &mut h);
-    unsafe { crate::slice::appended(re, x.len(), |re| {
-        crate::slice::appended(im, x.len(), |im| {
-            for ((((&x, &y), &h), re), im) in x.iter().zip(y).zip(&h).zip(re).zip(im) {
-                let (r, i) = root::<R, FUSED>(x, y, h);
-                re.write(r);
-                im.write(i);
-            }
+    unsafe {
+        crate::slice::appended(re, x.len(), |re| {
+            crate::slice::appended(im, x.len(), |im| {
+                for ((((&x, &y), &h), re), im) in x.iter().zip(y).zip(&h).zip(re).zip(im) {
+                    let (r, i) = root::<R, FUSED>(x, y, h);
+                    re.write(r);
+                    im.write(i);
+                }
+            })
         })
-    }) }
+    }
 }
 
 pub(super) fn rough_root<R: Native + Cast>(z: Complex<R>) -> bool {
@@ -160,4 +162,3 @@ pub(super) fn atanh_parts<R: Native + Cast>(x: &[R], y: &[R], re: &mut Vec<R>, i
 pub(super) fn rough_atanh<R: Native + Cast>(z: Complex<R>) -> bool {
     !z.re.is_finite() | !z.im.is_finite() | (z.re.abs().max(z.im.abs()) > atanh_huge::<R>() * R::narrow(0.5))
 }
-

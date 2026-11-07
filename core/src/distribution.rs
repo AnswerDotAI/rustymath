@@ -896,4 +896,3 @@ impl Formulas for Poisson {
         }
     }
 }
-

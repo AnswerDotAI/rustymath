@@ -113,8 +113,8 @@ fn map_blocks<F: crate::buffer::Cast, O: Element, const N: usize>(
     let recorded =
         |result: Result<(), Kind>| result.map_err(|kind| crate::error::record(Error::new(kind, "numerical kernel argument is outside its domain"))).is_ok();
     if let Some((len, rows)) = by_rows::<F>(inputs) {
-        crate::parallel::extended(values, range.len(), crate::CHUNK, &|part, slots| {
-            unsafe { slots.fill(part.len(), |out| recorded(fill_rows(&rows, len, part.start + range.start, out, apply))) }
+        crate::parallel::extended(values, range.len(), crate::CHUNK, &|part, slots| unsafe {
+            slots.fill(part.len(), |out| recorded(fill_rows(&rows, len, part.start + range.start, out, apply)))
         });
         return Ok(());
     }
@@ -129,7 +129,10 @@ fn map_blocks<F: crate::buffer::Cast, O: Element, const N: usize>(
             for ((arg, input), scratch) in args.iter_mut().zip(inputs).zip(scratch.iter_mut()) {
                 match input.part::<F>(run.clone(), checked, scratch) {
                     Ok(read) => *arg = read,
-                    Err(error) => { crate::error::record(error); return unsafe { slots.fill(n, |out| { for slot in out { slot.write(O::FILL); } false }) } & ok; }
+                    Err(error) => {
+                        crate::error::record(error);
+                        return unsafe { slots.fill(n, |out| { for slot in out { slot.write(O::FILL); } false }) } & ok;
+                    }
                 }
             }
             (unsafe { slots.fill(n, |out| recorded(apply(args, n, out))) }) & ok

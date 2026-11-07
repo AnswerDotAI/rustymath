@@ -148,13 +148,13 @@ pub fn index_of<K: Key>(x: &[K], y: &[K]) -> Vec<u32> {
 
 /// Appends `look(n)` to `found` for each needle `n` of `y`, in order. The lookups split across threads in units of `BETWEEN_CHECKS` needles, as `parallel::split` splits a call, so `look` must read only what no lookup changes.
 pub(crate) fn look_up<K: Copy + Sync>(found: &mut Vec<u32>, y: &[K], look: impl Fn(K) -> u32 + Sync) {
-    crate::parallel::extended(found, y.len(), crate::BETWEEN_CHECKS, &|r, slots| {
-        unsafe { slots.fill(r.len(), |slots| {
+    crate::parallel::extended(found, y.len(), crate::BETWEEN_CHECKS, &|r, slots| unsafe {
+        slots.fill(r.len(), |slots| {
             let needles = &y[r];
             let slots = &mut slots[..needles.len()];
             for i in 0..needles.len() { slots[i].write(look(needles[i])); }
             true
-        }) }
+        })
     });
 }
 
@@ -710,7 +710,12 @@ fn two_groups<T: Copy + Sync>(items: &[T], group: impl Fn(T) -> usize + Sync, ap
         vec![d0, d1]
     } else {
         let mut d = Vec::new();
-        unsafe { crate::slice::appended(&mut d, groups.len(), |d| { let (a, b) = d.split_at_mut(zeros); split2(&groups, a, b) }) };
+        unsafe {
+            crate::slice::appended(&mut d, groups.len(), |d| {
+                let (a, b) = d.split_at_mut(zeros);
+                split2(&groups, a, b)
+            })
+        };
         vec![d]
     };
     Groups { sizes: vec![zeros, ones], buffers }
@@ -1524,21 +1529,23 @@ pub fn view_argextremes(x: View<'_>, [outer, len, inner]: [usize; 3], down: bool
     fn extremes<T: Copy + Sync, K: Ord>(x: &[T], [outer, len, inner]: [usize; 3], down: bool, key: impl Fn(T) -> K + Sync) -> Vec<i64> {
         let mut out = Vec::with_capacity(outer * inner);
         crate::parallel::extended(&mut out, outer * inner, (crate::CHUNK / len.max(1)).max(1), &|range, slots| {
-            unsafe { slots.fill(range.len(), |slots| {
-                for (lane, slot) in range.zip(slots) {
-                    let start = lane / inner * len * inner + lane % inner;
-                    let (mut best, mut at) = (key(x[start]), 0);
-                    for j in 1..len {
-                        let k = key(x[start + j * inner]);
-                        if if down { k > best } else { k < best } {
-                            best = k;
-                            at = j;
+            unsafe {
+                slots.fill(range.len(), |slots| {
+                    for (lane, slot) in range.zip(slots) {
+                        let start = lane / inner * len * inner + lane % inner;
+                        let (mut best, mut at) = (key(x[start]), 0);
+                        for j in 1..len {
+                            let k = key(x[start + j * inner]);
+                            if if down { k > best } else { k < best } {
+                                best = k;
+                                at = j;
+                            }
                         }
+                        slot.write(at as i64);
                     }
-                    slot.write(at as i64);
-                }
-                true
-            }) };
+                    true
+                })
+            };
             true
         });
         out

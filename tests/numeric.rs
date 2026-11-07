@@ -436,8 +436,8 @@ mod integer {
         let (n, m) = (1_000_000_000_000_000i64, 1_000_000_000_000_001i64);
         let (v, ints) = (Variant::checked(i64::DTYPE), [i64::DTYPE; 2]);
         let compare = [
-            Kernel::resolve(Equal(t), v, ints), Kernel::resolve(NotEqual(t), v, ints), Kernel::resolve(LessEqual(t), v, ints), Kernel::resolve(GreaterEqual(t), v, ints),
-            Kernel::resolve(Greater(t), v, ints),
+            Kernel::resolve(Equal(t), v, ints), Kernel::resolve(NotEqual(t), v, ints), Kernel::resolve(LessEqual(t), v, ints),
+            Kernel::resolve(GreaterEqual(t), v, ints), Kernel::resolve(Greater(t), v, ints),
         ];
         let got = compare.map(|k| mapped(&k.unwrap(), [&[m][..], &[n][..]], 1).map(|r: Vec<bool>| r[0]));
         assert_eq!(got, [false, true, false, true, true].map(Some));
@@ -542,7 +542,8 @@ mod number_theory {
 mod operation {
     use rustymath::{
         agreement::{Agreement, Binding, Mapping, Missing, Read, ReadPlan}, array::{Array, ArrayView}, buffer::{Buffer, DType, Element, Width},
-        domain::{Range, Variant}, error::{self, Error, ErrorSlot}, facts::Formula, gather::Steps, layout::Layout, operation::{Kernel, Settings}, reduce::{Direction, Seed}
+        domain::{Range, Variant}, error::{self, Error, ErrorSlot}, facts::Formula, gather::Steps, layout::Layout, operation::{Kernel, Settings},
+        reduce::{Direction, Seed}
     };
 
     fn view<'a>(layout: &'a Layout, data: rustymath::buffer::View<'a>, mapping: &Mapping) -> ArrayView<'a> {
@@ -593,6 +594,14 @@ mod operation {
         let mut out = Buffer::with_capacity(small, 3);
         subtract.scan([1, 3, 1], Seed::Identity, Direction::Left, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, read, &mut out).unwrap();
         assert_eq!(i16::vec(out).unwrap(), [10, 8, 5]);
+        let (matrix, row) = (Layout::from([3, 2]), Layout::from([2]));
+        let values = ArrayView::compact(&matrix, i16::view(&[1, 2, 3, 4, 5, 6]));
+        let starts = ArrayView::compact(&row, i16::view(&[100, 200]));
+        for (seed, expected) in [(Seed::Identity, [1, 2, -2, -2, -7, -8]), (Seed::Initial(starts.read()), [99, 198, 96, 194, 91, 188])] {
+            let mut out = Buffer::with_capacity(small, 6);
+            subtract.scan([1, 3, 2], seed, Direction::Left, Settings { tolerance: Tolerance::EXACT }, values.read(), &mut out).unwrap();
+            assert_eq!(i16::vec(out).unwrap(), expected);
+        }
         let seed = [Binding::full(i64::view(&[100]))];
         let scalar = ReadPlan::input(0, 1);
         let seed = Read { sources: &seed, plan: &scalar };
@@ -687,7 +696,7 @@ mod operation {
 
     #[test]
     fn folds_keep_uncalled_values_and_scans_keep_their_carry() {
-        use rustymath::{Add, tolerant::{Less, Tolerance}};
+        use rustymath::{Add, Binary, tolerant::{Less, Tolerance}};
         let dtype = DType::Integer(Width::I64);
         let less = Kernel::resolve(Less(Tolerance::EXACT), Variant::checked(dtype), [dtype; 2]).unwrap();
         let input = [Binding::full(i64::view(&[3, 2, 1]))];
@@ -709,26 +718,36 @@ mod operation {
         less.scan([1, 3, 1], Seed::Identity, Direction::Left, Settings { tolerance: rustymath::tolerant::Tolerance::EXACT }, read, &mut out).unwrap();
         assert_eq!(i64::vec(out).unwrap(), [3, 0, 1]);
         // Packed comparisons keep raw seeds and numeric heads across word and read-chunk boundaries.
-        for len in [63, 64, 65, 5000] {
-            let data: Vec<i64> = (0..len).map(|i| (i % 5) as i64 - 2).collect();
-            let input = [Binding::full(i64::view(&data))];
-            let plan = ReadPlan::input(0, len);
-            for initial in [None, Some(7)] {
-                for direction in [Direction::Left, Direction::Right] {
-                    let mut ordered = data.clone();
-                    if direction == Direction::Right { ordered.reverse(); }
-                    let (mut carry, mut expected) = (initial, Vec::new());
-                    for x in ordered {
-                        let value = carry.map_or(x, |c| i64::from(if direction == Direction::Left { c < x } else { x < c }));
-                        expected.push(value);
-                        carry = Some(value);
+        for (dtype, tolerance) in [i64::DTYPE, f32::DTYPE, f64::DTYPE].into_iter().flat_map(|dtype| [Tolerance::EXACT, Tolerance::DEFAULT].map(|t| (dtype, t)))
+        {
+            let less = Kernel::resolve(Less(tolerance), Variant::checked(dtype), [dtype; 2]).unwrap();
+            let raw = Buffer::cast_results(i64::view(&[7]), dtype, true).unwrap();
+            let seed = [Binding::full(raw.view())];
+            for len in [0, 1, 63, 64, 65, 5000] {
+                let data: Vec<f64> = (0..len).map(|i| [-2., -1e-20, 0., 1., 1. + 1e-15, 1. + 1e-13, 2.][i % 7]).collect();
+                let typed = Buffer::cast_results(f64::view(&data), dtype, true).unwrap();
+                let data = f64::vec(Buffer::cast_results(typed.view(), f64::DTYPE, true).unwrap()).unwrap();
+                let input = [Binding::full(typed.view())];
+                let plan = ReadPlan::input(0, len);
+                for initial in [None, Some(7.)] {
+                    for direction in [Direction::Left, Direction::Right] {
+                        let mut ordered = data.clone();
+                        if direction == Direction::Right { ordered.reverse(); }
+                        let (mut carry, mut expected) = (initial, Vec::new());
+                        for x in ordered {
+                            let value = carry.map_or(x, |c| {
+                                u8::from(if direction == Direction::Left { Less(tolerance).one(c, x) } else { Less(tolerance).one(x, c) }) as f64
+                            });
+                            expected.push(value);
+                            carry = Some(value);
+                        }
+                        if direction == Direction::Right { expected.reverse(); }
+                        let seed = if initial.is_some() { Seed::Initial(Read { sources: &seed, plan: &scalar }) } else { Seed::Identity };
+                        let mut out = Buffer::with_capacity(less.scan_dtype(initial.is_some()), len);
+                        less.scan([1, len, 1], seed, direction, Settings { tolerance }, Read { sources: &input, plan: &plan }, &mut out).unwrap();
+                        assert_eq!(out.dtype(), if initial.is_some() { DType::Boolean } else { dtype });
+                        assert_eq!(f64::vec(Buffer::cast_results(out.view(), f64::DTYPE, true).unwrap()).unwrap(), expected);
                     }
-                    if direction == Direction::Right { expected.reverse(); }
-                    let seed = if initial.is_some() { Seed::Initial(Read { sources: &seed, plan: &scalar }) } else { Seed::Identity };
-                    let mut out = Buffer::with_capacity(less.scan_dtype(initial.is_some()), len);
-                    less.scan([1, len, 1], seed, direction, Settings { tolerance: Tolerance::EXACT }, Read { sources: &input, plan: &plan }, &mut out).unwrap();
-                    assert_eq!(out.dtype(), if initial.is_some() { DType::Boolean } else { dtype });
-                    assert_eq!(i64::vec(Buffer::cast_results(out.view(), dtype, true).unwrap()).unwrap(), expected);
                 }
             }
         }

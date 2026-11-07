@@ -63,4 +63,3 @@ pub(super) fn ordered_fold<T: crate::buffer::Cast>(
     *output = T::buffer(result);
     Ok(())
 }
-

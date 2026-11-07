@@ -15,25 +15,26 @@ pub unsafe fn ordered_scan<T: Copy>(
     data: &[T], [_, len, inner]: [usize; 3], seed: Option<&[T]>, out: &mut Vec<T>, lane: &dyn Fn(Option<T>, &[T], usize, &mut Vec<T>) -> Option<Kind>,
     block: &dyn Fn(&[T], &[T], &mut [std::mem::MaybeUninit<T>]) -> Result<(), Kind>) -> Option<Kind> {
     if inner == 1 { return lane(seed.map(|s| s[0]), data, len, out); }
-    unsafe { appended(out, data.len(), |slots| {
-        let mut failure = None;
-        for (items, outs) in data.chunks(len * inner).zip(slots.chunks_mut(len * inner)) {
-            match seed {
-                Some(s) => failure = failure.or(block(s, &items[..inner], &mut outs[..inner]).err()),
-                None => { for (slot, &x) in outs.iter_mut().zip(&items[..inner]) { slot.write(x); } }
+    unsafe {
+        appended(out, data.len(), |slots| {
+            let mut failure = None;
+            for (items, outs) in data.chunks(len * inner).zip(slots.chunks_mut(len * inner)) {
+                match seed {
+                    Some(s) => failure = failure.or(block(s, &items[..inner], &mut outs[..inner]).err()),
+                    None => { for (slot, &x) in outs.iter_mut().zip(&items[..inner]) { slot.write(x); } }
+                }
+                for r in 1..len {
+                    let (done, next) = outs.split_at_mut(r * inner);
+                    failure = failure.or(block(written(&mut done[(r - 1) * inner..]), &items[r * inner..(r + 1) * inner], &mut next[..inner]).err());
+                }
             }
-            for r in 1..len {
-                let (done, next) = outs.split_at_mut(r * inner);
-                failure = failure.or(block(written(&mut done[(r - 1) * inner..]), &items[r * inner..(r + 1) * inner], &mut next[..inner]).err());
-            }
-        }
-        failure
-    }) }
+            failure
+        })
+    }
 }
 
 /// Appends the running results along each lane of `len` consecutive items in `data` to `out`, and gives whether every one fits: `first` gives each lane's first result, and `step` each later one from the one before. Lanes shorter than [`SHORT_LANE`] run [`LANES`] side by side (`rows_scan`).
-pub fn lanes_scan<T: Copy>(
-    data: &[T], len: usize, out: &mut Vec<T>, first: impl Fn(T) -> (T, bool) + Copy, step: impl Fn(T, T) -> (T, bool) + Copy) -> bool {
+pub fn lanes_scan<T: Copy>(data: &[T], len: usize, out: &mut Vec<T>, first: impl Fn(T) -> (T, bool) + Copy, step: impl Fn(T, T) -> (T, bool) + Copy) -> bool {
     rows_scan(data, [0, len, 1], out, |lane, out| {
         let (total, ok) = first(lane[0]);
         out.push(total);
@@ -49,43 +50,47 @@ fn rows_scan<T: Copy, S: Copy>(
     if data.is_empty() { return true; }
     if inner == 1 && len >= SHORT_LANE { return data.chunks(len).fold(true, |fits, l| lane(l, out) & fits); }
     if inner == 1 {
-        return unsafe { appended(out, data.len(), |slots| {
-            let whole = data.len() / (LANES * len) * (LANES * len);
-            let (groups, rest) = slots.split_at_mut(whole);
-            // SAFETY: `side_by_side` gives each position of the data it runs on, which holds as many items as the slots written here.
-            side_by_side::<LANES, _, _>(&data[..whole], len, |x| first(0, x), step, |at, s| {
-                groups.get_unchecked_mut(at).write(s);
-            }, |_, _| {}) & side_by_side::<1, _, _>(&data[whole..], len, |x| first(0, x), step, |at, s| {
-                rest.get_unchecked_mut(at).write(s);
-            }, |_, _| {})
-        }) };
+        return unsafe {
+            appended(out, data.len(), |slots| {
+                let whole = data.len() / (LANES * len) * (LANES * len);
+                let (groups, rest) = slots.split_at_mut(whole);
+                // SAFETY: `side_by_side` gives each position of the data it runs on, which holds as many items as the slots written here.
+                side_by_side::<LANES, _, _>(&data[..whole], len, |x| first(0, x), step, |at, s| {
+                    groups.get_unchecked_mut(at).write(s);
+                }, |_, _| {}) & side_by_side::<1, _, _>(&data[whole..], len, |x| first(0, x), step, |at, s| {
+                    rest.get_unchecked_mut(at).write(s);
+                }, |_, _| {})
+            })
+        };
     }
     // Each row steps from the row before it, which `out` already holds.
-    unsafe { appended(out, data.len(), |slots| {
-        let mut fits = true;
-        let mut at = 0;
-        while at < data.len() {
-            let (row, outs) = (&data[at..at + inner], &mut slots[at..at + inner]);
-            for k in 0..inner {
-                let (t, f) = first(k, row[k]);
-                outs[k].write(t);
-                fits &= f;
-            }
-            let mut r = at + inner;
-            while r < at + len * inner {
-                let (done, rest) = slots.split_at_mut(r);
-                let (before, row, outs) = (written(&mut done[r - inner..]), &data[r..r + inner], &mut rest[..inner]);
+    unsafe {
+        appended(out, data.len(), |slots| {
+            let mut fits = true;
+            let mut at = 0;
+            while at < data.len() {
+                let (row, outs) = (&data[at..at + inner], &mut slots[at..at + inner]);
                 for k in 0..inner {
-                    let (t, f) = step(before[k], row[k]);
+                    let (t, f) = first(k, row[k]);
                     outs[k].write(t);
                     fits &= f;
                 }
-                r += inner;
+                let mut r = at + inner;
+                while r < at + len * inner {
+                    let (done, rest) = slots.split_at_mut(r);
+                    let (before, row, outs) = (written(&mut done[r - inner..]), &data[r..r + inner], &mut rest[..inner]);
+                    for k in 0..inner {
+                        let (t, f) = step(before[k], row[k]);
+                        outs[k].write(t);
+                        fits &= f;
+                    }
+                    r += inner;
+                }
+                at += len * inner;
             }
-            at += len * inner;
-        }
-        fits
-    }) }
+            fits
+        })
+    }
 }
 
 /// A function of two Booleans, held as its truth table: `Logical(t)` gives `t[r][x]` for the running result `r` and the next item `x`. Its scans run any such function.
@@ -162,11 +167,11 @@ fn pack(block: &[bool; 64]) -> u64 {
 
 /// Writes the 64 bits of `r` to `out` as Booleans, the lowest bit first. Each byte of `r` becomes 8 bytes of 0 or 1, bit `j` in byte `j`, through one multiplication, two masks, an add and a shift that's the same for every byte. LLVM compiles a test of bit `j` in byte `j` to a different shift for each byte, which wasm's SIMD can only emulate.
 #[inline(always)]
-fn unpack(r: u64, out: &mut [std::mem::MaybeUninit<bool>; 64]) {
+fn unpack<S>(r: u64, out: &mut [std::mem::MaybeUninit<S>; 64]) where bool: Source<S> {
     for (k, lanes) in out.as_chunks_mut::<8>().0.iter_mut().enumerate() {
         let bits = (r >> (8 * k) & 0xff).wrapping_mul(0x0101_0101_0101_0101) & 0x8040_2010_0804_0201;
         let bytes = ((bits + 0x7f7f_7f7f_7f7f_7f7f) >> 7 & 0x0101_0101_0101_0101).to_le_bytes();
-        *lanes = std::array::from_fn(|j| std::mem::MaybeUninit::new(bytes[j] != 0));
+        *lanes = std::array::from_fn(|j| std::mem::MaybeUninit::new(Source::<S>::read(bytes[j] != 0)));
     }
 }
 
@@ -195,56 +200,68 @@ fn packed(x: &[bool], start: usize) -> u64 {
 
 /// Appends the running results of `n` items to `out`, from the running result `carry` before the first. `maps(start)` gives the maps of the 64 items from `start` as two words of bits `(s, t)`: item `start + k` maps `r` to `(s ∧ r) ≠ t` for bit `k` of each. Bits past the last item are ignored.
 #[inline(always)]
-fn mapped(n: usize, mut carry: bool, maps: impl Fn(usize) -> (u64, u64), out: &mut Vec<bool>) {
-    unsafe { appended(out, n, |slots| {
-        let (outs, last) = slots.as_chunks_mut::<64>();
-        for (i, o) in outs.iter_mut().enumerate() {
-            let (s, t) = maps(64 * i);
-            let r = composed(s, t, carry);
-            unpack(r, o);
-            carry = r >> 63 != 0;
-        }
-        if !last.is_empty() {
-            let (s, t) = maps(n - last.len());
-            let r = composed(s, t, carry);
-            for (k, slot) in last.iter_mut().enumerate() { slot.write(r >> k & 1 != 0); }
-        }
-    }) };
+fn mapped<S: Copy>(n: usize, mut carry: bool, maps: impl Fn(usize) -> (u64, u64), out: &mut Vec<S>) where bool: Source<S> {
+    unsafe {
+        appended(out, n, |slots| {
+            let (outs, last) = slots.as_chunks_mut::<64>();
+            for (i, o) in outs.iter_mut().enumerate() {
+                let (s, t) = maps(64 * i);
+                let r = composed(s, t, carry);
+                unpack(r, o);
+                carry = r >> 63 != 0;
+            }
+            if !last.is_empty() {
+                let (s, t) = maps(n - last.len());
+                let r = composed(s, t, carry);
+                for (k, slot) in last.iter_mut().enumerate() { slot.write(Source::<S>::read(r >> k & 1 != 0)); }
+            }
+        })
+    };
 }
 
 /// Appends a Boolean-valued scan of long consecutive lanes, keeping an unseeded lane's first item as it is. Comparisons at carries 0 and 1 make independent two-state maps, whose packed words compose through `mapped`. A failed speculative comparison leaves `out` unchanged and declines, so the ordered runner checks only steps the scan actually takes.
-pub fn comparison_scan<T: Element + PartialEq>(
-    data: &[T], len: usize, start: Option<T>, step: impl Fn(T, T) -> (T, Option<Kind>) + Copy, out: &mut Vec<T>) -> bool where bool: Source<T> {
+pub fn comparison_scan<T: Element + PartialEq, S: Element>(
+    data: &[T], len: usize, start: Option<T>, step: impl Fn(T, T) -> (T, Option<Kind>) + Copy, read: impl Fn(T) -> S + Copy,
+    bulk: impl Fn(T, &[T], &mut Vec<bool>) -> Option<bool> + Copy, out: &mut Vec<S>) -> bool where bool: Source<T> + Source<S> {
     if len < SHORT_LANE { return false; }
     let (zero, one, before) = (false.read(), true.read(), out.len());
-    let (mut low, mut high, mut bits) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut low, mut high) = (Vec::new(), Vec::new());
     for lane in data.chunks(len) {
-        let (first, used) = match start { Some(seed) => (step(seed, lane[0]), 1), None => { out.push(lane[0]); (step(lane[0], lane[1]), 2) } };
+        let (first, used) = match start { Some(seed) => (step(seed, lane[0]), 1), None => { out.push(read(lane[0])); (step(lane[0], lane[1]), 2) } };
         let (first, failed) = first;
         if failed.is_some() { out.truncate(before); return false; }
-        out.push(first);
+        out.push(read(first));
         let rest = &lane[used..];
         low.clear();
         high.clear();
-        bits.clear();
         let transitions = |carry, dest: &mut Vec<bool>| {
-            unsafe { appended(dest, rest.len(), |slots| {
-                let mut valid = true;
-                for (&x, slot) in rest.iter().zip(slots) {
-                    let (value, failed) = step(carry, x);
-                    slot.write(value != zero);
-                    valid &= failed.is_none();
-                }
-                valid
-            }) }
+            if let Some(valid) = bulk(carry, rest, dest) { return valid; }
+            unsafe {
+                appended(dest, rest.len(), |slots| {
+                    let mut valid = true;
+                    for (&x, slot) in rest.iter().zip(slots) {
+                        let (value, failed) = step(carry, x);
+                        slot.write(value != zero);
+                        valid &= failed.is_none();
+                    }
+                    valid
+                })
+            }
         };
         if !(transitions(zero, &mut low) & transitions(one, &mut high)) { out.truncate(before); return false; }
-        mapped(rest.len(), first != zero, |at| {
-            let (l, h) = (packed(&low, at), packed(&high, at));
-            (l ^ h, l)
-        }, &mut bits);
-        out.extend(bits.iter().copied().map(Source::<T>::read));
+        mapped(rest.len(), first != zero, |at| { let (l, h) = (packed(&low, at), packed(&high, at)); (l ^ h, l) }, out);
     }
     true
 }
 
+/// Appends each cell's left difference scan without materializing its negated items. The first item is unchanged without a seed; every later item is subtracted from the running total.
+pub(super) fn negated_cells<T: Element, R: Reduction<T, Total = T>>(
+    items: &[T], dims: [usize; 3], seed: Option<&[T]>, out: &mut Vec<T>, neg: impl Fn(T) -> T + Copy) {
+    let start = |i| seed.map(|s| s[if s.len() == 1 { 0 } else { i }]);
+    let lane = |lane: &[T], out: &mut Vec<T>| {
+        let (total, rest) = match start(0) { Some(s) => (s, lane), None => { out.push(lane[0]); (lane[0], &lane[1..]) } };
+        grouped(rest, Some(total), out, neg, R::step, |x| x, T::DTYPE.is_integral());
+        true
+    };
+    rows_scan(items, dims, out, lane, |i, x| (start(i).map_or(x, |s| R::step(s, neg(x))), true), |t, x| (R::step(t, neg(x)), true));
+}

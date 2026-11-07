@@ -3,4 +3,3 @@
 extern crate rustymath_core;
 pub use rustymath_core::*;
 pub mod operation;
-

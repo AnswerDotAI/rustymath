@@ -1376,7 +1376,9 @@ fn product<T: Copy + Default + Send + Sync, P: Pair<T>, const MR: usize, const N
                 true
             };
             bp.clear();
-            unsafe { slice::appended(&mut bp, nc.div_ceil(NR) * unit, |slots| if threads == 1 { pack_b(0, slots) } else { parallel::split(slots, unit, &pack_b) }) };
+            unsafe {
+                slice::appended(&mut bp, nc.div_ceil(NR) * unit, |slots| if threads == 1 { pack_b(0, slots) } else { parallel::split(slots, unit, &pack_b) })
+            };
             let (a, bp, kernel) = (&a, &bp[..], &kernel);
             let lower = matches!(part, Part::Lower);
             parallel::pieces_of(c, band_rows * ldc, threads, &move |first, band| {
@@ -1433,4 +1435,3 @@ fn micro<T: Copy, P: Pair<T>, const MR: usize, const NR: usize>(a: &[T], b: &[T]
     for (a, b) in a.as_chunks::<MR>().0.iter().zip(b.as_chunks::<NR>().0) { for r in 0..MR { for s in 0..NR { acc[r][s] = P::step(acc[r][s], a[r], b[s]) } } }
     *t = acc;
 }
-

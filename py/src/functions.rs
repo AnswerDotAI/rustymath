@@ -57,9 +57,7 @@ fn axes_of(axis: Option<&Axes>, layout: &Layout) -> PyResult<Vec<usize>> {
 fn computes(function: &str, op: Op, arity: usize, dtype: DType, only: Option<&[DType]>) -> PyResult<DType> {
     match only {
         None => op.computing_dtype(arity, dtype),
-        Some(allowed) => {
-            dtype.computes_in(rustymath::buffer::Width::I64, dtype.numpy_float(), |at| allowed.contains(&at) && op.supports(arity, at))
-        }
+        Some(allowed) => dtype.computes_in(rustymath::buffer::Width::I64, dtype.numpy_float(), |at| allowed.contains(&at) && op.supports(arity, at)),
     }.ok_or_else(|| missing(function, dtype))
 }
 /// The kernel of `op` on arguments of types `types`, or of its partial in argument `side` (`Kernel::slope`), whose last type is then the result's.
@@ -587,8 +585,7 @@ fn _sliding<'py>(py: Python<'py>, function: NativeFunction<'_>, x: &Bound<'py, P
     let dims = [lanes.outer * (lanes.len + 1 - width), width, lanes.inner];
     let mut buffer = Buffer::with_capacity(kernel.fold_dtype(view.dtype(), width, None), layout.count());
     let order = released(py, || {
-        kernel.fold_read(
-            &dims, Some(1), rustymath::reduce::Seed::Identity, rustymath::reduce::Direction::Right, settings(mode), input.read(), &mut buffer)
+        kernel.fold_read(&dims, Some(1), rustymath::reduce::Seed::Identity, rustymath::reduce::Direction::Right, settings(mode), input.read(), &mut buffer)
     }).map_err(py_err)?;
     give_items(py, layout, buffer.ordered(order), false)
 }

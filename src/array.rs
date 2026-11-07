@@ -22,7 +22,8 @@ impl Array {
     pub fn set_names(&mut self, names: Vec<Option<Arc<str>>>) -> Result<(), Error> { self.layout = self.layout.clone().with_names(names)?; Ok(()) }
     pub fn set_keys(&mut self, keys: Vec<Option<Arc<Keys>>>) -> Result<(), Error> { self.layout = self.layout.clone().with_keys(keys)?; Ok(()) }
     pub fn view(&self) -> ArrayView<'_> {
-        ArrayView::new(&self.layout, self.sources.iter().map(|s| Binding::full(s.view())).collect(), self.plan.clone()).expect("an array's plan fits its layout")
+        ArrayView::new(&self.layout, self.sources.iter().map(|s| Binding::full(s.view())).collect(), self.plan.clone())
+            .expect("an array's plan fits its layout")
     }
     pub fn dtype(&self) -> DType { self.sources[0].dtype() }
     pub fn len(&self) -> usize { self.plan.len() }

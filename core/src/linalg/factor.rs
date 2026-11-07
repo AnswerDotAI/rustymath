@@ -518,13 +518,15 @@ pub(super) fn transpose_by_into<T: Copy + num_traits::Zero + Send + Sync>(
     a: &[T], [ls, lt]: [usize; 2], [rows, cols]: [usize; 2], f: impl Fn(T) -> T + Sync, t: &mut Vec<T>) {
     t.clear();
     if rows * cols == 0 { return; }
-    unsafe { appended(t, lt * cols, |slots| {
-        parallel::split(slots, lt, &|start, part| {
-            transpose_into(&a[start / lt..], ls, part, lt, [rows, part.len() / lt], |x| MaybeUninit::new(f(x)));
-            for row in part.chunks_exact_mut(lt) { row[rows..].fill(MaybeUninit::new(T::zero())) }
-            true
+    unsafe {
+        appended(t, lt * cols, |slots| {
+            parallel::split(slots, lt, &|start, part| {
+                transpose_into(&a[start / lt..], ls, part, lt, [rows, part.len() / lt], |x| MaybeUninit::new(f(x)));
+                for row in part.chunks_exact_mut(lt) { row[rows..].fill(MaybeUninit::new(T::zero())) }
+                true
+            })
         })
-    }) };
+    };
 }
 
 /// The transpose of the `m`×`n` matrix `a`.
@@ -1188,4 +1190,3 @@ fn summed<'a, T: Scalar + 'a>(mut parts: impl Iterator<Item = &'a Vec<T>>) -> Ve
     for part in parts { for (s, &v) in sum.iter_mut().zip(part) { *s = *s + v } }
     sum
 }
-

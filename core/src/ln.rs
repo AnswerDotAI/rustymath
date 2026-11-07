@@ -1,6 +1,7 @@
 //! Logarithms. They share SLEEF's reduction from `xlog` and `xlogf`: x = m × 2^e with m from 0.75 to 1.5, and ln m = ln((1+s)/(1-s)) with s = (m-1)/(m+1), from SLEEF's f64 polynomial and minimax ones for narrower results. See `THIRD-PARTY.md`.
+use crate::slice::{Arg, each_usual, none, written};
 use crate::{dd::Double, float::{Native, horner, ln2, sealed::Core, split_positive}};
-use std::f64::consts::{LN_2, LOG2_E, LOG10_E};
+use std::{f64::consts::{LN_2, LOG2_E, LOG10_E}, mem::MaybeUninit};
 
 /// The coefficients of (ln((1+s)/(1-s)) - 2s)/s³ as a polynomial in s², highest degree first, for |s| up to 0.2.
 const POLY_64: [f64; 7] = [
@@ -108,6 +109,42 @@ pub struct Logb;
 /// [`Logb`] with log base one of one defined as zero.
 #[derive(Clone, Copy, Debug)]
 pub struct MathishLogb;
+
+#[inline(always)]
+pub(crate) fn logb_mode<R: Native, const MATHISH: bool>(b: R, x: R) -> R {
+    let y = logb::<_, { crate::FUSED }>(b, x);
+    if MATHISH && b == R::one() && x == R::one() { R::zero() } else { y }
+}
+
+/// Hoists the constant operand's logarithm and retains base 2/10's exact powers.
+pub(crate) fn logb_many<R: Native, const MATHISH: bool>([b, x]: [Arg<'_, R>; 2], n: usize, out: &mut [MaybeUninit<R>]) -> bool {
+    let out = &mut out[..n];
+    match (b, x) {
+        (Arg::One(c), _) => {
+            // Bases 2 and 10 divide by 1, which their loop skips, and take the logarithms' fast form for usual items. Any other base divides by ln b, which can be 0 or NaN, so its loop judges every result.
+            let (to, d) = for_base::<_, { crate::FUSED }>(c);
+            if MATHISH && c == R::one() {
+                each!([b, x], n, out, |[_, x]| if x == R::one() { R::zero() } else { log::<_, { crate::FUSED }>(x, to) / d })
+            } else if d == R::one() {
+                each_usual(
+                    x, n, out, (usual, #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), to),), none(), #[inline(always)]
+                    |x| log::<_, { crate::FUSED }>(x, to))
+            } else { each!([b, x], n, out, |[_, x]| log::<_, { crate::FUSED }>(x, to) / d) }
+        }
+        (Arg::Many(bs), Arg::One(c)) => {
+            // A base of exactly 2 or 10 takes `log2` or `log10` of c. A second pass writes those items, because a select in the main loop stops it vectorizing. At those bases either result is NaN only where c is negative or NaN. The main loop's outcome holds.
+            let l = ln::<_, { crate::FUSED }>(c);
+            let ok = if MATHISH && c == R::one() {
+                each!([b, x], n, out, |[b, _]| if b == R::one() { R::zero() } else { l / ln::<_, { crate::FUSED }>(b) })
+            } else { each!([b, x], n, out, |[b, _]| l / ln::<_, { crate::FUSED }>(b)) };
+            let exact = [log2::<_, { crate::FUSED }>(c), log10::<_, { crate::FUSED }>(c)];
+            // SAFETY: each! writes every output, including when it reports an invalid result.
+            for (r, &b) in unsafe { written(out) }.iter_mut().zip(bs) { *r = by_base(b, [exact[0], exact[1], *r]); }
+            ok
+        }
+        _ => each!([b, x], n, out, |[b, x]| logb_mode::<_, MATHISH>(b, x)),
+    }
+}
 
 /// ln u + c/u, for u = 1 + x split as `(m, e)` and c = x - (u - 1), the part of 1 + x that rounding u lost. It gives none of `log1p`'s special values.
 #[inline(always)]

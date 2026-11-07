@@ -3,8 +3,7 @@ use crate::error::{Error, Kind};
 pub use crate::slice::running;
 use crate::{
     Arg, Float, Native, agreement::{Mapping, Read, Walked, expanded_items}, arith::Overflowing, buffer::{Buffer, Cast, DType, Element, Source, View, Width},
-    float::sealed::{Core, Folds}, gather::Steps, layout::Lanes, linalg::Scalar, parallel,
-    slice::{CHUNK, appended, written}
+    float::sealed::{Core, Folds}, gather::Steps, layout::Lanes, linalg::Scalar, parallel, slice::{CHUNK, appended, written}
 };
 use half::f16;
 use num_complex::Complex;
@@ -235,44 +234,46 @@ const SCAN_BLOCK: usize = 64;
 pub(crate) fn grouped<A: Copy, S: Copy, O>(
     x: &[A], start: Option<S>, out: &mut Vec<O>, from: impl Fn(A) -> S, f: impl Fn(S, S) -> S, to: impl Fn(S) -> O, reorders: bool) {
     let Some((&first, rest)) = x.split_first() else { return };
-    unsafe { appended(out, x.len(), |slots| {
-        let first = from(first);
-        let mut total = start.map_or(first, |s| f(s, first));
-        slots[0].write(to(total));
-        let ((groups, tail), (outs, last)) = (rest.as_chunks::<4>(), slots[1..].as_chunks_mut::<4>());
-        let scanned = |[a, b, c, d]: [A; 4]| {
-            let (a, b, c, d) = (from(a), from(b), from(c), from(d));
-            let ab = f(a, b);
-            [a, ab, f(ab, c), f(ab, f(c, d))]
-        };
-        let (mut sums, mut ends) = ([std::mem::MaybeUninit::<[S; 4]>::uninit(); SCAN_BLOCK], [std::mem::MaybeUninit::<S>::uninit(); SCAN_BLOCK]);
-        // Blocks by index: a loop over `chunks(SCAN_BLOCK)` zipped with `chunks_mut` cost `+\b` 90% more instructions.
-        let mut i0 = 0;
-        while i0 < groups.len() {
-            let n = (groups.len() - i0).min(SCAN_BLOCK);
-            let (groups, outs) = (&groups[i0..i0 + n], &mut outs[i0..i0 + n]);
-            if reorders {
-                for g in 0..n {
-                    let s = scanned(groups[g]);
-                    sums[g].write(s);
-                    ends[g].write(s[3]);
+    unsafe {
+        appended(out, x.len(), |slots| {
+            let first = from(first);
+            let mut total = start.map_or(first, |s| f(s, first));
+            slots[0].write(to(total));
+            let ((groups, tail), (outs, last)) = (rest.as_chunks::<4>(), slots[1..].as_chunks_mut::<4>());
+            let scanned = |[a, b, c, d]: [A; 4]| {
+                let (a, b, c, d) = (from(a), from(b), from(c), from(d));
+                let ab = f(a, b);
+                [a, ab, f(ab, c), f(ab, f(c, d))]
+            };
+            let (mut sums, mut ends) = ([std::mem::MaybeUninit::<[S; 4]>::uninit(); SCAN_BLOCK], [std::mem::MaybeUninit::<S>::uninit(); SCAN_BLOCK]);
+            // Blocks by index: a loop over `chunks(SCAN_BLOCK)` zipped with `chunks_mut` cost `+\b` 90% more instructions.
+            let mut i0 = 0;
+            while i0 < groups.len() {
+                let n = (groups.len() - i0).min(SCAN_BLOCK);
+                let (groups, outs) = (&groups[i0..i0 + n], &mut outs[i0..i0 + n]);
+                if reorders {
+                    for g in 0..n {
+                        let s = scanned(groups[g]);
+                        sums[g].write(s);
+                        ends[g].write(s[3]);
+                    }
                 }
+                for g in 0..n {
+                    // SAFETY: with `reorders`, the first pass wrote entries 0 to `n`.
+                    let sums = if reorders { sums[g].assume_init() } else { scanned(groups[g]) };
+                    // Four writes, not `array::map`, which cost `+\b` 53% more instructions.
+                    for k in 0..4 { outs[g][k].write(to(f(total, sums[k]))); }
+                    // The group's sum from its own buffer, which the compiler can't see is the last of `sums`. Taken from `sums`, the total would wait on the vector the outputs use.
+                    total = f(total, if reorders { ends[g].assume_init() } else { sums[3] });
+                }
+                i0 += n;
             }
-            for g in 0..n {
-                // SAFETY: with `reorders`, the first pass wrote entries 0 to `n`.
-                let sums = if reorders { sums[g].assume_init() } else { scanned(groups[g]) };
-                // Four writes, not `array::map`, which cost `+\b` 53% more instructions.
-                for k in 0..4 { outs[g][k].write(to(f(total, sums[k]))); }
-                // The group's sum from its own buffer, which the compiler can't see is the last of `sums`. Taken from `sums`, the total would wait on the vector the outputs use.
-                total = f(total, if reorders { ends[g].assume_init() } else { sums[3] });
+            for (o, &v) in last.iter_mut().zip(tail) {
+                total = f(total, from(v));
+                o.write(to(total));
             }
-            i0 += n;
-        }
-        for (o, &v) in last.iter_mut().zip(tail) {
-            total = f(total, from(v));
-            o.write(to(total));
-        }
-    }) }
+        })
+    }
 }
 
 /// The position of the first item of `x` that `test` picks, or its length where it picks none. Each block of 64 items is tested with no branch, so the test vectorizes.
@@ -515,36 +516,38 @@ mod lanes {
     /// The running sums of `x` after `start`, 16 items at a time. Each vector of four scans within itself in two shifted additions. Each vector then adds the total of everything before it: the running total, plus the sums of the vectors before it in its block. Only one addition in each block waits for the block before.
     fn sum_scan(x: &[f32], start: Option<f32>, out: &mut Vec<f32>) {
         use quad::*;
-        unsafe { appended(out, x.len(), |slots| {
-            let ((chunks, rest), (outs, tail)) = (x.as_chunks::<16>(), slots.as_chunks_mut::<16>());
-            let (fill, mut c) = (splat(-0.0), splat(start.unwrap_or(-0.0)));
-            for (o, x) in outs.iter_mut().zip(chunks) {
-                let scanned = |k: usize| {
-                    // SAFETY: the load reads four items of one chunk.
-                    let v = unsafe { load(x.as_ptr().add(4 * k)) };
-                    let v = add(v, up1(fill, v));
-                    add(v, up2(fill, v))
-                };
-                let (p0, p1, p2, p3) = (scanned(0), scanned(1), scanned(2), scanned(3));
-                let s0 = last(p0);
-                let s01 = add(s0, last(p1));
-                let s012 = add(s01, last(p2));
-                let o = o.as_mut_ptr().cast::<f32>();
-                // SAFETY: each store writes four slots of one chunk.
-                unsafe {
-                    store(o, add(c, p0));
-                    store(o.add(4), add(add(c, s0), p1));
-                    store(o.add(8), add(add(c, s01), p2));
-                    store(o.add(12), add(add(c, s012), p3));
+        unsafe {
+            appended(out, x.len(), |slots| {
+                let ((chunks, rest), (outs, tail)) = (x.as_chunks::<16>(), slots.as_chunks_mut::<16>());
+                let (fill, mut c) = (splat(-0.0), splat(start.unwrap_or(-0.0)));
+                for (o, x) in outs.iter_mut().zip(chunks) {
+                    let scanned = |k: usize| {
+                        // SAFETY: the load reads four items of one chunk.
+                        let v = unsafe { load(x.as_ptr().add(4 * k)) };
+                        let v = add(v, up1(fill, v));
+                        add(v, up2(fill, v))
+                    };
+                    let (p0, p1, p2, p3) = (scanned(0), scanned(1), scanned(2), scanned(3));
+                    let s0 = last(p0);
+                    let s01 = add(s0, last(p1));
+                    let s012 = add(s01, last(p2));
+                    let o = o.as_mut_ptr().cast::<f32>();
+                    // SAFETY: each store writes four slots of one chunk.
+                    unsafe {
+                        store(o, add(c, p0));
+                        store(o.add(4), add(add(c, s0), p1));
+                        store(o.add(8), add(add(c, s01), p2));
+                        store(o.add(12), add(add(c, s012), p3));
+                    }
+                    c = add(c, add(s012, last(p3)));
                 }
-                c = add(c, add(s012, last(p3)));
-            }
-            let mut total = first(c);
-            for (o, &v) in tail.iter_mut().zip(rest) {
-                total += v;
-                o.write(total);
-            }
-        }) }
+                let mut total = first(c);
+                for (o, &v) in tail.iter_mut().zip(rest) {
+                    total += v;
+                    o.write(total);
+                }
+            })
+        }
     }
     #[cfg(target_arch = "wasm32")]
     lanes! {
@@ -607,31 +610,35 @@ fn wide_sum(x: &[i64]) -> (i64, bool) {
 /// The running sums of `x` from `start` at `i64`, wrapped, and whether every one fits. A sum overflows where its sign differs from both its arguments' signs, as `Overflowing::plus` tests it. The loop gathers those sign bits in one word and tests it once at the end. A bool for each step, as `Overflowing::plus` gives, measured 7% slower.
 #[inline(always)]
 fn signed_cumsum<T: Copy + Into<i64>>(x: &[T], start: i64, out: &mut Vec<i64>) -> bool {
-    unsafe { appended(out, x.len(), |slots| {
-        let (mut total, mut overflow) = (start, 0i64);
-        for (o, &v) in slots.iter_mut().zip(x) {
-            let v: i64 = v.into();
-            let sum = total.wrapping_add(v);
-            overflow |= (total ^ sum) & (v ^ sum);
-            total = sum;
-            o.write(sum);
-        }
-        overflow >= 0
-    }) }
+    unsafe {
+        appended(out, x.len(), |slots| {
+            let (mut total, mut overflow) = (start, 0i64);
+            for (o, &v) in slots.iter_mut().zip(x) {
+                let v: i64 = v.into();
+                let sum = total.wrapping_add(v);
+                overflow |= (total ^ sum) & (v ^ sum);
+                total = sum;
+                o.write(sum);
+            }
+            overflow >= 0
+        })
+    }
 }
 
 /// Appends the running totals of `x` from `start` by `op`, which gives each total wrapped and whether it fits, and gives whether every total fits. Each step waits only for the wrapped total before it.
 #[inline(always)]
 fn checked_scan<T: Copy + Into<S>, S: Copy>(x: &[T], start: S, out: &mut Vec<S>, op: impl Fn(S, S) -> (S, bool)) -> bool {
-    unsafe { appended(out, x.len(), |slots| {
-        let (mut total, mut ok) = (start, true);
-        for (o, &v) in slots.iter_mut().zip(x) {
-            let (next, fits) = op(total, v.into());
-            (total, ok) = (next, ok & fits);
-            o.write(next);
-        }
-        ok
-    }) }
+    unsafe {
+        appended(out, x.len(), |slots| {
+            let (mut total, mut ok) = (start, true);
+            for (o, &v) in slots.iter_mut().zip(x) {
+                let (next, fits) = op(total, v.into());
+                (total, ok) = (next, ok & fits);
+                o.write(next);
+            }
+            ok
+        })
+    }
 }
 
 /// [`Sum`] and [`Product`] for each integer type of compact buffers, at `i64`. `$sum` sums a slice. Each step and product wraps through [`Overflowing`], which also tests whether it fits.
@@ -1334,4 +1341,3 @@ mod run;
 mod scans;
 mod sliding;
 pub use {along::*, pieces::*, run::*, scans::*, sliding::*};
-

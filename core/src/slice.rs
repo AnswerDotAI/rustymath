@@ -220,7 +220,9 @@ pub fn mapped<E: Copy, O, const N: usize>(x: &[Arg<'_, E>; N], n: usize, out: &m
 #[inline(always)]
 pub(crate) fn each<E: KernelItem, O: KernelItem, R: Outcome<O>, const N: usize>(
     x: [Arg<'_, E>; N], n: usize, out: &mut [MaybeUninit<O>], f: impl Fn([E; N]) -> R) -> bool {
-    mapped(&x, n, out, #[inline(always)] |a| f(a).split()) || (R::RESCUE && unsafe { written(&mut out[..n]) }.iter().enumerate().all(|(i, &r)| kept(r, items(&x, i))))
+    mapped(
+        &x, n, out, #[inline(always)] |a| f(a).split()
+    ) || (R::RESCUE && unsafe { written(&mut out[..n]) }.iter().enumerate().all(|(i, &r)| kept(r, items(&x, i))))
 }
 
 /// A rare form for `each_usual` that no block takes, for a function with no rare form.
@@ -431,11 +433,13 @@ macro_rules! each_triple {
 /// Appends `f` on each of `n` pairs of items to `out`, and gives whether `f` said `true` for every pair. An `Arg::One` pairs with every item of the other argument. The loops write straight into `out`'s spare capacity, which is never zeroed first. This is the loop that rustymath's slice forms run, and a caller's own kernels can run it too, as basedpl's arithmetic does. A long call splits across threads, as [`parallel`](crate::parallel) describes.
 #[inline(never)]
 pub fn pairs<X: Copy + Sync, Y: Copy + Sync, B: Send>(x: Arg<'_, X>, y: Arg<'_, Y>, n: usize, out: &mut Vec<B>, f: impl Fn(X, Y) -> (B, bool) + Sync) -> bool {
-    unsafe { appended(out, n, |slots| {
-        crate::parallel::split(slots, CHUNK, &|start, slots| {
-            pairs_into(x.part(start, slots.len()), y.part(start, slots.len()), slots.len(), slots, |a, b| f(a, b))
+    unsafe {
+        appended(out, n, |slots| {
+            crate::parallel::split(slots, CHUNK, &|start, slots| {
+                pairs_into(x.part(start, slots.len()), y.part(start, slots.len()), slots.len(), slots, |a, b| f(a, b))
+            })
         })
-    }) }
+    }
 }
 
 /// [`pairs`], writing into the `n` slots of `out` in place of appending to a vector. It runs [`triples_into`]'s loops with a unit first argument, which go straight to [`each_pair!`]'s.
@@ -530,4 +534,3 @@ pub unsafe fn buffered<O: Copy, P>(n: usize, out: &mut [MaybeUninit<P>], f: impl
     pairs_into(Arg::Many(&rs), Arg::One(()), n, &mut out[..n], |r, ()| (each(r), true));
     ok
 }
-

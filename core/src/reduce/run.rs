@@ -196,8 +196,8 @@ fn totals<T, R: Reduction<T>>((totals, fits): (Vec<R::Total>, bool), checked: bo
 
 impl Reduce {
     pub fn run_scan(
-        self, variant: crate::domain::Variant, dims: [usize; 3], seed: Seed<'_>, direction: Direction,
-        input: crate::agreement::Read<'_>, output: &mut crate::buffer::Buffer) -> Result<(), Error> {
+        self, variant: crate::domain::Variant, dims: [usize; 3], seed: Seed<'_>, direction: Direction, input: crate::agreement::Read<'_>,
+        output: &mut crate::buffer::Buffer) -> Result<(), Error> {
         if self == Reduce::Sum && let Some(done) = bounded_scan(variant, dims, seed, direction, false, input, output) { return done; }
         native_reduction!(self, variant.dtype, variant.fails_on_overflow(), |R, T| Some(native_scan::<T, R>(
             dims, seed, direction, variant.checked, input, output
@@ -206,8 +206,8 @@ impl Reduce {
 }
 
 fn native_scan<T, R>(
-    dims: [usize; 3], seed: Seed<'_>, direction: Direction, checked: bool, input: crate::agreement::Read<'_>,
-    output: &mut crate::buffer::Buffer) -> Result<(), Error> where T: crate::buffer::Cast, R: Reduction<T>, R::Total: crate::buffer::Cast {
+    dims: [usize; 3], seed: Seed<'_>, direction: Direction, checked: bool, input: crate::agreement::Read<'_>, output: &mut crate::buffer::Buffer
+) -> Result<(), Error> where T: crate::buffer::Cast, R: Reduction<T>, R::Total: crate::buffer::Cast {
     scan_read::<T, R::Total>(dims, seed, direction, checked, input, output, &|items, dims, seed, out| {
         let fits = scan_along::<T, R>(items, dims, seed, out);
         if checked && !fits { Err(Error::new(Kind::Overflow, "integer scan overflowed")) } else { Ok(()) }
@@ -222,7 +222,7 @@ pub fn negated_scan(
     macro_rules! negated {
         ($t:ty) => {
             scan_read::<$t, $t>(dims, seed, Direction::Left, variant.checked, input, output, &|items, dims, seed, out| {
-                negated_cells::<$t, Sum>(items, dims, seed, out, |x| -x);
+                super::scans::negated_cells::<$t, Sum>(items, dims, seed, out, |x| -x);
                 Ok(())
             })
         };
@@ -239,21 +239,10 @@ pub fn negated_scan(
     Ok(true)
 }
 
-/// Appends the left scan by `-` of each cell of `items`, `[_, n, inner]` with `n` rows, to `out`, as `R`'s scan of the items that `neg` negates: each lane's first row, or `seed` less it, and then each later row subtracted from the total before it.
-fn negated_cells<T: Copy, R: Reduction<T, Total = T>>(items: &[T], [_, n, inner]: [usize; 3], seed: Option<&[T]>, out: &mut Vec<T>, neg: impl Fn(T) -> T) {
-    let mut negated = Vec::with_capacity(n * inner);
-    for cell in items.chunks_exact(n * inner) {
-        let (start, rest) = match seed { Some(s) => (s, cell), None => { out.extend_from_slice(&cell[..inner]); (&cell[..inner], &cell[inner..]) } };
-        negated.clear();
-        negated.extend(rest.iter().map(|&x| neg(x)));
-        scan_along::<T, R>(&negated, [1, rest.len() / inner, inner], Some(start), out);
-    }
-}
-
 /// A sum scan of integers or Booleans, or with `negate` a left scan by `-` of them, whose caller asks for totals in `output`'s dtype, `i16` or `i32`, wide enough for every stored item that the scan reads, whatever width the kernel computes at. The caller asks only where its bound on every running total fits that type. Each lane totals in it through `SumAs`, wrapping. `None` for any other request.
 pub fn bounded_scan(
-    variant: crate::domain::Variant, dims: [usize; 3], seed: Seed<'_>, direction: Direction, negate: bool,
-    input: crate::agreement::Read<'_>, output: &mut crate::buffer::Buffer) -> Option<Result<(), Error>> {
+    variant: crate::domain::Variant, dims: [usize; 3], seed: Seed<'_>, direction: Direction, negate: bool, input: crate::agreement::Read<'_>,
+    output: &mut crate::buffer::Buffer) -> Option<Result<(), Error>> {
     use crate::buffer::{DType, Width};
     let DType::Integer(total @ (Width::I16 | Width::I32)) = output.dtype() else { return None };
     let fits = |d: DType| d == DType::Boolean || matches!(d, DType::Integer(w) if total.join(w) == total);
@@ -266,12 +255,12 @@ pub fn bounded_scan(
 
 /// `bounded_scan`'s scan in `C`, reading the items as `C`. Where `checked`, each total is then tested from the total before it and its item: a sum overflows where its sign differs from both its arguments', and a difference where its arguments' signs differ and its sign differs from the first's. Every item fits `C`, which makes the tests exact. An overflow fails the scan.
 fn totalled<C>(
-    dims: [usize; 3], seed: Seed<'_>, direction: Direction, checked: bool, negate: bool, input: crate::agreement::Read<'_>,
-    output: &mut crate::buffer::Buffer) -> Result<(), Error> where C: crate::buffer::Cast + Tally + Term + Into<i64> + Ord + Default
-        + std::ops::BitXor<Output = C> + std::ops::BitAnd<Output = C> + std::ops::BitOr<Output = C> {
+    dims: [usize; 3], seed: Seed<'_>, direction: Direction, checked: bool, negate: bool, input: crate::agreement::Read<'_>, output: &mut crate::buffer::Buffer
+) -> Result<(), Error> where C: crate::buffer::Cast + Tally + Term + Into<i64> + Ord + Default + std::ops::BitXor<Output = C> + std::ops::BitAnd<Output = C>
+        + std::ops::BitOr<Output = C> {
     scan_read::<C, C>(dims, seed, direction, checked, input, output, &|items, [g, n, inner], seed, out| {
         let from = out.len();
-        if negate { negated_cells::<C, SumAs<C>>(items, [g, n, inner], seed, out, |x| C::low(-x.into())) }
+        if negate { super::scans::negated_cells::<C, SumAs<C>>(items, [g, n, inner], seed, out, |x| C::low(-x.into())) }
         else { scan_along::<C, SumAs<C>>(items, [g, n, inner], seed, out); }
         if !checked { return Ok(()); }
         let test = |p: C, x: C, c: C| if negate { (p ^ x) & (p ^ c) } else { (p ^ c) & (x ^ c) };
@@ -293,9 +282,22 @@ pub fn seed_row<T: crate::buffer::Cast>(
     Ok((0..inner).map(|i| arg.nth(if one { 0 } else { i })).collect())
 }
 
-pub fn scan_read<T: crate::buffer::Cast, S: crate::buffer::Cast>(
-    dims: [usize; 3], seed: Seed<'_>, direction: Direction, checked: bool, input: crate::agreement::Read<'_>,
-    output: &mut crate::buffer::Buffer, run: &dyn Fn(&[T], [usize; 3], Option<&[S]>, &mut Vec<S>) -> Result<(), Error>) -> Result<(), Error> {
+pub fn scan_read<T: Cast, S: Cast>(
+    dims: [usize; 3], seed: Seed<'_>, direction: Direction, checked: bool, input: Read<'_>, output: &mut Buffer,
+    run: &dyn Fn(&[T], [usize; 3], Option<&[S]>, &mut Vec<S>) -> Result<(), Error>) -> Result<(), Error> {
+    scan_with_carry::<T, S, S>(dims, seed, direction, checked, input, output, run)
+}
+
+/// A Boolean-result scan with its raw seed and chunk carries read at the input's numeric type.
+pub fn boolean_scan_read<T: Cast>(
+    dims: [usize; 3], seed: Seed<'_>, direction: Direction, checked: bool, input: Read<'_>, output: &mut Buffer,
+    run: &dyn Fn(&[T], [usize; 3], Option<&[T]>, &mut Vec<bool>) -> Result<(), Error>) -> Result<(), Error> where bool: Source<T> {
+    scan_with_carry::<T, T, bool>(dims, seed, direction, checked, input, output, run)
+}
+
+fn scan_with_carry<T: Cast, C: Cast, S: Cast + Source<C>>(
+    dims: [usize; 3], seed: Seed<'_>, direction: Direction, checked: bool, input: Read<'_>, output: &mut Buffer,
+    run: &dyn Fn(&[T], [usize; 3], Option<&[C]>, &mut Vec<S>) -> Result<(), Error>) -> Result<(), Error> {
     use crate::agreement::{Mapping, Missing, Read};
     let [outer, len, inner] = dims;
     let reversed = matches!(direction, Direction::Right).then(|| {
@@ -326,7 +328,8 @@ pub fn scan_read<T: crate::buffer::Cast, S: crate::buffer::Cast>(
             }
             let carry = carry.get_or_insert_with(Vec::new);
             carry.clear();
-            carry.extend_from_slice(&values[values.len() - inner..]);
+            let tail = &values[values.len() - inner..];
+            if let Some(items) = S::borrowed(tail) { carry.extend_from_slice(items); } else { carry.extend(tail.iter().copied().map(Source::<C>::read)); }
         }
     }
     if reversed.is_some() { reverse_rows(&mut values, dims); }
@@ -365,4 +368,3 @@ pub fn reverse_rows<T>(values: &mut [T], [outer, len, inner]: [usize; 3]) {
         for row in 0..len / 2 { for column in 0..inner { cell.swap(row * inner + column, (len - row - 1) * inner + column); } }
     }
 }
-

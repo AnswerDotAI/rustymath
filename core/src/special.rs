@@ -693,7 +693,8 @@ fn regions<R: Native, const FUSED: bool>(x: &[R], out: &mut [MaybeUninit<R>], f:
             outside |= !(p < 1.0);
             p <= 0.5
         });
-        let (ps, qs, signs): (&[f64], &[f64], &[f64]) = (unsafe { written(&mut ps[..xs.len()]) }, unsafe { written(&mut qs[..xs.len()]) }, unsafe { written(&mut signs[..xs.len()]) });
+        let (ps, qs, signs): (&[f64], &[f64], &[f64]) =
+            (unsafe { written(&mut ps[..xs.len()]) }, unsafe { written(&mut qs[..xs.len()]) }, unsafe { written(&mut signs[..xs.len()]) });
         let (central, others) = unsafe { written(&mut place[..xs.len()]) }.split_at(central);
         let upper = placed(others.iter().copied(), &mut split, |i| qs[usize::from(i)] >= 0.25);
         let (upper, below) = unsafe { written(&mut split[..others.len()]) }.split_at(upper);
@@ -1027,4 +1028,3 @@ fn beta_steps<const FUSED: bool>(a: f64, b: f64, p: f64, mut x: f64) -> f64 {
     }
     x
 }
-

@@ -299,4 +299,3 @@ pub(crate) fn hypot<R: Native, const FUSED: bool>(x: R, y: R) -> R {
     let r = sa.mla::<FUSED>(sa, sb * sb).sqrt() * back;
     if a.is_infinite() | b.is_infinite() { R::infinity() } else { r }
 }
-

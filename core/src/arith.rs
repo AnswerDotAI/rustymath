@@ -103,6 +103,7 @@ macro_rules! wide_product {
 macro_rules! signed {
     ($($t:ty: |$x:ident, $y:ident| $times:expr),+) => {$(
         impl Overflowing for $t {
+            #[inline]
             fn low(x: i64) -> Self { x as $t }
             #[inline(always)]
             fn limit(sign: i64) -> Self { match sign.signum() { 1 => <$t>::MAX, -1 => <$t>::MIN, _ => 0 } }
@@ -125,6 +126,7 @@ signed!(
 macro_rules! unsigned {
     ($($t:ty: |$x:ident, $y:ident| $times:expr),+) => {$(
         impl Overflowing for $t {
+            #[inline]
             fn low(x: i64) -> Self { x as $t }
             #[inline(always)]
             fn limit(sign: i64) -> Self { match sign.signum() { 1 => <$t>::MAX, -1 => <$t>::MIN, _ => 0 } }

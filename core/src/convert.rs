@@ -130,12 +130,14 @@ pub fn count<F: Float>(out: &mut Vec<F>, start: i64, down: bool, n: usize) {
     let step = if down { -1 } else { 1 };
     let offsets: [f64; 8] = std::array::from_fn(|k| wide_float(step * k as i64));
     let first = move |j: usize| wide_float(start + step * (8 * j) as i64);
-    unsafe { crate::slice::appended(out, n, |slots| {
-        let (blocks, rest) = slots.as_chunks_mut::<8>();
-        let whole = blocks.len();
-        for (j, block) in blocks.iter_mut().enumerate() { let first = first(j); for k in 0..8 { block[k].write(F::narrow(first + offsets[k])); } }
-        for (slot, &offset) in rest.iter_mut().zip(&offsets) { slot.write(F::narrow(first(whole) + offset)); }
-    }) };
+    unsafe {
+        crate::slice::appended(out, n, |slots| {
+            let (blocks, rest) = slots.as_chunks_mut::<8>();
+            let whole = blocks.len();
+            for (j, block) in blocks.iter_mut().enumerate() { let first = first(j); for k in 0..8 { block[k].write(F::narrow(first + offsets[k])); } }
+            for (slot, &offset) in rest.iter_mut().zip(&offsets) { slot.write(F::narrow(first(whole) + offset)); }
+        })
+    };
 }
 
 /// Whether the target converts between `f64` and 64-bit integers in vector form, as AArch64 and x86-64 with AVX-512 do. Elsewhere they convert through a float's bits. Both ways give the same results for whole floats.
@@ -224,4 +226,3 @@ ints! {
     u32: wide, |i| f64::from_low(i.into(), 0.0) as f32, f64::from_low(i.into(), 0.0);
     i64: wide, |i| wide_float(i) as f32, wide_float(i);
 }
-

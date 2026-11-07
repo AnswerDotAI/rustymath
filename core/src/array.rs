@@ -53,5 +53,3 @@ impl<'a> ArrayView<'a> {
     }
     pub fn items<T: Element>(&self) -> Result<Cow<'a, [T]>, Error> { Ok(self.cast(T::DTYPE)?.items()) }
 }
-
-
