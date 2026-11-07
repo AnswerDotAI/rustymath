@@ -1,6 +1,6 @@
-//! Python array interchange and selectors, shared by rustymath and basedpl. [`read`] borrows native contiguous buffers and normalizes other supported buffers. [`read_array`] preserves sibling-array metadata. [`export`] fills a `Py_buffer`, and [`lend`] fills one read-only for items that the export itself keeps alive. [`labels`] and [`frame`] read dict keys and data frames, [`selection`] decodes Python indexing, [`walk`] walks nested Python values, and [`py_err`] converts array errors to Python exceptions.
+//! Python array interchange and selectors, shared by rustymath and basedpl. [`read`] borrows native contiguous buffers and normalizes other supported buffers. [`read_array`] preserves sibling-array metadata. [`export`] fills a `Py_buffer`, and [`lend`] fills one read-only for items that the export itself keeps alive. [`labels`] and [`frame`] read dict keys and data frames, [`rational`] reads a `fractions.Fraction`, [`selection`] decodes Python indexing, [`walk`] walks nested Python values, and [`py_err`] converts array errors to Python exceptions.
 use pyo3::exceptions::{PyBufferError, PyIndexError, PyKeyboardInterrupt, PyOverflowError, PyTimeoutError, PyTypeError, PyValueError};
-use pyo3::{IntoPyObjectExt, ffi, prelude::*, types::{PyComplex, PyInt, PyList, PyString}};
+use pyo3::{IntoPyObjectExt, ffi, prelude::*, sync::PyOnceLock, types::{PyComplex, PyInt, PyList, PyString, PyType}};
 use rustymath::buffer::{Buffer, ComplexWidth, DType, Element, FloatWidth, View, Width};
 use rustymath::error::{Error, Kind};
 use rustymath::{layout::element_count, with_dtype};
@@ -25,6 +25,18 @@ pub fn labels(labels: &Bound<'_, PyAny>) -> PyResult<Vec<Option<Arc<str>>>> {
         if label.is_exact_instance_of::<PyInt>() && label.extract::<usize>().is_ok_and(|n| n == i) { return Ok(None); }
         Err(PyTypeError::new_err("keys must be strings, or ints equal to their positions"))
     }).collect()
+}
+
+/// Python's `fractions.Fraction`.
+pub fn fraction(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
+    static FRACTION: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+    FRACTION.import(py, "fractions", "Fraction")
+}
+
+/// The value of `obj` where it is a `fractions.Fraction`, and `None` for any other object.
+pub fn rational(obj: &Bound<'_, PyAny>) -> PyResult<Option<num_rational::BigRational>> {
+    if !obj.is_instance(fraction(obj.py())?)? { return Ok(None); }
+    Ok(Some(num_rational::BigRational::new(obj.getattr("numerator")?.extract()?, obj.getattr("denominator")?.extract()?)))
 }
 
 /// The exception that a signal handler raised during an interrupt check, which [`py_err`] raises for the check's Interrupt error.

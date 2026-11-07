@@ -6,8 +6,8 @@
 //!
 //! The private module `factor` holds decompositions of real and complex matrices, whose blocked updates run on these loops. This module re-exports its public items, and [`Scalar`], the trait of the item types they take. [`transpose_into`] transposes a matrix through 8×8 tiles.
 use crate::{
-    Float, agreement::{Frames, Mapping, expanded_items}, buffer::{Buffer, DType, Element, FloatWidth, Source, View, Width, read_all}, convert, error::Error,
-    float::{FUSED, sealed::Core}, parallel, slice
+    Float, agreement::{Mapping, Walked, expanded_items}, buffer::{Element, Source, read_all}, convert, error::Error, float::{FUSED, sealed::Core},
+    parallel, slice
 };
 use num_complex::Complex;
 use num_traits::{One, Zero};
@@ -165,30 +165,124 @@ pub struct PlusEqual;
 #[derive(Default)]
 pub struct PlusNotEqual;
 
-/// One of the pairs above, for code that chooses a pair at run time, as a frontend does from its own names for functions. [`Product::run`] is where each pair finds its kernel for a dtype.
+/// A native inner-product pair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Product { PlusTimes, MaxPlus, MinPlus, OrAnd, AndOr, PlusEqual, PlusNotEqual }
 
-impl Product {
-    /// The pair's products of the cells of `x` and `y`, which share a dtype and pair as `frames` says, each of sizes `[n, k, m]`, with whether every product fits, as [`Kernels::product`](crate::operation::Kernels::product) gives them. `None` where the pair has no kernel for their dtype, and an error where an interrupt stopped them. A count computes at `i64` or at a float, and reads characters as their code points. An `i16` or `i32` count could overflow, and the `i64` kernel counts at those widths only where that's safe.
-    pub fn run(self, xy: [View<'_>; 2], frames: &Frames, size: [usize; 3]) -> Option<Result<(Buffer, bool), Error>> {
-        const COUNTS: [DType; 3] = [DType::Integer(Width::I64), DType::Float(FloatWidth::F32), DType::Float(FloatWidth::F64)];
-        match self {
-            Self::PlusTimes => crate::kernels!(Product PlusTimes).product(&PlusTimes, xy, frames, size),
-            Self::MaxPlus => crate::kernels!(Product MaxPlus).product(&MaxPlus, xy, frames, size),
-            Self::MinPlus => crate::kernels!(Product MinPlus).product(&MinPlus, xy, frames, size),
-            Self::OrAnd => crate::kernels!(Product OrAnd).product(&OrAnd, xy, frames, size),
-            Self::AndOr => crate::kernels!(Product AndOr).product(&AndOr, xy, frames, size),
-            Self::PlusEqual => crate::kernels!(Product PlusEqual).only(&COUNTS).product(&PlusEqual, xy.map(crate::characters::as_codes), frames, size),
-            Self::PlusNotEqual => crate::kernels!(Product PlusNotEqual).only(&COUNTS).product(&PlusNotEqual, xy.map(crate::characters::as_codes), frames, size),
+impl Product { pub fn compares_exactly(self) -> bool { matches!(self, Self::PlusEqual | Self::PlusNotEqual) } }
+
+/// Layout and reads of an inner product. Contracted axes follow output axes in `iteration`.
+#[derive(Clone, Debug)]
+pub struct ProductPlan { pub layout: crate::layout::Layout, pub iteration: crate::layout::Layout, pub mappings: [Mapping; 2], pub contracted: usize }
+
+#[derive(Clone, Copy, Debug)]
+pub struct MatrixProduct { pub frame_rank: usize, pub row_rank: usize, pub size: [usize; 3] }
+impl MatrixProduct {
+    fn of(shape: &[usize], owners: &[u8]) -> Option<Self> {
+        let frame_rank = owners.iter().take_while(|&&owner| owner == 3).count();
+        let row_rank = owners[frame_rank..].iter().take_while(|&&owner| owner == 1).count();
+        if !owners[frame_rank + row_rank..].iter().all(|&owner| owner == 2) { return None; }
+        let sizes = [&shape[frame_rank..frame_rank + row_rank], &shape[owners.len()..], &shape[frame_rank + row_rank..owners.len()]]
+            .map(|shape| crate::layout::element_count(shape).ok());
+        match sizes { [Some(m), Some(k), Some(n)] => Some(Self { frame_rank, row_rank, size: [m, k, n] }), _ => None }
+    }
+}
+
+impl ProductPlan {
+    /// The number of pairings each result folds: the product of the contracted axes' lengths.
+    pub fn contracted_len(&self) -> usize { let shape = self.iteration.shape(); crate::layout::count(&shape[shape.len() - self.contracted..]) }
+    pub fn folded(iteration: crate::layout::Layout, mappings: [Mapping; 2], contracted: usize) -> Result<Self, Error> {
+        let rank = iteration.shape().len();
+        if contracted > rank { return Err(Error::new(crate::error::Kind::Rank, "too many contracted axes")); }
+        let layout = iteration.axes(0..rank - contracted);
+        Ok(Self { layout, iteration, mappings, contracted })
+    }
+
+    /// The matrix product that runs this plan, from the iteration axes each operand steps along: its read's steps where the read reaches its items positionally, and otherwise its `mappings` entry's, which says which items it reads. An axis that no read steps along, as a broadcast gives, takes the class of the operands whose free axis `mappings` makes it, and an axis of one item takes the class of the axis before it. `None` where the axes don't fall into frames, rows and columns, in that order.
+    pub fn matrix_for(&self, inputs: [crate::agreement::Read<'_>; 2]) -> Option<MatrixProduct> {
+        let shape = self.iteration.shape();
+        let mut owners = vec![0; shape.len() - self.contracted];
+        let mut nominal = owners.clone();
+        for (side, input) in inputs.iter().enumerate() {
+            let plan = input.plan.remapped(self.mappings[side].clone(), self.iteration.count(), crate::agreement::Missing::Invalid);
+            let map =
+                crate::agreement::Read { sources: input.sources, plan: &plan }.positional(shape).map_or_else(|| self.mappings[side].clone(), |(_, map)| map);
+            let (_, steps) = map.affine(shape)?;
+            for (axis, owner) in owners.iter_mut().enumerate() { if steps[axis] != 0 { *owner |= 1 << side; } }
+            if let Some((_, free)) = self.mappings[side].affine(shape) {
+                for (named, &step) in nominal.iter_mut().zip(&free) { if step != 0 { *named |= 1 << side; } }
+            }
         }
+        // An axis of one item adds nothing to any size, so any class that keeps the order serves.
+        let mut last = 3;
+        for ((owner, named), &len) in owners.iter_mut().zip(nominal).zip(shape) {
+            if *owner == 0 { *owner = if len == 1 { last } else if named != 0 { named } else { 3 }; }
+            last = *owner;
+        }
+        MatrixProduct::of(shape, &owners)
     }
-    /// The products of [`run`](Self::run) with wrapping steps: `+.×` on `u8`, `i16` or `i32` items gives each result's exact sum of products wrapped to 32 bits, at `i32`, as static kinds and fixed widths keep integer results (`Wrapped<PlusTimes>`). `None` for any other pair or dtype, which `run` then takes.
-    pub fn run_wrapped(self, xy: [View<'_>; 2], frames: &Frames, size: [usize; 3]) -> Option<Result<(Buffer, bool), Error>> {
-        match self { Self::PlusTimes => crate::kernels!(Product crate::Wrapped<PlusTimes>).product(&crate::Wrapped(PlusTimes), xy, frames, size), _ => None }
+    pub fn dot([left, right]: [&crate::layout::Layout; 2]) -> Result<Self, Error> {
+        let rank = left.shape().len();
+        if rank == 0 || right.shape().is_empty() { return Err(Error::new(crate::error::Kind::Rank, "an inner product needs vectors or matrices")); }
+        Self::paired([left, right], &[(rank - 1, 0)], None)
     }
-    /// Whether the pair's kernel compares items exactly, as the counts `+.=` and `+.≠` do. A frontend sends approximate items that compare within a tolerance to another route.
-    pub fn compares_exactly(self) -> bool { matches!(self, Self::PlusEqual | Self::PlusNotEqual) }
+    pub fn matrices(inputs: [&crate::layout::Layout; 2], frame: usize) -> Result<Self, Error> {
+        let (contracted, destinations) = Self::matrix_axes(inputs, frame)?;
+        Self::paired(inputs, &[contracted], Some(destinations))
+    }
+    /// The contracted pair and the destinations of each input's remaining axes, in source order.
+    pub fn matrix_axes([left, right]: [&crate::layout::Layout; 2], frame: usize) -> Result<((usize, usize), [Vec<usize>; 2]), Error> {
+        use crate::agreement::Agreement;
+        let [lr, rr] = [left, right].map(|l| l.shape().len());
+        if lr <= frame || rr <= frame { return Err(Error::new(crate::error::Kind::Rank, "a matrix product needs vector or matrix cells")); }
+        let [lc, rc] = [(lr - frame).min(2), (rr - frame).min(2)];
+        let [lf, rf] = [left.axes(0..lr - lc), right.axes(0..rr - rc)];
+        let [mut xa, mut ya] = Agreement::axis_pairs(&lf, &rf);
+        let first = xa.iter().chain(&ya).max().map_or(0, |a| a + 1);
+        if lc == 2 { xa.push(first); }
+        if rc == 2 { ya.push(first + usize::from(lc == 2)); }
+        Ok(((lr - 1, rr - rc), [xa, ya]))
+    }
+    /// Contracts `pairs`; optional destinations pair the remaining axes, in each input's axis order. Without destinations, remaining axes concatenate left then right.
+    pub fn paired(inputs @ [left, right]: [&crate::layout::Layout; 2], pairs: &[(usize, usize)], destinations: Option<[Vec<usize>; 2]>) -> Result<Self, Error> {
+        use crate::{agreement::Agreement, error::Kind, layout::{element_count, generated_len}};
+        let contracted: [Vec<usize>; 2] = [pairs.iter().map(|p| p.0).collect(), pairs.iter().map(|p| p.1).collect()];
+        for (input, axes) in inputs.iter().zip(&contracted) {
+            if axes.iter().enumerate().any(|(i, a)| *a >= input.shape().len() || axes[..i].contains(a)) {
+                return Err(Error::new(Kind::Rank, "contracted axes must be distinct axes of their inputs"));
+            }
+        }
+        for &(a, b) in pairs {
+            let (x, y) = (left.shape()[a], right.shape()[b]);
+            if x != y {
+                return Err(Error::new(Kind::Length, format!("an inner product needs matching contracted lengths, not {x} and {y}")));
+            }
+            Mapping::contract(left, a, right, b).map_err(|_| Error::new(Kind::Length, "an inner product needs the same keys on its contracted axes"))?;
+        }
+        let free: [Vec<usize>; 2] = std::array::from_fn(|i| (0..inputs[i].shape().len()).filter(|a| !contracted[i].contains(a)).collect());
+        let free_layouts = std::array::from_fn::<_, 2, _>(|i| inputs[i].axes(free[i].iter().copied()));
+        let total = free[0].len() + free[1].len();
+        let destinations = destinations.unwrap_or_else(|| [(0..free[0].len()).collect(), (free[0].len()..total).collect()]);
+        for (axes, positions) in free.iter().zip(&destinations) {
+            if axes.len() != positions.len() || positions.iter().enumerate().any(|(i, p)| *p >= total || positions[..i].contains(p)) {
+                return Err(Error::new(Kind::Rank, "free axes need distinct output destinations"));
+            }
+        }
+        let agreement = Agreement::mapped(&free_layouts[0], &free_layouts[1], &destinations[0], &destinations[1], false)?;
+        if agreement.left.fills() || agreement.right.fills() { return Err(Error::new(Kind::Length, "keyed frames need a cell that an argument lacks")); }
+        let layout = agreement.layout;
+        generated_len(layout.shape())?;
+        let first = layout.shape().len();
+        let iteration = layout.concat(&left.axes(contracted[0].iter().copied()));
+        let items = element_count(iteration.shape())?;
+        let mappings = std::array::from_fn(|i| {
+            let mut axes = vec![0; inputs[i].shape().len()];
+            for (&a, &p) in free[i].iter().zip(&destinations[i]) { axes[a] = p; }
+            for (p, &a) in contracted[i].iter().enumerate() { axes[a] = first + p; }
+            Mapping::new(inputs[i], &axes, &iteration, items)
+        });
+        Ok(Self { layout, iteration, mappings, contracted: pairs.len() })
+    }
 }
 
 /// The scalar operations of a pair at item type `T`.
@@ -203,69 +297,34 @@ trait Pair<T> {
     fn step(acc: Self::Out, a: T, b: T) -> Self::Out { Self::f(acc, Self::g(a, b)) }
 }
 
-macro_rules! floats {
-    ($($t:ty),+) => {$(
-        impl Pair<$t> for PlusTimes {
-            type Out = $t;
-            const UNIT: $t = 0.0;
+/// `Pair` impls, one for each entry: the object, the item type, the result type and `UNIT`, then `g`, `f` and an optional fused `step`.
+macro_rules! pairs {
+    ($($obj:ty: $t:ty => $out:ty = $unit:expr, |$a:ident, $b:ident| $g:expr, |$x:ident, $y:ident| $f:expr $(, |$c:ident, $p:ident, $q:ident| $step:expr)?;)+) => {$(
+        impl Pair<$t> for $obj {
+            type Out = $out;
+            const UNIT: $out = $unit;
             #[inline(always)]
-            fn g(a: $t, b: $t) -> $t { a * b }
+            fn g($a: $t, $b: $t) -> $out { $g }
             #[inline(always)]
-            fn f(x: $t, y: $t) -> $t { x + y }
-            #[inline(always)]
-            fn step(acc: $t, a: $t, b: $t) -> $t { a.mla::<FUSED>(b, acc) }
-        }
-        impl Pair<$t> for MaxPlus {
-            type Out = $t;
-            const UNIT: $t = <$t>::NEG_INFINITY;
-            #[inline(always)]
-            fn g(a: $t, b: $t) -> $t { a + b }
-            #[inline(always)]
-            fn f(acc: $t, term: $t) -> $t { Core::maximum(term, acc) }
-        }
-        impl Pair<$t> for MinPlus {
-            type Out = $t;
-            const UNIT: $t = <$t>::INFINITY;
-            #[inline(always)]
-            fn g(a: $t, b: $t) -> $t { a + b }
-            #[inline(always)]
-            fn f(acc: $t, term: $t) -> $t { Core::minimum(term, acc) }
+            fn f($x: $out, $y: $out) -> $out { $f }
+            $(#[inline(always)]
+            fn step($c: $out, $p: $t, $q: $t) -> $out { $step })?
         }
     )+};
+}
+macro_rules! floats {
+    ($($t:ty),+) => {$(pairs! {
+        PlusTimes: $t => $t = 0.0, |a, b| a * b, |x, y| x + y, |acc, a, b| a.mla::<FUSED>(b, acc);
+        MaxPlus: $t => $t = <$t>::NEG_INFINITY, |a, b| a + b, |acc, term| Core::maximum(term, acc);
+        MinPlus: $t => $t = <$t>::INFINITY, |a, b| a + b, |acc, term| Core::minimum(term, acc);
+        PlusTimes: Complex<$t> => Complex<$t> = Complex::new(0.0, 0.0), |a, b| a * b, |x, y| x + y, |acc, a, b| a.mul_acc(b, acc);
+    })+};
 }
 floats!(f32, f64);
-macro_rules! complex_pairs {
-    ($($t:ty),+) => {$(
-        impl Pair<Complex<$t>> for PlusTimes {
-            type Out = Complex<$t>;
-            const UNIT: Complex<$t> = Complex::new(0.0, 0.0);
-            #[inline(always)]
-            fn g(a: Complex<$t>, b: Complex<$t>) -> Complex<$t> { a * b }
-            #[inline(always)]
-            fn f(x: Complex<$t>, y: Complex<$t>) -> Complex<$t> { x + y }
-            #[inline(always)]
-            fn step(acc: Complex<$t>, a: Complex<$t>, b: Complex<$t>) -> Complex<$t> { a.mul_acc(b, acc) }
-        }
-    )+};
-}
-complex_pairs!(f32, f64);
 
-impl Pair<bool> for OrAnd {
-    type Out = bool;
-    const UNIT: bool = false;
-    #[inline(always)]
-    fn g(a: bool, b: bool) -> bool { a & b }
-    #[inline(always)]
-    fn f(x: bool, y: bool) -> bool { x | y }
-}
-
-impl Pair<bool> for AndOr {
-    type Out = bool;
-    const UNIT: bool = true;
-    #[inline(always)]
-    fn g(a: bool, b: bool) -> bool { a | b }
-    #[inline(always)]
-    fn f(x: bool, y: bool) -> bool { x & y }
+pairs! {
+    OrAnd: bool => bool = false, |a, b| a & b, |x, y| x | y;
+    AndOr: bool => bool = true, |a, b| a | b, |x, y| x & y;
 }
 
 impl Inner<bool> for OrAnd {
@@ -307,66 +366,18 @@ fn packed<const NOT: bool>(a: &[bool], b: &[bool], [m, k, n]: [usize; 3], c: &mu
         }
     }
 }
-/// The pairs at `i64` and `+.×`'s pair at `i32`. `tiered` runs the pairs at `i64` only where every value that a product forms fits `i64`. Their wrapping operations then never wrap. The pair at `i32` wraps, as the products of [`Wrapped<PlusTimes>`] do.
-macro_rules! wrapping_times {
-    ($($t:ty),+) => {$(
-        impl Pair<$t> for PlusTimes {
-            type Out = $t;
-            const UNIT: $t = 0;
-            #[inline(always)]
-            fn g(a: $t, b: $t) -> $t { a.wrapping_mul(b) }
-            #[inline(always)]
-            fn f(x: $t, y: $t) -> $t { x.wrapping_add(y) }
-        }
-    )+};
-}
-wrapping_times!(i64, i32);
-impl Pair<i64> for MaxPlus {
-    type Out = i64;
-    const UNIT: i64 = i64::MIN;
-    #[inline(always)]
-    fn g(a: i64, b: i64) -> i64 { a.wrapping_add(b) }
-    #[inline(always)]
-    fn f(x: i64, y: i64) -> i64 { x.max(y) }
-}
-impl Pair<i64> for MinPlus {
-    type Out = i64;
-    const UNIT: i64 = i64::MAX;
-    #[inline(always)]
-    fn g(a: i64, b: i64) -> i64 { a.wrapping_add(b) }
-    #[inline(always)]
-    fn f(x: i64, y: i64) -> i64 { x.min(y) }
-}
-/// The pairs at `i128`, which `checked_into` uses where a result could pass `i64`. Each step of `+.×` checks that its running total fits 128 bits.
-impl Pair<i128> for PlusTimes {
-    type Out = Option<i128>;
-    const UNIT: Option<i128> = Some(0);
-    fn g(a: i128, b: i128) -> Option<i128> { a.checked_mul(b) }
-    fn f(x: Option<i128>, y: Option<i128>) -> Option<i128> { x?.checked_add(y?) }
-}
-impl Pair<i128> for MaxPlus {
-    type Out = Option<i128>;
-    const UNIT: Option<i128> = Some(i128::MIN);
-    fn g(a: i128, b: i128) -> Option<i128> { a.checked_add(b) }
-    fn f(x: Option<i128>, y: Option<i128>) -> Option<i128> { Some(x?.max(y?)) }
-}
-impl Pair<i128> for MinPlus {
-    type Out = Option<i128>;
-    const UNIT: Option<i128> = Some(i128::MAX);
-    fn g(a: i128, b: i128) -> Option<i128> { a.checked_add(b) }
-    fn f(x: Option<i128>, y: Option<i128>) -> Option<i128> { Some(x?.min(y?)) }
+// The pairs at `i64` and `+.×`'s pair at `i32`. `tiered` runs the pairs at `i64` only where every value that a product forms fits `i64`. Their wrapping operations then never wrap. The pair at `i32` wraps, as the products of [`Wrapped<PlusTimes>`] do. The pairs at `i128`, which `checked_into` uses where a result could pass `i64`. Each step of `+.×` checks that its running total fits 128 bits.
+pairs! {
+    PlusTimes: i64 => i64 = 0, |a, b| a.wrapping_mul(b), |x, y| x.wrapping_add(y);
+    PlusTimes: i32 => i32 = 0, |a, b| a.wrapping_mul(b), |x, y| x.wrapping_add(y);
+    MaxPlus: i64 => i64 = i64::MIN, |a, b| a.wrapping_add(b), |x, y| x.max(y);
+    MinPlus: i64 => i64 = i64::MAX, |a, b| a.wrapping_add(b), |x, y| x.min(y);
+    PlusTimes: i128 => Option<i128> = Some(0), |a, b| a.checked_mul(b), |x, y| x?.checked_add(y?);
+    MaxPlus: i128 => Option<i128> = Some(i128::MIN), |a, b| a.checked_add(b), |x, y| Some(x?.max(y?));
+    MinPlus: i128 => Option<i128> = Some(i128::MAX), |a, b| a.checked_add(b), |x, y| Some(x?.min(y?));
 }
 macro_rules! counts {
-    ($($t:ty => $out:ty),+) => {$(
-        impl Pair<$t> for PlusEqual {
-            type Out = $out;
-            const UNIT: $out = 0;
-            #[inline(always)]
-            fn g(a: $t, b: $t) -> $out { <$out>::from(a == b) }
-            #[inline(always)]
-            fn f(x: $out, y: $out) -> $out { x + y }
-        }
-    )+};
+    ($($t:ty => $out:ty),+) => {$(pairs! { PlusEqual: $t => $out = 0, |a, b| <$out>::from(a == b), |x, y| x + y; })+};
 }
 counts!(i64 => i64, i32 => i32, i16 => i16, f64 => i64, f32 => i32);
 
@@ -637,7 +648,7 @@ pub(crate) enum Op { Normal, Transpose, Adjoint, Conjugate }
 pub enum Orientation { Normal, Transpose }
 /// A row-major matrix whose items `mapping` reads from `data`, as [`expanded_items`] lays an argument over a frame. [`Inner::inner_mapped`] takes its operands this way. A matrix held in order has `Mapping::Linear(1)`.
 #[derive(Clone, Copy)]
-pub struct Mapped<'a, T> { pub data: &'a [T], pub mapping: &'a Mapping }
+pub struct Mapped<'a, T> { pub data: &'a [T], pub mapping: &'a Walked<'a> }
 
 impl<'a, T: Element> Mapped<'a, T> {
     /// The matrix in orientation `o`, with no copy, where the mapping reads its stored matrix at positive strides, one of them 1: row by row, or column by column as a transpose. `None` for any other mapping.
@@ -657,7 +668,7 @@ impl<'a, T: Element> Mapped<'a, T> {
     /// Whether [`Inner::inner_mapped`] reads this matrix where it lies, in orientation `o` with `size` rows and columns, rather than one block at a time.
     pub fn in_place(&self, o: Orientation, size: [usize; 2]) -> bool { self.matrix(o, size).is_some() }
     /// Items `start..start + n` of the matrix, as [`expanded_items`] reads them.
-    fn read<'b>(&'b self, start: usize, n: usize, buf: &'b mut Vec<T>) -> &'b [T] { expanded_items(self.mapping, self.data, start, n, buf) }
+    pub(crate) fn read<'b>(&'b self, start: usize, n: usize, buf: &'b mut Vec<T>) -> &'b [T] { expanded_items(self.mapping, self.data, start, n, buf) }
 }
 #[derive(Clone, Copy)]
 pub(crate) enum Side { Left, Right }
@@ -669,19 +680,19 @@ impl Op {
     fn transposed(self) -> bool { matches!(self, Self::Transpose | Self::Adjoint) }
 }
 impl<'a, T: Copy> Matrix<'a, T> {
-    pub fn rows(data: &'a [T], ld: usize) -> Self { Self { data, ld, op: Op::Normal } }
-    pub fn transpose(self) -> Self {
+    pub(crate) fn rows(data: &'a [T], ld: usize) -> Self { Self { data, ld, op: Op::Normal } }
+    pub(crate) fn transpose(self) -> Self {
         Self { op: match self.op {
             Op::Normal => Op::Transpose, Op::Transpose => Op::Normal, Op::Adjoint => Op::Conjugate, Op::Conjugate => Op::Adjoint
         }, ..self }
     }
     /// Starts at a row and column in the logical orientation.
-    pub fn offset(self, row: usize, col: usize) -> Self {
+    pub(crate) fn offset(self, row: usize, col: usize) -> Self {
         let at = if self.op.transposed() { col * self.ld + row } else { row * self.ld + col };
         Self { data: &self.data[at..], ..self }
     }
     /// The `rows`×`cols` matrix that an operand of [`Inner::inner_ops`] gives in orientation `o`. A transposed operand stores the `cols`×`rows` matrix, row-major.
-    pub fn oriented(data: &'a [T], o: Orientation, [rows, cols]: [usize; 2]) -> Self {
+    pub(crate) fn oriented(data: &'a [T], o: Orientation, [rows, cols]: [usize; 2]) -> Self {
         match o { Orientation::Normal => Self::rows(data, cols), Orientation::Transpose => Self { data, ld: rows, op: Op::Transpose } }
     }
     /// Checks the stored extent once, before any foreign call.
@@ -693,17 +704,17 @@ impl<'a, T: Copy> Matrix<'a, T> {
     }
 }
 impl<T: Scalar> Matrix<'_, T> {
-    pub fn conjugate(self) -> Self {
+    pub(crate) fn conjugate(self) -> Self {
         // Conjugation is an identity for real scalars; don't make their BLAS views more restrictive.
         if !T::COMPLEX { return self; }
         Self { op: match self.op {
             Op::Normal => Op::Conjugate, Op::Transpose => Op::Adjoint, Op::Adjoint => Op::Transpose, Op::Conjugate => Op::Normal
         }, ..self }
     }
-    pub fn adjoint(self) -> Self { self.transpose().conjugate() }
+    pub(crate) fn adjoint(self) -> Self { self.transpose().conjugate() }
     #[cfg(native)]
     #[inline(always)]
-    pub fn at(self, i: usize, j: usize) -> T {
+    pub(crate) fn at(self, i: usize, j: usize) -> T {
         let x = self.data[if self.op.transposed() { j * self.ld + i } else { i * self.ld + j }];
         if matches!(self.op, Op::Adjoint | Op::Conjugate) { x.conj() } else { x }
     }
@@ -829,10 +840,10 @@ const TAIL_STRIP: usize = 8;
 /// The fewest adjacent rows of `a` that [`by_columns`] reads at once. Shorter runs cost more in loop overhead than gathering saves.
 const COLUMN_RUN: usize = 64;
 
-/// `+.×` of `a` and a vector `b`, where each row of `a` starts one item after the row before it in storage, as the windows of a vector or a single-channel image do. Each column of `a` is then a run of storage, which [`scaled_runs`] reads where it lies and scales by its item of `b`. `a` is never gathered. `None` for a chosen fill, or where it doesn't split into entries for its rows and entries for its columns, or where its rows aren't adjacent in runs of at least [`COLUMN_RUN`]. The loop reads a fill as 0, the item type's own fill.
+/// `+.×` of `a` and a vector `b`, where each row of `a` starts one item after the row before it in storage, as the windows of a vector or a single-channel image do. Each column of `a` is then a run of storage, which [`scaled_runs`] reads where it lies and scales by its item of `b`. `a` is never gathered. `None` where it doesn't split into entries for its rows and entries for its columns, or where its rows aren't adjacent in runs of at least [`COLUMN_RUN`]. The loop reads a fill as 0, the item type's own fill.
 fn by_columns<T: Tiled + Element>(a: Mapped<'_, T>, b: Mapped<'_, T>, oa: Orientation, [m, k]: [usize; 2]) -> Option<Vec<T>> {
     use crate::gather::Steps;
-    let (Mapping::Steps { base, steps }, None) = (a.mapping, a.mapping.chosen()) else { return None };
+    let Mapping::Steps { base, steps } = &**a.mapping else { return None };
     if m * k == 0 { return None; }
     // The entries of the stored matrix's leading axis come first, and give its first `lead` items.
     let lead = if oa == Orientation::Normal { m } else { k };
@@ -929,10 +940,7 @@ fn narrow_sums<T: Tiled>(out: &mut [T], data: &[T], ld: usize, w: &[T]) {
     let mut acc = [[T::zero(); NARROW]; 4];
     let (quads, rest) = w[..whole].as_chunks::<4>();
     for (q, ws) in quads.iter().enumerate() {
-        for s in 0..4 {
-            let a = &data[(4 * q + s) * ld..][..NARROW];
-            for t in 0..NARROW { acc[s][t] = a[t].mul_acc(ws[s], acc[s][t]) }
-        }
+        for s in 0..4 { let a = &data[(4 * q + s) * ld..][..NARROW]; for t in 0..NARROW { acc[s][t] = a[t].mul_acc(ws[s], acc[s][t]) } }
     }
     for (p, &wp) in rest.iter().enumerate() {
         let a = &data[(4 * quads.len() + p) * ld..][..NARROW];
@@ -1017,7 +1025,8 @@ fn by_vector<T: Tiled>(c: &mut [T], ldc: usize, a: Matrix<'_, T>, alpha: T, b: M
     let flip = T::COMPLEX && conj != matches!(vector.op, Op::Adjoint | Op::Conjugate);
     let stride = if vector.op.transposed() { vector.ld } else { 1 };
     let x: Cow<'_, [T]> = if stride == 1 && !flip { Cow::Borrowed(&vector.data[..k]) }
-        else { (0..k).map(|p| if flip { vector.data[p * stride].conj() } else { vector.data[p * stride] }).collect() };
+    else { (0..k).map(|p| if flip { vector.data[p * stride].conj() }
+    else { vector.data[p * stride] }).collect() };
     let (data, ld, unit) = (matrix.data, matrix.ld, (VECTOR_WORK / k).max(1).next_multiple_of(4));
     let (one, start) = (alpha == T::one(), beta == T::zero());
     let direct = step == 1 && one && start && !conj;
@@ -1044,7 +1053,10 @@ fn by_vector<T: Tiled>(c: &mut [T], ldc: usize, a: Matrix<'_, T>, alpha: T, b: M
             }
         }
     } else {
-        let dots = match k { 1 => narrow_dots::<T, 1>, 2 => narrow_dots::<T, 2>, 3 => narrow_dots::<T, 3>, 4 => narrow_dots::<T, 4>, 5 => narrow_dots::<T, 5>, 6 => narrow_dots::<T, 6>, 7 => narrow_dots::<T, 7>, 8 => narrow_dots::<T, 8>, _ => dots::<T> };
+        let dots = match k {
+            1 => narrow_dots::<T, 1>, 2 => narrow_dots::<T, 2>, 3 => narrow_dots::<T, 3>, 4 => narrow_dots::<T, 4>, 5 => narrow_dots::<T, 5>,
+            6 => narrow_dots::<T, 6>, 7 => narrow_dots::<T, 7>, 8 => narrow_dots::<T, 8>, _ => dots::<T>
+        };
         parallel::split(y, unit, &|first, part| { dots(part, data, ld, first, &x); true });
     }
     if direct { return true; }
@@ -1388,9 +1400,15 @@ fn product<T: Copy + Default + Send + Sync, P: Pair<T>, const MR: usize, const N
                                     let at = |r: usize| (ic - i0 + ir + r) * ldc + jc + jr;
                                     let mut t = [[P::UNIT; NR]; MR];
                                     // A whole row moves as one run of `NR` items, which compiles to vector moves. Item by item, each move compiles to a scalar load, a store and a bounds check.
-                                    if load { for r in 0..rows { if cols == NR { t[r].copy_from_slice(&band[at(r)..][..NR]) } else { for s in 0..cols { t[r][s] = band[at(r) + s] } } } }
+                                    if load {
+                                        for r in 0..rows {
+                                            if cols == NR { t[r].copy_from_slice(&band[at(r)..][..NR]) } else { for s in 0..cols { t[r][s] = band[at(r) + s] } }
+                                        }
+                                    }
                                     kernel(&ap[ir * kc..(ir + MR) * kc], bj, &mut t, !load);
-                                    for r in 0..rows { if cols == NR { band[at(r)..][..NR].copy_from_slice(&t[r]) } else { for s in 0..cols { band[at(r) + s] = t[r][s] } } }
+                                    for r in 0..rows {
+                                        if cols == NR { band[at(r)..][..NR].copy_from_slice(&t[r]) } else { for s in 0..cols { band[at(r) + s] = t[r][s] } }
+                                    }
                                 }
                             }
                         }

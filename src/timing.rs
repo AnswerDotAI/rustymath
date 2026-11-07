@@ -2,7 +2,7 @@
 //!
 //! The lock keeps timings apart from builds and test runs on one machine. A timing takes it exclusively. A build or a test run takes it shared. It is an `flock` on the file `LOCK`. A timing holds a second file, `GATE`, exclusively from before it takes `LOCK` until it releases it, and a shared hold passes `GATE` before it takes `LOCK`. A waiting timing then stops new builds and test runs from starting, and it runs once the holds already taken end. `fastws.timelock` takes the same locks from Python. The browser build has no timing lock.
 #[cfg(not(target_arch = "wasm32"))]
-pub use lock::{GATE, Hold, LOCK, exclusive, shared};
+pub use lock::{GATE, Hold, LOCK, exclusive, hold_at, shared};
 /// The clock that timings and `parallel`'s rounds read: the browser's in a browser build, where `std::time::Instant` panics.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) use std::time::Instant;
@@ -41,6 +41,9 @@ const CI_CPU: &str = "AMD Ryzen 9 7950X3D 16-Core Processor";
 /// The CPU of the development Mac, on which the macOS budgets were set.
 const DEV_CPU: &str = "Apple M5 Max";
 
+/// The authoritative x86 budget CPU for native and browser timings on Syd1.
+const SYD1_CPU: &str = "Intel(R) Xeon(R) Silver 4216 CPU @ 2.10GHz";
+
 /// The copy times of the machines that run the speed tests in native builds, for copies whose source and destination fit in `CACHED_BYTES`: the CPU's name as [`cpu`] reads it, an item's size in bytes, the number of items, and the time for each item in seconds. Each is at the slower end of what that machine's copy normally takes, which is the copy that the expected costs in the budget files assume. On CI's runner, a copy measured beside each case varied more than 3 times between cases, while every function's own time varied at most 1.18 times. A stored time keeps that noise out of every cost.
 #[cfg(not(target_arch = "wasm32"))]
 pub const COPIES: &[(&str, usize, usize, f64)] = &[
@@ -69,6 +72,11 @@ pub const COPIES: &[(&str, usize, usize, f64)] = &[
     ("AMD EPYC 9V45 96-Core Processor", 8, 1_048_576, 0.12e-9),
     ("AMD EPYC 9V74 80-Core Processor", 8, 65_536, 0.21e-9),
     ("AMD EPYC 9V74 80-Core Processor", 8, 1_048_576, 0.24e-9),
+    // Syd1, 6 November 2026, from copies timed after `warm` under the timing lock, through Python's `Timing.copy` at sizes just past each one and `Timing.footprint`. 8-byte items at 65,536: 0.305 to 0.317 ns, and 0.53 ns when the copy and its gap, 1 MiB, spill from the L2 cache of that size; basedpl's speed runs measured 0.33 to 0.42 ns, and the pre-rewrite baseline 0.423. 4-byte items: 0.089 to 0.138 ns. 16-byte items: 1.22 to 1.26 ns, timed as twice as many 8-byte items, the same bytes and negations. 1,048,576 8-byte items: 0.629 to 0.658 ns.
+    (SYD1_CPU, 8, 65_536, 0.42e-9),
+    (SYD1_CPU, 4, 65_536, 0.14e-9),
+    (SYD1_CPU, 16, 65_536, 1.26e-9),
+    (SYD1_CPU, 8, 1_048_576, 0.66e-9),
 ];
 
 /// [`COPIES`] for the browser build, whose copy runs under the JavaScript engine that runs the build.
@@ -77,6 +85,9 @@ pub const COPIES: &[(&str, usize, usize, f64)] = &[
     // CI's Ubicloud runner under Node's V8, from the copies that `tests/wasm-speed.mjs` measured in seven runs of 22 October 2026: 0.172 to 0.218 ns at 65,536 items, and 0.196 to 0.249 ns at 1,048,576.
     (CI_CPU, 8, 65_536, 0.22e-9),
     (CI_CPU, 8, 1_048_576, 0.25e-9),
+    // Syd1 under Node/V8, 7 November 2026, released BPL O3/ThinLTO: slow end of the warm copies beside all 388 cases.
+    (SYD1_CPU, 8, 65_536, 0.522e-9),
+    (SYD1_CPU, 8, 1_048_576, 0.767e-9),
 ];
 
 /// This machine's CPU, as its operating system names it: `machdep.cpu.brand_string` on macOS. On Linux, it's the first `model name` in `/proc/cpuinfo`, or else the `CPU implementer` and `CPU part` codes that ARM machines give there in place of a model name, as `CPU implementer 0x41, part 0xd49`. In the browser build, it's the name passed to [`name_cpu`]. `None` without a name.
@@ -199,8 +210,7 @@ pub struct Held { pub column: usize, pub cost: f64, pub cause: Cause, pub estima
 pub fn hold(text: &str, holds: &mut Vec<Held>) -> Result<bool, String> {
     let (cause, rest) = match text.split_once(' ') {
         Some((keyword, rest)) if keyword == Cause::Gap.name() => (Cause::Gap, rest),
-        Some((keyword, rest)) if keyword == Cause::Busy.name() => (Cause::Busy, rest),
-        _ => return Ok(false),
+        Some((keyword, rest)) if keyword == Cause::Busy.name() => (Cause::Busy, rest), _ => return Ok(false)
     };
     let fail = || format!("{text:?} should be a column, the cost it's held at, any more columns and costs, then a colon and the reason");
     let (columns, _) = rest.split_once(':').filter(|(_, reason)| !reason.trim().is_empty()).ok_or_else(fail)?;
@@ -241,10 +251,7 @@ impl Budget {
 /// The budget as a speed test's line gives it: `16`, or with the hold and the rule budget, `32 held from 16` or `5.4 busy from 2.5`.
 impl std::fmt::Display for Budget {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self.cause {
-            None => write!(f, "{}", self.value),
-            Some(cause) => write!(f, "{} {} from {}", self.value, cause.name(), self.rule),
-        }
+        match self.cause { None => write!(f, "{}", self.value), Some(cause) => write!(f, "{} {} from {}", self.value, cause.name(), self.rule) }
     }
 }
 
@@ -260,12 +267,15 @@ pub fn cases(text: &str) -> Result<Vec<Listed<'_>>, String> {
         start += whole.len();
         if line.starts_with('#') { hold(line.strip_prefix("# ").unwrap_or_default(), &mut holds)?; continue; }
         if line.is_empty() { continue; }
-        let named = line.strip_prefix('[').and_then(|l| l.split_once(']')).filter(|(name, rest)| !name.contains(' ') && (rest.is_empty() || rest.starts_with(' ')));
+        let named =
+            line.strip_prefix('[').and_then(|l| l.split_once(']')).filter(|(name, rest)| !name.contains(' ') && (rest.is_empty() || rest.starts_with(' ')));
         if let Some((name, _)) = named { section = Some(name); continue; }
         let section = section.ok_or_else(|| format!("{line:?} comes before the first section"))?;
         let mut fields = line.split('\t');
         let (code, budgets): (&str, Vec<&str>) = (fields.next().unwrap_or_default(), fields.collect());
-        if budgets.iter().any(|b| b.parse::<f64>().map_or(true, |b| !b.is_finite() || b < 0.0)) { return Err(format!("{line:?} has a budget that isn't a number")); }
+        if budgets.iter().any(|b| b.parse::<f64>().map_or(true, |b| !b.is_finite() || b < 0.0)) {
+            return Err(format!("{line:?} has a budget that isn't a number"));
+        }
         cases.push(Listed { section, code, budgets, holds: std::mem::take(&mut holds), span });
     }
     if holds.is_empty() { Ok(cases) } else { Err("a held or busy line ends the file, with no case after it".into()) }
@@ -274,8 +284,7 @@ pub fn cases(text: &str) -> Result<Vec<Listed<'_>>, String> {
 /// Each case of `text`, a budget file, as its section, its code and its budget in `column`, as [`Budget::of`] gives it, or with `None` for every case where `column` is `None`. A case with no budget in `column` is an error.
 pub fn budgeted(text: &str, column: Option<usize>) -> Result<Vec<(&str, &str, Option<Budget>)>, String> {
     cases(text)?.into_iter().map(|c| match (column, Budget::of(c.section, &c.budgets, &c.holds, column)) {
-        (Some(i), None) => Err(format!("{} {} has no {} budget", c.section, c.code, COLUMNS[i])),
-        (_, budget) => Ok((c.section, c.code, budget)),
+        (Some(i), None) => Err(format!("{} {} has no {} budget", c.section, c.code, COLUMNS[i])), (_, budget) => Ok((c.section, c.code, budget))
     }).collect()
 }
 
@@ -283,20 +292,17 @@ pub fn budgeted(text: &str, column: Option<usize>) -> Result<Vec<(&str, &str, Op
 pub const RETRY_PAUSES: [f64; 3] = [0.1, 1.0, 10.0];
 
 /// Keeps the calling thread busy for 0.1 s by reading the clock, so that a timing after a pause runs at the core's full speed. An idle core runs slower until it has been busy for a while. A timing's `RUNS` calls of a small case finish within microseconds, before the core speeds up: on the development Mac, cases of 65,536 items that cost 0.74-0.84 copies cost 2.28-3.06 straight after a 10 s pause (30 October 2026). [`retried`] calls it after each pause, and the Python and browser speed tests call it after theirs.
-pub fn warm() {
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_millis(100) {}
-}
+pub fn warm() { let start = Instant::now(); while start.elapsed() < Duration::from_millis(100) {} }
 
-/// Which of a budget file's two native budgets this machine's speed tests compare costs with: 0, for macOS on Apple silicon, where matrix products run on Accelerate, or 1, for Linux on x86-64, as CI's runner is. Other machines, such as Linux on Arm, have no budgets: their speed tests report costs without comparing them. [`checks_budgets`] says whether a cost over its budget fails.
+/// Which of a budget file's two native budgets this machine's speed tests compare costs with: 0, for macOS on Apple silicon, where matrix products run on Accelerate, or 1, for Linux on x86-64, as Syd1 is. Other machines, such as Linux on Arm, have no budgets: their speed tests report costs without comparing them. [`checks_budgets`] says whether a cost over its budget fails.
 pub const NATIVE_COLUMN: Option<usize> = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
     Some(0)
 } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) { Some(1) }
 else { None };
 
-/// The CPU that this build's budgets were set for, as [`cpu`] names it: the development Mac's for macOS on Apple silicon, and CI's runner's for Linux on x86-64 and for the browser build. `None` for a build with no budgets, such as Linux on Arm.
+/// The authoritative budget CPU: Jeremy's development Mac for macOS on Apple silicon, Syd1 for Linux x86-64 and the browser build. `None` for a build without budgets, such as Linux on Arm.
 pub const BUDGET_CPU: Option<&str> = match NATIVE_COLUMN {
-    Some(0) => Some(DEV_CPU), Some(_) => Some(CI_CPU), None if cfg!(target_arch = "wasm32") => Some(CI_CPU), None => None
+    Some(0) => Some(DEV_CPU), Some(_) => Some(SYD1_CPU), None if cfg!(target_arch = "wasm32") => Some(SYD1_CPU), None => None
 };
 
 /// Whether this machine's speed tests fail on a case still over its budget after the retries: only where [`cpu`] is [`BUDGET_CPU`]. On any other CPU they print every cost, then each case still over its budget, marked `over`, and fail on none.
@@ -316,7 +322,9 @@ pub fn retried<T>(mut failures: Vec<T>, mut retime: impl FnMut(Vec<T>, f64) -> V
 #[cfg(not(target_arch = "wasm32"))]
 mod lock {
     use crate::parallel::set_threads;
-    use std::{fs::{File, TryLockError}, io, time::{Duration, Instant}};
+    use std::{cell::RefCell, fs::{File, TryLockError}, io, sync::{Arc, Weak}, time::{Duration, Instant}};
+
+    thread_local! { static HELD: RefCell<(bool, Weak<File>)> = const { RefCell::new((true, Weak::new())) }; }
 
     /// The file whose lock keeps timings apart from builds and test runs.
     pub const LOCK: &str = "/tmp/aai-ws-timing.lock";
@@ -324,9 +332,9 @@ mod lock {
     /// The file that a timing holds exclusively while it waits for `LOCK` and while it holds it. A shared hold locks it for a moment first, so it waits behind any timing.
     pub const GATE: &str = "/tmp/aai-ws-timing.gate";
 
-    /// A hold on the timing lock, released when dropped. The operating system also releases it when its process ends, even by a crash. An exclusive hold runs every call on its calling thread alone until it's dropped, because speed budgets are for one thread.
+    /// A hold on the timing lock, released when dropped. Shared holds acquired by one thread share a file until the last is dropped. Any nesting involving exclusive fails. The operating system also releases holds when their process ends, even by a crash. An exclusive hold runs every call on its calling thread alone until it's dropped, because speed budgets are for one thread.
     pub struct Hold {
-        _file: File,
+        _file: Arc<File>,
         /// `GATE`, which an exclusive hold keeps until it's dropped.
         _gate: Option<File>,
         /// The thread setting that an exclusive hold replaced, to restore when dropped.
@@ -336,45 +344,51 @@ mod lock {
     impl Drop for Hold { fn drop(&mut self) { if let Some(n) = self.threads { set_threads(n); } } }
 
     /// Takes the timing lock exclusively, for a timing. It waits up to 5 minutes for builds, test runs and other timings, then fails. From the start of its wait it holds `GATE`, so no build or test run starts meanwhile. After waiting 30 seconds it prints, once, the other processes that have the lock's file open. On macOS it also sets the calling thread's QoS class to user-interactive. macOS then favours the performance cores for that thread. QoS isn't CPU affinity.
-    pub fn exclusive() -> io::Result<Hold> { hold(false) }
+    pub fn exclusive() -> io::Result<Hold> { hold_at(LOCK, false) }
 
-    /// Takes the timing lock shared, for a build or a test run. It waits behind any timing that holds `GATE` or the lock, for up to 5 minutes, then goes ahead without the lock.
-    pub fn shared() -> io::Result<Hold> { hold(true) }
+    /// Takes the timing lock shared, for a build or a test run. It waits behind any timing that holds `GATE` or the lock, for up to 5 minutes, then fails. A nested shared hold acquired by the same thread reuses its file.
+    pub fn shared() -> io::Result<Hold> { hold_at(LOCK, true) }
 
-    fn hold(shared: bool) -> io::Result<Hold> {
+    /// Takes the timing lock whose file is `lock`, exclusively or `shared`, as [`exclusive`] and [`shared`] take `LOCK`. Its gate is `GATE` for `LOCK`, and `<lock>.gate` for any other file. A test of the protocol holds a file of its own, which no build or timing holds.
+    pub fn hold_at(lock: &str, shared: bool) -> io::Result<Hold> {
+        if let Some((was_shared, file)) = HELD.with(|h| { let h = h.borrow(); h.1.upgrade().map(|f| (h.0, f)) }) {
+            if shared && was_shared { return Ok(Hold { _file: file, _gate: None, threads: None }); }
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "timing locks can only nest shared inside shared"));
+        }
         #[cfg(target_vendor = "apple")]
         if !shared {
             unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
         }
         let open = |path: &str| File::options().create(true).append(true).open(path).map_err(|e| io::Error::new(e.kind(), format!("{path}: {e}")));
-        let (gate, file) = (open(GATE)?, open(LOCK)?);
-        let mut wait = Wait { start: Instant::now(), shared, waiting: false, reported: false, late: false };
-        wait.take(&gate, GATE)?;
-        wait.take(&file, LOCK)?;
-        Ok(Hold { _file: file, _gate: (!shared).then_some(gate), threads: (!shared).then(|| set_threads(1)) })
+        let gate = if lock == LOCK { GATE.into() } else { format!("{lock}.gate") };
+        let (gate_file, file) = (open(&gate)?, open(lock)?);
+        let mut wait = Wait { start: Instant::now(), shared, waiting: false, reported: false };
+        wait.take(&gate_file, &gate)?;
+        wait.take(&file, lock)?;
+        let file = Arc::new(file);
+        HELD.with(|h| *h.borrow_mut() = (shared, Arc::downgrade(&file)));
+        Ok(Hold { _file: file, _gate: (!shared).then_some(gate_file), threads: (!shared).then(|| set_threads(1)) })
     }
 
-    /// One hold's wait for `GATE` and then `LOCK`, against one deadline of 5 minutes.
-    struct Wait { start: Instant, shared: bool, waiting: bool, reported: bool, late: bool }
+    /// One hold's wait for its gate and then its lock, against one deadline of 5 minutes.
+    struct Wait { start: Instant, shared: bool, waiting: bool, reported: bool }
 
     impl Wait {
-        /// Locks `file`, which is the file at `path`, as the hold needs it, waiting while others hold it. After 5 minutes a shared hold goes ahead without it, and an exclusive hold fails.
+        /// Locks `file`, which is the file at `path`, as the hold needs it, waiting up to 5 minutes before failing.
         fn take(&mut self, file: &File, path: &str) -> io::Result<()> {
             let others = if self.shared { "a timing" } else { "a build or another timing" };
             loop {
-                if self.late { return Ok(()); }
                 match if self.shared { file.try_lock_shared() } else { file.try_lock() } {
-                    Ok(()) => return Ok(()), Err(TryLockError::WouldBlock) => {} Err(TryLockError::Error(e)) => return Err(io::Error::new(e.kind(), format!("{path}: {e}")))
+                    Ok(()) => return Ok(()), Err(TryLockError::WouldBlock) => {}
+                    Err(TryLockError::Error(e)) => return Err(io::Error::new(e.kind(), format!("{path}: {e}")))
                 }
                 if self.start.elapsed() > Duration::from_secs(300) {
-                    if !self.shared { return Err(io::Error::new(io::ErrorKind::TimedOut, format!("{others} has held {LOCK} for 5 minutes"))); }
-                    eprintln!("going ahead although {others} still holds {LOCK}");
-                    self.late = true;
-                    return Ok(());
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut, format!("{others} has held {path} for 5 minutes. Processes with it open: {}", users(path))));
                 }
-                if !self.waiting { eprintln!("waiting for {others} to release {LOCK}"); }
+                if !self.waiting { eprintln!("waiting for {others} to release {path}"); }
                 if !self.shared && !self.reported && self.start.elapsed() > Duration::from_secs(30) {
-                    eprintln!("{LOCK} is still taken after 30 seconds. Processes with it open: {}", users());
+                    eprintln!("{path} is still taken after 30 seconds. Processes with it open: {}", users(path));
                     self.reported = true;
                 }
                 self.waiting = true;
@@ -384,8 +398,8 @@ mod lock {
     }
 
     /// The processes other than this one that have the lock's file open, as `pid command` pairs from `lsof`. On macOS, where `lsof` doesn't show `flock` holds, the list also includes any other process waiting for the lock.
-    fn users() -> String {
-        let Ok(out) = std::process::Command::new("lsof").args(["+c", "0", "-F", "pc", LOCK]).output() else {
+    fn users(path: &str) -> String {
+        let Ok(out) = std::process::Command::new("lsof").args(["+c", "0", "-F", "pc", path]).output() else {
             return "unknown, because lsof didn't run".into();
         };
         let (text, me) = (String::from_utf8_lossy(&out.stdout), std::process::id().to_string());

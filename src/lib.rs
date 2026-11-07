@@ -2,19 +2,20 @@
 #![doc = include_str!("lib.md")]
 #[macro_use]
 mod slice;
-pub mod agreement;
 mod arc;
 mod arith;
 #[macro_use]
 pub mod buffer;
+pub mod agreement;
 pub mod array;
 pub mod characters;
 mod complex;
 pub mod convert;
 pub mod create;
-pub mod derivative;
 mod dd;
+pub mod derivative;
 pub mod distribution;
+pub mod domain;
 pub mod error;
 pub mod events;
 pub mod exact;
@@ -52,22 +53,21 @@ mod table;
 pub mod timing;
 pub mod tolerant;
 mod trig;
-#[cfg(accelerate)]
-mod vforce;
 
+pub use arc::{RealAcos, RealAsin};
 pub use arith::{
-    Add, BitAnd, BitNot, BitOr, BitXor, Bitwise, Divide, LeftShift, MathishDivide, Multiply, Nand, Negate, Nor, Not, PiTimes, Reciprocal, RightShift, Subtract,
-    WholeDivide, bitwise,
+    Add, BitAnd, BitOr, Bitwise, Divide, LeftShift, MathishDivide, Multiply, Nand, Negate, Nor, Not, PiTimes, Reciprocal, RightShift, Subtract, bitwise,
 };
 pub use complex::{Cis, divide};
 pub use exp::{Exp, Expm1};
 pub use float::{FUSED, Float, Native};
-pub use ln::{Ln, Log1p, Log2, Log10, Logb, MathishLogb};
+pub use hyperbolic::{RealAcosh, RealAtanh};
+pub use ln::{Ln, Log1p, Log2, Log10, Logb, MathishLogb, RealLn};
 pub use parts::{Abs, Angle, Choose, Clip, Conj, Imag, Isfinite, Isinf, Isnan, Real, Rint, Round, Scale, Sign, Trunc};
-pub use pow::{Exponent, Pow, Root, WholePow, WrappingPow};
-pub use slice::{Arg, Binary, CHUNK, Flipped, Forms, KernelItem, Results, Ternary, Unary, Wrapped, choose, pairs};
-pub use special::{Erfc, Erfcinv, Erfinv};
-pub use sqrts::Sqrt;
+pub use pow::{Exponent, Pow, RealPow, Root};
+pub use slice::{Arg, Binary, CHUNK, Flipped, KernelItem, Results, Ternary, Unary, Wrapped, pairs};
+pub use special::{BetaincAt, Erfc, Erfcinv, Erfinv};
+pub use sqrts::{RealSqrt, RealSqrt1mx2, RealSqrtm1mx2, RealSqrtx2m1, Sqrt};
 pub use trig::{Cos, Sin, Tan};
 /// The crates whose types compact buffers hold, which the exported width macros name.
 pub use {half, num_complex};
@@ -75,15 +75,15 @@ pub use {half, num_complex};
 /// How many items a function handles between checks for an interrupt ([`interrupt::check`]), which keeps the check out of the loop over items.
 pub const BETWEEN_CHECKS: usize = 1024;
 
-/// Declares each function at the crate root, where it multiplies and adds as the target's `FUSED` says, and in `fused` and `unfused`, which choose for themselves. Each entry names the module whose function of the same name implements it, generic over `R: Native` and `const FUSED: bool`. Every wrapper is `#[inline(always)]`, because LLVM leaves a large function such as `gamma` out of line in a caller's loop, and the call stops that loop vectorizing. An entry marked `as` also declares a function object of that name, whose forms rustymath compiles and never inlines into a caller. Its scalar form calls the function, and its slice form runs the function on each item. An entry marked `: total` never gives NaN from arguments that aren't NaN. Its object's body gives a [`Total`](slice::Total) output, and the object's slice loop tests no item. An object with forms of its own, such as [`Pow`], is written with `forms!` beside its function. `function_doc!(ln)` gives an entry's doc by its name. The Python package's functions take their docs from it.
+/// Declares each function at the crate root, where it multiplies and adds as the target's `FUSED` says, and in `fused` and `unfused`, which choose for themselves. Each entry names the module whose function of the same name implements it, generic over `R: Native` and `const FUSED: bool`. Every wrapper is `#[inline(always)]`, because LLVM leaves a large function such as `gamma` out of line in a caller's loop, and the call stops that loop vectorizing. An entry marked `as` also declares a function object of that name, for the facts table's formula. An object with forms, such as [`Pow`] or [`Atan`], is written with `forms!` beside its function. `function_doc!(ln)` gives an entry's doc by its name. The Python package's functions take their docs from it.
 macro_rules! functions {
-    ($($(#[doc = $doc:literal])* $name:ident($($x:ident),+) in $module:ident $(as $object:ident $(: $outcome:ident)?)?;)+) => {
+    ($($(#[doc = $doc:literal])* $name:ident($($x:ident),+) in $module:ident $(as $object:ident)?;)+) => {
         $(
             $(#[doc = $doc])*
             #[inline(always)]
             pub fn $name<F: Float>($($x: F),+) -> F { functions!(@call FUSED, $module, $name, ($($x),+)) }
         )+
-        $(functions!(@object $($object $(: $outcome)?)?; $name, $module, ($($x),+));)+
+        $(functions!(@object $($object)?; $name, $module, ($($x),+));)+
         /// Each function's doc by its name, as `function_doc!(ln)`, with its lines joined by newlines.
         #[macro_export]
         macro_rules! function_doc {
@@ -109,14 +109,11 @@ macro_rules! functions {
         }
     };
     (@object; $name:ident, $module:ident, ($($x:ident),+)) => {};
-    (@object $object:ident $(: $outcome:ident)?; $name:ident, $module:ident, ($($x:ident),+)) => {
-        #[doc = concat!("[`", stringify!($name), "`](crate::", stringify!($name), ") as a function object, with the slice form `many`.")]
+    (@object $object:ident; $name:ident, $module:ident, ($($x:ident),+)) => {
+        #[doc = concat!("[`", stringify!($name), "`](crate::", stringify!($name), ") as a function object.")]
         #[derive(Clone, Copy, Debug)]
         pub struct $object;
-        forms!($object at real: |_, [$($x),+]| functions!(@outcome [$($outcome)?], crate::$module::$name::<_, { crate::FUSED }>($($x),+)));
     };
-    (@outcome [], $e:expr) => { $e };
-    (@outcome [total], $e:expr) => { crate::slice::Total($e) };
     (@call $fused:expr, $module:ident, $name:ident, ($($x:ident),+)) => { F::from_working(crate::$module::$name::<_, { $fused }>($($x.working()),+)) };
 }
 
@@ -146,17 +143,17 @@ functions! {
     /// acos x. A real x gives a result from 0 to π and NaN beyond a magnitude of 1.
     acos(x) in arc as Acos;
     /// atan x. A real x gives a result from -π/2 to π/2.
-    atan(x) in arc as Atan: total;
+    atan(x) in arc as Atan;
     /// The angle of the point (x, y) from the positive x axis, from -π to π, with y first as in C's `atan2`. Zeros and infinities give C99's angles: atan2(±0, -0) is ±π, and atan2(±∞, ±∞) is an odd multiple of ±π/4.
-    atan2(y, x) in arc as Atan2: total;
+    atan2(y, x) in arc as Atan2;
     /// sinh x. It stays finite up to where sinh itself overflows, beyond the point where e^x does.
-    sinh(x) in hyperbolic as Sinh: total;
+    sinh(x) in hyperbolic as Sinh;
     /// cosh x. It stays finite up to where cosh itself overflows, beyond the point where e^x does.
-    cosh(x) in hyperbolic as Cosh: total;
+    cosh(x) in hyperbolic as Cosh;
     /// tanh x.
-    tanh(x) in hyperbolic as Tanh: total;
+    tanh(x) in hyperbolic as Tanh;
     /// asinh x.
-    asinh(x) in hyperbolic as Asinh: total;
+    asinh(x) in hyperbolic as Asinh;
     /// acosh x. A real x below 1 gives NaN.
     acosh(x) in hyperbolic as Acosh;
     /// atanh x. ±1 gives ±∞, and a real x of magnitude beyond 1 gives NaN.
@@ -166,13 +163,13 @@ functions! {
     /// The real nth root of y, computed without rounding 1/n first. A negative y has one only for an odd whole n. n = 0, an infinite n and NaN give NaN.
     root(n, y) in pow;
     /// The cube root of x.
-    cbrt(x) in pow as Cbrt: total;
+    cbrt(x) in pow as Cbrt;
     /// √(x² + y²), with no overflow or underflow in between. An infinite argument gives ∞, even beside NaN.
-    hypot(x, y) in pow as Hypot: total;
+    hypot(x, y) in pow as Hypot;
     /// √(1 - x²), without the digits that squaring x first loses near |x| = 1. A real x of magnitude beyond 1 gives NaN.
     sqrt1mx2(x) in sqrts as Sqrt1mx2;
     /// √(1 + x²), with no overflow where x² would overflow.
-    sqrt1px2(x) in sqrts as Sqrt1px2: total;
+    sqrt1px2(x) in sqrts as Sqrt1px2;
     /// √(x - 1) √(x + 1): √(x² - 1) with the sign of a real x, without the digits that squaring x first loses near |x| = 1. A real x of magnitude below 1 gives NaN.
     sqrtx2m1(x) in sqrts as Sqrtx2m1;
     /// Γ(x). Γ(±0) is ±∞, a negative whole x and -∞ give NaN, and Γ(∞) is ∞.
@@ -180,7 +177,7 @@ functions! {
     /// Γ(x + 1), which is x! for a whole x from 0.
     factorial(x) in special as Factorial;
     /// ln |Γ(x)|. It is ∞ at 0, at the negative whole numbers and at ±∞. Near its zeros at 1 and 2 its error is within 4 ulps of 2, not of the result.
-    lgamma(x) in special as Lgamma: total;
+    lgamma(x) in special as Lgamma;
     /// ψ(x), the digamma function: the derivative of ln Γ(x), Γ′(x)/Γ(x). ψ(+0) is -∞, ψ(-0) is ∞, a negative whole x and -∞ give NaN, and ψ(∞) is ∞. Near its zeros its error is within 4 ulps of 1, not of the result, and below -20 within 4 ulps of ln(1 - x).
     digamma(x) in special as Digamma;
     /// ψ⁽ⁿ⁾(x), the polygamma function: the nth derivative of ψ, for a whole n from 0 to 170. For n from 1, x from 0 down gives NaN, as do a fractional or negative n and an n above 170.
@@ -194,7 +191,7 @@ functions! {
     /// ∂C(n, k)/∂k, the binomial coefficient's slope in k: C(n, k)(ψ(n - k + 1) - ψ(k + 1)). At a whole n from 0 below a whole k, it is the negative of `binom_dn`. Other poles of ψ, as at a negative whole k, give NaN. For a whole k from 0 to 64, its error is within 2k ulps of C(n, k) times ψ(n - k + 1) - ψ(k + 1), plus the error of that difference, so near n = 2k, where the two ψ cancel, its relative error has no bound.
     binom_dk(n, k) in special as BinomDk;
     /// The error function, 2/√π times the integral of e^-t² from 0 to x.
-    erf(x) in special as Erf: total;
+    erf(x) in special as Erf;
     /// 1 - erf(x), without the loss of digits for large x that `1 - erf(x)` has.
     erfc(x) in special;
     /// The x with erf(x) = p. ±1 gives ±∞, and a magnitude beyond 1 gives NaN.

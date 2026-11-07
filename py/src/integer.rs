@@ -30,13 +30,12 @@ fn encode<'py>(py: Python<'py>, bases: &Bound<'py, PyAny>, values: &Bound<'py, P
     give(py, core(digits, &shape)?, false)
 }
 
-/// The `int64` value of each vector of digits along the last axis of `digits`. The first base is unused. A value that doesn't fit `int64` raises `OverflowError`. A vector of digits gives a Python integer.
+/// The `int64` value of each vector of digits along the last axis of `digits`. The first base is unused. A value wraps at `int64`'s range, as BPL's integer `⊥` does. A vector of digits gives a Python integer.
 #[pyfunction]
 fn decode<'py>(py: Python<'py>, bases: &Bound<'py, PyAny>, digits: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     let ((b, bases), (mut shape, digits)) = (integers(bases)?, integers(digits)?);
     radix(&b, &shape)?;
-    let values =
-        released(py, || rustymath::integer::decode(&bases, &digits)).ok_or_else(|| py_err(Error::new(Kind::Overflow, "a decoded value doesn't fit int64")))?;
+    let values = released(py, || rustymath::integer::decode(&bases, &digits));
     shape.pop();
     give(py, core(values, &shape)?, true)
 }

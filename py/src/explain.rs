@@ -1,24 +1,12 @@
-//! Python access to the shared route-event capture.
-use pyo3::prelude::*;
-use rustymath::events::{EventKind, Record, Report, Run, Sink};
+//! Python access to the shared producer-event capture.
+use pyo3::{prelude::*, types::PyDict};
+use rustymath::events::{self, Event, EventKind, Field, Report, Run, Sink};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 #[derive(Default)]
 struct Store(Mutex<Report>);
 impl Store { fn lock(&self) -> MutexGuard<'_, Report> { self.0.lock().unwrap_or_else(PoisonError::into_inner) } }
-impl Sink for Store { fn record(&self, event: Record) { self.lock().record(event); } }
-
-#[pyclass(name = "RouteEvent", module = "rustymath", get_all, frozen)]
-struct RouteEvent { kind: &'static str, route: &'static str, reason: &'static str, calls: usize, items: usize }
-#[pymethods]
-impl RouteEvent {
-    fn __repr__(&self) -> String {
-        format!(
-            "{} {}{} ({} calls, {} items)", self.kind, self.route, if self.reason.is_empty() { String::new() } else { format!(": {}", self.reason) },
-            self.calls, self.items
-        )
-    }
-}
+impl Sink for Store { fn record(&self, event: Event) { self.lock().record(event); } }
 
 #[pyclass(name = "Explanation", module = "rustymath")]
 struct Explanation { store: Arc<Store>, run: Option<Run> }
@@ -35,25 +23,30 @@ impl Explanation {
         if let Some(outer) = outer { for event in &self.store.lock().records { outer.record(event.clone()); } }
     }
     #[getter]
-    fn routes(&self) -> Vec<&'static str> { self.store.lock().records.iter().filter(|r| r.kind == EventKind::Taken).map(|r| r.route.name()).collect() }
+    fn routes(&self) -> Vec<&'static str> { self.store.lock().routes().filter(|r| r.kind == EventKind::Taken).map(|r| r.route.name()).collect() }
     #[getter]
-    fn records(&self) -> Vec<RouteEvent> {
-        self.store.lock().records.iter().map(|r| RouteEvent { kind: r.kind.name(), route: r.route.name(), reason: r.reason, calls: r.calls, items: r.items })
-            .collect()
+    fn records(&self, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
+        let report = self.store.lock().clone();
+        report.records.iter().map(|event| {
+            let record = PyDict::new(py);
+            record.set_item("kind", event.name())?;
+            for ((name, _), field) in events::TABLES[event.table()].1.iter().zip(event.fields()) {
+                match field {
+                    Field::Text(t) => record.set_item(name, t)?, Field::Count(n) => record.set_item(name, n)?, Field::Truth(t) => record.set_item(name, t)?
+                }
+            }
+            Ok(record.unbind())
+        }).collect()
     }
-    /// One line for each record, as its `RouteEvent` displays, or `no route events` where the capture recorded none.
     fn __repr__(&self) -> String {
-        let records = self.records();
-        if records.is_empty() { "no route events".into() } else { records.iter().map(RouteEvent::__repr__).collect::<Vec<_>>().join("\n") }
+        let report = self.store.lock();
+        if report.records.is_empty() { return "no events".into(); }
+        report.records.iter().map(|event| format!("{} {:?}", event.name(), event)).collect::<Vec<_>>().join("\n")
     }
 }
 
-/// Capture route events with `with rm.explain() as report:`. `report.routes` lists routes taken; `report.records` gives their counts, declined optimizations and stopped traces. A report displays its records, one a line. Captures include every thread and must not overlap, apart from nesting on one thread.
+/// Capture producer events with `with rm.explain() as report:`. `routes` lists successes; `records` gives dictionaries of event fields. Capture includes workers and permits nesting on one thread.
 #[pyfunction]
 fn explain() -> Explanation { Explanation { store: Arc::default(), run: None } }
 
-pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<RouteEvent>()?;
-    m.add_class::<Explanation>()?;
-    m.add_function(wrap_pyfunction!(explain, m)?)
-}
+pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> { m.add_class::<Explanation>()?; m.add_function(wrap_pyfunction!(explain, m)?) }

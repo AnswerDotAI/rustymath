@@ -61,13 +61,21 @@ impl Stacked {
 
     /// The stack `a` that the matrix function named `function` takes alone.
     fn matrices<'a>(&self, function: &str, a: ArrayView<'a>) -> Result<Matrices<'a>, Error> {
-        let (compute, store) = self.dtypes(function, &[a])?;
+        let (compute, store) = self.dtypes(function, &[&a])?;
         let layout = a.layout();
         Ok(Matrices { compute, store, layout, size: matrix(function, layout)?, frames: Frames::new(&[(layout, 2)])?, items: a.cast(compute)? })
     }
 
+    /// The LU `factors` and row positions `p` that the matrix function named `function` takes alone.
+    fn lu_factors<'a>(&self, function: &str, factors: ArrayView<'a>, p: &ArrayView<'_>) -> Result<Factored<'a>, Error> {
+        let (compute, store) = self.dtypes(function, &[&factors])?;
+        let (n, positions) = factored(function, factors.layout(), p)?;
+        let frames = Frames::new(&[(factors.layout(), 2), (p.layout(), 1)])?;
+        Ok(Factored { compute, store, n, positions, frames, items: factors.cast(compute)? })
+    }
+
     /// The dtypes that a call of `function` on `args` computes in and gives its results at. It computes in the dtype that rustymath's ladder ([`DType::computes_in`]) gives the arguments' common dtype, where exact numbers compute as floats of the caller's width. Results take the common dtype where it's a float or complex dtype, and the computing dtype otherwise. A Domain error for characters.
-    fn dtypes(&self, function: &str, args: &[ArrayView<'_>]) -> Result<(DType, DType), Error> {
+    fn dtypes(&self, function: &str, args: &[&ArrayView<'_>]) -> Result<(DType, DType), Error> {
         let missing = |d: DType| Error::new(Kind::Domain, format!("{function} doesn't take {}", d.name()));
         let mut common = args[0].dtype();
         for a in &args[1..] { common = common.common(a.dtype()).ok_or_else(|| missing(DType::Character))?; }
@@ -78,7 +86,7 @@ impl Stacked {
 
     #[doc = crate::stacked_doc!(solve)]
     pub fn solve(&self, a: ArrayView<'_>, b: ArrayView<'_>) -> Result<Array, Error> {
-        let (compute, store) = self.dtypes("solve", &[a, b])?;
+        let (compute, store) = self.dtypes("solve", &[&a, &b])?;
         let (la, lb) = (a.layout(), b.layout());
         let (ra, rb) = (la.shape().len(), lb.shape().len());
         let [m, n] = matrix("solve", la)?;
@@ -94,7 +102,7 @@ impl Stacked {
 
     #[doc = crate::stacked_doc!(lstsq)]
     pub fn lstsq(&self, a: ArrayView<'_>, b: ArrayView<'_>) -> Result<(Array, Array), Error> {
-        let (compute, store) = self.dtypes("lstsq", &[a, b])?;
+        let (compute, store) = self.dtypes("lstsq", &[&a, &b])?;
         let (la, lb) = (a.layout(), b.layout());
         let (ra, rb) = (la.shape().len(), lb.shape().len());
         let [m, n] = matrix("lstsq", la)?;
@@ -180,9 +188,9 @@ impl Stacked {
 
     #[doc = crate::stacked_doc!(lu_solve)]
     pub fn lu_solve(&self, factors: ArrayView<'_>, p: ArrayView<'_>, b: ArrayView<'_>) -> Result<Array, Error> {
-        let (compute, store) = self.dtypes("lu_solve", &[factors, b])?;
+        let (compute, store) = self.dtypes("lu_solve", &[&factors, &b])?;
         let (lf, lb) = (factors.layout(), b.layout());
-        let (n, positions) = factored("lu_solve", lf, p)?;
+        let (n, positions) = factored("lu_solve", lf, &p)?;
         let (core, k, vector) = rhs("lu_solve", lb, n)?;
         let frames = Frames::new(&[(lf, 2), (p.layout(), 1), (lb, core)])?;
         let (fi, bi) = (factors.cast(compute)?, b.cast(compute)?);
@@ -197,46 +205,34 @@ impl Stacked {
 
     #[doc = crate::stacked_doc!(lu_inverse)]
     pub fn lu_inverse(&self, factors: ArrayView<'_>, p: ArrayView<'_>) -> Result<Array, Error> {
-        let (compute, store) = self.dtypes("lu_inverse", &[factors])?;
-        let lf = factors.layout();
-        let (n, positions) = factored("lu_inverse", lf, p)?;
-        let frames = Frames::new(&[(lf, 2), (p.layout(), 1)])?;
-        let fi = factors.cast(compute)?;
-        crate::with_inexact!(compute, T => {
-            let (a, p) = (fi.of::<T>(), &positions);
-            let x = self.slots(&frames, n * n, |i, out: &mut [T], _: &mut ()| out.copy_from_slice(&Lu::new(n, &a[frames.items(0, i, n * n)], &p[frames.items(1, i, n)]).inverse()))?;
-            Ok(array(x, &frames.layout, [n, n], store)?)
+        let f = self.lu_factors("lu_inverse", factors, &p)?;
+        crate::with_inexact!(f.compute, T => {
+            let a = f.items.of::<T>();
+            let x = self.slots(&f.frames, f.n * f.n, |i, out: &mut [T], _: &mut ()| out.copy_from_slice(&f.lu(a, i).inverse()))?;
+            Ok(array(x, &f.frames.layout, [f.n, f.n], f.store)?)
         })
     }
 
     #[doc = crate::stacked_doc!(lu_det)]
     pub fn lu_det(&self, factors: ArrayView<'_>, p: ArrayView<'_>) -> Result<Array, Error> {
-        let (compute, store) = self.dtypes("lu_det", &[factors])?;
-        let lf = factors.layout();
-        let (n, positions) = factored("lu_det", lf, p)?;
-        let frames = Frames::new(&[(lf, 2), (p.layout(), 1)])?;
-        let fi = factors.cast(compute)?;
-        crate::with_inexact!(compute, T => {
-            let (a, p) = (fi.of::<T>(), &positions);
-            let d = self.slots(&frames, 1, |i, out: &mut [T], _: &mut ()| out[0] = Lu::new(n, &a[frames.items(0, i, n * n)], &p[frames.items(1, i, n)]).determinant())?;
-            Ok(array(d, &frames.layout, Layout::EMPTY, store)?)
+        let f = self.lu_factors("lu_det", factors, &p)?;
+        crate::with_inexact!(f.compute, T => {
+            let a = f.items.of::<T>();
+            let d = self.slots(&f.frames, 1, |i, out: &mut [T], _: &mut ()| out[0] = f.lu(a, i).determinant())?;
+            Ok(array(d, &f.frames.layout, Layout::EMPTY, f.store)?)
         })
     }
 
     #[doc = crate::stacked_doc!(lu_slogdet)]
     pub fn lu_slogdet(&self, factors: ArrayView<'_>, p: ArrayView<'_>) -> Result<(Array, Array), Error> {
-        let (compute, store) = self.dtypes("lu_slogdet", &[factors])?;
-        let lf = factors.layout();
-        let (n, positions) = factored("lu_slogdet", lf, p)?;
-        let frames = Frames::new(&[(lf, 2), (p.layout(), 1)])?;
-        let fi = factors.cast(compute)?;
-        crate::with_inexact!(compute, T => {
-            let (a, p) = (fi.of::<T>(), &positions);
-            let ((sign, log), _) = stack::<(Vec<T>, Vec<<T as Scalar>::Real>), ()>(frames.count, [1, 1], &|i, (sign, log), _| {
-                (sign[0], log[0]) = Lu::new(n, &a[frames.items(0, i, n * n)], &p[frames.items(1, i, n)]).log_determinant();
+        let f = self.lu_factors("lu_slogdet", factors, &p)?;
+        crate::with_inexact!(f.compute, T => {
+            let a = f.items.of::<T>();
+            let ((sign, log), _) = stack::<(Vec<T>, Vec<<T as Scalar>::Real>), ()>(f.frames.count, [1, 1], &|i, (sign, log), _| {
+                (sign[0], log[0]) = f.lu(a, i).log_determinant();
                 true
             })?;
-            Ok((array(sign, &frames.layout, Layout::EMPTY, store)?, array(log, &frames.layout, Layout::EMPTY, store.real())?))
+            Ok((array(sign, &f.frames.layout, Layout::EMPTY, f.store)?, array(log, &f.frames.layout, Layout::EMPTY, f.store.real())?))
         })
     }
 
@@ -306,9 +302,9 @@ impl Stacked {
 
     #[doc = crate::stacked_doc!(svd_solve)]
     pub fn svd_solve(&self, u: ArrayView<'_>, s: ArrayView<'_>, v: ArrayView<'_>, b: ArrayView<'_>) -> Result<Array, Error> {
-        let (compute, store) = self.dtypes("svd_solve", &[u, s, v, b])?;
+        let (compute, store) = self.dtypes("svd_solve", &[&u, &s, &v, &b])?;
         let (lu, ls, lv, lb) = (u.layout(), s.layout(), v.layout(), b.layout());
-        let ([m, n], p) = factors("svd_solve", u, s, v)?;
+        let ([m, n], p) = factors("svd_solve", &u, &s, &v)?;
         let (core, k, vector) = rhs("svd_solve", lb, m)?;
         let (ru, rv, rb) = (lu.shape().len(), lv.shape().len(), lb.shape().len());
         let frames = Frames::new(&[(lu, 2), (ls, 1), (lv, 2), (lb, core)])?;
@@ -324,9 +320,9 @@ impl Stacked {
 
     #[doc = crate::stacked_doc!(svd_pinv)]
     pub fn svd_pinv(&self, u: ArrayView<'_>, s: ArrayView<'_>, v: ArrayView<'_>) -> Result<Array, Error> {
-        let (compute, store) = self.dtypes("svd_pinv", &[u, s, v])?;
+        let (compute, store) = self.dtypes("svd_pinv", &[&u, &s, &v])?;
         let (lu, ls, lv) = (u.layout(), s.layout(), v.layout());
-        let ([m, n], p) = factors("svd_pinv", u, s, v)?;
+        let ([m, n], p) = factors("svd_pinv", &u, &s, &v)?;
         let (ru, rv) = (lu.shape().len(), lv.shape().len());
         let frames = Frames::new(&[(lu, 2), (ls, 1), (lv, 2)])?;
         let (ui, si, vi) = (u.cast(compute)?, s.cast(compute.real())?, v.cast(compute)?);
@@ -458,7 +454,7 @@ impl Stacked {
 
     #[doc = crate::stacked_doc!(echelon)]
     pub fn echelon(&self, a: ArrayView<'_>, columns: Option<usize>) -> Result<(Array, Array, Array), Error> {
-        let (compute, store) = self.dtypes("echelon", &[a])?;
+        let (compute, store) = self.dtypes("echelon", &[&a])?;
         let &[m, n] = a.layout().shape() else { return Err(Error::new(Kind::Rank, "echelon takes one matrix").into()) };
         let columns = columns.unwrap_or(n);
         let ai = a.cast(compute)?;
@@ -476,6 +472,16 @@ pub fn cells<R: Send, S: Default>(frames: &Frames, f: impl Fn(usize, &mut S) -> 
 
 /// One stack of matrices that a matrix function takes alone, as [`Stacked::matrices`] reads it: its compute and store dtypes, its layout, its matrices' rows and columns, its frames, and its items in the compute dtype.
 struct Matrices<'a> { compute: DType, store: DType, layout: &'a Layout, size: [usize; 2], frames: Frames, items: Items<'a> }
+
+/// LU factors and their row positions, as the `lu_` functions that take nothing else read them ([`Stacked::lu_factors`]): the compute and store dtypes, each matrix's order, the row positions, the frames, and the factors' items in the compute dtype.
+struct Factored<'a> { compute: DType, store: DType, n: usize, positions: Vec<usize>, frames: Frames, items: Items<'a> }
+
+impl Factored<'_> {
+    /// Frame `i`'s factors, read from `a`, the factors' items as `T`.
+    fn lu<'b, T>(&'b self, a: &'b [T], i: usize) -> Lu<T, &'b [T], &'b [usize]> {
+        Lu::new(self.n, &a[self.frames.items(0, i, self.n * self.n)], &self.positions[self.frames.items(1, i, self.n)])
+    }
+}
 
 /// The rows and columns of the matrices in `layout`. A Rank error for fewer than two axes.
 fn matrix(function: &str, layout: &Layout) -> Result<[usize; 2], Error> {
@@ -512,17 +518,17 @@ pub fn paired<'a>(items: Items<'a>, layout: &Layout, axis: usize, with: &Layout,
 }
 
 /// The size of each of `function`'s square factor matrices, laid out by `factors`, and the row positions in `p`, as [`Stacked::lu`] gives them. Positions read as index positions do ([`signed_positions`](crate::structure::signed_positions)), so a float must be a whole number. A Length error where `p`'s cells don't hold that many positions. An Index error for a position outside 0 to the matrices' size.
-fn factored(function: &str, factors: &Layout, p: ArrayView<'_>) -> Result<(usize, Vec<usize>), Error> {
+fn factored(function: &str, factors: &Layout, p: &ArrayView<'_>) -> Result<(usize, Vec<usize>), Error> {
     let n = square(function, matrix(function, factors)?)?;
     if p.layout().shape().last() != Some(&n) { return Err(Error::new(Kind::Length, format!("{function} needs {n} row positions for each matrix"))); }
     let items = p.cast(p.dtype())?;
-    let positions =
-        crate::structure::signed_positions(items.view())?.into_iter().map(|r| usize::try_from(r?).ok().filter(|&r| r < n)).collect::<Option<Vec<_>>>();
+    let positions = crate::structure::signed_positions(items.view(), crate::tolerant::Tolerance::EXACT).into_iter()
+        .map(|r| usize::try_from(r?).ok().filter(|&r| r < n)).collect::<Option<Vec<_>>>();
     Ok((n, positions.ok_or_else(|| Error::new(Kind::Index, format!("{function} needs row positions from 0 to {}", n.saturating_sub(1))))?))
 }
 
 /// The rows and columns of each of `function`'s matrices, from their thin SVD factors `u`, `s` and `v`, as [`Stacked::svd`] gives them, and how many singular values each has. A Length error where the factors' shapes don't fit together, and a Domain error for complex singular values, which `svd` never gives.
-fn factors(function: &str, u: ArrayView<'_>, s: ArrayView<'_>, v: ArrayView<'_>) -> Result<([usize; 2], usize), Error> {
+fn factors(function: &str, u: &ArrayView<'_>, s: &ArrayView<'_>, v: &ArrayView<'_>) -> Result<([usize; 2], usize), Error> {
     if matches!(s.dtype(), DType::Complex(_)) { return Err(Error::new(Kind::Domain, format!("{function} needs real singular values"))); }
     let ([m, p], [n, q]) = (matrix(function, u.layout())?, matrix(function, v.layout())?);
     if p != q || s.layout().shape().last() != Some(&p) {

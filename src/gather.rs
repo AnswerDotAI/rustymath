@@ -25,96 +25,64 @@ pub(crate) fn cycled<T: Copy>(d: &mut Vec<T>, s: &[T], from: usize, n: usize) {
 /// The bytes of whole periods that `cycled` copies at a time, small enough to stay in cache.
 const CYCLE_BLOCK: usize = 32 << 10;
 
-/// Appends each of `items`, converted by `f`, as many times as its count. `counts` holds one count for all the items, or one for each item. The counts are nonnegative and sum to `total`. An item with a count of at most 4 writes four copies where its run starts. The items after it overwrite the copies beyond its count. A larger count fills its run. With a count for each item, a group of 4 items whose counts are all at most 4 writes its copies after one check for the whole group. With a check and a taken branch for each item, the loop's cost varied by about a third with where its code was placed.
+/// Appends `item(j)` for each `j` below `len`, as many times as its count. `counts` holds one count for all the items, or one for each item. The counts are nonnegative and sum to `total`. An item with a count of at most 4 writes four copies where its run starts. The items after it overwrite the copies beyond its count. A larger count fills its run. With a count for each item, a group of 4 items whose counts are all at most 4 writes its copies after one check for the whole group. With a check and a taken branch for each item, the loop's cost varied by about a third with where its code was placed.
 #[inline]
-pub fn repeat<S: Copy, D: Copy>(out: &mut Vec<D>, items: &[S], counts: &[i64], total: usize, f: impl Fn(S) -> D) {
+pub fn repeat<D: Copy, C: Key>(out: &mut Vec<D>, len: usize, counts: &[C], total: usize, item: impl Fn(usize) -> D) {
     crate::slice::appended(out, total, |d| {
         let mut k = 0;
-        let each = |d: &mut [MaybeUninit<D>], k: &mut usize, x: S, n: usize| {
-            let x = MaybeUninit::new(f(x));
+        let each = |d: &mut [MaybeUninit<D>], k: &mut usize, x: D, n: usize| {
+            let x = MaybeUninit::new(x);
             match d[*k..].first_chunk_mut::<4>() { Some(w) if n <= 4 => *w = [x; 4], _ => d[*k..*k + n].fill(x) }
             *k += n;
         };
-        if let [n] = *counts { for &x in items { each(d, &mut k, x, n as usize) } } else {
-            let (groups, rest) = items.as_chunks::<4>();
+        if let [n] = *counts { for j in 0..len { each(d, &mut k, item(j), n.key() as usize) } } else {
             let count_groups = counts.as_chunks::<4>().0;
-            for j in 0..groups.len() {
-                let (g, c) = (groups[j], count_groups[j]);
-                if k + 16 > total || c[0].max(c[1]).max(c[2]).max(c[3]) as u64 > 4 { for i in 0..4 { each(d, &mut k, g[i], c[i] as usize) } continue; }
+            for (g, &c) in count_groups.iter().enumerate().take(len / 4) {
+                let j = 4 * g;
+                if k + 16 > total || c[0].key().max(c[1].key()).max(c[2].key()).max(c[3].key()) as u64 > 4 {
+                    for i in 0..4 { each(d, &mut k, item(j + i), c[i].key() as usize) }
+                    continue;
+                }
                 let w = &mut d[k..k + 16];
                 let mut o = 0;
                 for i in 0..4 {
-                    *w[o..].first_chunk_mut::<4>().expect("each count in the group is at most 4") = [MaybeUninit::new(f(g[i])); 4];
-                    o += c[i] as usize;
+                    *w[o..].first_chunk_mut::<4>().expect("each count in the group is at most 4") = [MaybeUninit::new(item(j + i)); 4];
+                    o += c[i].key() as usize;
                 }
                 k += o;
             }
-            for (&x, &n) in rest.iter().zip(&counts[groups.len() * 4..]) { each(d, &mut k, x, n as usize) }
+            for j in len / 4 * 4..len { each(d, &mut k, item(j), counts[j].key() as usize) }
         }
         assert_eq!(k, total, "the counts must sum to `total`");
     })
 }
 
-/// Appends `item(j)` for each position `j` whose count in `mask` is 1, in order. Every count is 0 or 1, and `total` of them are 1. It suits items read from a slice: where a block of counts holds both 0s and 1s, `written` reads every item in order.
+/// Appends `position(j)` for each position `j` whose count in `mask` is 1, in order. Every count is 0 or 1, and `total` of them are 1. Long runs cost little: a block of 64 counts that are all 0 is skipped, and one whose counts are all 1 is written in one loop. In a block that mixes both, `selected` computes only the selected items. Each count is read by its low bit, which writes every slot whatever the counts hold.
 #[inline]
-pub fn compress<M: Key, D: Copy>(out: &mut Vec<D>, mask: &[M], total: usize, item: impl Fn(usize) -> D) { kept::<false, M, D>(out, mask, total, item) }
-
-/// Appends `position(j)` for each position `j` whose count in `mask` is 1, in order. Every count is 0 or 1, and `total` of them are 1. It suits items computed from `j`: where a block of counts holds both 0s and 1s, `selected` computes only the selected items.
-#[inline]
-pub fn positions<M: Key, D: Copy>(out: &mut Vec<D>, mask: &[M], total: usize, position: impl Fn(usize) -> D) { kept::<true, M, D>(out, mask, total, position) }
-
-/// `compress`, or `positions` with `TABLE`. Long runs cost little: a block of 64 counts that are all 0 is skipped, and one whose counts are all 1 is copied. Without `TABLE`, consecutive blocks that mix both go through `written` in one pass. Each count is read by its low bit, which writes every slot whatever the counts hold.
-#[inline(always)]
-fn kept<const TABLE: bool, M: Key, D: Copy>(out: &mut Vec<D>, mask: &[M], total: usize, item: impl Fn(usize) -> D) {
+pub fn positions<M: Key, D: Copy>(out: &mut Vec<D>, mask: &[M], total: usize, position: impl Fn(usize) -> D) {
     crate::slice::appended(out, total, |d| {
-        // `k` slots are written. Without `TABLE`, the mixed blocks from position `from`, holding `mixed` counts of 1, wait for one pass.
-        let (mut k, mut from, mut mixed) = (0, 0, 0);
+        // `k` slots are written.
+        let mut k = 0;
         for (start, m) in (0..).step_by(64).zip(mask.chunks(64)) {
             // A block's count is at most 64, which fits in a byte. Byte additions vectorize in the widest lanes.
             let mut n = 0u8;
             for x in m { n += x.key() as u8 & 1 }
             let n = usize::from(n);
-            if !TABLE && 0 < n && n < m.len() { mixed += n; continue; }
-            if mixed > 0 { written(&mut d[k..], &mask[from..start], |j| item(from + j)) }
-            (k, mixed, from) = (k + mixed, 0, start + m.len());
-            if n == m.len() { let run = &mut d[k..k + n]; for j in 0..n { run[j].write(item(start + j)); } }
-            else if TABLE {
+            if n == m.len() { let run = &mut d[k..k + n]; for j in 0..n { run[j].write(position(start + j)); } }
+            else if n > 0 {
                 let (blocks, rest) = m.as_chunks::<8>();
                 let mut at = k;
                 for (b, block) in blocks.iter().enumerate() {
                     let start = start + 8 * b;
-                    at = selected(d, at, mask_bits(block), |i| item(start + usize::from(i)));
+                    at = selected(d, at, mask_bits(block), |i| position(start + usize::from(i)));
                 }
                 let (start, last) = (start + 8 * blocks.len(), mask_bits(rest));
-                selected(d, at, last, |i| item(start + usize::from(i)));
+                selected(d, at, last, |i| position(start + usize::from(i)));
             }
             k += n;
         }
-        if mixed > 0 { written(&mut d[k..], &mask[from..], |j| item(from + j)) }
-        assert_eq!(k + mixed, total, "`total` counts must be 1");
+        assert_eq!(k, total, "`total` counts must be 1");
     })
-}
-
-/// Writes `item(j)` into `d`, in order, for each position `j` whose count in `mask` is 1. `d` holds at least as many slots as the counts add up to. Each item is written where it goes if its count is 1, and the next item writes over it if its count is 0, so the loop has no branch on the counts. It takes four counts at a time, so that one addition moves on past all four.
-// Out of line: inlined into `kept`'s loop over blocks, the loop below ran out of x86-64's 16 registers and reloaded six values from the stack for every four counts.
-#[inline(never)]
-fn written<M: Key, D: Copy>(d: &mut [MaybeUninit<D>], mask: &[M], item: impl Fn(usize) -> D) {
-    let count = |m: M| (m.key() & 1) as usize;
-    let (mut j, mut k) = (0, 0);
-    for m in mask.as_chunks::<4>().0 {
-        let Some(w) = d.get_mut(k..k + 4) else { break };
-        let (a, b, c) = (count(m[0]), count(m[1]), count(m[2]));
-        w[0].write(item(j));
-        w[a & 3].write(item(j + 1));
-        w[(a + b) & 3].write(item(j + 2));
-        w[(a + b + c) & 3].write(item(j + 3));
-        k += a + b + c + count(m[3]);
-        j += 4;
-    }
-    for (j, &n) in mask.iter().enumerate().skip(j) {
-        if k < d.len() { d[k].write(item(j)); }
-        k += count(n);
-    }
 }
 
 /// For each mask of 8 bits, the positions of its set bits in ascending order, then zeros.
@@ -315,46 +283,11 @@ fn windows_into<const L: usize, U: Unit>(out: &mut [U], items: &[U], o: usize, s
     }
 }
 
-/// Appends `rows` rows to `out`, each holding a lane of `left`, then a lane of `right`, as two arrays joined along an axis lay out their lanes: lane `r` of a side whose lanes hold `n` items is its items from `r × n` up to `(r + 1) × n`. Rows go in order, straight into `out`'s spare capacity: each result item is written once, with no fill first. Where both sides' lanes hold one length of at most `RUN` items, each row moves as one block of units. Other lanes copy as slices.
-pub fn interleave<T: Item>(out: &mut Vec<T>, [left, right]: [&[T]; 2], [m, n]: [usize; 2], rows: usize) {
-    assert!(left.len() == rows * m && right.len() == rows * n, "each side holds one lane for every row");
-    let (left, right) = (units(left), units(right));
-    crate::slice::appended(out, rows * (m + n), |slots| {
-        // SAFETY: each unit written below is a unit of an item, read through `units`.
-        let slots = unsafe { written_as::<MaybeUninit<T>, MaybeUninit<T::Unit>>(slots) };
-        if m == n && (1..=RUN).contains(&n) { runs!(n, L => lane_pairs::<L, T::Unit>(slots, left, right)) } else { lane_slices(slots, left, right, m, n) }
-    })
-}
-
-/// [`interleave`]'s rows where both sides' lanes hold `L` units: each lane moves as one block of `L` units.
-#[inline]
-fn lane_pairs<const L: usize, U: Unit>(slots: &mut [MaybeUninit<U>], left: &[U], right: &[U]) {
-    let (a, b, mut to) = (left.as_ptr().cast::<[U; L]>(), right.as_ptr().cast::<[U; L]>(), slots.as_mut_ptr().cast::<[U; L]>());
-    for r in 0..left.len() / L {
-        // SAFETY: each side holds `left.len() / L` lanes of `L` units, and `slots` holds a row of two lanes for each.
-        unsafe {
-            to.write(a.add(r).read());
-            to.add(1).write(b.add(r).read());
-            to = to.add(2)
-        }
-    }
-}
-
-/// [`interleave`]'s rows where the sides' lanes differ in length or are long: each lane copies as a slice.
-fn lane_slices<U: Unit>(slots: &mut [MaybeUninit<U>], left: &[U], right: &[U], m: usize, n: usize) {
-    if m + n == 0 { return; }
-    for (r, row) in slots.chunks_exact_mut(m + n).enumerate() {
-        let (to_left, to_right) = row.split_at_mut(m);
-        for (slot, &u) in to_left.iter_mut().zip(&left[r * m..][..m]) { slot.write(u); }
-        for (slot, &u) in to_right.iter_mut().zip(&right[r * n..][..n]) { slot.write(u); }
-    }
-}
-
-/// Replaces the item of `out` at each offset with the matching one of `items`, converted by `conv`, or with the only one when `items` holds one. A later offset wins. A [`Steps::FILL`] offset writes nothing.
+/// Replaces the item of `out` at each offset with the matching one of `items`, converted by `conv`, or with the only one when `items` holds one. A later offset wins. An out-of-range offset, including [`Steps::FILL`], writes nothing.
 #[inline]
 pub fn scatter<S: Copy, D>(out: &mut [D], offsets: &[usize], items: &[S], conv: impl Convert<S, D>) {
     let items = Arg::of(items);
-    for (k, &o) in offsets.iter().enumerate() { if o != Steps::FILL { out[o] = conv.one(items.nth(k)) } }
+    for (k, &o) in offsets.iter().enumerate() { if let Some(slot) = out.get_mut(o) { *slot = conv.one(items.nth(k)) } }
 }
 /// Replaces the items of `out` that `steps` reach from `base`, in the order that [`walk`] reads them, with the matching ones of `items`, converted by `conv`, or with the only one when `items` holds one. `items` holds one item for each position the steps reach, or one item. A fill position writes nothing. A conversion other than [`Same`] converts a block of items at a time, whole rows of the first axis up to about `CHUNK` items, then writes that block while it's still in cache. Where `D` has a fixed-width loop that converts from `S` ([`Item::cells_from`]), short cells along a stride convert as they write instead, with no separate pass. The walk's fixed-width loops then move items as [`Unit`]s, so they compile once for each size of item, whatever the types and conversion. Rows longer than `RUN` write along a slice each. Short cells write through one table of their offsets, as [`walk`] reads them. Cells that a table of starts picks, each reaching items a stride apart, as columns' do, must be disjoint or identical. They write in blocks of 8 cells, row by row, so each block's writes share the lines they touch, as [`walk`]'s reads do. A later identical cell wins. Other steps write in [`walk`]'s order.
 pub fn scatter_walk<S: Item, D: Item>(out: &mut [D], items: &[S], base: usize, steps: &[Steps], conv: impl Convert<S, D>) {
@@ -534,41 +467,28 @@ impl<'a> Writes<'a> {
     pub fn write<S: Item, D: Item>(self, out: &mut [D], items: &[S], conv: impl Convert<S, D>) {
         match self { Self::Offsets(offsets) => scatter(out, offsets, items, conv), Self::Walk { base, steps } => scatter_walk(out, items, base, steps, conv) }
     }
-    /// Combines the matching item of `values`, or its only item, into the item of `out` at each write by `f`, in order, as `out[o] = f(out[o], y)`. A place that repeats combines again. With addition, this is the transpose of a gather that reads a position more than once.
-    pub fn combine<D: Copy, S: Copy>(self, out: &mut [D], values: Arg<'_, S>, f: impl Fn(D, S) -> D) {
+    /// Combines the matching item of `values`, or its only item, into the item of `out` at each write by `f`, in order, as `out[o] = f(out[o], y).0`. An out-of-range position writes nothing; a place that repeats combines again. With addition, this is the transpose of a gather that reads a position more than once. It gives the last failure that `f` reports.
+    pub fn combine<D: Copy, S: Copy, E: Copy>(self, out: &mut [D], values: Arg<'_, S>, f: impl Fn(D, S) -> (D, Option<E>)) -> Option<E> {
+        let mut failed = None;
         self.runs_while(&mut |k, run| {
-            for (j, &o) in run.iter().enumerate() { if o != Steps::FILL { out[o] = f(out[o], values.nth(k + j)) } }
+            failed = combine_run(out, run, values.part(k, run.len()), &f).or(failed);
             true
         });
+        failed
     }
-    /// [`Writes::combine`] by the reduction `R`: each write steps the item of `out` at its place, the place's running fold, by its value through `R::checked`. A place written more than once folds its values as `R` folds, with `R`'s rule beside NaN. It gives whether every step fits.
-    pub fn fold<R: crate::reduce::Reduction<T, Total = T>, T: Copy>(self, out: &mut [T], values: Arg<'_, T>) -> bool {
-        let fits = std::cell::Cell::new(true);
-        self.combine(out, values, |acc, x| {
-            let (t, f) = R::checked(acc, x);
-            fits.set(fits.get() & f);
-            t
-        });
-        fits.get()
-    }
-    /// [`Writes::combine`] for an `f` that gives `None` for a pair it can't combine. At the first such pair, it restores every item that earlier writes changed and gives false. It restores from a copy of `out` where `out` holds no more items than there are writes, as a histogram's counters do, and otherwise from a record of each item it changes.
-    pub fn try_combine<D: Copy, S: Copy>(self, out: &mut [D], values: Arg<'_, S>, f: impl Fn(D, S) -> Option<D>) -> bool {
-        let saved = (out.len() <= self.len()).then(|| out.to_vec());
-        let mut undo = Vec::new();
-        let ok = self.runs_while(&mut |k, run| {
-            for (j, &o) in run.iter().enumerate() {
-                if o == Steps::FILL { continue; }
-                let Some(new) = f(out[o], values.nth(k + j)) else { return false };
-                if saved.is_none() { undo.push((o, out[o])) }
-                out[o] = new;
-            }
-            true
-        });
-        if !ok {
-            match saved { Some(saved) => out.copy_from_slice(&saved), None => { for (o, old) in undo.into_iter().rev() { out[o] = old } } }
+}
+
+/// [`Writes::combine`] over one run of offsets, with its values. As an argument, `out` tells the compiler that its writes leave what `f` reads unchanged: the loop then reads `f`'s settings once, not at every write.
+fn combine_run<D: Copy, S: Copy, E: Copy>(out: &mut [D], run: &[usize], values: Arg<'_, S>, f: &impl Fn(D, S) -> (D, Option<E>)) -> Option<E> {
+    let mut failed = None;
+    for (j, &o) in run.iter().enumerate() {
+        if let Some(slot) = out.get_mut(o) {
+            let (r, e) = f(*slot, values.nth(j));
+            *slot = r;
+            failed = e.or(failed)
         }
-        ok
     }
+    failed
 }
 
 /// Whether `xs` is 0, 1, 2 and so on: offsets that read a source in order, or an axis order that a transpose leaves unchanged.
@@ -583,39 +503,34 @@ fn padded_parts(start: i128, len: usize, size: usize) -> (usize, usize, usize) {
     ((lo - start).clamp(0, len as i128) as usize, lo as usize, (hi - lo).max(0) as usize)
 }
 
-/// The source offsets that one axis of `walk`'s result reads. Regular patterns are held as a formula, so a long axis needs no table. A `None` offset gives a fill.
+/// The source offsets of one result axis. Regular patterns need no position table; a missing offset reads fill.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Steps {
-    /// `len` offsets from `start`, each `step` further on. A negative step walks backwards.
+    /// Consecutive offsets with a signed step.
     Stride { start: usize, len: usize, step: isize },
-    /// `len` positions from `start` along an axis of `size` items with `stride`, at least one of them outside the axis, which reads by `edge`: a fill, or a position inside the axis. [`Steps::padded`] builds one, and gives a `Stride` for positions that all lie inside.
+    /// Positions along one source axis, reading past its ends under the edge mode.
     Padded { start: i128, len: usize, size: usize, stride: usize, edge: Edge },
-    /// All `len` positions of an axis with `stride`, from position `shift`, wrapping round to the start. [`Steps::rotated`] builds one, and gives a `Stride` for a whole turn.
+    /// A whole source axis beginning at the shift and wrapping to the start.
     Rotated { shift: usize, len: usize, stride: usize },
-    /// Explicit positions, as a [`Table`] holds them.
+    /// Explicit source offsets.
     Table(Table),
 }
 
 /// Index values that a table reads as positions along an axis, converting each one as it reads it, so that the values aren't first copied into a list of offsets. [`Table::indices`] takes them.
-pub trait IndexSource: std::fmt::Debug + Send + Sync {
-    /// The index values, as Booleans, integers, or floats that are whole numbers.
+pub trait IndexSource: Send + Sync {
+    /// The index values, as Booleans or integers ([`IndexValue`]).
     fn view(&self) -> View<'_>;
 }
+impl IndexSource for crate::buffer::Buffer { fn view(&self) -> View<'_> { self.view() } }
 
-/// A value that names a position along an axis: a Boolean, an integer, or a float that is a whole number.
+/// A value that names a position along an axis: a Boolean or an integer. A float index value names the whole number it equals within the comparison tolerance, which [`crate::structure::float_position`] reads before any table holds it.
 pub trait IndexValue: Copy {
     /// The position the value names, where a negative one counts back from the end.
     fn position(self) -> i64;
-    /// Whether the value is a whole number, as every Boolean and integer is.
-    #[inline(always)]
-    fn whole(self) -> bool { true }
-    /// The least and greatest positions that `values` name, which mean nothing where `values` is empty, and whether every value is a whole number.
-    fn bounds(values: &[Self]) -> (i64, i64, bool) {
+    /// The least and greatest positions that `values` name, which mean nothing where `values` is empty.
+    fn bounds(values: &[Self]) -> (i64, i64) {
         // Folding with no branch keeps the loop vectorised.
-        values.iter().fold((i64::MAX, i64::MIN, true), |(lo, hi, whole), &i| {
-            let p = i.position();
-            (lo.min(p), hi.max(p), whole & i.whole())
-        })
+        values.iter().fold((i64::MAX, i64::MIN), |(lo, hi), &i| { let p = i.position(); (lo.min(p), hi.max(p)) })
     }
 }
 impl IndexValue for bool {
@@ -623,40 +538,42 @@ impl IndexValue for bool {
     fn position(self) -> i64 { self.into() }
 }
 macro_rules! index_values {
-    ($($t:ty),*; $($f:ty),*) => {
+    ($($t:ty),*) => {
         $(impl IndexValue for $t {
             #[inline(always)] fn position(self) -> i64 { self.into() }
             // Folding in the integers' own type, before they widen to positions, uses that type's vector lanes.
-            fn bounds(values: &[Self]) -> (i64, i64, bool) { let (lo, hi) = values.iter().fold((<$t>::MAX, <$t>::MIN), |(lo, hi), &i| (lo.min(i), hi.max(i))); (lo.into(), hi.into(), true) }
-        })*
-        $(impl IndexValue for $f {
-            #[inline(always)] fn position(self) -> i64 { crate::float::Float::wide(self) as i64 }
-            // Only a whole number converts to an integer and back unchanged: a fraction, a NaN or an infinity doesn't.
-            #[inline(always)] fn whole(self) -> bool { let x = crate::float::Float::wide(self); x as i64 as f64 == x }
+            fn bounds(values: &[Self]) -> (i64, i64) { let (lo, hi) = values.iter().fold((<$t>::MAX, <$t>::MIN), |(lo, hi), &i| (lo.min(i), hi.max(i))); (lo.into(), hi.into()) }
         })*
     };
 }
-index_values!(i8, i16, i32, i64, u8, u16, u32; crate::half::f16, f32, f64);
+index_values!(i8, i16, i32, i64, u8, u16, u32);
 
 /// Explicit offsets along one axis, with [`Steps::FILL`] where a fill goes: a list of offsets, or index values that each give one. `start` and `len` choose the offsets in use, so that slicing a table copies none of them.
 #[derive(Clone, Debug)]
 pub struct Table { all: Positions, start: usize, len: usize }
 
 /// Where a table's offsets come from: a list, or index values along an axis of `size` positions, each counted back from the end where it's negative, and multiplied by `scale`. `even` holds the first position and the step between positions, where the values give evenly spaced positions.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum Positions { Listed(Arc<Vec<usize>>), Indices { values: Arc<dyn IndexSource>, size: usize, scale: usize, even: Option<(usize, isize)> } }
+impl std::fmt::Debug for Positions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Listed(offsets) => f.debug_tuple("Listed").field(offsets).finish(),
+            Self::Indices { size, scale, even, .. } => f.debug_struct("Indices").field("size", size).field("scale", scale).field("even", even).finish(),
+        }
+    }
+}
 
 /// The most offsets that [`Table::chunks`] converts from index values at a time, into a buffer on the stack.
 const TABLE_CHUNK: usize = 256;
 
-/// `$body` on the index values `$view`, as a slice `$x` of Booleans, integers or floats.
+/// `$body` on the index values `$view`, as a slice `$x` of Booleans or integers. Float index values become positions before they reach a table ([`crate::structure::index_table`]).
 macro_rules! with_index_values {
     ($view:expr, |$x:ident| $body:expr) => {
         match $view {
             View::Booleans($x) => $body,
             View::Integers(ix) => with_ints!(ix, |$x| $body),
-            View::Floats(x) => with_floats!(x, |$x| $body),
-            _ => unreachable!("index values are Booleans, integers or floats"),
+            _ => unreachable!("a table's index values are Booleans or integers"),
         }
     };
 }
@@ -862,6 +779,13 @@ fn converted(view: View<'_>, start: usize, len: usize, size: usize, scale: usize
 }
 
 impl Steps {
+    fn merged(outer: &Self, inner: &Self) -> Option<Self> {
+        let (Self::Stride { start: a, len: m, step: so }, Self::Stride { start: b, len: n, step: si }) = (outer.even()?, inner.even()?) else { return None };
+        (so == si.checked_mul(n as isize)?).then_some(Self::Stride { start: a + b, len: m * n, step: si })
+    }
+}
+
+impl Steps {
     /// The table entry that marks a fill.
     pub const FILL: usize = usize::MAX;
     /// Every position of an axis of `len` items with `stride`, in order.
@@ -881,8 +805,9 @@ impl Steps {
             Self::Rotated { shift, len, stride } => Self::Rotated { shift, len, stride: stride * k }, Self::Table(table) => Self::Table(table.scaled(k))
         }
     }
-    /// `len` positions from `start` along an axis of `size` items with `stride`, read past the axis's ends by `edge`: a `Padded` entry where a position falls outside the axis, the `Rotated` entry for a wrapped stretch as long as the axis, and otherwise the `Stride` that reads the same offsets.
+    /// `len` positions from `start` along an axis of `size` items with `stride`, read past the axis's ends by `edge`: a `Padded` entry where a position falls outside the axis, the `Rotated` entry for a wrapped stretch as long as the axis, a `Stride` of step 0 for an axis of one item that an edge other than `Fill` reads, and otherwise the `Stride` that reads the same offsets.
     pub fn padded(start: i128, len: usize, size: usize, stride: usize, edge: Edge) -> Self {
+        if edge != Edge::Fill && size == 1 { return Self::Stride { start: 0, len, step: 0 }; }
         if edge == Edge::Wrap && len == size && size != 0 { return Self::rotated(start.rem_euclid(size as i128) as usize, len, stride); }
         if start >= 0 && start + len as i128 <= size as i128 { Self::Stride { start: start as usize * stride, len, step: stride as isize } }
         else { Self::Padded { start, len, size, stride, edge } }
@@ -891,7 +816,9 @@ impl Steps {
     pub fn clipped(start: i128, len: usize, size: usize, stride: usize) -> Self { Self::padded(start, len, size, stride, Edge::Fill) }
     /// All `len` positions of an axis with `stride`, from position `shift`, wrapping round: a `Rotated` entry, or the `Stride` that reads the same offsets where the shift is a whole turn.
     pub fn rotated(shift: usize, len: usize, stride: usize) -> Self {
-        if len < 2 || shift % len == 0 { Self::along(len, stride) } else { Self::Rotated { shift: shift % len, len, stride } }
+        if len < 2 { return Self::along(len, stride); }
+        let shift = shift % len;
+        if shift == 0 { Self::along(len, stride) } else { Self::Rotated { shift, len, stride } }
     }
     /// The number of offsets.
     #[inline]
@@ -991,12 +918,12 @@ impl Steps {
         }
         flush(out)
     }
-    /// `steps` without axes of one position, whose offset moves into `base`, and with neighbouring axes merged into one where they step as one axis (`merged`). A table whose offsets step evenly merges as the stride it is (`Steps::even`), and becomes that stride where it's the innermost axis, which `walk_into` and `scatter_into` then reach without the table. An outer table that merges with nothing stays a table, for their routes that take a table of starts.
+    /// Removes single positions into the base and merges neighbouring axes that step as one axis.
     pub(crate) fn simplify<B: std::borrow::Borrow<Self>>(mut base: usize, steps: &[B]) -> (usize, Vec<Cow<'_, Self>>) {
         let mut kept: Vec<Cow<Self>> = Vec::with_capacity(steps.len());
         for s in steps {
             let s = s.borrow();
-            if let Some(o) = if s.len() == 1 { s.get(0) } else { None } { base += o; continue; }
+            if s.len() == 1 && let Some(first) = s.get(0) { base += first; continue; }
             kept.push(Cow::Borrowed(s));
             while let [.., outer, inner] = kept.as_slice() {
                 let Some(merged) = Self::merged(outer, inner) else { break };
@@ -1004,14 +931,9 @@ impl Steps {
                 kept.push(Cow::Owned(merged));
             }
         }
-        let innermost = kept.last().and_then(|s| if let Self::Table(_) = **s { s.even() } else { None });
+        let innermost = kept.last().and_then(|s| if matches!(**s, Self::Table(_)) { s.even() } else { None });
         if let (Some(stride), Some(last)) = (innermost, kept.last_mut()) { *last = Cow::Owned(stride); }
         (base, kept)
-    }
-    /// `outer` and `inner` as one axis, where each step of `outer` moves past one run of `inner`: `outer`'s step is `inner`'s step times `inner`'s length. Adjacent items, runs one stride apart and a broadcast along both qualify. `None` where they don't form one axis.
-    fn merged(outer: &Self, inner: &Self) -> Option<Self> {
-        let (Self::Stride { start: a, len: m, step: so }, Self::Stride { start: b, len: n, step: si }) = (outer.even()?, inner.even()?) else { return None };
-        (so == si * n as isize).then_some(Self::Stride { start: a + b, len: m * n, step: si })
     }
     /// `outer` and `inner` as a transpose, which the tiled `transposed` copy reads: `outer` reads adjacent items and `inner` steps by more than 1. Their combined start, `outer`'s length, `inner`'s length and `inner`'s stride.
     pub(crate) fn transposing(outer: &Self, inner: &Self) -> Option<(usize, usize, usize, usize)> {
@@ -1040,16 +962,16 @@ impl Steps {
         }
         if let Some(Self::Stride { start, .. }) = strides.first_mut() { *start = rest; }
     }
-    /// This axis as one stride: itself where it is a stride, and a table of at least two offsets where none is a fill and each lies the same distance on from the one before. `None` for any other axis.
+    /// This axis as one stride, or None when its offsets do not step evenly.
     pub(crate) fn even(&self) -> Option<Self> {
-        match *self {
-            Self::Stride { start, len, step } => Some(Self::Stride { start, len, step }),
-            Self::Table(ref t) => {
-                let Some(o) = t.listed() else { return t.stride() };
-                let &[first, second, ..] = o else { return None };
+        match self {
+            Self::Stride { .. } => Some(self.clone()),
+            Self::Table(t) => {
+                let Some(offsets) = t.listed() else { return t.stride() };
+                let &[first, second, ..] = offsets else { return None };
                 let step = second.wrapping_sub(first) as isize;
-                let even = first != Self::FILL && o.windows(2).all(|p| p[1] != Self::FILL && p[1].wrapping_sub(p[0]) as isize == step);
-                even.then_some(Self::Stride { start: first, len: o.len(), step })
+                (first != Self::FILL && offsets.windows(2).all(|p| p[1] != Self::FILL && p[1].wrapping_sub(p[0]) as isize == step)).then_some(Self::Stride {
+                    start: first, len: offsets.len(), step })
             }
             _ => None,
         }
@@ -1064,6 +986,17 @@ impl Steps {
             i /= s.len();
         }
         Some(offset)
+    }
+    /// An offset that no item of `steps` passes from `base`: `base` plus each entry's furthest offset, where a fill reaches none and a padded entry stops at the end of its axis. Only a table's entry reads its offsets to find it. `None` where an entry has no items, so the walk reads nothing.
+    pub fn furthest(base: usize, steps: &[impl std::borrow::Borrow<Self>]) -> Option<usize> {
+        steps.iter().try_fold(base, |at, s| {
+            let furthest = match *s.borrow() {
+                ref s if s.len() == 0 => return None, Self::Stride { start, len, step } => start.wrapping_add_signed(step.max(0) * (len - 1) as isize),
+                Self::Padded { size, stride, .. } => size.saturating_sub(1) * stride, Self::Rotated { len, stride, .. } => (len - 1) * stride,
+                Self::Table(ref t) => (0..t.len()).filter_map(|j| t.get(j)).max().unwrap_or(0)
+            };
+            Some(at + furthest)
+        })
     }
     /// The first source offset and stride of items `start..start + n`, where they form one regular run. Singleton axes disappear and neighbouring strides can form one run. Padded and rotated reads must stay within their valid, unwrapped part.
     #[inline]
@@ -1116,7 +1049,7 @@ impl Steps {
     pub fn fills(&self) -> bool { match self { Self::Padded { edge, .. } => *edge == Edge::Fill, Self::Table(t) => t.fills(), _ => false } }
     /// This entry's first offset and step, where it reads its whole axis as one regular run with no fill: a `Stride`, or a `Rotated` entry that doesn't rotate.
     pub fn affine(&self) -> Option<(usize, isize)> { match *self { Self::Stride { start, step, .. } => Some((start, step)), _ => None } }
-    /// Whether a walk through `tables` reads offsets 0, 1, 2 and so on, in order. A copy through such tables of a source with as many items as the walk reads is the source unchanged. Only `Stride` entries that start at 0 qualify.
+    /// Whether a walk through `tables` reads offsets 0, 1, 2 and so on, in order. A copy through such tables of a source with as many items as the walk reads is the source unchanged. Only `Stride` entries that start at 0 qualify, and tables whose offsets run 0, 1, 2 and so on at their axis's stride.
     pub fn in_order(tables: &[Self]) -> bool {
         let mut stride = 1;
         tables.iter().rev().all(|s| match *s {
@@ -1124,6 +1057,15 @@ impl Steps {
                 let ordered = len <= 1 || step == stride as isize;
                 stride *= len;
                 ordered
+            }
+            Self::Table(ref t) => {
+                let (mut j, at) = (0, stride);
+                stride *= t.len();
+                t.all(|o| {
+                    let ordered = o == Some(j * at);
+                    j += 1;
+                    ordered
+                })
             }
             _ => false,
         })
@@ -1174,12 +1116,33 @@ impl Steps {
     pub fn with_base(base: usize, steps: Vec<Self>) -> Vec<Self> {
         if base == 0 { steps } else { std::iter::once(Self::Stride { start: base, len: 1, step: 0 }).chain(steps).collect() }
     }
-    /// `outer`'s reads of an array of `shape`, composed with `inner`, which maps the positions along each axis of `shape` to offsets from `base`: one entry for each of `outer`'s, with the new base. Walking the result reads what walking `inner` and then `outer` reads. `None` where `outer`'s entries don't each walk one axis of `shape` ([`Walk::new`]), where two entries walk one axis that `inner` doesn't map by a `Stride`, or where an entry reads part of an axis that `inner` rotates or clips. Callers then force the copy that `inner` describes, in one walk.
+    /// The lengths for which [`Walk::new`] can give each of `outer`'s entries one axis of `shape`: those of `outer`'s entries after neighbours that step as one merge (`simplify`), with each entry that steps as an axis of `shape` and covers that axis and whole axes outside it split into those axes' lengths, as a reshape of a view of `shape` reads them.
+    fn by_axes(outer: &[Self], shape: &[usize]) -> Vec<usize> {
+        let strides = crate::layout::strides(shape);
+        let (_, merged) = Self::simplify(0, outer);
+        let mut lens = Vec::with_capacity(shape.len());
+        for e in &merged {
+            if let Self::Stride { len, step, .. } = **e && let Some(a) = (0..shape.len()).find(|&a| shape[a] > 1 && strides[a] as isize == step)
+                && len > shape[a] {
+                    let (mut first, mut n) = (a + 1, 1);
+                    while first > 0 && n < len {
+                        first -= 1;
+                        n *= shape[first];
+                    }
+                    if n == len { lens.extend_from_slice(&shape[first..=a]); continue; }
+                }
+            lens.push(e.len());
+        }
+        lens
+    }
+    /// `outer`'s reads of an array of `shape`, composed with `inner`, which maps the positions along each axis of `shape` to offsets from `base`, with the new base. Walking the result reads what walking `inner` and then `outer` reads. Where an entry of `outer` walks several whole axes of `shape`, as a reshape of a view reads them, the walk splits it into one entry for each of those axes (`by_axes`), and the result holds one entry for each. `None` where `outer`'s entries don't each walk one axis of `shape` even so ([`Walk::new`]), where two entries walk one axis that `inner` doesn't map by a `Stride`, or where an entry reads part of an axis that `inner` rotates or clips. Callers then force the copy that `inner` describes, in one walk.
     pub fn through(outer: &[Self], shape: &[usize], mut base: usize, inner: &[Self]) -> Option<(usize, Vec<Self>)> {
-        let Walk { base: at, steps: outer, along: axes, strides } = Walk::new(outer, &outer.iter().map(Self::len).collect::<Vec<_>>(), shape)?;
+        let lens: Vec<usize> = outer.iter().map(Self::len).collect();
+        let Walk { base: at, steps: outer, along: axes, strides } =
+            Walk::new(outer, &lens, shape).or_else(|| Walk::new(outer, &Self::by_axes(outer, shape), shape))?;
         let mut walks = vec![0usize; shape.len()];
         for &a in axes.iter().flatten() { walks[a] += 1; }
-        // Checked before any `read_through`, so that a composition that fails builds no table.
+        // Where two entries walk an axis that `inner` pads (windows over padding, padding over padding, padding over a reversed axis), callers store the padded copy: about 2.1 million items in a forward 3×3 "same" convolution and in the conv gradient speed case, 264,196 in a fold of centred 3×3 windows over a 512×512 grid. A coupled fill-edge form would read through instead, as tinygrad's masked views and XLA's padded windows do: an item's position along a source axis is the sum of the positions of the entries that walk it, and one fill edge checks that sum against the axis's valid range. It would cost about 170 to 290 lines in the walkers, for a gain, unmeasured, of about one stored copy per padded window read. Checked before any `read_through`, so that a composition that fails builds no table.
         if walks.iter().zip(inner).any(|(&w, r)| w > 1 && !matches!(r, Self::Stride { .. })) { return None; }
         // The share of a `Stride`'s offset at position 0 that each entry along its axis takes. The first entry takes all of it. Along an axis that `inner` reads backwards, each later entry starts at its own far end instead, so that its own offsets stay at or above 0, and the first gives that up.
         let (mut first, mut taken) = (vec![None; shape.len()], vec![0; outer.len()]);
@@ -1364,34 +1327,45 @@ unsafe fn written_as<A, B>(items: &mut [A]) -> &mut [B] {
     unsafe { std::slice::from_raw_parts_mut(items.as_mut_ptr().cast(), items.len()) }
 }
 
-/// The sizes, in bytes, of the runs that [`copied`] copies with a loop of its own, on x86-64 Linux with glibc alone. In this range glibc's `memcpy` copies with `rep movsb`, which Zen 3 and Zen 4 run many times slower when the destination sits a little past the source modulo 4 KB (glibc bug 30994, fixed in glibc 2.40). Below it `memcpy` copies with vector loops, and above it with vector loops whose stores bypass the cache. Elsewhere the range is empty: on this Mac, Apple's `memmove` copies about a third faster than the loop.
-const OWN_COPY: std::ops::Range<usize> = if cfg!(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu")) { 4 << 10..1 << 20 } else { 0..0 };
-
-/// Appends the items of `s` to `d`. A run whose size is in [`OWN_COPY`] copies in 64-byte blocks, stored where the destination's cache lines start. Other runs copy with `memcpy`.
-pub(crate) fn copied<T: Item>(d: &mut Vec<T>, s: &[T]) {
-    let bytes = size_of_val(s);
-    if !OWN_COPY.contains(&bytes) { return d.extend_from_slice(s); }
-    crate::slice::appended(d, s.len(), |slots| {
-        // SAFETY: an `Item` has no padding, so every byte of `s` is initialized, and `slots` holds the same number of bytes.
-        let (to, from) = unsafe {
-            (std::slice::from_raw_parts_mut(slots.as_mut_ptr().cast::<MaybeUninit<u8>>(), bytes), std::slice::from_raw_parts(s.as_ptr().cast::<u8>(), bytes))
-        };
-        let bytewise = |to: &mut [MaybeUninit<u8>], from: &[u8]| {
-            for (slot, &byte) in to.iter_mut().zip(from) { slot.write(byte); }
-        };
-        // The blocks start where the destination's cache lines start, so that no store splits across two lines.
-        let head = to.as_ptr().align_offset(64);
-        let ((head_to, to), (head_from, from)) = (to.split_at_mut(head), from.split_at(head));
-        bytewise(head_to, head_from);
-        let ((blocks, tail), (sources, rest)) = (to.as_chunks_mut::<64>(), from.as_chunks::<64>());
-        for (block, source) in blocks.iter_mut().zip(sources) {
-            *block = source.map(MaybeUninit::new);
-            // SAFETY: no instructions. LLVM must assume that they read and write memory, so it keeps the loop instead of a call of `memcpy`.
-            #[cfg(target_arch = "x86_64")]
-            unsafe { std::arch::asm!("", options(nostack, preserves_flags)) }
+/// Appends `rows` rows to `out`, each holding the next lane of each part in turn, as arrays joined along an axis lay out their lanes. Lane `r` of a part whose lanes hold `n` items is its items from `r × n` up to `(r + 1) × n`. Rows go straight into `out`'s spare capacity, so each result item is written once. Where two parts' lanes hold one length of at most `RUN` items, each lane moves as one block of units. Other lanes copy item by item.
+pub fn interleave<T: Item>(out: &mut Vec<T>, parts: &[(&[T], usize)], rows: usize) {
+    assert!(parts.iter().all(|&(items, n)| items.len() == rows * n), "each part holds one lane for every row");
+    let width = parts.iter().map(|&(_, n)| n).sum::<usize>();
+    let parts: Vec<(&[T::Unit], usize)> = parts.iter().map(|&(items, n)| (units(items), n)).collect();
+    crate::slice::appended(out, rows * width, |slots| {
+        // SAFETY: each unit written below is a unit of an item, read through `units`.
+        let slots = unsafe { written_as::<MaybeUninit<T>, MaybeUninit<T::Unit>>(slots) };
+        match *parts {
+            [(a, n), (b, m)] if n == m && (1..=RUN).contains(&n) => runs!(n, L => lane_pairs::<L, T::Unit>(slots, [a, b])),
+            _ => lane_items(slots, &parts, width),
         }
-        bytewise(tail, rest);
     })
+}
+
+/// [`interleave`]'s rows where two parts' lanes hold `L` units: each lane moves as one block, with both sources in registers.
+#[inline]
+fn lane_pairs<const L: usize, U: Unit>(slots: &mut [MaybeUninit<U>], [a, b]: [&[U]; 2]) {
+    let (a, b, mut to) = (a.as_ptr().cast::<[U; L]>(), b.as_ptr().cast::<[U; L]>(), slots.as_mut_ptr().cast::<[U; L]>());
+    for r in 0..slots.len() / (2 * L) {
+        // SAFETY: each part holds a lane of `L` units for each row, and `slots` holds a row of both lanes for each.
+        unsafe {
+            to.write(a.add(r).read());
+            to.add(1).write(b.add(r).read());
+            to = to.add(2)
+        }
+    }
+}
+
+/// [`interleave`]'s rows where the parts are more than two, or their lanes differ in length or are long: each lane copies item by item.
+fn lane_items<U: Unit>(slots: &mut [MaybeUninit<U>], parts: &[(&[U], usize)], width: usize) {
+    if width == 0 { return; }
+    for (r, row) in slots.chunks_exact_mut(width).enumerate() {
+        let mut at = 0;
+        for &(items, n) in parts {
+            for (slot, &u) in row[at..at + n].iter_mut().zip(&items[r * n..][..n]) { slot.write(u); }
+            at += n;
+        }
+    }
 }
 
 /// Writes `items` into `out`, each converted by `conv`, as [`windows_into`] writes units: one cell at each start along a stride of `step` from `at`, with its items where `rest` reaches. Gives `false` where `rest` isn't a short cell (`short_cells`). Only the sources that [`Item::cells_into_f64`] names call it, so its loops compile for those pairs alone.
@@ -1447,8 +1421,9 @@ fn walked<S: Item, D, C: Convert<S, D>>(out: &mut Vec<D>, conv: &C, n: usize, wa
                 true
             });
         }
-        Some(out) => walk(out, 0, n),
+        Some(out) => { out.reserve(n); walk(out, 0, n) }
         None => {
+            out.reserve(n);
             let mut block = Vec::with_capacity(n.min(CHUNK));
             for from in (0..n).step_by(CHUNK) {
                 block.clear();
@@ -1524,7 +1499,7 @@ fn walk_axis<T: Item>(d: &mut Vec<T>, s: &[T], fill: T, base: usize, axis: &Step
         if let Steps::Stride { start: b, len: n, step: 1 } = **inner {
             if n > RUN {
                 d.reserve(axis.len() * n);
-                axis.for_each(|_, o| match o { Some(o) => copied(d, &s[base + b + o..][..n]), None => d.extend(std::iter::repeat_n(fill, n)) });
+                axis.for_each(|_, o| match o { Some(o) => d.extend_from_slice(&s[base + b + o..][..n]), None => d.extend(std::iter::repeat_n(fill, n)) });
                 return;
             }
         }
@@ -1554,7 +1529,7 @@ fn walk_axis<T: Item>(d: &mut Vec<T>, s: &[T], fill: T, base: usize, axis: &Step
     // Each loop gets the source from `base` onwards by value, so that the compiler keeps its bounds in registers. A padded axis whose positions all lie outside an empty source reads nothing from it, whatever its base.
     let s = s.get(base..).unwrap_or_default();
     match *axis {
-        Steps::Stride { start, len, step: 1 } => copied(d, &s[start..start + len]),
+        Steps::Stride { start, len, step: 1 } => d.extend_from_slice(&s[start..start + len]),
         Steps::Stride { start, len, step: -1 } => d.extend(s[start + 1 - len..=start].iter().rev().copied()),
         Steps::Stride { start, len, step: 0 } => d.extend(std::iter::repeat_n(s[start], len)),
         Steps::Stride { start, len, step } => {

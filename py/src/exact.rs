@@ -3,20 +3,14 @@ use crate::convert::{Arg, released};
 use crate::integer::radix;
 use num_rational::BigRational;
 use num_traits::{One, ToPrimitive};
-use pyo3::{exceptions::{PyOverflowError, PyTypeError, PyValueError}, prelude::*, sync::PyOnceLock, types::{PyComplex, PyFloat, PyInt, PyType}};
+use pyo3::{exceptions::{PyOverflowError, PyTypeError, PyValueError}, prelude::*, types::{PyComplex, PyFloat, PyInt}};
 use rustymath::agreement::Agreement;
 use rustymath::error::{Error, Kind};
 use rustymath::layout::Layout;
 use rustymath::{exact, linalg::exact as matrix, polynomial};
-use rustymath_buffer::{py_err, read, walk::{Collect, walked}};
+use rustymath_buffer::{fraction, py_err, rational, read, walk::{Collect, walked}};
 
 type R = BigRational;
-
-/// Python's `fractions.Fraction`.
-fn fraction(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
-    static FRACTION: PyOnceLock<Py<PyType>> = PyOnceLock::new();
-    FRACTION.import(py, "fractions", "Fraction")
-}
 
 fn inexact() -> PyErr { PyTypeError::new_err("exact arithmetic takes integers and fractions.Fraction, not floats") }
 
@@ -36,9 +30,8 @@ impl Collect for Exact {
             return Ok(Some((Rationals(Arg::from(r).items::<i64>()?.iter().map(|&n| R::from_integer(n.into())).collect()), shape)));
         }
         let value = if obj.is_instance_of::<PyInt>() { R::from_integer(obj.extract()?) }
-        else if obj.is_instance(fraction(obj.py())?)? {
-            R::new(obj.getattr("numerator")?.extract()?, obj.getattr("denominator")?.extract()?)
-        } else if obj.is_instance_of::<PyFloat>() || obj.is_instance_of::<PyComplex>() { return Err(inexact()); }
+        else if let Some(r) = rational(obj)? { r }
+        else if obj.is_instance_of::<PyFloat>() || obj.is_instance_of::<PyComplex>() { return Err(inexact()); }
         else { return Ok(None); };
         Ok(Some((Rationals(vec![value]), vec![])))
     }

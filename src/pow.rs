@@ -1,17 +1,56 @@
-//! Powers and roots. `pow` and `root` compute e^(y ln |x|): at f64 through `table`'s logarithm and exponential, and for narrower types through `ln_narrow` and `exp_narrow` in f64. `Exponent` sends a whole exponent from 1 to `MULTIPLIED`, or to `COMPENSATED` where the target fuses multiply-add, to squaring and multiplying instead (`recipe::power`). One of 1 or 3 halves takes √x first. A degree of 2 or 3 takes `sqrt` or `cbrt`. `cbrt` refines an estimate taken from x's bits with Newton steps. `hypot` scales both arguments by a power of two before squaring them. See `THIRD-PARTY.md`.
-use crate::{Arg, dd::Double, exp::exp_narrow, float::Native, ln::ln_narrow, slice::Total, table};
-use num_complex::Complex;
-
+//! Powers and roots use compensated native block forms for their general cases and shared recipes for cheap constant exponents and degrees. Native block loops compute the usual case first, then repair exceptional items. See `THIRD-PARTY.md`.
+use crate::{dd::Double, exp::exp_narrow, float::Native, ln::ln_narrow, recipe::{Ops, root2}, table};
 /// Whether a is finite and nonzero, for an a whose sign bit is clear. 0, ∞ and NaN give false.
 #[inline]
 fn positive_finite(a: f64) -> bool { a.to_bits().wrapping_sub(1) < f64::INFINITY.to_bits() - 1 }
 
-/// Whether y is a whole number, and whether it is an odd one. Infinities count as even whole numbers, and NaN as neither.
 #[inline]
 pub(crate) fn parity<R: Native>(y: R) -> (bool, bool) {
     let half = R::narrow(0.5) * y;
     let whole = y.trunc() == y;
     (whole, whole & (half.trunc() != half))
+}
+
+/// Cheap constant powers lower to the shared recipe; general powers stay native.
+pub(crate) fn formula<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, y: O::V) -> O::V {
+    if let Some(k) = o.constant(y) { if let Some(result) = crate::recipe::power(o, Exponent::of(k.wide(), o.fused()), x) { return result; } }
+    o.binary(crate::recipe::Binary::Power, x, y)
+}
+
+/// Only degrees with a short recipe enter a fused stage. Other roots use the native bulk form.
+pub(crate) fn root_formula<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, n: O::V, y: O::V) -> Option<O::V> {
+    let k = o.constant(n)?;
+    rooted(o, Degree::of(k.wide()), k < F::zero(), y)
+}
+
+/// The route [`Root`] takes for a degree n, chosen by n's magnitude. The slice form reads the route once for a constant n.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Degree { One, Two, Three, Four, Eight, Half, General }
+
+impl Degree {
+    /// The route for degree n.
+    #[inline(always)]
+    fn of(n: f64) -> Self {
+        match n.abs() { 1.0 => Self::One, 2.0 => Self::Two, 3.0 => Self::Three, 4.0 => Self::Four, 8.0 => Self::Eight, 0.5 => Self::Half, _ => Self::General }
+    }
+}
+
+/// The root of degree n of y by n's route `d`. A negative n (`negative`) takes the reciprocal of the route's root. For `Half` it squares y's reciprocal instead.
+#[inline(always)]
+fn rooted<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, d: Degree, negative: bool, y: O::V) -> Option<O::V> {
+    let r = match d {
+        Degree::One => y,
+        Degree::Two => root2(o, y),
+        Degree::Three => cbrt_formula(o, y),
+        Degree::Four => root2(o, root2(o, y)),
+        Degree::Eight => root2(o, root2(o, root2(o, y))),
+        Degree::Half => {
+            let x = if negative { o.reciprocal(y) } else { y };
+            return Some(o.select(o.less(y, o.number(F::zero())), o.number(F::nan()), o.multiply(x, x)));
+        }
+        Degree::General => return None,
+    };
+    Some(if negative { o.reciprocal(r) } else { r })
 }
 
 /// e^(y ln |x|), or e^(ln |x| / y) when `divide`. At f64, ln |x| is a double word from `table`, which keeps the error of the exponent below an ulp of the result after the product or quotient with y. Narrower types compute in f64 with no table, so that loops vectorize where the target has no gathers. There (|x| - 1) × ∞ stands for the logarithm that `ln_narrow` doesn't take: -∞ at 0, ∞ at ∞, and NaN at NaN. It's large, and LLVM would otherwise leave it out of line, which would stop the loops that call it vectorizing.
@@ -34,40 +73,6 @@ fn signed<R: Native>(r: R, x: R, odd: bool, exists: bool) -> R {
     let r = if x.is_sign_negative() & odd { -r } else { r };
     if (x < R::zero()) & (x > R::neg_infinity()) & !exists { R::nan() } else { r }
 }
-
-/// x^y. Special values follow IEEE 754's `pow`: x^0 and 1^y are 1, even for NaN, and a negative x has a power only for a whole y. At f64 it is `pow_one`: the f64 loop reads tables, which targets without gathers run one item at a time anyway. Narrower types have no branch, so the loops that call them vectorize.
-#[inline(always)]
-pub(crate) fn pow<R: Native, const FUSED: bool>(x: R, y: R) -> R { if R::WIDE { pow_one::<R, FUSED>(x, y) } else { pow_any::<R, FUSED>(x, y) } }
-
-/// The real nth root of y, y^(1/n), computed as e^(ln |y| / n) without rounding 1/n first. A negative y has one only for an odd whole n. n = 0, an infinite n and NaN give NaN. It branches as `pow` does.
-#[inline(always)]
-pub(crate) fn root<R: Native, const FUSED: bool>(n: R, y: R) -> R { if R::WIDE { root_one::<R, FUSED>(n, y) } else { root_any::<R, FUSED>(n, y) } }
-
-/// `pow` with one branch to its fast path wherever that applies, at every width, as Arm's scalar `pow` and `powf` do. An exponent that `Exponent::of` doesn't send to the general route takes another branch, to squaring and multiplying. `Pow`'s scalar form takes it, because each call computes one value, which no loop around it can vectorize. At f64 the fast path is `fast`, and at narrower widths `fast_single`.
-#[inline(always)]
-pub(crate) fn pow_one<R: Native, const FUSED: bool>(x: R, y: R) -> R {
-    match Exponent::of(y.wide()) {
-        Exponent::Whole { m, negative } if m > MULTIPLIED => times(Exponent::Whole { m, negative }, x),
-        Exponent::Whole { m, negative: true } => counted!(m, K => times(Exponent::Whole { m: K, negative: true }, x)),
-        Exponent::Whole { m, negative: false } => counted!(m, K => times(Exponent::Whole { m: K, negative: false }, x)),
-        Exponent::Halves { m, negative: true } => halved!(m, K => times(Exponent::Halves { m: K, negative: true }, x)),
-        Exponent::Halves { m, negative: false } => halved!(m, K => times(Exponent::Halves { m: K, negative: false }, x)),
-        Exponent::General => match if R::WIDE { fast::<R, FUSED>(x, y, false) } else { fast_single::<R, FUSED>(x, y, false) } { Some(r) => r, None => pow_any::<R, FUSED>(x, y) },
-    }
-}
-
-/// The root of degree 2, as `recipe::root2` gives it.
-#[inline(always)]
-fn root2<R: Native>(y: R) -> R { crate::recipe::root2::<R, _>(&crate::recipe::Floats, y) }
-
-/// `root` with one branch, as `pow_one` has, and one each to `sqrt` and `cbrt` for degrees 2 and 3. `Root`'s scalar form takes it.
-#[inline(always)]
-pub(crate) fn root_one<R: Native, const FUSED: bool>(n: R, y: R) -> R {
-    if n == R::narrow(2.0) { return root2(y); }
-    if n == R::narrow(3.0) { return cbrt::<R, FUSED>(y); }
-    match if R::WIDE { fast::<R, FUSED>(y, n, true) } else { fast_single::<R, FUSED>(y, n, true) } { Some(r) => r, None => root_any::<R, FUSED>(n, y) }
-}
-
 /// x^y, or the yth root of x when `divide`, where neither function needs a special case, or `None`. x must be positive, finite and nonzero, and y `usable`. At f64 the exponent must also be within `table::NORMAL`, where the result is a normal float. That path skips the selects for special values in `table`'s logarithm and exponential. No branch.
 #[inline(always)]
 fn fast<R: Native, const FUSED: bool>(x: R, y: R, divide: bool) -> Option<R> {
@@ -114,7 +119,24 @@ fn root_any<R: Native, const FUSED: bool>(n: R, y: R) -> R {
     if (n == R::zero()) | !n.is_finite() { R::nan() } else { r }
 }
 
-/// The greatest whole exponent that `pow` raises to by squaring and multiplying in single words (`recipe::multiplied`). Without fused multiply-add, larger exponents take the general route. `Pow`'s slice form compiles a loop for each such exponent (`counted!`).
+/// Scalar powers retain the same exact exponent shortcuts as their block form.
+#[inline]
+pub(crate) fn pow<R: Native, const FUSED: bool>(x: R, y: R) -> R {
+    let o = crate::recipe::NativeOps::<FUSED>::DEFAULT;
+    if let Some(r) = crate::recipe::power(&o, Exponent::of(y.wide(), FUSED), x) { return r; }
+    let r = if R::WIDE { fast::<R, FUSED>(x, y, false) } else { fast_single::<R, FUSED>(x, y, false) };
+    r.unwrap_or_else(|| pow_any::<R, FUSED>(x, y))
+}
+
+/// Scalar roots retain the same short degree recipes as their block form.
+#[inline]
+pub(crate) fn root<R: Native, const FUSED: bool>(n: R, y: R) -> R {
+    if let Some(r) = root_formula(&crate::recipe::NativeOps::<FUSED>::DEFAULT, n, y) { return r; }
+    let r = if R::WIDE { fast::<R, FUSED>(y, n, true) } else { fast_single::<R, FUSED>(y, n, true) };
+    r.unwrap_or_else(|| root_any::<R, FUSED>(n, y))
+}
+
+/// The greatest positive whole exponent that `pow` raises to by squaring and multiplying in single words (`recipe::multiplied`). Larger powers and negative powers below -1 use compensation where multiply-add fuses, otherwise the general route.
 pub(crate) const MULTIPLIED: u32 = 8;
 
 /// The greatest whole exponent that `pow` raises to by squaring and multiplying where the target fuses multiply-add (`FUSED`). Above `MULTIPLIED`, every step but those of bit position 0 runs in double words (`recipe::whole`). Larger exponents take the general route. From 64 on, squaring and multiplying is slower than the general route for some exponents.
@@ -123,149 +145,149 @@ pub(crate) const COMPENSATED: u32 = 63;
 /// How [`Pow`] raises to an exponent y. Its slice form reads it once for a constant y, and its scalar form for each item. The JIT's lowering of a constant power reads it too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exponent {
-    /// x^m, or x^-m where `negative`, by squaring and multiplying (`recipe::power`): a whole y of magnitude m from 1 to `MULTIPLIED`, or to `COMPENSATED` where the target fuses multiply-add. No result fails.
+    /// x^m, or x^-m where `negative`, through `recipe::power`. Positive m goes to `MULTIPLIED`, or `COMPENSATED` with fused multiply-add. Negative powers below -1 need fused multiply-add. No result fails.
     Whole { m: u32, negative: bool },
-    /// √x^m, or 1/√x^m where `negative`: a y of m halves, for m of 1 or 3. √x^3 carries √x's rounding three times and two roundings of its own, within 4 ulps. 1/√x^3 adds the reciprocal's rounding and passes 4 ulps, as rustymath's accuracy page lists. √x gives `pow`'s values at -0 and -∞, and a negative finite x has no real power, as on the general route.
+    /// √x^m, or 1/√x^m where `negative`, for m of 1 or 3. Negative three halves needs fused multiply-add for compensated products. √x gives `pow`'s values at -0 and -∞, and a negative finite x has no real power.
     Halves { m: u32, negative: bool },
     /// Any other y: e^(y ln |x|).
     General,
 }
 
 impl Exponent {
-    /// The route for y.
+    /// The route for y, using compensated products only when the operations fuse multiply-add.
     #[inline(always)]
-    pub fn of(y: f64) -> Self {
+    pub fn of(y: f64, fused: bool) -> Self {
         let (a, negative) = (y.abs(), y < 0.0);
         // Clamped to the range and truncated, a is unchanged only if it's a whole number in that range. That one comparison is one branch. Separate tests compile to separate branches on x86, which mispredict for exponents in a random order.
-        let most = if crate::FUSED { COMPENSATED } else { MULTIPLIED };
+        let most = if fused { COMPENSATED } else if negative { 1 } else { MULTIPLIED };
         let m = a.max(1.0).min(most.into()).trunc();
         if m == a { return Self::Whole { m: m as u32, negative }; }
         let halves = a + a;
-        if (halves == 1.0) | (halves == 3.0) { Self::Halves { m: halves as u32, negative } } else { Self::General }
+        if (halves == 1.0) | ((halves == 3.0) & (!negative | fused)) { Self::Halves { m: halves as u32, negative } } else { Self::General }
     }
 }
 
-/// `$body` with `$k` a const for the magnitude m of `Exponent::Whole`, from 1 to `MULTIPLIED`.
-macro_rules! counted {
-    ($m:expr, $k:ident => $body:expr) => {
-        match $m {
-            1 => { const $k: u32 = 1; $body }
-            2 => { const $k: u32 = 2; $body }
-            3 => { const $k: u32 = 3; $body }
-            4 => { const $k: u32 = 4; $body }
-            5 => { const $k: u32 = 5; $body }
-            6 => { const $k: u32 = 6; $body }
-            7 => { const $k: u32 = 7; $body }
-            _ => { const $k: u32 = 8; $body }
-        }
-    };
-}
-use counted;
-
-/// `$body` with `$k` a const for the count m of `Exponent::Halves`, 1 or 3.
-macro_rules! halved {
-    ($m:expr, $k:ident => $body:expr) => { if $m == 1 { const $k: u32 = 1; $body } else { const $k: u32 = 3; $body } };
-}
-use halved;
-
-/// One `each` loop for each bit length of a whole exponent m from `MULTIPLIED` + 1 to `COMPENSATED`, 4 to 6, and each sign, with a `recipe::step` written out for each bit position below m's highest (`steps!`). Rolled, as LLVM leaves such a loop at opt-level 2, those steps would stop the loop around them vectorizing.
-macro_rules! unrolled {
-    ($m:expr, $negative:expr, $x:expr, $n:expr, $out:expr; $($len:literal: [$($i:literal)+]),+) => {
-        match (u32::BITS - $m.leading_zeros(), $negative) {
-            $(
-                ($len, false) => each!([$x], $n, $out, |[x]| Total(steps!($m, false, x; $($i)+))),
-                ($len, true) => each!([$x], $n, $out, |[x]| Total(steps!($m, true, x; $($i)+))),
-            )+
-            _ => unreachable!("a whole exponent from `MULTIPLIED` + 1 to `COMPENSATED`"),
-        }
-    };
-}
-
-/// `recipe::whole` of `$x`, with a `recipe::step` for each bit position `$i` of `$m`.
-macro_rules! steps {
-    ($m:expr, $negative:literal, $x:expr; $($i:literal)+) => {{
-        let o = &crate::recipe::Floats;
-        let m = $m;
-        let (b, mut error) = crate::recipe::base(o, $negative, $x);
-        let mut w = (b, None);
-        $( w = crate::recipe::step(o, w, b, m, $i, &mut error); )+
-        w.0
-    }};
-}
-
-/// `recipe::power` on one float, for an exponent off the general route. `counted!` and `halved!` make the exponent's magnitude a const in each arm, so each loop unrolls.
+/// `f` of each of `xs` into `out`, at the working precision. Each route's loop inlines it and vectorizes.
 #[inline(always)]
-fn times<R: Native>(e: Exponent, x: R) -> R { crate::recipe::power::<R, _>(&crate::recipe::Floats, e, x).expect("an exponent off the general route") }
-
-/// `Pow`'s slice form, which `WholePow`'s runs too. A constant exponent takes its `Exponent` route. Whole exponents never fail, and their loop vectorizes with no test of each result. Any other call computes every item the fast way, then redoes only the rare items with special values.
-macro_rules! pow_many {
-    ($x:expr, $y:expr, $n:expr, $out:expr) => {
-        match if let Arg::One(k) = $y { Exponent::of(<_ as crate::float::Float>::wide(k)) } else { Exponent::General } {
-            Exponent::Whole { m, negative } if m > MULTIPLIED => unrolled!(m, negative, $x, $n, $out; 4: [2 1 0], 5: [3 2 1 0], 6: [4 3 2 1 0]),
-            Exponent::Whole { m, negative: true } => counted!(m, K => each!([$x], $n, $out, |[x]| Total(times(Exponent::Whole { m: K, negative: true }, x)))),
-            Exponent::Whole { m, negative: false } => counted!(m, K => each!([$x], $n, $out, |[x]| Total(times(Exponent::Whole { m: K, negative: false }, x)))),
-            Exponent::Halves { m, negative: true } => halved!(m, K => each!([$x], $n, $out, |[x]| times(Exponent::Halves { m: K, negative: true }, x))),
-            Exponent::Halves { m, negative: false } => halved!(m, K => each!([$x], $n, $out, |[x]| times(Exponent::Halves { m: K, negative: false }, x))),
-            Exponent::General => two_pass!([$x, $y], $n, $out, |[a, b]| fast::<_, { crate::FUSED }>(a, b, false), |[a, b]| pow_any::<_, { crate::FUSED }>(a, b)),
-        }
-    };
+fn each<F: crate::Float>(xs: &[F], out: &mut [std::mem::MaybeUninit<F>], f: impl Fn(F::Working) -> F::Working) {
+    for (r, &x) in out.iter_mut().zip(xs) { r.write(F::from_working(f(F::working(x)))); }
 }
 
-/// [`pow`](crate::pow) as a function object. Its scalar form takes one branch to a fast path wherever one applies, and its slice form is `pow_many`.
+/// Shared block pass and exceptional-item repair for general powers and roots, including f16 storage.
+#[inline]
+fn general_slice<F: crate::Float>(x: crate::Arg<'_, F>, y: crate::Arg<'_, F>, n: usize, out: &mut [std::mem::MaybeUninit<F>], divide: bool) -> bool {
+    crate::slice::two_pass(
+        [x, y], n, out, #[inline(always)] |[a, b]| fast::<F::Working, { crate::FUSED }>(a.working(), b.working(), divide).map(F::from_working),
+        #[inline(always)] |[a, b]| {
+            F::from_working(if divide { root_any::<F::Working, { crate::FUSED }>(b.working(), a.working()) }
+            else { pow_any::<F::Working, { crate::FUSED }>(a.working(), b.working()) })
+        })
+}
+
+/// `x^k` into `out` for each of `xs`, with `k`'s route (`Exponent::of`) chosen once, at the working precision. Each whole power up to `MULTIPLIED`, each power of halves and the general route have a loop of their own, so squarings unroll and each loop vectorizes. Larger whole powers share one loop.
+pub(crate) fn powers<F: crate::Float>(e: Exponent, k: F, xs: &[F], out: &mut [std::mem::MaybeUninit<F>]) {
+    #[inline(always)]
+    fn route<F: crate::Float>(e: Exponent, xs: &[F], out: &mut [std::mem::MaybeUninit<F>]) {
+        let o = crate::recipe::NativeOps::<{ crate::FUSED }>::DEFAULT;
+        each(xs, out, #[inline(always)] |x| crate::recipe::power(&o, e, x).expect("a route off the general route"));
+    }
+    macro_rules! routes { ($($kind:ident $m:literal),+) => { match e {
+        $(Exponent::$kind { m: $m, negative: false } => route(Exponent::$kind { m: $m, negative: false }, xs, out),
+          Exponent::$kind { m: $m, negative: true } => route(Exponent::$kind { m: $m, negative: true }, xs, out),)+
+        Exponent::General => { general_slice(crate::Arg::Many(xs), crate::Arg::One(k), xs.len(), out, false); }
+        e => route(e, xs, out),
+    } } }
+    routes!(Whole 1, Whole 2, Whole 3, Whole 4, Whole 5, Whole 6, Whole 7, Whole 8, Halves 1, Halves 3);
+}
+
+/// [`Pow`]'s slice form: [`powers`] for a shared exponent, otherwise the general block pass with scalar repair. Returns whether every result is valid: not NaN, or from a NaN argument.
+pub(crate) fn power_slice<F: crate::float::Native>(_: &Pow, [x, y]: [crate::Arg<'_, F>; 2], n: usize, out: &mut [std::mem::MaybeUninit<F>]) -> bool {
+    if let (crate::Arg::Many(xs), crate::Arg::One(k)) = (x, y) {
+        let e = Exponent::of(k.wide(), crate::FUSED);
+        powers(e, k, &xs[..n], &mut out[..n]);
+        return !matches!(e, Exponent::Halves { .. } | Exponent::General) || k.is_nan()
+            || xs[..n].iter().zip(crate::slice::written(&mut out[..n]).iter()).all(|(x, r)| !r.is_nan() || x.is_nan());
+    }
+    general_slice(x, y, n, out, false)
+}
+
+/// The root of degree `n` of each of `ys` into `out`, at the working precision, with `n`'s route (`Degree::of`) chosen once. Each route and sign has its own loop, which vectorizes.
+pub(crate) fn roots<F: crate::Float>(n: F, ys: &[F], out: &mut [std::mem::MaybeUninit<F>]) {
+    let o = crate::recipe::NativeOps::<{ crate::FUSED }>::DEFAULT;
+    macro_rules! routes { ($($d:ident),+) => { match (Degree::of(n.wide()), n < F::zero()) {
+        $((Degree::$d, false) => each(ys, out, #[inline(always)] |y| rooted(&o, Degree::$d, false, y).expect("a degree off the general route")),
+          (Degree::$d, true) => each(ys, out, #[inline(always)] |y| rooted(&o, Degree::$d, true, y).expect("a degree off the general route")),)+
+        (Degree::General, _) => { general_slice(crate::Arg::Many(ys), crate::Arg::One(n), ys.len(), out, true); }
+    } } }
+    routes!(One, Two, Three, Four, Eight, Half);
+}
+
+/// [`Root`]'s slice form: [`roots`] for a shared degree, otherwise the general block pass followed by per-item short-degree recipes. It gives final validity after repair.
+pub(crate) fn root_slice<F: crate::float::Native>(_: &Root, [n, y]: [crate::Arg<'_, F>; 2], len: usize, out: &mut [std::mem::MaybeUninit<F>]) -> bool {
+    if let (crate::Arg::One(k), crate::Arg::Many(ys)) = (n, y) {
+        roots(k, &ys[..len], &mut out[..len]);
+        return matches!(Degree::of(k.wide()), Degree::One | Degree::Three) || k.is_nan()
+            || ys[..len].iter().zip(crate::slice::written(&mut out[..len]).iter()).all(|(y, r)| !r.is_nan() || y.is_nan());
+    }
+    let o = crate::recipe::NativeOps::<{ crate::FUSED }>::DEFAULT;
+    general_slice(y, n, len, out, true);
+    let results = crate::slice::written(&mut out[..len]);
+    for (i, r) in results.iter_mut().enumerate() { if let Some(exact) = root_formula(&o, n.nth(i), y.nth(i)) { *r = exact; } }
+    results.iter().enumerate().all(|(i, r)| !r.is_nan() || n.nth(i).is_nan() || y.nth(i).is_nan())
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Pow;
-forms!(Pow at real: |_, [x, y]| pow_one::<_, { crate::FUSED }>(x, y), many |_, [x, y], n, out| pow_many!(x, y, n, out));
-
-/// [`Pow`] with wrapping integer results. Fractional negative integer powers fail.
 #[derive(Clone, Copy, Debug)]
-pub struct WrappingPow;
-forms!(WrappingPow at real: |_, [x, y]| crate::Binary::one(&Pow, x, y), many |_, [x, y], n, out| crate::slice::Forms::slice(&Pow, [x, y], n, out));
-forms!(WrappingPow at Complex<f32>, Complex<f64>: |_, [x, y]| crate::Binary::one(&Pow, x, y), many |_, [x, y], n, out| crate::slice::Forms::slice(&Pow, [x, y], n, out));
+pub struct RealPow;
 
-/// [`Pow`] for a whole exponent, where every real base has a real power and no result fails. Its forms are `Pow`'s. A caller passes it whole exponents only.
-#[derive(Clone, Copy, Debug)]
-pub struct WholePow;
-forms!(WholePow at real: |_, [x, y]| Total(pow_one::<_, { crate::FUSED }>(x, y)), many |_, [x, y], n, out| crate::slice::Forms::slice(&Pow, [x, y], n, out));
+pub(crate) fn real_formula<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, y: O::V) -> O::V {
+    let r = formula(o, o.magnitude(x), y);
+    let real = o.multiply(r, crate::recipe::sincospi(o, y).1);
+    o.select(o.less(x, o.number(F::zero())), real, r)
+}
 
 /// [`root`](crate::root) as a function object, with a scalar form and a slice form that work as [`Pow`]'s do. A constant degree of 2 or 3 takes `sqrt` or `cbrt`.
 #[derive(Clone, Copy, Debug)]
 pub struct Root;
-forms!(Root at real: |_, [n, y]| root_one::<_, { crate::FUSED }>(n, y),
-many |_, [n, y], count, out| match n {
-    Arg::One(d) if d == 2.0 => each!([y], count, out, |[y]| root2(y)),
-    Arg::One(d) if d == 3.0 => each!([y], count, out, |[y]| cbrt::<_, { crate::FUSED }>(y)),
-    _ => two_pass!([n, y], count, out, |[a, b]| fast::<_, { crate::FUSED }>(b, a, true), |[a, b]| root_any::<_, { crate::FUSED }>(a, b)),
-});
-// A complex degree of 2 takes `Sqrt`, and any other finite degree but 0 takes `Pow` of its reciprocal. A degree of 0 or an infinite degree gives NaN, as the real form does, which fails.
-forms!(Root at Complex<f32>, Complex<f64>: |_, [n, y]| if n == Complex::new(0.0, 0.0) || !n.is_finite() {
-    Complex::new(num_traits::Float::nan(), num_traits::Float::nan())
-} else if n == Complex::new(2.0, 0.0) {
-    crate::Unary::one(&crate::Sqrt, y)
-} else {
-    crate::Binary::one(&Pow, y, crate::divide(Complex::new(1.0, 0.0), n))
-});
 
 /// The top bits of |x|^(-1/3) plus a third of those of |x|, at f64 and at f32, as `top` reads them. The sum is nearly the same for every positive normal x. These values keep `cbrt`'s first estimate within 3.5%.
 const CBRT_MAGIC: [f64; 2] = [1499661097332631.0, 2773273.0];
 
-/// The cube root of x at its own width. The top bits of a positive float grow nearly in proportion to its logarithm. `CBRT_MAGIC` less a third of |x|'s top bits is therefore the top bits of a z near |x|^(-1/3). Newton steps with no division square z's error: three at f64 and two at f32. y = |x| z² is then ∛|x|, which a last step corrects: with ε = y z - 1, ∛|x| is close to y(1 - 2ε/3). A subnormal x scales up first, by 2^54 at f64 and 2^24 at f32, and its root scales down last, by 2^18 or 2^8.
+/// Two or three Newton steps from an inverse-cube-root bit estimate, followed by the product correction that preserves exact cubes.
 #[inline(always)]
-pub(crate) fn cbrt<R: Native, const FUSED: bool>(x: R) -> R {
-    let c = R::narrow;
-    let a = x.abs();
-    let (least, up, down) =
-        if R::WIDE { (f64::MIN_POSITIVE, 18014398509481984.0, 3.814697265625e-6) } else { (f32::MIN_POSITIVE as f64, 16777216.0, 0.00390625) };
-    let sub = a < c(least);
-    let b = if sub { a * c(up) } else { a };
-    let mut z = R::from_top(b.top().mla::<FUSED>(c(-1.0 / 3.0), c(CBRT_MAGIC[usize::from(!R::WIDE)])));
-    for _ in 0..if R::WIDE { 3 } else { 2 } { z = z * ((b * z) * (z * z)).mla::<FUSED>(c(-1.0 / 3.0), c(4.0 / 3.0)); }
-    let y = b * z * z;
-    // Without FMA, y z rounds before the subtraction, which loses ε's low bits. A double-word product keeps them, so that an exact cube gives its root exactly.
-    let e = if FUSED { y.mla::<FUSED>(z, -R::one()) } else { let p = Double::new(y, R::zero()).mul_float::<FUSED>(z); (p.hi - R::one()) + p.lo };
-    let y = (y * c(-2.0 / 3.0)).mla::<FUSED>(e, y) * if sub { c(down) } else { R::one() };
-    // 0, ∞ and NaN give themselves.
-    let y = if positive_finite(a.wide()) { y } else { a };
-    y.copysign(x)
+pub(crate) fn cbrt<R: Native, const FUSED: bool>(x: R) -> R { cbrt_formula(&crate::recipe::NativeOps::<FUSED>::DEFAULT, x) }
+
+pub(crate) fn cbrt_formula<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, x: O::V) -> O::V {
+    use crate::{buffer::FloatWidth, recipe::Integer};
+    let c = |x| o.number(F::narrow(x));
+    let wide = o.width() == FloatWidth::F64;
+    let (mantissa, bits, least, up, down) =
+        if wide { (52, 64, f64::MIN_POSITIVE, 18014398509481984.0, 3.814697265625e-6) } else { (23, 32, f32::MIN_POSITIVE as f64, 16777216.0, 0.00390625) };
+    let a = o.magnitude(x);
+    let sub = o.less(a, c(least));
+    let b = o.select(sub, o.multiply(a, c(up)), a);
+    let top = o.from_integer(o.integer_op(Integer::ShiftRight, o.to_bits(b), o.integer(bits - mantissa)));
+    let t = o.multiply_add(top, c(-1.0 / 3.0), c(CBRT_MAGIC[usize::from(!wide)]));
+    let rounded = o.to_bits(o.add(t, c((1u64 << mantissa) as f64)));
+    let rounded = o.integer_op(Integer::And, rounded, o.integer((1i64 << mantissa) - 1));
+    let mut z = o.from_bits(o.integer_op(Integer::ShiftLeft, rounded, o.integer(bits - mantissa)));
+    for _ in 0..if wide { 3 } else { 2 } { z = o.multiply(z, o.multiply_add(o.multiply(o.multiply(b, z), o.multiply(z, z)), c(-1.0 / 3.0), c(4.0 / 3.0))); }
+    let y = o.multiply(o.multiply(b, z), z);
+    let e = if o.fused() { o.multiply_add(y, z, c(-1.0)) } else {
+        let mask = o.integer(!((1i64 << ((mantissa + 2) / 2)) - 1));
+        let yh = o.from_bits(o.integer_op(Integer::And, o.to_bits(y), mask));
+        let zh = o.from_bits(o.integer_op(Integer::And, o.to_bits(z), mask));
+        let (yl, zl) = (o.subtract(y, yh), o.subtract(z, zh));
+        let p = o.multiply(y, z);
+        let error = o.add(o.add(o.add(o.subtract(o.multiply(yh, zh), p), o.multiply(yl, zh)), o.multiply(yh, zl)), o.multiply(yl, zl));
+        o.add(o.subtract(p, c(1.0)), error)
+    };
+    let y = o.multiply(o.multiply_add(o.multiply(y, c(-2.0 / 3.0)), e, y), o.select(sub, c(down), c(1.0)));
+    let finite = o.and(o.less(c(0.0), a), o.less(a, c(f64::INFINITY)));
+    let y = o.select(finite, y, a);
+    let sign = o.integer_op(Integer::And, o.to_bits(x), o.integer(if wide { i64::MIN } else { i32::MIN as u32 as i64 }));
+    o.from_bits(o.integer_op(Integer::Or, o.to_bits(y), sign))
 }
 
 /// √(x² + y²), without overflow or underflow in between. Both arguments first scale by the power of two that `scales` gives for the larger, which brings it into [2, 4) exactly. Each type computes at its own width. An infinite x or y gives ∞, even beside NaN.

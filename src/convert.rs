@@ -1,8 +1,82 @@
-//! Conversions between floats and integers whose loops vectorize on every target. AVX2 and wasm have no vector instruction for converting between `f64` and a 64-bit integer. AArch64 converts bytes to floats two lanes at a time. A loop that converts such types with `as` runs one item at a time on those targets. [`int`] and [`float`] convert them through a float's bits. They use the conversion instruction for types that every target converts in vector form, and for 64-bit integers where the target can. [`count`] writes runs of whole numbers as floats. Where the target can't convert 64-bit integers in vector form, it converts one item in 8.
+//! Conversions between floats and integers whose loops vectorize on every target. AVX2 and wasm have no vector instruction for converting between `f64` and a 64-bit integer. AArch64 converts bytes to floats two lanes at a time. A loop that converts such types with `as` runs one item at a time on those targets. [`int`] and [`float`] convert them through a float's bits. They use the conversion instruction for types that every target converts in vector form, and for 64-bit integers where the target can. [`count`] writes runs of whole numbers as floats. Where the target can't convert 64-bit integers in vector form, it converts one item in 8. [`saturated`] also converts big integers and `u64`s, saturating them at an integer type's range.
 use crate::float::{Float, sealed::{Core, Sealed}};
+use num_bigint::{BigInt, Sign};
+use num_traits::Bounded;
 
 /// An integer type that [`int`] and [`float`] convert: `i8`, `i16`, `i32`, `i64`, `u8`, `u16` or `u32`.
 pub trait Int: Copy + Sealed + sealed::Ways {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ConversionKind { Cast, Truncate, Bits, Keep }
+
+/// Resolved kinds include the working float width even when the other kind is a word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Conversion { pub input: crate::buffer::DType, pub output: crate::buffer::DType, pub kind: ConversionKind }
+impl Conversion {
+    pub fn validity<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(self, o: &O, x: O::V) -> Option<(crate::error::Kind, O::B)> {
+        use crate::buffer::{DType, Width};
+        if self.kind == ConversionKind::Keep && self.input.is_integral() && self.output.is_integral() {
+            let bounds = |dtype| match dtype {
+                DType::Boolean => (0, 1), DType::Integer(width) => with_width!(width, T => (T::MIN as i64, T::MAX as i64)), _ => unreachable!()
+            };
+            let ((input_lo, input_hi), (lo, hi)) = (bounds(self.input), bounds(self.output));
+            if lo <= input_lo && hi >= input_hi { return None; }
+            let x = o.to_integer(x);
+            let valid = o.and(
+                o.integer_compare(crate::recipe::Cmp::LessEqual, o.integer(lo.max(input_lo)), x),
+                o.integer_compare(crate::recipe::Cmp::LessEqual, x, o.integer(hi.min(input_hi))));
+            return Some((crate::error::Kind::Domain, valid));
+        }
+        if self.kind != ConversionKind::Cast { return None; }
+        let valid = match self.output {
+            DType::Boolean => o.or(o.equal(x, o.number(F::zero())), o.equal(x, o.number(F::one()))),
+            DType::Integer(width) if matches!(self.input, DType::Float(_)) => {
+                let upper = if width == Width::U8 { 256.0 } else { 2f64.powi((8 * self.output.bytes() - 1) as i32) };
+                let lower = if width == Width::U8 { 0.0 } else { -upper };
+                let x = if width == Width::I64 { x } else { o.from_integer(o.to_integer(x)) };
+                o.and(o.less_equal(o.number(F::narrow(lower)), x), o.less(x, o.number(F::narrow(upper))))
+            }
+            _ => return None,
+        };
+        Some((crate::error::Kind::Overflow, valid))
+    }
+    pub fn may_raise(self, checked: bool) -> bool {
+        self.kind == ConversionKind::Keep || checked && (self.output == crate::buffer::DType::Character || self
+                        .validity::<f64, _>(&crate::recipe::RangeOps(self.input), crate::domain::Range::of_dtype(self.input))
+                        .is_some_and(|(_, valid)| valid != Some(true)))
+    }
+    pub fn map(
+        self, input: crate::agreement::Read<'_>, range: std::ops::Range<usize>, checked: bool, output: &mut crate::buffer::Buffer
+    ) -> Result<(), crate::error::Error> {
+        use crate::buffer::{Buffer, DType, FloatWidth, Floats};
+        use crate::error::{Error, Kind};
+        if self.kind == ConversionKind::Cast && !matches!((self.input, self.output), (DType::Integer(_), DType::Integer(_))) {
+            return input.read_into(range, self.output, checked, output);
+        }
+        let mut scratch = Buffer::with_capacity(self.input, 0);
+        let values = input.part_view(range, self.input, checked, &mut scratch)?;
+        *output = match (self.kind, values, self.output) {
+            (ConversionKind::Cast, _, _) => Buffer::cast_results(values, self.output, checked)?,
+            (ConversionKind::Keep, _, _) => Buffer::kept(values, self.output)?,
+            (ConversionKind::Truncate, crate::buffer::View::Floats(_), DType::Integer(_)) => Buffer::cast_results(values, self.output, false)?,
+            (ConversionKind::Bits, crate::buffer::View::Floats(Floats::F32(values)), DType::Integer(crate::buffer::Width::I64)) => {
+                Buffer::Integers(crate::buffer::IntBuf::I64(values.iter().map(|x| i64::from(x.to_bits())).collect()))
+            }
+            (ConversionKind::Bits, crate::buffer::View::Floats(Floats::F64(values)), DType::Integer(crate::buffer::Width::I64)) => {
+                Buffer::Integers(crate::buffer::IntBuf::I64(values.iter().map(|x| x.to_bits() as i64).collect()))
+            }
+            (ConversionKind::Bits, crate::buffer::View::Integers(values), DType::Float(FloatWidth::F32)) => {
+                Buffer::Floats(crate::buffer::FloatBuf::F32((0..values.len()).map(|i| f32::from_bits(values.get(i) as u32)).collect()))
+            }
+            (ConversionKind::Bits, crate::buffer::View::Integers(values), DType::Float(FloatWidth::F64)) => {
+                Buffer::Floats(crate::buffer::FloatBuf::F64((0..values.len()).map(|i| f64::from_bits(values.get(i) as u64)).collect()))
+            }
+            (ConversionKind::Truncate, _, _) if self.input.is_integral() && self.output.is_integral() => Buffer::cast_results(values, self.output, false)?,
+            _ => return Err(Error::new(Kind::Domain, "unsupported resolved conversion")),
+        };
+        Ok(())
+    }
+}
 
 pub(crate) mod sealed {
     /// One integer type's conversions from and to `f32` and `f64`, which [`int`](super::int), [`saturated`](super::saturated) and [`float`](super::float) pick by the float type.
@@ -20,9 +94,22 @@ pub(crate) mod sealed {
 #[inline(always)]
 pub fn int<I: Int, F: Float>(x: F) -> Option<I> { if <F::Working as Core>::WIDE { I::from_f64(x.wide()) } else { I::from_f32(x.wide() as f32) } }
 
-/// `x` as an integer of type `I`, as Rust's `as` converts a float: NaN gives 0, a fraction gives the integer toward 0, and a value past `I`'s range gives its largest or smallest value. A type that fits an `i32` converts in vector form on every target, where `as` would convert one item at a time, as it does from an `f64` on AArch64 and from any float on x86-64.
+/// `x` as an integer of type `I`, or `I`'s largest or smallest value where `x` lies past its range. A float converts as Rust's `as` converts it: NaN gives 0, and a fraction gives the integer toward 0. A type that fits an `i32` converts from a float in vector form on every target, where `as` would convert one item at a time, as it does from an `f64` on AArch64 and from any float on x86-64. [`Saturates`] lists the other sources.
 #[inline(always)]
-pub fn saturated<I: Int, F: Float>(x: F) -> I { if <F::Working as Core>::WIDE { I::saturated_f64(x.wide()) } else { I::saturated_f32(x.wide() as f32) } }
+pub fn saturated<I, S: Saturates<I>>(x: S) -> I { x.saturated() }
+/// A number that [`saturated`] converts to the integer type `I`: a float to any [`Int`], and a big integer or a `u64` to any integer type that `TryFrom` converts it to.
+pub trait Saturates<I> { fn saturated(self) -> I; }
+impl<I: Int, F: Float> Saturates<I> for F {
+    #[inline(always)]
+    fn saturated(self) -> I { if <F::Working as Core>::WIDE { I::saturated_f64(self.wide()) } else { I::saturated_f32(self.wide() as f32) } }
+}
+impl<I: Bounded + for<'a> TryFrom<&'a BigInt>> Saturates<I> for &BigInt {
+    fn saturated(self) -> I { I::try_from(self).unwrap_or_else(|_| if self.sign() == Sign::Minus { I::min_value() } else { I::max_value() }) }
+}
+impl<I: Bounded + TryFrom<u64>> Saturates<I> for u64 { fn saturated(self) -> I { I::try_from(self).unwrap_or_else(|_| I::max_value()) } }
+/// The floor of `x` within `t` as an integer of type `I`, saturated at `I`'s range as [`saturated`] saturates: NaN gives 0. The one float-to-integer rule for conversions that change a number's domain: BPL's `ₓ` marks and Python's `astype` and integer `dtype=`.
+#[inline(always)]
+pub fn floored<I: Int, F: Float>(x: F, t: impl crate::tolerant::Tolerant) -> I { saturated(t.floor(x)) }
 
 /// `i` as the nearest float of type `F`.
 #[inline(always)]

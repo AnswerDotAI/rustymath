@@ -5,9 +5,10 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::pyclass::CompareOp;
 use pyo3::types::{PyComplex, PyTuple};
 use pyo3::{IntoPyObjectExt, ffi, prelude::*};
-use rustymath::array::{Array as Core, ArrayView};
-use rustymath::buffer::{Buffer, Element, FloatWidth, Items, View};
+use rustymath::array::Array as Core;
+use rustymath::buffer::{Buffer, DType, Element, FloatWidth, Items, View};
 use rustymath::layout::Layout;
+use rustymath::tolerant::Exactly;
 use rustymath_buffer::{item, lend, nested, py_err};
 use std::ffi::c_int;
 use std::sync::Arc;
@@ -23,7 +24,7 @@ impl Array {
 
 /// `core` as a Python object: with `scalar`, a rank-0 result is a Python number, and anything else is a `rustymath.Array`. A function passes `scalar` where every argument was a Python scalar, and where its result covers the whole of its arguments, as a reduction of a whole array or one decoded vector of digits does.
 pub fn give(py: Python<'_>, core: Core, scalar: bool) -> PyResult<Bound<'_, PyAny>> {
-    if scalar && core.layout().shape().is_empty() { item(py, core.strided().contiguous().expect("one strided item is contiguous"), 0) }
+    if scalar && core.layout().shape().is_empty() { item(py, core.view().cast(core.dtype()).map_err(py_err)?.view(), 0) }
     else { Ok(Bound::new(py, Array::new(core))?.into_any()) }
 }
 
@@ -48,9 +49,8 @@ fn operand<'py>(other: &Bound<'py, PyAny>, call: impl FnOnce() -> PyResult<Bound
 }
 
 /// Item `i` rounded for display, without changing the stored value or scalar conversions.
-fn shown<'py>(py: Python<'py>, view: ArrayView<'_>, i: usize) -> PyResult<Bound<'py, PyAny>> {
-    let i = view.mapping().get(i).expect("a strided view has no fills");
-    match view.storage() {
+fn shown<'py>(py: Python<'py>, view: View<'_>, i: usize) -> PyResult<Bound<'py, PyAny>> {
+    match view {
         View::Floats(v) => display_float(v.get(i), v.tag()).into_bound_py_any(py),
         View::Complexes(v) => {
             let (z, w) = (v.get(i), v.tag().into());
@@ -163,31 +163,37 @@ array_methods! { folds [sum, prod, max, min, all, any, mean] scans [cumsum, cump
     }
     fn __bool__(&self, py: Python<'_>) -> PyResult<bool> {
         if self.core.len() != 1 { return Err(PyValueError::new_err("an array with other than one item has ambiguous truth")); }
-        let view = self.core.strided();
-        item(py, view.storage(), view.mapping().get(0).expect("a strided view has no fills"))?.is_truthy()
+        let items = self.core.view().cast(self.core.dtype()).map_err(py_err)?;
+        item(py, items.view(), 0)?.is_truthy()
     }
-    /// Selects each axis by an integer, key, slice, mask or index array. Index arrays pair by broadcasting from the front, as arguments do, and their axes take the first array's place. `None` inserts an axis and `...` keeps omitted axes. Basic slices share storage, with independent value semantics. No remaining axes gives a Python scalar.
+    /// Selects each axis by an integer, key, slice or index array. Booleans are positions 0 and 1, as in BPL's indexing. Index arrays pair by broadcasting from the front, as arguments do, and their axes take the first array's place. `None` inserts an axis and `...` keeps omitted axes. Basic slices share storage, with independent value semantics. No remaining axes gives a Python scalar.
     fn __getitem__<'py>(&self, py: Python<'py>, key: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let plan = crate::structure::selection(self.core.layout(), key)?;
         give(py, released(py, || self.core.selected(plan, None)).map_err(py_err)?, true)
     }
     fn __contains__(slf: &Bound<'_, Self>, query: &Bound<'_, PyAny>) -> PyResult<bool> { crate::search::contains(slf.py(), slf, query) }
-    /// Writes through the same selection as indexing, broadcasting from the front. Repeated targets take the last assigned item. Other arrays and existing buffer exports keep their values.
+    /// Writes through the same selection as indexing, broadcasting from the front. A key that the array lacks is added first, holding the fill, as BPL's assignment adds it. Repeated targets take the last assigned item. Other arrays and existing buffer exports keep their values.
     fn __setitem__(slf: &Bound<'_, Self>, key: &Bound<'_, PyAny>, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        let plan = crate::structure::selection(slf.try_borrow()?.core.layout(), key)?;
         // Finish reading/copying first: `value` can be this array, or a buffer that views its items.
         let source = crate::convert::one(value)?.into_core()?;
+        let extended = crate::structure::with_missing_keys(&slf.try_borrow()?.core, key)?;
+        if let Some(core) = extended { slf.try_borrow_mut()?.core = core; }
+        let plan = crate::structure::selection(slf.try_borrow()?.core.layout(), key)?;
         slf.try_borrow_mut()?.core.assign(&plan, &source).map_err(py_err)
     }
     /// The items as nested lists of Python scalars, or one Python scalar for a rank-0 array.
     fn tolist<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let view = self.core.strided();
-        nested(py, view.layout().shape(), &|i| item(py, view.storage(), view.mapping().get(i).expect("a strided view has no fills")))
+        let items = self.core.view().cast(self.core.dtype()).map_err(py_err)?;
+        nested(py, self.core.layout().shape(), &|i| item(py, items.view(), i))
     }
-    /// A copy at `dtype`, a name such as `"float64"`, keeping keys and names. Items convert as `Buffer::cast` converts them: floats to integers truncate toward zero, a value that doesn't fit raises `OverflowError`, and a complex number with an imaginary part, or any conversion to or from characters, raises `ValueError`.
+    /// A copy at `dtype`, a name such as `"float64"`, keeping keys and names. An integer `dtype` converts as BPL's `ₓ` converts (`Buffer::floored`): a float takes its floor and saturates at the integer's range, NaN giving 0, and an integer wraps to the width. Other targets convert as `Buffer::cast` converts them: a complex number with an imaginary part, or any conversion to or from characters, raises `ValueError`.
     fn astype(&self, py: Python<'_>, dtype: &str) -> PyResult<Array> {
         let to = crate::convert::dtype(dtype)?;
-        let buffer = released(py, || self.core.view().cast(to).map(|items| match items { Items::Borrowed(v) => Buffer::copied(v, 0..v.len()), Items::Owned(b) => b })).map_err(py_err)?;
+        let view = self.core.view();
+        let buffer = released(py, || match to {
+            DType::Integer(_) => view.cast(self.core.dtype()).and_then(|items| Buffer::floored(items.view(), to, Exactly)),
+            _ => view.cast(to).map(|items| match items { Items::Borrowed(v) => Buffer::copied(v, 0..v.len()), Items::Owned(b) => b }),
+        }).map_err(py_err)?;
         Ok(Array::new(Core::new(self.core.layout().clone(), buffer).map_err(py_err)?))
     }
     /// Compact items without retaining a larger base allocation. Small views otherwise keep their whole base alive. Keys and names are preserved.
@@ -226,18 +232,23 @@ array_methods! { folds [sum, prod, max, min, all, any, mean] scans [cumsum, cump
     #[pyo3(name = "T")]
     fn transposed(slf: &Bound<'_, Self>) -> PyResult<Array> { crate::structure::transpose(slf.py(), slf.as_any(), None) }
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
-        let mut text = format!("Array({}, dtype={}", nested(py, self.core.layout().shape(), &|i| shown(py, self.core.strided(), i))?.repr()?, self.dtype());
+        let items = self.core.view().cast(self.core.dtype()).map_err(py_err)?;
+        let mut text = format!("Array({}, dtype={}", nested(py, self.core.layout().shape(), &|i| shown(py, items.view(), i))?.repr()?, self.dtype());
         let layout = self.core.layout();
         if layout.has_keys() { text += &format!(", keys={}", self.keys(py)?.repr()?); }
         if layout.names().iter().any(Option::is_some) { text += &format!(", names={}", self.names(py)?.repr()?); }
         Ok(text + ")")
     }
     unsafe fn __getbuffer__(slf: Bound<'_, Self>, view: *mut ffi::Py_buffer, flags: c_int) -> PyResult<()> {
-        let core = slf.borrow().core.clone();
-        let (offset, strides) = core.strided().mapping().affine(core.layout().shape()).expect("a strided view is affine");
+        let mut core = slf.borrow().core.clone();
+        if core.view().affine().is_none() { core = released(slf.py(), || core.compact()); }
+        let (data, offset, strides) = core.view().affine().expect("an export is affine or explicitly compact");
         let (dtype, shape) = (core.dtype(), core.layout().shape().to_vec());
-        // SAFETY: the offset and strides reach only items of `core`, which the export holds.
-        unsafe { lend(view, flags, slf.py(), core, |c| c.strided().storage().as_ptr().add(offset * dtype.bytes()), dtype, &shape, Some(&strides)) }
+        // SAFETY: the affine query checked every reached offset in storage retained by the export.
+        unsafe {
+            let data = data.as_ptr().add(offset * dtype.bytes());
+            lend(view, flags, slf.py(), core, |_| data, dtype, &shape, Some(&strides))
+        }
     }
 } }
 

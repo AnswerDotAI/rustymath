@@ -1,27 +1,72 @@
 pub mod support;
 
-mod arith {
-    use rustymath::{Abs, Add, Binary, Multiply, Sign, Subtract, Unary};
+#[cfg(not(target_arch = "wasm32"))]
+mod timing {
+    /// The nesting rules for shared and exclusive holds, on a lock file of the test's own, which no build or timing holds.
+    #[test]
+    fn hold_modes_and_lifetimes() {
+        use rustymath::timing::hold_at;
+        use std::io::ErrorKind::InvalidInput;
+        let path = std::env::temp_dir().join(format!("rustymath-timing-{}.lock", std::process::id()));
+        let lock = path.to_str().unwrap();
+        let first = hold_at(lock, true).unwrap();
+        let last = hold_at(lock, true).unwrap();
+        drop(first);
+        assert_eq!(hold_at(lock, false).err().unwrap().kind(), InvalidInput);
+        drop(last);
+        let timing = hold_at(lock, false).unwrap();
+        for result in [hold_at(lock, true), hold_at(lock, false)] { assert_eq!(result.err().unwrap().kind(), InvalidInput); }
+        drop(timing);
+        for file in [lock.to_owned(), format!("{lock}.gate")] { std::fs::remove_file(file).unwrap(); }
+    }
 
-    /// The integer forms of the arithmetic objects at type `$t`, on every pair of edge values, against the exact result in `i128`. Each form fails where that doesn't fit `$t`.
+    /// A budget is the expected cost times its multiplier, rounded up, and a `held` or `busy` line raises one column's budget to the budget for the cost it gives, or to twice a cost marked as an estimate. Only a gap's hold goes stale, once a cost is within 90% of the rule budget.
+    #[test]
+    fn budgets_follow_the_rule_and_holds() {
+        use rustymath::timing;
+        assert_eq!([0.2, 0.27, 15.6, 142.0, 12682.0].map(|c| timing::budget("f64", c, false)), [0.5, 0.54, 32.0, 220.0, 17000.0]);
+        assert_eq!((timing::budget("f64", 60.0, true), timing::budget("widths", 0.72, false)), (120.0, 0.97));
+        let text = "[f64]\n# 2 copies: one read and one write.\n# held linux 15.6: the cause isn't known yet\nExp\t4\t4\n# busy macos 2.7: a busy host\nLog\t4\t4\n# held linux ~60: no run has measured it\nSin\t4\t4\n";
+        let cases = timing::cases(text).unwrap();
+        let budget = |i: usize, column| timing::Budget::of(cases[i].section, &cases[i].budgets, &cases[i].holds, Some(column)).unwrap();
+        assert_eq!(
+            [budget(0, 0), budget(0, 1), budget(1, 0), budget(2, 1)].map(|b| b.to_string()), ["4", "32 held from 4", "5.4 busy from 4", "120 held from 4"]
+        );
+        assert!(budget(0, 1).stale(3.6) && !budget(0, 1).stale(3.7) && !budget(1, 0).stale(1.0));
+        for bad in ["# held linux: no cost", "# held linux 15.6", "# held linux 1 linux 2: twice"] {
+            assert!(timing::cases(&format!("[f64]\n{bad}\nExp\t4\t4\n")).is_err(), "{bad}");
+        }
+    }
+}
+
+mod arith {
+    use crate::support::mapped;
+    use rustymath::{Abs, Add, Multiply, Sign, Subtract, buffer::Element, domain::Variant, facts::Formula, operation::Kernel};
+
+    /// The checked integer kernels of the arithmetic objects at type `$t`, on every pair of edge values, against the exact result in `i128`. Each fails where that doesn't fit `$t`.
     macro_rules! check {
         ($($t:ty),+) => {$({
+            let variant = Variant::checked(<$t>::DTYPE);
+            let pairs = [Add.resolve(variant, [variant.dtype; 2]), Subtract.resolve(variant, [variant.dtype; 2]), Multiply.resolve(variant, [variant.dtype; 2])].map(Result::unwrap);
+            let [abs, sign] = [Abs.resolve(variant, [variant.dtype]), Sign.resolve(variant, [variant.dtype])].map(Result::unwrap);
+            let one = |k: &Kernel, x: $t| mapped(k, [&[x][..]], 1).map(|r: Vec<$t>| r[0]);
             let edges: Vec<$t> = [<$t>::MIN, <$t>::MAX, 0, 1, 2, 3, 7].into_iter().chain([-1i128, -2, -3].map(|v| v as $t))
                 .chain([<$t>::MIN / 2, <$t>::MAX / 2, <$t>::MAX - 1, <$t>::MIN.wrapping_add(1)]).collect();
             let fits = |r: i128| <$t>::try_from(r).ok();
             for &x in &edges {
                 for &y in &edges {
                     let (a, b) = (x as i128, y as i128);
-                    assert_eq!((Add.checked(x, y), Subtract.checked(x, y), Multiply.checked(x, y)), (fits(a + b), fits(a - b), fits(a * b)), "{x} and {y}");
+                    let got = pairs.each_ref().map(|k| mapped(k, [&[x][..], &[y][..]], 1).map(|r: Vec<$t>| r[0]));
+                    assert_eq!(got, [fits(a + b), fits(a - b), fits(a * b)], "{x} and {y}");
                 }
-                assert_eq!(Unary::<$t>::checked(&Abs, x), fits((x as i128).abs()), "|{x}|");
-                assert_eq!(Sign.one(x) as i128, (x as i128).signum(), "sign {x}");
+                assert_eq!(one(&abs, x), fits((x as i128).abs()), "|{x}|");
+                assert_eq!(one(&sign, x).map(|s| s as i128), Some((x as i128).signum()), "sign {x}");
             }
         })+};
     }
 
     #[test]
-    fn integer_forms_match_exact_arithmetic() { check!(u8, i16, i32, i64); }
+    fn integer_kernels_match_exact_arithmetic() { check!(u8, i16, i32, i64); }
 }
 
 mod convert {
@@ -57,7 +102,6 @@ mod convert {
 }
 
 mod distribution {
-    use crate::support::seeded;
     use rustymath::distribution::*;
     use rustymath::{Arg, Unary};
 
@@ -99,10 +143,10 @@ mod distribution {
     #[test]
     fn samples_follow_cdfs() {
         const N: usize = 20_000;
-        let mut rng = seeded(1);
+        let key = rustymath::random::Key::seeded(1);
         let mut out = vec![0.0; N];
-        for d in cases() {
-            d.samples(&mut rng, &mut out);
+        for (c, d) in cases().into_iter().enumerate() {
+            d.samples(&mut rustymath::random::Items::new(key.stream(c as u64), d.words()), &mut out);
             for p in [0.1, 0.5, 0.9] {
                 let x = d.quantile(p);
                 let c = d.cdf(x);
@@ -111,7 +155,7 @@ mod distribution {
             }
         }
         let mut one = [0.0; 1];
-        Distribution::poisson(0.0).unwrap().samples(&mut rng, &mut one);
+        Distribution::poisson(0.0).unwrap().samples(&mut rustymath::random::Items::new(key.stream(99), 1), &mut one);
         assert_eq!(one[0], 0.0);
     }
 
@@ -122,11 +166,11 @@ mod distribution {
             let mut out = Vec::new();
             (f.many(Arg::Many(items), items.len(), &mut out), out)
         }
-        let (xs, ps) = ([-1.0, 0.0, 0.25, 0.5, 1.0, 3.0, 100.0, f64::NAN], [0.001, 0.25, 0.5, 0.999, f64::NAN]);
+        let (xs, ps) = ([-1.0, 0.0, 0.25, 0.5, 1.0, 3.0, 100.0, f64::NAN], [0.001, 0.25, 0.5, 0.999]);
         for d in cases() {
             assert!(many(Pdf(d), &xs).0 && many(Cdf(d), &xs).0 && many(Quantile(d), &ps).0, "{d:?}");
             let (ok, out) = many(Quantile(d), &xs);
-            assert!(!ok && [0, 5, 6].iter().all(|&i| out[i].is_nan()), "{d:?}");
+            assert!(!ok && [0, 5, 6, 7].iter().all(|&i| out[i].is_nan()), "{d:?}");
         }
     }
 
@@ -183,11 +227,12 @@ mod exact {
 }
 
 mod integer {
-    use crate::support::random;
+    use crate::support::{mapped, random};
     use num_bigint::BigInt;
     use rustymath::integer::*;
     use rustymath::{
-        Abs, Arg, Binary, Binom, Pow, Sign, Unary, tolerant::{Ceil, Equal, Floor, FloorDivide, Gcd, Greater, GreaterEqual, Lcm, LessEqual, NotEqual, Residue}
+        Abs, Arg, Binary, Binom, Pow, buffer::{DType, Element}, domain::Variant, facts::Formula,
+        tolerant::{Ceil, Equal, Floor, FloorDivide, Gcd, Greater, GreaterEqual, Lcm, LessEqual, NotEqual, Residue}
     };
 
     /// Integers that exercise overflow and sign: the extremes, small numbers, powers of two and random bits.
@@ -199,14 +244,12 @@ mod integer {
 
     #[test]
     fn gcd_lcm_power_residue() {
-        assert_eq!(sum_bounds([-2, 3], 4, Some(10), false), Some([2, 22]));
-        assert_eq!((sum_bounds([-2, 3], 4, None, true), sum_bounds([-2, 3], 4, Some(10), true)), (Some([-11, 9]), Some([-2, 18])));
-        assert_eq!((product_bounds([-3, 2], [-5, 7]), product_bounds([i64::MAX, i64::MAX], [2, 2])), (Some([-21, 15]), None));
-        assert_eq!(sum_bounds([i64::MIN, i64::MAX], 2, None, false), None);
         // Hours, minutes and seconds; a base of 0 that takes what remains; and a quotient that leaves `i64`.
         assert_eq!((encode(&[24, 60, 60], &[3661, 86399]), encode(&[0, 10], &[123])), (Some(vec![1, 1, 1, 23, 59, 59]), Some(vec![12, 3])));
-        assert_eq!((encode(&[-1], &[i64::MIN]), decode(&[24, 60, 60], &[1, 1, 1, 23, 59, 59])), (None, Some(vec![3661, 86399])));
-        assert_eq!(decode(&[1, 1 << 62], &[2, 0]), None);
+        assert_eq!((encode(&[-1], &[i64::MIN]), decode(&[24, 60, 60], &[1, 1, 1, 23, 59, 59])), (Some(vec![0]), vec![3661, 86399]));
+        assert_eq!(encode(&[7, -1], &[i64::MIN, 5]), Some(vec![1, 0, 2, 0]));
+        assert_eq!(encode(&[0, -1], &[i64::MIN]), None);
+        assert_eq!(decode(&[1, 1 << 62], &[2, 0]), vec![i64::MIN]);
         let fit = |v: i128| i64::try_from(v).ok();
         for &x in &samples() {
             for &y in &samples() {
@@ -222,14 +265,14 @@ mod integer {
                 assert_eq!(d.div_mod(y), fit((b - r) / a).map(|q| (q, r as i64)), "div_mod({x}, {y})");
             }
             for y in -3..70 {
-                let want = if y < 0 { (x.abs() == 1).then(|| if y % 2 == 0 { 1 } else { x }) } else { BigInt::from(x).pow(y as u32).try_into().ok() };
+                // A negative y floors 1 ÷ x^-y, and 0 to a negative power gives the greatest i64.
+                let want = if y < 0 {
+                    Some(if x == 0 { i64::MAX } else { num_integer::Integer::div_floor(&BigInt::from(1), &BigInt::from(x).pow(-y as u32)).try_into().unwrap() })
+                } else { BigInt::from(x).pow(y as u32).try_into().ok() };
                 assert_eq!(power(x, y), want, "power({x}, {y})");
             }
         }
-        assert_eq!([power(0, 0), power(0, -1), power(-1, i64::MIN), power(-2, 63), power(2, 63)], [Some(1), None, Some(1), Some(i64::MIN), None]);
-        for (x, y, result) in [(2, -1, None), (200, 2, Some(-25536)), (-1, -3, Some(-1))] {
-            assert_eq!(Binary::<i16>::checked(&rustymath::WrappingPow, x, y), result);
-        }
+        assert_eq!([power(0, 0), power(0, -1), power(-1, i64::MIN), power(-2, 63), power(2, 63)], [Some(1), Some(i64::MAX), Some(1), Some(i64::MIN), None]);
     }
 
     #[test]
@@ -248,13 +291,14 @@ mod integer {
                 if fits(53) { assert_eq!(rustymath::binom(n as f64, k as f64), c.unwrap() as f64, "f64 binom({n}, {k})") }
                 if fits(24) { assert_eq!(rustymath::binom(n as f32, k as f32), c.unwrap() as f32, "f32 binom({n}, {k})") }
             }
-            assert_eq!(binom(n, -1), None);
+            assert_eq!(binom(n, -1), Some(i64::from(n == -1)));
         }
         assert_eq!(binom(i64::MIN, 1), Some(i64::MIN));
         assert_eq!(binom(i64::MAX, 1), Some(i64::MAX));
         assert_eq!(binom(i64::MAX, 2), None);
         assert_eq!(binom(-2, 1_000_000_000_000), Some(1_000_000_000_001));
         assert_eq!(binom(-1, i64::MAX), Some(-1));
+        for (n, k, c) in [(-2, -3, -2), (-3, -5, 6)] { assert_eq!(binom(n, k), Some(c)); }
         // A whole k with a non-whole n takes the falling factorial, which stays accurate beside the polynomial's roots, where Γ(n + 1)/(Γ(k + 1) Γ(n - k + 1)) cancels: C(n, k) and its slope in n against mpmath, within the documented 2k ulps.
         let near = |got: f64, want: f64, k: f64| assert!((got - want).abs() <= 2.0 * k * f64::EPSILON * want.abs(), "{got} against {want}");
         for (n, k, c, slope) in [
@@ -354,41 +398,56 @@ mod integer {
                 assert_eq!(Binary::<u8>::checked(&Lcm(t), x, y), fit(lcm(a, b)), "lcm({x}, {y})");
                 assert_eq!(Binary::<u8>::checked(&Pow, x, y), fit(power(a, b)), "power({x}, {y})");
                 assert_eq!(i64::from(Residue(t).one(x, y)), residue(a, b), "residue({x}, {y})");
-                assert_eq!(Binary::<u8>::checked(&FloorDivide(t), x, y), fit(floor_quotient(a, b)), "floor quotient({x}, {y})");
             }
         }
-        // `i16` and `i32` floor division divides in `f32` and `f64`, where the quotients have exact floors. It agrees with `floor_quotient` on every `i16` dividend and on `i32` samples beside the type's ends. A zero divisor, or a quotient past the type, fails the whole call.
+        // Floor division of every `u8` dividend by every nonzero `u8` divisor, through each width's checked kernel.
+        let divide = |dtype| FloorDivide(t).resolve(Variant::checked(dtype), [dtype; 2]).unwrap();
+        let floor = |x: i64, y: i64| { let q = x / y; if x % y != 0 && (x < 0) != (y < 0) { q - 1 } else { q } };
+        let (xs8, ds8): (Vec<u8>, Vec<u8>) = (0..=u8::MAX).flat_map(|x| (1..=u8::MAX).map(move |d| (x, d))).unzip();
+        let want: Vec<u8> = xs8.iter().zip(&ds8).map(|(&x, &d)| floor(x.into(), d.into()) as u8).collect();
+        assert_eq!(mapped(&divide(u8::DTYPE), [&xs8[..], &ds8[..]], xs8.len()), Some(want));
+        // A zero divisor gives `i64`'s limit of the dividend's sign, and 0 for 0 ÷ 0. A narrower width reports that limit as an overflow, so a dynamic call widens to `i64`.
+        assert_eq!(mapped(&divide(i64::DTYPE), [&[5i64, -5, 0][..], &[0][..]], 3), Some(vec![i64::MAX, i64::MIN, 0]));
+        assert_eq!(mapped(&divide(u8::DTYPE), [&[0u8][..], &[0][..]], 1), Some(vec![0u8]));
+        assert_eq!(mapped::<u8, u8, 2>(&divide(u8::DTYPE), [&[5][..], &[0][..]], 1), None);
+        // `i16` and `i32` floor division agrees with floor division in `i64` on every `i16` dividend and on `i32` samples beside the type's ends. A quotient past the type fails the whole call.
         let xs16: Vec<i16> = (i16::MIN..=i16::MAX).collect();
-        let floor16 = |x: i16, y: i16| floor_quotient(x.into(), y.into()).and_then(|q| i16::try_from(q).ok());
+        let floor16 = |x: i16, y: i16| i16::try_from(floor(x.into(), y.into())).ok();
         let ds16: Vec<i16> = xs16.iter().map(|&x| x.rotate_left(5) | 1).collect();
         let want: Option<Vec<i16>> = xs16.iter().zip(&ds16).map(|(&x, &d)| floor16(x, d)).collect();
-        let mut out = Vec::new();
-        assert_eq!(FloorDivide(t).many(Arg::Many(&xs16), Arg::Many(&ds16), xs16.len(), &mut out).then_some(out), want);
-        for d in [7i16, -12, 1, -1, 3, -3, i16::MAX, i16::MIN, 0] {
+        let divide16 = divide(i16::DTYPE);
+        assert_eq!(mapped(&divide16, [&xs16[..], &ds16[..]], xs16.len()), want);
+        for d in [7i16, -12, 1, -1, 3, -3, i16::MAX, i16::MIN] {
             for xs in [&xs16[..], &xs16[1..]] {
                 let want: Option<Vec<i16>> = xs.iter().map(|&x| floor16(x, d)).collect();
-                let mut out = Vec::new();
-                assert_eq!(FloorDivide(t).many(Arg::Many(xs), Arg::One(d), xs.len(), &mut out).then_some(out), want, "divisor {d}");
+                assert_eq!(mapped(&divide16, [xs, &[d][..]], xs.len()), want, "divisor {d}");
             }
         }
         let xs32: Vec<i32> = samples().into_iter().map(|v| v as i32).chain([i32::MIN, i32::MIN + 1, i32::MAX, i32::MAX - 1]).collect();
-        let floor32 = |x: i32, y: i32| floor_quotient(x.into(), y.into()).and_then(|q| i32::try_from(q).ok());
-        for d in [3i32, -3, 7, -12, 1, -1, i32::MAX, i32::MIN, 1 << 16, -(1 << 16) - 1, 0] {
+        let floor32 = |x: i32, y: i32| i32::try_from(floor(x.into(), y.into())).ok();
+        let divide32 = divide(i32::DTYPE);
+        for d in [3i32, -3, 7, -12, 1, -1, i32::MAX, i32::MIN, 1 << 16, -(1 << 16) - 1] {
             for xs in [&xs32[..], &xs32[..xs32.len() - 4]] {
                 let want: Option<Vec<i32>> = xs.iter().map(|&x| floor32(x, d)).collect();
-                let mut out = Vec::new();
-                assert_eq!(FloorDivide(t).many(Arg::Many(xs), Arg::One(d), xs.len(), &mut out).then_some(out), want, "divisor {d}");
+                assert_eq!(mapped(&divide32, [xs, &[d][..]], xs.len()), want, "divisor {d}");
             }
         }
         // Integers compare exactly, however close they are within the tolerance.
         let (n, m) = (1_000_000_000_000_000i64, 1_000_000_000_000_001i64);
-        assert_eq!(
-            [Equal(t).one(n, m), NotEqual(t).one(n, m), LessEqual(t).one(m, n), GreaterEqual(t).one(m, n), Greater(t).one(m, n)],
-            [false, true, false, true, true]
-        );
-        assert_eq!((Floor(t).one(m), Ceil(t).one(-m), Floor(t).one(true)), (m, -m, true));
-        assert_eq!((Unary::<i16>::checked(&Abs, i16::MIN), Abs.one(-5i16), Abs.one(7u8), Abs.one(false)), (None, 5, 7, false));
-        assert_eq!((Sign.one(-9i32), Sign.one(0i64), Sign.one(200u8)), (-1, 0, 1));
+        let (v, ints) = (Variant::checked(i64::DTYPE), [i64::DTYPE; 2]);
+        let compare = [
+            Equal(t).resolve(v, ints), NotEqual(t).resolve(v, ints), LessEqual(t).resolve(v, ints), GreaterEqual(t).resolve(v, ints),
+            Greater(t).resolve(v, ints),
+        ];
+        let got = compare.map(|k| mapped(&k.unwrap(), [&[m][..], &[n][..]], 1).map(|r: Vec<bool>| r[0]));
+        assert_eq!(got, [false, true, false, true, true].map(Some));
+        let [floor, ceil] = [Floor(t).resolve(v, [i64::DTYPE]), Ceil(t).resolve(v, [i64::DTYPE])].map(Result::unwrap);
+        assert_eq!((mapped(&floor, [&[m][..]], 1), mapped(&ceil, [&[-m][..]], 1)), (Some(vec![m]), Some(vec![-m])));
+        // `Floor` and `Abs` keep Booleans as they are.
+        let booleans = Variant::checked(DType::Boolean);
+        for kernel in [Floor(t).resolve(booleans, [DType::Boolean]), Abs.resolve(booleans, [DType::Boolean])].map(Result::unwrap) {
+            assert_eq!(mapped(&kernel, [&[false, true][..]], 2), Some(vec![false, true]));
+        }
     }
 }
 
@@ -481,135 +540,275 @@ mod number_theory {
 }
 
 mod operation {
-    use rustymath::agreement::Agreement;
-    use rustymath::array::ArrayView;
-    use rustymath::buffer::{Buffer, ComplexWidth, DType, FloatWidth, Width};
-    use rustymath::layout::Layout;
-    use rustymath::{kernels, reduce};
-    #[test]
-    fn kernels_follow_forms() {
-        let (b, i16, i64, f16, f32, f64, c64) = (DType::Boolean, DType::Integer(Width::I16), DType::Integer(Width::I64), DType::Float(FloatWidth::F16),
-            DType::Float(FloatWidth::F32), DType::Float(FloatWidth::F64), DType::Complex(ComplexWidth::F32));
-        // `Exp` has real and complex forms, so Booleans and integers compute in the narrowest float that holds them exactly, but at least `f32`, and characters have no kernel.
-        let exp = kernels!(Unary rustymath::Exp);
-        assert_eq!([b, i16, i64, f16, f32, c64].map(|d| exp.computes(d)), [Some(f32), Some(f32), Some(f64), Some(f16), Some(f32), Some(c64)]);
-        assert_eq!(exp.computes(DType::Character), None);
-        // `Add` has integer forms, so Booleans compute as `i64`.
-        assert_eq!(kernels!(Binary rustymath::Add).computes(b), Some(i64));
-        // `Cis` has `f32` and `f64` forms only, so `f16` widens to `f32`.
-        assert_eq!(kernels!(Unary rustymath::Cis).computes(f16), Some(f32));
-        // A value names its object too. `Equal` has Boolean, integer, real and complex forms, so Booleans compute as themselves. Characters have no kernel of their own: they compare as code points (`characters::binary`).
-        let equal = kernels!(Binary of rustymath::tolerant::Equal(rustymath::tolerant::Tolerance::DEFAULT));
-        assert_eq!([b, DType::Character].map(|d| equal.computes(d)), [Some(b), None]);
-        // A sum of a narrow integer type has its own fold, whose totals are `i64`.
-        let sum = kernels!(Fold reduce::Sum);
-        let (totals, ok) = sum.run(&reduce::Sum, Buffer::Integers(rustymath::buffer::IntBuf::I16(vec![1, 2, 3, 4])).view(), [2, 2, 1], None).unwrap();
-        assert!(ok && matches!(totals, Buffer::Integers(rustymath::buffer::IntBuf::I64(ref t)) if *t == [3, 7]));
-        // An integer argument to `Exp` casts to `f64`, and broadcasting pairs a scalar with every item.
-        let x = Buffer::Integers(rustymath::buffer::IntBuf::I64(vec![0, 1]));
-        let (r, _) = exp.unary(&rustymath::Exp, ArrayView::compact(&Layout::from([2]), x.view())).unwrap();
-        assert!(matches!(r, Buffer::Floats(rustymath::buffer::FloatBuf::F64(ref v)) if v[0] == 1.0 && (v[1] - std::f64::consts::E).abs() < 1e-15));
-        let (two, row) = (Layout::from([1usize].as_slice()), Layout::from([3usize].as_slice()));
-        let agreement = Agreement::new(&two, &row).unwrap();
-        let (s, ok) = kernels!(Binary rustymath::Add).binary(
-                &rustymath::Add, ArrayView::compact(&two, rustymath::buffer::View::Booleans(&[true])),
-                ArrayView::compact(&row, rustymath::buffer::View::Booleans(&[true, false, true])), &agreement).unwrap();
-        assert!(ok && matches!(s, Buffer::Integers(rustymath::buffer::IntBuf::I64(ref v)) if *v == [2, 1, 2]));
-        // An integer result that doesn't fit fails.
-        let big = Buffer::Integers(rustymath::buffer::IntBuf::I64(vec![i64::MAX]));
-        let big = ArrayView::compact(&two, big.view());
-        assert!(!kernels!(Binary rustymath::Add).binary(&rustymath::Add, big, big, &Agreement::new(&two, &two).unwrap()).unwrap().1);
-        let data = Buffer::Integers(rustymath::buffer::IntBuf::I16(vec![10, 2, 3]));
-        let (scan, ok) = kernels!(LeftScan rustymath::Subtract).run(&rustymath::Subtract, data.view(), [1, 3, 1], None).unwrap();
-        assert!(ok && matches!(scan, Buffer::Integers(rustymath::buffer::IntBuf::I16(ref v)) if *v == [10, 8, 5]));
-        let seed = Buffer::Integers(rustymath::buffer::IntBuf::I64(vec![100]));
-        let (scan, ok) = kernels!(Scan reduce::Sum).run(&reduce::Sum, data.view(), [1, 3, 1], Some(seed.view())).unwrap();
-        assert!(ok && matches!(scan, Buffer::Integers(rustymath::buffer::IntBuf::I64(ref v)) if *v == [110, 112, 115]));
-        // Ordered folds keep a local total for consecutive lanes, and read a differently typed tail in the computing dtype.
-        let right = kernels!(RightFold rustymath::Subtract);
-        let (fold, ok) = right.run(&rustymath::Subtract, data.view(), [1, 3, 1], Some(seed.view())).unwrap();
-        assert!(ok && matches!(fold, Buffer::Integers(rustymath::buffer::IntBuf::I16(ref v)) if *v == [-89]));
-        // A failed scalar step retains its actual value and the healthy lanes in the raw kernel result.
-        let (fold, ok) = kernels!(RightFold rustymath::Pow)
-            .run(&rustymath::Pow, Buffer::Floats(rustymath::buffer::FloatBuf::F64(vec![-1., 1., 0.5, 2.])).view(), [1, 2, 2], None).unwrap();
-        assert!(!ok && matches!(fold, Buffer::Floats(rustymath::buffer::FloatBuf::F64(ref v)) if v[0].is_nan() && v[1] == 1.));
+    use rustymath::{
+        agreement::{Agreement, Binding, Mapping, Missing, Read, ReadPlan}, array::{Array, ArrayView}, buffer::{Buffer, DType, Element, Width},
+        domain::{Range, Variant}, error::{self, Error, ErrorSlot}, facts::Formula, gather::Steps, layout::Layout, operation::{Direction, Kernel, Seed, Settings}
+    };
+
+    fn view<'a>(layout: &'a Layout, data: rustymath::buffer::View<'a>, mapping: &Mapping) -> ArrayView<'a> {
+        ArrayView::new(layout, vec![Binding::full(data)], ReadPlan::input(0, data.len()).remapped(mapping.clone(), layout.count(), Missing::Default)).unwrap()
+    }
+
+    fn apply<const N: usize>(kernel: &Kernel, inputs: [ArrayView<'_>; N]) -> Result<Buffer, Error> {
+        let layout = inputs.iter().try_fold(Layout::EMPTY, |l, a| Agreement::new(&l, a.layout()).map(|a| a.layout))?;
+        let inputs = inputs.each_ref().map(|a| a.remapped(Agreement::new(&layout, a.layout()).unwrap().right, layout.count()));
+        let reads = inputs.each_ref().map(ArrayView::read);
+        let mut out = Buffer::with_capacity(kernel.result_dtype(), layout.count());
+        kernel.map(&reads, 0..layout.count(), Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, &mut out)?;
+        Ok(out)
     }
 
     #[test]
+    fn native_operations_use_input_kinds_and_run_settings() {
+        use rustymath::{Add, Binary, Binom, Bitwise, Exp, Subtract, tolerant::{Residue, Tolerance}};
+        let (small, wide) = (DType::Integer(Width::I16), DType::Integer(Width::I64));
+        let exp = Exp.resolve(Variant::checked(wide), [wide]).unwrap();
+        let mut out = Buffer::with_capacity(exp.result_dtype(), 2);
+        crate::support::map(&exp, [i64::view(&[0, 1])], 2, &mut out).unwrap();
+        let r = f64::vec(out).unwrap();
+        assert!(r[0] == 1. && (r[1] - std::f64::consts::E).abs() < 1e-15);
+        let add = Add.resolve(Variant::checked(DType::Boolean), [DType::Boolean; 2]).unwrap();
+        let mut out = Buffer::with_capacity(add.result_dtype(), 3);
+        crate::support::map(&add, [bool::view(&[true]), bool::view(&[true, false, true])], 3, &mut out).unwrap();
+        assert_eq!(i64::vec(out).unwrap(), [2, 1, 2]);
+        let checked = Add.resolve(Variant::checked(wide), [wide; 2]).unwrap();
+        let slot = ErrorSlot::new();
+        let mut out = Buffer::with_capacity(wide, 1);
+        slot.within(|| crate::support::map(&checked, [i64::view(&[i64::MAX]), i64::view(&[1])], 1, &mut out)).unwrap();
+        assert!(slot.pending());
+        let wrapped = Add.resolve(Variant { wrapping: true, ..Variant::checked(wide) }, [wide; 2]).unwrap();
+        let mut out = Buffer::with_capacity(wide, 1);
+        error::checked(|| crate::support::map(&wrapped, [i64::view(&[i64::MAX]), i64::view(&[1])], 1, &mut out)).unwrap();
+        assert_eq!(i64::vec(out).unwrap(), [i64::MIN]);
+        let range = wrapped.range_on(&[Range::of(Some(i64::MAX as f64)), Range::of(Some(1.))], false);
+        assert!(Range::of(Some(i64::MIN as f64)).within(range.lo, range.hi));
+        let binom = Binom.resolve(Variant { wrapping: true, ..Variant::checked(wide) }, [wide; 2]).unwrap();
+        let mut out = Buffer::with_capacity(wide, 3);
+        error::checked(|| crate::support::map(&binom, [i64::view(&[200, -200, 67]), i64::view(&[100, 101, 33])], 3, &mut out)).unwrap();
+        assert_eq!(i64::vec(out).unwrap(), [3674307795577560168, -7960601317545944800, -4220223336089263246]);
+        let input = [Binding::full(i16::view(&[10, 2, 3]))];
+        let plan = ReadPlan::input(0, 3);
+        let read = Read { sources: &input, plan: &plan };
+        let subtract = Subtract.resolve(Variant::checked(small), [small; 2]).unwrap();
+        let mut out = Buffer::with_capacity(small, 3);
+        subtract.scan([1, 3, 1], Seed::Identity, Direction::Left, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, read, &mut out).unwrap();
+        assert_eq!(i16::vec(out).unwrap(), [10, 8, 5]);
+        let seed = [Binding::full(i64::view(&[100]))];
+        let scalar = ReadPlan::input(0, 1);
+        let seed = Read { sources: &seed, plan: &scalar };
+        let mut out = Buffer::with_capacity(small, 1);
+        subtract.fold_read(&[3], Some(0), Seed::Tail(seed), Direction::Right, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, read, &mut out)
+            .unwrap();
+        assert_eq!(i16::vec(out).unwrap(), [-89]);
+        let dtype = f64::DTYPE;
+        let residue = Residue(Tolerance::EXACT).resolve(Variant::checked(dtype), [dtype; 2]).unwrap();
+        let values = [[3.], [3. - 1e-14]];
+        let bindings = values.each_ref().map(|x| Binding::full(f64::view(x)));
+        let reads = bindings.each_ref().map(|x| Read { sources: std::slice::from_ref(x), plan: &scalar });
+        assert_ne!(Residue(Tolerance::EXACT).one(3., values[1][0]), Residue(Tolerance::DEFAULT).one(3., values[1][0]));
+        for tolerance in [Tolerance::EXACT, Tolerance::DEFAULT] {
+            let mut out = Buffer::with_capacity(dtype, 1);
+            residue.map(&reads, 0..1, Settings { tolerance }, &mut out).unwrap();
+            assert_eq!(f64::vec(out).unwrap(), [Residue(tolerance).one(3., values[1][0])]);
+        }
+        for table in 0..16 {
+            let kernel = Bitwise(table).resolve(Variant::checked(DType::Boolean), [DType::Boolean; 2]).unwrap();
+            let mut out = Buffer::with_capacity(DType::Boolean, 4);
+            crate::support::map(&kernel, [bool::view(&[false, false, true, true]), bool::view(&[false, true, false, true])], 4, &mut out).unwrap();
+            assert_eq!(bool::vec(out).unwrap(), (0..4).map(|i| table >> i & 1 != 0).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn inverse_folds_keep_logical_order() {
+        use rustymath::{Divide, MathishDivide, Subtract, operation::{Piece, Total}};
+        let dtype = DType::Float(rustymath::buffer::FloatWidth::F64);
+        let subtract = Subtract.resolve(Variant::checked(dtype), [dtype; 2]).unwrap();
+        let divide = Divide.resolve(Variant::checked(dtype), [dtype; 2]).unwrap();
+        let mathish = MathishDivide.resolve(Variant::checked(dtype), [dtype; 2]).unwrap();
+        let fold = |kernel: &Kernel, shape: &[usize], axis, mapping: Mapping, data: &Buffer| {
+            let layout = Layout::from(shape.to_vec());
+            let input = view(&layout, data.view(), &mapping);
+            let mut out = Buffer::with_capacity(kernel.fold_dtype(data.dtype(), shape[axis], None), 0);
+            let order = kernel.fold_read(
+                    shape, Some(axis), Seed::Identity, Direction::Right, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, input.read(), &mut out
+                ).unwrap();
+            out.ordered(order)
+        };
+        let mut data = vec![0.; 128];
+        data[2] = 1.;
+        let data = f64::buffer(data);
+        assert_eq!(f64::vec(fold(&subtract, &[64, 2], 0, Mapping::Linear(1), &data)).unwrap(), [-1., 0.]);
+        let transpose = Mapping::from(vec![Steps::along(2, 1), Steps::along(64, 2)]);
+        assert_eq!(f64::vec(fold(&subtract, &[2, 64], 1, transpose, &data)).unwrap(), [-1., 0.]);
+        let reverse = Mapping::from(vec![Steps::Stride { start: 1, len: 2, step: -1 }]);
+        assert_eq!(f64::vec(fold(&subtract, &[2], 0, reverse, &f64::buffer(vec![1., 2.]))).unwrap(), [1.]);
+        let windows = Mapping::from(vec![Steps::along(2, 1), Steps::along(3, 1)]);
+        assert_eq!(f64::vec(fold(&subtract, &[2, 3], 1, windows, &f64::buffer(vec![1., 2., 3., 4.]))).unwrap(), [2., 3.]);
+        let add = rustymath::Add.resolve(Variant::checked(dtype), [dtype; 2]).unwrap();
+        let windows = Mapping::from(vec![Steps::along(2, 6), Steps::along(4, 1), Steps::along(3, 6), Steps::along(3, 1)]);
+        let data = f64::buffer((0..24).map(|n| 0.5 * f64::from(n)).collect());
+        let rows = fold(&add, &[2, 4, 3, 3], 3, windows, &data);
+        assert_eq!(rows.len(), 24);
+        let sums = fold(&add, &[2, 4, 3], 2, Mapping::Linear(1), &rows);
+        assert_eq!(f64::vec(sums).unwrap(), [31.5, 36., 40.5, 45., 58.5, 63., 67.5, 72.]);
+        for (kernel, values, expected) in [(&divide, vec![8., 2., 2.], 8.), (&mathish, vec![0., 0.], 0.), (&subtract, vec![], 0.), (&divide, vec![], 1.)] {
+            assert_eq!(f64::vec(fold(kernel, &[values.len()], 0, Mapping::Linear(1), &f64::buffer(values))).unwrap(), [expected]);
+        }
+        let values = [1., 2., 3., 4., 5., 6.];
+        let pieces = |range: std::ops::Range<usize>, emit: &mut dyn FnMut(usize, Piece<'_>)| {
+            for at in (range.start..range.end).step_by(3) { emit(at, Piece::Items(f64::view(&values[at..(at + 3).min(range.end)]))); }
+            Ok(())
+        };
+        let mut out = Buffer::with_capacity(dtype, 1);
+        subtract.fold_pieces([1, 6, 1], Seed::Identity, Direction::Right, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, &pieces, &mut out)
+            .unwrap();
+        assert_eq!(f64::vec(out).unwrap(), [-3.]);
+        let partial = |_: std::ops::Range<usize>, emit: &mut dyn FnMut(usize, Piece<'_>)| {
+            emit(0, Piece::Total(Total { items: 2, bits: 1f64.to_bits() }));
+            Ok(())
+        };
+        let mut out = Buffer::with_capacity(dtype, 1);
+        assert!(
+            subtract
+                .fold_pieces([1, 2, 1], Seed::Identity, Direction::Right, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, &partial, &mut out)
+                .is_err()
+        );
+        let byte = DType::Integer(Width::U8);
+        let wrapped = Subtract.resolve(Variant { wrapping: true, ..Variant::checked(byte) }, [byte; 2]).unwrap();
+        assert_eq!(u8::vec(fold(&wrapped, &[2], 0, Mapping::Linear(1), &u8::buffer(vec![0, 255]))).unwrap(), [1]);
+        let range = wrapped.range_on(&[Range::of(Some(0.)), Range::of(Some(255.))], false);
+        assert!(Range::of(Some(1.)).within(range.lo, range.hi));
+        let complex = DType::Complex(rustymath::buffer::ComplexWidth::F64);
+        let quotient = Divide.resolve(Variant::checked(complex), [complex; 2]).unwrap();
+        let data = num_complex::Complex64::buffer(vec![num_complex::Complex64::new(0., 2.), num_complex::Complex64::new(0., 1.)]);
+        assert_eq!(num_complex::Complex64::vec(fold(&quotient, &[2], 0, Mapping::Linear(1), &data)).unwrap(), [num_complex::Complex64::new(2., 0.)]);
+    }
+
+    #[test]
+    fn folds_keep_uncalled_values_and_scans_keep_their_carry() {
+        use rustymath::{Add, tolerant::{Less, Tolerance}};
+        let dtype = DType::Integer(Width::I64);
+        let less = Less(Tolerance::EXACT).resolve(Variant::checked(dtype), [dtype; 2]).unwrap();
+        let input = [Binding::full(i64::view(&[3, 2, 1]))];
+        let seed = [Binding::full(i64::view(&[7]))];
+        let scalar = ReadPlan::input(0, 1);
+        for (len, initial, expected) in [(0, true, 7), (1, false, 3), (3, false, 0)] {
+            let plan = ReadPlan::input(0, len);
+            let input = [Binding::full(i64::view(&[3, 2, 1][..len]))];
+            let read = Read { sources: &input, plan: &plan };
+            let seed = if initial { Seed::Tail(Read { sources: &seed, plan: &scalar }) } else { Seed::Identity };
+            let mut out = Buffer::with_capacity(less.fold_dtype(dtype, len, initial.then_some(dtype)), 1);
+            less.fold_read(&[len], Some(0), seed, Direction::Right, Settings { tolerance: rustymath::tolerant::Tolerance::EXACT }, read, &mut out).unwrap();
+            assert_eq!(out.dtype(), if len < 2 { dtype } else { DType::Boolean });
+            assert_eq!(i64::vec(Buffer::cast_results(out.view(), dtype, true).unwrap()).unwrap(), [expected]);
+        }
+        let plan = ReadPlan::input(0, 3);
+        let read = Read { sources: &input, plan: &plan };
+        let mut out = Buffer::with_capacity(less.scan_dtype(false), 3);
+        less.scan([1, 3, 1], Seed::Identity, Direction::Left, Settings { tolerance: rustymath::tolerant::Tolerance::EXACT }, read, &mut out).unwrap();
+        assert_eq!(i64::vec(out).unwrap(), [3, 0, 1]);
+        // Packed comparisons keep raw seeds and numeric heads across word and read-chunk boundaries.
+        for len in [63, 64, 65, 5000] {
+            let data: Vec<i64> = (0..len).map(|i| (i % 5) as i64 - 2).collect();
+            let input = [Binding::full(i64::view(&data))];
+            let plan = ReadPlan::input(0, len);
+            for initial in [None, Some(7)] {
+                for direction in [Direction::Left, Direction::Right] {
+                    let mut ordered = data.clone();
+                    if direction == Direction::Right { ordered.reverse(); }
+                    let (mut carry, mut expected) = (initial, Vec::new());
+                    for x in ordered {
+                        let value = carry.map_or(x, |c| i64::from(if direction == Direction::Left { c < x } else { x < c }));
+                        expected.push(value);
+                        carry = Some(value);
+                    }
+                    if direction == Direction::Right { expected.reverse(); }
+                    let seed = if initial.is_some() { Seed::Initial(Read { sources: &seed, plan: &scalar }) } else { Seed::Identity };
+                    let mut out = Buffer::with_capacity(less.scan_dtype(initial.is_some()), len);
+                    less.scan([1, len, 1], seed, direction, Settings { tolerance: Tolerance::EXACT }, Read { sources: &input, plan: &plan }, &mut out).unwrap();
+                    assert_eq!(out.dtype(), if initial.is_some() { DType::Boolean } else { dtype });
+                    assert_eq!(i64::vec(Buffer::cast_results(out.view(), dtype, true).unwrap()).unwrap(), expected);
+                }
+            }
+        }
+        let sum = Add.resolve(Variant::checked(DType::Integer(Width::I16)), [DType::Integer(Width::I16); 2]).unwrap();
+        let narrow = [Binding::full(i16::view(&[3]))];
+        let mut out = Buffer::with_capacity(sum.fold_dtype(DType::Integer(Width::I16), 1, None), 1);
+        sum.fold_read(
+            &[1], Some(0), Seed::Identity, Direction::Right, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT },
+            Read { sources: &narrow, plan: &scalar }, &mut out).unwrap();
+        assert_eq!(i64::vec(out).unwrap(), [3]);
+    }
+    #[test]
     fn logical_views_compose_prepare_and_run() {
-        use rustymath::{agreement::Mapping, buffer::Element, gather::Steps};
         let (shape, data) = (Layout::from([3, 2]), [0., 1., 2., 3., 4., 5.]);
         let transpose = Mapping::Steps { base: 0, steps: vec![Steps::along(3, 1), Steps::along(2, 3)].into() };
-        let x = ArrayView::new(&shape, f64::view(&data), &transpose);
+        let x = view(&shape, f64::view(&data), &transpose);
         assert!(x.contiguous().is_none());
         assert_eq!(x.items::<f64>().unwrap().as_ref(), &[0., 3., 1., 4., 2., 5.]);
         assert_eq!(transpose.affine(shape.shape()), Some((0, vec![1, 3])));
         let reversed = Mapping::Steps { base: 0, steps: vec![Steps::Stride { start: 4, len: 3, step: -2 }, Steps::along(2, 1)].into() };
         let composed = transpose.compose(&reversed, shape.shape(), shape.shape()).unwrap();
-        assert_eq!(ArrayView::new(&shape, f64::view(&data), &composed).items::<f64>().unwrap().as_ref(), &[2., 5., 1., 4., 0., 3.]);
-        let compact = ArrayView::compact(&shape, f64::view(&data));
-        let (sum, ok) = kernels!(Binary rustymath::Add).binary(&rustymath::Add, x, compact, &Agreement::new(&shape, &shape).unwrap()).unwrap();
-        assert!(ok);
-        assert_eq!(f64::of(sum.view()).unwrap(), &[0., 4., 3., 7., 6., 10.]);
-        let (one, two) = (Agreement::new(&shape, &Layout::EMPTY).unwrap(), Agreement::new(&shape, &Layout::EMPTY).unwrap());
-        let args = [x, ArrayView::compact(&Layout::EMPTY, f64::view(&[1.])), ArrayView::compact(&Layout::EMPTY, f64::view(&[4.]))];
-        let (clipped, ok) = kernels!(Ternary rustymath::Clip).ternary(&rustymath::Clip, args, &one, &two).unwrap();
-        assert!(ok);
-        assert_eq!(f64::of(clipped.view()).unwrap(), &[1., 3., 1., 4., 2., 4.]);
-        // A table of positions reads through its offsets before broadcasting.
+        assert_eq!(view(&shape, f64::view(&data), &composed).items::<f64>().unwrap().as_ref(), &[2., 5., 1., 4., 0., 3.]);
+        let add = rustymath::Add.resolve(Variant::checked(f64::DTYPE), [f64::DTYPE; 2]).unwrap();
+        let compact = || ArrayView::compact(&shape, f64::view(&data));
+        assert_eq!(f64::vec(apply(&add, [x, compact()]).unwrap()).unwrap(), [0., 4., 3., 7., 6., 10.]);
+        let clip = rustymath::Clip.resolve(Variant::checked(f64::DTYPE), [f64::DTYPE; 3]).unwrap();
+        let args = [
+            view(&shape, f64::view(&data), &transpose), ArrayView::compact(&Layout::EMPTY, f64::view(&[1.])),
+            ArrayView::compact(&Layout::EMPTY, f64::view(&[4.])),
+        ];
+        assert_eq!(f64::vec(apply(&clip, args).unwrap()).unwrap(), [1., 3., 1., 4., 2., 4.]);
         let row = Layout::from([3]);
         let positions = Mapping::Steps { base: 0, steps: vec![Steps::table(vec![5, 0, 3])].into() };
-        let row_view = ArrayView::new(&row, f64::view(&data), &positions);
-        let (sum, _) = kernels!(Binary rustymath::Add).binary(&rustymath::Add, row_view, compact, &Agreement::new(&row, &shape).unwrap()).unwrap();
-        assert_eq!(f64::of(sum.view()).unwrap(), &[5., 6., 2., 3., 7., 8.]);
-        // Checked casts inspect only selected items; a compact subrange borrows its exact storage.
+        let row_view = view(&row, f64::view(&data), &positions);
+        assert_eq!(f64::vec(apply(&add, [row_view, compact()]).unwrap()).unwrap(), [5., 6., 2., 3., 7., 8.]);
+        let storage = [f64::NAN, 1., 2., 3., f64::INFINITY];
         let sub = Mapping::Steps { base: 1, steps: vec![Steps::along(3, 1)].into() };
-        let selected = ArrayView::new(&row, f64::view(&[f64::NAN, 1., 2., 3., f64::INFINITY]), &sub);
+        let selected = view(&row, f64::view(&storage), &sub);
         assert_eq!(selected.items::<i16>().unwrap().as_ref(), &[1, 2, 3]);
-        assert_eq!(selected.contiguous().unwrap().as_ptr(), selected.storage().as_ptr().wrapping_add(8));
+        assert_eq!(selected.contiguous().unwrap().as_ptr(), f64::view(&storage).as_ptr().wrapping_add(8));
+        let data = [1., f64::NAN, 2., f64::INFINITY, 3.];
         let strided = Mapping::Steps { base: 0, steps: vec![Steps::Stride { start: 4, len: 3, step: -2 }].into() };
-        assert_eq!(ArrayView::new(&row, f64::view(&[1., f64::NAN, 2., f64::INFINITY, 3.]), &strided).items::<i16>().unwrap().as_ref(), &[3, 2, 1]);
+        assert_eq!(view(&row, f64::view(&data), &strided).items::<i16>().unwrap().as_ref(), &[3, 2, 1]);
         let prefix = Layout::from([2]);
-        let prefix = ArrayView::new(&prefix, f64::view(&[1., f64::NAN, 2., f64::INFINITY, 3.]), &strided);
+        let prefix = view(&prefix, f64::view(&data), &strided);
         assert_eq!(prefix.items::<f64>().unwrap().as_ref(), &[3., 2.]);
         assert_eq!(prefix.items::<i16>().unwrap().as_ref(), &[3, 2]);
-        let empty = Layout::from([0, 3]);
-        assert!(ArrayView::new(&empty, f64::view(&data), &transpose).items::<f64>().unwrap().is_empty());
+        assert!(view(&Layout::from([0, 3]), f64::view(&data), &transpose).items::<f64>().unwrap().is_empty());
         assert!(Mapping::Linear(2).affine(&[3]).is_none());
         let table = |items| Mapping::Steps { base: 2, steps: vec![Steps::table(items)].into() };
         assert_eq!(table(vec![3]).affine(&[1]), Some((5, vec![0])));
         assert_eq!(table(vec![3, Steps::FILL]).affine(&[0]), Some((0, vec![0])));
         assert!(table(vec![3, Steps::FILL]).affine(&[2]).is_none() && table(vec![Steps::FILL]).affine(&[1]).is_none());
-        // A weighted mean reads the fill that a mapping chose where it reaches no item: one stored 2 reads as 0 2 0, and as 4 2 4 with a chosen fill of 4.
-        let padded = Mapping::Steps { base: 0, steps: vec![Steps::clipped(-1, 3, 1, 1)].into() };
-        assert_eq!(rustymath::stats::average(&[2.], &[1.], &rustymath::stats::Axes::new(&row, &[0]).unwrap(), [&padded, &Mapping::Single]), [2. / 3.]);
-        let fill = |x| std::sync::Arc::new(rustymath::buffer::Fill::new(f64::view(&[x]), f64::DTYPE).unwrap());
-        let chosen = padded.filled(Some(fill(4.)));
-        assert_eq!(rustymath::stats::average(&[2.], &[1.], &rustymath::stats::Axes::new(&row, &[0]).unwrap(), [&chosen, &Mapping::Single]), [10. / 3.]);
-        // Two distinct fills cannot be flattened into one mapping.
-        let first = Agreement { layout: row, len: 3, left: chosen, right: Mapping::Single };
-        let outer = Mapping::Steps { base: 0, steps: vec![Steps::clipped(-1, 5, 3, 1)].into() }.filled(Some(fill(8.)));
-        let second = Agreement { layout: Layout::from([5]), len: 5, left: outer, right: Mapping::Single };
-        let data = [2., 1., 10.];
-        let args = data.each_ref().map(|x| ArrayView::compact(&Layout::EMPTY, f64::view(std::slice::from_ref(x))));
-        let (clipped, ok) = kernels!(Ternary rustymath::Clip).ternary(&rustymath::Clip, args, &first, &second).unwrap();
-        assert!(ok);
-        assert_eq!(f64::of(clipped.view()).unwrap(), &[8., 4., 2., 4., 8.]);
+        let data = Array::new([1].into(), f64::buffer(vec![2.])).unwrap();
+        let padding = rustymath::structure::pad(data.layout(), &[(1, 1)], rustymath::structure::Edge::Fill).unwrap();
+        let padded = data.selected(padding.clone(), None).unwrap();
+        let chosen = data.selected(padding, Some(std::sync::Arc::new(f64::buffer(vec![4.])))).unwrap();
+        let axes = rustymath::stats::Axes::new(&row, &[0]).unwrap();
+        for (data, expected) in [(&padded, 2. / 3.), (&chosen, 10. / 3.)] {
+            assert_eq!(rustymath::stats::average(&data.view().items::<f64>().unwrap(), &[1.], &axes, [&Mapping::Linear(1), &Mapping::Single]), [expected]);
+        }
+        let padding = rustymath::structure::pad(chosen.layout(), &[(1, 1)], rustymath::structure::Edge::Fill).unwrap();
+        let chosen = chosen.selected(padding, Some(std::sync::Arc::new(f64::buffer(vec![8.])))).unwrap();
+        let args = [chosen.view(), ArrayView::compact(&Layout::EMPTY, f64::view(&[1.])), ArrayView::compact(&Layout::EMPTY, f64::view(&[10.]))];
+        assert_eq!(f64::vec(apply(&clip, args).unwrap()).unwrap(), [8., 4., 2., 4., 8.]);
     }
 
     #[test]
     fn owned_views_share_detach_and_release_their_base() {
-        use rustymath::{array::Array, buffer::Element, structure::{self, Selector}};
+        use rustymath::structure::{self, Selector};
         let mut base = Array::new([2, 3].into(), i64::buffer((0..6).collect())).unwrap();
         let transposed = base.selected(structure::transpose(base.layout(), &[1, 0]).unwrap(), None).unwrap();
-        assert_eq!(base.view().storage().as_ptr(), transposed.view().storage().as_ptr());
+        assert_eq!(base.view().sources()[0].view.as_ptr(), transposed.view().sources()[0].view.as_ptr());
         assert_eq!(transposed.view().items::<i64>().unwrap().as_ref(), &[0, 3, 1, 4, 2, 5]);
         let reshaped = base.reshape([6].into()).unwrap();
-        assert_eq!(base.view().storage().as_ptr(), reshaped.view().storage().as_ptr());
+        assert_eq!(base.view().sources()[0].view.as_ptr(), reshaped.view().sources()[0].view.as_ptr());
         let mut tail = reshaped.selected(structure::select_axis(reshaped.layout(), 0, Selector::Range { start: 2, len: 3, step: 1 }).unwrap(), None).unwrap();
-        assert_eq!(tail.view().storage().len(), 6);
+        assert_eq!(tail.view().sources()[0].view.len(), 6);
         let compact = tail.compact();
-        assert_eq!(compact.view().storage().len(), 3);
+        assert_eq!(compact.view().sources()[0].view.len(), 3);
         assert_eq!(compact.view().items::<i64>().unwrap().as_ref(), &[2, 3, 4]);
         let (_, moved) = tail.clone().into_compact();
         assert_eq!(moved.len(), 3);
@@ -623,38 +822,54 @@ mod operation {
         assert_eq!(transposed.reshape([6].into()).unwrap().view().items::<i64>().unwrap().as_ref(), &[0, 3, 1, 4, 2, 5]);
     }
 
-    /// `binary` of characters and `x` or `y`, laid out as vectors.
-    fn characters<K>(k: K, x: &Buffer, y: &Buffer) -> Option<(Buffer, bool)> where K: rustymath::characters::Characters
-            + rustymath::Binary<i32, Out: rustymath::buffer::Element> + rustymath::Binary<i64, Out: rustymath::buffer::Element> + Sync {
+    fn characters<K: Formula<2>>(k: K, x: &Buffer, y: &Buffer) -> Result<Buffer, Error> {
         let (lx, ly) = (Layout::from([x.len()]), Layout::from([y.len()]));
-        let agreement = Agreement::new(&lx, &ly).unwrap();
-        rustymath::characters::binary(&k, ArrayView::compact(&lx, x.view()), ArrayView::compact(&ly, y.view()), agreement.layout.shape(), &agreement)
+        let dtype = x.dtype().common(y.dtype()).unwrap_or(DType::Integer(Width::I64));
+        let kernel = k.resolve(Variant::checked(dtype), [x.dtype(), y.dtype()])?;
+        error::checked(|| apply(&kernel, [ArrayView::compact(&lx, x.view()), ArrayView::compact(&ly, y.view())]))
     }
 
     #[test]
     fn characters_compute_as_code_points() {
-        use rustymath::{Add, Subtract, buffer::{Element, IntBuf}, reduce::{Maximum, Minimum}, tolerant::{Less, Tolerance}};
+        use rustymath::{Add, Subtract, buffer::IntBuf, reduce::{Maximum, Minimum}, tolerant::{Less, Tolerance}};
         let text = |s: &str| Buffer::Characters(s.chars().collect());
         let (ab, ba, ints) = (text("ab"), text("ba"), Buffer::Integers(IntBuf::I64(vec![1, 2])));
-        let run = |result: Option<(Buffer, bool)>| {
-            let (b, ok) = result.unwrap();
-            assert!(ok);
-            b
-        };
-        // Characters order by code point, and the maximum gives a character.
-        assert_eq!(bool::vec(run(characters(Less(Tolerance::DEFAULT), &ab, &ba))), Some(vec![true, false]));
-        assert_eq!(char::vec(run(characters(Maximum, &ab, &ba))), Some(vec!['b', 'b']));
-        // A character minus a character is an integer, and an integer offsets a character on either side of `+`.
-        assert_eq!(i32::vec(run(characters(Subtract, &ba, &ab))), Some(vec![1, -1]));
-        assert_eq!(char::vec(run(characters(Add, &ab, &ints))), Some(vec!['b', 'd']));
-        assert_eq!(char::vec(run(characters(Add, &ints, &ab))), Some(vec!['b', 'd']));
-        assert!(characters(Add, &ab, &ba).is_none() && characters(Subtract, &ints, &ab).is_none());
-        // Numbers order before characters, whatever the items.
-        assert_eq!(bool::vec(run(characters(Less(Tolerance::DEFAULT), &ints, &ab))), Some(vec![true, true]));
-        assert_eq!(char::vec(run(characters(Maximum, &ints, &ab))), Some(vec!['a', 'b']));
-        assert_eq!(i64::vec(run(characters(Minimum, &ab, &ints))), Some(vec![1, 2]));
-        // A result past the last code point fails.
-        assert!(!characters(Add, &text("\u{10FFFF}"), &Buffer::Integers(IntBuf::I64(vec![1]))).unwrap().1);
+        assert_eq!(bool::vec(characters(Less(Tolerance::DEFAULT), &ab, &ba).unwrap()), Some(vec![true, false]));
+        assert_eq!(char::vec(characters(Maximum, &ab, &ba).unwrap()), Some(vec!['b', 'b']));
+        assert_eq!(i32::vec(characters(Subtract, &ba, &ab).unwrap()), Some(vec![1, -1]));
+        assert_eq!(char::vec(characters(Add, &ab, &ints).unwrap()), Some(vec!['b', 'd']));
+        assert_eq!(char::vec(characters(Add, &ints, &ab).unwrap()), Some(vec!['b', 'd']));
+        assert!(characters(Add, &ab, &ba).is_err() && characters(Subtract, &ints, &ab).is_err());
+        assert_eq!(bool::vec(characters(Less(Tolerance::DEFAULT), &ints, &ab).unwrap()), Some(vec![true, true]));
+        assert_eq!(char::vec(characters(Maximum, &ints, &ab).unwrap()), Some(vec!['a', 'b']));
+        assert_eq!(i64::vec(characters(Minimum, &ab, &ints).unwrap()), Some(vec![1, 2]));
+        assert!(characters(Add, &text("\u{10FFFF}"), &i64::buffer(vec![1])).is_err());
+        let offsets = f64::buffer(vec![0.5, 1.000000000000001]);
+        let kernel = Add.resolve(Variant::checked(offsets.dtype()), [ab.dtype(), offsets.dtype()]).unwrap();
+        let layout = Layout::from([2]);
+        let (chars, offsets) = (ArrayView::compact(&layout, ab.view()), ArrayView::compact(&layout, offsets.view()));
+        let mut output = Buffer::with_capacity(DType::Character, 2);
+        kernel.map(&[chars.read(), offsets.read()], 1..2, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, &mut output).unwrap();
+        assert_eq!(char::of(output.view()), Some(&['c'][..]));
+        assert!(kernel.map(&[chars.read(), offsets.read()], 0..1, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, &mut output).is_err());
+        let seed = f64::buffer(vec![0.5]);
+        let seed = ArrayView::compact(&Layout::EMPTY, seed.view());
+        assert!(
+            kernel
+                .scan(
+                    [1, 2, 1], Seed::Initial(seed.read()), Direction::Left, Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, chars.read(),
+                    &mut output
+                )
+                .is_err()
+        );
+        let (empty, chosen) = (text(""), text("x"));
+        let kernel = Add.resolve(Variant::checked(ints.dtype()), [DType::Character, ints.dtype()]).unwrap();
+        for (fill, want) in [(Missing::Default, vec!['!', '"']), (Missing::Scalar(1), vec!['y', 'z'])] {
+            let plan = ReadPlan::copy(0, 0, Mapping::Tiled(0), 2, fill);
+            let chars = ArrayView::new(&layout, vec![Binding::full(empty.view()), Binding::full(chosen.view())], plan).unwrap();
+            let result = apply(&kernel, [chars, ArrayView::compact(&layout, ints.view())]).unwrap();
+            assert_eq!(char::vec(result), Some(want));
+        }
     }
 }
 
@@ -1048,44 +1263,89 @@ mod polynomial {
 }
 
 mod random {
-    use crate::support::seeded;
     use rustymath::Arg;
     use rustymath::random::*;
 
     #[test]
     fn rolls_and_deals() {
-        let mut rng = seeded(1);
+        let key = Key::seeded(1);
         let mut out = vec![9];
-        roll(Arg::One(6), 60_000, &mut rng, &mut out);
+        roll(Arg::One(6), 60_000, &mut Items::new(key.stream(0), 1), &mut out);
         assert_eq!(out[0], 9);
         let counts = (0..6).map(|k| out[1..].iter().filter(|&&r| r == k).count());
         assert!(counts.into_iter().all(|c| (9_000..11_000).contains(&c)));
         let bounds: Vec<u64> = (1..=1000).collect();
         let mut rolls = Vec::new();
-        roll(Arg::Many(&bounds), 1000, &mut rng, &mut rolls);
+        roll(Arg::Many(&bounds), 1000, &mut Items::new(key.stream(1), 1), &mut rolls);
         assert!(rolls.iter().zip(&bounds).all(|(r, b)| r < b));
         let mut dealt = Vec::new();
-        deal(50, 60, &mut rng, &mut dealt);
+        deal(50, 60, &mut key.stream(2).at(0), &mut dealt);
         dealt.sort_unstable();
         dealt.dedup();
         assert!(dealt.len() == 50 && dealt.iter().all(|&d| d < 60));
     }
 
-    // A seed gives the numbers that `rand`'s `Uniform` gives for each bound, from one bound or one for each draw, also for bounds near 2⁶³, where about half the draws reject a word.
+    // Each draw is the number that `rand`'s `Uniform` gives for its bound from its item's words, from one bound or one for each draw, also for bounds near 2⁶³, where about half the items reject their packed word and read their regions.
     #[test]
     fn rolls_match_rand() {
         use rand::distr::{Distribution, Uniform};
         let mixed: Vec<u64> = (0..2000).map(|k| if k % 7 == 0 { (1 << 63) + 1 } else { k + 1 }).collect();
-        for b in [1, 6, 1 << 63, (1 << 63) + 1, u64::MAX] {
-            let (mut ours, mut theirs) = (seeded(2), seeded(2));
-            let ones = vec![b; 2000];
+        let rolled = |number: u64, bounds: Arg<'_, u64>| {
             let mut out = Vec::new();
-            roll(Arg::One(b), 2000, &mut ours, &mut out);
-            roll(Arg::Many(&ones), 2000, &mut ours, &mut out);
-            roll(Arg::Many(&mixed), 2000, &mut ours, &mut out);
-            out.push(below(b, &mut ours));
-            let bounds = [&ones[..], &ones, &mixed, &[b]].concat();
-            assert_eq!(out, bounds.iter().map(|&b| Uniform::new(0, b).unwrap().sample(&mut theirs)).collect::<Vec<_>>());
+            roll(bounds, 2000, &mut Items::new(Key::seeded(2).stream(number), 1), &mut out);
+            out
+        };
+        let theirs = |number: u64, bounds: &[u64]| {
+            let mut items = Items::new(Key::seeded(2).stream(number), 1);
+            bounds.iter().map(|&b| Uniform::new(0, b).unwrap().sample(&mut items.item())).collect::<Vec<_>>()
+        };
+        for b in [1, 6, 1 << 63, (1 << 63) + 1, u64::MAX] {
+            let ones = vec![b; 2000];
+            assert_eq!(rolled(0, Arg::One(b)), theirs(0, &ones));
+            assert_eq!(rolled(1, Arg::Many(&ones)), theirs(1, &ones));
+            assert_eq!(rolled(2, Arg::Many(&mixed)), theirs(2, &mixed));
+            assert_eq!(below(b, &mut Items::new(Key::seeded(2).stream(0), 1).item()), theirs(0, &ones)[0]);
         }
+    }
+}
+
+mod circle_real_parts {
+    use num_complex::Complex64;
+    use rustymath::{
+        Asinh, Atan, Cos, Cosh, FUSED, RealAcos, RealAcosh, RealAsin, RealAtanh, RealSqrt1mx2, RealSqrtm1mx2, RealSqrtx2m1, Sin, Sinh, Sqrt1px2, Tan, Tanh,
+        facts::{Formula, formula_at}, recipe::NativeOps
+    };
+
+    /// `k`, the real part of a code of `○`, at real arguments inside and outside its real domain: the real part of its complex form there, and a slope that matches a central difference away from ±1.
+    fn check<K: Formula<1>>(k: K, name: &str) {
+        for x in [-3.0, -1.5, -0.5, 0.0, 0.3, 0.9, 1.5, 4.0] {
+            let (real, complex) = (formula_at(&k, [x]), k.complex(&NativeOps::<FUSED>::DEFAULT, [Complex64::new(x, 0.0)]).unwrap().re);
+            assert!((real - complex).abs() <= 1e-14 * real.abs().max(1.0), "{name}({x}): {real} against the complex form's {complex}");
+            let h = 1e-6;
+            let difference = (formula_at(&k, [x + h]) - formula_at(&k, [x - h])) / (2.0 * h);
+            let slope = k.emit_partials(&NativeOps::<FUSED>::DEFAULT, [x], real, [true])[0].unwrap();
+            assert!((slope - difference).abs() <= 1e-6 * difference.abs().max(1.0), "{name}'s slope at {x}: {slope} against {difference}");
+        }
+    }
+
+    #[test]
+    fn real_parts() {
+        check(RealSqrt1mx2, "RealSqrt1mx2");
+        check(RealSqrtx2m1, "RealSqrtx2m1");
+        check(RealAsin, "RealAsin");
+        check(RealAcos, "RealAcos");
+        check(RealAcosh, "RealAcosh");
+        check(RealAtanh, "RealAtanh");
+        check(RealSqrtm1mx2(false), "RealSqrtm1mx2(false)");
+        check(RealSqrtm1mx2(true), "RealSqrtm1mx2(true)");
+        check(Sin, "Sin");
+        check(Cos, "Cos");
+        check(Tan, "Tan");
+        check(Sqrt1px2, "Sqrt1px2");
+        check(Sinh, "Sinh");
+        check(Cosh, "Cosh");
+        check(Tanh, "Tanh");
+        check(Atan, "Atan");
+        check(Asinh, "Asinh");
     }
 }

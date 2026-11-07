@@ -6,7 +6,7 @@ use crate::{parallel::Slots, slice::{Arg, Ternary}};
 pub const FUSED: bool = cfg!(any(target_arch = "aarch64", target_feature = "fma"));
 
 /// A float type that rustymath's functions take: `half::f16`, `f32` or `f64`.
-pub trait Float: num_traits::Float + sealed::Sealed + crate::slice::KernelItem {
+pub trait Float: num_traits::Float + sealed::Sealed + crate::slice::KernelItem + crate::buffer::Source<Self> {
     /// The type this float computes in, its working precision: `f32` for `f16`, and the type itself otherwise. A function of an `f16` computes in `f32` and rounds once. Sums keep their running totals in this type.
     type Working: Native;
     /// This float in its working type, which holds it exactly.
@@ -21,6 +21,8 @@ pub trait Float: num_traits::Float + sealed::Sealed + crate::slice::KernelItem {
     fn next_up(self) -> Self;
     /// The greatest float of this type below `self`, as `f64::next_down` gives it.
     fn next_down(self) -> Self;
+    /// Rounds to the nearest whole number, with ties to even.
+    fn round_ties_even(self) -> Self;
     /// The unsigned type, of this float's width, that `order_key` gives.
     type OrderKey: RadixKey + Key;
     /// A key whose unsigned order is the order of `total_cmp`, after `¯0` becomes `0` and every NaN becomes one NaN. So `¯0` and `0` share a key, NaN's key follows every other, and two floats match exactly when their keys are equal.
@@ -58,12 +60,6 @@ pub(crate) mod sealed {
         type Bits: Copy;
         /// `u - less` as a float, for a whole number u below 2^m, through the bits of 2^m + u. A loop that calls it vectorizes even where the target has no vector conversion for u's type. [`convert`](crate::convert) builds on it.
         fn from_low(u: Self::Bits, less: Self) -> Self;
-        /// The whole number nearest `self`, for `self` from 0 to below 2^m, as the low bits of 2^m + `self`. `from_low` reverses it.
-        fn to_low(self) -> Self::Bits;
-        /// The bits of a positive `self` without their low `BITS - m`, read as a whole number, as a float. They grow nearly in proportion to `self`'s logarithm. `from_top` reverses it.
-        fn top(self) -> Self;
-        /// The float whose bits without their low `BITS - m` are the whole number `t`, for a `t` from 0 to below 2^m.
-        fn from_top(t: Self) -> Self;
         /// `self×b+c`, with one rounding when `FUSED` is true and two otherwise.
         fn mla<const FUSED: bool>(self, b: Self, c: Self) -> Self;
         /// 2^n, from `z` = `SHIFT + n`, for a whole n within the exponents of normal floats.
@@ -158,6 +154,8 @@ macro_rules! native {
             fn next_up(self) -> $t { $t::next_up(self) }
             #[inline]
             fn next_down(self) -> $t { $t::next_down(self) }
+            #[inline]
+            fn round_ties_even(self) -> Self { $t::round_ties_even(self) }
             order_key!($bits);
         }
         impl Native for $t {
@@ -176,22 +174,13 @@ macro_rules! native {
                 $t::from_bits(two_m.to_bits() | u) - (two_m + less)
             }
             #[inline]
-            fn to_low(self) -> $bits { (self + (1 as $bits << $mantissa) as $t).to_bits() & ((1 << $mantissa) - 1) }
-            #[inline]
-            fn top(self) -> $t { Self::from_low(self.to_bits() >> (<$bits>::BITS - $mantissa), 0.0) }
-            #[inline]
-            fn from_top(t: $t) -> $t { $t::from_bits(t.to_low() << (<$bits>::BITS - $mantissa)) }
-            #[inline]
             fn mla<const FUSED: bool>(self, b: $t, c: $t) -> $t { if FUSED { self.mul_add(b, c) } else { self * b + c } }
             // The low bits of `z` hold n. Adding the bias to them and shifting them into the exponent field gives 2^n. Integer adds and shifts vectorize on every target, where a conversion from a float to a 64-bit integer doesn't on x86-64.
             #[inline]
-            fn pow2(z: $t) -> $t { $t::from_bits(z.to_bits().wrapping_add($bias) << $mantissa) }
-            // e comes from the exponent field of `self÷0.75`, converted through `from_low`.
+            fn pow2(z: $t) -> $t { crate::recipe::pow2(&crate::recipe::Floats, z) }
             #[inline]
             fn split(self) -> ($t, $t) {
-                let exponent = ((self * (1.0 / 0.75)).to_bits() >> $mantissa) & (2 * $bias + 1);
-                let m = $t::from_bits(self.to_bits().wrapping_sub(exponent.wrapping_sub($bias) << $mantissa));
-                (m, Self::from_low(exponent, $bias as $t))
+                crate::recipe::split(&crate::recipe::Floats, self)
             }
             // Subtracting the smallest normal float's top bits wraps zero and the subnormals around to the top, where negative floats' top bits already lie. Only positive normal floats then lie below infinity's top bits less the same amount.
             #[inline(always)]
@@ -246,37 +235,25 @@ impl Float for half::f16 {
     }
     #[inline]
     fn next_down(self) -> Self { -(-self).next_up() }
+    #[inline]
+    fn round_ties_even(self) -> Self { half::f16::from_f32(self.to_f32().round_ties_even()) }
     order_key!(u16);
 }
 
 /// The polynomial with coefficients `c`, highest degree first, at `x`, by Horner's rule. The coefficients convert to `R` when the compiler inlines the call.
 #[inline]
 pub(crate) fn horner<R: Native, const FUSED: bool, const N: usize>(x: R, c: [f64; N]) -> R {
-    let mut y = R::narrow(c[0]);
-    for &k in &c[1..] { y = y.mla::<FUSED>(x, R::narrow(k)); }
-    y
+    crate::recipe::horner(&crate::recipe::NativeOps::<FUSED>::DEFAULT, x, &c)
 }
 
 /// ln 2, split into a part whose product with any whole number up to 2^11 at f64 or 2^8 at f32 is exact, and the rest. That covers every exponent of a float and every n that `exp` reduces by.
 #[inline]
-pub(crate) fn ln2<R: Native>() -> (R, R) {
-    let (hi, lo) = if R::WIDE { (0.69314718055966295651160180568695068359375, 0.28235290563031577122588448175013436025525412068e-12) }
-    else { (0.693145751953125, 1.428606765330187e-06) };
-    (R::narrow(hi), R::narrow(lo))
-}
+pub(crate) fn ln2<R: Native>() -> (R, R) { crate::recipe::ln2(&crate::recipe::Floats) }
 
 /// y × 2^n, for a whole n, in two factors. The first multiplication is exact, so a result below the normal floats rounds once, in the second.
 #[inline]
-pub(crate) fn pow2_times<R: Native, const FUSED: bool>(y: R, n: R) -> R {
-    let half = n.mla::<FUSED>(R::narrow(0.5), R::SHIFT);
-    y * R::pow2(half) * R::pow2(n - (half - R::SHIFT) + R::SHIFT)
-}
+pub(crate) fn pow2_times<R: Native, const FUSED: bool>(y: R, n: R) -> R { crate::recipe::ldexp(&crate::recipe::NativeOps::<FUSED>::DEFAULT, y, n) }
 
 /// (m, e) with x = m × 2^e, m from 0.75 to 1.5 and e whole, for a positive x, subnormals included. A subnormal x scales up by 2^64 first, so that its bits split as a normal float's do.
 #[inline]
-pub(crate) fn split_positive<R: Native>(x: R) -> (R, R) {
-    // The scale is chosen before the one product. Choosing between x and its scaled value made LLVM split both and choose between their parts, a second split for every item.
-    let k = if x < R::min_positive_value() { R::narrow(64.0) } else { R::zero() };
-    let (m, e) = (x * R::pow2(R::SHIFT + k)).split();
-    (m, e - k)
-}
+pub(crate) fn split_positive<R: Native>(x: R) -> (R, R) { crate::recipe::frexp(&crate::recipe::Floats, x) }

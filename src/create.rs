@@ -43,8 +43,8 @@ pub fn triangle(layout: Layout, values: View<'_>, offset: i64, upper: bool) -> R
         if rows > 0 && cols > 0 {
             for (i, row) in data.chunks(cols).enumerate() {
                 let end = (i as i128 % rows as i128 + offset as i128 + i128::from(!upper)).clamp(0, cols as i128) as usize;
-                if upper { out.resize(out.len() + end, T::FILL); crate::gather::copied(&mut out, &row[end..]); }
-                else { crate::gather::copied(&mut out, &row[..end]); out.resize(out.len() + cols - end, T::FILL); }
+                if upper { out.resize(out.len() + end, T::FILL); out.extend_from_slice(&row[end..]); }
+                else { out.extend_from_slice(&row[..end]); out.resize(out.len() + cols - end, T::FILL); }
             }
         }
         T::buffer(out)
@@ -85,6 +85,6 @@ pub fn linspace(start: f64, stop: f64, n: usize, endpoint: bool) -> Result<Vec<f
 pub fn logspace(start: f64, stop: f64, n: usize, endpoint: bool, base: f64) -> Result<Vec<f64>, Error> {
     let exponents = linspace(start, stop, n, endpoint)?;
     let mut out = Vec::with_capacity(n);
-    crate::Binary::many(&crate::Pow, crate::Arg::One(base), crate::Arg::Many(&exponents), n, &mut out);
+    crate::pairs(crate::Arg::One(base), crate::Arg::Many(&exponents), n, &mut out, |x, y| (crate::facts::formula_at(&crate::Pow, [x, y]), true));
     Ok(out)
 }

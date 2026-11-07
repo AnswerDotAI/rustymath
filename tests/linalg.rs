@@ -14,18 +14,42 @@ mod products {
 
     #[test]
     fn native_inner_pairs_keep_right_folds_and_bounded_terms() {
-        use rustymath::{buffer::Element, kernels, tolerant::{Equal, Greater, Tolerance}};
+        use rustymath::{
+            agreement::{Binding, Missing, Read, ReadPlan}, buffer::{Buffer, Element, View}, domain::Variant, error::{self, Error}, facts::Formula,
+            operation::{Direction, Kernel, Seed, Settings}, tolerant::{Equal, Greater, Tolerance}
+        };
+        fn fold(kernel: &Kernel, data: View<'_>, dims: [usize; 3], tail: Option<View<'_>>) -> Result<Buffer, Error> {
+            let mut sources = vec![Binding::full(data)];
+            if let Some(tail) = tail { sources.push(Binding::full(tail)); }
+            let plan = ReadPlan::input(0, data.len());
+            let tail_plan = ReadPlan::input(1, tail.map_or(0, View::len));
+            let seed = if tail.is_some() { Seed::Tail(Read { sources: &sources, plan: &tail_plan }) } else { Seed::Identity };
+            let mut out = Buffer::with_capacity(kernel.result_dtype(), dims[0] * dims[2]);
+            error::checked(|| {
+                kernel.fold_read(
+                    &dims, Some(1), seed, Direction::Right, Settings { tolerance: Tolerance::EXACT }, Read { sources: &sources, plan: &plan }, &mut out)
+            })?;
+            Ok(out)
+        }
         macro_rules! inner {
             ($f:expr, $g:expr, $a:expr, $b:expr, $size:expr) => {{
-                let (f, g) = ($f, $g);
-                let (fk, gk) = (kernels!(RightFold of f), kernels!(Binary of g));
-                let checked = |(buffer, ok)| if ok { Ok(buffer) } else { Err(()) };
-                inner_with($a, $b, $size,
-                    |x, y, agreement| {
-                        use rustymath::{array::ArrayView, layout::Layout};
+                let (f, g, a, b) = ($f, $g, $a, $b);
+                let dtype = a.dtype().common(b.dtype()).unwrap();
+                let gk = g.resolve(Variant::checked(dtype), [a.dtype(), b.dtype()]).unwrap();
+                let fk = f.resolve(Variant::checked(gk.result_dtype()), [gk.result_dtype(); 2]).unwrap();
+                inner_with(
+                    a, b, $size, |x, y, agreement| {
                         assert!(agreement.len <= rustymath::CHUNK);
-                        checked(gk.binary(&g, ArrayView::compact(&Layout::from([x.len()]), x), ArrayView::compact(&Layout::from([y.len()]), y), agreement).unwrap())
-                    }, |x, dims, tail| checked(fk.run(&f, x, dims, tail).unwrap()),
+                        let sources = [Binding::full(x), Binding::full(y)];
+                        let plans = [
+                            ReadPlan::input(0, x.len()).remapped(agreement.left.clone(), agreement.len, Missing::Default),
+                            ReadPlan::input(1, y.len()).remapped(agreement.right.clone(), agreement.len, Missing::Default),
+                        ];
+                        let reads = plans.each_ref().map(|plan| Read { sources: &sources, plan });
+                        let mut out = Buffer::with_capacity(gk.result_dtype(), agreement.len);
+                        error::checked(|| gk.map(&reads, 0..agreement.len, Settings { tolerance: Tolerance::EXACT }, &mut out))?;
+                        Ok(out)
+                    }, |x, dims, tail| fold(&fk, x, dims, tail),
                 )
             }};
         }
@@ -54,10 +78,9 @@ mod products {
         assert!(inner!(rustymath::Pow, rustymath::Add, f64::view(&[-1., 0.5]), f64::view(&[0., 2., 0., 1.5]), [1, 2, 2]).is_err());
         assert!(inner!(rustymath::Add, rustymath::Multiply, i64::view(&[i64::MAX, 1]), i64::view(&[2, 2]), [1, 2, 1]).is_err());
         assert!(inner!(rustymath::Add, rustymath::Multiply, i64::view(&[]), i64::view(&[2, 2]), [0, 2, 1]).unwrap().is_empty());
-        let sum = kernels!(Fold rustymath::reduce::Sum);
-        let (out, ok) = sum.run(&rustymath::reduce::Sum, bool::view(&[true, false]), [1, 2, 1], Some(i64::view(&[7]))).unwrap();
-        assert!(ok && i64::of(out.view()).unwrap() == [8]);
-        assert!(!sum.run(&rustymath::reduce::Sum, i64::view(&[i64::MAX]), [1, 1, 1], Some(i64::view(&[1]))).unwrap().1);
+        let sum = rustymath::Add.resolve(Variant::checked(i64::DTYPE), [i64::DTYPE; 2]).unwrap();
+        assert_eq!(i64::vec(fold(&sum, bool::view(&[true, false]), [1, 2, 1], Some(i64::view(&[7]))).unwrap()).unwrap(), [8]);
+        assert!(fold(&sum, i64::view(&[i64::MAX]), [1, 1, 1], Some(i64::view(&[1]))).is_err());
     }
 
     /// An inner product taken in order, item by item.
@@ -74,7 +97,7 @@ mod products {
     fn transposed_operands_read_as_their_transposes() {
         // Float `PlusTimes` reads a transposed operand in place, and `MaxPlus` takes the default, which copies it. `inner_mapped` uses an operand where its map reads it: through a transposing map, through padded rows, or in a transposed orientation. A map that reads backwards is read in blocks. On rustymath's own kernels, a product with a vector takes both of `by_vector`'s routes: rows dotted four at a time with a remainder, and stored rows added a block at a time into a whole strip of results and a tail. Small whole numbers keep every sum exact.
         fn check<P: Inner<f64, Out = f64>>(p: P, a: &[f64], b: &[f64], [m, k, n]: [usize; 3]) {
-            use rustymath::{agreement::Mapping, gather::Steps};
+            use rustymath::{agreement::{Mapping, Walked}, gather::Steps};
             let (at, bt, expected) = (transpose(a, m, k), transpose(b, k, n), p.inner(a, b, [m, k, n]));
             assert_eq!(p.inner_ops(&at, b, [Orientation::Transpose, Orientation::Normal], [m, k, n]), expected);
             assert_eq!(p.inner_ops(a, &bt, [Orientation::Normal, Orientation::Transpose], [m, k, n]), expected);
@@ -87,10 +110,21 @@ mod products {
             let (from_at, padded_rows) = (read([(0, m, 1), (0, k, mi)]), read([(0, k, ni + 2), (0, n, 1)]));
             let (backwards, stored_t) = (read([((m - 1) * k, m, -ki), (k - 1, k, -1)]), read([(0, k, 1), (0, m, ki)]));
             let normal = [Orientation::Normal; 2];
-            assert_eq!(p.inner_mapped(Mapped { data: &at, mapping: &from_at }, Mapped { data: &padded, mapping: &padded_rows }, normal, [m, k, n]), expected);
-            assert_eq!(p.inner_mapped(Mapped { data: &reversed, mapping: &backwards }, Mapped { data: b, mapping: &held }, normal, [m, k, n]), expected);
             assert_eq!(
-                p.inner_mapped(Mapped { data: a, mapping: &stored_t }, Mapped { data: &bt, mapping: &held }, [Orientation::Transpose; 2], [m, k, n]), expected
+                p.inner_mapped(
+                    Mapped { data: &at, mapping: &Walked::from(&from_at) }, Mapped { data: &padded, mapping: &Walked::from(&padded_rows) }, normal, [m, k, n]
+                ), expected
+            );
+            assert_eq!(
+                p.inner_mapped(
+                    Mapped { data: &reversed, mapping: &Walked::from(&backwards) }, Mapped { data: b, mapping: &Walked::from(&held) }, normal, [m, k, n]
+                ), expected
+            );
+            assert_eq!(
+                p.inner_mapped(
+                    Mapped { data: a, mapping: &Walked::from(&stored_t) }, Mapped { data: &bt, mapping: &Walked::from(&held) }, [Orientation::Transpose; 2],
+                    [m, k, n]
+                ), expected
             );
         }
         for [m, k, n] in [[5, 7, 9], [1, 11, 37], [37, 11, 1]] {
@@ -103,16 +137,17 @@ mod products {
     #[test]
     fn vector_products_read_windows_by_columns() {
         // `+.×` of windows and a vector reads each column of the windows where it lies, when the windows' rows are adjacent in long runs: the windows of a vector, of a single-channel image whose first row of windows reads fills, and long windows transposed. Each matches the product of the gathered windows. Small whole numbers keep every sum exact.
-        use rustymath::{agreement::{Mapping, expanded_items}, gather::Steps};
+        use rustymath::{agreement::{Mapping, Walked, expanded_items}, gather::Steps};
         let along = |start, len, step| Steps::Stride { start, len, step };
         let check = |data: &[f64], steps: Vec<Steps>, o: Orientation, [m, k]: [usize; 2]| {
             let mapping = Mapping::Steps { base: 0, steps: steps.into() };
             let mut buf = Vec::new();
-            let stored = expanded_items(&mapping, data, 0, m * k, &mut buf).to_vec();
+            let stored = expanded_items(&Walked::from(&mapping), data, 0, m * k, &mut buf).to_vec();
             let a = if o == Orientation::Normal { stored } else { transpose(&stored, k, m) };
             let b: Vec<f64> = (0..k).map(|i| (i * 5 % 13) as f64 - 6.0).collect();
             let got = PlusTimes.inner_mapped(
-                Mapped { data, mapping: &mapping }, Mapped { data: &b, mapping: &Mapping::Linear(1) }, [o, Orientation::Normal], [m, k, 1]);
+                Mapped { data, mapping: &Walked::from(&mapping) }, Mapped { data: &b, mapping: &Walked::from(&Mapping::Linear(1)) }, [o, Orientation::Normal],
+                [m, k, 1]);
             assert_eq!(got, PlusTimes.inner(&a, &b, [m, k, 1]));
         };
         let x: Vec<f64> = (0..300).map(|i| (i * 7 % 17) as f64 - 8.0).collect();
@@ -473,7 +508,7 @@ mod factor {
         assert_eq!(lu(&[p, T::one(), q, T::one()], 2).factors, [p, q / p, T::one(), T::one() - q / p], "lu with a subnormal pivot");
     }
 
-    /// Checks `solve`, `pinv`, `qr_complete`, the determinants and `hermitian_eigenvalues` at `T`, where `tolerance` is a few times `T`'s epsilon. The singular matrices repeat columns, so their rank is exact.
+    /// Checks `solve`, `pinv`, the complete QR factorization, the determinants and `hermitian_eigenvalues` at `T`, where `tolerance` is a few times `T`'s epsilon. The singular matrices repeat columns, so their rank is exact.
     fn solves_and_determinants<T: RealItem>(tolerance: f64) {
         let bound = 64.0 * tolerance;
         let base = random::<T>(9, 4, 7);
@@ -494,7 +529,7 @@ mod factor {
             let expected = product(&p, &wide(&b), [n, m, 2]);
             assert!(distance(&x, &expected, norm(&expected)) < bound, "solve at {m}×{n}");
             // The complete QR: Q is square and orthogonal, R's rows below the thin ones are zero, and Q R is A.
-            let (q, r) = qr_complete(&a, [m, n]);
+            let (q, r) = T::matrix_qr(&a, [m, n], true);
             let (q, r, thin) = (wide(&q), wide(&r), m.min(n));
             assert!(orthogonality(&q, m, m) < bound, "complete Q at {m}×{n}");
             assert!(r[thin * n..].iter().all(|&v| v == 0.0), "complete R's lower rows at {m}×{n}");

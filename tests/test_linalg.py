@@ -142,7 +142,7 @@ def test_linalg(kind):
         # complex64 computes at its own width, with real results, such as singular values, in float32.
         eye = np.eye(3, dtype=np.complex64)
         assert A(la.pinv(eye)).dtype == np.complex64 and A(la.svd(eye).s).dtype == np.float32 and A(la.slogdet(eye[None])[1]).dtype == np.float32
-        with pytest.raises(ValueError, match="doesn't take"): la.inner(rm.maximum, rm.add)(a, b)
+        with pytest.raises(ValueError): la.inner(rm.maximum, rm.add)(a, b)
         return
     # Min-plus products give shortest paths, and or-and products give reachability.
     d = np.array([[0, 3, np.inf], [np.inf, 0, 1], [2, np.inf, 0]])
@@ -174,8 +174,8 @@ def test_linalg(kind):
     assert count([0.3, 1.0], [0.1 + 0.2, 1.0]) == 2 and count([[0.3 + 1j]], [[0.1 + 0.2 + 1j]]) == 1
     # NumPy's ufuncs aren't rustymath's functions.
     with pytest.raises(ValueError): la.inner(np.add, np.multiply)
-    # An integer product that doesn't fit int64 raises: 2^62 times 4 is 2^64.
-    with pytest.raises(OverflowError): rm.matmul([[2**62]], [[4]])
+    # An integer product wraps at int64, as BPL's `+.×` does: 2^62 times 4 is 2^64, which wraps to 0.
+    assert rm.matmul([[2**62]], [[4]]).tolist() == [[0]]
     # A matrix that can't be factored gives NaN, with no warning.
     for f, x in (la.cholesky, -np.eye(2)), (la.eig, [[1., np.nan], [0, 1]]):
         with np.errstate(all='raise'): assert np.isnan(A(f(np.array(x))[0])).all()

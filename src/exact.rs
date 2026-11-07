@@ -7,6 +7,17 @@ use num_traits::{One, Signed, ToPrimitive, Zero};
 /// `y` modulo `x` with the sign of `x`, `y - x⌊y/x⌋`, which APL writes `x|y`. A zero `x` gives `y`.
 pub fn residue<T: Clone + Integer>(x: &Ratio<T>, y: &Ratio<T>) -> Ratio<T> { if x.is_zero() { y.clone() } else { y - x * (y / x).floor() } }
 
+pub(crate) fn boolean(value: bool) -> num_rational::BigRational { Ratio::from_integer(i64::from(value).into()) }
+
+pub fn divide(x: &num_rational::BigRational, y: &num_rational::BigRational, mathish: bool) -> Result<Option<num_rational::BigRational>, Error> {
+    if y.is_zero() { return Ok((mathish && x.is_zero()).then(num_rational::BigRational::zero)); }
+    Ok(Some(x / y))
+}
+
+pub fn floor_divide(x: &num_rational::BigRational, y: &num_rational::BigRational, mathish: bool) -> Result<Option<num_rational::BigRational>, Error> {
+    Ok(divide(x, y, mathish)?.map(|value| value.floor()))
+}
+
 /// The greatest common divisor of `x` and `y`: the largest rational that divides each a whole number of times. It is the gcd of their numerators over the lcm of their denominators. It is never negative, and the gcd of 0 and 0 is 0.
 pub fn gcd<T: Clone + Integer>(x: &Ratio<T>, y: &Ratio<T>) -> Ratio<T> { Ratio::new(x.numer().gcd(y.numer()), x.denom().lcm(y.denom())) }
 
@@ -37,4 +48,17 @@ pub fn binom<T>(n: &Ratio<T>, k: i64) -> Result<Ratio<T>, Error> where T: Clone 
         value = value * (n - Ratio::from_integer(T::from(i))) / Ratio::from_integer(T::from(i + 1));
     }
     Ok(value)
+}
+
+pub fn factorial(value: &num_rational::BigRational) -> Result<Option<num_rational::BigRational>, Error> {
+    if !value.is_integer() || value.is_negative() { return Ok(None); }
+    let n = value.to_u64().filter(|&n| n <= 100_000).ok_or_else(|| Error::new(crate::error::Kind::Limit, "exact factorial argument is too large"))?;
+    Ok(Some(Ratio::from_integer(crate::number_theory::factorial(n)?.into())))
+}
+
+pub fn power(x: &num_rational::BigRational, y: &num_rational::BigRational) -> Result<Option<num_rational::BigRational>, Error> {
+    if !y.is_integer() { return Ok(None); }
+    let n = y.to_i32().filter(|&n| n.unsigned_abs() <= 1_000_000).ok_or_else(|| Error::new(crate::error::Kind::Limit, "exact exponent is too large"))?;
+    if x.is_zero() && n < 0 { return Ok(None); }
+    Ok(Some(x.pow(n)))
 }

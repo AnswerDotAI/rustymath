@@ -662,11 +662,9 @@ fn erfc_blocks<R: Native, const FUSED: bool>(x: &[R], out: &mut [MaybeUninit<R>]
         true
     })
 }
-/// [`erfinv`](crate::erfinv) as a function object, with the slice form `many`, which runs `regions` on a slice of f64s.
+/// [`erfinv`](crate::erfinv) as a function object.
 #[derive(Clone, Copy, Debug)]
 pub struct Erfinv;
-forms!(Erfinv at real: |_, [p]| erfinv::<_, { crate::FUSED }>(p),
-    many |_, [p], n, out| inverses(p, n, out, #[inline(always)] |p| erfinv::<_, { crate::FUSED }>(p), #[inline(always)] |p| (p.abs(), 1.0 - p.abs(), p)));
 
 /// [`erfcinv`](crate::erfcinv) as a function object, with the slice form `many`, which runs `regions` on a slice of f64s.
 #[derive(Clone, Copy, Debug)]
@@ -674,7 +672,7 @@ pub struct Erfcinv;
 forms!(Erfcinv at real: |_, [q]| erfcinv::<_, { crate::FUSED }>(q),
     many |_, [q], n, out| inverses(q, n, out, #[inline(always)] |q| erfcinv::<_, { crate::FUSED }>(q), #[inline(always)] |q| ((q - 1.0).abs(), q.min(2.0 - q), 1.0 - q)));
 
-/// The slice form of [`Erfinv`] and [`Erfcinv`]: `regions` on a slice of f64s, and `f` on each item otherwise. `parts` gives an f64 item's `maddock` arguments and the value whose sign its result takes.
+/// The slice form of [`Erfcinv`]: `regions` on a slice of f64s, and `f` on each item otherwise. `parts` gives an f64 item's `maddock` arguments and the value whose sign its result takes.
 fn inverses<R: Native>(x: Arg<'_, R>, n: usize, out: &mut [MaybeUninit<R>], f: impl Fn(R) -> R, parts: impl Fn(f64) -> (f64, f64, f64)) -> bool {
     match x { Arg::Many(x) if R::WIDE => regions::<R, { crate::FUSED }>(&x[..n], out, f, parts), x => each!([x], n, out, |[x]| f(x)) }
 }
@@ -917,6 +915,13 @@ fn gammainc64<const FUSED: bool>(a: f64, x: f64) -> f64 { incomplete_gamma::<FUS
 fn halley(x: f64, residual: f64, slope: f64, curve: f64) -> f64 { let u = residual / slope; x - u / (1.0 - 0.5 * (u * curve).min(1.0)) }
 const SETTLED: f64 = 1.5e-8;
 
+/// The rough normal deviate at `p` that `gammaincinv64` and `beta_guess` start from: Abramowitz and Stegun's 26.2.22, negated for `p` below ½.
+fn normal_guess<const FUSED: bool>(p: f64) -> f64 {
+    let t = (-2.0 * ln::<f64, FUSED>(p.min(1.0 - p))).sqrt();
+    let z = (2.30753 + t * 0.27061) / (1.0 + t * (0.99229 + t * 0.04481)) - t;
+    if p < 0.5 { -z } else { z }
+}
+
 /// The x with P(a, x) = p: a first guess from the Wilson–Hilferty approximation for a > 1, or from P's leading terms for a ≤ 1, then Halley steps.
 fn gammaincinv64<const FUSED: bool>(a: f64, p: f64) -> f64 {
     if !(a > 0.0 && a.is_finite() && (0.0..=1.0).contains(&p)) { return f64::NAN; }
@@ -925,9 +930,7 @@ fn gammaincinv64<const FUSED: bool>(a: f64, p: f64) -> f64 {
     let lg = lgamma64::<FUSED>(a);
     let a1 = a - 1.0;
     let mut x = if a > 1.0 {
-        let t = (-2.0 * ln::<f64, FUSED>(p.min(1.0 - p))).sqrt();
-        let z = (2.30753 + t * 0.27061) / (1.0 + t * (0.99229 + t * 0.04481)) - t;
-        let z = if p < 0.5 { -z } else { z };
+        let z = normal_guess::<FUSED>(p);
         let c = 1.0 - 1.0 / (9.0 * a) - z / (3.0 * a.sqrt());
         (a * c * c * c).max(1e-3)
     } else {
@@ -967,6 +970,10 @@ fn beta_fraction(a: f64, b: f64, x: f64) -> f64 {
     h
 }
 
+/// The regularized incomplete beta CDF with shape parameters a and b fixed.
+#[derive(Clone, Copy, Debug)]
+pub struct BetaincAt(pub f64, pub f64);
+
 /// ln B(a, b) = ln Γ(a) + ln Γ(b) - ln Γ(a + b).
 fn lbeta<const FUSED: bool>(a: f64, b: f64) -> f64 { lgamma64::<FUSED>(a) + lgamma64::<FUSED>(b) - lgamma64::<FUSED>(a + b) }
 
@@ -994,9 +1001,7 @@ fn betaincinv64<const FUSED: bool>(a: f64, b: f64, p: f64) -> f64 {
 /// A first guess at the x with I_x(a, b) = p: from a normal approximation for a and b from 1 up, or from I's leading terms near 0 and 1 otherwise.
 fn beta_guess<const FUSED: bool>(a: f64, b: f64, p: f64) -> f64 {
     if a >= 1.0 && b >= 1.0 {
-        let t = (-2.0 * ln::<f64, FUSED>(p.min(1.0 - p))).sqrt();
-        let z = (2.30753 + t * 0.27061) / (1.0 + t * (0.99229 + t * 0.04481)) - t;
-        let z = if p < 0.5 { -z } else { z };
+        let z = normal_guess::<FUSED>(p);
         let al = (z * z - 3.0) / 6.0;
         let h = 2.0 / (1.0 / (2.0 * a - 1.0) + 1.0 / (2.0 * b - 1.0));
         let w = z * (al + h).sqrt() / h - (1.0 / (2.0 * b - 1.0) - 1.0 / (2.0 * a - 1.0)) * (al + 5.0 / 6.0 - 2.0 / (3.0 * h));

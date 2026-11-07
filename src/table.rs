@@ -1,5 +1,5 @@
 //! Table-based logarithm and exponential for f64 `pow` and `root`, from Arm Optimized Routines' `pow`. The logarithm reduces x by a centre c whose reciprocal has few bits, so that z/c - 1 needs no division, and looks up ln c. The exponential reduces by multiples of ln 2/256 and looks up 2^(j/256) as a float and the tail of its rounding, which leaves a short polynomial. Both steps carry a double word. Each item reads its own table entries, so LLVM vectorizes the loops that call them only where the target has gathers, as AVX2 does. On NEON and in wasm they run one item at a time. `log2_single` and `exp2_single` are the logarithm and exponential of Arm's scalar `powf`, for `Pow`'s and `Root`'s scalar forms at f32 and f16. See `THIRD-PARTY.md`.
-use crate::{dd::Double, exp::{clamp, limit}, float::sealed::Core};
+use crate::{dd::Double, exp::clamp, float::sealed::Core};
 use std::f64::consts::LOG2_E;
 
 /// `ix - off`, k as an f64 and the bits of z, for the float with bits `ix` = z × 2^k and z from the float with bits `off` to twice it. The table index is in the bits of `ix - off` below its top 12, which hold k. They're read with a bias of 2048, so that no shift needs a sign, and k converts through `Core::from_low`.
@@ -202,7 +202,7 @@ const C: [f64; 3] = [0.49999999999999756, 0.1666666799409282, 0.0416666705449092
 /// e^(hi + lo), for a double word whose lo is far below hi. lo joins the reduced argument, except where `clamp` changes hi and the result is 0 or ∞ whatever lo is. The result is 2^e × 2^(j/256) × e^r, with 2^(j/256) carried as `SBITS` and its `TAIL`. 2^e multiplies in two factors, so a result below the normal floats rounds once, in the second.
 #[inline(always)]
 pub(crate) fn exp<const FUSED: bool>(hi: f64, lo: f64) -> f64 {
-    let x = clamp(hi, limit());
+    let x = clamp(hi, 1100.0);
     let (ki, r) = reduce::<FUSED>(x);
     let j = ki & 255;
     let t = f64::from_bits(SBITS[j as usize] + (j << 44));

@@ -4,7 +4,7 @@ use pyo3::exceptions::{PySystemError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyComplex, PyFloat, PyInt, PyList, PyString};
 use rustymath::array::{Array as Core, ArrayView};
-use rustymath::buffer::{Buffer, ComplexWidth, DType, Element, Fill, FloatWidth, Items, Width};
+use rustymath::buffer::{Buffer, ComplexWidth, DType, Element, FloatWidth, Items, Width};
 use rustymath::error::{Error, Kind};
 use rustymath::half::f16;
 use rustymath::layout::Layout;
@@ -67,7 +67,7 @@ impl Arg {
         match self.source { Source::Read { read, layout } => Core::new(layout, read.into_buffer()).map_err(py_err), Source::Owned(c) => Ok(c) }
     }
     /// Selects by `plan` before taking ownership, with the GIL released, reading `fill`, or the item type's fill, where the plan reaches no item: foreign items gather directly, and rustymath arrays select as [`Core::selected`] does.
-    pub fn selected(&self, py: Python<'_>, plan: rustymath::structure::Plan, fill: Option<Arc<Fill>>) -> PyResult<Core> {
+    pub fn selected(&self, py: Python<'_>, plan: rustymath::structure::Plan, fill: Option<Arc<Buffer>>) -> PyResult<Core> {
         match &self.source {
             Source::Read { read, .. } => { let items = read.view(); released(py, || Core::gathered(items, &plan, fill)) }
             Source::Owned(c) => released(py, || c.selected(plan, fill)),

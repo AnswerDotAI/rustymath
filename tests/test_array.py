@@ -33,11 +33,11 @@ def test_numpy_views_share_items():
 def test_views_that_strides_cant_describe_keep_what_they_gather():
     image = rm.arange(256.).reshape(16, 16)
     rows = rm.windows(image, (3, 3)).reshape(-1, 9)
-    declines = lambda report: [(r.route, r.reason, r.calls) for r in report.records if r.kind == 'declined']
+    declines = lambda report: [(r['route'], r['reason'], r['calls']) for r in report.records if r['kind'] == 'declined']
     with rm.explain() as report: row = rows[2]
     assert row.tolist() == [2, 3, 4, 18, 19, 20, 34, 35, 36] and declines(report) == []
     with rm.explain() as report: totals = {rows.sum(), rows.sum(), np.asarray(rows).sum(), sum(map(sum, rows.tolist()))}
-    assert len(totals) == 1 and declines(report) == [('in place', 'a view that gathers', 1)]
+    assert len(totals) == 1 and declines(report) == []
     with rm.explain() as report: repeated = rm.repeat(image[:, ::2], 2, axis=1)
     assert repeated.tolist() == np.repeat(np.asarray(image)[:, ::2], 2, axis=1).tolist() and declines(report) == []
     padded = rm.pad(rm.arange(4.), 1, fill=9.)
@@ -86,7 +86,7 @@ def test_python_values():
     with pytest.raises(ValueError): rm.array(['ab'])
     with pytest.raises(OverflowError): rm.array([2**70])
     with pytest.raises(TypeError): rm.array(x for x in [1])
-    with pytest.raises(KeyError): t['c']
+    assert t['c'].tolist() == [0, 0]
     with pytest.raises(IndexError): m[2]
 
 def test_data_frames():
@@ -119,13 +119,17 @@ def test_methods():
     with pytest.raises(IndexError): m[0, 0, 0]
     assert t.astype('float32').dtype == 'float32' and t.astype('float32').keys == t.keys and rm.array([True]).astype('uint8').tolist() == [1]
     assert rm.array([1.5]).astype('complex128').tolist() == [1.5 + 0j] and m.astype('int64').tolist() == m.tolist()
-    assert rm.array([1.7, -1.7]).astype('int64').tolist() == [1, -1] and rm.array([5]).astype('int16').tolist() == [5] and rm.array([2 + 0j]).astype('uint8').tolist() == [2]
+    assert rm.array([1.7, -1.7]).astype('int64').tolist() == [1, -2] and rm.array([5]).astype('int16').tolist() == [5] and rm.array([2 + 0j]).astype('uint8').tolist() == [2]
     assert rm.array([0, 1]).astype('bool').tolist() == rm.array([0.0, 1.0]).astype('bool').tolist() == [False, True] and rm.array([1 + 2j]).astype('complex64').dtype == 'complex64'
     for source, values, targets in (('uint8', [0, 255], ('int16', 'int32', 'int64')), ('int16', [-32768, 32767], ('int32', 'int64')), ('int32', [-2**31, 2**31-1], ('int64',))):
         a = rm.array(values, dtype=source)
         for target in targets: assert a.astype(target).tolist() == a.astype(target).astype(source).tolist() == values
-    for x, dtype in ((-1, 'uint8'), (300, 'uint8'), (2**40, 'int32'), (float('nan'), 'int64'), (float('inf'), 'int16'), (2, 'bool'), (0.5, 'bool'), (1.5, 'bool'), (1e19, 'int64')):
-        with pytest.raises(OverflowError): rm.array([x]).astype(dtype)
+    # An integer target converts as BPL's `ₓ` does: a float floors and saturates, NaN gives 0, and an integer wraps to the width.
+    for x, dtype, expected in ((-1, 'uint8', 255), (300, 'uint8', 44), (2**40, 'int32', 0), (float('nan'), 'int64', 0), (float('inf'), 'int16', 32767),
+                               (-1.5, 'int16', -2), (1e19, 'int64', 2**63 - 1)):
+        assert rm.array([x]).astype(dtype).tolist() == [expected]
+    for x in 2, 0.5, 1.5:
+        with pytest.raises(OverflowError): rm.array([x]).astype('bool')
     with pytest.raises(ValueError, match='imaginary'): rm.array([1 + 1j]).astype('float64')
     with pytest.raises(ValueError, match='characters'): rm.array('ab').astype('int64')
     with pytest.raises(ValueError, match='unknown dtype'): m.astype('f64')

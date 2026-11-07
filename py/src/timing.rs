@@ -11,9 +11,9 @@ macro_rules! at_width {
     };
 }
 
-/// A hold on the machine's timing lock, taken exclusively when a `with` block starts and released when it ends, as `rustymath::timing::exclusive` takes it. While the block runs, the calling thread runs rustymath's calls on one thread, and on macOS it asks for user-interactive QoS. `pauses` gives the pauses, in seconds, before each retry of a case over its budget, `column` which of a budget file's two native budgets this machine compares costs with, or `None` on a machine with no budgets, as `rustymath::timing::NATIVE_COLUMN` gives it, and `checks_budgets` whether a case still over its budget fails, as `rustymath::timing::checks_budgets` decides. `warm` keeps the thread busy after each pause. `budgets` reads a budget file, and `copy`, `peak_held`, `footprint` and `line` give what the speed test measures and prints.
+/// A hold on the timing lock that `timing` names, taken exclusively when a `with` block starts and released when it ends, as `rustymath::timing::hold_at` takes it. While the block runs, the calling thread runs rustymath's calls on one thread, and on macOS it asks for user-interactive QoS. `pauses` gives the pauses, in seconds, before each retry of a case over its budget, `column` which of a budget file's two native budgets this machine compares costs with, or `None` on a machine with no budgets, as `rustymath::timing::NATIVE_COLUMN` gives it, and `checks_budgets` whether a case still over its budget fails, as `rustymath::timing::checks_budgets` decides. `warm` keeps the thread busy after each pause. `budgets` reads a budget file, and `copy`, `peak_held`, `footprint` and `line` give what the speed test measures and prints.
 #[pyclass(module = "rustymath")]
-struct Timing(Option<rustymath::timing::Hold>);
+struct Timing { lock: String, hold: Option<rustymath::timing::Hold> }
 
 #[pymethods]
 impl Timing {
@@ -55,9 +55,13 @@ impl Timing {
         let cases = rustymath::timing::budgeted(text, rustymath::timing::NATIVE_COLUMN).map_err(pyo3::exceptions::PyValueError::new_err)?;
         Ok(cases.into_iter().map(|(section, code, budget)| (section.into(), code.into(), budget.map(Budget))).collect())
     }
-    /// Waits for the lock without holding the GIL, as long as `rustymath::timing::exclusive` waits.
-    fn __enter__(mut slf: PyRefMut<'_, Self>) -> PyResult<PyRefMut<'_, Self>> { slf.0 = Some(slf.py().detach(rustymath::timing::exclusive)?); Ok(slf) }
-    fn __exit__(&mut self, _kind: &Bound<'_, PyAny>, _value: &Bound<'_, PyAny>, _traceback: &Bound<'_, PyAny>) { self.0 = None; }
+    /// Waits for the lock without holding the GIL, as long as `rustymath::timing::hold_at` waits.
+    fn __enter__(mut slf: PyRefMut<'_, Self>) -> PyResult<PyRefMut<'_, Self>> {
+        let lock = slf.lock.clone();
+        slf.hold = Some(slf.py().detach(|| rustymath::timing::hold_at(&lock, false))?);
+        Ok(slf)
+    }
+    fn __exit__(&mut self, _kind: &Bound<'_, PyAny>, _value: &Bound<'_, PyAny>, _traceback: &Bound<'_, PyAny>) { self.hold = None; }
 }
 
 /// A case's budget in the column that this machine checks, with any hold, as `rustymath::timing::Budget` gives it. `over(cost)` says whether a cost is over it, `stale(cost)` whether the hold of a gap has outlived the gap, and `str()` gives it as a speed test's line does.
@@ -71,8 +75,13 @@ impl Budget {
     fn __str__(&self) -> String { self.0.to_string() }
 }
 
-/// A hold on the machine's timing lock, for `with rustymath.timing():` around a timing.
+/// A hold on the machine's timing lock, for `with rustymath.timing():` around a timing, or on the lock whose file is `lock`, as a test of the protocol holds a file of its own.
 #[pyfunction]
-fn timing() -> Timing { Timing(None) }
+#[pyo3(signature = (lock=None))]
+fn timing(lock: Option<String>) -> Timing { Timing { lock: lock.unwrap_or_else(|| rustymath::timing::LOCK.into()), hold: None } }
 
-pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> { m.add_class::<Timing>()?; m.add_class::<Budget>()?; m.add_function(wrap_pyfunction!(timing, m)?) }
+pub fn add(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<Timing>()?;
+    m.add_class::<Budget>()?;
+    m.add_function(wrap_pyfunction!(timing, m)?)
+}

@@ -1,7 +1,7 @@
 //! Probability distributions. Each has a density, a cumulative distribution, a quantile function and a sampler. The first three are also function objects, `Pdf`, `Cdf` and `Quantile`, which hold the distribution. Their slice forms choose the distribution's formulas once, outside the loop, so the loops of the closed-form distributions vectorize. Their one-item forms run the slice forms on one item. An item of a slice form fails where its result is NaN and its argument isn't, as for a quantile of p outside 0 to 1. A discrete distribution's density is its mass at a whole x, and its quantile function and sampler give whole numbers.
 use crate::{
-    Arg, Atan, Erfc, Erfcinv, Float, Ln, Log1p, Pow, Root, Tan, Unary, betainc, betaincinv, cos, erfcinv, exp, expm1, gammainc, gammaincc, gammaincinv, lgamma,
-    ln, log1p, pow, sin, slice::{CHUNK, Forms, kept, written}
+    Arg, Atan, Erfc, Erfcinv, Float, Ln, Log1p, Unary, betainc, betaincinv, cos, erfcinv, exp, expm1, gammainc, gammaincc, gammaincinv, lgamma, ln, log1p, pow,
+    random::Items, sin, slice::{CHUNK, kept, written}
 };
 use rand::{Rng, distr::{Distribution as _, Open01, StandardUniform}};
 use std::{f64::consts::{FRAC_1_SQRT_2, PI, SQRT_2, TAU}, mem::MaybeUninit};
@@ -55,8 +55,10 @@ trait Formulas {
     fn pdf(&self, x: f64) -> f64;
     fn cdf(&self, x: f64) -> f64;
     fn quantile(&self, p: f64) -> f64;
-    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64;
-    fn samples<R: Rng + ?Sized>(&self, rng: &mut R, out: &mut [f64]) { for o in out { *o = self.sample(rng); } }
+    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { self.quantile(open(rng)) }
+    /// The words that one attempt of a draw reads, which an item packs before its region's (`random::Items`).
+    fn words(&self) -> usize { 1 }
+    fn samples(&self, items: &mut Items, out: &mut [f64]) { for o in out { *o = self.sample(&mut items.item()); } }
     #[inline(always)]
     fn pdf_map<F: Float>(&self) -> impl Fn(F) -> F + Copy { move |x| narrowed(x, |x| self.pdf(x)) }
     #[inline(always)]
@@ -64,19 +66,18 @@ trait Formulas {
     #[inline(always)]
     fn quantile_map<F: Float>(&self) -> impl Fn(F) -> F + Copy { move |p| narrowed(p, |p| self.quantile(p)) }
     #[inline(always)]
-    fn pdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Ln: Forms<F, 1, Out = F>, Pow: Forms<F, 2, Out = F> {
+    fn pdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Ln: Unary<F, Out = F> {
         let pdf = self.pdf_map();
         each!([x], n, out, |[x]| pdf(x))
     }
     #[inline(always)]
-    fn cdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Erfc: Forms<F, 1, Out = F>, Atan: Forms<F, 1, Out = F>,
-        Pow: Forms<F, 2, Out = F> { let cdf = self.cdf_map(); each!([x], n, out, |[x]| cdf(x)) }
-    #[inline(always)]
-    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Erfcinv: Forms<F, 1, Out = F>,
-        Log1p: Forms<F, 1, Out = F>, Tan: Forms<F, 1, Out = F>, Ln: Forms<F, 1, Out = F>, Root: Forms<F, 2, Out = F> {
-        let q = self.quantile_map();
-        each!([p], n, out, |[p]| q(p))
+    fn cdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Erfc: Unary<F, Out = F>, Atan: Unary<F, Out = F> {
+        let cdf = self.cdf_map();
+        each!([x], n, out, |[x]| cdf(x))
     }
+    #[inline(always)]
+    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Erfcinv: Unary<F, Out = F>, Log1p: Unary<F, Out = F>,
+        Ln: Unary<F, Out = F> { let q = self.quantile_map(); each!([p], n, out, |[p]| q(p)) }
 }
 
 /// `Formulas`' `f64` methods for a law whose generic methods hold its formulas: each runs its slice form on one item.
@@ -106,29 +107,48 @@ fn one_item<F: Float>(many: impl FnOnce(&mut [MaybeUninit<F>]) -> bool) -> F {
 #[inline(always)]
 fn narrowed<F: Float>(x: F, f: impl Fn(f64) -> f64) -> F { F::narrow(f(x.wide())) }
 
-/// [`Distribution::pdf`] as a function object. The log-normal distribution's slice form takes ln from [`Ln`]'s slice form, which vectorizes where a loop of whole densities doesn't. The Weibull distribution's takes its power from [`Pow`]'s.
+/// [`Distribution::pdf`] as a function object. The log-normal distribution's slice form takes ln from [`Ln`]'s slice form, which vectorizes where a loop of whole densities doesn't. The Weibull distribution uses the shared [`Pow`] formula.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Pdf(pub Distribution);
 forms!(Pdf at real: |k, [x]| one_item(|out| k.slice([Arg::One(x)], 1, out)), many |k, [x], n, out| each_law!(&k.0 .0, d => d.pdf_many(x, n, out)));
 
-/// [`Distribution::cdf`] as a function object. The normal and log-normal distributions' slice forms take erfc from [`Erfc`]'s slice form, which computes only the formulas that each block of arguments needs. The Cauchy distribution's takes atan from [`Atan`]'s, and the Weibull distribution's takes its power from [`Pow`]'s.
+/// [`Distribution::cdf`] as a function object. The normal and log-normal distributions' slice forms take erfc from [`Erfc`]'s slice form, which computes only the formulas that each block of arguments needs. The Cauchy distribution's takes atan from [`Atan`]'s, and the Weibull distribution uses the shared [`Pow`] formula.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cdf(pub Distribution);
 forms!(Cdf at real: |k, [x]| one_item(|out| k.slice([Arg::One(x)], 1, out)), many |k, [x], n, out| each_law!(&k.0 .0, d => d.cdf_many(x, n, out)));
 
-/// [`Distribution::quantile`] as a function object, through [`quantiles`]. The normal and log-normal distributions' slice forms take erfcinv(2p) from [`Erfcinv`]'s slice form, whose loops don't branch on each item's region. The exponential, Cauchy, Laplace, logistic and Weibull distributions' take their logarithms, tangent or root from the slice forms of [`Log1p`], [`Ln`], [`Tan`] and [`Root`].
+/// [`Distribution::quantile`] as a function object, through [`quantiles`]. The normal and log-normal distributions' slice forms take erfcinv(2p) from [`Erfcinv`]'s slice form, whose loops don't branch on each item's region. Logarithms use [`Log1p`] and [`Ln`] slice forms; tangent and root use the shared [`Tan`] and [`Root`] formulas.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Quantile(pub Distribution);
 forms!(Quantile at real: |k, [p]| one_item(|out| k.slice([Arg::One(p)], 1, out)), many |k, [p], n, out| quantiles(p, n, out, |p, n, out| each_law!(&k.0 .0, d => d.quantile_many(p, n, out))));
 
-/// The quantiles that `law`, a law's `quantile_many`, gives at the `n` items of `p`, written into `out`. A p outside 0 to 1 gives NaN, which fails unless p is NaN. The law's formulas never see such a p.
+macro_rules! native_law {
+    ($( $object:ident $(valid $valid:ident)? ),+) => {$(
+        impl crate::facts::Formula<1> for $object {
+            fn supports(&self, dtype: crate::buffer::DType) -> bool { matches!(dtype, crate::buffer::DType::Float(_)) }
+            const FAILS_NAN: bool = true;
+            $(fn emit_valid<F: Float, O: crate::recipe::Ops<F> + ?Sized>(&self, _: crate::domain::Variant, o: &O, [p]: [O::V; 1], _: O::V) -> Option<(crate::error::Kind, O::B)> { Some((crate::error::Kind::Domain, $valid(o, p))) })?
+            fn real<F: crate::float::Native>(&self, _: &crate::recipe::NativeOps<{ crate::FUSED }>, [x]: [F; 1]) -> Option<F> {
+                Some(F::narrow(if F::WIDE { self.one(x.wide()) } else { f64::from(self.one(x.wide() as f32)) }))
+            }
+            fn native_slices(&self) -> Option<crate::facts::NativeSlices<Self, 1>> { Some(crate::facts::NativeSlices::unary()) }
+        }
+    )+};
+}
+native_law!(Pdf, Cdf, Quantile valid probability);
+
+fn probability<F: Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, p: O::V) -> O::B {
+    o.and(o.less_equal(o.number(F::zero()), p), o.less_equal(p, o.number(F::one())))
+}
+
+/// Writes quantiles from `law`. Probabilities outside 0..=1, including NaN, produce NaN and mark the call invalid. The law receives 0.5 in those lanes.
 fn quantiles<F: Float>(p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>], law: impl Fn(Arg<'_, F>, usize, &mut [MaybeUninit<F>]) -> bool) -> bool {
-    let inside = |p: F| (F::zero()..=F::one()).contains(&p);
+    let inside = |p: F| probability(&crate::recipe::Floats, p);
     let all = match p { Arg::Many(p) => p[..n].iter().fold(true, |all, &p| all & inside(p)), Arg::One(p) => inside(p) };
     if all { return law(p, n, out); }
     let within: Vec<F> = (0..n).map(|i| if inside(p.nth(i)) { p.nth(i) } else { F::narrow(0.5) }).collect();
     let ok = law(Arg::Many(&within), n, out);
-    (0..n).filter(|&i| !inside(p.nth(i))).fold(ok, |ok, i| { out[i].write(F::nan()); ok & p.nth(i).is_nan() })
+    (0..n).filter(|&i| !inside(p.nth(i))).fold(ok, |_, i| { out[i].write(F::nan()); false })
 }
 
 /// `finish(x, v)` for each of the `n` items x of `x`, written into `out`. `values` writes a block's values v into the block's slots of `out`, from the block's arguments `inner(x)`, usually through one slice form, as [`through`] gives it. It may overwrite the arguments. A `One` argument computes its result once. Each step runs over up to `CHUNK` items at a time, so the arguments and values between the steps stay in cache, and the arguments' buffer holds no more items than `x`. An item fails where its result is NaN and its argument isn't, as in every slice form. Gives whether every item succeeded.
@@ -160,11 +180,12 @@ fn composed<F: Float>(
 }
 
 /// The values of `g`'s slice form at a block's arguments, for [`composed`].
-fn through<F: Float, G: Forms<F, 1, Out = F>>(g: G) -> impl Fn(&mut [F], &mut [MaybeUninit<F>]) { move |a, v| { g.slice([Arg::Many(a)], a.len(), v); } }
+fn through<F: Float, G: Unary<F, Out = F>>(g: G) -> impl Fn(&mut [F], &mut [MaybeUninit<F>]) { move |a, v| { g.slice([Arg::Many(a)], a.len(), v); } }
 
-/// The values of `Pow`'s slice form, each argument of a block raised to `k`, for [`composed`].
-fn raised<F: Float>(k: F) -> impl Fn(&mut [F], &mut [MaybeUninit<F>]) where Pow: Forms<F, 2, Out = F> {
-    move |a, v| { Pow.slice([Arg::Many(a), Arg::One(k)], a.len(), v); }
+/// Each argument of a block raised to `k`, with `k`'s route chosen once (`pow::powers`), for [`composed`].
+fn raised<F: Float>(k: F) -> impl Fn(&mut [F], &mut [MaybeUninit<F>]) {
+    let e = crate::pow::Exponent::of(k.wide(), crate::FUSED);
+    move |a, v| crate::pow::powers(e, k, a, v)
 }
 
 impl Distribution {
@@ -174,10 +195,10 @@ impl Distribution {
     pub fn cdf(&self, x: f64) -> f64 { Cdf(*self).one(x) }
     /// The least x whose `cdf` is at least p. p outside 0 to 1 gives NaN.
     pub fn quantile(&self, p: f64) -> f64 { Quantile(*self).one(p) }
-    /// One value drawn from the distribution.
-    pub fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { each_law!(&self.0, d => d.sample(rng)) }
-    /// Fills `out` with values drawn from the distribution.
-    pub fn samples<R: Rng + ?Sized>(&self, rng: &mut R, out: &mut [f64]) { each_law!(&self.0, d => d.samples(rng, out)) }
+    /// The words that one attempt of a draw reads, which each item of `samples` packs (`random::Items`).
+    pub fn words(&self) -> usize { each_law!(&self.0, d => d.words()) }
+    /// Fills `out` with values drawn from the distribution, one for each item of `items`, which packs this distribution's `words`. A normal distribution's item gives two values, from one pair of uniform words.
+    pub fn samples(&self, items: &mut Items, out: &mut [f64]) { each_law!(&self.0, d => d.samples(items, out)) }
     /// Whether the distribution's values are whole numbers.
     pub fn is_discrete(&self) -> bool { matches!(self.0, Law::Binomial(_) | Law::Poisson(_)) }
 }
@@ -186,6 +207,9 @@ impl Distribution {
 fn checked(parameters: &[f64], ok: bool, message: &'static str) -> Result<(), Invalid> {
     if !parameters.iter().all(|p| p.is_finite()) { Err(Invalid("distribution parameters must be finite")) } else if ok { Ok(()) } else { Err(Invalid(message)) }
 }
+
+/// The largest binomial trial count or Poisson rate: f64 holds every whole number up to it. Past it, `btrd`'s ratio walk (`i += 1.0`) and `least`'s halving stop advancing.
+const WHOLE: u64 = 1 << 53;
 
 impl Distribution {
     /// The normal distribution with this mean and standard deviation.
@@ -262,11 +286,13 @@ impl Distribution {
     /// The binomial distribution of the successes in n trials, each with probability p.
     pub fn binomial(n: u64, p: f64) -> Result<Self, Invalid> {
         checked(&[p], (0.0..=1.0).contains(&p), "the probability must be from 0 to 1")?;
+        if n > WHOLE { return Err(Invalid("binomial trials exceed the sampler's whole-number range")); }
         Ok(Self(Law::Binomial(Binomial { n: n as f64, p })))
     }
     /// The Poisson distribution with this rate.
     pub fn poisson(rate: f64) -> Result<Self, Invalid> {
         checked(&[rate], rate >= 0.0, "the rate must not be negative")?;
+        if rate > WHOLE as f64 { return Err(Invalid("the Poisson rate exceeds the sampler's whole-number range")); }
         Ok(Self(Law::Poisson(Poisson { rate })))
     }
 }
@@ -294,6 +320,9 @@ fn standard_normal<R: Rng + ?Sized>(rng: &mut R) -> f64 {
     let (u, v): (f64, f64) = (open(rng), StandardUniform.sample(rng));
     (-2.0 * ln(u)).sqrt() * cos(TAU * v)
 }
+
+/// The words that one attempt of `standard_gamma` reads at `shape`: the normal draw's two and the test's one, and one more below a shape of 1.
+fn gamma_words(shape: f64) -> usize { if shape < 1.0 { 4 } else { 3 } }
 
 /// A value drawn from the gamma distribution with this shape and scale 1, by Marsaglia and Tsang's method. A shape below 1 draws with shape + 1 and scales by u^(1/shape).
 fn standard_gamma<R: Rng + ?Sized>(shape: f64, rng: &mut R) -> f64 {
@@ -338,20 +367,22 @@ impl Formulas for Normal {
     #[inline(always)]
     fn pdf_map<F: Float>(&self) -> impl Fn(F) -> F + Copy { self.density() }
     #[inline(always)]
-    fn cdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Erfc: Forms<F, 1, Out = F> {
+    fn cdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Erfc: Unary<F, Out = F> {
         let half = F::narrow(0.5);
         composed(x, n, out, self.erfc_line(), through(Erfc), #[inline(always)] move |_, e| half * e)
     }
     #[inline(always)]
-    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Erfcinv: Forms<F, 1, Out = F> {
+    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Erfcinv: Unary<F, Out = F> {
         let (two, from) = (F::narrow(2.0), self.from_erfcinv());
         composed(p, n, out, #[inline(always)] move |p| two * p, through(Erfcinv), #[inline(always)] move |_, e| from(e))
     }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { self.mean + self.sd * standard_normal(rng) }
-    /// Each pair of uniform draws gives two values, from the cosine and the sine of one angle.
-    fn samples<R: Rng + ?Sized>(&self, rng: &mut R, out: &mut [f64]) {
+    /// An item, a pair of uniform words, gives two values, from the cosine and the sine of one angle.
+    fn words(&self) -> usize { 2 }
+    fn samples(&self, items: &mut Items, out: &mut [f64]) {
         for pair in out.chunks_mut(2) {
-            let (u, v): (f64, f64) = (open(rng), StandardUniform.sample(rng));
+            let mut item = items.item();
+            let (u, v): (f64, f64) = (open(&mut item), StandardUniform.sample(&mut item));
             let r = self.sd * (-2.0 * ln(u)).sqrt();
             pair[0] = self.mean + r * cos(TAU * v);
             if let Some(second) = pair.get_mut(1) { *second = self.mean + r * sin(TAU * v); }
@@ -402,6 +433,7 @@ impl Formulas for Beta {
     }
     fn cdf(&self, x: f64) -> f64 { betainc(self.a, self.b, x.clamp(0.0, 1.0)) }
     fn quantile(&self, p: f64) -> f64 { betaincinv(self.a, self.b, p) }
+    fn words(&self) -> usize { gamma_words(self.a) + gamma_words(self.b) }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { let x = standard_gamma(self.a, rng); x / (x + standard_gamma(self.b, rng)) }
 }
 
@@ -417,7 +449,7 @@ impl Formulas for Cauchy {
     }
     /// The arctangent, from `Atan`'s slice form, is of z near the centre and of -1/z beyond |z| = 1. From that arctangent a, the cdf is 1/2 + a/π near the centre, a/π below -1 and 1 + a/π above 1. There 1/2 + atan(z)/π would lose the lower tail's digits.
     #[inline(always)]
-    fn cdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Atan: Forms<F, 1, Out = F> {
+    fn cdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Atan: Unary<F, Out = F> {
         let (location, rscale, rpi, half) = (F::narrow(self.location), F::narrow(self.scale.recip()), F::narrow(PI.recip()), F::narrow(0.5));
         composed(x, n, out, move |x| {
             let z = (x - location) * rscale;
@@ -428,19 +460,22 @@ impl Formulas for Cauchy {
             if z.abs() <= F::one() { half + a } else if z < F::zero() { a } else { F::one() + a }
         })
     }
-    /// The tangent, from `Tan`'s slice form, is of π·a, where a is p below p = 1/4, 1 - p above 3/4, and p - 1/2 between, so its argument stays within ±π/4. Near 0 and 1 the quantile is location ∓ scale/tan(π·a), which keeps p's digits there.
+    /// The tangent, from the shared `Tan` formula, is of π·a, where a is p below p = 1/4, 1 - p above 3/4, and p - 1/2 between, so its argument stays within ±π/4. Near 0 and 1 the quantile is location ∓ scale/tan(π·a), which keeps p's digits there.
     #[inline(always)]
-    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Tan: Forms<F, 1, Out = F> {
+    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool {
         let (location, scale, pi, low, high, half) =
             (F::narrow(self.location), F::narrow(self.scale), F::narrow(PI), F::narrow(0.25), F::narrow(0.75), F::narrow(0.5));
         composed(p, n, out, move |p| {
             pi * if p < low { p } else if p > high { F::one() - p } else { p - half }
-        }, through(Tan), move |p, t| {
+        }, |a, v| {
+            each!([Arg::Many(a)], a.len(), v, |[x]| F::from_working(crate::trig::formula(
+                &crate::recipe::NativeOps::<{ crate::FUSED }>::DEFAULT, F::working(x), crate::trig::Kind::Tan
+            )));
+        }, move |p, t| {
             let (num, den) = if p < low { (-scale, t) } else if p > high { (scale, t) } else { (scale * t, F::one()) };
             location + num / den
         })
     }
-    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { self.quantile(open(rng)) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -459,7 +494,7 @@ impl Formulas for Exponential {
         move |x| { let c = -expm1(-rate * x); if x <= F::zero() { F::zero() } else { c } }
     }
     #[inline(always)]
-    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Log1p: Forms<F, 1, Out = F> {
+    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Log1p: Unary<F, Out = F> {
         let mean = F::narrow(self.rate.recip());
         composed(p, n, out, |p| -p, through(Log1p), move |_, l| -l * mean)
     }
@@ -480,6 +515,7 @@ impl Formulas for Fisher {
     }
     fn cdf(&self, x: f64) -> f64 { if x <= 0.0 { 0.0 } else if x.is_infinite() { 1.0 } else { self.beta.cdf(self.y(x)) } }
     fn quantile(&self, p: f64) -> f64 { let y = self.beta.quantile(p); self.df2 * y / (self.df1 * (1.0 - y)) }
+    fn words(&self) -> usize { gamma_words(self.df1 / 2.0) + gamma_words(self.df2 / 2.0) }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 {
         let x = standard_gamma(self.df1 / 2.0, rng) / self.df1;
         x / (standard_gamma(self.df2 / 2.0, rng) / self.df2)
@@ -499,6 +535,7 @@ impl Formulas for Gamma {
     }
     fn cdf(&self, x: f64) -> f64 { if x <= 0.0 { 0.0 } else { gammainc(self.shape, x / self.scale) } }
     fn quantile(&self, p: f64) -> f64 { self.scale * gammaincinv(self.shape, p) }
+    fn words(&self) -> usize { gamma_words(self.shape) }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { self.scale * standard_gamma(self.shape, rng) }
 }
 
@@ -513,6 +550,7 @@ impl Formulas for InverseGamma {
     }
     fn cdf(&self, x: f64) -> f64 { if x <= 0.0 { 0.0 } else { gammaincc(self.shape, self.scale / x) } }
     fn quantile(&self, p: f64) -> f64 { self.scale / gammaincinv(self.shape, 1.0 - p) }
+    fn words(&self) -> usize { gamma_words(self.shape) }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { self.scale / standard_gamma(self.shape, rng) }
 }
 
@@ -537,14 +575,13 @@ impl Formulas for Laplace {
         }
     }
     #[inline(always)]
-    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Ln: Forms<F, 1, Out = F> {
+    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Ln: Unary<F, Out = F> {
         let (location, scale, half) = (F::narrow(self.location), F::narrow(self.scale), F::narrow(0.5));
         composed(p, n, out, move |p| {
             let r = if p < half { p } else { F::one() - p };
             r + r
         }, through(Ln), move |p, l| if p < half { location + scale * l } else { location - scale * l })
     }
-    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { self.quantile(open(rng)) }
 }
 
 /// The logistic distribution. Its formulas use e^-|z|, which can't overflow, so its tails stay exact.
@@ -573,11 +610,10 @@ impl Formulas for Logistic {
         }
     }
     #[inline(always)]
-    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Ln: Forms<F, 1, Out = F> {
+    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Ln: Unary<F, Out = F> {
         let (location, scale) = (F::narrow(self.location), F::narrow(self.scale));
         composed(p, n, out, |p| p / (F::one() - p), through(Ln), move |_, l| location + scale * l)
     }
-    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { self.quantile(open(rng)) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -592,7 +628,7 @@ impl Formulas for LogNormal {
     through_slices!();
     /// A nonpositive or NaN x goes to `Ln` as 1. Its density is then 0, or NaN for NaN.
     #[inline(always)]
-    fn pdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Ln: Forms<F, 1, Out = F> {
+    fn pdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Ln: Unary<F, Out = F> {
         let pdf = self.normal().density();
         composed(x, n, out, #[inline(always)] |x| if x > F::zero() { x } else { F::one() }, through(Ln), #[inline(always)] move |x, l| {
             let p = pdf(l) / x;
@@ -600,16 +636,17 @@ impl Formulas for LogNormal {
         })
     }
     #[inline(always)]
-    fn cdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Erfc: Forms<F, 1, Out = F> {
+    fn cdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Erfc: Unary<F, Out = F> {
         let (line, half) = (self.normal().erfc_line(), F::narrow(0.5));
         composed(
             x, n, out, #[inline(always)] move |x| line(ln(x)), through(Erfc), #[inline(always)] move |x, e| if x <= F::zero() { F::zero() } else { half * e })
     }
     #[inline(always)]
-    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Erfcinv: Forms<F, 1, Out = F> {
+    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Erfcinv: Unary<F, Out = F> {
         let (two, from) = (F::narrow(2.0), self.normal().from_erfcinv());
         composed(p, n, out, #[inline(always)] move |p| two * p, through(Erfcinv), #[inline(always)] move |_, e| exp(from(e)))
     }
+    fn words(&self) -> usize { 2 }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { exp(self.normal().sample(rng)) }
 }
 
@@ -634,6 +671,7 @@ impl Formulas for StudentT {
         else { let x = betaincinv(h, 0.5, q); (self.df * (1.0 - x) / x).sqrt() };
         if p < 0.5 { -t } else { t }
     }
+    fn words(&self) -> usize { 2 + gamma_words(self.df / 2.0) }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { standard_normal(rng) / (standard_gamma(self.df / 2.0, rng) * 2.0 / self.df).sqrt() }
 }
 
@@ -642,9 +680,9 @@ struct Weibull { shape: f64, scale: f64 }
 
 impl Formulas for Weibull {
     through_slices!();
-    /// shape/scale·z^(shape-1)·e^(-z^shape) for z = x/scale. `Pow`'s slice form gives z^(shape-1), from a base of 1 for a negative x. The density is 0 where e^(-z^shape) underflows, even where z^(shape-1) overflows, and for a negative or infinite x.
+    /// shape/scale·z^(shape-1)·e^(-z^shape) for z = x/scale. The shared `Pow` formula gives z^(shape-1), from a base of 1 for a negative x. The density is 0 where e^(-z^shape) underflows, even where z^(shape-1) overflows, and for a negative or infinite x.
     #[inline(always)]
-    fn pdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Pow: Forms<F, 2, Out = F> {
+    fn pdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool {
         let (rscale, height) = (F::narrow(self.scale.recip()), F::narrow(self.shape / self.scale));
         composed(x, n, out, move |x| if x < F::zero() { F::one() } else { x * rscale }, raised(F::narrow(self.shape - 1.0)), move |x, w| {
             let e = exp(-times(x * rscale, w));
@@ -652,24 +690,23 @@ impl Formulas for Weibull {
             if x < F::zero() || x.is_infinite() { F::zero() } else { d }
         })
     }
-    /// 1 - e^(-z^shape) for z = x/scale. `Pow`'s slice form gives z^shape, from a base of 1 for a nonpositive x, whose cdf is 0.
+    /// 1 - e^(-z^shape) for z = x/scale. The shared `Pow` formula gives z^shape, from a base of 1 for a nonpositive x, whose cdf is 0.
     #[inline(always)]
-    fn cdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Pow: Forms<F, 2, Out = F> {
+    fn cdf_many<F: Float>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool {
         let rscale = F::narrow(self.scale.recip());
         composed(x, n, out, move |x| if x <= F::zero() { F::one() } else { x * rscale }, raised(F::narrow(self.shape)), |x, w| {
             let c = -expm1(-w);
             if x <= F::zero() { F::zero() } else { c }
         })
     }
-    /// scale·(-log1p(-p))^(1/shape), from `Log1p`'s slice form and then `Root`'s. `Root` takes shape itself as its degree, where `Pow` would need 1/shape rounded.
+    /// scale·(-log1p(-p))^(1/shape), from `Log1p` slice form and the shared `Root` formula. `Root` takes shape itself as its degree, where `Pow` would need 1/shape rounded.
     #[inline(always)]
-    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Log1p: Forms<F, 1, Out = F>, Root: Forms<F, 2, Out = F>
-    {
+    fn quantile_many<F: Float>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool where Log1p: Unary<F, Out = F> {
         let (degree, scale) = (F::narrow(self.shape), F::narrow(self.scale));
         composed(p, n, out, |p| -p, move |a, v| {
             Log1p.slice([Arg::Many(a)], a.len(), v);
             for (x, &l) in a.iter_mut().zip(written(v).iter()) { *x = -l; }
-            Root.slice([Arg::One(degree), Arg::Many(a)], a.len(), v);
+            crate::pow::roots(degree, a, v);
         }, move |_, w| scale * w)
     }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { self.scale * pow(-ln(open(rng)), 1.0 / self.shape) }
@@ -729,7 +766,8 @@ impl Formulas for Binomial {
         let (n, p) = (self.n, self.p);
         if p == 0.0 { 0.0 } else if p == 1.0 { n } else { least(q, normal_guess(n * p, (n * p * (1.0 - p)).sqrt(), q), n, |k| self.cdf(k)) }
     }
-    /// Inversion when the smaller of np and n(1-p) is below 10, and Hörmann's BTRD method otherwise. Both draw with p up to 1/2 and reflect.
+    /// Inversion when the smaller of np and n(1-p) is below 10, and Hörmann's BTRD method otherwise. Both draw with p up to 1/2 and reflect. Inversion reads one uniform draw and BTRD two.
+    fn words(&self) -> usize { if self.n * self.p.min(1.0 - self.p) < 10.0 { 1 } else { 2 } }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 {
         let flip = self.p > 0.5;
         let p = if flip { 1.0 - self.p } else { self.p };
@@ -827,6 +865,8 @@ impl Formulas for Poisson {
         else if q == 1.0 { f64::INFINITY }
         else { least(q, normal_guess(self.rate, self.rate.sqrt(), q), f64::INFINITY, |k| self.cdf(k)) }
     }
+    /// Below a rate of 10, an attempt multiplies uniform draws until their product passes e^-rate: the expected count, rate + 1, is packed. PTRS reads two.
+    fn words(&self) -> usize { if self.rate < 10.0 { (self.rate + 1.0).ceil() as usize } else { 2 } }
     /// Multiplying uniform draws below a rate of 10, and Hörmann's PTRS method (transformed rejection with squeeze) above.
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 {
         let rate = self.rate;

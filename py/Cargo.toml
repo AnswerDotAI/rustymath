@@ -7,10 +7,11 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 test = false
+doctest = false
 
 [features]
 default = ["native"]
-native = ["rustymath/native"]
+native = ["rustymath/default"]
 
 [dependencies]
 rustymath.workspace = true

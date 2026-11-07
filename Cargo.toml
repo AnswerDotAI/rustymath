@@ -7,7 +7,7 @@ version = "0.1.55"
 edition = "2024"
 
 [workspace.dependencies]
-rustymath = { path = ".", version = ">=0.1.39, <1", default-features = false }
+rustymath = { path = ".", version = ">=0.1.55, <1", default-features = false }
 rustymath-buffer = { path = "buffer", version = ">=0.1.39, <1" }
 pyo3 = ">=0.29"
 pyo3-build-config = ">=0.29"
@@ -27,6 +27,12 @@ repository = "https://github.com/AnswerDotAI/rustymath"
 [lib]
 name = "rustymath"
 test = false
+doctest = false
+
+# The timing suite: plain `cargo test` skips it; `cargo test --test speed` runs it.
+[[test]]
+name = "speed"
+test = false
 
 [features]
 default = ["native"]
@@ -43,7 +49,7 @@ num-complex = ">=0.4.6, <1"
 num-integer = ">=0.1.46, <1"
 num-rational = ">=0.4.2, <1"
 num-traits = ">=0.2.19, <1"
-rand = { version = ">=0.10.2, <1", default-features = false, features = ["alloc"] }
+rand = { version = ">=0.10.2, <1", default-features = false, features = ["alloc", "chacha"] }
 strength_reduce = ">=0.2.4, <1"
 
 # The browser build has no threads. There `parallel` runs its pieces in turn on the calling thread.
@@ -62,7 +68,7 @@ libc = ">=0.2.190, <1"
 inherits = "release"
 
 [profile.release]
-opt-level = 2
+opt-level = 3
 # Thin LTO across the crate's own codegen units, Cargo's default. Incremental builds put `#[inline]` helpers such as iterator adapters in codegen units of their own, where only LTO can inline them.
 lto = false
 overflow-checks = false
@@ -73,6 +79,8 @@ debug = false
 
 [profile.dist]
 inherits = "release"
+lto = "thin"
+codegen-units = 16
 incremental = false
 strip = true
 

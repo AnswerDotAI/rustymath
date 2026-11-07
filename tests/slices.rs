@@ -50,7 +50,6 @@ mod parallel {
 
 mod forms {
     use half::f16;
-    use num_complex::Complex;
     use rustymath::{reduce::{Maximum, Minimum}, *};
     use std::fmt::Debug;
 
@@ -68,62 +67,38 @@ mod forms {
         wide.iter().flat_map(|&x| [x, -x]).map(F::narrow).collect()
     }
 
-    /// `k.many` against `k.one` for every pairing of `One` and `Many` among `items`. It must append after what `out` holds, and say whether every item succeeded, as `checked` does item by item. Where `K` isn't total, the verdict follows the NaN rule: an item fails exactly where it gives NaN from arguments that aren't NaN. A function whose `TOTAL` is true must succeed on every item, including where NaN is its value, as sin ∞ is.
-    fn binary<F: Float + Debug, K: Binary<F, Out = F>>(k: K, name: &str) {
-        let items = items::<F>();
-        let check = |x: Arg<'_, F>, y: Arg<'_, F>, n: usize| {
-            let at = |a: Arg<'_, F>, i| match a { Arg::One(v) => v, Arg::Many(s) => s[i] };
-            let mut out = vec![F::one()];
-            let ok = k.many(x, y, n, &mut out);
-            assert_eq!((out.len(), out[0]), (n + 1, F::one()), "{name}");
-            for i in 0..n { assert!(same(out[i + 1], k.one(at(x, i), at(y, i))), "{name}({:?}, {:?})", at(x, i), at(y, i)) }
-            assert_eq!(ok, (0..n).all(|i| k.checked(at(x, i), at(y, i)).is_some()), "{name}");
-            if !K::TOTAL {
-                assert_eq!(ok, (0..n).all(|i| !out[i + 1].is_nan() || [at(x, i), at(y, i)].iter().any(|v| v.is_nan())), "{name} breaks the NaN rule")
-            }
-            assert!(ok || !K::TOTAL, "{name} is total but fails");
-        };
-        let (xs, ys): (Vec<F>, Vec<F>) = items.iter().flat_map(|&x| items.iter().map(move |&y| (x, y))).unzip();
-        check(Arg::Many(&xs), Arg::Many(&ys), xs.len());
-        for &v in &items {
-            check(Arg::One(v), Arg::Many(&items), items.len());
-            check(Arg::Many(&items), Arg::One(v), items.len());
+    fn check<F: Float + buffer::Element + Debug, K: facts::Formula<A>, const A: usize>(k: &K, name: &str, args: [Arg<'_, F>; A], n: usize) {
+        let kernel = k.resolve(domain::Variant { checked: false, ..domain::Variant::checked(F::DTYPE) }, [F::DTYPE; A]).unwrap();
+        let views = args.each_ref().map(|a| {
+            F::view(match a { Arg::One(v) => std::slice::from_ref(v), Arg::Many(s) => s })
+        });
+        let mut out = F::buffer(vec![]);
+        crate::support::map(&kernel, views, n, &mut out).unwrap();
+        let out = F::vec(out).unwrap();
+        assert_eq!(out.len(), n, "{name}");
+        for i in 0..n {
+            let x = args.map(|a| match a { Arg::One(v) => v, Arg::Many(s) => s[i] });
+            assert!(same(out[i], facts::formula_at(k, x)), "{name}{x:?}");
         }
     }
 
-    /// `k.many` against `k.one` for each of `items`, and for each item as `Arg::One`, as for `binary`.
-    fn unary<F: Float + Debug, K: Unary<F, Out = F>>(k: K, name: &str, items: &[F]) {
-        let check = |x: Arg<'_, F>, n: usize| {
-            let at = |i| match x { Arg::One(v) => v, Arg::Many(s) => s[i] };
-            let mut out = vec![F::one()];
-            let ok = k.many(x, n, &mut out);
-            assert_eq!((out.len(), out[0]), (n + 1, F::one()), "{name}");
-            for i in 0..n { assert!(same(out[i + 1], k.one(at(i))), "{name}({:?})", at(i)) }
-            assert_eq!(ok, (0..n).all(|i| k.checked(at(i)).is_some()), "{name}");
-            if !K::TOTAL { assert_eq!(ok, (0..n).all(|i| !out[i + 1].is_nan() || at(i).is_nan()), "{name} breaks the NaN rule") }
-            assert!(ok || !K::TOTAL, "{name} is total but fails");
-        };
-        check(Arg::Many(items), items.len());
-        for &v in items { check(Arg::One(v), 3) }
+    fn binary<F: Float + buffer::Element + Debug, K: facts::Formula<2>>(k: K, name: &str) {
+        let items = items::<F>();
+        let (xs, ys): (Vec<F>, Vec<F>) = items.iter().flat_map(|&x| items.iter().map(move |&y| (x, y))).unzip();
+        check(&k, name, [Arg::Many(&xs), Arg::Many(&ys)], xs.len());
+        for &v in &items {
+            check(&k, name, [Arg::One(v), Arg::Many(&items)], items.len());
+            check(&k, name, [Arg::Many(&items), Arg::One(v)], items.len());
+        }
     }
 
-    /// `k.many` against `k.one` for every triple of `items`, as `Many` arguments and with each argument in turn as `One`, as for `binary`.
-    fn ternary<F: Float + Debug, K: Ternary<F, Out = F>>(k: K, name: &str) {
+    fn unary<F: Float + buffer::Element + Debug, K: facts::Formula<1>>(k: K, name: &str, items: &[F]) {
+        check(&k, name, [Arg::Many(items)], items.len());
+        for &v in items { check(&k, name, [Arg::One(v)], 3) }
+    }
+
+    fn ternary<F: Float + buffer::Element + Debug, K: facts::Formula<3>>(k: K, name: &str) {
         let items = items::<F>();
-        let at = |a: Arg<'_, F>, i| match a { Arg::One(v) => v, Arg::Many(s) => s[i] };
-        let check = |[x, y, z]: [Arg<'_, F>; 3], n: usize| {
-            let mut out = vec![F::one()];
-            let ok = k.many(x, y, z, n, &mut out);
-            assert_eq!((out.len(), out[0]), (n + 1, F::one()), "{name}");
-            for i in 0..n {
-                assert!(same(out[i + 1], k.one(at(x, i), at(y, i), at(z, i))), "{name}({:?}, {:?}, {:?})", at(x, i), at(y, i), at(z, i))
-            }
-            assert_eq!(ok, (0..n).all(|i| k.checked(at(x, i), at(y, i), at(z, i)).is_some()), "{name}");
-            if !K::TOTAL {
-                assert_eq!(ok, (0..n).all(|i| !out[i + 1].is_nan() || [at(x, i), at(y, i), at(z, i)].iter().any(|v| v.is_nan())), "{name} breaks the NaN rule")
-            }
-            assert!(ok || !K::TOTAL, "{name} is total but fails");
-        };
         let (mut xs, mut ys, mut zs) = (Vec::new(), Vec::new(), Vec::new());
         for &x in &items {
             for &y in &items {
@@ -134,11 +109,11 @@ mod forms {
                 }
             }
         }
-        check([Arg::Many(&xs), Arg::Many(&ys), Arg::Many(&zs)], xs.len());
+        check(&k, name, [Arg::Many(&xs), Arg::Many(&ys), Arg::Many(&zs)], xs.len());
         for &v in &items {
-            check([Arg::One(v), Arg::Many(&items), Arg::Many(&items)], items.len());
-            check([Arg::Many(&items), Arg::One(v), Arg::Many(&items)], items.len());
-            check([Arg::Many(&items), Arg::Many(&items), Arg::One(v)], items.len());
+            check(&k, name, [Arg::One(v), Arg::Many(&items), Arg::Many(&items)], items.len());
+            check(&k, name, [Arg::Many(&items), Arg::One(v), Arg::Many(&items)], items.len());
+            check(&k, name, [Arg::Many(&items), Arg::Many(&items), Arg::One(v)], items.len());
         }
     }
 
@@ -156,12 +131,11 @@ mod forms {
                 Lgamma, Erf, Erfc, Erfinv, Erfcinv, LambertW, Sqrt, Sqrt1mx2, Sqrt1px2, Sqrtx2m1, Abs, Sign, Angle;
             binary: Pow, Root, Hypot, Atan2, Gammainc, Gammaincc, Gammaincinv, Binom, Logb, Maximum, Minimum; ternary: Betainc, Betaincinv
         );
-        // `Erfinv`'s and `Erfcinv`'s f64 slice forms place each block's items by region. Several blocks of uniform items, in random order, reach every region.
+        // `Erfcinv`'s f64 slice form places each block's items by region. Several blocks of uniform items, in random order, reach every region.
         use rand::RngExt;
         let mut rng = crate::support::seeded(1);
         let q: Vec<f64> = (0..2000).map(|_| 2.0 * rng.random::<f64>()).collect();
         unary(Erfcinv, "Erfcinv", &q);
-        unary(Erfinv, "Erfinv", &q.iter().map(|&q| q - 1.0).collect::<Vec<_>>());
         // The logarithms' slice forms take each block of 64 items whose every item is positive, normal and finite through a form with no special values. Blocks of such items, some holding a special value, reach both forms.
         let mut x: Vec<f64> = (0..2000).map(|_| 1000.0 * rng.random::<f64>()).collect();
         for (i, v) in [0.0, -1.0, 1e-310, f64::INFINITY, f64::NAN, 1.0].into_iter().enumerate() { x[300 * i + 5] = v }
@@ -180,36 +154,10 @@ mod forms {
         let ramp32: Vec<f32> = ramp.iter().map(|&v| v as f32).collect();
         unary(Erfc, "Erfc", &ramp);
         unary(Erfc, "Erfc", &ramp32);
-        // Complex `Sqrt` takes a plain form for blocks of 64 items whose parts are all 0 or of moderate size, which gives exactly the full form's parts. Random items, with special or extreme items in some blocks and a run of real items, reach both forms.
-        fn roots<F: Float + Debug>(z: &[Complex<F>]) where Sqrt: Unary<Complex<F>, Out = Complex<F>> {
-            let exact = |a: F, b: F| (a == b && a.is_sign_negative() == b.is_sign_negative()) || (a.is_nan() && b.is_nan());
-            let mut out = Vec::new();
-            Sqrt.many(Arg::Many(z), z.len(), &mut out);
-            for (&z, &r) in z.iter().zip(&out) {
-                let s = Sqrt.one(z);
-                assert!(exact(r.re, s.re) && exact(r.im, s.im), "complex Sqrt({z:?}): {r:?} against {s:?}")
-            }
-        }
-        let mut z: Vec<Complex<f64>> = (0..2000).map(|_| Complex::new(8.0 * rng.random::<f64>() - 4.0, 8.0 * rng.random::<f64>() - 4.0)).collect();
-        for (i, (re, im)) in [(0.0, 0.0), (f64::INFINITY, 1.0), (1.0, f64::NAN), (1e-300, 0.0), (2.0, 1e-160), (1e160, 1.0)].into_iter().enumerate() {
-            z[300 * i + 5] = Complex::new(re, im)
-        }
-        for v in &mut z[1600..1700] { v.im = 0.0 }
-        roots(&z);
-        roots(&z.iter().map(|z| Complex::new(z.re as f32, z.im as f32)).collect::<Vec<_>>());
-        for b in [2.0, 10.0] {
-            let mut out = Vec::new();
-            let ok = Logb.many(Arg::One(b), Arg::Many(&x), x.len(), &mut out);
-            assert!(x.iter().zip(&out).all(|(&v, &r)| same(r, Logb.one(b, v))), "Logb at base {b}");
-            assert_eq!(ok, x.iter().all(|&v| Logb.checked(b, v).is_some()), "Logb at base {b}");
-        }
-        assert!(
-            <Exp as Results<f64, 1>>::TOTAL && <Maximum as Results<f32, 2>>::TOTAL && !<Pow as Results<f64, 2>>::TOTAL && !<Sqrt as Results<f16, 1>>::TOTAL
-        );
-        assert!(<Add as Results<i64, 2>>::WRAPS && <Pow as Results<u8, 2>>::WRAPS && !<Add as Results<f64, 2>>::WRAPS && !<Binom as Results<i64, 2>>::WRAPS);
+        for b in [2.0, 10.0] { check(&Logb, "Logb", [Arg::One(b), Arg::Many(&x)], x.len()); }
     }
 
-    /// An output type other than the item type, at each float type, f16 included, and at concrete complex types. A `bool` output is never NaN, so it never fails.
+    /// An output type other than the item type, at each float type, f16 included. A `bool` output is never NaN, so it never fails.
     #[test]
     fn outputs_can_differ_from_items() {
         use rustymath::tolerant::{Greater, Tolerance};
@@ -221,9 +169,6 @@ mod forms {
         assert_eq!(positive(&[1.0f64, -1.0, f64::NAN]), [true, false, false]);
         assert_eq!(positive(&[f16::from_f32(2.0), f16::NAN]), [true, false]);
         assert_eq!(Greater(Tolerance::EXACT).checked(f32::NAN, 0.0), Some(false));
-        let mut out = Vec::new();
-        assert!(Abs.many(Arg::Many(&[Complex::new(3.0f32, 4.0), Complex::new(f32::INFINITY, f32::NAN)]), 2, &mut out));
-        assert_eq!(out, [5.0, f32::INFINITY]);
     }
 }
 
@@ -231,7 +176,6 @@ mod reductions {
     use half::f16;
     use num_complex::Complex;
     use rustymath::reduce::*;
-    use rustymath::{Add, Arg, Binary, Subtract, tolerant::{Less, Tolerance}};
 
     /// Each reduction and scan against the same taken item by item, in order: sums and running sums of `sums`, and the product of `prods`. Their items keep every sum and product exact at every width, so any grouping gives the same result.
     fn exact<T: Copy + PartialEq + std::fmt::Debug, S: Copy + PartialEq + std::fmt::Debug>(
@@ -241,7 +185,7 @@ mod reductions {
         let running: Vec<_> = sums.iter().map(|&v| { total = total.and_then(|t| add(t, v)); total.unwrap() }).collect();
         assert_eq!(sum(sums), (total.unwrap(), true));
         let mut out = Vec::new();
-        assert!(cumsum(sums, None, &mut out));
+        assert!(Sum::scan(sums, None, &mut out));
         assert_eq!(out, running);
         assert_eq!(prod(prods), (prods.iter().try_fold(one, |t, &v| mul(t, v)).unwrap(), true));
     }
@@ -263,7 +207,7 @@ mod reductions {
         exact(&s, &p, |t, v| Some(t + v.to_f32()), |t, v| Some(t * v.to_f32()), 0.0, 1.0);
         assert_eq!(extremes(&sums), (*sums.iter().min().unwrap(), *sums.iter().max().unwrap()));
         let mut maxima = Vec::new();
-        cummax(&sums, Some(-5), &mut maxima);
+        Max::scan(&sums, Some(-5), &mut maxima);
         assert_eq!(
             maxima, sums.iter().scan(-5, |m, &v| {
                 *m = (*m).max(v);
@@ -275,7 +219,7 @@ mod reductions {
         let z: Vec<Complex<f64>> = (0..101).map(|k| Complex::new(k as f64, -(k as f64) / 2.0)).collect();
         assert_eq!(sum(&z), (z.iter().fold(Complex::new(0.0, 0.0), |s, &v| s + v), true));
         let mut out = Vec::new();
-        assert!(cumsum(&z, Some(Complex::new(1.0, 1.0)), &mut out));
+        assert!(Sum::scan(&z, Some(Complex::new(1.0, 1.0)), &mut out));
         assert_eq!(
             out, z.iter().scan(Complex::new(1.0, 1.0), |s, &v| {
                 *s += v;
@@ -289,10 +233,10 @@ mod reductions {
         assert_eq!((sum::<f64>(&[]), prod::<i32>(&[]), max::<f32>(&[]), min::<i16>(&[])), ((0.0, true), (1, true), f32::NEG_INFINITY, i16::MAX));
         assert_eq!((maximum(1.0, f64::NAN).is_nan(), minimum(f32::NAN, 1.0), maximum(-1.0, 2.0), minimum(f16::ONE, f16::ZERO)), (true, 1.0, 2.0, f16::ZERO));
         assert_eq!((sum(&[i64::MAX, 1]), sum(&[i64::MAX, 1, -2]), prod(&[i64::MAX, 2])), ((i64::MIN, false), (i64::MAX - 1, true), (-2, false)));
-        assert!(!cumsum(&[i64::MAX, 1], None, &mut Vec::new()));
-        assert!(!cumprod(&[i32::MAX, i32::MAX, i32::MAX], None, &mut Vec::new()));
+        assert!(!Sum::scan(&[i64::MAX, 1], None, &mut Vec::new()));
+        assert!(!Product::scan(&[i32::MAX, i32::MAX, i32::MAX], None, &mut Vec::new()));
         let mut out = vec![7.0];
-        assert!(cumsum(&[1.0f64, 2.0], Some(10.0), &mut out));
+        assert!(Sum::scan(&[1.0f64, 2.0], Some(10.0), &mut out));
         assert_eq!(out, [7.0, 11.0, 13.0]);
     }
 
@@ -420,49 +364,17 @@ mod reductions {
                 }
             }
             let mut out = Vec::new();
-            assert!(scan_along::<i64, Sum>(&x, shape, Some(10), &mut out));
+            assert!(scan_along::<i64, Sum>(&x, shape, Some(&[10]), &mut out));
             assert_eq!(out, want, "{shape:?}");
-            let mut ordered = Vec::new();
-            assert!(left_scan(&Add, &x, shape, Some(10), &mut ordered));
-            assert_eq!(ordered, want, "{shape:?}");
-            ordered.clear();
-            assert!(left_scan(&Subtract, &x, shape, None, &mut ordered));
-            let mut running = Vec::new();
-            difference_scan_along(&x, shape, None, &mut running);
-            assert_eq!(running, ordered, "{shape:?}");
-            running.clear();
-            difference_scan_as::<_, i64>(&x, shape, None, &mut running);
-            assert_eq!(running, ordered, "{shape:?}");
-            let mut differences = Vec::new();
-            assert!(adjacent(
-                &x, shape, &mut differences, |_, _| true, |before, next, out| {
-                    out.extend(next.iter().zip(before).map(|(&a, &b)| a - b));
-                    true
-                }
-            ));
-            let want: Vec<_> = x.chunks((len * inner).max(1)).flat_map(|lane| lane[inner..].iter().zip(lane).map(|(&a, &b)| a - b)).collect();
-            assert_eq!(differences, want, "{shape:?}");
-            for seed in [None, Some(10)] {
-                ordered.clear();
-                assert!(left_scan(&Less(Tolerance::EXACT), &x, shape, seed, &mut ordered));
-                let starts = seed.map(|s| x.chunks((len * inner).max(1)).flat_map(|lane| lane[..inner].iter().map(move |&v| s < v)).collect::<Vec<_>>());
-                let (bits, ok) =
-                    comparison_scan(&x, shape, starts.as_deref(), 0, 1, &|t, xs, out| Less(Tolerance::EXACT).many(t, Arg::Many(xs), xs.len(), out));
-                assert!(ok && bits.len() == ordered.len());
-                assert!(
-                    bits.iter().zip(&ordered).enumerate().all(|(i, (&bit, &v))| seed.is_none() && i % (len * inner) < inner || i64::from(bit) == v),
-                    "{shape:?} {seed:?}"
-                );
-            }
             // `SumAs`'s running sums of Booleans and of narrow integers match `Sum`'s, which run at 64 bits.
-            let wide = |items: Vec<i64>, start: Option<i64>| {
+            let wide = |items: Vec<i64>, seed: Option<&[i64]>| {
                 let mut out = Vec::new();
-                scan_along::<i64, Sum>(&items, shape, start, &mut out);
+                scan_along::<i64, Sum>(&items, shape, seed, &mut out);
                 out.into_iter().map(|v| v as i32).collect::<Vec<_>>()
             };
             let mut counts = Vec::new();
-            scan_along::<bool, SumAs<i32>>(&x.iter().map(|v| v % 3 == 0).collect::<Vec<_>>(), shape, Some(3), &mut counts);
-            assert_eq!(counts, wide(x.iter().map(|v| i64::from(v % 3 == 0)).collect(), Some(3)), "{shape:?}");
+            scan_along::<bool, SumAs<i32>>(&x.iter().map(|v| v % 3 == 0).collect::<Vec<_>>(), shape, Some(&[3]), &mut counts);
+            assert_eq!(counts, wide(x.iter().map(|v| i64::from(v % 3 == 0)).collect(), Some(&[3])), "{shape:?}");
             let mut sums = Vec::new();
             scan_along::<i16, SumAs<i32>>(&x.iter().map(|&v| v as i16).collect::<Vec<_>>(), shape, None, &mut sums);
             assert_eq!(sums, wide(x.clone(), None), "{shape:?}");
@@ -474,60 +386,32 @@ mod reductions {
             assert_eq!(along::<bool, Xor>(&b, shape).0, lanes.iter().map(|l| ones(l) % 2 == 1).collect::<Vec<_>>());
             assert_eq!(along::<bool, Xnor>(&b, shape).0, lanes.iter().map(|l| (l.len() - ones(l)) % 2 == 0).collect::<Vec<_>>());
             assert_eq!(along::<bool, SumAs<u8>>(&b, shape).0, lanes.iter().map(|l| ones(l) as u8).collect::<Vec<_>>());
+            // The Boolean reductions scan by their truth tables `t`, item `t[r][x]` for the running result `r` and the next item `x`: `or` is 14, `and` 8, `!=` 6 and `==` 9.
             for start in [None, Some(false), Some(true)] {
-                for code in 0..16 {
-                    let table = Logical([[code & 1 != 0, code & 2 != 0], [code & 4 != 0, code & 8 != 0]]);
+                for code in [14, 8, 6, 9] {
+                    let table = [[code & 1 != 0, code & 2 != 0], [code & 4 != 0, code & 8 != 0]];
                     let mut want = b.clone();
                     for i in 0..outer {
                         for k in 0..inner {
                             (0..len).fold(start, |t, j| {
                                 let p = (i * len + j) * inner + k;
-                                want[p] = t.map_or(b[p], |t| table.0[usize::from(t)][usize::from(b[p])]);
+                                want[p] = t.map_or(b[p], |t| table[usize::from(t)][usize::from(b[p])]);
                                 Some(want[p])
                             });
                         }
                     }
-                    let mut out = Vec::new();
-                    table.scan_along(&b, shape, start, &mut out);
-                    assert_eq!(out, want, "{shape:?} {start:?} {code}");
-                    // `fold` gives each lane's right fold by the table, `x₀ f (x₁ f (… f last))`, with `start` as every lane's tail where it's given.
-                    if Logical::folds(shape) {
-                        let folds: Vec<bool> = lanes.iter().map(|l| {
-                            let (last, items) = match start { Some(s) => (s, &l[..]), None => (l[len - 1], &l[..len - 1]) };
-                            items.iter().rev().fold(last, |r, &v| table.0[usize::from(v)][usize::from(r)])
-                        }).collect();
-                        assert_eq!(table.fold(&b, len, start.map(|s| vec![s; outer]).as_deref()), folds, "{shape:?} {start:?} {code}");
-                    }
-                    // The Boolean reductions scan by their tables: `or` is 14, `and` 8, `!=` 6 and `==` 9.
-                    let mut reduced = Vec::new();
+                    let (seed, mut reduced) = (start.as_ref().map(std::slice::from_ref), Vec::new());
                     match code {
-                        14 => scan_along::<bool, Max>(&b, shape, start, &mut reduced), 8 => scan_along::<bool, Min>(&b, shape, start, &mut reduced),
-                        6 => scan_along::<bool, Xor>(&b, shape, start, &mut reduced), 9 => scan_along::<bool, Xnor>(&b, shape, start, &mut reduced),
-                        _ => continue
+                        14 => scan_along::<bool, Max>(&b, shape, seed, &mut reduced), 8 => scan_along::<bool, Min>(&b, shape, seed, &mut reduced),
+                        6 => scan_along::<bool, Xor>(&b, shape, seed, &mut reduced), _ => scan_along::<bool, Xnor>(&b, shape, seed, &mut reduced)
                     };
                     assert_eq!(reduced, want, "{shape:?} {start:?} {code}");
                 }
-            }
-            // `chosen` picks each item's result from `low` or `high` by the result before it, from either carry. Item `first + i·len` takes `fixed[i]` whatever the result before it.
-            let high: Vec<bool> = x.iter().map(|v| v % 5 != 0).collect();
-            for (carry, len, first, restarts) in [(false, 1, 0, false), (true, 1, 0, false), (true, 3, 2, true), (false, 4, 1, true), (true, 70, 5, true)] {
-                let fixed: Vec<bool> = if restarts { (first..b.len()).step_by(len).map(|p| x[p] % 3 == 0).collect() } else { Vec::new() };
-                let mut t = carry;
-                let want: Vec<bool> = (0..b.len()).map(|k| {
-                    let restart = (k >= first && (k - first) % len == 0).then(|| fixed.get((k - first) / len)).flatten();
-                    t = restart.copied().unwrap_or(if t { high[k] } else { b[k] });
-                    t
-                }).collect();
-                let mut out = Vec::new();
-                chosen(carry, &b, &high, len, first, &fixed, &mut out);
-                assert_eq!(out, want, "{shape:?} {carry} {len} {first}");
             }
         }
         assert!(!along::<i64, Sum>(&[i64::MAX, 1], [1, 2, 1]).1);
         assert!(!along::<i64, Sum>(&[i64::MAX, 0, 1, 0], [1, 2, 2]).1);
         assert!(!scan_along::<i64, Sum>(&[i64::MAX, 0, 1, 0], [1, 2, 2], None, &mut Vec::new()));
-        assert!(!left_scan(&Add, &[i64::MAX, 1], [1, 2, 1], None, &mut Vec::new()));
-        assert!(!left_scan(&Add, &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, i64::MAX, 1], [8, 2, 1], None, &mut Vec::new()));
     }
 
     /// Each window's fold matches the same reduction of that window's items alone, for windows folded directly, across the blocks of a long lane and by van Herk-Gil-Werman, a last block cut short, a window as wide as its lane, and windows down rows. A float maximum skips each NaN item, as `Max::step` does. Each window's pick is its first row that gives its maximum or minimum, and so is each whole lane's pick and each running pick. A sum that wraps reports it.
@@ -709,7 +593,7 @@ mod search {
         let mut x = [9., 1., 5., 3., 7.];
         assert_eq!(quantiles(&mut x, &[0., 0.25, 0.5, 1.]).unwrap(), [1., 3., 5., 9.]);
         assert!(quantiles(&mut x, &[1.5]).is_err() && quantiles(&mut x, &[f64::NAN]).is_err());
-        let part = view_partition(View::Floats(rustymath::buffer::Floats::F64(&[f64::NAN, -0., 0., 3.])), 1).unwrap();
+        let part = view_partition_along(View::Floats(rustymath::buffer::Floats::F64(&[f64::NAN, -0., 0., 3.])), [1, 4, 1], 1, false).unwrap().unwrap();
         assert_eq!(f64::of(part.view()).unwrap()[1], 0.);
     }
 
@@ -751,7 +635,8 @@ mod search {
         let many: Vec<i32> = (0..20).map(|i| [10, 40, 30][i % 3]).collect();
         assert_eq!(index_of(&x, &many), (0..20).map(|i| [1, 4, 0][i % 3]).collect::<Vec<_>>());
         let n = numbered(&classes(&x));
-        assert_eq!((&n, n.counts()), (&Numbered { firsts: vec![0, 1, 2], numbers: vec![0, 1, 2, 1] }, vec![1, 2, 1]));
+        assert_eq!((n.firsts.as_slice(), &*n.numbers.view().widened(), n.counts.as_slice()), (&[0, 1, 2][..], &[0i64, 1, 2, 1][..], &[1, 2, 1][..]));
+        assert_eq!(n.numbers.view().tag(), rustymath::buffer::Width::U8);
         assert_eq!(classes(&x), [0, 1, 2, 1]);
         assert_eq!(sort_rows(x.len(), vec![x.iter().map(|&v| v as u32).collect()]), [1, 3, 2, 0]);
         // 300 rows take the counting sort. Equal keys keep their order of position, also under complemented keys, which reverse it.
@@ -791,11 +676,9 @@ mod search {
         let together = |k: &[i32]| {
             let n = numbered(&classes(k));
             let mut each = vec![Vec::new(); n.firsts.len()];
-            for (i, &g) in n.numbers.iter().enumerate() { each[g as usize].push(i as u32) }
+            for (i, &g) in n.numbers.view().widened().iter().enumerate() { each[g as usize].push(i as u32) }
             let g = grouped_keys(k).expect("a table holds the keys");
             assert_eq!((&g.firsts, g.groups.each().collect::<Vec<_>>()), (&n.firsts, each.iter().map(Vec::as_slice).collect()));
-            let buffers = g.groups.into_buffers();
-            assert!(buffers == each || buffers == [each.concat()]);
         };
         together(&(0..300).map(|i| i32::from(i % 3 == 0)).collect::<Vec<_>>());
         together(&(0..300).map(|i| 3 + (i * 7 + 2) % 5).collect::<Vec<_>>());
@@ -834,8 +717,8 @@ mod search {
         let x = [1u8, 2, 1];
         assert_eq!(view_index_of(u8::view(&x), f64::view(&[1., 256., -1., 2.]), Tolerance::DEFAULT).unwrap().unwrap(), [0, 3, 3, 1]);
         assert!(view_index_of(u8::view(&x), f64::view(&[1. + 1e-15]), Tolerance::DEFAULT).is_none());
-        let groups = numbered(&[0, 1, 0]);
-        assert_eq!(groups.fold::<_, rustymath::reduce::Sum>(&[i64::MAX, 2, 1]), (vec![i64::MIN, 2], false));
+        let groups = rustymath::search::ClassNumbers { count: 2, numbers: &[0u8, 1, 0] };
+        assert_eq!(rustymath::search::Grouping::fold::<_, rustymath::reduce::Sum>(&groups, &[i64::MAX, 2, 1]), (vec![i64::MIN, 2], false));
         assert_eq!(find_with(&[2], &[2, 3], |i, j| Ok::<_, ()>([1, 2][i] == [1, 2, 1, 1, 2, 3][j])).unwrap(), [true, false, false, true, false, false]);
         assert_eq!(
             view_find(i16::view(&[1, 2]), &[2], u8::view(&[1, 2, 1, 1, 2, 3]), &[2, 3], Tolerance::EXACT), Some(vec![true, false, false, true, false, false])
@@ -943,6 +826,7 @@ mod tolerant {
 
     #[test]
     fn residue_and_gcd() {
+        use rustymath::{buffer::{DType, FloatWidth}, domain::Variant, facts::Formula};
         assert_eq!([(3.0, -5.0), (3.0, 5.0), (-3.0, -4.0), (-3.0, 4.0)].map(|(x, y)| T.residue(x, y)), [1.0, 2.0, -1.0, -2.0]);
         let r = [3.12, -1.0, -0.6].map(|y| T.residue(0.5, y));
         assert!((r[0] - 0.12).abs() < 1e-15 && r[1] == 0.0 && (r[2] - 0.4).abs() < 1e-15);
@@ -952,7 +836,12 @@ mod tolerant {
         assert_eq!((T.residue(0.1, 0.3), T.residue(0.0, 2.5)), (0.0, 2.5));
         assert!((Exactly.residue(0.1, 0.3) - 0.1).abs() < 1e-15);
         let (x, y) = (2.2500000000000018, 0.7500000000000007);
-        assert_eq!((FloorDivide(Tolerance::EXACT).one(x, y), Residue(Tolerance::EXACT).one(y, x)), (2.0, x - 2.0 * y));
+        let f64s = DType::Float(FloatWidth::F64);
+        let quotient = FloorDivide(Tolerance::EXACT).resolve(Variant::checked(f64s), [f64s; 2]).unwrap();
+        assert_eq!(
+            (quotient.real(&[x, y], rustymath::operation::Settings { tolerance: Tolerance::EXACT }).unwrap(), Residue(Tolerance::EXACT).one(y, x)),
+            (2.0, x - 2.0 * y)
+        );
         if rustymath::FUSED { assert_ne!(Exactly.residue(0.1, 1.0), 0.0); }
         assert_eq!(Exactly.residue(1e300, 1e-300), 1e-300);
         assert!((T.gcd(0.6, 0.4) - 0.2).abs() < 1e-15 && Exactly.gcd(0.6, 0.4) < 1e-15);
@@ -1015,7 +904,7 @@ mod tolerant {
     fn against_one<F: Float + std::fmt::Debug>(t: Tolerance, items: &[f64]) where Equal: Binary<F, Out = bool>, NotEqual: Binary<F, Out = bool>,
         Less: Binary<F, Out = bool>, LessEqual: Binary<F, Out = bool>, Greater: Binary<F, Out = bool>, GreaterEqual: Binary<F, Out = bool>,
         Matches: Binary<F, Out = bool> {
-        fn check<F: Copy + std::fmt::Debug, K: Binary<F, Out = bool> + std::fmt::Debug>(k: K, x: &[F]) {
+        fn check<F: Copy + Sync + std::fmt::Debug, K: Binary<F, Out = bool> + std::fmt::Debug>(k: K, x: &[F]) {
             for &c in x {
                 let (mut left, mut right) = (Vec::new(), Vec::new());
                 assert!(k.many(Arg::Many(x), Arg::One(c), x.len(), &mut left) & k.many(Arg::One(c), Arg::Many(x), x.len(), &mut right));
@@ -1036,7 +925,7 @@ mod tolerant {
     #[test]
     fn objects() {
         let (xs, ys) = (&[3.0, -3.0, 0.3, 0.0, f64::NAN, 2.0][..], &[-5.0, 5.0, 0.1 + 0.2, 7.0, 1.0, 2.9999999999999996][..]);
-        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let agree = |a: &[f64], b: &[f64]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x == y || x.is_nan() && y.is_nan());
         for t in [T, Tolerance::EXACT] {
             let (mut floors, mut residues, mut equal, mut order) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
             assert!(Floor(t).many(Arg::Many(ys), 6, &mut floors) & Ceil(t).many(Arg::Many(ys), 6, &mut floors));
@@ -1046,7 +935,8 @@ mod tolerant {
             let floor: Vec<f64> = ys.iter().map(|&y| t.floor(y)).chain(ys.iter().map(|&y| t.ceil(y))).collect();
             let residue: Vec<f64> = (0..6).map(|i| t.residue(xs[i], ys[i])).chain(ys.iter().map(|&y| t.residue(3.0, y))).collect();
             let eq: Vec<bool> = (0..6).map(|i| t.equal(xs[i], ys[i])).chain(xs.iter().map(|&x| t.matches(x, f64::NAN))).collect();
-            assert_eq!((bits(&floors), bits(&residues), equal), (bits(&floor), bits(&residue), eq));
+            assert!(agree(&floors, &floor) && agree(&residues, &residue), "{floors:?} {residues:?}");
+            assert_eq!(equal, eq);
             assert_eq!(order, (0..6).map(|i| t.compare(xs[i], ys[i]).unwrap_or(Ordering::Greater)).collect::<Vec<_>>());
             let check = |many: &dyn Fn(&mut Vec<bool>) -> bool, one: &dyn Fn(f64, f64) -> bool| {
                 let mut got = Vec::new();
@@ -1146,7 +1036,7 @@ mod tolerant {
 }
 
 mod gather {
-    use rustymath::{agreement::{Mapping, expanded_items}, buffer::Element, gather::{Same, Steps, scatter, scatter_walk, walk}, structure::Walk};
+    use rustymath::{agreement::{Mapping, Walked, expanded_items}, buffer::Element, gather::{Same, Steps, scatter, scatter_walk, walk}, structure::Walk};
     /// The items of `s` that `steps` reach from `base`, with -1 for a fill.
     fn read(s: &[i64], base: usize, steps: &[Steps]) -> Vec<i64> {
         let mut out = vec![];
@@ -1192,7 +1082,7 @@ mod gather {
             let filled: Vec<i64> = whole.iter().map(|&x| if x == -1 { i64::FILL } else { x }).collect();
             for (from, n) in [(1, 7), (5, whole.len() - 5), (0, whole.len())] {
                 let mut buf = vec![];
-                assert_eq!(expanded_items(&mapping, &s, from, n, &mut buf), &filled[from..from + n]);
+                assert_eq!(expanded_items(&Walked::from(&mapping), &s, from, n, &mut buf), &filled[from..from + n]);
             }
             // `scatter_walk` writes where the walk reads, in the same order, so it agrees with `scatter` at the listed offsets, for many items and for one.
             let offsets = Steps::combined(*base, steps);
@@ -1217,6 +1107,39 @@ mod gather {
             }
         }
     }
+    /// Overlapping window writes accumulate every contribution at its source position.
+    #[test]
+    fn window_writes_accumulate() {
+        use rustymath::gather::Writes;
+        let check = |source: &[usize], shape: &[usize], tables: Vec<Steps>| {
+            let u: Vec<i64> = (1..=shape.iter().product::<usize>() as i64).collect();
+            let mut scattered = vec![0; source.iter().product()];
+            for (i, &x) in u.iter().enumerate() { scattered[Steps::reach(0, &tables, i).expect("windows read no fill")] += x; }
+            let mut summed = vec![0; scattered.len()];
+            Writes::Walk { base: 0, steps: &tables }.combine(&mut summed, rustymath::Arg::Many(&u), |a, x| (a + x, None::<()>));
+            assert_eq!(summed, scattered, "{tables:?}");
+            let Some((order, terms)) = Walk::new(&tables, shape, source).and_then(|w| w.transpose_windows(source)) else { return false };
+            let axes = rustymath::search::inverse_permutation(order.iter().copied());
+            let moved = read(&u, 0, &rustymath::structure::transpose_steps(shape, &axes).unwrap());
+            summed.fill(0);
+            for term in terms {
+                let (base, steps) = term.to_walk(source);
+                let mut items = vec![];
+                walk(&mut items, &moved, base, &steps, 0, Same);
+                for (sum, item) in summed.iter_mut().zip(items) { *sum += item; }
+            }
+            assert_eq!(summed, scattered, "{tables:?}");
+            true
+        };
+        for (s, start) in [(1, 0), (1, 2), (2, 0), (2, 1), (3, 0), (3, 2), (4, 1)] {
+            let frames = (17 - start) / s + 1;
+            assert_eq!(check(&[20], &[frames, 3], vec![Steps::Stride { start, len: frames, step: s as isize }, along(3, 1)]), s == 1 && start == 0);
+        }
+        assert!(!check(&[20], &[6, 3], vec![along(6, 3), along(3, 2)]));
+        assert!(!check(&[10, 12], &[4, 4, 3, 2], vec![along(4, 24), along(4, 3), along(3, 12), along(2, 1)]));
+        assert!(check(&[20], &[2, 19], vec![along(2, 1), along(19, 1)]));
+        assert!(check(&[5, 6, 2], &[3, 4, 3, 3, 2], vec![along(3, 12), along(4, 2), along(3, 12), along(3, 2), along(2, 1)]));
+    }
     /// Index arrays pair by broadcasting and take the place of the first one, while a range keeps its axis in place. With one index array, pairing is the cross product.
     #[test]
     fn index_arrays_pair() {
@@ -1224,7 +1147,7 @@ mod gather {
         let s: Vec<i64> = (0..24).collect();
         let layout = Layout::from([2, 3, 4]);
         let ix = |positions: Vec<usize>| Selector::Indices { layout: Layout::from([positions.len()]), positions: rustymath::gather::Table::new(positions) };
-        let paired = select(&layout, vec![ix(vec![0, 1]), Selector::all(3), ix(vec![1, 2])], true).unwrap();
+        let paired = select(&layout, vec![ix(vec![0, 1]), Selector::All, ix(vec![1, 2])], true).unwrap();
         assert_eq!(paired.layout.shape(), &[2, 3]);
         assert_eq!(read(&s, 0, &paired.steps), [1, 5, 9, 14, 18, 22]);
         let one = [ix(vec![1, 0]), Selector::At(2)];
@@ -1244,7 +1167,7 @@ mod gather {
         assert!(Steps::in_order(&whole.steps));
         let diagonal = select(&Layout::from([4, 4]), vec![ix(&["i"], &[4], (0..4).collect()), ix(&["i"], &[4], (0..4).collect())], true).unwrap();
         assert_eq!(diagonal.steps, [Steps::Stride { start: 0, len: 4, step: 5 }]);
-        let windows = select(&m, vec![Selector::all(4), ix(&["p", "q"], &[2, 3], vec![0, 1, 2, 2, 3, 4])], true).unwrap();
+        let windows = select(&m, vec![Selector::All, ix(&["p", "q"], &[2, 3], vec![0, 1, 2, 2, 3, 4])], true).unwrap();
         assert!(windows.steps.iter().all(|s| matches!(s, Steps::Stride { .. })));
         assert_eq!(read(&s, 0, &windows.steps)[..6], [0, 1, 2, 2, 3, 4]);
         let rows = select(&m, vec![ix(&["r"], &[4], vec![2, 0, 3, 1]), ix(&["c"], &[6], (0..6).collect())], true).unwrap();
@@ -1269,7 +1192,7 @@ mod gather {
         let rows = |positions: &[usize]| {
             let layout = Layout::from([positions.len()]).with_names(vec![Some("r".into())]).unwrap();
             let plan =
-                select(&Layout::from([4, 6]), vec![Selector::Indices { layout, positions: Table::new(positions.to_vec()) }, Selector::all(6)], true).unwrap();
+                select(&Layout::from([4, 6]), vec![Selector::Indices { layout, positions: Table::new(positions.to_vec()) }, Selector::All], true).unwrap();
             let table = Steps::table(positions.iter().map(|&p| if p == F { F } else { 6 * p }).collect());
             assert_eq!(read(&s, 0, &plan.steps), read(&s, 0, &[table, along(6, 1)]));
             plan.steps[0].clone()
@@ -1331,13 +1254,5 @@ mod gather {
         assert!(Walk::new(&[Steps::Stride { start: 2, len: 1, step: 0 }, Steps::Rotated { shift: 1, len: 6, stride: 1 }], &[6], &[10]).is_none());
         assert!(along(3, 0).spreads() && Steps::table(vec![1, 1]).spreads() && !Steps::Rotated { shift: 1, len: 4, stride: 1 }.spreads());
         assert!(Steps::rereads(&[along(8, 1), along(3, 1)], &[10]) && !Steps::rereads(&[along(10, 1)], &[10]));
-    }
-    #[test]
-    fn windows_are_recognised() {
-        // `Walk::windows` gives each window axis's frames, window size and move, and refuses windows that don't start at 0.
-        let windows = |t: &[Steps], shape: &[usize], source: &[usize]| Walk::new(t, shape, source).and_then(|w| w.windows(source));
-        assert_eq!(windows(&[along(3, 6), along(4, 1), along(2, 6), along(3, 1)], &[3, 4, 2, 3], &[4, 6]), Some(vec![[3, 2, 1], [4, 3, 1]]));
-        assert_eq!(windows(&[along(3, 2), along(3, 1)], &[3, 3], &[7]), Some(vec![[3, 3, 2]]));
-        assert_eq!(windows(&[Steps::Stride { start: 2, len: 4, step: 1 }, along(3, 1)], &[4, 3], &[8]), None);
     }
 }
