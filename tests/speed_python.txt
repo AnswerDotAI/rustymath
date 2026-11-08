@@ -12,6 +12,13 @@ x*2	2.2	2.5	instructions linux 1.019
 -x	2.2	2	instructions linux 0.941
 # 7.1 copies, for Exp's 7 copies, plus a tenth of a copy for the Python call.
 rm.exp(x)	15	9.7	instructions linux 10.44
+# One real input and one complex output per item; bulk cost is uncalibrated.
+rm.cis(x)	-	-
+# Error-function slice forms at f64; bulk costs are uncalibrated.
+rm.erfc(x)	-	-
+rm.erfinv(x)	-	-
+# Sorted inputs exercise whole-region Erfc blocks at both widths; costs are uncalibrated.
+rm.erfc(xs)	-	-
 # 1.9 copies, for reading the Boolean mask, x and y, a select, one write, plus a tenth of a copy for the Python call.
 rm.where(mask, x, y)	3.8	5.6	instructions linux 2.173
 # 1.6 copies, for one read, two comparisons, one write, plus a tenth of a copy for the Python call.
@@ -72,6 +79,12 @@ np.asarray(x)	0.5	0.5	instructions linux 0.29
 xf+yf	3.4	3.2	instructions linux 0.735
 # 5.7 copies, for Exp's 5.5 copies at f32, plus the call.
 rm.exp(xf)	12	6.5	instructions linux 4.193
+# Real-input cis with complex output at f32; bulk cost is uncalibrated.
+rm.cis(xf)	-	-
+# Error-function slice forms at f32; bulk costs are uncalibrated.
+rm.erfc(xf)	-	-
+rm.erfinv(xf)	-	-
+rm.erfc(xsf)	-	-
 # 2.1 copies, for reading the mask, xf and yf, a select, one write,, plus the call.
 rm.where(mask, xf, yf)	4.2	5.5	instructions linux 1.116
 # 0.7 copies, for one read per item, plus the call.

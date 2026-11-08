@@ -21,11 +21,13 @@ where K: crate::facts::Formula<N>, F: crate::Native + crate::buffer::Cast + Outp
     }
 }
 
-/// A formula's complex results from real arguments (`Formula::real_complex`). An item that it declines takes `Formula::complex` on its arguments as complex numbers.
+/// Complex results from real arguments through a native slice, or `Formula::real_complex` with `Formula::complex` for the items it declines.
 pub(super) fn map_real_complex<K, F, const N: usize>(
-    object: &K, variant: crate::domain::Variant, inputs: Inputs<'_, '_>, range: std::ops::Range<usize>, ops: &NativeOps<{ FUSED }>, output: &mut Output<'_, '_>
+    object: &K, variant: crate::domain::Variant, inputs: Inputs<'_, '_>, range: std::ops::Range<usize>, ops: &NativeOps<{ FUSED }>,
+    slice: Option<crate::facts::Slice<K, F, N, (), num_complex::Complex<F>>>, output: &mut Output<'_, '_>
 ) -> Result<(), Error> where K: crate::facts::Formula<N>, F: crate::Native + crate::buffer::Cast, num_complex::Complex<F>: OutputItem {
     map_blocks::<F, num_complex::Complex<F>, N>(inputs, range, variant.checked, output, &|args, n, out| {
+        if let Some(slice) = slice { slice(object, ops, args, n, out); return Ok(()); }
         let nan = num_complex::Complex::new(F::nan(), F::nan());
         if !crate::slice::mapped(&args, n, out, #[inline(always)] |x| object.real_complex(ops, x).map_or((nan, false), |z| (z, true))) {
             for (i, z) in unsafe { crate::slice::written(&mut out[..n]) }.iter_mut().enumerate() {

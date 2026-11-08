@@ -131,11 +131,12 @@ mod forms {
                 Lgamma, Erf, Erfc, Erfinv, Erfcinv, LambertW, Sqrt, Sqrt1mx2, Sqrt1px2, Sqrtx2m1, Abs, Sign, Angle;
             binary: Pow, Root, Hypot, Atan2, Gammainc, Gammaincc, Gammaincinv, Binom, Logb, MathishLogb, Maximum, Minimum; ternary: Betainc, Betaincinv
         );
-        // `Erfcinv`'s f64 slice form places each block's items by region. Several blocks of uniform items, in random order, reach every region.
+        // The f64 inverse-error slice forms place each block's items by region. Several blocks of uniform items, in random order, reach every region.
         use rand::RngExt;
         let mut rng = crate::support::seeded(1);
         let q: Vec<f64> = (0..2000).map(|_| 2.0 * rng.random::<f64>()).collect();
         unary(Erfcinv, "Erfcinv", &q);
+        unary(Erfinv, "Erfinv", &q.iter().map(|&v| v - 1.0).collect::<Vec<_>>());
         // The logarithms' slice forms take each block of 64 items whose every item is positive, normal and finite through a form with no special values. Blocks of such items, some holding a special value, reach both forms.
         let mut x: Vec<f64> = (0..2000).map(|_| 1000.0 * rng.random::<f64>()).collect();
         for (i, v) in [0.0, -1.0, 1e-310, f64::INFINITY, f64::NAN, 1.0].into_iter().enumerate() { x[300 * i + 5] = v }

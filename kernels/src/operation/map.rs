@@ -45,10 +45,10 @@ pub(super) fn map_formula<K: crate::facts::Formula<N>, const N: usize>(
         },
         DType::Integer(width) => with_width!(width, I => map_integer::<K, I, N>(object, variant, inputs, range, judge, output)),
         DType::Complex(crate::buffer::ComplexWidth::F32) if K::REAL_COMPLEX && inputs.real() => {
-            map_real_complex::<K, f32, N>(object, variant, inputs, range, &ops, output)
+            map_real_complex::<K, f32, N>(object, variant, inputs, range, &ops, slices.and_then(|s| s.real_complex_single()), output)
         }
         DType::Complex(crate::buffer::ComplexWidth::F64) if K::REAL_COMPLEX && inputs.real() => {
-            map_real_complex::<K, f64, N>(object, variant, inputs, range, &ops, output)
+            map_real_complex::<K, f64, N>(object, variant, inputs, range, &ops, slices.and_then(|s| s.real_complex_double()), output)
         }
         DType::Complex(crate::buffer::ComplexWidth::F32) => {
             map_complex::<K, f32, N>(object, variant, inputs, range, &ops, slices.and_then(|s| s.complex_single()), judge, output)
