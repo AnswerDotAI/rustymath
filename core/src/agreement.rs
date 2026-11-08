@@ -156,10 +156,10 @@ impl ReadPlan {
             }
         }
     }
-    pub fn mapped(input: ReadPlan, map: Mapping, missing: ReadPlan, items: usize) -> Self {
+    fn mapped(input: ReadPlan, map: Mapping, missing: Missing, items: usize) -> Self {
         if map.in_order(input.items, &[items]) { return input; }
         if let Some(plan) = Self::single_map(&input, &map, items) { return plan; }
-        Self { route: Arc::new(ReadRoute::Map { input, map, missing }), items }
+        Self { route: Arc::new(ReadRoute::Map { input, map, missing: Self::fallback(missing, items) }), items }
     }
     /// `map` over `input`'s own map, composed into one map over `input`'s input. A read of the result then walks the source once, not once for each run of `map`. `None` unless `map` stays within `input`, `input`'s misses read a fill or are invalid, and the composition is structural with no longer tables.
     fn single_map(input: &ReadPlan, map: &Mapping, items: usize) -> Option<Self> {
@@ -168,9 +168,9 @@ impl ReadPlan {
         if map.bounds(&frame)?.end > input.items { return None; }
         let misses = match missing.route() { ReadRoute::Default => Missing::Default, ReadRoute::Invalid => Missing::Invalid, _ => return None };
         let composed = first.compose(map, &input.shape_hint(), &frame)?;
-        (composed.footprint() <= first.footprint() + map.footprint()).then(|| Self::mapped(inner.clone(), composed, Self::fallback(misses, items), items))
+        (composed.footprint() <= first.footprint() + map.footprint()).then(|| Self::mapped(inner.clone(), composed, misses, items))
     }
-    pub fn remapped(&self, map: Mapping, items: usize, missing: Missing) -> Self { Self::mapped(self.clone(), map, Self::fallback(missing, items), items) }
+    pub fn remapped(&self, map: Mapping, items: usize, missing: Missing) -> Self { Self::mapped(self.clone(), map, missing, items) }
     /// Calls `visit` with each source that this read reaches and its item count. A plan's routes form a tree, so each place that reads a source visits it once.
     pub fn try_for_each_source<E>(&self, visit: &mut impl FnMut(usize, usize) -> Result<(), E>) -> Result<(), E> {
         match self.route() {
@@ -188,7 +188,7 @@ impl ReadPlan {
     /// This read with each default read giving `value`.
     fn defaulted(&self, value: i64) -> Self {
         match self.route() {
-            ReadRoute::Map { input, map, missing } => Self::mapped(input.defaulted(value), map.clone(), missing.defaulted(value), self.items),
+            ReadRoute::Map { input, map, missing } => Self::mapped(input.defaulted(value), map.clone(), Missing::Input(missing.defaulted(value)), self.items),
             ReadRoute::Join(parts) => {
                 let parts: Vec<_> = parts.iter().map(|part| ReadPart { end: part.end, plan: part.plan.defaulted(value) }).collect();
                 Self { route: Arc::new(ReadRoute::Join(parts.into())), items: self.items }
