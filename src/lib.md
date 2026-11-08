@@ -36,14 +36,14 @@ let mut squares = Vec::new();
 Pow.many(Arg::Many(&[1.5, 2.0, 3.0]), Arg::One(2.0), 3, &mut squares); // squares: [2.25, 4.0, 9.0]
 ```
 
-`facts::Formula` holds an object's numerical and kind rules. `Formula::resolve` selects a working dtype and returns an `operation::Kernel` for callers choosing dtypes at run time. Its `map`, `fold_read`, `fold_pieces` and `scan` methods consume shared `agreement::Read` plans. `Kernel::real`, `complex` and `exact` evaluate scalar arguments through the same object.
+`facts::Formula` holds an object's numerical and kind rules. `Kernel::resolve` selects a working dtype and returns an `operation::Kernel` for callers choosing dtypes at run time. Its `map`, `fold_read`, `fold_pieces` and `scan` methods consume shared `agreement::Read` plans. `Kernel::real`, `complex` and `exact` evaluate scalar arguments through the same object.
 
 ```rust
-use rustymath::{Exp, domain::Variant, facts::Formula, buffer::{DType, FloatWidth, Width}};
+use rustymath::{Exp, domain::Variant, operation::Kernel, buffer::{DType, FloatWidth, Width}};
 
 let double = DType::Float(FloatWidth::F64);
-let exp = Exp.resolve(Variant::checked(double), [DType::Integer(Width::I32)]).unwrap();
-assert_eq!(exp.variant.dtype, double);
+let exp = Kernel::resolve(Exp, Variant::checked(double), [DType::Integer(Width::I32)]).unwrap();
+assert_eq!(exp.variant().dtype, double);
 ```
 
 `Sin`, `Cos` and `Tan` use short reduction and polynomials for their common range. An object's repair predicate marks arguments beyond 2^23 at f64 or 2^20 at f32. Its native slice driver applies the object's scalar repair routine to those items before returning the results. `Kernel::ranged` omits repair when the same predicate is proved false over the supplied ranges.
@@ -87,7 +87,6 @@ Equal(Tolerance::DEFAULT).many(Arg::Many(&[0.3, 0.1 + 0.2, 0.31]), Arg::One(0.3)
 - `structure`: plans for structural operations. A `Plan` holds the result's `Layout` and the `Steps` that `walk` reads it by. `select` applies independent axis selectors for positions, ranges, index arrays and inserted axes. Index arrays pair, all of them by broadcasting as `.[]` reads them, or those that share an axis name as `⌷` reads them. `addressed` gives the axis that each selector selects along. `take` takes or drops items, `rotate` rotates or reverses an axis, with one count or one for each lane, `transpose` sends axes to new positions, and `catenate` gives the layout of two arrays joined along an axis. `Windows` plans windows over leading axes, centred on each position of a padded axis, which reads past its ends by an `Edge` mode. `Walk` classifies how a copy walks its source: the source axis that each entry walks, and, through `read` and `range`, what the entries along one source axis read as windows. `Walk::windows` recognises a copy of windows laid out as `Windows::plan` lays them out without padding, and gives each axis's frames, window size and move. `Transpose` gives the kernel that adds a copy's cotangent back to its source: a sum along its spread axes, then reads that send each item back, overlap-add for windows that move by more than 1, or a scatter-add. Each plan checks its arguments. Keys and names follow their positions.
 - `signal`: correlations and convolutions, which slide a kernel along an array's leading axes, and overlap-add. `correlation` gives the plans that a correlation reads: the array with the fills its `Mode` adds, its windows, and the kernel, reversed for a convolution. `correlate` runs them through an `Inner` pair's `inner_mapped`. Float and complex `PlusTimes` read the windows a block at a time. `overlap_add` adds each frame back where its window was read, the transpose of taking windows.
 - `convert`: `int` converts a whole float to an integer type. It gives `None` outside the type's range, and for `i64` and `u32` beyond a magnitude of 2^51 - 1. `float` converts an integer to the nearest float. Loops that call either vectorize on every target. AVX2 and wasm lack a vector instruction between `f64` and 64-bit integers. On those targets a loop that converts with `as` runs one item at a time.
-- `timing`: the machine's timing lock, which keeps timings apart from builds and test runs. `exclusive` takes it for a timing and runs the calling thread's calls on that thread alone while it's held. `shared` takes it for a build or a test run. The browser build doesn't have it.
 
 The special functions `gamma`, `lgamma`, `digamma`, `erf`, `erfc`, their inverses, `binom` with its slopes `binom_dn` and `binom_dk`, the incomplete gamma and beta functions and Lambert W have free functions and objects at the crate root, as the elementary functions do.
 

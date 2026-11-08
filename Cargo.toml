@@ -1,16 +1,32 @@
 [workspace]
-members = ["buffer", "py"]
+members = ["core", "kernels", "timing", "buffer", "py"]
 default-members = [".", "buffer", "py"]
 
 [workspace.package]
-version = "0.1.56"
+version = "0.1.57"
 edition = "2024"
 
 [workspace.dependencies]
-rustymath = { path = ".", version = ">=0.1.55, <1", default-features = false }
+rustymath = { path = ".", version = ">=0.1.56, <1", default-features = false }
 rustymath-buffer = { path = "buffer", version = ">=0.1.39, <1" }
 pyo3 = ">=0.29"
 pyo3-build-config = ">=0.29"
+rustymath-core = { path = "core", version = ">=0.1.56, <1", default-features = false }
+rustymath-kernels = { path = "kernels", version = ">=0.1.56, <1" }
+rustymath-timing = { path = "timing", version = ">=0.1.56, <1" }
+half = { version = ">=2.7.1, <3", features = ["num-traits"] }
+hashbrown = ">=0.15, <1"
+foldhash = ">=0.2.0, <1"
+num-bigint = ">=0.4.6, <0.5"
+num-complex = ">=0.4.6, <1"
+num-integer = ">=0.1.46, <1"
+num-rational = ">=0.4.2, <1"
+num-traits = ">=0.2.19, <1"
+rand = { version = ">=0.10.2, <1", features = ["chacha"] }
+strength_reduce = ">=0.2.4, <1"
+rayon = ">=1.12.0, <2"
+web-time = ">=1.1.0, <2"
+libc = { version = ">=0.2.190, <1", features = ["extra_traits"] }
 
 [workspace.metadata.fastfmt]
 join_comments = true
@@ -29,40 +45,28 @@ name = "rustymath"
 test = false
 doctest = false
 
-# The timing suite: plain `cargo test` skips it; `cargo test --test speed` runs it.
-[[test]]
-name = "speed"
-test = false
-
 [features]
 default = ["native"]
 # Compiles rustymath's own linear algebra into macOS builds too, beside Accelerate, so `RUSTYMATH_NATIVE=1` can select it at run time.
 # Other targets always compile it. The Mac release builds turn it off with `--no-default-features`.
-native = []
+native = ["rustymath-core/native"]
 
 [dependencies]
-half = { version = ">=2.7.1, <3", features = ["num-traits"] }
-hashbrown = ">=0.15, <1"
-foldhash = ">=0.2.0, <1"
-num-bigint = ">=0.4.6, <0.5"
-num-complex = ">=0.4.6, <1"
-num-integer = ">=0.1.46, <1"
-num-rational = ">=0.4.2, <1"
-num-traits = ">=0.2.19, <1"
-rand = { version = ">=0.10.2, <1", default-features = false, features = ["alloc", "chacha"] }
-strength_reduce = ">=0.2.4, <1"
+rustymath-core.workspace = true
+rustymath-kernels.workspace = true
+num-complex.workspace = true
+num-traits.workspace = true
 
-# The browser build has no threads. There `parallel` runs its pieces in turn on the calling thread.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rayon = ">=1.12.0, <2"
-
-# The browser's clock, for the timing loop in `timing`, as basedpl's browser build uses it.
-[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
-web-time = ">=1.1.0, <2"
-
-[target.'cfg(unix)'.dependencies]
-# The memory guard calls `libc` to read physical memory and, on Linux, to ask for huge pages. On macOS, the timing lock also makes its QoS call through it, to favour the performance cores for a timing.
-libc = ">=0.2.190, <1"
+[dev-dependencies]
+rustymath-timing.workspace = true
+half.workspace = true
+hashbrown.workspace = true
+foldhash.workspace = true
+num-bigint.workspace = true
+num-integer.workspace = true
+num-rational.workspace = true
+rand.workspace = true
+strength_reduce.workspace = true
 
 [profile.test]
 inherits = "release"
@@ -76,6 +80,10 @@ debug-assertions = false
 incremental = true
 # Line tables change with every shifted line and recompile the code below it.
 debug = false
+
+[profile.quick]
+inherits = "release"
+lto = "off"
 
 [profile.dist]
 inherits = "release"

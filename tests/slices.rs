@@ -50,7 +50,7 @@ mod parallel {
 
 mod forms {
     use half::f16;
-    use rustymath::{reduce::{Maximum, Minimum}, *};
+    use rustymath::{operation::Kernel, reduce::{Maximum, Minimum}, *};
     use std::fmt::Debug;
 
     /// Whether `a` and `b` agree: both NaN, the same value, or finite and nonzero within 8 units in the last place of each other. A scalar form and its slice form can round differently, as `Pow`'s do at f32, where only the scalar form reads tables. Infinities and signs must match exactly, apart from a zero's sign, which can differ between routes: a vector maximum orders `-0` below `0`, where the scalar form gives its second argument on a tie.
@@ -68,7 +68,7 @@ mod forms {
     }
 
     fn check<F: Float + buffer::Element + Debug, K: facts::Formula<A>, const A: usize>(k: &K, name: &str, args: [Arg<'_, F>; A], n: usize) {
-        let kernel = k.resolve(domain::Variant { checked: false, ..domain::Variant::checked(F::DTYPE) }, [F::DTYPE; A]).unwrap();
+        let kernel = Kernel::resolve((*k).clone(), domain::Variant { checked: false, ..domain::Variant::checked(F::DTYPE) }, [F::DTYPE; A]).unwrap();
         let views = args.each_ref().map(|a| {
             F::view(match a { Arg::One(v) => std::slice::from_ref(v), Arg::Many(s) => s })
         });
@@ -129,7 +129,7 @@ mod forms {
         each_width!(
             unary: Exp, Expm1, Ln, Log1p, Log2, Log10, Sin, Cos, Tan, Asin, Acos, Atan, Sinh, Cosh, Tanh, Asinh, Acosh, Atanh, Cbrt, Gamma,
                 Lgamma, Erf, Erfc, Erfinv, Erfcinv, LambertW, Sqrt, Sqrt1mx2, Sqrt1px2, Sqrtx2m1, Abs, Sign, Angle;
-            binary: Pow, Root, Hypot, Atan2, Gammainc, Gammaincc, Gammaincinv, Binom, Logb, Maximum, Minimum; ternary: Betainc, Betaincinv
+            binary: Pow, Root, Hypot, Atan2, Gammainc, Gammaincc, Gammaincinv, Binom, Logb, MathishLogb, Maximum, Minimum; ternary: Betainc, Betaincinv
         );
         // `Erfcinv`'s f64 slice form places each block's items by region. Several blocks of uniform items, in random order, reach every region.
         use rand::RngExt;
@@ -157,6 +157,27 @@ mod forms {
         for b in [2.0, 10.0] { check(&Logb, "Logb", [Arg::One(b), Arg::Many(&x)], x.len()); }
     }
 
+    #[test]
+    fn logarithm_slices_keep_permitted_nan_results() {
+        fn check<F: Float + buffer::Element + Debug>() {
+            let items = [F::zero(), F::one(), F::infinity(), F::nan()];
+            for mathish in [false, true] {
+                let variant = domain::Variant::checked(F::DTYPE);
+                let kernel = if mathish { Kernel::new(MathishLogb, variant) } else { Kernel::new(Logb, variant) };
+                for args in [[&items[..], &items[..]], [&items[1..2], &items[..]], [&items[..], &items[1..2]]] {
+                    let got = crate::support::mapped::<F, F, 2>(&kernel, args, items.len()).unwrap();
+                    for (i, &r) in got.iter().enumerate() {
+                        let x = args.map(|s| s[if s.len() == 1 { 0 } else { i }]);
+                        let want = if mathish { facts::formula_at(&MathishLogb, x) } else { facts::formula_at(&Logb, x) };
+                        assert!(same(r, want), "{x:?}: {r:?} != {want:?}");
+                    }
+                }
+            }
+        }
+        check::<f32>();
+        check::<f64>();
+    }
+
     /// An output type other than the item type, at each float type, f16 included. A `bool` output is never NaN, so it never fails.
     #[test]
     fn outputs_can_differ_from_items() {
@@ -176,6 +197,7 @@ mod reductions {
     use half::f16;
     use num_complex::Complex;
     use rustymath::reduce::*;
+    use std::fmt::Display;
 
     /// Each reduction and scan against the same taken item by item, in order: sums and running sums of `sums`, and the product of `prods`. Their items keep every sum and product exact at every width, so any grouping gives the same result.
     fn exact<T: Copy + PartialEq + std::fmt::Debug, S: Copy + PartialEq + std::fmt::Debug>(
@@ -249,7 +271,7 @@ mod reductions {
             };
             let unit = |greatest: bool| if greatest { f64::NEG_INFINITY } else { f64::INFINITY };
             let want = |items: &mut dyn Iterator<Item = T>, greatest: bool| items.fold(unit(greatest), |a, v| step(a, v.into(), greatest));
-            let check = |got: T, want: f64, case: &str| {
+            let check = |got: T, want: f64, case: &dyn Display| {
                 let got: f64 = got.into();
                 assert!(got.is_nan() || got == want, "{case}: {got}, where {want} or NaN");
             };
@@ -275,7 +297,7 @@ mod reductions {
                         let mut seen = start.map_or(unit(greatest), |s| step(unit(greatest), s.into(), greatest));
                         for (i, &got) in out.iter().enumerate() {
                             seen = step(seen, x[i].into(), greatest);
-                            check(got, seen, &format!("{case}, scan from {:?}, item {i}", start.map(Into::<f64>::into)));
+                            check(got, seen, &format_args!("{case}, scan from {:?}, item {i}", start.map(Into::<f64>::into)));
                         }
                     }
                     for inner in [1, 3, 7] {
@@ -283,7 +305,7 @@ mod reductions {
                         let data = &x[..rows * inner];
                         let column = |j: usize| (0..rows).map(move |r| data[r * inner + j]);
                         let folds = if greatest { along::<T, Max>(data, [1, rows, inner]).0 } else { along::<T, Min>(data, [1, rows, inner]).0 };
-                        for j in 0..inner { check(folds[j], want(&mut column(j), greatest), &format!("{case}, column {j} of {inner}")); }
+                        for j in 0..inner { check(folds[j], want(&mut column(j), greatest), &format_args!("{case}, column {j} of {inner}")); }
                         for width in [3, 50].into_iter().filter(|&w| w <= rows && len <= 200) {
                             let windows =
                                 if greatest { sliding::<T, Max>(data, [1, rows, inner], width).0 } else { sliding::<T, Min>(data, [1, rows, inner], width).0 };
@@ -291,7 +313,7 @@ mod reductions {
                                 for j in 0..inner {
                                     check(
                                         windows[w * inner + j], want(&mut (w..w + width).map(|r| data[r * inner + j]), greatest),
-                                        &format!("{case}, window {w} of {width} rows of {inner}"));
+                                        &format_args!("{case}, window {w} of {width} rows of {inner}"));
                                 }
                             }
                         }
@@ -826,7 +848,7 @@ mod tolerant {
 
     #[test]
     fn residue_and_gcd() {
-        use rustymath::{buffer::{DType, FloatWidth}, domain::Variant, facts::Formula};
+        use rustymath::{buffer::{DType, FloatWidth}, domain::Variant, operation::Kernel};
         assert_eq!([(3.0, -5.0), (3.0, 5.0), (-3.0, -4.0), (-3.0, 4.0)].map(|(x, y)| T.residue(x, y)), [1.0, 2.0, -1.0, -2.0]);
         let r = [3.12, -1.0, -0.6].map(|y| T.residue(0.5, y));
         assert!((r[0] - 0.12).abs() < 1e-15 && r[1] == 0.0 && (r[2] - 0.4).abs() < 1e-15);
@@ -837,7 +859,7 @@ mod tolerant {
         assert!((Exactly.residue(0.1, 0.3) - 0.1).abs() < 1e-15);
         let (x, y) = (2.2500000000000018, 0.7500000000000007);
         let f64s = DType::Float(FloatWidth::F64);
-        let quotient = FloorDivide(Tolerance::EXACT).resolve(Variant::checked(f64s), [f64s; 2]).unwrap();
+        let quotient = Kernel::resolve(FloorDivide(Tolerance::EXACT), Variant::checked(f64s), [f64s; 2]).unwrap();
         assert_eq!(
             (quotient.real(&[x, y], rustymath::operation::Settings { tolerance: Tolerance::EXACT }).unwrap(), Residue(Tolerance::EXACT).one(y, x)),
             (2.0, x - 2.0 * y)

@@ -1,0 +1,18 @@
+[package]
+name = "rustymath-timing"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.98"
+license = "Apache-2.0"
+description = "What rustymath's and basedpl's speed tests share: the machine's timing lock, the timing loop, instruction and byte counts, copy times and budget files."
+repository = "https://github.com/AnswerDotAI/rustymath"
+
+[lib]
+test = false
+doctest = false
+
+[dependencies]
+rustymath-core.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

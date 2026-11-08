@@ -1,0 +1,20 @@
+[package]
+name = "rustymath-kernels"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.98"
+license = "Apache-2.0"
+description = "Resolved numerical kernels over Rustymath formulas and storage."
+repository = "https://github.com/AnswerDotAI/rustymath"
+
+[lib]
+test = false
+doctest = false
+
+[dependencies]
+rustymath-core.workspace = true
+half.workspace = true
+num-complex.workspace = true
+num-rational.workspace = true
+num-traits.workspace = true
+

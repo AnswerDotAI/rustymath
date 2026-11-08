@@ -1,9 +1,11 @@
-"How fast rustymath's Python API runs. Each case in `speed_python.txt` is timed as `speed.rs` times the Rust slice forms, and checked against its budget."
+"How fast rustymath's Python API runs. Each case in `speed_python.txt` is timed as `speed.rs` times the Rust slice forms, and checked against its budget and against any instruction count that the file records for this machine's column. `RUSTYMATH_COSTS` asks for a calibration run, as `speed.rs` describes."
 import gc, os, sys, time
+from contextlib import contextmanager
 from pathlib import Path
-import numpy as np, pytest, rustymath as rm
+import numpy as np, rustymath as rm
 
 N, RUNS = 65_536, 5
+CALIBRATING = 'RUSTYMATH_COSTS' in os.environ
 
 def arrays():
     "The arrays that the cases name. Each case's main input holds `N` items."
@@ -25,53 +27,67 @@ def fastest(run):
         del result
     return best
 
-def cost(code, namespace, copy, itemsize, timing):
-    "The time that `code` takes for each of `N` items, in copies that take `copy` seconds an item and in seconds, and its footprint, as `timing.footprint` gives it for `N` items of `itemsize` bytes and the most bytes `code` held at once."
-    case = compile(code, code, 'eval')
-    best, held = timing.peak_held(lambda: fastest(lambda: eval(case, namespace)))
-    return best / N / copy, best / N, timing.footprint(itemsize, N, held)
-
-@pytest.fixture
-def timing():
-    "Hold the timing lock exclusively through `rm.timing`, as `speed.rs` does, with the garbage collector off. Gives the hold, whose `pauses`, `warm`, `copy`, `peak_held`, `footprint` and `line` the test uses. As a fixture, its wait for the lock falls outside the test's timeout."
-    with rm.timing() as hold:
+@contextmanager
+def held(hold):
+    "Keep `hold`, a hold on the timing lock from `rm.timing` or `rm.try_timing`, with the garbage collector off."
+    with hold:
         gc.disable()
         try: yield hold
         finally: gc.enable()
 
-def over_budget(cases, namespace, timing, show):
-    "Time `cases`, as `timing.budgets` gives them, in copies of the time that `timing.copy` gives for their section's item type, then time each one over its budget again after each of `timing.pauses`, in seconds, and `timing.warm`, printing the earlier and new costs. Prints each case whose gap's hold has outlived the gap, as `Budget.stale` decides from its first cost, marked `stale`. Gives the lines of the cases still over budget. With `show`, prints each item type's copy line and every case's line, in the formats `basedpl.bpltests.logged_costs` reads."
-    units = {s: timing.copy(np.dtype(s).itemsize, N) for s in dict.fromkeys(s for s, _, _ in cases)}
-    if show:
-        for _, line in units.values(): print(line, file=sys.stderr)
-    def attempt(case):
-        section, code, budget = case
-        copies, seconds, footprint = cost(code, namespace, units[section][0], np.dtype(section).itemsize, timing)
-        return timing.line(section, code, copies, '-' if budget is None else str(budget), seconds, footprint), budget is not None and budget.over(copies), budget is not None and budget.stale(copies)
-    over, stale = [], []
-    for case in cases:
-        line, failed, outlived = attempt(case)
-        if show: print(line, file=sys.stderr)
-        if failed: over.append((case, line))
-        if outlived: stale.append(line)
-    for pause in timing.pauses:
-        if not over: break
-        for _, line in over: print(f'{line}: over, timed again after {pause:g} s', file=sys.stderr)
-        time.sleep(pause)
-        timing.warm()
-        again = []
-        for case, _ in over:
-            line, failed, _ = attempt(case)
-            print(line, file=sys.stderr)
-            if failed: again.append((case, line))
-        over = again
-    for line in stale: print(f'{line}: stale', file=sys.stderr)
-    return [line for _, line in over]
+def attempt(case, namespace, units, timing):
+    "The line of `case`, a `(section, code, budget, counts)` from `timing.budgets`, its cost in copies of the copy time that `units` gives for its section's item type, and the instructions that one run retires for each of `N` items, or `None` where they can't be counted. The counted run comes before the timed runs."
+    section, code, budget, _ = case
+    expr = compile(code, code, 'eval')
+    _, instructions = timing.instructions(lambda: eval(expr, namespace))
+    best, peak = timing.peak_held(lambda: fastest(lambda: eval(expr, namespace)))
+    copies, per_item = best / N / units[section][0], None if instructions is None else instructions / N
+    footprint = timing.footprint(np.dtype(section).itemsize, N, peak)
+    return timing.line(section, code, copies, '-' if budget is None else str(budget), best / N, footprint, (per_item, None)), copies, per_item
 
-def test_speed(capsys, timing):
-    "Every case costs no more than its budget, on the CPU that the budgets were set for (`timing.checks_budgets`). On any other CPU, it prints every cost, then each case still over its budget, marked `over`, and fails on none. Each case whose gap's hold has outlived the gap is printed, marked `stale`. `RUSTYMATH_COSTS` prints every cost."
+def retimed(over, namespace, units, timing):
+    "Time each of `over`'s `(case, line)` pairs again, printing its new line, and give those still over budget, with their new lines."
+    again = []
+    for case, _ in over:
+        line, copies, _ = attempt(case, namespace, units, timing)
+        print(line, file=sys.stderr)
+        if case[2].over(copies): again.append((case, line))
+    return again
+
+def test_speed(capsys):
+    "Every case costs no more than its budget, and retires no more instructions than its recorded count allows, on the CPU that the budgets were set for (`timing.checks_budgets`). On any other CPU, it prints every cost, then each case still over, marked `over`, and fails on none. An ordinary run holds the timing lock shared, on one thread, beside builds and other tests. It then times each case over its budget again if it can hold the lock exclusively at once, and otherwise marks the case `unconfirmed` and doesn't fail it. A calibration run, which `RUSTYMATH_COSTS` asks for, holds the lock exclusively, prints every cost and times each case over its budget again after each of `timing.pauses`. Each case whose gap's hold has outlived the gap is printed, marked `stale`, and each whose instructions fall below its record divided by the margin is marked `fewer instructions`."
+    timing = rm.timing(shared=not CALIBRATING)
     namespace, cases = arrays(), timing.budgets(Path(__file__).with_name('speed_python.txt').read_text())
+    show, failures = not timing.checks_budgets or CALIBRATING, []
     with capsys.disabled():
-        over = over_budget(cases, namespace, timing, not timing.checks_budgets or 'RUSTYMATH_COSTS' in os.environ)
-        if timing.checks_budgets: assert not over, '\n'.join(over)
-        for line in over: print(f'{line}: over', file=sys.stderr)
+        with held(timing):
+            units = {s: timing.copy(np.dtype(s).itemsize, N) for s in dict.fromkeys(case[0] for case in cases)}
+            if show:
+                for _, line in units.values(): print(line, file=sys.stderr)
+            measured = [(case, *attempt(case, namespace, units, timing)) for case in cases]
+            for (_, _, budget, counts), line, copies, instructions in measured:
+                if show: print(line, file=sys.stderr)
+                if budget is not None and budget.stale(copies): print(f'{line}: stale', file=sys.stderr)
+                record = counts[timing.measures.index('instructions')]
+                if record is None or instructions is None: continue
+                if record.over(instructions, timing.count_margin): failures.append(f'{line}: instructions over the {record.value} recorded')
+                elif instructions * timing.count_margin < record.value: print(f'{line}: fewer instructions than the {record.value} recorded', file=sys.stderr)
+            over = [(case, line) for case, line, copies, _ in measured if case[2] is not None and case[2].over(copies)]
+            for pause in timing.pauses if CALIBRATING else ():
+                if not over: break
+                for _, line in over: print(f'{line}: over, timed again after {pause:g} s', file=sys.stderr)
+                time.sleep(pause)
+                timing.warm()
+                over = retimed(over, namespace, units, timing)
+        if over and not CALIBRATING:
+            if (quiet := rm.try_timing()) is None:
+                for _, line in over: print(f'{line}: unconfirmed, because builds or tests hold the timing lock', file=sys.stderr)
+                over = []
+            else:
+                with held(quiet):
+                    timing.warm()
+                    for _, line in over: print(f'{line}: over, timed again with the timing lock held exclusively', file=sys.stderr)
+                    over = retimed(over, namespace, units, timing)
+        failures += [line for _, line in over]
+        if timing.checks_budgets: assert not failures, '\n'.join(failures)
+        for line in failures: print(f'{line}: over', file=sys.stderr)

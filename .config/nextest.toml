@@ -1,0 +1,19 @@
+# `cargo nextest run` runs each test in its own process and every binary at once.
+[profile.default]
+# A test running past 5 s is reported as slow. One still running at 30 s is stopped and fails.
+slow-timeout = { period = "5s", terminate-after = 6 }
+fail-fast = false
+
+# Timings run last, with nothing beside them: threaded correctness tests such as `linalg` would slow them.
+[[profile.default.overrides]]
+filter = 'binary(speed)'
+threads-required = 'num-cpus'
+priority = -100
+
+# Optional selection excluding timings, used by focused cross-repo diagnostics beside basedpl's untimed selection.
+[profile.untimed]
+default-filter = 'not binary(speed)'
+
+# Optional timing-only selection. An explicit cross-repo ('untimed', 'timed', 'speed') run uses this after basedpl timings. Plain run_tests uses default and includes everything.
+[profile.speed]
+default-filter = 'binary(speed)'
