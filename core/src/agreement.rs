@@ -387,26 +387,23 @@ impl<'s> Read<'s> {
         let end = start.checked_add(if stride == 0 { 1 } else { range.len() })?;
         Some((binding.borrow(start..end)?, stride as usize))
     }
-    /// `run_view`, where the storage holds `dtype`.
-    fn storage_run(&self, range: &Range<usize>, dtype: crate::buffer::DType) -> Option<(crate::buffer::View<'_>, usize)> {
-        self.run_view(range).filter(|(view, _)| view.dtype() == dtype)
-    }
     /// Borrows a contiguous input range; other reads use scratch at exactly the requested length.
     pub fn part_view<'a>(
         &'a self, range: Range<usize>, dtype: crate::buffer::DType, checked: bool, scratch: &'a mut crate::buffer::Buffer
     ) -> Result<crate::buffer::View<'a>, Error> {
         self.range(&range)?;
-        if let Some((view, stride)) = self.storage_run(&range, dtype) { if stride == 1 || range.len() == 1 { return Ok(view); } }
-        self.read_into(range, dtype, checked, scratch)?;
+        let run = self.run_view(&range);
+        if let Some((view, stride)) = run && view.dtype() == dtype && (stride == 1 || range.len() == 1) { return Ok(view); }
+        self.write_into(range, dtype, checked, scratch, run)?;
         Ok(scratch.view())
     }
 
-    /// A contiguous or repeated span at its actual storage dtype. Copied spans require sources of one dtype.
+    /// A span at its actual storage dtype and the item count copied. Copied spans require sources of one dtype.
     pub fn argument<'a>(
         self, range: Range<usize>, checked: bool, scratch: &'a mut crate::buffer::Buffer
-    ) -> Result<crate::buffer::View<'a>, Error> where 's: 'a {
+    ) -> Result<(crate::buffer::View<'a>, usize), Error> where 's: 'a {
         self.range(&range)?;
-        if let Some((view, _)) = self.run_view(&range) { return Ok(view); }
+        if let Some((view, _)) = self.run_view(&range) { return Ok((view, 0)); }
         let mut dtype = None;
         self.plan.try_for_each_source(&mut |source, _| {
             let current = self.sources[source].view.dtype();
@@ -415,8 +412,9 @@ impl<'s> Read<'s> {
             Ok(())
         })?;
         let dtype = dtype.ok_or_else(|| Error::new(Kind::Domain, "read has no storage dtype"))?;
-        self.read_into(range, dtype, checked, scratch)?;
-        Ok(scratch.view())
+        let copied = range.len();
+        self.write_into(range, dtype, checked, scratch, None)?;
+        Ok((scratch.view(), copied))
     }
     /// A typed span borrowed from storage, or one scalar converted once; `None` means array materialization is needed.
     pub fn borrowed<T: crate::buffer::Cast>(&self, range: Range<usize>, checked: bool) -> Result<Option<Arg<'s, T>>, Error> {
@@ -550,10 +548,17 @@ impl<'s> Read<'s> {
     }
     pub fn read_into(&self, range: Range<usize>, dtype: crate::buffer::DType, checked: bool, output: &mut crate::buffer::Buffer) -> Result<(), Error> {
         self.range(&range)?;
+        let run = self.run_view(&range);
+        self.write_into(range, dtype, checked, output, run)
+    }
+    fn write_into(
+        &self, range: Range<usize>, dtype: crate::buffer::DType, checked: bool,
+        output: &mut crate::buffer::Buffer, run: Option<(crate::buffer::View<'s>, usize)>
+    ) -> Result<(), Error> {
         if output.dtype() != dtype { *output = crate::buffer::Buffer::with_capacity(dtype, range.len()); }
         with_dtype!(dtype, T => {
             let items = T::vec_mut(output).expect("output has the selected dtype");
-            if let Some((view, stride)) = self.run_view(&range) {
+            if let Some((view, stride)) = run {
                 if view.dtype() != dtype { return cast_run(view, stride, range.len(), checked, items); }
                 let source = T::of(view).expect("a typed read selected its dtype");
                 items.clear();
