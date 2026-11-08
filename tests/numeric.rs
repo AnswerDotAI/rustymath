@@ -581,7 +581,8 @@ mod operation {
             let layout = Layout::from([n]);
             let inputs: Vec<_> = inputs.iter().map(|&data| view(&layout, data, &if data.len() == 1 { Mapping::Single } else { Mapping::Linear(1) })).collect();
             let reads: Vec<_> = inputs.iter().map(ArrayView::read).collect();
-            Slots::append(values, n, |slots| kernel.map_in(&reads, 0..n, Settings { tolerance: Tolerance::EXACT }, &mut Scratch::default(), MapOutput::F64(slots)))
+            let map = rustymath::operation::Map::Kernel(kernel.clone(), Settings { tolerance: Tolerance::EXACT });
+            Slots::append(values, n, |slots| map.run(&reads, 0..n, &mut Scratch::default(), MapOutput::F64(slots)))
         }
         let float = f64::DTYPE;
         let add = Kernel::resolve(Add, Variant::checked(float), [float; 2]).unwrap();
@@ -604,6 +605,16 @@ mod operation {
         append(&ints, &inputs, 0, &mut values).unwrap();
         assert!(append(&ints, &inputs, 1, &mut values).is_err());
         assert_eq!(values.len(), 9);
+        let data = f64::view(&[-1.5, 2.9]);
+        assert_eq!(i16::vec(Buffer::floored(data, i16::DTYPE, Tolerance::EXACT).unwrap()).unwrap(), [-2, 2]);
+        assert_eq!(i16::vec(Buffer::cast_results(data, i16::DTYPE, true).unwrap()).unwrap(), [-1, 2]);
+        assert_eq!(u8::vec(Buffer::floored(i64::view(&[300]), u8::DTYPE, Tolerance::EXACT).unwrap()).unwrap(), [44]);
+        let errors = rustymath::error::ErrorSlot::default();
+        errors.within(|| {
+            assert!(Buffer::kept(data, i16::DTYPE).is_err());
+            assert!(Buffer::cast_results(i64::view(&[300]), u8::DTYPE, true).is_err());
+            assert!(Buffer::cast_results(i64::view(&[0xd800]), char::DTYPE, true).is_err());
+        });
     }
 
     #[test]
@@ -619,6 +630,8 @@ mod operation {
         let mut out = Buffer::with_capacity(add.result_dtype(), 3);
         crate::support::map(&add, [bool::view(&[true]), bool::view(&[true, false, true])], 3, &mut out).unwrap();
         assert_eq!(i64::vec(out).unwrap(), [2, 1, 2]);
+        let byte = Kernel::resolve(Add, Variant::checked(u8::DTYPE), [u8::DTYPE; 2]).unwrap();
+        assert!(byte.range_on(&[Range::of(Some(200.)); 2], false).hi >= 400.);
         let checked = Kernel::resolve(Add, Variant::checked(wide), [wide; 2]).unwrap();
         let slot = ErrorSlot::new();
         let mut out = Buffer::with_capacity(wide, 1);
@@ -760,7 +773,7 @@ mod operation {
             assert_eq!(i64::vec(Buffer::cast_results(out.view(), dtype, true).unwrap()).unwrap(), [expected]);
         }
         for inner in [1, 2] {
-            let outer = rustymath::CHUNK / 3 + 1;
+            let outer = rustymath_core::CHUNK / 3 + 1;
             let data: Vec<i64> = (0..outer * 3 * inner).map(|i| [3, 2, 1][i / inner % 3]).collect();
             let input = [Binding::full(i64::view(&data))];
             let plan = ReadPlan::input(0, data.len());
@@ -825,6 +838,9 @@ mod operation {
         let extended = Layout::from([8]);
         let extended = view(&extended, f64::view(&data), &Mapping::Linear(1));
         assert_eq!(extended.read().plan.contiguous(1..4), Some((0, 1..4)));
+        assert_eq!(extended.read().plan.contiguous(1..1), None);
+        let fallback = ReadPlan::copy(1, 0, Mapping::Linear(1), 2, Missing::Input(ReadPlan::input(0, 1)));
+        assert!(fallback.contiguous(0..2).is_none());
         assert_eq!(extended.items::<f64>().unwrap().as_ref(), &[0., 1., 2., 3., 4., 5., 0., 0.]);
         assert!(matches!(extended.read().part_counted::<i16>(2..3, true, &mut Vec::new()), Ok((rustymath::Arg::One(2), 0))));
         let sources = [Binding::window(f64::view(&data[2..4]), 2, data.len()).unwrap()];
@@ -870,6 +886,7 @@ mod operation {
         let prefix = Layout::from([2]);
         let prefix = view(&prefix, f64::view(&data), &strided);
         assert_eq!(prefix.items::<f64>().unwrap().as_ref(), &[3., 2.]);
+        assert_eq!(prefix.read().plan.contiguous(0..1), Some((0, 4..5)));
         assert_eq!(prefix.items::<i16>().unwrap().as_ref(), &[3, 2]);
         assert!(view(&Layout::from([0, 3]), f64::view(&data), &transpose).items::<f64>().unwrap().is_empty());
         assert!(Mapping::Linear(2).affine(&[3]).is_none());

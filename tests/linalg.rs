@@ -39,7 +39,7 @@ mod products {
                 let fk = Kernel::resolve(f, Variant::checked(gk.result_dtype()), [gk.result_dtype(); 2]).unwrap();
                 inner_with(
                     a, b, $size, |x, y, agreement| {
-                        assert!(agreement.len <= rustymath::CHUNK);
+                        assert!(agreement.len <= rustymath_core::CHUNK);
                         let sources = [Binding::full(x), Binding::full(y)];
                         let plans = [
                             ReadPlan::input(0, x.len()).remapped(agreement.left.clone(), agreement.len, Missing::Default),
@@ -53,7 +53,7 @@ mod products {
                 )
             }};
         }
-        let [m, k, n] = [2, rustymath::CHUNK + 3, 3];
+        let [m, k, n] = [2, rustymath_core::CHUNK + 3, 3];
         let a = (0..m * k).map(|i| (i % 7) as i64 - 3).collect::<Vec<_>>();
         let b = (0..k * n).map(|i| (i % 5) as i64 - 2).collect::<Vec<_>>();
         let out = inner!(rustymath::Subtract, rustymath::Multiply, i64::view(&a), i64::view(&b), [m, k, n]).unwrap();
@@ -68,8 +68,8 @@ mod products {
             (0..k - 2).rev().fold(t, |t, p| term(p) == i64::from(t))
         }).collect::<Vec<_>>();
         assert_eq!(bool::of(out.view()).unwrap(), expected);
-        let wide = vec![1i64; 3 * (rustymath::CHUNK + 1)];
-        let out = inner!(rustymath::Subtract, rustymath::Multiply, i64::view(&[1, 2, 3]), i64::view(&wide), [1, 3, rustymath::CHUNK + 1]).unwrap();
+        let wide = vec![1i64; 3 * (rustymath_core::CHUNK + 1)];
+        let out = inner!(rustymath::Subtract, rustymath::Multiply, i64::view(&[1, 2, 3]), i64::view(&wide), [1, 3, rustymath_core::CHUNK + 1]).unwrap();
         assert!(i64::of(out.view()).unwrap().iter().all(|&x| x == 2));
         let out = inner!(rustymath::Add, Greater(Tolerance::EXACT), i64::view(&[2, 3, 4]), i64::view(&[1, 5, 2]), [1, 3, 1]).unwrap();
         assert_eq!(i64::of(out.view()).unwrap(), [2]);
@@ -241,7 +241,7 @@ mod products {
     #[test]
     fn wrapped_and_half_products_match_folds() {
         // `Wrapped(PlusTimes)` folds with wrapping `i32` steps whatever its items' type, whether they compute as exact floats or on the `i32` kernel: `u8`, `i16` and `i32` items give the folds of their `i32` values, and the large `i16` and `i32` items overflow 32 bits. Small and moderate `i32` items take the exact float route, and the moderate ones still wrap at 32 bits. f16 `+.×` gives the f32 folds of the same values, which small whole numbers keep exact.
-        use rustymath::Wrapped;
+        use rustymath_core::Wrapped;
         fn widened<T: Copy + Into<i32>>(x: &[T]) -> Vec<i32> { x.iter().map(|&v| v.into()).collect() }
         for size @ [m, k, n] in [[0, 3, 4], [3, 0, 4], [3, 4, 0], [5, 7, 9], [MC + 3, KC + 5, 37]] {
             let wrapped = |a: &[i32], b: &[i32]| folded(a, b, size, 0i32, |s, x, y| s.wrapping_add(x.wrapping_mul(y)));

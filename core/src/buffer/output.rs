@@ -1,22 +1,15 @@
 use super::*;
 use crate::{Arg, parallel::Slots};
 
-/// Where a map appends its results: an owned buffer or the next slots of a caller's result.
-pub enum MapOutput<'a, 'b> {
-    Buffer(&'a mut Buffer), F16(&'a mut Slots<'b, half::f16>), F32(&'a mut Slots<'b, f32>), F64(&'a mut Slots<'b, f64>), Bool(&'a mut Slots<'b, bool>),
-    U8(&'a mut Slots<'b, u8>), I16(&'a mut Slots<'b, i16>), I32(&'a mut Slots<'b, i32>), I64(&'a mut Slots<'b, i64>),
-    C32(&'a mut Slots<'b, num_complex::Complex32>), C64(&'a mut Slots<'b, num_complex::Complex64>), Char(&'a mut Slots<'b, char>)
-}
-
 pub trait OutputItem: Element { fn slots<'s, 'b>(output: &'s mut MapOutput<'_, 'b>) -> Option<&'s mut Slots<'b, Self>>; }
 
 macro_rules! outputs {
     ($($v:ident: $t:ty),+ $(,)?) => {
-        impl MapOutput<'_, '_> {
+        /// Where a map appends: an owned buffer or the next slots of a caller's result.
+        pub enum MapOutput<'a, 'b> { Buffer(&'a mut Buffer), $($v(&'a mut Slots<'b, $t>)),+ }
+        impl<'b> MapOutput<'_, 'b> {
             fn dtype(&self) -> DType { match self { Self::Buffer(b) => b.dtype(), $(Self::$v(_) => <$t>::DTYPE),+ } }
-            fn copy(&mut self, view: View<'_>) {
-                match self { Self::Buffer(b) => { b.extend_from(view, 0..view.len()); }, $(Self::$v(s) => s.copy(<$t>::of(view).expect("result conversion has the destination's dtype"))),+ }
-            }
+            pub fn reborrow(&mut self) -> MapOutput<'_, 'b> { match self { Self::Buffer(b) => MapOutput::Buffer(b), $(Self::$v(s) => MapOutput::$v(s)),+ } }
             pub fn fill(&mut self, n: usize) {
                 match self {
                     Self::Buffer(b) => with_dtype!(b.dtype(), T => { let v = T::vec_mut(b).expect("a buffer has its dtype"); v.resize(v.len() + n, T::FILL); }),
@@ -39,7 +32,7 @@ outputs!(F16: half::f16, F32: f32, F64: f64, Bool: bool, U8: u8, I16: i16, I32: 
 
 /// Conversion buffers retained for one execution, by computing dtype and operand position.
 #[derive(Default)]
-pub struct Scratch { buffers: Vec<(DType, Vec<Buffer>)>, copied: usize }
+pub struct Scratch { buffers: Vec<(DType, Vec<Buffer>)>, results: Vec<Buffer>, direct: Option<crate::agreement::ReadPlan>, copied: usize }
 
 impl Scratch {
     fn buffers(&mut self, dtype: DType, n: usize) -> &mut [Buffer] {
@@ -53,6 +46,16 @@ impl Scratch {
     }
     pub fn copied(&self) -> usize { self.copied }
     pub fn record_copies(&mut self, items: usize) { self.copied += items; }
+    fn result<T: Element>(&mut self) -> &mut Vec<T> {
+        let at = self.results.iter().position(|buffer| buffer.dtype() == T::DTYPE).unwrap_or_else(|| {
+            self.results.push(Buffer::with_capacity(T::DTYPE, 0));
+            self.results.len() - 1
+        });
+        T::vec_mut(&mut self.results[at]).expect("a result buffer has its computing dtype")
+    }
+    pub(crate) fn input_plan(&mut self, items: usize) -> crate::agreement::ReadPlan {
+        self.direct.get_or_insert_with(|| crate::agreement::ReadPlan::input(0, 0)).sized_input(items)
+    }
     pub fn buffer(&mut self, dtype: DType) -> &mut Buffer { &mut self.buffers(dtype, 1)[0] }
     pub fn inputs<T: Element, const N: usize>(&mut self) -> [&mut Vec<T>; N] {
         let buffers: &mut [Buffer; N] = self.buffers(T::DTYPE, N).try_into().expect("scratch has an entry per operand");
@@ -61,7 +64,7 @@ impl Scratch {
 }
 
 pub struct Output<'a, 'b> {
-    pub target: MapOutput<'a, 'b>, pub dtype: DType, pub checked: bool, pub scratch: Option<&'a mut Scratch>
+    pub target: MapOutput<'a, 'b>, pub result_dtype: DType, pub checked: bool, pub scratch: Option<&'a mut Scratch>
 }
 
 impl Output<'_, '_> {
@@ -101,14 +104,22 @@ fn converted<O: OutputItem>(
     target: &mut MapOutput<'_, '_>, range: std::ops::Range<usize>, checked: bool, mut work: Option<&mut Scratch>,
     apply: &(dyn Fn(std::ops::Range<usize>, &mut Slots<'_, O>, Option<&mut Scratch>) -> bool + Sync)
 ) -> Result<(), Error> {
-    let mut scratch = Vec::<O>::new();
-    for at in (range.start..range.end).step_by(crate::CHUNK) {
-        let n = crate::CHUNK.min(range.end - at);
-        scratch.clear();
-        Slots::append(&mut scratch, n, |slots| apply(at..at + n, slots, work.as_deref_mut()));
-        match Buffer::cast_results(O::view(&scratch), target.dtype(), checked) {
-            Ok(buffer) => target.copy(buffer.view()), Err(error) => { target.fill(range.end - at); return Err(error); }
+    let mut values = work.as_deref_mut().map_or_else(Vec::new, |work| std::mem::take(work.result::<O>()));
+    let mut local = Scratch::default();
+    let conversion = crate::convert::Conversion { input: O::DTYPE, output: target.dtype(), kind: crate::convert::ConversionKind::Truncate };
+    let result = (|| {
+        for at in (range.start..range.end).step_by(crate::CHUNK) {
+            let n = crate::CHUNK.min(range.end - at);
+            values.clear();
+            Slots::append(&mut values, n, |slots| apply(at..at + n, slots, work.as_deref_mut()));
+            if let Err(error) = conversion.append(O::view(&values), checked, crate::tolerant::Tolerance::EXACT,
+                work.as_deref_mut().unwrap_or(&mut local), target.reborrow()) {
+                target.fill(range.end - at - n);
+                return Err(error);
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })();
+    if let Some(work) = work { *work.result::<O>() = values; }
+    result
 }

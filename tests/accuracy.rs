@@ -686,7 +686,7 @@ mod complex {
         cases.sort_by(|a, b| a.0.cmp(&b.0));
         for group in cases.chunk_by(|a, b| a.0 == b.0) {
             let name = &group[0].0;
-            let count = if bulk && name == "exp" { group.len().max(rustymath::CHUNK + 1) } else { group.len() };
+            let count = if bulk && name == "exp" { group.len().max(rustymath_core::CHUNK + 1) } else { group.len() };
             let group = group.iter().cycle().take(count).collect::<Vec<_>>();
             let inputs = (0..group[0].1.len()).map(|i| group.iter().map(|(_, a, _)| c(narrow(a[i].re), narrow(a[i].im))).collect()).collect::<Vec<_>>();
             let got = apply_many(name, &inputs, bulk).expect("a reference function");
@@ -705,7 +705,7 @@ mod complex {
     fn bulk_edges<R: Native + Element>() where Complex<R>: Element {
         let real = |x| c(R::narrow(x), R::zero());
         assert!(evaluate::<R, 1>(Exp, [&[]], true).is_empty());
-        let n = rustymath::CHUNK + 1;
+        let n = rustymath_core::CHUNK + 1;
         let bases = [real(0.0), real(2.0), real(-2.0)].into_iter().cycle().take(n).collect::<Vec<_>>();
         for (exponent, values) in [(0.0, [1.0, 1.0, 1.0]), (1.0, [0.0, 2.0, -2.0]), (2.0, [0.0, 4.0, 4.0]), (-1.0, [f64::INFINITY, 0.5, -0.5])] {
             let got = evaluate(Pow, [&bases, &[real(exponent)]], true);

@@ -10,7 +10,7 @@ where K: crate::facts::Formula<N>, F: crate::Native + crate::buffer::Cast + Outp
         map_values::<num_complex::Complex<F>, bool, N>(
             inputs, range, variant.checked, judge.checked, output, |x| value(x).re != F::zero(),
             |x, r| invalid(x, num_complex::Complex::new(if r { F::one() } else { F::zero() }, F::zero())))
-    } else if output.dtype.is_real() {
+    } else if output.result_dtype.is_real() {
         map_values::<num_complex::Complex<F>, F, N>(
             inputs, range, variant.checked, judge.checked, output, |x| value(x).re, |x, r| invalid(x, num_complex::Complex::new(r, F::zero())))
     } else {

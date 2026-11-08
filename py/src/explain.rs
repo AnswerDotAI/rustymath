@@ -1,6 +1,6 @@
 //! Python access to the shared producer-event capture.
 use pyo3::{prelude::*, types::PyDict};
-use rustymath::events::{self, Event, EventKind, Field, Report, Run, Sink};
+use rustymath::events::{Event, EventKind, Field, Report, Run, Sink};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 #[derive(Default)]
@@ -30,9 +30,9 @@ impl Explanation {
         report.records.iter().map(|event| {
             let record = PyDict::new(py);
             record.set_item("kind", event.name())?;
-            for ((name, _), field) in events::TABLES[event.table()].1.iter().zip(event.fields()) {
+            for ((name, _), field) in event.table().1.iter().zip(event.fields()) {
                 match field {
-                    Field::Text(t) => record.set_item(name, t)?, Field::Count(n) => record.set_item(name, n)?, Field::Truth(t) => record.set_item(name, t)?
+                    Field::Text(t) => record.set_item(name, t.as_ref())?, Field::Count(n) => record.set_item(name, n)?, Field::Truth(t) => record.set_item(name, t)?
                 }
             }
             Ok(record.unbind())

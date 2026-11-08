@@ -20,7 +20,7 @@ pub enum Mapping {
     Steps { base: usize, steps: Vec<Steps> },
 }
 
-/// What an unmapped position reads. Input plans use the output position; Scalar broadcasts one source item.
+/// What an unmapped position reads. Input plans use the output position and are invalid beyond their end. Scalar broadcasts one source item.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Missing { Default, Input(ReadPlan), Scalar(usize), Invalid }
 
@@ -70,11 +70,16 @@ pub struct ReadPlan { route: Arc<ReadRoute>, items: usize }
 
 impl ReadPlan {
     pub fn input(source: usize, items: usize) -> Self { Self { route: Arc::new(ReadRoute::Input(source)), items } }
+    pub(crate) fn sized_input(&self, items: usize) -> Self {
+        assert!(matches!(&*self.route, ReadRoute::Input(_)), "only an input recipe binds a new count");
+        Self { route: self.route.clone(), items }
+    }
     pub fn fill(items: usize) -> Self { Self { route: Arc::new(ReadRoute::Default), items } }
     pub fn index(base: i64, step: i64, items: usize) -> Self { Self { route: Arc::new(ReadRoute::Index { base, step }), items } }
     fn fallback(missing: Missing, items: usize) -> Self {
         match missing {
-            Missing::Input(plan) => plan, Missing::Scalar(source) => Self::input(source, 1).remapped(Mapping::Single, items, Missing::Invalid),
+            Missing::Input(plan) => plan.remapped(Mapping::Linear(1), items, Missing::Invalid),
+            Missing::Scalar(source) => Self::input(source, 1).remapped(Mapping::Single, items, Missing::Invalid),
             Missing::Default => Self::fill(items), Missing::Invalid => Self { route: Arc::new(ReadRoute::Invalid), items }
         }
     }
@@ -260,27 +265,15 @@ impl ReadPlan {
     /// The items that `range` reads as one run of a source: its source, first position and stride, 0 for one item that every position reads and 1 for consecutive items. `runs` must give the whole range as that one run.
     fn run(&self, range: &Range<usize>) -> Option<(usize, usize, isize)> {
         if range.is_empty() || range.end > self.items { return None; }
-        let n = range.len();
-        let (source, first, stride) = match self.route() {
-            &ReadRoute::Input(source) => (source, range.start, 1),
-            ReadRoute::Map { input, map, missing } => {
-                if input.is_empty() { return missing.run(range); }
-                let (first, stride) = map.run(range.start, n)?;
-                let stride = if n == 1 { 1 } else { stride };
-                if !matches!(stride, 0 | 1) { return None; }
-                if first >= input.len() { return missing.run(range); }
-                let end = first.checked_add(if stride == 0 { 1 } else { n })?;
-                let (source, at, step) = input.run(&(first..end))?;
-                (source, at, if stride == 0 { 0 } else { step })
+        let (n, mut found) = (range.len(), None);
+        self.runs(range.clone(), &mut |_: usize, len: usize, run: Run| {
+            if len == n && let Run::Source { source, first, stride } = run && (n == 1 || matches!(stride, 0 | 1)) {
+                found = Some((source, first, if n == 1 { 1 } else { stride }));
             }
-            ReadRoute::Join(parts) => {
-                let (part, at, _, after) = joined_at(parts, range.start)?;
-                if n > after { return None; }
-                part.run(&(at..at.checked_add(n)?))?
-            }
-            ReadRoute::Index { .. } | ReadRoute::Default | ReadRoute::Invalid => return None
-        };
-        Some((source, first, if n == 1 { 1 } else { stride }))
+            // A second span cannot make the first cover this range; never walk it to decide borrowing.
+            false
+        });
+        found
     }
 }
 

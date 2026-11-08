@@ -179,7 +179,7 @@ fn fill_rows<F: Copy, O, const N: usize>(
 }
 
 pub(super) fn copied(inputs: Inputs<'_, '_>, range: std::ops::Range<usize>, checked: bool, output: &mut Output<'_, '_>) -> Result<(), Error> {
-    with_dtype!(output.dtype, T => map_values::<T, T, 1>(inputs, range, checked, false, output, |x| x[0], |_, _| None))
+    with_dtype!(output.result_dtype, T => map_values::<T, T, 1>(inputs, range, checked, false, output, |x| x[0], |_, _| None))
 }
 
 pub(super) fn constant(value: bool, n: usize, output: &mut Output<'_, '_>) -> Result<(), Error> {
