@@ -575,28 +575,34 @@ mod operation {
     }
 
     #[test]
-    fn ready_maps_append_direct_converted_and_failed_results() {
-        use rustymath::{Add, Sqrt, operation::MapOutput, parallel::Slots, tolerant::{Less, Tolerance}};
-        let settings = Settings { tolerance: Tolerance::EXACT };
+    fn mapped_kernels_append_direct_converted_and_failed_results() {
+        use rustymath::{Add, Sqrt, buffer::{MapOutput, Scratch}, parallel::Slots, tolerant::{Less, Tolerance}};
+        fn append(kernel: &Kernel, inputs: &[rustymath::buffer::View<'_>], n: usize, values: &mut Vec<f64>) -> Result<(), Error> {
+            let layout = Layout::from([n]);
+            let inputs: Vec<_> = inputs.iter().map(|&data| view(&layout, data, &if data.len() == 1 { Mapping::Single } else { Mapping::Linear(1) })).collect();
+            let reads: Vec<_> = inputs.iter().map(ArrayView::read).collect();
+            Slots::append(values, n, |slots| kernel.map_in(&reads, 0..n, Settings { tolerance: Tolerance::EXACT }, &mut Scratch::default(), MapOutput::F64(slots)))
+        }
         let float = f64::DTYPE;
         let add = Kernel::resolve(Add, Variant::checked(float), [float; 2]).unwrap();
+        let row_shape = Layout::from([2, 32]);
+        let rows = view(&row_shape, f64::view(&[1., 2.]), &Mapping::Linear(32));
+        assert!(add.map(&[rows.read(), rows.read()], 0..65, Settings { tolerance: Tolerance::EXACT }, &mut Buffer::with_capacity(float, 0)).is_err());
         let mut values = vec![10.];
-        Slots::append(&mut values, 3, |slots| add.map_ready(&[f64::view(&[1.]), f64::view(&[2., 3., 4.])], 3, settings, MapOutput::F64(slots))).unwrap();
+        append(&add, &[f64::view(&[1.]), f64::view(&[2., 3., 4.])], 3, &mut values).unwrap();
         assert_eq!(values, [10., 3., 4., 5.]);
         let less = Kernel::resolve(Less(Tolerance::EXACT), Variant::checked(float), [float; 2]).unwrap();
-        Slots::append(&mut values, 3, |slots| less.map_ready(&[f64::view(&[3.]), f64::view(&[2., 3., 4.])], 3, settings, MapOutput::F64(slots))).unwrap();
+        append(&less, &[f64::view(&[3.]), f64::view(&[2., 3., 4.])], 3, &mut values).unwrap();
         assert_eq!(values, [10., 3., 4., 5., 0., 0., 1.]);
         let complex = num_complex::Complex64::DTYPE;
         let sqrt = Kernel::resolve(Sqrt, Variant::checked(complex), [complex]).unwrap();
-        let result = Slots::append(&mut values, 1, |slots| {
-            sqrt.map_ready(&[num_complex::Complex64::view(&[num_complex::Complex64::new(-1., 0.)])], 1, settings, MapOutput::F64(slots))
-        });
+        let result = append(&sqrt, &[num_complex::Complex64::view(&[num_complex::Complex64::new(-1., 0.)])], 1, &mut values);
         assert!(result.is_err());
         assert_eq!(values.len(), 8);
         let ints = Kernel::resolve(Add, Variant::checked(i64::DTYPE), [float; 2]).unwrap();
         let inputs = [f64::view(&[f64::NAN]), f64::view(&[1.])];
-        Slots::append(&mut values, 0, |slots| ints.map_ready(&inputs, 0, settings, MapOutput::F64(slots))).unwrap();
-        assert!(Slots::append(&mut values, 1, |slots| ints.map_ready(&inputs, 1, settings, MapOutput::F64(slots))).is_err());
+        append(&ints, &inputs, 0, &mut values).unwrap();
+        assert!(append(&ints, &inputs, 1, &mut values).is_err());
         assert_eq!(values.len(), 9);
     }
 
@@ -816,12 +822,28 @@ mod operation {
     #[test]
     fn logical_views_compose_prepare_and_run() {
         let (shape, data) = (Layout::from([3, 2]), [0., 1., 2., 3., 4., 5.]);
+        let extended = Layout::from([8]);
+        let extended = view(&extended, f64::view(&data), &Mapping::Linear(1));
+        assert_eq!(extended.read().plan.contiguous(1..4), Some((0, 1..4)));
+        assert_eq!(extended.items::<f64>().unwrap().as_ref(), &[0., 1., 2., 3., 4., 5., 0., 0.]);
+        assert!(matches!(extended.read().part_counted::<i16>(2..3, true, &mut Vec::new()), Ok((rustymath::Arg::One(2), 0))));
+        let sources = [Binding::window(f64::view(&data[2..4]), 2, data.len()).unwrap()];
+        let source = ReadPlan::input(0, data.len());
+        assert!(Read { sources: &sources, plan: &source }.rows::<f64>([3, 2]).is_none());
+        let slice = source.remapped(Mapping::Steps { base: 2, steps: vec![Steps::along(1, 0), Steps::along(2, 1)].into() }, 2, Missing::Invalid);
+        assert_eq!(Read { sources: &sources, plan: &slice }.rows::<f64>([1, 2]).unwrap().items, &data[2..4]);
+        assert!(Read { sources: &sources, plan: &slice }.rows::<f64>([1, 1]).is_none());
+        let broadcast = Mapping::Steps { base: 0, steps: vec![Steps::along(2, 2), Steps::along(3, 0), Steps::along(2, 1)].into() };
+        assert_eq!(broadcast.affine(&[2, 3, 2]), Some((0, vec![2, 0, 1])));
+        assert!(broadcast.affine(&[6, 2]).is_none());
         let transpose = Mapping::Steps { base: 0, steps: vec![Steps::along(3, 1), Steps::along(2, 3)].into() };
         let x = view(&shape, f64::view(&data), &transpose);
         assert!(x.contiguous().is_none());
         assert_eq!(x.items::<f64>().unwrap().as_ref(), &[0., 3., 1., 4., 2., 5.]);
-        assert_eq!(transpose.affine(shape.shape()), Some((0, vec![1, 3])));
+        let reshaped = Layout::from([1, 3, 2]);
+        assert_eq!(x.with_layout(&reshaped).unwrap().affine().map(|(_, base, strides)| (base, strides)), Some((0, vec![0, 1, 3])));
         let reversed = Mapping::Steps { base: 0, steps: vec![Steps::Stride { start: 4, len: 3, step: -2 }, Steps::along(2, 1)].into() };
+        assert_eq!(reversed.affine(shape.shape()), Some((4, vec![-2, 1])));
         let composed = transpose.compose(&reversed, shape.shape(), shape.shape()).unwrap();
         assert_eq!(view(&shape, f64::view(&data), &composed).items::<f64>().unwrap().as_ref(), &[2., 5., 1., 4., 0., 3.]);
         let add = Kernel::resolve(rustymath::Add, Variant::checked(f64::DTYPE), [f64::DTYPE; 2]).unwrap();
@@ -867,6 +889,12 @@ mod operation {
         let chosen = chosen.selected(padding, Some(std::sync::Arc::new(f64::buffer(vec![8.])))).unwrap();
         let args = [chosen.view(), ArrayView::compact(&Layout::EMPTY, f64::view(&[1.])), ArrayView::compact(&Layout::EMPTY, f64::view(&[10.]))];
         assert_eq!(f64::vec(apply(&clip, args).unwrap()).unwrap(), [8., 4., 2., 4., 8.]);
+        for (p, run) in [(0, 0), (0, 8), (1, 0), (1, 8), (3, 2), (3, 3), (3, 8)] {
+            let mut got = Vec::new();
+            let tiled = rustymath::agreement::tiled_cycle(&[0u8, 1, 2][..p], &Mapping::Tiled(p), run, &mut got);
+            assert!(got.iter().enumerate().all(|(i, &v)| v == (i % p) as u8));
+            assert_eq!(rustymath::agreement::Period::Cycles(p).tiling(run).map(|(_, n)| n), tiled.map(|_| got.len()));
+        }
     }
 
     #[test]

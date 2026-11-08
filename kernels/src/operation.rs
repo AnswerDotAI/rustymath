@@ -1,7 +1,7 @@
 //! Resolved numerical operations over shared [`Read`](crate::agreement::Read) plans. [`Kernel::try_resolve`] fixes the computing dtype, result dtype and character policy from an object's [`Formula`](crate::facts::Formula). The same definition supplies native execution and graph formulas.
 //!
 //! [`DType::computes_in`] promotes unsupported Boolean and integer inputs to i64, then to the NumPy float width. Unsupported character arithmetic is a domain error.
-use crate::buffer::{Buffer, DType, Element, FloatWidth, Source, View, Width};
+use crate::buffer::{Buffer, DType, Element, FloatWidth, MapOutput, Output, Source, View, Width};
 use crate::domain::Range;
 use crate::error::{Error, Kind};
 use crate::gather::Writes;
@@ -428,40 +428,36 @@ impl Kernel {
     }
     pub fn map(&self, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, output: &mut Buffer) -> Result<(), Error> {
         output.clear();
-        self.mapping(Inputs::Mapped(inputs), range, settings, MapOutput::Buffer(output))
+        self.mapping(Inputs(inputs), range, settings, MapOutput::Buffer(output), None)
     }
 
-    /// Appends n results from ready inputs into output. A one-item view broadcasts; every other view contains n items.
-    pub fn map_ready(&self, inputs: &[View<'_>], n: usize, settings: Settings, mut output: MapOutput<'_, '_>) -> Result<(), Error> {
-        if inputs.iter().any(|v| v.len() != 1 && v.len() != n) { output.fill(n); return Err(Error::new(Kind::Length, "ready kernel input length changed")); }
-        self.mapping(Inputs::Ready(inputs), 0..n, settings, output)
+    /// Appends a mapped range using the caller's execution-local conversion buffers.
+    pub fn map_in<'a, 'b>(
+        &self, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings,
+        scratch: &'a mut crate::buffer::Scratch, output: MapOutput<'a, 'b>
+    ) -> Result<(), Error> {
+        self.mapping(Inputs(inputs), range, settings, output, Some(scratch))
     }
 
-    fn mapping(&self, inputs: Inputs<'_, '_>, range: std::ops::Range<usize>, settings: Settings, mut target: MapOutput<'_, '_>) -> Result<(), Error> {
+    fn mapping<'a, 'b>(
+        &self, inputs: Inputs<'_, '_>, range: std::ops::Range<usize>, settings: Settings, mut target: MapOutput<'a, 'b>,
+        scratch: Option<&'a mut crate::buffer::Scratch>
+    ) -> Result<(), Error> {
         use crate::characters::{ByKinds, Policy};
         if inputs.len() != self.arity() { target.fill(range.len()); return Err(Error::new(Kind::Length, "kernel operand count changed")); }
         if range.is_empty() { return Ok(()); }
-        let mut output = Output { target, dtype: self.result, checked: self.variant.fails_on_overflow() };
+        let mut output = Output { target, dtype: self.result, checked: self.variant.fails_on_overflow(), scratch };
         crate::error::checked(|| match self.policy {
             Some(Policy::Kinds(ByKinds::Truth(value))) => map::constant(value, range.len(), &mut output),
             Some(Policy::Kinds(side)) => map::copied(inputs.selected(usize::from(side == ByKinds::Right)), range, self.variant.checked, &mut output),
             _ => {
-                let apply = |inputs: Inputs<'_, '_>, output: &mut Output<'_, '_>| {
-                    self.definition.map(self.variant, inputs, range.clone(), settings, self.repair, self.may_raise(), output)
-                };
-                match inputs {
-                    Inputs::Mapped(reads) => {
-                        self.projected(reads, Some(range.clone()), Seed::Identity, settings, |reads, _| apply(Inputs::Mapped(reads), &mut output))
-                    }
-                    Inputs::Ready(_) if self.projection(settings) == Projection::AsIs => apply(inputs, &mut output),
-                    Inputs::Ready(views) => {
-                        let projected = match views.iter().map(|&v| projected_view(v, self.projection(settings))).collect::<Result<Vec<_>, _>>() {
-                            Ok(projected) => projected, Err(error) => { output.target.fill(range.len()); return Err(error); }
-                        };
-                        let views: Vec<_> = projected.iter().map(|v| v.view()).collect();
-                        apply(Inputs::Ready(&views), &mut output)
-                    }
-                }
+                let mut entered = false;
+                let result = self.projected(inputs.0, Some(range.clone()), Seed::Identity, settings, |reads, _| {
+                    entered = true;
+                    self.definition.map(self.variant, Inputs(reads), range.clone(), settings, self.repair, self.may_raise(), &mut output)
+                });
+                if !entered { output.target.fill(range.len()); }
+                result
             }
         })
     }
@@ -842,5 +838,5 @@ mod binary;
 mod fold;
 mod map;
 mod product;
-pub use {at::*, map::MapOutput, product::*};
-use {binary::*, fold::*, map::{Inputs, Output, map_formula}};
+pub use {at::*, product::*};
+use {binary::*, fold::*, map::{Inputs, map_formula}};

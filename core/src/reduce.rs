@@ -523,7 +523,7 @@ mod lanes {
                 for (o, x) in outs.iter_mut().zip(chunks) {
                     let scanned = |k: usize| {
                         // SAFETY: the load reads four items of one chunk.
-                        let v = unsafe { load(x.as_ptr().add(4 * k)) };
+                        let v = load(x.as_ptr().add(4 * k));
                         let v = add(v, up1(fill, v));
                         add(v, up2(fill, v))
                     };
@@ -533,12 +533,10 @@ mod lanes {
                     let s012 = add(s01, last(p2));
                     let o = o.as_mut_ptr().cast::<f32>();
                     // SAFETY: each store writes four slots of one chunk.
-                    unsafe {
-                        store(o, add(c, p0));
-                        store(o.add(4), add(add(c, s0), p1));
-                        store(o.add(8), add(add(c, s01), p2));
-                        store(o.add(12), add(add(c, s012), p3));
-                    }
+                    store(o, add(c, p0));
+                    store(o.add(4), add(add(c, s0), p1));
+                    store(o.add(8), add(add(c, s01), p2));
+                    store(o.add(12), add(add(c, s012), p3));
                     c = add(c, add(s012, last(p3)));
                 }
                 let mut total = first(c);

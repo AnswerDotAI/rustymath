@@ -780,6 +780,14 @@ casts!(integers u8, i16, i32, i64);
 casts!(floats half::f16, f32, f64);
 casts!(complex Complex32, Complex64);
 
+pub(crate) fn kept_as<T: Cast>(view: View<'_>, i: usize) -> Result<T, Error> {
+    let whole = match view { View::Floats(v) => v.get(i).fract() == 0.0, View::Complexes(v) => v.get(i).re.fract() == 0.0, _ => true };
+    let lost = || Error::new(Kind::Domain, format!("a {} item doesn't keep its value as {}", view.dtype().name(), T::DTYPE.name()));
+    if T::DTYPE.is_integral() && !whole { return Err(lost()); }
+    T::cast(view, i).map_err(|_| lost())
+}
+
+
 impl Buffer {
     /// Flattened positions whose item differs from its type's fill (zero, false or a space).
     pub fn nonzero(view: View<'_>) -> Vec<usize> {
@@ -832,12 +840,7 @@ impl Buffer {
     pub fn cast(view: View<'_>, dtype: DType) -> Result<Self, Error> { Self::cast_mapped(view, &crate::agreement::Mapping::Linear(1), view.len(), dtype) }
     /// The items of `view` at `dtype`, where every item keeps its value. Items convert as [`Buffer::cast`] converts them, and a float that becomes a Boolean or an integer must be whole. A float rounds to a float of another width. A Domain error where an item doesn't keep its value.
     pub fn kept(view: View<'_>, dtype: DType) -> Result<Self, Error> {
-        let whole = match view {
-            View::Floats(v) => (0..v.len()).all(|i| v.get(i).fract() == 0.0), View::Complexes(v) => (0..v.len()).all(|i| v.get(i).re.fract() == 0.0), _ => true
-        };
-        let lost = || Error::new(Kind::Domain, format!("a {} item doesn't keep its value as {}", view.dtype().name(), dtype.name()));
-        if dtype.is_integral() && !whole { return Err(lost()); }
-        Self::cast(view, dtype).map_err(|_| lost())
+        with_dtype!(dtype, T => (0..view.len()).map(|i| kept_as::<T>(view, i)).collect::<Result<Vec<_>, _>>().map(T::buffer))
     }
     /// Shared conversion dispatch for compact and mapped logical items. Unselected storage never participates in checked conversion.
     pub fn cast_mapped(view: View<'_>, mapping: &crate::agreement::Mapping, n: usize, dtype: DType) -> Result<Self, Error> {
@@ -888,3 +891,6 @@ impl Buffer {
         }
     }
 }
+
+mod output;
+pub use output::{MapOutput, Output, OutputItem, Scratch};
