@@ -49,10 +49,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - id: auth
         uses: rust-lang/crates-io-auth-action@v1
-      - run: |
-          for crate in rustymath-core rustymath-kernels rustymath-timing rustymath rustymath-buffer; do
-            cargo publish -p "$crate" --no-verify
-          done
+      - run: cargo publish --workspace --no-verify
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
       - uses: actions/download-artifact@v8
