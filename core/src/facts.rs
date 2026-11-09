@@ -188,10 +188,11 @@ impl Op {
 pub struct NativeSlices<K, const N: usize> {
     pub(crate) single: Option<Slice<K, f32, N>>, pub(crate) double: Option<Slice<K, f64, N>>, pub(crate) byte: Option<Slice<K, u8, N>>,
     pub(crate) short: Option<Slice<K, i16, N>>, pub(crate) int: Option<Slice<K, i32, N>>, pub(crate) long: Option<Slice<K, i64, N>>,
-    pub(crate) complex_single: Option<Slice<K, num_complex::Complex32, N, ()>>, pub(crate) complex_double: Option<Slice<K, num_complex::Complex64, N, ()>>
+    pub(crate) complex_single: Option<Slice<K, num_complex::Complex32, N, ()>>, pub(crate) complex_double: Option<Slice<K, num_complex::Complex64, N, ()>>,
+    pub(crate) real_complex_single: Option<Slice<K, f32, N, (), num_complex::Complex32>>, pub(crate) real_complex_double: Option<Slice<K, f64, N, (), num_complex::Complex64>>
 }
-/// A slice form takes the item body's run context and writes all `n` results. Real and integer forms return their validity; complex forms leave validation to `complex_valid` at the map boundary.
-pub type Slice<K, T, const N: usize, R = bool> = fn(&K, &NativeOps<{ FUSED }>, [crate::Arg<'_, T>; N], usize, &mut [std::mem::MaybeUninit<T>]) -> R;
+/// A slice form writes all `n` results at `U` from arguments at `T`. The caller reports errors from its verdict `R`: `bool` for real/integer forms, `()` for complex forms.
+pub type Slice<K, T, const N: usize, R = bool, U = T> = fn(&K, &NativeOps<{ FUSED }>, [crate::Arg<'_, T>; N], usize, &mut [std::mem::MaybeUninit<U>]) -> R;
 impl<K, const N: usize> NativeSlices<K, N> {
     pub fn single(&self) -> Option<Slice<K, f32, N>> { self.single }
     pub fn double(&self) -> Option<Slice<K, f64, N>> { self.double }
@@ -201,10 +202,16 @@ impl<K, const N: usize> NativeSlices<K, N> {
     pub fn long(&self) -> Option<Slice<K, i64, N>> { self.long }
     pub fn complex_single(&self) -> Option<Slice<K, num_complex::Complex32, N, ()>> { self.complex_single }
     pub fn complex_double(&self) -> Option<Slice<K, num_complex::Complex64, N, ()>> { self.complex_double }
+    pub fn real_complex_single(&self) -> Option<Slice<K, f32, N, (), num_complex::Complex32>> { self.real_complex_single }
+    pub fn real_complex_double(&self) -> Option<Slice<K, f64, N, (), num_complex::Complex64>> { self.real_complex_double }
 
-    const NONE: Self = Self { single: None, double: None, byte: None, short: None, int: None, long: None, complex_single: None, complex_double: None };
+    const NONE: Self = Self { single: None, double: None, byte: None, short: None, int: None, long: None, complex_single: None, complex_double: None,
+        real_complex_single: None, real_complex_double: None };
     fn with_complex(self, single: Slice<K, num_complex::Complex32, N, ()>, double: Slice<K, num_complex::Complex64, N, ()>) -> Self {
         Self { complex_single: Some(single), complex_double: Some(double), ..self }
+    }
+    fn with_real_complex(self, single: Slice<K, f32, N, (), num_complex::Complex32>, double: Slice<K, f64, N, (), num_complex::Complex64>) -> Self {
+        Self { real_complex_single: Some(single), real_complex_double: Some(double), ..self }
     }
 }
 impl<K> NativeSlices<K, 1> where K: Unary<f32, Out = f32> + Unary<f64, Out = f64> {
@@ -366,6 +373,7 @@ macro_rules! objects {
         $(native_integer |$nik:pat_param, $nio:tt, $nix:tt| $native_integer:expr;)?
         $(native_complex |$nfk:pat_param, $nfo:tt, $nfx:tt| $native_complex:expr;)?
         $(complex_slices $complex_slices:ident;)?
+        $(real_complex_slices $real_complex_slices:ident;)?
         $(native_real |$nrk:pat_param, $nro:tt, $nrx:tt| $native_real:expr;)?
         $(real_complex |$rck:pat_param, $rco:tt, $rcx:tt| $real_complex:expr;)?
         $(slices $slices:ident;)?
@@ -412,6 +420,7 @@ macro_rules! objects {
             fn native_slices(&self) -> Option<NativeSlices<Self, $n>> {
                 None $(.or_else(|| Some(NativeSlices::$slices())))?
                     $(.or_else(|| Some(NativeSlices::NONE)).map(|s| s.with_complex(crate::complex::bulk::$complex_slices, crate::complex::bulk::$complex_slices)))?
+                    $(.or_else(|| Some(NativeSlices::NONE)).map(|s| s.with_real_complex(crate::complex::bulk::$real_complex_slices, crate::complex::bulk::$real_complex_slices)))?
             }
         }
     )+};
@@ -552,16 +561,16 @@ objects!(1:
     crate::tolerant::Floor { formula |k, o, [x]| Some(crate::with_tolerance!(k.0, |t| t.floor_in(o, x))); slope |o, _, _| o.number(F::zero()); integers formula; native_complex |k, o, [x]| Some(crate::tolerant::TolerantComplex::complex_floor(native_tolerance(o.tolerance, k.0), x)); exact |_, [x]| Ok(Some(x.floor())); }
     crate::tolerant::Ceil { formula |k, o, [x]| Some(crate::with_tolerance!(k.0, |t| t.ceil_in(o, x))); slope |o, _, _| o.number(F::zero()); integers formula; native_complex |k, o, [x]| Some(crate::tolerant::TolerantComplex::complex_ceil(native_tolerance(o.tolerance, k.0), x)); exact |_, [x]| Ok(Some(x.ceil())); }
     crate::Not { table 1; test |_, o, [x]| Some(o.equal(x, o.number(F::zero()))); integers formula; valid |_, v, o, x, _| truth_valid(v, o, x); }
-    crate::Cis { output complex; native_complex |_, _, [x]| Some(crate::complex::exp::<F, { crate::FUSED }>(num_complex::Complex::new(-x.im, x.re))); complex_slices cis; real_complex |_, o, [x]| (!crate::trig::Kind::Cos.predicate(o, x)).then(|| { let (c, s) = crate::complex::quarter(x).unwrap_or_else(|| (crate::trig::formula(o, x, crate::trig::Kind::Cos), crate::trig::formula(o, x, crate::trig::Kind::Sin))); num_complex::Complex::new(c, s) }); }
+    crate::Cis { output complex; native_complex |_, _, [x]| Some(crate::complex::exp::<F, { crate::FUSED }>(num_complex::Complex::new(-x.im, x.re))); complex_slices cis; real_complex_slices real_cis; real_complex |_, o, [x]| (!crate::trig::Kind::Cos.predicate(o, x)).then(|| { let (c, s) = crate::complex::quarter(x).unwrap_or_else(|| (crate::trig::formula(o, x, crate::trig::Kind::Cos), crate::trig::formula(o, x, crate::trig::Kind::Sin))); num_complex::Complex::new(c, s) }); }
     crate::LambertW { domain dtype, [x] => crate::lambert::real_domain(dtype, x); native_complex |_, _, [x]| Some(crate::lambert::complex(x)); native_real |_, _, [x]| Some(crate::lambert::lambertw::<F, { crate::FUSED }>(x)); checks nan; }
     crate::Lgamma { slope |o, x, _| o.digamma(x); native_complex |_, _, [x]| Some(crate::complex::lgamma::<F, { crate::FUSED }>(x)); native_real |_, _, [x]| Some(crate::special::lgamma::<F, { crate::FUSED }>(x)); checks nan; }
     // ψ's slope is ψ⁽¹⁾.
     crate::Digamma { slope |o, x, _| o.polygamma(o.number(F::one()), x); native_real |_, _, [x]| Some(crate::special::digamma::<F, { crate::FUSED }>(x)); }
     // 2/√π e^-x², and its negative for erfc.
     crate::Erf { slope |o, x, _| o.multiply(o.number(F::narrow(std::f64::consts::FRAC_2_SQRT_PI)), o.exp(o.negate(o.multiply(x, x)))); native_real |_, _, [x]| Some(crate::special::erf::<F, { crate::FUSED }>(x)); }
-    crate::Erfc { slope |o, x, _| o.multiply(o.number(F::narrow(-std::f64::consts::FRAC_2_SQRT_PI)), o.exp(o.negate(o.multiply(x, x)))); native_real |_, _, [x]| Some(crate::special::erfc::<F, { crate::FUSED }>(x)); }
+    crate::Erfc { slope |o, x, _| o.multiply(o.number(F::narrow(-std::f64::consts::FRAC_2_SQRT_PI)), o.exp(o.negate(o.multiply(x, x)))); native_real |_, _, [x]| Some(crate::special::erfc::<F, { crate::FUSED }>(x)); slices unary; }
     // √π/2 e^(erfinv x)², from the result.
-    crate::Erfinv { slope |o, _, r| o.multiply(o.number(F::narrow(std::f64::consts::FRAC_2_SQRT_PI.recip())), o.exp(o.multiply(r, r))); native_real |_, _, [x]| Some(crate::special::erfinv::<F, { crate::FUSED }>(x)); checks nan; }
+    crate::Erfinv { slope |o, _, r| o.multiply(o.number(F::narrow(std::f64::consts::FRAC_2_SQRT_PI.recip())), o.exp(o.multiply(r, r))); native_real |_, _, [x]| Some(crate::special::erfinv::<F, { crate::FUSED }>(x)); slices unary; checks nan; }
     crate::Erfcinv { slope |o, _, r| o.multiply(o.number(F::narrow(-std::f64::consts::FRAC_2_SQRT_PI.recip())), o.exp(o.multiply(r, r))); native_real |_, _, [x]| Some(crate::special::erfcinv::<F, { crate::FUSED }>(x)); slices unary; checks nan; }
 );
 objects!(2:

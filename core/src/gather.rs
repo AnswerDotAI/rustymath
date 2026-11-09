@@ -762,7 +762,20 @@ fn stepping<T: Copy>(values: &[T], strides: &mut [Steps], position: impl Fn(T) -
     Some(first)
 }
 
-impl PartialEq for Table { fn eq(&self, other: &Self) -> bool { self.len == other.len && (0..self.len).all(|j| self.get(j) == other.get(j)) } }
+impl PartialEq for Table {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len != other.len { return false; }
+        // Cloned geometry compares without reading its index data; distinct recipes still compare their offsets.
+        let shared = self.start == other.start && match (&self.all, &other.all) {
+            (Positions::Listed(a), Positions::Listed(b)) => Arc::ptr_eq(a, b),
+            (Positions::Indices { values: a, size: sa, scale: ka, .. }, Positions::Indices { values: b, size: sb, scale: kb, .. }) => {
+                sa == sb && ka == kb && Arc::ptr_eq(a, b)
+            }
+            _ => false,
+        };
+        shared || (0..self.len).all(|j| self.get(j) == other.get(j))
+    }
+}
 impl Eq for Table {}
 
 /// Position `j` of the index values `view` along an axis of `size` positions.
@@ -991,13 +1004,14 @@ impl Steps {
         }
         Some(offset)
     }
-    /// An offset that no item of `steps` passes from `base`: `base` plus each entry's furthest offset, where a fill reaches none and a padded entry stops at the end of its axis. Only a table's entry reads its offsets to find it. `None` where an entry has no items, so the walk reads nothing.
+    /// An offset that no item of `steps` passes from `base`: `base` plus each entry's furthest offset, where a fill reaches none and a padded entry stops at the end of its axis. Indexed tables use their axis bounds; listed tables read their offsets. `None` where an entry has no items, so the walk reads nothing.
     pub fn furthest(base: usize, steps: &[impl std::borrow::Borrow<Self>]) -> Option<usize> {
         steps.iter().try_fold(base, |at, s| {
             let furthest = match *s.borrow() {
                 ref s if s.len() == 0 => return None, Self::Stride { start, len, step } => start.wrapping_add_signed(step.max(0) * (len - 1) as isize),
                 Self::Padded { size, stride, .. } => size.saturating_sub(1) * stride, Self::Rotated { len, stride, .. } => (len - 1) * stride,
-                Self::Table(ref t) => (0..t.len()).filter_map(|j| t.get(j)).max().unwrap_or(0)
+                Self::Table(ref t) => t.span().map_or_else(
+                    || (0..t.len()).filter_map(|j| t.get(j)).max().unwrap_or(0), |(scale, size)| size.saturating_sub(1) * scale)
             };
             Some(at + furthest)
         })

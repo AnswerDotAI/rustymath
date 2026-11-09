@@ -20,7 +20,7 @@ pub enum Mapping {
     Steps { base: usize, steps: Vec<Steps> },
 }
 
-/// What an unmapped position reads. Input plans use the output position; Scalar broadcasts one source item.
+/// What an unmapped position reads. Input plans use the output position and are invalid beyond their end. Scalar broadcasts one source item.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Missing { Default, Input(ReadPlan), Scalar(usize), Invalid }
 
@@ -59,23 +59,27 @@ impl<F: FnMut(usize, usize, Run) -> bool> RunSink for F { fn run(&mut self, at: 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadPart { pub end: usize, pub plan: ReadPlan }
 
-/// Data-free positional routes shared by readers, compilation and read-back.
+/// Data-free positional routes shared by readers, compilation and read-back. Leaves stay inline; maps and joins share their recursive payloads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReadRoute {
-    Input(usize), Index { base: i64, step: i64 }, Map { input: ReadPlan, map: Mapping, missing: ReadPlan }, Join(Arc<[ReadPart]>), Default, Invalid
+    Input(usize), Index { base: i64, step: i64 }, Map(Arc<ReadMap>), Join(Arc<[ReadPart]>), Default, Invalid
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReadMap { pub input: ReadPlan, pub map: Mapping, pub missing: ReadPlan }
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReadPlan { route: Arc<ReadRoute>, items: usize }
+pub struct ReadPlan { route: ReadRoute, items: usize }
 
 impl ReadPlan {
-    pub fn input(source: usize, items: usize) -> Self { Self { route: Arc::new(ReadRoute::Input(source)), items } }
-    pub fn fill(items: usize) -> Self { Self { route: Arc::new(ReadRoute::Default), items } }
-    pub fn index(base: i64, step: i64, items: usize) -> Self { Self { route: Arc::new(ReadRoute::Index { base, step }), items } }
+    pub fn input(source: usize, items: usize) -> Self { Self { route: ReadRoute::Input(source), items } }
+    pub fn fill(items: usize) -> Self { Self { route: ReadRoute::Default, items } }
+    pub fn index(base: i64, step: i64, items: usize) -> Self { Self { route: ReadRoute::Index { base, step }, items } }
     fn fallback(missing: Missing, items: usize) -> Self {
         match missing {
-            Missing::Input(plan) => plan, Missing::Scalar(source) => Self::input(source, 1).remapped(Mapping::Single, items, Missing::Invalid),
-            Missing::Default => Self::fill(items), Missing::Invalid => Self { route: Arc::new(ReadRoute::Invalid), items }
+            Missing::Input(plan) => plan.remapped(Mapping::Linear(1), items, Missing::Invalid),
+            Missing::Scalar(source) => Self::input(source, 1).remapped(Mapping::Single, items, Missing::Invalid),
+            Missing::Default => Self::fill(items), Missing::Invalid => Self { route: ReadRoute::Invalid, items }
         }
     }
     pub fn copy(source: usize, source_items: usize, map: Mapping, items: usize, missing: Missing) -> Self {
@@ -91,7 +95,7 @@ impl ReadPlan {
             width = width.checked_add(share).ok_or_else(too_large)?;
             joined.push(ReadPart { end: width, plan });
         }
-        Ok(Self { route: Arc::new(ReadRoute::Join(joined.into())), items: width.checked_mul(rows).ok_or_else(too_large)? })
+        Ok(Self { route: ReadRoute::Join(joined.into()), items: width.checked_mul(rows).ok_or_else(too_large)? })
     }
     pub fn len(&self) -> usize { self.items }
     pub fn is_empty(&self) -> bool { self.items == 0 }
@@ -129,7 +133,8 @@ impl ReadPlan {
                 }
                 true
             }
-            ReadRoute::Map { input, map, missing } => {
+            ReadRoute::Map(read) => {
+                let ReadMap { input, map, missing } = read.as_ref();
                 if input.is_empty() { return missing.runs_through(first, stride, len, at, sink); }
                 match stride {
                     1 => {
@@ -156,26 +161,27 @@ impl ReadPlan {
             }
         }
     }
-    pub fn mapped(input: ReadPlan, map: Mapping, missing: ReadPlan, items: usize) -> Self {
+    fn mapped(input: ReadPlan, map: Mapping, missing: Missing, items: usize) -> Self {
         if map.in_order(input.items, &[items]) { return input; }
         if let Some(plan) = Self::single_map(&input, &map, items) { return plan; }
-        Self { route: Arc::new(ReadRoute::Map { input, map, missing }), items }
+        Self { route: ReadRoute::Map(Arc::new(ReadMap { input, map, missing: Self::fallback(missing, items) })), items }
     }
     /// `map` over `input`'s own map, composed into one map over `input`'s input. A read of the result then walks the source once, not once for each run of `map`. `None` unless `map` stays within `input`, `input`'s misses read a fill or are invalid, and the composition is structural with no longer tables.
     fn single_map(input: &ReadPlan, map: &Mapping, items: usize) -> Option<Self> {
-        let ReadRoute::Map { input: inner, map: first, missing } = input.route() else { return None };
+        let ReadRoute::Map(read) = input.route() else { return None };
+        let ReadMap { input: inner, map: first, missing } = read.as_ref();
         let frame = map.shape(items);
         if map.bounds(&frame)?.end > input.items { return None; }
         let misses = match missing.route() { ReadRoute::Default => Missing::Default, ReadRoute::Invalid => Missing::Invalid, _ => return None };
         let composed = first.compose(map, &input.shape_hint(), &frame)?;
-        (composed.footprint() <= first.footprint() + map.footprint()).then(|| Self::mapped(inner.clone(), composed, Self::fallback(misses, items), items))
+        (composed.footprint() <= first.footprint() + map.footprint()).then(|| Self::mapped(inner.clone(), composed, misses, items))
     }
-    pub fn remapped(&self, map: Mapping, items: usize, missing: Missing) -> Self { Self::mapped(self.clone(), map, Self::fallback(missing, items), items) }
+    pub fn remapped(&self, map: Mapping, items: usize, missing: Missing) -> Self { Self::mapped(self.clone(), map, missing, items) }
     /// Calls `visit` with each source that this read reaches and its item count. A plan's routes form a tree, so each place that reads a source visits it once.
     pub fn try_for_each_source<E>(&self, visit: &mut impl FnMut(usize, usize) -> Result<(), E>) -> Result<(), E> {
         match self.route() {
             ReadRoute::Input(source) => visit(*source, self.items),
-            ReadRoute::Map { input, missing, .. } => { input.try_for_each_source(visit)?; missing.try_for_each_source(visit) }
+            ReadRoute::Map(read) => { read.input.try_for_each_source(visit)?; read.missing.try_for_each_source(visit) }
             ReadRoute::Join(parts) => { for part in &**parts { part.plan.try_for_each_source(visit)?; } Ok(()) }
             ReadRoute::Index { .. } | ReadRoute::Default | ReadRoute::Invalid => Ok(()),
         }
@@ -188,10 +194,10 @@ impl ReadPlan {
     /// This read with each default read giving `value`.
     fn defaulted(&self, value: i64) -> Self {
         match self.route() {
-            ReadRoute::Map { input, map, missing } => Self::mapped(input.defaulted(value), map.clone(), missing.defaulted(value), self.items),
+            ReadRoute::Map(read) => Self::mapped(read.input.defaulted(value), read.map.clone(), Missing::Input(read.missing.defaulted(value)), self.items),
             ReadRoute::Join(parts) => {
                 let parts: Vec<_> = parts.iter().map(|part| ReadPart { end: part.end, plan: part.plan.defaulted(value) }).collect();
-                Self { route: Arc::new(ReadRoute::Join(parts.into())), items: self.items }
+                Self { route: ReadRoute::Join(parts.into()), items: self.items }
             }
             ReadRoute::Default => Self::index(value, 0, self.items),
             ReadRoute::Input(_) | ReadRoute::Index { .. } | ReadRoute::Invalid => self.clone(),
@@ -201,13 +207,14 @@ impl ReadPlan {
         let (source, start, stride) = self.run(&range)?;
         (stride == 1 || range.len() == 1).then(|| (source, start..start + range.len()))
     }
-    pub fn shape_hint(&self) -> Vec<usize> { match self.route() { ReadRoute::Map { map, .. } => map.shape(self.items), _ => vec![self.items] } }
+    pub fn shape_hint(&self) -> Vec<usize> { match self.route() { ReadRoute::Map(read) => read.map.shape(self.items), _ => vec![self.items] } }
     /// The one source that a read over a result of `shape` reaches by an affine map, and that map, where every position stays within the source. `None` for a read that joins sources, fills, or maps otherwise.
     pub fn positional(&self, shape: &[usize]) -> Option<(usize, Mapping)> {
         if count(shape) != self.items { return None; }
         match self.route() {
             ReadRoute::Input(source) => Some((*source, Mapping::Linear(1))),
-            ReadRoute::Map { input, map, .. } => {
+            ReadRoute::Map(read) => {
+                let ReadMap { input, map, .. } = read.as_ref();
                 if input.is_empty() || map.bounds(shape)?.end > input.len() { return None; }
                 let inner_shape = input.shape_hint();
                 let (source, inner) = input.positional(&inner_shape)?;
@@ -217,11 +224,21 @@ impl ReadPlan {
             _ => None,
         }
     }
-    /// One source's affine view. Missing positions and non-affine compositions have no borrowed export.
-    pub fn affine(&self, shape: &[usize]) -> Option<(usize, usize, Vec<isize>)> {
-        let (source, map) = self.positional(shape)?;
-        let (base, strides) = map.affine(shape)?;
-        Some((source, base, strides))
+    fn affine_into(&self, shape: &[usize], strides: &mut [isize]) -> Option<(usize, usize, Range<usize>)> {
+        if count(shape) != self.items || shape.len() != strides.len() { return None; }
+        let (source, map, items) = match self.route() {
+            ReadRoute::Input(source) => (*source, &Mapping::Linear(1), self.items),
+            ReadRoute::Map(read) => {
+                let ReadMap { input, map, .. } = read.as_ref();
+                let &ReadRoute::Input(source) = input.route() else { return None };
+                (source, map, input.len())
+            }
+            ReadRoute::Join(parts) if parts.len() == 1 => return parts[0].plan.affine_into(shape, strides),
+            _ => return None,
+        };
+        let base = map.affine_axes(shape, &mut |k, step| strides[k] = step)?;
+        let bounds = affine_bounds(base, strides, shape)?;
+        (bounds.end <= items).then_some((source, base, bounds))
     }
     /// The inverse read where this plan visits every item of one source once by affine axes.
     pub fn inverse(&self, source: usize, shape: &[usize], items: usize) -> Option<Mapping> {
@@ -248,17 +265,31 @@ impl ReadPlan {
         }).collect::<Option<Vec<_>>>()?;
         Some(Mapping::from(steps))
     }
-    /// The items that `range` reads as one run of a source: its source, first position and stride, 0 for one item that every position reads and 1 for consecutive items. `runs` must give the whole range as that one run.
+    /// A cheap proof that `range` reads one source with stride 0 or 1. This follows route depth and never scans positions; `runs` may enumerate a table just to discover its first span.
     fn run(&self, range: &Range<usize>) -> Option<(usize, usize, isize)> {
         if range.is_empty() || range.end > self.items { return None; }
-        let mut found = None;
-        self.runs(range.clone(), &mut |_, len, run| {
-            if let Run::Source { source, first, stride } = run && len == range.len() && (len == 1 || matches!(stride, 0 | 1)) {
-                found = Some((source, first, if len == 1 { 1 } else { stride }));
+        let n = range.len();
+        let (source, first, stride) = match self.route() {
+            &ReadRoute::Input(source) => (source, range.start, 1),
+            ReadRoute::Map(read) => {
+                let ReadMap { input, map, missing } = read.as_ref();
+                if input.is_empty() { return missing.run(range); }
+                let (first, stride) = map.run(range.start, n)?;
+                let stride = if n == 1 { 1 } else { stride };
+                if !matches!(stride, 0 | 1) { return None; }
+                if first >= input.len() { return missing.run(range); }
+                let end = first.checked_add(if stride == 0 { 1 } else { n })?;
+                let (source, at, step) = input.run(&(first..end))?;
+                (source, at, if stride == 0 { 0 } else { step })
             }
-            false
-        });
-        found
+            ReadRoute::Join(parts) => {
+                let (part, at, _, after) = joined_at(parts, range.start)?;
+                if n > after { return None; }
+                part.run(&(at..at.checked_add(n)?))?
+            }
+            ReadRoute::Index { .. } | ReadRoute::Default | ReadRoute::Invalid => return None
+        };
+        Some((source, first, if n == 1 { 1 } else { stride }))
     }
 }
 
@@ -365,46 +396,73 @@ impl<'s> Read<'s> {
         let end = start.checked_add(if stride == 0 { 1 } else { range.len() })?;
         Some((binding.borrow(start..end)?, stride as usize))
     }
-    /// `run_view`, where the storage holds `dtype`.
-    fn storage_run(&self, range: &Range<usize>, dtype: crate::buffer::DType) -> Option<(crate::buffer::View<'_>, usize)> {
-        self.run_view(range).filter(|(view, _)| view.dtype() == dtype)
-    }
     /// Borrows a contiguous input range; other reads use scratch at exactly the requested length.
     pub fn part_view<'a>(
         &'a self, range: Range<usize>, dtype: crate::buffer::DType, checked: bool, scratch: &'a mut crate::buffer::Buffer
     ) -> Result<crate::buffer::View<'a>, Error> {
         self.range(&range)?;
-        if let Some((view, stride)) = self.storage_run(&range, dtype) { if stride == 1 || range.len() == 1 { return Ok(view); } }
-        self.read_into(range, dtype, checked, scratch)?;
+        let run = self.run_view(&range);
+        if let Some((view, stride)) = run && view.dtype() == dtype && (stride == 1 || range.len() == 1) { return Ok(view); }
+        self.write_into(range, dtype, checked, scratch, run)?;
         Ok(scratch.view())
     }
-    pub fn part<'a, T: crate::buffer::Cast>(&'a self, range: Range<usize>, checked: bool, scratch: &'a mut Vec<T>) -> Result<Arg<'a, T>, Error> {
+
+    /// A span at its actual storage dtype and the item count copied. Copied spans require sources of one dtype.
+    pub fn argument<'a>(
+        self, range: Range<usize>, checked: bool, scratch: &'a mut crate::buffer::Buffer
+    ) -> Result<(crate::buffer::View<'a>, usize), Error> where 's: 'a {
         self.range(&range)?;
-        if range.is_empty() { return Ok(Arg::Many(&[])); }
+        if let Some((view, _)) = self.run_view(&range) { return Ok((view, 0)); }
+        let mut dtype = None;
+        self.plan.try_for_each_source(&mut |source, _| {
+            let current = self.sources[source].view.dtype();
+            if dtype.is_some_and(|dtype| dtype != current) { return Err(Error::new(Kind::Domain, "read sources have different storage dtypes")); }
+            dtype = Some(current);
+            Ok(())
+        })?;
+        let dtype = dtype.ok_or_else(|| Error::new(Kind::Domain, "read has no storage dtype"))?;
+        let copied = range.len();
+        self.write_into(range, dtype, checked, scratch, None)?;
+        Ok((scratch.view(), copied))
+    }
+    /// A typed span borrowed from storage, or one scalar converted once; `None` means array materialization is needed.
+    pub fn borrowed<T: crate::buffer::Cast>(&self, range: Range<usize>, checked: bool) -> Result<Option<Arg<'s, T>>, Error> {
+        self.range(&range)?;
+        if range.is_empty() { return Ok(Some(Arg::Many(&[]))); }
+        match self.run_view(&range) { Some((view, _)) => borrowed_as(view, checked), None => Ok(None) }
+    }
+    pub fn part<'a, T: crate::buffer::Cast>(&'a self, range: Range<usize>, checked: bool, scratch: &'a mut Vec<T>) -> Result<Arg<'a, T>, Error> {
+        self.part_counted(range, checked, scratch).map(|(items, _)| items)
+    }
+    /// The same read and the number of items it materialized in scratch; borrowed runs and scalar conversions count zero.
+    pub fn part_counted<'a, T: crate::buffer::Cast>(
+        &'a self, range: Range<usize>, checked: bool, scratch: &'a mut Vec<T>
+    ) -> Result<(Arg<'a, T>, usize), Error> {
+        self.range(&range)?;
+        if range.is_empty() { return Ok((Arg::Many(&[]), 0)); }
         if let Some((view, stride)) = self.run_view(&range) {
-            if view.dtype() != T::DTYPE {
-                if stride == 0 { return Ok(Arg::One(kept(T::cast(view, 0), checked)?)); }
-                cast_run(view, stride, range.len(), checked, scratch)?;
-                return Ok(Arg::Many(scratch));
-            }
-            let items = T::of(view).expect("a typed read selected its dtype");
-            return Ok(if stride == 0 { Arg::One(items[0]) } else { Arg::Many(items) });
+            if let Some(items) = borrowed_as::<T>(view, checked)? { return Ok((items, 0)); }
+            cast_run(view, stride, range.len(), checked, scratch)?;
+            return Ok((Arg::Many(scratch), range.len()));
         }
         scratch.clear();
+        let copied = range.len();
         self.read_onto(range, checked, scratch)?;
-        Ok(Arg::Many(scratch))
+        Ok((Arg::Many(scratch), copied))
     }
     /// Whether `part` reads `range` in place, writing no scratch: one run of a source that holds `T`, or one item that every position reads.
     pub fn in_place<T: crate::buffer::Cast>(&self, range: &Range<usize>) -> bool {
-        self.run_view(range).is_some_and(|(view, stride)| stride == 0 || view.dtype() == T::DTYPE)
+        self.run_view(range).is_some_and(|(view, _)| view.len() == 1 || view.dtype() == T::DTYPE)
     }
     /// This read as rows over a result of `shape`, which is rows then items, where every source is bound as the plan reads it, the plan maps one source that holds `T` affinely over `shape`, and each row reads one item or a run of items. `None` for any other read.
     pub fn rows<T: crate::buffer::Cast>(&self, shape: [usize; 2]) -> Option<Rows<'s, T>> {
         self.bindings().ok()?;
-        let (source, base, strides) = self.plan.affine(&shape)?;
-        let (view, first) = self.sources.get(source)?.affine(base, &strides, &shape)?;
-        let &[step, inner @ (0 | 1)] = &strides[..] else { return None };
-        Some(Rows { items: T::of(view)?, first, step, run: inner == 1 })
+        let mut strides = [0; 2];
+        let (source, base, bounds) = self.plan.affine_into(&shape, &mut strides)?;
+        let binding = self.sources.get(source)?;
+        binding.borrow(bounds)?;
+        let [step, inner @ (0 | 1)] = strides else { return None };
+        Some(Rows { items: T::of(binding.view)?, first: base.checked_sub(binding.start)?, step, run: inner == 1 })
     }
     /// Appends items `range` of the plan onto `output` at `T`, a run at a time (`ReadPlan::runs`): a map over one source walks whole where it can (`walk_onto`), and each other run copies a source's run, gives index values or fills.
     fn read_onto<T: crate::buffer::Cast>(&self, range: Range<usize>, checked: bool, output: &mut Vec<T>) -> Result<(), Error> {
@@ -474,7 +532,8 @@ impl<'s> Read<'s> {
     }
     /// The whole source and the mapping of a read that maps one source with no fills, for a reader that walks the mapping itself (`linalg::Mapped`).
     pub fn mapped_source(&self) -> Option<(crate::buffer::View<'s>, &'s Mapping)> {
-        let ReadRoute::Map { input, map, .. } = self.plan.route() else { return None };
+        let ReadRoute::Map(read) = self.plan.route() else { return None };
+        let ReadMap { input, map, .. } = read.as_ref();
         if map.fills() { return None; }
         Some((self.walkable(input, map, self.plan.len())?.view, map))
     }
@@ -499,10 +558,17 @@ impl<'s> Read<'s> {
     }
     pub fn read_into(&self, range: Range<usize>, dtype: crate::buffer::DType, checked: bool, output: &mut crate::buffer::Buffer) -> Result<(), Error> {
         self.range(&range)?;
+        let run = self.run_view(&range);
+        self.write_into(range, dtype, checked, output, run)
+    }
+    fn write_into(
+        &self, range: Range<usize>, dtype: crate::buffer::DType, checked: bool,
+        output: &mut crate::buffer::Buffer, run: Option<(crate::buffer::View<'s>, usize)>
+    ) -> Result<(), Error> {
         if output.dtype() != dtype { *output = crate::buffer::Buffer::with_capacity(dtype, range.len()); }
         with_dtype!(dtype, T => {
             let items = T::vec_mut(output).expect("output has the selected dtype");
-            if let Some((view, stride)) = self.run_view(&range) {
+            if let Some((view, stride)) = run {
                 if view.dtype() != dtype { return cast_run(view, stride, range.len(), checked, items); }
                 let source = T::of(view).expect("a typed read selected its dtype");
                 items.clear();
@@ -548,6 +614,12 @@ fn joined_at(parts: &[ReadPart], position: usize) -> Option<(&ReadPlan, usize, u
     let part = parts.get(k)?;
     Some((&part.plan, row * (part.end - start) + column - start, column - start, part.end - column))
 }
+fn borrowed_as<'a, T: crate::buffer::Cast>(view: crate::buffer::View<'a>, checked: bool) -> Result<Option<Arg<'a, T>>, Error> {
+    if let Some(items) = T::of(view) { return Ok(Some(Arg::of(items))); }
+    if view.len() == 1 { return Ok(Some(Arg::One(kept(T::cast(view, 0), checked)?))); }
+    Ok(None)
+}
+
 /// The `len` items of a borrowed run of another dtype, as `T` in `output`: one typed loop over the run ([`Cast::extend_cast`](crate::buffer::Cast::extend_cast)), in place of a routed read for each item. A stride of 0 repeats the run's one item.
 fn cast_run<T: crate::buffer::Cast>(view: crate::buffer::View<'_>, stride: usize, len: usize, checked: bool, output: &mut Vec<T>) -> Result<(), Error> {
     output.clear();
@@ -564,7 +636,7 @@ impl Filled {
         match missing.route() {
             ReadRoute::Default => Some(Self::Fill), ReadRoute::Invalid => Some(Self::Never), &ReadRoute::Index { base, step: 0 } => Some(Self::Value(base)),
             &ReadRoute::Input(source) if missing.len() == 1 => Some(Self::Source(source)),
-            ReadRoute::Map { input, map: Mapping::Single, .. } => match *input.route() { ReadRoute::Input(source) => Some(Self::Source(source)), _ => None },
+            ReadRoute::Map(read) if matches!(&read.map, Mapping::Single) => match *read.input.route() { ReadRoute::Input(source) => Some(Self::Source(source)), _ => None },
             _ => None
         }
     }
@@ -589,10 +661,11 @@ pub enum Period<'a> {
 }
 
 impl Period<'_> {
-    /// How a reader takes this cycle in runs of up to `run` positions: the period, and how many positions it writes the cycle out over (`tiled_cycle`). A cycle shorter than `LONG_CYCLE`, read in order or by walking entries, is written out over `run` positions, so that a run reads it in place at any phase. A longer walk is gathered once with no repeats. `None` for a longer cycle read in order, which a run reads in place, and for repeats.
+    /// The period and exact backing length written by `tiled_cycle` for this run size. Long plain cycles return `None`; long walking cycles are stored once.
     pub fn tiling(&self, run: usize) -> Option<(usize, usize)> {
         match *self {
-            Self::Cycles(p) | Self::Walks { len: p, .. } if p < LONG_CYCLE => Some((p, run)), Self::Walks { len, .. } => Some((len, 0)),
+            Self::Cycles(p) | Self::Walks { len: p, .. } if p > 0 && p < LONG_CYCLE =>
+                Some((p, if p < run { p * (run.div_ceil(p) + 1) } else { p })), Self::Walks { len, .. } => Some((len, len)),
             Self::Cycles(_) | Self::Repeats(_) => None
         }
     }
@@ -668,6 +741,22 @@ impl<'a> Walked<'a> {
     }
     /// The length of the cycle whose items the mapping's positions read again in order (`Period::Cycles`), where it has one.
     pub fn cycle(&self) -> Option<usize> { *self.cycle.get_or_init(|| match self.mapping.period() { Some(Period::Cycles(p)) => Some(p), _ => None }) }
+
+    /// A walking copy, or one cycle written out to cover runs of up to `cover` items at any phase.
+    /// `None` only when the mapping has neither a tiling period nor explicit walking entries.
+    pub fn gathered(&self, input: crate::buffer::View<'_>, cover: usize) -> Option<crate::buffer::Buffer> {
+        with_dtype!(input.dtype(), A => {
+            let data = A::of(input).expect("the view has its dtype");
+            let mut items = Vec::new();
+            if tiled_cycle(data, self, cover, &mut items).is_none() {
+                let Mapping::Steps { steps, .. } = &**self else { return None; };
+                let n = Steps::count(steps);
+                items.reserve(n);
+                expanded_items(self, data, 0, n, &mut items);
+            }
+            Some(A::buffer(items))
+        })
+    }
 }
 
 impl<'a> From<&'a Mapping> for Walked<'a> { fn from(mapping: &'a Mapping) -> Self { Self::new(Cow::Borrowed(mapping)) } }
@@ -684,21 +773,34 @@ impl Mapping {
     pub fn tabled(&self) -> bool { matches!(self, Self::Steps { steps, .. } if steps.iter().any(|s| matches!(s, Steps::Table(_)))) }
     /// The writes at the places that a [`Mapping::Steps`] reads, in order, as `From<Writes>` makes one. `None` for any other mapping.
     pub fn as_writes(&self) -> Option<Writes<'_>> { if let Self::Steps { base, steps } = self { Some(Writes::Walk { base: *base, steps }) } else { None } }
+    /// Affine coefficients for aligned axes, without normalizing or exporting a mapping.
+    fn affine_axes(&self, shape: &[usize], axis: &mut dyn FnMut(usize, isize)) -> Option<usize> {
+        if shape.contains(&0) { for k in 0..shape.len() { axis(k, 0); } return Some(0); }
+        if let Self::Steps { base, steps } = self {
+            if steps.iter().map(Steps::len).ne(shape.iter().copied()) { return None; }
+            return steps.iter().enumerate().try_fold(*base, |at, (k, s)| {
+                let (start, step) = if s.len() == 1 { (s.get(0)?, 0) } else { s.affine()? };
+                axis(k, step);
+                Some(at.wrapping_add(start))
+            });
+        }
+        if let Self::Linear(period) | Self::Tiled(period) = *self {
+            if period < count(shape) && period != 1 && !shape.iter().rev().scan(1, |p, &n| { *p *= n; Some(*p) }).any(|p| p == period) { return None; }
+        }
+        let (base, mut stride) = (self.get(0)?, count(shape));
+        for (k, &len) in shape.iter().enumerate() {
+            stride /= len;
+            axis(k, if len > 1 { self.get(stride)? as isize - base as isize } else { 0 });
+        }
+        Some(base)
+    }
+
     /// This mapping as one entry per axis of `shape`, or `None` where offsets aren't axis-separable.
     pub fn entries(&self, shape: &[usize]) -> Option<(usize, Vec<Steps>)> {
         if shape.contains(&0) { return Some((0, shape.iter().map(|&n| Steps::along(n, 0)).collect())); }
         if let Self::Steps { base, steps } = self { let (offset, steps) = Steps::per_axis(steps, shape)?; return Some((base + offset, steps)); }
-        if let Self::Linear(period) | Self::Tiled(period) = *self {
-            let n = count(shape);
-            if period < n && period != 1 && !shape.iter().rev().scan(1, |p, &n| {
-                *p *= n;
-                Some(*p)
-            }).any(|p| p == period) { return None; }
-        }
-        let base = self.get(0)?;
-        let steps = shape.iter().zip(strides(shape))
-            .map(|(&len, stride)| Some(Steps::Stride { start: 0, len, step: if len > 1 { self.get(stride)? as isize - base as isize } else { 0 } }))
-            .collect::<Option<_>>()?;
+        let mut steps = Vec::with_capacity(shape.len());
+        let base = self.affine_axes(shape, &mut |k, step| steps.push(Steps::Stride { start: 0, len: shape[k], step }))?;
         Some((base, steps))
     }
     /// Composes positional reads through the logical axes of shape.
@@ -789,8 +891,15 @@ impl Mapping {
     /// The first offset and stride of items `start..start + n`, where a `Steps` mapping reads one regular run.
     #[inline]
     pub fn run(&self, start: usize, n: usize) -> Option<(usize, isize)> {
-        let Self::Steps { base, steps } = self else { return None };
-        Steps::run(*base, steps, start, n)
+        if n == 0 { return None; }
+        match *self {
+            Self::Single => Some((0, 0)), Self::Linear(0) | Self::Tiled(0) => None,
+            Self::Linear(1) => Some((start, 1)),
+            Self::Linear(r) if n <= r - start % r => Some((start / r, 0)),
+            Self::Tiled(p) if n <= p - start % p => Some((start % p, 1)),
+            Self::Steps { base, ref steps } => Steps::run(base, steps, start, n),
+            _ => None
+        }
     }
     /// The offset for position `i`, or `None` where it reads a fill.
     // Per-item loops in basedpl call this for every item. The `Steps` arm calls an out-of-line walk to keep `get` small enough to inline there. `Linear(1)` skips the division.
@@ -911,6 +1020,11 @@ impl Mapping {
         match *self {
             Self::Single => { f(at, range.len(), (items > 0).then_some((0, 0))); }
             Self::Linear(0) | Self::Tiled(0) => { f(at, range.len(), None); }
+            Self::Linear(1) => {
+                let below = items.saturating_sub(at).min(range.len());
+                if below > 0 && !f(at, below, Some((at, 1))) { return; }
+                if below < range.len() { f(at + below, range.len() - below, None); }
+            }
             Self::Linear(r) => {
                 while at < range.end {
                     let (k, end) = (at / r, range.end.min((at / r + 1) * r));
@@ -970,7 +1084,7 @@ impl Agreement {
             let shape = if left.shape().is_empty() { right.shape() } else { left.shape() };
             let len = generated_len(shape)?;
             let map = |l: &Layout| if len > 1 && l.shape() == shape { Mapping::Linear(1) } else { Mapping::Single };
-            return Ok(Self { layout: Layout::from(shape.to_vec()), len, left: map(left), right: map(right) });
+            return Ok(Self { layout: Layout::from(shape), len, left: map(left), right: map(right) });
         }
         let [xa, ya] = Self::axis_pairs(left, right);
         Self::mapped(left, right, &xa, &ya, false)
@@ -1106,10 +1220,7 @@ const LINE_BLOCK: usize = 1 << 16;
 
 /// The one item that every position in `start..start + n` reads, where `mapping` repeats a single item over all of them. `None` where the positions read more than one item.
 fn single<A: Copy>(mapping: &Mapping, data: &[A], start: usize, n: usize) -> Option<A> {
-    match *mapping {
-        Mapping::Single => Some(data[0]), Mapping::Linear(r) if r != 1 && n <= r - start % r => Some(data[start / r]),
-        Mapping::Steps { .. } => mapping.run(start, n).and_then(|(o, step)| (step == 0).then(|| data[o])), _ => None
-    }
+    mapping.run(start, n).and_then(|(o, step)| (step == 0).then(|| data[o]))
 }
 
 /// Items `start..start + n` of an argument that `mapping` lays out, read as `expanded` reads them but always as a slice of all `n` items. A repeated item fills `buf`.
@@ -1124,18 +1235,19 @@ pub fn expanded_items<'a, A: Element>(mapping: &Walked, data: &'a [A], start: us
 
 /// Items `start..start + n` of an argument that `mapping` lays out, where they need no copy: a single item, a contiguous run, items within one repeat, or items of a cycle: within one period of a mapping that cycles (`Period::Cycles`), and as far as `data` holds a `Tiled` cycle, once or written out past its end (`tiled_cycle`). A `Steps` mapping reads a forward run in place through `run`.
 pub fn in_place<'a, A: Copy>(mapping: &Walked, data: &'a [A], start: usize, n: usize) -> Option<Arg<'a, A>> {
-    if let Mapping::Steps { .. } = **mapping {
-        // One check of the walk finds both a repeated item and a forward run.
-        return match mapping.run(start, n) {
-            Some((o, 0)) => Some(Arg::One(data[o])), Some((o, 1)) => Some(Arg::Many(&data[o..o + n])),
-            _ => mapping.cycle().filter(|&p| start % p + n <= p).map(|p| Arg::Many(&data[start % p..start % p + n]))
-        };
+    match mapping.run(start, n) {
+        Some((o, 0)) => return data.get(o).copied().map(Arg::One),
+        Some((o, 1)) => return data.get(o..o.checked_add(n)?).map(Arg::Many),
+        _ => {}
     }
-    if let Some(x) = single(mapping, data, start, n) { return Some(Arg::One(x)); }
-    match **mapping {
-        Mapping::Linear(1) => Some(Arg::Many(&data[start..start + n])),
-        Mapping::Tiled(m) if start % m + n <= data.len() => Some(Arg::Many(&data[start % m..start % m + n])), _ => None
-    }
+    // A `Tiled` source may already hold several periods (`tiled_cycle`); a cyclic Steps view only borrows within one.
+    let period = match **mapping {
+        Mapping::Tiled(p) if p > 0 => p,
+        Mapping::Steps { .. } => mapping.cycle().filter(|&p| p > 0 && n <= p - start % p)?,
+        _ => return None
+    };
+    let from = start % period;
+    data.get(from..from.checked_add(n)?).map(Arg::Many)
 }
 
 /// Items `start..start + n` of an argument that `mapping` lays out over the frame, read `in_place` where they can be. Others copy into `buf`. A repeated item fills each of its periods. A cycled argument copies through `gather::cycled`, and a `Steps` mapping through `walk_plan`, over the walk that its reader keeps (`Walked`).
@@ -1147,7 +1259,7 @@ pub fn expanded<'a, A: Element>(mapping: &Walked, data: &'a [A], start: usize, n
 /// The cycle that `mapping`'s positions read from `data`, written into `buf` as `Period::tiling` says for runs of up to `run` positions, with the `Tiled` mapping that then reads it in place: a cycle read in order copies its first period, and one that walks entries (`Period::Walks`) gathers its period through them. A cycle shorter than its cover is written out past its end, so that a run reads it in place at any phase. `None` where `tiling` gives none, leaving `buf` alone.
 pub fn tiled_cycle<A: Element>(data: &[A], mapping: &Mapping, run: usize, buf: &mut Vec<A>) -> Option<Mapping> {
     let period = mapping.period()?;
-    let (p, cover) = period.tiling(run)?;
+    let (p, n) = period.tiling(run)?;
     match period {
         Period::Walks { base, steps, .. } => { copied(&Walked::from(Mapping::Steps { base, steps: steps.to_vec().into() }), data, 0, p, buf); }
         _ => {
@@ -1156,7 +1268,7 @@ pub fn tiled_cycle<A: Element>(data: &[A], mapping: &Mapping, run: usize, buf: &
         }
     }
     buf.truncate(p);
-    if p < cover { *buf = buf.repeat(cover.div_ceil(p) + 1); }
+    if p < n { *buf = buf.repeat(n / p); }
     Some(Mapping::Tiled(p))
 }
 

@@ -131,11 +131,12 @@ mod forms {
                 Lgamma, Erf, Erfc, Erfinv, Erfcinv, LambertW, Sqrt, Sqrt1mx2, Sqrt1px2, Sqrtx2m1, Abs, Sign, Angle;
             binary: Pow, Root, Hypot, Atan2, Gammainc, Gammaincc, Gammaincinv, Binom, Logb, MathishLogb, Maximum, Minimum; ternary: Betainc, Betaincinv
         );
-        // `Erfcinv`'s f64 slice form places each block's items by region. Several blocks of uniform items, in random order, reach every region.
+        // The f64 inverse-error slice forms place each block's items by region. Several blocks of uniform items, in random order, reach every region.
         use rand::RngExt;
         let mut rng = crate::support::seeded(1);
         let q: Vec<f64> = (0..2000).map(|_| 2.0 * rng.random::<f64>()).collect();
         unary(Erfcinv, "Erfcinv", &q);
+        unary(Erfinv, "Erfinv", &q.iter().map(|&v| v - 1.0).collect::<Vec<_>>());
         // The logarithms' slice forms take each block of 64 items whose every item is positive, normal and finite through a form with no special values. Blocks of such items, some holding a special value, reach both forms.
         let mut x: Vec<f64> = (0..2000).map(|_| 1000.0 * rng.random::<f64>()).collect();
         for (i, v) in [0.0, -1.0, 1e-310, f64::INFINITY, f64::NAN, 1.0].into_iter().enumerate() { x[300 * i + 5] = v }
@@ -867,6 +868,12 @@ mod tolerant {
         if rustymath::FUSED { assert_ne!(Exactly.residue(0.1, 1.0), 0.0); }
         assert_eq!(Exactly.residue(1e300, 1e-300), 1e-300);
         assert!((T.gcd(0.6, 0.4) - 0.2).abs() < 1e-15 && Exactly.gcd(0.6, 0.4) < 1e-15);
+        let tiny = f64::from_bits(1);
+        for (x, y, g) in [
+            (0.75, 0.5, 0.25), (1.0, 0.75, 0.25), (3.0 * tiny, 9.0 * tiny, 3.0 * tiny),
+            (f64::MAX, tiny, tiny), (f64::MAX, f64::MAX, f64::MAX),
+        ] { assert_eq!(Exactly.gcd(x, y), g); }
+        assert_eq!(Exactly.gcd(0.6, 0.4), f64::EPSILON / 2.0);
         assert_eq!((T.gcd(12.0, 18.0), T.gcd(-12.0, 18.0), T.gcd(0.0, 2.5), T.gcd(0.0, 0.0), T.gcd(12.0f32, 18.0)), (6.0, 6.0, 2.5, 0.0, 6.0));
         assert!(T.gcd(f64::NAN, 1.0).is_nan() && T.gcd(f64::NAN, f64::NAN).is_nan() && T.gcd(f64::INFINITY, 1.0).is_nan());
     }
@@ -1162,6 +1169,19 @@ mod gather {
         assert!(check(&[20], &[2, 19], vec![along(2, 1), along(19, 1)]));
         assert!(check(&[5, 6, 2], &[3, 4, 3, 3, 2], vec![along(3, 12), along(4, 2), along(3, 12), along(3, 2), along(2, 1)]));
     }
+    /// Shared index storage still distinguishes its axis interpretation, scale and selected range.
+    #[test]
+    fn index_tables_compare_source_and_offsets() {
+        use rustymath::{buffer::{Buffer, IntBuf}, gather::{IndexSource, Table}};
+        let values: std::sync::Arc<dyn IndexSource> = std::sync::Arc::new(Buffer::Integers(IntBuf::I16(vec![-1, 0, 1])));
+        let table = Table::indices(values.clone(), 4, None);
+        assert_eq!(table, table.clone());
+        assert_eq!(table, Table::new(vec![3, 0, 1]));
+        assert_ne!(table, table.clone().scaled(2));
+        assert_ne!(table, Table::indices(values, 5, None));
+        assert_ne!(table.slice(0, 2), table.slice(1, 2));
+    }
+
     /// Index arrays pair by broadcasting and take the place of the first one, while a range keeps its axis in place. With one index array, pairing is the cross product.
     #[test]
     fn index_arrays_pair() {

@@ -38,6 +38,31 @@ fn sin_cos<R: Native + Cast>(y: &[R], sin: &mut Vec<R>, cos: &mut Vec<R>) {
     }
 }
 
+/// Real-input cis through the shared real sin/cos slices, with exact quarter turns.
+pub(crate) fn real_cis<R: Native + Cast>(
+    k: &crate::Cis, ops: &NativeOps<{ FUSED }>, [arg]: [Arg<'_, R>; 1], n: usize, out: &mut [MaybeUninit<Complex<R>>]) {
+    let ys = match arg {
+        Arg::One(y) => {
+            let value = k.complex(ops, [c(y, R::zero())]).expect("cis has a complex scalar body");
+            for slot in &mut out[..n] { slot.write(value); }
+            return;
+        }
+        Arg::Many(ys) => &ys[..n],
+    };
+    let (mut sin, mut cos) = (Vec::new(), Vec::new());
+    for (ys, out) in ys.chunks(crate::CHUNK).zip(out[..n].chunks_mut(crate::CHUNK)) {
+        sin.clear();
+        cos.clear();
+        sin_cos(ys, &mut sin, &mut cos);
+        for ((slot, &re), &im) in out.iter_mut().zip(&cos).zip(&sin) { slot.write(c(re, im)); }
+        if ys.iter().fold(false, |turned, &y| turned | turns(y).1) {
+            let values = unsafe { slice::written(out) };
+            for (value, &y) in values.iter_mut().zip(ys) { if let Some((re, im)) = quarter(y) { *value = c(re, im); } }
+        }
+    }
+}
+
+
 fn split<K: Formula<N>, R: Native + Cast, const N: usize>(
     k: &K, ops: &NativeOps<{ FUSED }>, args: [Arg<'_, Complex<R>>; N], n: usize, out: &mut [MaybeUninit<Complex<R>>],
     fast: impl FnOnce([(&[R], &[R]); N], &mut Vec<R>, &mut Vec<R>), rare: impl Fn([Complex<R>; N], Complex<R>) -> bool) {

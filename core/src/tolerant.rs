@@ -117,6 +117,12 @@ pub trait Tolerant: Copy + Send + Sync {
         let whole = x.fract() == 0.0 && y.fract() == 0.0 && x * y < 1e14 && self.value() <= Tolerance::DEFAULT.value();
         if let Some(g) = whole.then(|| crate::integer::gcd(int(x)?, int(y)?)).flatten() { return float(g); }
         let (t, (nx, dy)) = (self.value(), ratio_parts(x, y));
+        if t == 0.0 {
+            // Odd significands share no powers of two; the smaller exponent supplies their common unit.
+            let g = crate::integer::gcd(nx.0 as i64, dy.0 as i64).unwrap() as f64;
+            let unit = if nx.1 == 0 { x / nx.0 as f64 } else { y / dy.0 as f64 };
+            return F::narrow(unit * g);
+        }
         if let Some(g) = fixed_gcd(x, y, nx, dy, t) { return F::narrow(g); }
         // The same walk on big integers, where the test `|p·d − q·n| ≤ t·n·q` is exact for `t = m·2^e`.
         let (n, d) = (BigInt::from(nx.0) << nx.1, BigInt::from(dy.0) << dy.1);
@@ -678,7 +684,7 @@ pub fn classes<F: Float>(t: impl Tolerant, x: &[F]) -> Result<Vec<u32>, Error> {
 #[inline(never)]
 pub fn firsts<F: Float>(t: impl Tolerant, x: &[F]) -> Result<Vec<bool>, Error> {
     if let Some((keys, _)) = wholes(t, x, whole_limit(t)) { return Ok(search::firsts(&keys)); }
-    if t.value() == 0.0 { return Ok(search::first_mask(&search::first_classes(x, F::order_key))); }
+    if t.value() == 0.0 { return Ok(search::first_mask(x, F::order_key)); }
     let mut firsts = vec![false; x.len()];
     checked_runs(t, x, |run| firsts[run[0]] = true)?;
     Ok(firsts)

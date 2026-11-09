@@ -662,9 +662,11 @@ fn erfc_blocks<R: Native, const FUSED: bool>(x: &[R], out: &mut [MaybeUninit<R>]
         true
     })
 }
-/// [`erfinv`](crate::erfinv) as a function object.
+/// [`erfinv`](crate::erfinv) as a function object, with the slice form `many`, which runs `regions` on a slice of f64s.
 #[derive(Clone, Copy, Debug)]
 pub struct Erfinv;
+forms!(Erfinv at real: |_, [p]| erfinv::<_, { crate::FUSED }>(p),
+    many |_, [p], n, out| inverses(p, n, out, #[inline(always)] |p| erfinv::<_, { crate::FUSED }>(p), #[inline(always)] |p| (p.abs(), 1.0 - p.abs(), p)));
 
 /// [`erfcinv`](crate::erfcinv) as a function object, with the slice form `many`, which runs `regions` on a slice of f64s.
 #[derive(Clone, Copy, Debug)]
@@ -672,7 +674,7 @@ pub struct Erfcinv;
 forms!(Erfcinv at real: |_, [q]| erfcinv::<_, { crate::FUSED }>(q),
     many |_, [q], n, out| inverses(q, n, out, #[inline(always)] |q| erfcinv::<_, { crate::FUSED }>(q), #[inline(always)] |q| ((q - 1.0).abs(), q.min(2.0 - q), 1.0 - q)));
 
-/// The slice form of [`Erfcinv`]: `regions` on a slice of f64s, and `f` on each item otherwise. `parts` gives an f64 item's `maddock` arguments and the value whose sign its result takes.
+/// The slice form of [`Erfinv`] and [`Erfcinv`]: `regions` on a slice of f64s, and `f` on each item otherwise. `parts` gives an f64 item's `maddock` arguments and the value whose sign its result takes.
 fn inverses<R: Native>(x: Arg<'_, R>, n: usize, out: &mut [MaybeUninit<R>], f: impl Fn(R) -> R, parts: impl Fn(f64) -> (f64, f64, f64)) -> bool {
     match x { Arg::Many(x) if R::WIDE => regions::<R, { crate::FUSED }>(&x[..n], out, f, parts), x => each!([x], n, out, |[x]| f(x)) }
 }

@@ -1,7 +1,7 @@
 //! Search and sort over slices of keys. A key is an item read as a whole number (`Key`), or an unsigned word whose order is the order you want (`RadixKey`). `Float::order_key` gives each float such a word, as wide as the float. Positions take 32 bits inside these functions, so a slice holds at most `u32::MAX` items. `tolerant` builds its searches over floats on these functions.
 //!
-//! `index_of`, `classes` and `firsts` index the first position of each key. `index_of` passes over `x` once for each item of `y` when `y` has at most `SCANNED` items. The index is a table when the keys span at most twice the slice's length, or 1024, and a hash map otherwise. `numbered` numbers the classes in order of first position, with each one's size. `grouped_keys` numbers them the same way from a table of keys, with each one's positions, `numbered_keys` with each item's number, and `class_counts` gives only their sizes. `counts` counts the items with each key in such a table. `sort_rows` sorts keys that span such a table by counting them. It sorts other keys with an LSD radix sort that skips any byte that is the same in every key. `view_sort_along`, `view_partition_along` and `view_quantiles_along` work on each item's `SortKey`, which reads back to the item exactly. A sort counts, sorts a float lane through a bitonic network on vectors, or sorts the keys by comparison or by the same radix sort. With several threads, the radix sort splits each pass of more than `RADIX_PIECE` keys across them, and `index_of` splits its lookups.
-use crate::hashing::{HashMap, HashMapExt};
+//! `index_of` and `classes` index the first position of each key; `firsts` marks first occurrences directly. `index_of` passes over `x` once for each item of `y` when `y` has at most `SCANNED` items. The index is a table when the keys span at most twice the slice's length, or 1024, and a hash table otherwise. `numbered` numbers the classes in order of first position, with each one's size. `grouped_keys` numbers them the same way from a table of keys, with each one's positions, `numbered_keys` with each item's number, and `class_counts` gives only their sizes. `counts` counts the items with each key in such a table. `sort_rows` sorts keys that span such a table by counting them. It sorts other keys with an LSD radix sort that skips any byte that is the same in every key. `view_sort_along`, `view_partition_along` and `view_quantiles_along` work on each item's `SortKey`, which reads back to the item exactly. A sort counts, sorts a float lane through a bitonic network on vectors, or sorts the keys by comparison or by the same radix sort. With several threads, the radix sort splits each pass of more than `RADIX_PIECE` keys across them, and `index_of` splits its lookups.
+use crate::hashing::{HashMap, HashMapExt, HashSet, HashSetExt};
 use crate::{
     Float, Native, agreement::Mapping, array::ArrayView, buffer::{Buffer, DType, Element, Floats, IntBuf, View, Width}, error::{Error, Kind}, interrupt::check,
     layout::{Layout, count}, tolerant::{self, Tolerance}
@@ -166,10 +166,10 @@ pub fn classes<K: Key>(x: &[K]) -> Vec<u32> {
     x.iter().map(move |&n| first[n.key().wrapping_sub(min) as usize]).collect()
 }
 
-/// Whether each item of `x` is the first with its key. The pass that writes each key's first position marks it as it goes, with no second pass over `x`. Wider keys mark the items that are their own class.
+/// Whether each item is the first with its key. Narrow key ranges mark first positions in a table; wider keys use a hash set.
 #[inline(never)]
 pub fn firsts<K: Key>(x: &[K]) -> Vec<bool> {
-    let Some((min, mut table)) = table(x, u32::MAX) else { return first_mask(&first_classes(x, |n| n)) };
+    let Some((min, mut table)) = table(x, u32::MAX) else { return first_mask(x, |n| n) };
     let mut mask = vec![false; x.len()];
     write_first(x, min, &mut table, None, |p, new| mask[p] |= new);
     mask
@@ -590,8 +590,11 @@ impl Ord for Exact<'_> {
 
 impl PartialOrd for Exact<'_> { fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) } }
 
-/// Whether each position of `classes` is its own class, which makes its item the first with its key.
-pub(crate) fn first_mask(classes: &[u32]) -> Vec<bool> { classes.iter().enumerate().map(|(i, &c)| c as usize == i).collect() }
+/// Whether each item is the first with its key, from one hash insert per item.
+pub(crate) fn first_mask<T: Copy, K: Eq + Hash>(x: &[T], key: impl Fn(T) -> K) -> Vec<bool> {
+    let mut seen = HashSet::with_capacity(x.len());
+    x.iter().map(|&v| seen.insert(key(v))).collect()
+}
 
 /// The positions of `groups` in order of group, keeping their order within each group, with the number in each of the `n` groups.
 #[inline(never)]
