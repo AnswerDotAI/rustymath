@@ -6,20 +6,15 @@ mod integer;
 mod real;
 use {complex::*, integer::*, real::map_real};
 mod io;
-pub use io::MapOutput;
-use io::OutputItem;
-pub(super) use io::{Inputs, Output};
+use crate::buffer::{Output, OutputItem};
+pub(super) use io::Inputs;
 pub(super) fn map_formula<K: crate::facts::Formula<N>, const N: usize>(
     object: &K, variant: crate::domain::Variant, inputs: Inputs<'_, '_>, range: std::ops::Range<usize>, settings: Settings, repair: bool, judged: bool,
     output: &mut Output<'_, '_>) -> Result<(), Error> {
     if inputs.len() != N { return Err(Error::new(Kind::Length, "kernel operand count changed")); }
     let ops = settings.ops();
     crate::events::taken(crate::events::Route::VectorKernel, range.len());
-    match inputs {
-        Inputs::Mapped(reads) => report_maps(reads.iter().map(|read| read.plan), range.clone()),
-        Inputs::Ready(views) if range.len() > 1 && views.iter().any(|v| v.len() == 1) => crate::events::taken(crate::events::Route::MappedKernel, range.len()),
-        _ => {}
-    }
+    report_maps(inputs.0.iter().map(|read| read.plan), range.clone());
     // A kernel whose arguments' types can't make an error judges no item: `judge` is `variant` unchecked. Reads and `IntegerOps` keep `variant`, so an argument that doesn't convert, or an overflow that `IntegerOps::result` reports, still fails.
     let judge = crate::domain::Variant { checked: variant.checked && judged, ..variant };
     let slices = object.native_slices();
@@ -50,10 +45,10 @@ pub(super) fn map_formula<K: crate::facts::Formula<N>, const N: usize>(
         },
         DType::Integer(width) => with_width!(width, I => map_integer::<K, I, N>(object, variant, inputs, range, judge, output)),
         DType::Complex(crate::buffer::ComplexWidth::F32) if K::REAL_COMPLEX && inputs.real() => {
-            map_real_complex::<K, f32, N>(object, variant, inputs, range, &ops, output)
+            map_real_complex::<K, f32, N>(object, variant, inputs, range, &ops, slices.and_then(|s| s.real_complex_single()), output)
         }
         DType::Complex(crate::buffer::ComplexWidth::F64) if K::REAL_COMPLEX && inputs.real() => {
-            map_real_complex::<K, f64, N>(object, variant, inputs, range, &ops, output)
+            map_real_complex::<K, f64, N>(object, variant, inputs, range, &ops, slices.and_then(|s| s.real_complex_double()), output)
         }
         DType::Complex(crate::buffer::ComplexWidth::F32) => {
             map_complex::<K, f32, N>(object, variant, inputs, range, &ops, slices.and_then(|s| s.complex_single()), judge, output)
@@ -112,26 +107,37 @@ fn map_blocks<F: crate::buffer::Cast, O: OutputItem, const N: usize>(
     apply: &(dyn Fn([Arg<'_, F>; N], usize, &mut [std::mem::MaybeUninit<O>]) -> Result<(), Kind> + Sync)) -> Result<(), Error> {
     let recorded =
         |result: Result<(), Kind>| result.map_err(|kind| crate::error::record(Error::new(kind, "numerical kernel argument is outside its domain"))).is_ok();
-    if let Inputs::Mapped(reads) = inputs && let Some((len, rows)) = by_rows::<F>(reads) {
-        return output
-            .write(range.len(), &|part, slots| unsafe { slots.fill(part.len(), |out| recorded(fill_rows(&rows, len, part.start + range.start, out, apply))) });
+    match inputs.borrowed::<F, N>(range.clone(), checked) {
+        Ok(Some(args)) => return output.write(range.len(), &|part, slots, _| unsafe {
+            slots.fill(part.len(), |out| recorded(apply(args.map(|arg| arg.part(part.start, part.len())), part.len(), out)))
+        }),
+        Ok(None) => {}, Err(error) => { output.target.fill(range.len()); return Err(error); }
     }
-    output.write(range.len(), &|part, slots| {
+    if let Some((len, rows)) = by_rows::<F, N>(inputs.0) {
+        return output
+            .write(range.len(), &|part, slots, _| unsafe { slots.fill(part.len(), |out| recorded(fill_rows(&rows, len, part.start + range.start, out, apply))) });
+    }
+    output.write(range.len(), &|part, slots, work| {
         let part = part.start + range.start..part.end + range.start;
-        let len = if inputs.in_place::<F>(&part) { part.len().max(1) } else { crate::CHUNK };
-        let mut scratch: [Vec<F>; N] = std::array::from_fn(|_| Vec::new());
-        part.clone().step_by(len).fold(true, |ok, at| {
+        let in_place = inputs.in_place::<F>(&part);
+        let len = if in_place { part.len().max(1) } else { crate::CHUNK };
+        let mut local: [Vec<F>; N] = std::array::from_fn(|_| Vec::new());
+        let (mut work, mut copied) = (work, 0);
+        let mut scratch = match work.as_deref_mut() { Some(work) if !in_place => work.inputs::<F, N>(), _ => local.each_mut() };
+        let ok = part.clone().step_by(len).fold(true, |ok, at| {
             let run = at..(at + len).min(part.end);
             let n = run.len();
             let args = match inputs.part::<F, N>(run, checked, &mut scratch) {
-                Ok(args) => args,
+                Ok((args, n)) => { copied += n; args }
                 Err(error) => {
                     crate::error::record(error);
                     return unsafe { slots.fill(n, |out| { for slot in out { slot.write(O::FILL); } false }) } & ok;
                 }
             };
             (unsafe { slots.fill(n, |out| recorded(apply(args, n, out))) }) & ok
-        })
+        });
+        if let Some(work) = work { work.record_copies(copied); }
+        ok
     })
 }
 
@@ -139,15 +145,21 @@ fn map_blocks<F: crate::buffer::Cast, O: OutputItem, const N: usize>(
 const ROWS: usize = 16;
 
 /// The row length `len` and each input as rows of `len` items (`Read::rows`), for a map that reads faster by rows than by blocks: at least two rows of at least `ROWS` items, and an input that blocks would copy, because each of its rows reads one item that changes from row to row, or its rows don't follow on from each other, as an outer product's operands do. `len` is the `k` of the first mapped input's repeat or cycle of `k` items, and else the last axis that input steps along. `None` otherwise.
-fn by_rows<'a, F: crate::buffer::Cast>(inputs: &[crate::agreement::Read<'a>]) -> Option<(usize, Vec<crate::agreement::Rows<'a, F>>)> {
-    use crate::agreement::{Mapping, ReadRoute};
+fn by_rows<'a, F: crate::buffer::Cast, const N: usize>(inputs: &[crate::agreement::Read<'a>]) -> Option<(usize, [crate::agreement::Rows<'a, F>; N])> {
+    use crate::{agreement::{Mapping, ReadRoute}, gather::Steps};
     let len = inputs.iter().find_map(|read| match read.plan.route() {
-        ReadRoute::Map { map: Mapping::Linear(k) | Mapping::Tiled(k), .. } => Some(*k), ReadRoute::Map { .. } => read.plan.shape_hint().last().copied(),
+        ReadRoute::Map(mapped) => match &mapped.map {
+            Mapping::Linear(k) | Mapping::Tiled(k) => Some(*k),
+            Mapping::Steps { steps, .. } if Steps::count(steps) == read.plan.len() => steps.last().map(Steps::len),
+            _ => Some(read.plan.len()),
+        },
         _ => None
     })?;
     let items = inputs.first()?.plan.len();
     if len < ROWS || items <= len || items % len != 0 { return None; }
-    let rows = inputs.iter().map(|read| read.rows([items / len, len])).collect::<Option<Vec<_>>>()?;
+    let mut rows = std::array::from_fn(|_| None);
+    for k in 0..N { rows[k] = Some(inputs.get(k)?.rows([items / len, len])?); }
+    let rows: [crate::agreement::Rows<'a, F>; N] = rows.map(Option::unwrap);
     rows.iter().any(|row| if row.run { row.step != len as isize } else { row.step != 0 }).then_some((len, rows))
 }
 
@@ -169,9 +181,9 @@ fn fill_rows<F: Copy, O, const N: usize>(
 }
 
 pub(super) fn copied(inputs: Inputs<'_, '_>, range: std::ops::Range<usize>, checked: bool, output: &mut Output<'_, '_>) -> Result<(), Error> {
-    with_dtype!(output.dtype, T => map_values::<T, T, 1>(inputs, range, checked, false, output, |x| x[0], |_, _| None))
+    with_dtype!(output.result_dtype, T => map_values::<T, T, 1>(inputs, range, checked, false, output, |x| x[0], |_, _| None))
 }
 
 pub(super) fn constant(value: bool, n: usize, output: &mut Output<'_, '_>) -> Result<(), Error> {
-    output.write::<bool>(n, &|part, slots| slots.pairs(Arg::One(value), Arg::One(()), part.len(), |x, ()| (x, true)))
+    output.write::<bool>(n, &|part, slots, _| slots.pairs(Arg::One(value), Arg::One(()), part.len(), |x, ()| (x, true)))
 }

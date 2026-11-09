@@ -686,7 +686,7 @@ mod complex {
         cases.sort_by(|a, b| a.0.cmp(&b.0));
         for group in cases.chunk_by(|a, b| a.0 == b.0) {
             let name = &group[0].0;
-            let count = if bulk && name == "exp" { group.len().max(rustymath::CHUNK + 1) } else { group.len() };
+            let count = if bulk && name == "exp" { group.len().max(rustymath_core::CHUNK + 1) } else { group.len() };
             let group = group.iter().cycle().take(count).collect::<Vec<_>>();
             let inputs = (0..group[0].1.len()).map(|i| group.iter().map(|(_, a, _)| c(narrow(a[i].re), narrow(a[i].im))).collect()).collect::<Vec<_>>();
             let got = apply_many(name, &inputs, bulk).expect("a reference function");
@@ -702,10 +702,10 @@ mod complex {
         out
     }
 
-    fn bulk_edges<R: Native>() where Complex<R>: Element {
+    fn bulk_edges<R: Native + Element>() where Complex<R>: Element {
         let real = |x| c(R::narrow(x), R::zero());
         assert!(evaluate::<R, 1>(Exp, [&[]], true).is_empty());
-        let n = rustymath::CHUNK + 1;
+        let n = rustymath_core::CHUNK + 1;
         let bases = [real(0.0), real(2.0), real(-2.0)].into_iter().cycle().take(n).collect::<Vec<_>>();
         for (exponent, values) in [(0.0, [1.0, 1.0, 1.0]), (1.0, [0.0, 2.0, -2.0]), (2.0, [0.0, 4.0, 4.0]), (-1.0, [f64::INFINITY, 0.5, -0.5])] {
             let got = evaluate(Pow, [&bases, &[real(exponent)]], true);
@@ -714,6 +714,18 @@ mod complex {
         let exponents = [0.0, 1.0, 2.0, -1.0].into_iter().cycle().take(n).map(real).collect::<Vec<_>>();
         let got = evaluate(Pow, [&[real(-2.0)], &exponents], true);
         assert!(got.iter().zip([1.0, -2.0, 4.0, -0.5].into_iter().cycle()).all(|(&g, w)| g == real(w)), "broadcast base");
+        let cis = Kernel::resolve(rustymath::Cis, Variant::checked(Complex::<R>::DTYPE), [R::DTYPE]).unwrap();
+        let ys = [0.0, FRAC_PI_2, -PI, 0.3, 1e20].map(R::narrow).into_iter().cycle().take(n).collect::<Vec<_>>();
+        let tolerance = 8.0 * if R::WIDE { f64::EPSILON } else { f32::EPSILON.into() };
+        for (count, xs) in [(0, &ys[..0]), (n, &ys[4..5]), (n, &ys[..])] {
+            let got: Vec<Complex<R>> = crate::support::mapped(&cis, [xs], count).unwrap();
+            assert_eq!(got.len(), count);
+            for (i, z) in got.iter().enumerate() {
+                let want = unary(rustymath::Cis, c(xs[if xs.len() == 1 { 0 } else { i }], R::zero()));
+                assert!((z.re.wide() - want.re.wide()).hypot(z.im.wide() - want.im.wide()) <= tolerance);
+            }
+            if xs.len() > 1 { assert!(got[..3] == [real(1.0), c(R::zero(), R::one()), real(-1.0)]); }
+        }
     }
 
     #[test]

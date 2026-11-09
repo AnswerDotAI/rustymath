@@ -40,7 +40,7 @@ impl<'a, T: Copy> Arg<'a, T> {
 
     /// Items `start..start + n` of this argument. A `One` argument stays as it is.
     #[inline(always)]
-    pub(crate) fn part(self, start: usize, n: usize) -> Self { match self { Arg::One(v) => Arg::One(v), Arg::Many(s) => Arg::Many(&s[start..start + n]) } }
+    pub fn part(self, start: usize, n: usize) -> Self { match self { Arg::One(v) => Arg::One(v), Arg::Many(s) => Arg::Many(&s[start..start + n]) } }
 }
 
 /// A type that function objects take or give: a float, a complex number, an integer, a Boolean, a character or an ordering. Pieces on several threads read and write items.

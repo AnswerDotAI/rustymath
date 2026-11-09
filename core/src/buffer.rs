@@ -780,6 +780,14 @@ casts!(integers u8, i16, i32, i64);
 casts!(floats half::f16, f32, f64);
 casts!(complex Complex32, Complex64);
 
+pub(crate) fn kept_as<T: Cast>(view: View<'_>, i: usize) -> Result<T, Error> {
+    let whole = match view { View::Floats(v) => v.get(i).fract() == 0.0, View::Complexes(v) => v.get(i).re.fract() == 0.0, _ => true };
+    let lost = || Error::new(Kind::Domain, format!("a {} item doesn't keep its value as {}", view.dtype().name(), T::DTYPE.name()));
+    if T::DTYPE.is_integral() && !whole { return Err(lost()); }
+    T::cast(view, i).map_err(|_| lost())
+}
+
+
 impl Buffer {
     /// Flattened positions whose item differs from its type's fill (zero, false or a space).
     pub fn nonzero(view: View<'_>) -> Vec<usize> {
@@ -832,12 +840,7 @@ impl Buffer {
     pub fn cast(view: View<'_>, dtype: DType) -> Result<Self, Error> { Self::cast_mapped(view, &crate::agreement::Mapping::Linear(1), view.len(), dtype) }
     /// The items of `view` at `dtype`, where every item keeps its value. Items convert as [`Buffer::cast`] converts them, and a float that becomes a Boolean or an integer must be whole. A float rounds to a float of another width. A Domain error where an item doesn't keep its value.
     pub fn kept(view: View<'_>, dtype: DType) -> Result<Self, Error> {
-        let whole = match view {
-            View::Floats(v) => (0..v.len()).all(|i| v.get(i).fract() == 0.0), View::Complexes(v) => (0..v.len()).all(|i| v.get(i).re.fract() == 0.0), _ => true
-        };
-        let lost = || Error::new(Kind::Domain, format!("a {} item doesn't keep its value as {}", view.dtype().name(), dtype.name()));
-        if dtype.is_integral() && !whole { return Err(lost()); }
-        Self::cast(view, dtype).map_err(|_| lost())
+        crate::convert::Conversion { input: view.dtype(), output: dtype, kind: crate::convert::ConversionKind::Keep }.buffer(view, true, crate::tolerant::Tolerance::EXACT)
     }
     /// Shared conversion dispatch for compact and mapped logical items. Unselected storage never participates in checked conversion.
     pub fn cast_mapped(view: View<'_>, mapping: &crate::agreement::Mapping, n: usize, dtype: DType) -> Result<Self, Error> {
@@ -846,7 +849,8 @@ impl Buffer {
         let missing = Missing::prototype(view.dtype(), &mut sources);
         let plan = ReadPlan::copy(0, view.len(), mapping.clone(), n, missing);
         let mut output = Self::with_capacity(dtype, n);
-        Read { sources: &sources, plan: &plan }.read_into(0..n, dtype, true, &mut output)?;
+        crate::convert::Conversion { input: view.dtype(), output: dtype, kind: crate::convert::ConversionKind::Cast }
+            .map(Read { sources: &sources, plan: &plan }, 0..n, true, &mut output)?;
         Ok(output)
     }
 }
@@ -854,37 +858,13 @@ impl Buffer {
 impl Buffer {
     /// The items of `view` as integers of `dtype`, as BPL's `ₓ` marks and Python's `astype` convert them: a float takes its floor within `t` and saturates at the range, NaN giving 0 ([`crate::convert::floored`]); an integer wraps to the width; a Boolean gives 0 or 1. Other items and targets convert as [`Buffer::cast`] converts them.
     pub fn floored(view: View<'_>, dtype: DType, t: impl crate::tolerant::Tolerant) -> Result<Self, Error> {
-        match (view, dtype) {
-            (View::Floats(values), DType::Integer(width)) => {
-                Ok(with_width!(width, I => I::buffer(with_floats!(values, |values| values.iter().map(|&x| crate::convert::floored::<I, _>(x, t)).collect()))))
-            }
-            (View::Integers(_) | View::Booleans(_), DType::Integer(_)) => Self::cast_results(view, dtype, false),
-            _ => Self::cast(view, dtype),
-        }
+        let tolerance = crate::tolerant::Tolerance::new(t.value()).expect("a tolerance lies in 0..1");
+        crate::convert::Conversion { input: view.dtype(), output: dtype, kind: crate::convert::ConversionKind::Floor }.buffer(view, true, tolerance)
     }
     pub fn cast_results(view: View<'_>, dtype: DType, checked: bool) -> Result<Self, Error> {
-        match (view, dtype) {
-            (View::Floats(values), DType::Integer(width)) => {
-                Ok(with_width!(width, I => I::buffer(with_floats!(values, |values| values.iter().map(|&x| crate::convert::saturated::<I, _>(x)).collect()))))
-            }
-            (View::Integers(values), DType::Integer(width)) if !checked => {
-                Ok(with_width!(width, T => with_ints!(values, |values| T::buffer(values.iter().map(|&x| x as T).collect()))))
-            }
-            (View::Booleans(values), DType::Integer(width)) => Ok(with_width!(width, T => T::buffer(values.iter().map(|&x| x as T).collect()))),
-            (_, DType::Character) if view.dtype().is_integral() => {
-                let items = (0..view.len()).map(|i| {
-                    let value = integer(view, i).ok().and_then(|x| u32::try_from(x).ok()).and_then(char::from_u32);
-                    match value {
-                        Some(value) => Ok(value), None if checked => Err(Error::new(Kind::Domain, "result is not a Unicode character")), None => Ok(char::FILL)
-                    }
-                }).collect::<Result<Vec<_>, _>>()?;
-                Ok(Self::Characters(items))
-            }
-            _ => with_dtype!(dtype, T => {
-                let mut items = Vec::new();
-                T::extend_cast(view, view.len(), checked, &mut items)?;
-                Ok(T::buffer(items))
-            }),
-        }
+        crate::convert::Conversion { input: view.dtype(), output: dtype, kind: crate::convert::ConversionKind::Truncate }.buffer(view, checked, crate::tolerant::Tolerance::EXACT)
     }
 }
+
+mod output;
+pub use output::{MapOutput, Output, OutputItem, Scratch};

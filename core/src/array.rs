@@ -40,7 +40,8 @@ impl<'a> ArrayView<'a> {
         self.sources.get(source)?.borrow(range)
     }
     pub fn affine(&self) -> Option<(View<'a>, usize, Vec<isize>)> {
-        let (source, base, strides) = self.plan.affine(self.layout.shape())?;
+        let (source, mapping) = self.plan.positional(self.layout.shape())?;
+        let (base, strides) = mapping.affine(self.layout.shape())?;
         let (view, base) = self.sources.get(source)?.affine(base, &strides, self.layout.shape())?;
         Some((view, base, strides))
     }
