@@ -762,7 +762,20 @@ fn stepping<T: Copy>(values: &[T], strides: &mut [Steps], position: impl Fn(T) -
     Some(first)
 }
 
-impl PartialEq for Table { fn eq(&self, other: &Self) -> bool { self.len == other.len && (0..self.len).all(|j| self.get(j) == other.get(j)) } }
+impl PartialEq for Table {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len != other.len { return false; }
+        // Cloned geometry compares without reading its index data; distinct recipes still compare their offsets.
+        let shared = self.start == other.start && match (&self.all, &other.all) {
+            (Positions::Listed(a), Positions::Listed(b)) => Arc::ptr_eq(a, b),
+            (Positions::Indices { values: a, size: sa, scale: ka, .. }, Positions::Indices { values: b, size: sb, scale: kb, .. }) => {
+                sa == sb && ka == kb && Arc::ptr_eq(a, b)
+            }
+            _ => false,
+        };
+        shared || (0..self.len).all(|j| self.get(j) == other.get(j))
+    }
+}
 impl Eq for Table {}
 
 /// Position `j` of the index values `view` along an axis of `size` positions.

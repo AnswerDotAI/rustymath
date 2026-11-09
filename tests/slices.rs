@@ -1169,6 +1169,19 @@ mod gather {
         assert!(check(&[20], &[2, 19], vec![along(2, 1), along(19, 1)]));
         assert!(check(&[5, 6, 2], &[3, 4, 3, 3, 2], vec![along(3, 12), along(4, 2), along(3, 12), along(3, 2), along(2, 1)]));
     }
+    /// Shared index storage still distinguishes its axis interpretation, scale and selected range.
+    #[test]
+    fn index_tables_compare_source_and_offsets() {
+        use rustymath::{buffer::{Buffer, IntBuf}, gather::{IndexSource, Table}};
+        let values: std::sync::Arc<dyn IndexSource> = std::sync::Arc::new(Buffer::Integers(IntBuf::I16(vec![-1, 0, 1])));
+        let table = Table::indices(values.clone(), 4, None);
+        assert_eq!(table, table.clone());
+        assert_eq!(table, Table::new(vec![3, 0, 1]));
+        assert_ne!(table, table.clone().scaled(2));
+        assert_ne!(table, Table::indices(values, 5, None));
+        assert_ne!(table.slice(0, 2), table.slice(1, 2));
+    }
+
     /// Index arrays pair by broadcasting and take the place of the first one, while a range keeps its axis in place. With one index array, pairing is the cross product.
     #[test]
     fn index_arrays_pair() {
