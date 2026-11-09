@@ -48,16 +48,22 @@ def attempt(case, namespace, units, timing):
     return timing.line(section, code, copies, '-' if budget is None else str(budget), best / N, footprint, (per_item, None)), copies, per_item
 
 def retimed(over, namespace, units, timing):
-    "Time each of `over`'s `(case, line)` pairs again, printing its new line, and give those still over budget, with their new lines."
-    again = []
-    for case, _ in over:
-        line, copies, _ = attempt(case, namespace, units, timing)
-        print(line, file=sys.stderr)
-        if case[2].over(copies): again.append((case, line))
-    return again
+    "Retry cases over budget after each of `timing.pauses`, warming before each retry, and return those still over. Print each failure before its retry and each new measurement."
+    for pause in timing.pauses:
+        if not over: break
+        for _, line in over: print(f'{line}: over, timed again after {pause:g} s', file=sys.stderr)
+        time.sleep(pause)
+        timing.warm()
+        again = []
+        for case, _ in over:
+            line, copies, _ = attempt(case, namespace, units, timing)
+            print(line, file=sys.stderr)
+            if case[2].over(copies): again.append((case, line))
+        over = again
+    return over
 
 def test_speed(capsys):
-    "Every case costs no more than its budget, and retires no more instructions than its recorded count allows, on the CPU that the budgets were set for (`timing.checks_budgets`). On any other CPU, it prints every cost, then each case still over, marked `over`, and fails on none. An ordinary run holds the timing lock shared, on one thread, beside builds and other tests. It then times each case over its budget again if it can hold the lock exclusively at once, and otherwise marks the case `unconfirmed` and doesn't fail it. A calibration run, which `RUSTYMATH_COSTS` asks for, holds the lock exclusively, prints every cost and times each case over its budget again after each of `timing.pauses`. Each case whose gap's hold has outlived the gap is printed, marked `stale`, and each whose instructions fall below its record divided by the margin is marked `fewer instructions`."
+    "Every case costs no more than its budget, and retires no more instructions than its recorded count allows, on the CPU that the budgets were set for (`timing.checks_budgets`). On any other CPU, it prints every cost, then each case still over, marked `over`, and fails on none. An ordinary run holds the timing lock shared, on one thread, beside builds and other tests. It retries each case over its budget after each of `timing.pauses` if it can hold the lock exclusively at once, and otherwise marks the case `unconfirmed` and doesn't fail it. A calibration run, which `RUSTYMATH_COSTS` asks for, holds the lock exclusively, prints every cost and times each case over its budget again after each of `timing.pauses`. Each case whose gap's hold has outlived the gap is printed, marked `stale`, and each whose instructions fall below its record divided by the margin is marked `fewer instructions`."
     timing = rm.timing(shared=not CALIBRATING)
     namespace, cases = arrays(), timing.budgets(Path(__file__).with_name('speed_python.txt').read_text())
     show, failures = not timing.checks_budgets or CALIBRATING, []
@@ -75,19 +81,13 @@ def test_speed(capsys):
                 if record.over(instructions, timing.count_margin): failures.append(f'{line}: instructions over the {record.value} recorded')
                 elif instructions * timing.count_margin < record.value: print(f'{line}: fewer instructions than the {record.value} recorded', file=sys.stderr)
             over = [(case, line) for case, line, copies, _ in measured if case[2] is not None and case[2].over(copies)]
-            for pause in timing.pauses if CALIBRATING else ():
-                if not over: break
-                for _, line in over: print(f'{line}: over, timed again after {pause:g} s', file=sys.stderr)
-                time.sleep(pause)
-                timing.warm()
-                over = retimed(over, namespace, units, timing)
+            if CALIBRATING: over = retimed(over, namespace, units, timing)
         if over and not CALIBRATING:
             if (quiet := rm.try_timing()) is None:
                 for _, line in over: print(f'{line}: unconfirmed, because builds or tests hold the timing lock', file=sys.stderr)
                 over = []
             else:
                 with held(quiet):
-                    timing.warm()
                     for _, line in over: print(f'{line}: over, timed again with the timing lock held exclusively', file=sys.stderr)
                     over = retimed(over, namespace, units, timing)
         failures += [line for _, line in over]

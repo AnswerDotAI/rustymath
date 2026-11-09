@@ -13,7 +13,7 @@ authors = [{name = "Jeremy Howard", email = "github@jhoward.fastmail.fm"}]
 classifiers = ["Programming Language :: Rust", "Programming Language :: Python :: Implementation :: CPython"]
 
 [project.optional-dependencies]
-dev = ["fastship>=0.0.11", "fastws-cli>=0.0.34", "maturin>=1.0,<2.0", "pytest", "pytest-timeout", "nbdev", "numpy", "pandas", "scipy"]
+dev = ["fastship>=0.0.11", "fastws-cli>=0.0.35", "maturin>=1.0,<2.0", "pytest", "pytest-timeout", "nbdev", "numpy", "pandas", "scipy"]
 
 [project.urls]
 Homepage = "https://github.com/AnswerDotAI/rustymath"
@@ -36,7 +36,7 @@ module-name = "rustymath._core"
 macos-deployment-target = "15.0"
 
 [tool.uv]
-cache-keys = [{ file = "pyproject.toml" }, { file = "Cargo.toml" }, { file = "core/Cargo.toml" }, { file = "kernels/Cargo.toml" }, { file = "py/Cargo.toml" }]
+cache-keys = [{ file = "pyproject.toml" }, { file = "Cargo.toml" }, { file = "core/Cargo.toml" }, { file = "kernels/Cargo.toml" }, { file = "py/Cargo.toml" }, { file = "timing/Cargo.toml" }, { file = "buffer/Cargo.toml" }]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
