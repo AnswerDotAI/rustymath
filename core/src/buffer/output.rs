@@ -4,7 +4,7 @@ use crate::{Arg, parallel::Slots};
 pub trait OutputItem: Element { fn slots<'s, 'b>(output: &'s mut MapOutput<'_, 'b>) -> Option<&'s mut Slots<'b, Self>>; }
 
 macro_rules! outputs {
-    ($($v:ident: $t:ty),+ $(,)?) => {
+    ([$($v:ident: ($dtype:expr) $t:ty),+]) => {
         /// Where a map appends: an owned buffer or the next slots of a caller's result.
         pub enum MapOutput<'a, 'b> { Buffer(&'a mut Buffer), $($v(&'a mut Slots<'b, $t>)),+ }
         impl<'b> MapOutput<'_, 'b> {
@@ -27,8 +27,7 @@ macro_rules! outputs {
         })+
     };
 }
-outputs!(F16: half::f16, F32: f32, F64: f64, Bool: bool, U8: u8, I16: i16, I32: i32, I64: i64,
-    C32: num_complex::Complex32, C64: num_complex::Complex64, Char: char);
+element_types!((outputs));
 
 /// Conversion buffers retained for one execution, by computing dtype and operand position.
 #[derive(Default)]
