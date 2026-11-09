@@ -611,9 +611,12 @@ mod operation {
         assert_eq!(u8::vec(Buffer::floored(i64::view(&[300]), u8::DTYPE, Tolerance::EXACT).unwrap()).unwrap(), [44]);
         let errors = rustymath::error::ErrorSlot::default();
         errors.within(|| {
-            assert!(Buffer::kept(data, i16::DTYPE).is_err());
-            assert!(Buffer::cast_results(i64::view(&[300]), u8::DTYPE, true).is_err());
-            assert!(Buffer::cast_results(i64::view(&[0xd800]), char::DTYPE, true).is_err());
+            assert!(Buffer::kept(data, i16::DTYPE).is_ok());
+            assert_eq!(errors.take().unwrap().kind, rustymath::error::Kind::Domain);
+            assert!(Buffer::cast_results(i64::view(&[300]), u8::DTYPE, true).is_ok());
+            assert_eq!(errors.take().unwrap().kind, rustymath::error::Kind::Overflow);
+            assert!(Buffer::cast_results(i64::view(&[0xd800]), char::DTYPE, true).is_ok());
+            assert_eq!(errors.take().unwrap().kind, rustymath::error::Kind::Domain);
         });
     }
 

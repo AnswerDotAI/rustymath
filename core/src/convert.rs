@@ -12,6 +12,51 @@ pub enum ConversionKind { Cast, Truncate, Bits, Keep, Floor }
 /// Resolved kinds include the working float width even when the other kind is a word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Conversion { pub input: crate::buffer::DType, pub output: crate::buffer::DType, pub kind: ConversionKind }
+
+macro_rules! conversion {
+    ($call:expr, $checked:expr, $tolerance:expr, $write:ident) => {{
+        use crate::{buffer::{DType, Element, FloatWidth, Width}, error::{Error, Kind}};
+        match ($call.kind, $call.input, $call.output) {
+            (ConversionKind::Floor, DType::Float(width), DType::Integer(to)) => with_width!(to, I => with_float_width!(width, F => {
+                crate::with_tolerance!($tolerance, |t| $write!(F, I, |x| Ok(floored(x, t))))
+            })),
+            (ConversionKind::Floor, DType::Integer(from), DType::Integer(to)) => {
+                with_width!(to, I => with_width!(from, S => $write!(S, I, |x| Ok(x as I))))
+            }
+            (ConversionKind::Floor | ConversionKind::Truncate, DType::Boolean, DType::Integer(to)) => {
+                with_width!(to, I => $write!(bool, I, |x| Ok(u8::from(x) as I)))
+            }
+            (ConversionKind::Truncate, DType::Float(width), DType::Integer(to)) => {
+                with_width!(to, I => with_float_width!(width, F => $write!(F, I, |x| Ok(saturated(x)))))
+            }
+            (ConversionKind::Cast | ConversionKind::Truncate, DType::Integer(from), DType::Integer(to)) => with_width!(to, I => with_width!(from, S => {
+                $write!(S, I, |x| {
+                    if $checked { I::try_from(x).map_err(|_| Error::new(Kind::Overflow, "integer doesn't fit its converted dtype")) } else { Ok(x as I) }
+                })
+            })),
+            (ConversionKind::Truncate, input_type, DType::Character) if input_type.is_integral() => $write!(i64, char, |x| {
+                match u32::try_from(x).ok().and_then(char::from_u32) {
+                    Some(x) => Ok(x), None if $checked => Err(Error::new(Kind::Domain, "result is not a Unicode character")), None => Ok(char::FILL)
+                }
+            }),
+            (ConversionKind::Bits, DType::Float(FloatWidth::F32), DType::Integer(Width::I64)) => {
+                $write!(f32, i64, |x| Ok(i64::from(x.to_bits())))
+            }
+            (ConversionKind::Bits, DType::Float(FloatWidth::F64), DType::Integer(Width::I64)) => {
+                $write!(f64, i64, |x| Ok(x.to_bits() as i64))
+            }
+            (ConversionKind::Bits, DType::Integer(_), DType::Float(FloatWidth::F32)) => {
+                $write!(i64, f32, |x| Ok(f32::from_bits(x as u32)))
+            }
+            (ConversionKind::Bits, DType::Integer(_), DType::Float(FloatWidth::F64)) => {
+                $write!(i64, f64, |x| Ok(f64::from_bits(x as u64)))
+            }
+            (ConversionKind::Keep, _, dtype) => with_dtype!(dtype, T => $write!(@keep T)),
+            (ConversionKind::Cast | ConversionKind::Floor | ConversionKind::Truncate, _, dtype) => with_dtype!(dtype, T => $write!(@cast T)),
+            _ => $write!(@unsupported),
+        }
+    }};
+}
 impl Conversion {
     pub fn validity<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(self, o: &O, x: O::V) -> Option<(crate::error::Kind, O::B)> {
         use crate::buffer::{DType, Width};
@@ -45,11 +90,20 @@ impl Conversion {
                         .validity::<f64, _>(&crate::recipe::RangeOps(self.input), crate::domain::Range::of_dtype(self.input))
                         .is_some_and(|(_, valid)| valid != Some(true)))
     }
-    /// Converts stored items through the same resolved call used for mapped reads.
+    /// Converts contiguous storage through the shared typed conversion rules, without a read plan.
     pub(crate) fn buffer(self, view: crate::buffer::View<'_>, checked: bool, tolerance: crate::tolerant::Tolerance) -> Result<crate::buffer::Buffer, crate::error::Error> {
-        let mut output = crate::buffer::Buffer::with_capacity(self.output, view.len());
-        self.append(view, checked, tolerance, &mut crate::buffer::Scratch::default(), crate::buffer::MapOutput::Buffer(&mut output))?;
-        Ok(output)
+        use crate::buffer::Cast;
+        macro_rules! write {
+            ($s:ty, $t:ty, $convert:expr) => { Ok(converted_buffer::<$s, $t>(view, checked, $convert)) };
+            (@keep $t:ty) => { Ok(<$t>::buffer((0..view.len()).map(|i| converted_item(crate::buffer::kept_as::<$t>(view, i)).0).collect())) };
+            (@cast $t:ty) => {{
+                let mut values = Vec::with_capacity(view.len());
+                if let Err(error) = <$t>::extend_cast(view, view.len(), checked, &mut values) { crate::error::record(error); values.resize(view.len(), <$t>::FILL); }
+                Ok(<$t>::buffer(values))
+            }};
+            (@unsupported) => { Err(crate::error::Error::new(crate::error::Kind::Domain, "unsupported resolved conversion")) };
+        }
+        crate::error::checked(|| conversion!(self, checked, tolerance, write))
     }
     pub(crate) fn append<'a, 'b>(
         self, view: crate::buffer::View<'_>, checked: bool, tolerance: crate::tolerant::Tolerance,
@@ -70,81 +124,44 @@ impl Conversion {
         self, input: crate::agreement::Read<'_>, range: std::ops::Range<usize>, checked: bool, tolerance: crate::tolerant::Tolerance,
         scratch: &'a mut crate::buffer::Scratch, target: crate::buffer::MapOutput<'a, 'b>
     ) -> Result<(), crate::error::Error> {
-        use crate::buffer::{DType, Element, FloatWidth, Width};
-        use crate::error::{Error, Kind};
         let mut output = crate::buffer::Output { target, result_dtype: self.output, checked, scratch: Some(scratch) };
-        let errors = std::sync::Mutex::new(None);
-        let failed = |error: Error| {
-            crate::error::record(error.clone());
-            errors.lock().expect("conversion error lock is not poisoned").get_or_insert(error);
-        };
-        let result = crate::error::checked(|| match (self.kind, self.input, self.output) {
-            (ConversionKind::Floor, DType::Float(width), DType::Integer(to)) => with_width!(to, I => with_float_width!(width, F => {
-                crate::with_tolerance!(tolerance, |t| written::<F, I>(input, range, checked, &mut output, &failed, |x| Ok(floored(x, t))))
-            })),
-            (ConversionKind::Floor, DType::Integer(from), DType::Integer(to)) => {
-                with_width!(to, I => with_width!(from, S => written::<S, I>(input, range, checked, &mut output, &failed, |x| Ok(x as I))))
-            }
-            (ConversionKind::Floor | ConversionKind::Truncate, DType::Boolean, DType::Integer(to)) => {
-                with_width!(to, I => written::<bool, I>(input, range, checked, &mut output, &failed, |x| Ok(u8::from(x) as I)))
-            }
-            (ConversionKind::Truncate, DType::Float(width), DType::Integer(to)) => {
-                with_width!(to, I => with_float_width!(width, F => written::<F, I>(input, range, checked, &mut output, &failed, |x| Ok(saturated(x)))))
-            }
-            (ConversionKind::Cast | ConversionKind::Truncate, DType::Integer(from), DType::Integer(to)) => with_width!(to, I => with_width!(from, S => {
-                written::<S, I>(input, range, checked, &mut output, &failed, |x| {
-                    if checked { I::try_from(x).map_err(|_| Error::new(Kind::Overflow, "integer doesn't fit its converted dtype")) } else { Ok(x as I) }
-                })
-            })),
-            (ConversionKind::Truncate, input_type, DType::Character) if input_type.is_integral() => written::<i64, char>(input, range, checked, &mut output, &failed, |x| {
-                match u32::try_from(x).ok().and_then(char::from_u32) {
-                    Some(x) => Ok(x), None if checked => Err(Error::new(Kind::Domain, "result is not a Unicode character")), None => Ok(char::FILL)
-                }
-            }),
-            (ConversionKind::Bits, DType::Float(FloatWidth::F32), DType::Integer(Width::I64)) => {
-                written::<f32, i64>(input, range, checked, &mut output, &failed, |x| Ok(i64::from(x.to_bits())))
-            }
-            (ConversionKind::Bits, DType::Float(FloatWidth::F64), DType::Integer(Width::I64)) => {
-                written::<f64, i64>(input, range, checked, &mut output, &failed, |x| Ok(x.to_bits() as i64))
-            }
-            (ConversionKind::Bits, DType::Integer(_), DType::Float(FloatWidth::F32)) => {
-                written::<i64, f32>(input, range, checked, &mut output, &failed, |x| Ok(f32::from_bits(x as u32)))
-            }
-            (ConversionKind::Bits, DType::Integer(_), DType::Float(FloatWidth::F64)) => {
-                written::<i64, f64>(input, range, checked, &mut output, &failed, |x| Ok(f64::from_bits(x as u64)))
-            }
-            (ConversionKind::Keep, _, dtype) => with_dtype!(dtype, T => {
-                output.write::<T>(range.len(), &|part, slots, work| {
-                    let mut local = crate::buffer::Buffer::with_capacity(self.input, 0);
-                    let scratch = match work { Some(work) => work.buffer(self.input), None => &mut local };
-                    match input.part_view(part.start + range.start..part.end + range.start, self.input, checked, scratch) {
-                        Ok(values) => unsafe { slots.fill(part.len(), |out| {
-                            let mut good = true;
-                            for (i, slot) in out.iter_mut().enumerate() {
-                                slot.write(match crate::buffer::kept_as::<T>(values, i) {
-                                    Ok(value) => value, Err(error) => { failed(error); good = false; T::FILL }
-                                });
-                            }
-                            good
-                        }) },
-                        Err(error) => {
-                            failed(error);
-                            unsafe { slots.fill(part.len(), |out| { for slot in out { slot.write(T::FILL); } false }) }
-                        }
-                    }
-                })
-            }),
-            (ConversionKind::Cast | ConversionKind::Floor | ConversionKind::Truncate, _, dtype) => with_dtype!(dtype, T => written::<T, T>(input, range, checked, &mut output, &failed, Ok)),
-            _ => { output.target.fill(range.len()); Err(Error::new(Kind::Domain, "unsupported resolved conversion")) },
-        });
-        result.and_then(|()| errors.into_inner().expect("conversion error lock is not poisoned").map_or(Ok(()), Err))
+        macro_rules! write {
+            ($s:ty, $t:ty, $convert:expr) => { written::<$s, $t>(input, range, checked, &mut output, $convert) };
+            (@cast $t:ty) => { write!($t, $t, Ok) };
+            (@keep $t:ty) => { kept_mapped::<$t>(self.input, input, range, checked, &mut output) };
+            (@unsupported) => {{ output.target.fill(range.len()); Err(Error::new(Kind::Domain, "unsupported resolved conversion")) }};
+        }
+        crate::error::checked(|| conversion!(self, checked, tolerance, write))
     }
+}
+
+#[inline]
+fn converted_item<T: crate::buffer::Element>(value: Result<T, crate::error::Error>) -> (T, bool) {
+    match value { Ok(value) => (value, true), Err(error) => { crate::error::record(error); (T::FILL, false) } }
+}
+
+fn converted_buffer<S: crate::buffer::Cast, T: crate::buffer::Element>(
+    view: crate::buffer::View<'_>, checked: bool, convert: impl Fn(S) -> Result<T, crate::error::Error>
+) -> crate::buffer::Buffer {
+    let (mut values, mut scratch) = (Vec::with_capacity(view.len()), Vec::new());
+    for from in (0..view.len()).step_by(crate::CHUNK) {
+        let part = view.slice(from..(from + crate::CHUNK).min(view.len()));
+        let items = if let Some(items) = S::of(part) { items } else {
+            scratch.clear();
+            if let Err(error) = S::extend_cast(part, part.len(), checked, &mut scratch) {
+                crate::error::record(error); values.resize(values.len() + part.len(), T::FILL); continue;
+            }
+            &scratch
+        };
+        values.extend(items.iter().map(|&x| converted_item(convert(x)).0));
+    }
+    T::buffer(values)
 }
 
 #[inline]
 fn written<S: crate::buffer::Cast, T: crate::buffer::OutputItem>(
     input: crate::agreement::Read<'_>, range: std::ops::Range<usize>, checked: bool, output: &mut crate::buffer::Output<'_, '_>,
-    failed: &(dyn Fn(crate::error::Error) + Sync), convert: impl Fn(S) -> Result<T, crate::error::Error> + Sync
+    convert: impl Fn(S) -> Result<T, crate::error::Error> + Sync
 ) -> Result<(), crate::error::Error> {
     output.write::<T>(range.len(), &|part, slots, work| {
         let part = part.start + range.start..part.end + range.start;
@@ -159,13 +176,11 @@ fn written<S: crate::buffer::Cast, T: crate::buffer::OutputItem>(
             let input = match input.part_counted::<S>(range, checked, scratch) {
                 Ok((input, n)) => { copied += n; input }
                 Err(error) => {
-                    failed(error);
+                    crate::error::record(error);
                     return unsafe { slots.fill(n, |out| { for slot in out { slot.write(T::FILL); } false }) } & ok;
                 }
             };
-            slots.pairs(input, crate::Arg::One(()), n, |x, ()| match convert(x) {
-                Ok(value) => (value, true), Err(error) => { failed(error); (T::FILL, false) }
-            }) & ok
+            slots.pairs(input, crate::Arg::One(()), n, |x, ()| converted_item(convert(x))) & ok
         });
         if let Some(work) = work { work.record_copies(copied); }
         ok
@@ -319,4 +334,28 @@ ints! {
     u16: narrow, |i| f32::from_low(i.into(), 0.0), f32::from_low(i.into(), 0.0).into();
     u32: wide, |i| f64::from_low(i.into(), 0.0) as f32, f64::from_low(i.into(), 0.0);
     i64: wide, |i| wide_float(i) as f32, wide_float(i);
+}
+
+fn kept_mapped<T: crate::buffer::OutputItem + crate::buffer::Cast>(
+    dtype: crate::buffer::DType, input: crate::agreement::Read<'_>, range: std::ops::Range<usize>, checked: bool, output: &mut crate::buffer::Output<'_, '_>
+) -> Result<(), crate::error::Error> {
+    output.write::<T>(range.len(), &|part, slots, work| {
+        let mut local = crate::buffer::Buffer::with_capacity(dtype, 0);
+        let scratch = match work { Some(work) => work.buffer(dtype), None => &mut local };
+        match input.part_view(part.start + range.start..part.end + range.start, dtype, checked, scratch) {
+            Ok(values) => unsafe { slots.fill(part.len(), |out| {
+                let mut good = true;
+                for (i, slot) in out.iter_mut().enumerate() {
+                    slot.write(match crate::buffer::kept_as::<T>(values, i) {
+                        Ok(value) => value, Err(error) => { crate::error::record(error); good = false; T::FILL }
+                    });
+                }
+                good
+            }) },
+            Err(error) => {
+                crate::error::record(error);
+                unsafe { slots.fill(part.len(), |out| { for slot in out { slot.write(T::FILL); } false }) }
+            }
+        }
+    })
 }

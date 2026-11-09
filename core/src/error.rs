@@ -49,7 +49,7 @@ impl std::fmt::Display for Error { fn fmt(&self, f: &mut std::fmt::Formatter<'_>
 
 impl std::error::Error for Error {}
 
-/// Measures and the Interfaces' errors entry: the session's 1 error slot, homed here so kernels set it from every thread that runs the read's work (rustymath's parallel runtime installs the caller's slot on its workers). It keeps the 1st data error and a count of errors recorded. basedpl's `Session` holds one, rustymath's Python API reads its own; its representation is this module's.
+/// The first recorded numerical error and its count. The parallel runtime installs the caller's active slot on workers; `checked` supplies one for a standalone operation.
 #[derive(Clone, Default)]
 pub struct ErrorSlot(std::sync::Arc<Errors>);
 
@@ -88,6 +88,8 @@ pub fn record(error: Error) {
 }
 
 /// Checked eager entry for Rust and Python callers.
+/// Returns direct failures and, when no slot is active, the first recorded failure. With an
+/// active slot, recorded failures remain for its enclosing operation to collect.
 pub fn checked<R>(run: impl FnOnce() -> Result<R, Error>) -> Result<R, Error> {
     let (mut run, mut result) = (Some(run), None);
     let recorded = recorded(&mut || result = run.take().map(|run| run()));

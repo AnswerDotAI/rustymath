@@ -70,6 +70,9 @@ impl Map {
     pub fn arity(&self) -> usize { match self { Self::Kernel(kernel, _) => kernel.arity(), Self::Convert(..) => 1 } }
     /// Appends every result, including initialized fallback items on a numerical error.
     /// Errors are execution failures, not a pre-write refusal to handle the call.
+    /// Both variants follow [`crate::error::checked`]: an enclosing checked scope owns recorded
+    /// numerical failures. Under an active error slot, `Ok` alone does not establish success.
+    /// Discard private outputs when that scope fails; neither `Err` nor a recorded failure is a route refusal.
     pub fn run<'a, 'b>(
         &self, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>,
         scratch: &'a mut crate::buffer::Scratch, mut output: MapOutput<'a, 'b>

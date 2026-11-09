@@ -1063,7 +1063,7 @@ impl Agreement {
             let shape = if left.shape().is_empty() { right.shape() } else { left.shape() };
             let len = generated_len(shape)?;
             let map = |l: &Layout| if len > 1 && l.shape() == shape { Mapping::Linear(1) } else { Mapping::Single };
-            return Ok(Self { layout: Layout::from(shape.to_vec()), len, left: map(left), right: map(right) });
+            return Ok(Self { layout: Layout::from(shape), len, left: map(left), right: map(right) });
         }
         let [xa, ya] = Self::axis_pairs(left, right);
         Self::mapped(left, right, &xa, &ya, false)
