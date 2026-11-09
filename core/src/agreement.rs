@@ -736,6 +736,22 @@ impl<'a> Walked<'a> {
     }
     /// The length of the cycle whose items the mapping's positions read again in order (`Period::Cycles`), where it has one.
     pub fn cycle(&self) -> Option<usize> { *self.cycle.get_or_init(|| match self.mapping.period() { Some(Period::Cycles(p)) => Some(p), _ => None }) }
+
+    /// A walking copy, or one cycle written out to cover runs of up to `cover` items at any phase.
+    /// `None` only when the mapping has neither a tiling period nor explicit walking entries.
+    pub fn gathered(&self, input: crate::buffer::View<'_>, cover: usize) -> Option<crate::buffer::Buffer> {
+        with_dtype!(input.dtype(), A => {
+            let data = A::of(input).expect("the view has its dtype");
+            let mut items = Vec::new();
+            if tiled_cycle(data, self, cover, &mut items).is_none() {
+                let Mapping::Steps { steps, .. } = &**self else { return None; };
+                let n = Steps::count(steps);
+                items.reserve(n);
+                expanded_items(self, data, 0, n, &mut items);
+            }
+            Some(A::buffer(items))
+        })
+    }
 }
 
 impl<'a> From<&'a Mapping> for Walked<'a> { fn from(mapping: &'a Mapping) -> Self { Self::new(Cow::Borrowed(mapping)) } }
