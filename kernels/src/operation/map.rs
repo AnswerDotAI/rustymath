@@ -21,17 +21,17 @@ pub(super) fn map_formula<K: crate::facts::Formula<N>, const N: usize>(
     if let Some(slices) = &slices {
         let valid = |ok: bool| if judge.checked && !ok { Err(Kind::Domain) } else { Ok(()) };
         let blocks = match variant.dtype {
-            DType::Float(FloatWidth::F64) => sliced(object, &ops, slices.double(), inputs, range.clone(), variant.checked, &valid, output),
-            DType::Float(FloatWidth::F32) => sliced(object, &ops, slices.single(), inputs, range.clone(), variant.checked, &valid, output),
-            DType::Float(FloatWidth::F16) => slices.single().map(|single| {
+            DType::Float(FloatWidth::F64) => sliced(object, &ops, slices.double, inputs, range.clone(), variant.checked, &valid, output),
+            DType::Float(FloatWidth::F32) => sliced(object, &ops, slices.single, inputs, range.clone(), variant.checked, &valid, output),
+            DType::Float(FloatWidth::F16) => slices.single.map(|single| {
                 map_blocks::<f32, half::f16, N>(inputs, range.clone(), variant.checked, output, &|args, n, out| {
                     valid(unsafe { crate::slice::buffered(n, out, |out| single(object, &ops, args, n, out), half::f16::from_f32) })
                 })
             }),
-            DType::Integer(Width::U8) => sliced(object, &ops, slices.byte(), inputs, range.clone(), variant.checked, &valid, output),
-            DType::Integer(Width::I16) => sliced(object, &ops, slices.short(), inputs, range.clone(), variant.checked, &valid, output),
-            DType::Integer(Width::I32) => sliced(object, &ops, slices.int(), inputs, range.clone(), variant.checked, &valid, output),
-            DType::Integer(Width::I64) => sliced(object, &ops, slices.long(), inputs, range.clone(), variant.checked, &valid, output),
+            DType::Integer(Width::U8) => sliced(object, &ops, slices.byte, inputs, range.clone(), variant.checked, &valid, output),
+            DType::Integer(Width::I16) => sliced(object, &ops, slices.short, inputs, range.clone(), variant.checked, &valid, output),
+            DType::Integer(Width::I32) => sliced(object, &ops, slices.int, inputs, range.clone(), variant.checked, &valid, output),
+            DType::Integer(Width::I64) => sliced(object, &ops, slices.long, inputs, range.clone(), variant.checked, &valid, output),
             _ => None,
         };
         if let Some(blocks) = blocks { return blocks; }
@@ -45,16 +45,16 @@ pub(super) fn map_formula<K: crate::facts::Formula<N>, const N: usize>(
         },
         DType::Integer(width) => with_width!(width, I => map_integer::<K, I, N>(object, variant, inputs, range, judge, output)),
         DType::Complex(crate::buffer::ComplexWidth::F32) if K::REAL_COMPLEX && inputs.real() => {
-            map_real_complex::<K, f32, N>(object, variant, inputs, range, &ops, slices.and_then(|s| s.real_complex_single()), output)
+            map_real_complex::<K, f32, N>(object, variant, inputs, range, &ops, slices.and_then(|s| s.real_complex_single), output)
         }
         DType::Complex(crate::buffer::ComplexWidth::F64) if K::REAL_COMPLEX && inputs.real() => {
-            map_real_complex::<K, f64, N>(object, variant, inputs, range, &ops, slices.and_then(|s| s.real_complex_double()), output)
+            map_real_complex::<K, f64, N>(object, variant, inputs, range, &ops, slices.and_then(|s| s.real_complex_double), output)
         }
         DType::Complex(crate::buffer::ComplexWidth::F32) => {
-            map_complex::<K, f32, N>(object, variant, inputs, range, &ops, slices.and_then(|s| s.complex_single()), judge, output)
+            map_complex::<K, f32, N>(object, variant, inputs, range, &ops, slices.as_ref().and_then(|s| s.complex_single), slices.and_then(|s| s.complex_test_single), judge, output)
         }
         DType::Complex(crate::buffer::ComplexWidth::F64) => {
-            map_complex::<K, f64, N>(object, variant, inputs, range, &ops, slices.and_then(|s| s.complex_double()), judge, output)
+            map_complex::<K, f64, N>(object, variant, inputs, range, &ops, slices.as_ref().and_then(|s| s.complex_double), slices.and_then(|s| s.complex_test_double), judge, output)
         }
         DType::Character => Err(Error::new(Kind::Domain, "characters are not numerical kernel operands")),
     }

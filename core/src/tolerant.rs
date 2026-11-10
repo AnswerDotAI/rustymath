@@ -1,10 +1,10 @@
 //! Tolerant comparison of floats: `x` equals `y` within a relative tolerance `t` when `|x-y|` is less than `t` times the larger of `|x|` and `|y|`. APL's definition says at most, which differs only where `|x-y|` lands exactly on that bound. Dyalog APL calls `t` the comparison tolerance, `⎕CT`, and its default is 1e-14. A tolerance has no effect when either number is zero.
 //!
-//! A tolerance is a value of a type that implements `Tolerant`: a `Tolerance`, or `Exactly`, whose methods compile to plain IEEE comparisons and `floor`. A function written once over `Tolerant` compiles to a version for each. `with_tolerance!` picks one when the program runs, outside any loop. The methods are generic over the float type and compute at its width. `TolerantComplex` gives the complex versions. The function objects `Equal`, `NotEqual`, `Less`, `LessEqual`, `Greater`, `GreaterEqual`, `Matches`, `Compare`, `Floor`, `Ceil`, `Residue`, `FloorDivide`, `Gcd` and `Lcm` each hold a `Tolerance` and give the same results as the methods, one item at a time or over slices. A slice form picks its loop with `with_tolerance!` once. A comparison's slice form compares many items with one number through the range of floats equal to it (`Tolerant::range`), so each item takes one or two plain comparisons. All but `Matches` and `Compare` also have integer forms, from the `integer` module, which ignore the tolerance. `Floor` and `Ceil` also take Booleans.
+//! `Tolerant` supplies real comparison and rounding; `TolerantComplex` supplies complex operations. Formula objects hold a Tolerance. Native bulk loops choose Exactly or Tolerance once through `with_tolerance!`, and comparison kernels use `against` for one constant argument.
 //!
 //! Tolerant equality isn't transitive: `x` can equal `y` and `y` equal `z` while `x` doesn't equal `z`. Hash maps and sorting need a transitive `PartialEq`. This module therefore has no float type with a tolerant `==`. Each comparison is a method of the tolerance.
 use crate::{
-    Arg, BETWEEN_CHECKS, buffer::Element, convert::{float, int}, error::Error, float::{Float, Native}, interrupt::check, recipe::{self, Floats},
+    Arg, BETWEEN_CHECKS, convert::{float, int}, error::Error, float::{Float, Native}, interrupt::check, recipe::{self, Floats},
     search::{self, Chains, Key, Links}, slice::{Total, pairs_into}
 };
 use num_bigint::BigInt;
@@ -25,6 +25,9 @@ impl Tolerance {
     /// The tolerance `t`, when it lies from 0 up to but not including 1. `None` for any other `t`, including NaN.
     #[inline]
     pub fn new(t: f64) -> Option<Self> { (0.0..1.0).contains(&t).then_some(Self(t)) }
+    /// A valid runtime tolerance in place of this formula's declared tolerance.
+    #[inline]
+    pub(crate) fn overridden(self, value: Option<f64>) -> Self { value.and_then(Self::new).unwrap_or(self) }
     /// Whether this tolerance is 0.
     #[inline]
     pub fn is_exact(self) -> bool { self.0 == 0.0 }
@@ -290,45 +293,6 @@ macro_rules! with_tolerance {
     }};
 }
 
-/// Writes a tolerant function object's forms from one item body over a tolerance `$t`, at `real` or at a list of concrete types, as `forms!` takes them, with its attributes, such as `#[inline]`. The object holds a `Tolerance`. Its slice form reads it once and runs the body's loop at `Exactly` where the tolerance is 0. Its scalar forms run the body at the `Tolerance` itself, which gives the exact result at 0 with no test for each item, so a caller's own loop over items has no branch to hoist.
-macro_rules! tolerant {
-    ($(#[$($m:tt)+])* $object:ident at real $(=> $o:ty)?: $($rest:tt)+) => { tolerant!(@forms [$(#[$($m)+])*], $object, (real $(=> $o)?), $($rest)+); };
-    ($(#[$($m:tt)+])* $object:ident at $($e:ty $(=> $o:ty)?),+: $($rest:tt)+) => { tolerant!(@forms [$(#[$($m)+])*], $object, ($($e $(=> $o)?),+), $($rest)+); };
-    (@forms [$(#[$($m:tt)+])*], $object:ident, ($($at:tt)+), |$t:ident, [$($x:ident),+]| $body:expr) => {
-        forms!($(#[$($m)+])* $object at $($at)+: |k, [$($x),+]| { let $t = k.0; $body },
-            many |k, [$($x),+], n, out| with_tolerance!(k.0, |$t| each!([$($x),+], n, out, |[$($x),+]| $body)));
-    };
-}
-
-/// `b` as 1 or 0 for an [`Indicator`]. Choosing between the two constants turns a comparison's lane mask into the result with one `and`. [`Element::truth`] converts through an integer instead, which suits the stored Booleans that `slice::masked` reads but would narrow and widen a lane mask here.
-#[inline(always)]
-fn indicated<E: Element>(b: bool) -> E where bool: crate::buffer::Source<E> {
-    if b { crate::buffer::Source::<E>::read(true) } else { crate::buffer::Source::<E>::read(false) }
-}
-
-/// Writes an [`Indicator`]'s forms for the tolerant comparison `$object` at each float type `$e`, through `forms!`: its item body over a tolerance `$t` as 1 or 0, and a slice form that compares many items with one number through `against`, writing each float in the same loop.
-macro_rules! indicator {
-    ($object:ident: |$t:ident, [$x:ident, $y:ident]| $body:expr, $left:ident, $right:ident, $($e:ty),+) => {$(
-        forms!([Indicator<$object>] at $e: |k, [$x, $y]| crate::slice::Total(indicated::<$e>({ let $t = k.0.0; $body })),
-            many |k, [$x, $y], n, out| match against(k.0.0, $x, $y, n, out, Band::$left, Band::$right, |xs, lo, hi, band, out| in_band(xs, lo, hi, band, out, indicated::<$e>)) {
-                Some(ok) => ok,
-                None => with_tolerance!(k.0.0, |$t| each!([$x, $y], n, out, |[$x, $y]| crate::slice::Total(indicated::<$e>($body)))),
-            });
-    )+};
-}
-
-/// Writes a tolerant comparison's forms at `real`: its item body over a tolerance `$t`, at the `Tolerance` itself, as `tolerant!` writes them, and a slice form that compares many items with one number through `against`. `$left` is the band an item must lie in when it is on the left of the one number, and `$right` the band when it is on the right. It also writes the comparison's [`Indicator`] forms at `f32` and `f64`.
-macro_rules! compared {
-    ($object:ident: |$t:ident, [$x:ident, $y:ident]| $body:expr, $left:ident, $right:ident) => {
-        forms!($object at real => bool: |k, [$x, $y]| { let $t = k.0; $body },
-            many |k, [$x, $y], n, out| match against(k.0, $x, $y, n, out, Band::$left, Band::$right, Banded::banded) {
-                Some(ok) => ok,
-                None => with_tolerance!(k.0, |$t| each!([$x, $y], n, out, |[$x, $y]| $body)),
-            });
-        indicator!($object: |$t, [$x, $y]| $body, $left, $right, f32, f64);
-        impl Banding for $object { const BANDS: (Band, Band) = (Band::$left, Band::$right); }
-    };
-}
 
 /// Where an item must lie against the range of floats equal to one number (`Tolerant::range`) for a comparison with that number to hold. `NotAbove` and `NotBelow` include the range itself.
 #[derive(Clone, Copy)]
@@ -396,9 +360,6 @@ pub fn against<F: Float, O>(
     Some(true)
 }
 
-/// A comparison's results as floats, 1 where it holds and 0 where it doesn't, as a [`Binary`](crate::Binary) at `f32` and `f64` for each comparison here. A caller that computes in floats reads a comparison's results this way, rather than storing Booleans and converting them. Its slice form compares each item and writes its float in one loop.
-#[derive(Clone, Copy, Debug)]
-pub struct Indicator<K>(pub K);
 
 /// Wasm has no instruction that narrows a 64-bit lane to a byte. LLVM writes a float comparison's results two items at a time, in about ten instructions for each item. Where it can prove that lanes hold masks, it also replaces wasm's narrowing instructions with slower code. Here each block of 16 items compares with vector instructions, then shuffles the first byte of each mask into place: 7 shuffles for `f64`'s 8 vectors, and 3 for `f32`'s 4.
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
@@ -463,16 +424,20 @@ mod narrowed {
 /// [`Tolerant::equal`], or [`TolerantComplex::complex_equal`] for complex items, at the tolerance it holds, as a function object.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Equal(pub Tolerance);
-compared!(Equal: |t, [x, y]| t.equal(x, y), Inside, Inside);
-forms!(Equal at Complex<f32> => bool, Complex<f64> => bool: |k, [x, y]| k.0.complex_equal(x, y),
-    many |k, [x, y], n, out| with_tolerance!(k.0, |t| complex_equals(t, [x, y], n, out, false)));
+impl Banding for Equal { const BANDS: (Band, Band) = (Band::Inside, Band::Inside); }
+pub(crate) fn complex_equal_slice<R: Native>(k: &Equal, o: &recipe::NativeOps<{ crate::FUSED }>, args: [Arg<'_, Complex<R>>; 2], n: usize, out: &mut [std::mem::MaybeUninit<bool>]) {
+    let tolerance = k.0.overridden(o.tolerance);
+    with_tolerance!(tolerance, |t| { complex_equals(t, args, n, out, false); });
+}
 
 /// The negation of [`Equal`] at the tolerance it holds, as a function object, for real and complex items.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NotEqual(pub Tolerance);
-compared!(NotEqual: |t, [x, y]| !t.equal(x, y), Outside, Outside);
-forms!(NotEqual at Complex<f32> => bool, Complex<f64> => bool: |k, [x, y]| !k.0.complex_equal(x, y),
-    many |k, [x, y], n, out| with_tolerance!(k.0, |t| complex_equals(t, [x, y], n, out, true)));
+impl Banding for NotEqual { const BANDS: (Band, Band) = (Band::Outside, Band::Outside); }
+pub(crate) fn complex_not_equal_slice<R: Native>(k: &NotEqual, o: &recipe::NativeOps<{ crate::FUSED }>, args: [Arg<'_, Complex<R>>; 2], n: usize, out: &mut [std::mem::MaybeUninit<bool>]) {
+    let tolerance = k.0.overridden(o.tolerance);
+    with_tolerance!(tolerance, |t| { complex_equals(t, args, n, out, true); });
+}
 
 /// `Equal`'s slice form on complex items, or with `negate` `NotEqual`'s. Each `CHUNK` of items splits into slices of real and imaginary parts, as in `slice::split`, so `squared_equal` runs over plain slices with no branch and vectorizes. `scaled_equal` then takes the pairs it leaves undecided, one at a time. No result fails.
 #[inline(always)]
@@ -490,22 +455,22 @@ fn complex_equals<T: TolerantComplex, R: Native>(
 /// [`Tolerant::less`] at the tolerance it holds, as a function object.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Less(pub Tolerance);
-compared!(Less: |t, [x, y]| t.less(x, y), Below, Above);
+impl Banding for Less { const BANDS: (Band, Band) = (Band::Below, Band::Above); }
 
 /// [`Tolerant::less_equal`] at the tolerance it holds, as a function object.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LessEqual(pub Tolerance);
-compared!(LessEqual: |t, [x, y]| t.less_equal(x, y), NotAbove, NotBelow);
+impl Banding for LessEqual { const BANDS: (Band, Band) = (Band::NotAbove, Band::NotBelow); }
 
 /// [`Tolerant::greater`] at the tolerance it holds, as a function object.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Greater(pub Tolerance);
-compared!(Greater: |t, [x, y]| t.greater(x, y), Above, Below);
+impl Banding for Greater { const BANDS: (Band, Band) = (Band::Above, Band::Below); }
 
 /// [`Tolerant::greater_equal`] at the tolerance it holds, as a function object.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GreaterEqual(pub Tolerance);
-compared!(GreaterEqual: |t, [x, y]| t.greater_equal(x, y), NotBelow, NotAbove);
+impl Banding for GreaterEqual { const BANDS: (Band, Band) = (Band::NotBelow, Band::NotAbove); }
 
 /// A tolerant comparison as steps of `recipe`'s formulas, which a compiler records through its `recipe::Ops`: the composition that `Tolerant`'s method of the same name uses, with `recipe::close` at the object's tolerance and the arguments in the same order.
 pub trait Stepped {
@@ -564,38 +529,26 @@ impl Stepped for GreaterEqual {
     fn steps<F: Float, O: recipe::Ops<F> + ?Sized>(self, o: &O, x: O::V, y: O::V) -> O::B { LessEqual(self.0).steps(o, y, x) }
 }
 
-/// [`Tolerant::matches`] at the tolerance it holds, as a function object: `equal`, except that NaN matches NaN.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Matches(pub Tolerance);
-compared!(Matches: |t, [x, y]| t.matches(x, y), Inside, Inside);
-
-/// [`Tolerant::compare`] at the tolerance it holds, as a function object. NaN orders after every number and equal to NaN, as [`Tolerant::matches`] has NaN match NaN.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Compare(pub Tolerance);
-tolerant!(Compare at real => Ordering: |t, [x, y]| t.compare(x, y).unwrap_or(x.is_nan().cmp(&y.is_nan())));
 
 /// [`Tolerant::floor`], or [`TolerantComplex::complex_floor`] for complex items, at the tolerance it holds, as a function object.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Floor(pub Tolerance);
-tolerant!(#[inline] Floor at real: |t, [y]| Total(t.floor(y)));
-tolerant!(Floor at Complex<f32>, Complex<f64>: |t, [y]| Total(t.complex_floor(y)));
 
 /// [`Tolerant::ceil`], or [`TolerantComplex::complex_ceil`] for complex items, at the tolerance it holds, as a function object.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Ceil(pub Tolerance);
-tolerant!(#[inline] Ceil at real: |t, [y]| Total(t.ceil(y)));
-tolerant!(Ceil at Complex<f32>, Complex<f64>: |t, [y]| Total(t.complex_ceil(y)));
 
 /// [`Tolerant::residue`], or [`TolerantComplex::complex_residue`] for complex items, at the tolerance it holds, as a function object: `y` modulo `x`, for arguments `x` and `y` in that order. At no tolerance, where `y/x` passes the float's precision ([`far`]), the rounded quotient has lost its low digits, and [`exact_residue`] gives the residue. The slice form recomputes those items in a second pass. Its `i64` form is [`integer::residue`](crate::integer::residue), which needs no tolerance.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Residue(pub Tolerance);
-forms!(#[inline] Residue at real: |k, [x, y]| Total(if k.0.is_exact() { exact_residue(x, y) } else { k.0.residue(x, y) }),
-many |k, [x, y], n, out| with_tolerance!(k.0, |t| {
-    if t.value() != 0.0 { return each!([x, y], n, out, |[x, y]| Total(t.residue(x, y))); }
-    if !each!([x, y], n, out, |[x, y]| (t.residue(x, y), near(x, y))) { replace_far(x, y, n, out); }
-    true
-}));
-tolerant!(Residue at Complex<f32>, Complex<f64>: |t, [x, y]| t.complex_residue(x, y));
+pub(crate) fn residue_slice<R: Native>(k: &Residue, o: &recipe::NativeOps<{ crate::FUSED }>, [x, y]: [Arg<'_, R>; 2], n: usize, out: &mut [std::mem::MaybeUninit<R>]) -> bool {
+    let tolerance = k.0.overridden(o.tolerance);
+    with_tolerance!(tolerance, |t| {
+        if t.value() != 0.0 { return each!([x, y], n, out, |[x, y]| Total(t.residue(x, y))); }
+        if !each!([x, y], n, out, |[x, y]| (t.residue(x, y), near(x, y))) { replace_far(x, y, n, out); }
+        true
+    })
+}
 
 /// Recomputes through [`exact_residue`] the residue in `out` of each item that isn't [`near`]. Of those, only the items that [`far`] picks change. The slice form runs this only where its loop finds an item that isn't near.
 fn replace_far<F: Float>(x: Arg<'_, F>, y: Arg<'_, F>, n: usize, out: &mut [std::mem::MaybeUninit<F>]) {
@@ -632,14 +585,10 @@ pub struct MathishFloorDivide(pub Tolerance);
 /// [`Tolerant::gcd`], or [`TolerantComplex::complex_gcd`] for complex items, at the tolerance it holds, as a function object. A non-finite argument gives NaN, which marks the item failed. Its `i64` form is [`integer::gcd`](crate::integer::gcd).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Gcd(pub Tolerance);
-tolerant!(Gcd at real: |t, [x, y]| t.gcd(x, y));
-tolerant!(Gcd at Complex<f32>, Complex<f64>: |t, [x, y]| t.complex_gcd(x, y));
 
 /// The least common multiple x y / gcd(x, y), with the sign of x y, at the tolerance it holds, as a function object. Where the gcd is 0, so is the result. Its `i64` form is [`integer::lcm`](crate::integer::lcm).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Lcm(pub Tolerance);
-tolerant!(Lcm at real: |t, [x, y]| lcm_from_gcd(x, y, t.gcd(x, y)));
-tolerant!(Lcm at Complex<f32>, Complex<f64>: |t, [x, y]| lcm_from_gcd(x, y, t.complex_gcd(x, y)));
 
 #[inline]
 pub(crate) fn lcm_from_gcd<T: Copy + num_traits::Num>(x: T, y: T, g: T) -> T { if g.is_zero() { g } else { x / g * y } }

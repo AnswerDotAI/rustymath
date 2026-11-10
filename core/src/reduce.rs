@@ -81,16 +81,10 @@ pub fn minimum<F: Float>(x: F, y: F) -> F { F::from_working(Core::minimum(x.work
 /// [`maximum`] as a function object, which also takes integers and Booleans. The maximum of two Booleans is their `or`.
 #[derive(Clone, Copy, Debug)]
 pub struct Maximum;
-forms!(#[inline] Maximum at real: |_, [x, y]| crate::slice::Total(maximum(x, y)));
-forms!(#[inline] Maximum at u8, i16, i32, i64: |_, [x, y]| x.max(y));
-forms!(#[inline] Maximum at bool: |_, [x, y]| x | y);
 
 /// [`minimum`] as a function object, which also takes integers and Booleans. The minimum of two Booleans is their `and`.
 #[derive(Clone, Copy, Debug)]
 pub struct Minimum;
-forms!(#[inline] Minimum at real: |_, [x, y]| crate::slice::Total(minimum(x, y)));
-forms!(#[inline] Minimum at u8, i16, i32, i64: |_, [x, y]| x.min(y));
-forms!(#[inline] Minimum at bool: |_, [x, y]| x & y);
 
 /// A reduction by [`Sum`], [`Product`], [`ScaledProduct`], [`Max`], [`Min`], [`And`], [`Or`], [`Xor`], [`Xnor`], [`SumAs`], [`Squares`] or [`Alternated`], implemented inside rustymath once for each item type it takes. `slice` folds a whole slice of consecutive items, in any order, `merge` combines the folds of two neighbouring runs, and `scan` gives the running folds. [`along`], [`fold_into`] and [`scan_along`] fold along an axis whose items aren't consecutive. [`Sum`] and [`Product`] take floats, integers and complex numbers. [`Max`] and [`Min`] take floats, integers and Booleans, [`And`], [`Or`] and [`Xor`] take integers and Booleans, [`Xnor`] takes signed integers, bytes and Booleans, [`SumAs`] takes Booleans and integers, [`Squares`] takes floats and complex numbers, [`ScaledProduct`] takes floats, `Alternated<Sum>` takes floats, integers and complex numbers, `Alternated<ScaledProduct>` takes floats, and `Alternated<Product>` takes complex numbers. An `f16` reduction computes in `f32`. A sum or product of `f16`s gives an `f32` total, for its caller to round once. A total that doesn't fit its type fails, with its value wrapped to that type.
 pub trait Reduction<T> {
@@ -177,8 +171,6 @@ pub struct Xor;
 /// The fold of integers by bitwise XNOR, `!(a ^ b)`, and of Booleans by `==`: true where an even number of them are false.
 #[derive(Clone, Copy, Debug)]
 pub struct Xnor;
-forms!(Xor at bool: |_, [x, y]| x != y);
-forms!(Xnor at bool: |_, [x, y]| x == y);
 
 /// `x` folded by `add` from `unit`, through the running results that `running_results` gives, which `merge` combines.
 #[inline(always)]

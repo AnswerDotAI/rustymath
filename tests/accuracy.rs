@@ -462,7 +462,7 @@ fn error_functions_accuracy() {
 /// `Erfc`'s slice form gives `erfc`'s bits at both widths. Its blocks of 256 items lie wholly below 0.84375 (with NaN), wholly from it up (with -∞ and magnitudes past 28), on both sides, and in a short block of zeros and ∞.
 #[test]
 fn erfc_blocks() {
-    use rustymath::{Arg, Erfc, Unary};
+    use rustymath::{Erfc, buffer::Element, domain::Variant, operation::Kernel};
     let mut xs = vec![f64::NAN];
     xs.extend((1..256).map(|i| -0.84 + 1.68 * f64::from(i) / 256.0));
     xs.push(f64::NEG_INFINITY);
@@ -470,8 +470,8 @@ fn erfc_blocks() {
     xs.extend((0..256).map(|i| if i % 2 == 0 { f64::from(i) / 1024.0 } else { -0.9 - f64::from(i) / 16.0 }));
     xs.extend([0.0, -0.0, f64::INFINITY]);
     let xs32: Vec<f32> = xs.iter().map(|&x| x as f32).collect();
-    let (mut out, mut out32) = (Vec::new(), Vec::new());
-    assert!(Erfc.many(Arg::Many(&xs), xs.len(), &mut out) & Erfc.many(Arg::Many(&xs32), xs32.len(), &mut out32));
+    let out: Vec<f64> = crate::support::mapped(&Kernel::new(Erfc, Variant::checked(f64::DTYPE)), [&xs[..]], xs.len()).unwrap();
+    let out32: Vec<f32> = crate::support::mapped(&Kernel::new(Erfc, Variant::checked(f32::DTYPE)), [&xs32[..]], xs32.len()).unwrap();
     let same = |a: f64, b: f64| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan());
     assert!(out.iter().zip(&xs).all(|(&r, &x)| same(r, rustymath::erfc(x))), "{out:?}");
     assert!(out32.iter().zip(&xs32).all(|(&r, &x)| same(r.into(), rustymath::erfc(x).into())), "{out32:?}");

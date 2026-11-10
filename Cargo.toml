@@ -7,11 +7,11 @@ version = "0.1.60"
 edition = "2024"
 
 [workspace.dependencies]
-rustymath = { path = ".", version = ">=0.1.59, <1", default-features = false }
+rustymath = { path = ".", version = ">=0.1.60, <1", default-features = false }
 rustymath-buffer = { path = "buffer", version = ">=0.1.39, <1" }
 pyo3 = ">=0.29"
 pyo3-build-config = ">=0.29"
-rustymath-core = { path = "core", version = ">=0.1.59, <1", default-features = false }
+rustymath-core = { path = "core", version = ">=0.1.60, <1", default-features = false }
 rustymath-kernels = { path = "kernels", version = ">=0.1.59, <1" }
 rustymath-timing = { path = "timing", version = ">=0.1.56, <1" }
 half = { version = ">=2.7.1, <3", features = ["num-traits"] }

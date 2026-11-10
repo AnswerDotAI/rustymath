@@ -16,7 +16,7 @@ rustflags = ["-C", "target-cpu=x86-64-v3"]
 
 Rust's default x86-64 target has no fused multiply-add and no vector instruction for `floor` or `trunc`. Without the setting, rustymath multiplies and adds separately. Some of its loops also run one item at a time.
 
-Each function comes in two forms. The free function, such as `exp`, is generic over `f32`, `f64` and `half::f16`. The compiler inlines it into the loop that calls it and vectorizes that loop:
+Free functions such as `exp` are generic over `f32`, `f64` and `half::f16`. The compiler inlines it into the loop that calls it and vectorizes that loop:
 
 ```rust
 use half::f16;
@@ -27,16 +27,27 @@ let e32 = exp(1.0f32); // 2.718282
 let e16 = exp(f16::from_f32(1.0)); // 2.719
 ```
 
-The function object, such as `Exp` or `Pow`, has a scalar form `one` and a slice form `many`. Both run code that rustymath compiles itself. Your build settings don't change their speed. Each argument of `many` is one item, which every result pairs with, or a slice with one item for each result. `many` appends the results to a vector and returns whether every item succeeded. A NaN result from arguments that aren't NaN counts as a failure. An object implements `Unary`, `Binary` or `Ternary` at each item type it takes: `f16`, `f32` and `f64`, complex numbers where the function has complex values, and integers for some, such as `Gcd` at `i64`. Code that is generic over the float type states the bound it needs, such as `where Exp: Unary<F, Out = F>`. The free functions need no bound.
+For whole arrays, resolve a formula object such as `Pow` to an `operation::Kernel`. `Kernel::map` reads each argument through a `ReadPlan` and replaces the contents of an output `Buffer`. A plan can read a source in order or repeat one item, as the exponent does here:
 
 ```rust
-use rustymath::{Arg, Binary, Pow};
+use rustymath::{
+    Pow, agreement::{Binding, Mapping, Missing, Read, ReadPlan}, buffer::{Buffer, Element},
+    domain::Variant, operation::{Kernel, Settings}, tolerant::Tolerance,
+};
 
-let mut squares = Vec::new();
-Pow.many(Arg::Many(&[1.5, 2.0, 3.0]), Arg::One(2.0), 3, &mut squares); // squares: [2.25, 4.0, 9.0]
+let x = [1.5, 2.0, 3.0];
+let exponent = [2.0];
+let sources = [Binding::full(f64::view(&x)), Binding::full(f64::view(&exponent))];
+let plans = [ReadPlan::input(0, 3), ReadPlan::copy(1, 1, Mapping::Single, 3, Missing::Default)];
+let reads = plans.each_ref().map(|plan| Read { sources: &sources, plan });
+let pow = Kernel::resolve(Pow, Variant::checked(f64::DTYPE), [f64::DTYPE; 2]).unwrap();
+let settings = Settings { tolerance: Tolerance::EXACT };
+let mut squares = Buffer::with_capacity(pow.result_dtype(), 3);
+pow.map(&reads, 0..3, settings, &mut squares).unwrap();
+assert_eq!(f64::vec(squares).unwrap(), [2.25, 4.0, 9.0]);
 ```
 
-`facts::Formula` holds an object's numerical and kind rules. `Kernel::resolve` selects a working dtype and returns an `operation::Kernel` for callers choosing dtypes at run time. Its `map`, `fold_read`, `fold_pieces` and `scan` methods consume shared `agreement::Read` plans. `Kernel::real`, `complex` and `exact` evaluate scalar arguments through the same object.
+`facts::Formula` owns each object's numerical rules, supported kinds, validity, ranges and derivatives. `Kernel::resolve` selects its computing and result dtypes. `Kernel::of` selects a formula from a runtime `facts::Op`. Kernels use native bulk routines where a formula supplies them, and otherwise run its item formula. Their `map`, `fold_read`, `fold_pieces` and `scan` methods consume shared `agreement::Read` plans. `real`, `integers`, `complex` and `exact` evaluate scalar arguments with the kernel's numerical policy and return a `Result`.
 
 ```rust
 use rustymath::{Exp, domain::Variant, operation::Kernel, buffer::{DType, FloatWidth, Width}};
@@ -48,19 +59,23 @@ assert_eq!(exp.variant().dtype, double);
 
 `Sin`, `Cos` and `Tan` use short reduction and polynomials for their common range. An object's repair predicate marks arguments beyond 2^23 at f64 or 2^20 at f32. Its native slice driver applies the object's scalar repair routine to those items before returning the results. `Kernel::ranged` omits repair when the same predicate is proved false over the supplied ranges.
 
-`atan2(y, x)` and its object `Atan2` give the angle of the point (x, y), from -π to π. `y` comes first, as in `f64::atan2`.
+`atan2(y, x)` and a kernel of `Atan2` give the angle of the point (x, y), from -π to π. `y` comes first, as in `f64::atan2`.
 
 `divide(x, y)` divides complex numbers, inline in the caller's loop, as the free functions do. Two real arguments divide as reals, so a real zero divisor gives ±∞ or NaN with an imaginary part of 0. Its formula's |y|² overflows beyond about 1e154 at f64 and 1e19 at f32.
 
 ## Tolerant comparison
 
-The `tolerant` module has APL's tolerant comparison: x equals y when |x - y| is less than the tolerance times the larger of |x| and |y|. Its objects, such as `Equal`, `Less`, `Floor`, `Residue` and `Gcd`, each hold a `Tolerance`. With `Tolerance::EXACT`, a slice form runs a loop of plain IEEE comparisons, chosen once per call.
+The `tolerant` module has APL's tolerant comparison: x equals y when |x - y| is less than the tolerance times the larger of |x| and |y|. Its formula objects, such as `Equal`, `Less`, `Floor`, `Residue` and `Gcd`, hold a `Tolerance`. `operation::Settings` supplies the tolerance for a kernel execution. `Tolerance::EXACT` selects ordinary comparison once per call. A comparison kernel produces Boolean array results; its scalar `real` method represents true and false as 1 and 0:
 
 ```rust
-use rustymath::{tolerant::{Equal, Tolerance}, Arg, Binary};
+use rustymath::{
+    buffer::Element, domain::Variant, operation::{Kernel, Settings}, tolerant::{Equal, Tolerance},
+};
 
-let mut same = Vec::new();
-Equal(Tolerance::DEFAULT).many(Arg::Many(&[0.3, 0.1 + 0.2, 0.31]), Arg::One(0.3), 3, &mut same); // same: [true, true, false]
+let equal = Kernel::resolve(Equal(Tolerance::DEFAULT), Variant::checked(f64::DTYPE), [f64::DTYPE; 2]).unwrap();
+let settings = Settings { tolerance: Tolerance::DEFAULT };
+let same = [0.3, 0.1 + 0.2, 0.31].map(|x| equal.real(&[x, 0.3], settings).unwrap());
+assert_eq!(same, [1.0, 1.0, 0.0]);
 ```
 
 ## Other modules
@@ -90,11 +105,11 @@ Equal(Tolerance::DEFAULT).many(Arg::Many(&[0.3, 0.1 + 0.2, 0.31]), Arg::One(0.3)
 
 The special functions `gamma`, `lgamma`, `digamma`, `erf`, `erfc`, their inverses, `binom` with its slopes `binom_dn` and `binom_dk`, the incomplete gamma and beta functions and Lambert W have free functions and objects at the crate root, as the elementary functions do.
 
-`Add`, `Subtract`, `Multiply` and the other arithmetic objects at the crate root have no scalar or slice forms. `Kernel` runs them at every float, complex and integer type, with its explicit `Variant` checking and wrapping policy. Unbounded rational callers use `Formula::exact` through `Kernel::exact`.
+`Add`, `Subtract`, `Multiply` and the other arithmetic objects at the crate root implement `Formula`. `Kernel` runs them at every float, complex and integer type, with its explicit `Variant` checking and wrapping policy. Unbounded rational callers use `Formula::exact` through `Kernel::exact`.
 
 ## Accuracy and speed
 
-The table gives nanoseconds per item for a loop over 65,536 inputs on an Apple M5 Max, in October 2026, beside the standard library's version of each function. A row named after an object times its slice form. `Pow.one` and `Root.one` time the scalar forms. To print the table on your own machine, run `RUSTYMATH_COSTS=1 cargo test --test speed`.
+The table gives nanoseconds per item for a loop over 65,536 inputs on an Apple M5 Max, in October 2026, beside the standard library's version of each function. A row named after an object times its bulk kernel. The labels `Pow.one` and `Root.one` time scalar formulas pair by pair. To print the table on your own machine, run `RUSTYMATH_COSTS=1 cargo test --test speed`.
 
 | Function | f64 | std f64 | f32 | std f32 |
 |---|---|---|---|---|

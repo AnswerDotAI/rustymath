@@ -61,7 +61,7 @@ pub use hyperbolic::{RealAcosh, RealAtanh};
 pub use ln::{Ln, Log1p, Log2, Log10, Logb, MathishLogb, RealLn};
 pub use parts::{Abs, Angle, Choose, Clip, Conj, Imag, Isfinite, Isinf, Isnan, Real, Rint, Round, Scale, Sign, Trunc};
 pub use pow::{Exponent, Pow, RealPow, Root};
-pub use slice::{Arg, Binary, CHUNK, Flipped, KernelItem, Results, Ternary, Unary, Wrapped, pairs};
+pub use slice::{Arg, CHUNK, Flipped, KernelItem, Wrapped, pairs};
 pub use special::{BetaincAt, Erfc, Erfcinv, Erfinv};
 pub use sqrts::{RealSqrt, RealSqrt1mx2, RealSqrtm1mx2, RealSqrtx2m1, Sqrt, Sqrtm1mx2};
 pub use trig::{Cos, Sin, Tan};
@@ -71,7 +71,7 @@ pub use {half, num_complex};
 /// How many items a function handles between checks for an interrupt ([`interrupt::check`]), which keeps the check out of the loop over items.
 pub const BETWEEN_CHECKS: usize = 1024;
 
-/// Declares each function at the crate root, where it multiplies and adds as the target's `FUSED` says, and in `fused` and `unfused`, which choose for themselves. Each entry names the module whose function of the same name implements it, generic over `R: Native` and `const FUSED: bool`. Every wrapper is `#[inline(always)]`, because LLVM leaves a large function such as `gamma` out of line in a caller's loop, and the call stops that loop vectorizing. An entry marked `as` also declares a function object of that name, for the facts table's formula. An object with forms, such as [`Pow`] or [`Atan`], is written with `forms!` beside its function. `function_doc!(ln)` gives an entry's doc by its name. The Python package's functions take their docs from it.
+/// Declares each scalar function at the crate root and in `fused`/`unfused`, with an optional Formula object. `function_doc!(ln)` gives an entry's docs for Python.
 macro_rules! functions {
     ($($(#[doc = $doc:literal])* $name:ident($($x:ident),+) in $module:ident $(as $object:ident)?;)+) => {
         $(

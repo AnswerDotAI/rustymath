@@ -23,7 +23,7 @@ pub(crate) fn root_formula<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, n: O::V, 
     rooted(o, Degree::of(k.wide()), k < F::zero(), y)
 }
 
-/// The route [`Root`] takes for a degree n, chosen by n's magnitude. The slice form reads the route once for a constant n.
+/// The route [`Root`] takes for a degree n, chosen by n's magnitude. The native bulk routine reads the route once for a constant n.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Degree { One, Two, Three, Four, Eight, Half, General }
 
@@ -142,7 +142,7 @@ pub(crate) const MULTIPLIED: u32 = 8;
 /// The greatest whole exponent that `pow` raises to by squaring and multiplying where the target fuses multiply-add (`FUSED`). Above `MULTIPLIED`, every step but those of bit position 0 runs in double words (`recipe::whole`). Larger exponents take the general route. From 64 on, squaring and multiplying is slower than the general route for some exponents.
 pub(crate) const COMPENSATED: u32 = 63;
 
-/// How [`Pow`] raises to an exponent y. Its slice form reads it once for a constant y, and its scalar form for each item. The JIT's lowering of a constant power reads it too.
+/// How [`Pow`] raises to an exponent y. Its native bulk routine resolves a constant y once; scalar evaluation resolves each call. The JIT's lowering of a constant power uses the same routes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exponent {
     /// x^m, or x^-m where `negative`, through `recipe::power`. Positive m goes to `MULTIPLIED`, or `COMPENSATED` with fused multiply-add. Negative powers below -1 need fused multiply-add. No result fails.
@@ -200,7 +200,7 @@ pub(crate) fn powers<F: crate::Float>(e: Exponent, k: F, xs: &[F], out: &mut [st
     routes!(Whole 1, Whole 2, Whole 3, Whole 4, Whole 5, Whole 6, Whole 7, Whole 8, Halves 1, Halves 3);
 }
 
-/// [`Pow`]'s slice form: [`powers`] for a shared exponent, otherwise the general block pass with scalar repair. Returns whether every result is valid: not NaN, or from a NaN argument.
+/// [`Pow`]'s native bulk routine: [`powers`] for a shared exponent, otherwise the general block pass with scalar repair. Returns whether every result is valid: not NaN, or from a NaN argument.
 pub(crate) fn power_slice<F: crate::float::Native>(_: &Pow, [x, y]: [crate::Arg<'_, F>; 2], n: usize, out: &mut [std::mem::MaybeUninit<F>]) -> bool {
     if let (crate::Arg::Many(xs), crate::Arg::One(k)) = (x, y) {
         let e = Exponent::of(k.wide(), crate::FUSED);
@@ -222,7 +222,7 @@ pub(crate) fn roots<F: crate::Float>(n: F, ys: &[F], out: &mut [std::mem::MaybeU
     routes!(One, Two, Three, Four, Eight, Half);
 }
 
-/// [`Root`]'s slice form: [`roots`] for a shared degree, otherwise the general block pass followed by per-item short-degree recipes. It gives final validity after repair.
+/// [`Root`]'s native bulk routine: [`roots`] for a shared degree, otherwise the general block pass followed by per-item short-degree recipes. It gives final validity after repair.
 pub(crate) fn root_slice<F: crate::float::Native>(_: &Root, [n, y]: [crate::Arg<'_, F>; 2], len: usize, out: &mut [std::mem::MaybeUninit<F>]) -> bool {
     if let (crate::Arg::One(k), crate::Arg::Many(ys)) = (n, y) {
         roots(k, &ys[..len], &mut out[..len]);
@@ -247,7 +247,7 @@ pub(crate) fn real_formula<F: crate::Float, O: Ops<F> + ?Sized>(o: &O, x: O::V, 
     o.select(o.less(x, o.number(F::zero())), real, r)
 }
 
-/// [`root`](crate::root) as a function object, with a scalar form and a slice form that work as [`Pow`]'s do. A constant degree of 2 or 3 takes `sqrt` or `cbrt`.
+/// [`root`](crate::root) as a function object, with a shared recipe and a native bulk routine as [`Pow`] has. A constant degree of 2 or 3 takes `sqrt` or `cbrt`.
 #[derive(Clone, Copy, Debug)]
 pub struct Root;
 

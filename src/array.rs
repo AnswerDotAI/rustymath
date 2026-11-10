@@ -2,7 +2,7 @@
 use crate::agreement::{Agreement, Binding, Mapping, Missing, Read, ReadPlan, ReadRoute};
 use crate::buffer::{Buffer, DType, Element, Items, View};
 use crate::error::{Error, Kind};
-use crate::gather::{Steps, Writes};
+use crate::gather::Writes;
 use crate::layout::{Keys, Lanes, Layout, element_count};
 use crate::operation::{Kernel, Settings, WriteRoot};
 pub use rustymath_core::array::ArrayView;
@@ -94,19 +94,13 @@ impl Array {
             if view.dtype() != source.dtype() { return Err(Error::new(Kind::Domain, "concatenate items must have one dtype")); }
             layout = crate::structure::catenate(&layout, view.layout(), axis)?;
         }
-        let lanes = arrays.iter().map(|a| Lanes::new(a.layout().shape(), axis)).collect::<Result<Vec<_>, _>>()?;
-        let lens: Vec<usize> = lanes.iter().map(|l| l.len * l.inner).collect();
-        let (outer, stride) = (lanes[0].outer, lens.iter().sum::<usize>());
-        let buffer = with_dtype!(source.dtype(), T => {
-            let parts = arrays.iter().map(|a| a.items::<T>()).collect::<Result<Vec<_>, _>>()?;
-            let mut out = parts.iter().find_map(|p| p.first()).map_or_else(Vec::new, |&x| vec![x; outer * stride]);
-            let mut at = 0;
-            for (part, &n) in parts.iter().zip(&lens) {
-                crate::gather::scatter_walk(&mut out, part, at, &[Steps::along(outer, stride), Steps::along(n, 1)], crate::gather::Same);
-                at += n;
-            }
-            T::buffer(out)
-        });
+        let dtype = source.dtype();
+        let outer = Lanes::new(source.layout().shape(), axis)?.outer;
+        let parts = arrays.iter().map(|a| a.cast(dtype)).collect::<Result<Vec<_>, _>>()?;
+        let sources: Vec<_> = parts.iter().map(|part| Binding::full(part.view())).collect();
+        let plan = ReadPlan::joined(outer, sources.iter().enumerate().map(|(i, source)| ReadPlan::input(i, source.items)))?;
+        let mut buffer = Buffer::with_capacity(dtype, layout.count());
+        Read { sources: &sources, plan: &plan }.read_into(0..layout.count(), dtype, true, &mut buffer)?;
         Self::new(layout, buffer)
     }
     pub fn choose(condition: ArrayView<'_>, x: ArrayView<'_>, y: ArrayView<'_>) -> Result<Self, Error> {

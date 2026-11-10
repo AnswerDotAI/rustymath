@@ -79,6 +79,8 @@ np.asarray(x)	0.5	0.5	instructions linux 0.29
 xf+yf	3.4	3.2	instructions linux 0.735
 # 5.7 copies, for Exp's 5.5 copies at f32, plus the call.
 rm.exp(xf)	12	6.5	instructions linux 4.193
+# Degree-five roots of nonnegative f32 values, matching the native Root row; public bulk cost is uncalibrated.
+rm.root(root_nf, root_yf)	-	-
 # Real-input cis with complex output at f32; bulk cost is uncalibrated.
 rm.cis(xf)	-	-
 # Error-function slice forms at f32; bulk costs are uncalibrated.

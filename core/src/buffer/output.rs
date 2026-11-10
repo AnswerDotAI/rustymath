@@ -101,7 +101,6 @@ fn converted<O: OutputItem>(
     apply: &(dyn Fn(std::ops::Range<usize>, &mut Slots<'_, O>, Option<&mut Scratch>) -> bool + Sync)
 ) -> Result<(), Error> {
     let mut values = work.as_deref_mut().map_or_else(Vec::new, |work| std::mem::take(work.result::<O>()));
-    let mut local = Scratch::default();
     let conversion = crate::convert::Conversion { input: O::DTYPE, output: target.dtype(), kind: crate::convert::ConversionKind::Truncate };
     let result = (|| {
         for at in (range.start..range.end).step_by(crate::CHUNK) {
@@ -109,7 +108,7 @@ fn converted<O: OutputItem>(
             values.clear();
             Slots::append(&mut values, n, |slots| apply(at..at + n, slots, work.as_deref_mut()));
             if let Err(error) = conversion.append(O::view(&values), checked, crate::tolerant::Tolerance::EXACT,
-                work.as_deref_mut().unwrap_or(&mut local), target.reborrow()) {
+                work.as_deref_mut(), target.reborrow()) {
                 target.fill(range.end - at - n);
                 return Err(error);
             }

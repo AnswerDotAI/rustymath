@@ -1,7 +1,7 @@
-//! Functions of `i64`s: greatest common divisor, least common multiple, binomial coefficients, powers, square roots and residues. Each gives `None` where its result isn't an `i64`. Their function objects are the ones that floats and complex numbers use: [`Gcd`], [`Lcm`] and [`Residue`] from [`tolerant`](crate::tolerant), whose integer forms ignore the tolerance they hold, and [`Binom`] and [`Pow`]. A slice form appends results to a vector and reports whether every item fitted. [`Divisor`] divides many integers by one, with multiplications in place of division instructions. Where every item has the same divisor, `Residue`'s slice form divides through `FloatDivisor`, which multiplies by the divisor's reciprocal in `f64` and vectorizes, for divisors and dividends below 2⁵¹ in magnitude. At types of 16 bits or fewer it multiplies 32-bit integers instead, and it takes `Divisor` for 64-bit dividends of 2⁵¹ or more.
+//! Functions of `i64`s: greatest common divisor, least common multiple, binomial coefficients, powers, square roots and residues. Each gives `None` where its result isn't an `i64`. Their function objects are the ones that floats and complex numbers use: [`Gcd`](crate::tolerant::Gcd), [`Lcm`](crate::tolerant::Lcm) and [`Residue`](crate::tolerant::Residue) from [`tolerant`](crate::tolerant), whose integer formulas ignore the tolerance they hold, and [`Binom`](crate::Binom) and [`Pow`](crate::Pow). A native bulk routine writes results and reports whether every item fitted. [`Divisor`] divides many integers by one, with multiplications in place of division instructions. Where every item has the same divisor, `Residue`'s native bulk routine divides through `FloatDivisor`, which multiplies by the divisor's reciprocal in `f64` and vectorizes, for divisors and dividends below 2⁵¹ in magnitude. At types of 16 bits or fewer it multiplies 32-bit integers instead, and it takes `Divisor` for 64-bit dividends of 2⁵¹ or more.
 //!
-//! `Gcd`, `Lcm`, `Binom`, `Pow` and `Residue` also take the narrower integer types of compact buffers, `u8`, `i16` and `i32`, which they compute through these functions. A result that doesn't fit its type fails. `Pow` floors a negative power.
-use crate::{Arg, Binom, Pow, convert::{self, WIDE_LIMIT}, float::sealed::Core, tolerant::{Gcd, Lcm, Residue}};
+//! `Gcd`, `Lcm`, `Binom` and `Pow` compute the compact integer types `u8`, `i16` and `i32` through the `i64` helpers, with the variant's checked or wrapping result policy. `Residue` has a native bulk routine at each width. Integer powers floor negative exponents.
+use crate::{Arg, convert::{self, WIDE_LIMIT}, float::sealed::Core, tolerant::Residue};
 use strength_reduce::StrengthReducedU64;
 
 /// The greatest common divisor of x and y, which is never negative. `gcd(0, 0)` is 0. `None` only where it is 2^63, as for `gcd(i64::MIN, 0)`.
@@ -211,15 +211,8 @@ fn decoded(bases: &[i64], digits: &[i64], step: impl Fn(i64, i64, i64) -> Option
     digits.chunks(bases.len()).map(|d| (1..d.len()).try_fold(d[0], |v, k| step(v, bases[k], d[k]))).collect()
 }
 
-forms!(#[inline] Gcd at i64: |_, [x, y]| gcd(x, y));
-forms!(#[inline] Lcm at i64: |_, [x, y]| lcm(x, y));
-// On Booleans, the greatest common divisor is `or` and the least common multiple is `and`.
-forms!(#[inline] Gcd at bool: |_, [x, y]| x | y);
-forms!(#[inline] Lcm at bool: |_, [x, y]| x & y);
-forms!(#[inline] Binom at i64: |_, [n, k]| binom(n, k));
-forms!(#[inline] Pow at i64: |_, [x, y]| wrapped_power(x, y, i64::MAX));
-forms!(
-    #[inline] Residue at i64: |_, [x, y]| residue(x, y), many |_, [x, y], n, out| if let Arg::One(d) = x && let Some(m) = mask(d) {
+pub(crate) fn residue_long(_: &Residue, _: &crate::recipe::NativeOps<{ crate::FUSED }>, [x, y]: [Arg<'_, i64>; 2], n: usize, out: &mut [std::mem::MaybeUninit<i64>]) -> bool {
+    if let Arg::One(d) = x && let Some(m) = mask(d) {
         each!([y], n, out, |[y]| y & m)
     } else if let Arg::One(d) = x && let Some(r) = FloatDivisor::new(d) && fit(y, n) {
         each!([y], n, out, |[y]| r.residue(y))
@@ -228,18 +221,12 @@ forms!(
     } else {
         each!([x, y], n, out, |[x, y]| residue(x, y))
     }
-);
+}
 
-/// The narrower types' forms of `Gcd`, `Lcm`, `Binom`, `Pow` and `Residue`, which compute at `i64`. A result that doesn't fit the type fails, as one beyond `i64` does. A power that fails holds the power wrapped to the type. Every residue fits.
-macro_rules! narrower {
-    ($($t:ty),+) => {$(
-        forms!(#[inline] Gcd at $t: |_, [x, y]| gcd(x.into(), y.into()).and_then(|r| <$t>::try_from(r).ok()));
-        forms!(#[inline] Lcm at $t: |_, [x, y]| lcm(x.into(), y.into()).and_then(|r| <$t>::try_from(r).ok()));
-        forms!(#[inline] Binom at $t: |_, [n, k]| binom(n.into(), k.into()).and_then(|r| <$t>::try_from(r).ok()));
-        forms!(#[inline] Pow at $t: |_, [x, y]| { let (p, exact) = wrapped_power(x.into(), y.into(), <$t>::MAX.into()); (p as $t, exact && <$t>::try_from(p).is_ok()) });
-        forms!(
-            #[inline] Residue at $t: |_, [x, y]| residue(x.into(), y.into()) as $t,
-            many |_, [x, y], n, out| if let Arg::One(d) = x && let Some(m) = mask(d.into()) {
+macro_rules! residues {
+    ($($name:ident: $t:ty),+) => {$(
+        pub(crate) fn $name(_: &Residue, _: &crate::recipe::NativeOps<{ crate::FUSED }>, [x, y]: [Arg<'_, $t>; 2], n: usize, out: &mut [std::mem::MaybeUninit<$t>]) -> bool {
+            if let Arg::One(d) = x && let Some(m) = mask(d.into()) {
                 each!([y], n, out, |[y]| y & m as $t)
             } else if let Arg::One(d) = x && <$t>::BITS <= 16 && let Some(s) = Short::new(d as i16) {
                 each!([y], n, out, |[y]| s.residue(y as i16) as $t)
@@ -248,10 +235,10 @@ macro_rules! narrower {
             } else {
                 each!([x, y], n, out, |[x, y]| residue(x.into(), y.into()) as $t)
             }
-        );
+        }
     )+};
 }
-narrower!(u8, i16, i32);
+residues!(residue_byte: u8, residue_short: i16, residue_int: i32);
 
 /// x^y at `variant`'s integer width, as [`wrapped_power`] gives it. 0 to a negative power gives the greatest value: i64's under dynamic kinds, which a narrower width reports as an overflow so the call widens, and otherwise the width's. Where `variant` fails on overflow, a power that doesn't fit the width reports an overflow.
 pub(crate) fn native_power(variant: crate::domain::Variant, x: i64, y: i64) -> i64 {

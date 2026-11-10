@@ -33,13 +33,20 @@ pub fn threads_lock() -> std::sync::MutexGuard<'static, ()> {
 pub fn map<const N: usize>(
     kernel: &rustymath::operation::Kernel, args: [rustymath::buffer::View<'_>; N], n: usize, out: &mut rustymath::buffer::Buffer
 ) -> Result<(), rustymath::error::Error> {
+    map_with(kernel, args, n, out, rustymath::operation::Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT })
+}
+
+pub fn map_with<const N: usize>(
+    kernel: &rustymath::operation::Kernel, args: [rustymath::buffer::View<'_>; N], n: usize, out: &mut rustymath::buffer::Buffer,
+    settings: rustymath::operation::Settings
+) -> Result<(), rustymath::error::Error> {
     use rustymath::agreement::{Binding, Mapping, Missing, Read, ReadPlan};
     let sources = args.map(Binding::full);
     let plans: [_; N] = std::array::from_fn(|i| {
         ReadPlan::input(i, args[i].len()).remapped(if args[i].len() == 1 { Mapping::Single } else { Mapping::Linear(1) }, n, Missing::Default)
     });
     let reads = plans.each_ref().map(|plan| Read { sources: &sources, plan });
-    kernel.map(&reads, 0..n, rustymath::operation::Settings { tolerance: rustymath::tolerant::Tolerance::DEFAULT }, out)
+    kernel.map(&reads, 0..n, settings, out)
 }
 
 /// `kernel`'s `n` results on `args`, each of one item or of `n`, or `None` where any result fails.

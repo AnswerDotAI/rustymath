@@ -70,8 +70,9 @@ pub(crate) fn atan<R: Native, const FUSED: bool>(x: R) -> R {
     (hi + ((u * z).mla::<FUSED>(p, u) + lo)).copysign(x)
 }
 
-// The Cauchy distribution's cdf runs this slice form (`distribution::through`).
-forms!(Atan at real: |_, [x]| crate::slice::Total(atan::<_, { crate::FUSED }>(x)));
+pub(crate) fn atan_slice<R: Native>(_: &Atan, _: &crate::recipe::NativeOps<{ crate::FUSED }>, x: [crate::Arg<'_, R>; 1], n: usize, out: &mut [std::mem::MaybeUninit<R>]) -> bool {
+    each!(x, n, out, |[x]| crate::slice::Total(atan::<_, { crate::FUSED }>(x)))
+}
 
 /// [`atan2`](crate::atan2), as atan(y/x) in the point's quadrant. It takes the arctangent of the smaller magnitude over the larger, which never overflows.
 #[inline]

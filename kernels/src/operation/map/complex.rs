@@ -2,11 +2,17 @@ use super::*;
 
 pub(super) fn map_complex<K, F, const N: usize>(
     object: &K, variant: crate::domain::Variant, inputs: Inputs<'_, '_>, range: std::ops::Range<usize>, ops: &NativeOps<{ FUSED }>,
-    slice: Option<crate::facts::Slice<K, num_complex::Complex<F>, N, ()>>, judge: crate::domain::Variant, output: &mut Output<'_, '_>) -> Result<(), Error>
+    slice: Option<crate::facts::Slice<K, num_complex::Complex<F>, N, ()>>, test: Option<crate::facts::Slice<K, num_complex::Complex<F>, N, (), bool>>,
+    judge: crate::domain::Variant, output: &mut Output<'_, '_>) -> Result<(), Error>
 where K: crate::facts::Formula<N>, F: crate::Native + crate::buffer::Cast + OutputItem, num_complex::Complex<F>: crate::buffer::Cast + OutputItem {
     let value = |x| object.complex(ops, x).unwrap_or(num_complex::Complex::new(F::zero(), F::zero()));
     let invalid = |x, r| (!complex_valid::<K, F, N>(ops, x, r)).then_some(Kind::Domain);
     if const { K::BOOLEAN } {
+        if let Some(test) = test {
+            return map_blocks::<num_complex::Complex<F>, bool, N>(inputs, range, variant.checked, output, &|args, n, out| {
+                test(object, ops, args, n, out); Ok(())
+            });
+        }
         map_values::<num_complex::Complex<F>, bool, N>(
             inputs, range, variant.checked, judge.checked, output, |x| value(x).re != F::zero(),
             |x, r| invalid(x, num_complex::Complex::new(if r { F::one() } else { F::zero() }, F::zero())))

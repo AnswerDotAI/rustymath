@@ -183,14 +183,14 @@ mod forms {
     #[test]
     fn outputs_can_differ_from_items() {
         use rustymath::tolerant::{Greater, Tolerance};
-        fn positive<F: Float>(x: &[F]) -> Vec<bool> where Greater: Binary<F, Out = bool> {
-            let mut out = Vec::new();
-            assert!(Greater(Tolerance::EXACT).many(Arg::Many(x), Arg::One(F::zero()), x.len(), &mut out));
-            out
+        fn positive<F: Float + buffer::Element>(x: &[F]) -> Vec<bool> {
+            let k = Kernel::new(Greater(Tolerance::EXACT), domain::Variant::checked(F::DTYPE));
+            crate::support::mapped(&k, [x, &[F::zero()]], x.len()).unwrap()
         }
         assert_eq!(positive(&[1.0f64, -1.0, f64::NAN]), [true, false, false]);
         assert_eq!(positive(&[f16::from_f32(2.0), f16::NAN]), [true, false]);
-        assert_eq!(Greater(Tolerance::EXACT).checked(f32::NAN, 0.0), Some(false));
+        let k = Kernel::new(Greater(Tolerance::EXACT), domain::Variant::checked(<f32 as buffer::Element>::DTYPE));
+        assert_eq!(k.real(&[f64::NAN, 0.0], operation::Settings { tolerance: Tolerance::EXACT }).unwrap(), 0.0);
     }
 }
 
@@ -796,11 +796,18 @@ mod tolerant {
     use half::f16;
     use num_complex::Complex64;
     use num_traits::Float as _;
-    use rustymath::{Arg, Binary, Float, Unary, search, tolerant::*, with_tolerance};
+    use rustymath::{Float, buffer::{Buffer, Element}, domain::Variant, facts::Formula, operation::{Kernel, Settings}, search, tolerant::*, with_tolerance};
     use std::cmp::Ordering;
 
     const T: Tolerance = Tolerance::DEFAULT;
     fn c(re: f64, im: f64) -> Complex64 { Complex64::new(re, im) }
+
+    fn many<T: Element, O: Element, K: Formula<N>, const N: usize>(k: K, t: Tolerance, args: [&[T]; N], n: usize) -> Vec<O> {
+        let kernel = Kernel::new(k, Variant { checked: false, ..Variant::checked(T::DTYPE) });
+        let mut out = Buffer::with_capacity(kernel.result_dtype(), n);
+        crate::support::map_with(&kernel, args.map(T::view), n, &mut out, Settings { tolerance: t }).unwrap();
+        O::vec(out).unwrap()
+    }
 
     #[test]
     fn equal_and_match() {
@@ -862,7 +869,7 @@ mod tolerant {
         let f64s = DType::Float(FloatWidth::F64);
         let quotient = Kernel::resolve(FloorDivide(Tolerance::EXACT), Variant::checked(f64s), [f64s; 2]).unwrap();
         assert_eq!(
-            (quotient.real(&[x, y], rustymath::operation::Settings { tolerance: Tolerance::EXACT }).unwrap(), Residue(Tolerance::EXACT).one(y, x)),
+            (quotient.real(&[x, y], rustymath::operation::Settings { tolerance: Tolerance::EXACT }).unwrap(), Exactly.residue(y, x)),
             (2.0, x - 2.0 * y)
         );
         if rustymath::FUSED { assert_ne!(Exactly.residue(0.1, 1.0), 0.0); }
@@ -899,10 +906,11 @@ mod tolerant {
         // The slice forms decide most pairs from squared magnitudes, in a loop with no branch, then redo the rest.
         let zs = [c(2.0, 1.0), huge, tiny, c(0.0, 0.0), c(f64::INFINITY, 1.0), c(f64::NAN, 0.0), c(-1e300, 0.0)];
         let (xs, ys): (Vec<_>, Vec<_>) = zs.iter().flat_map(|&x| zs.iter().map(move |&y| (x, y * (1.0 + 1e-15)))).unzip();
-        let (mut equal, mut unequal) = (Vec::new(), Vec::new());
-        assert!(Equal(T).many(Arg::Many(&xs), Arg::Many(&ys), xs.len(), &mut equal));
-        assert!(NotEqual(T).many(Arg::Many(&xs), Arg::Many(&ys), xs.len(), &mut unequal));
-        for i in 0..xs.len() { assert!(equal[i] == T.complex_equal(xs[i], ys[i]) && unequal[i] != equal[i], "{:?} {:?}", xs[i], ys[i]) }
+        for t in [T, Tolerance::EXACT] {
+            let equal: Vec<bool> = many(Equal(T), t, [&xs[..], &ys[..]], xs.len());
+            let unequal: Vec<bool> = many(NotEqual(T), t, [&xs[..], &ys[..]], xs.len());
+            for i in 0..xs.len() { assert!(equal[i] == t.complex_equal(xs[i], ys[i]) && unequal[i] != equal[i], "{:?} {:?}", xs[i], ys[i]) }
+        }
     }
 
     /// `range(c)` gives the last floats equal to `c` on each side.
@@ -929,104 +937,71 @@ mod tolerant {
         assert_eq!(T.range(f16::from_f32(0.3)), Some((f16::from_f32(0.3), f16::from_f32(0.3))));
     }
 
-    /// Checks each real comparison's slice form against its scalar form for many items against one number, in either order, with each item of `items` as the number.
-    fn against_one<F: Float + std::fmt::Debug>(t: Tolerance, items: &[f64]) where Equal: Binary<F, Out = bool>, NotEqual: Binary<F, Out = bool>,
-        Less: Binary<F, Out = bool>, LessEqual: Binary<F, Out = bool>, Greater: Binary<F, Out = bool>, GreaterEqual: Binary<F, Out = bool>,
-        Matches: Binary<F, Out = bool> {
-        fn check<F: Copy + Sync + std::fmt::Debug, K: Binary<F, Out = bool> + std::fmt::Debug>(k: K, x: &[F]) {
+    /// Native comparison kernels keep broadcast comparisons and each scalar tolerance method in agreement.
+    fn against_one<F: Float + Element + std::fmt::Debug>(t: Tolerance, items: &[f64]) {
+        fn check<F: Float + Element + std::fmt::Debug, K: Formula<2>>(k: K, t: Tolerance, x: &[F], one: impl Fn(F, F) -> bool) {
             for &c in x {
-                let (mut left, mut right) = (Vec::new(), Vec::new());
-                assert!(k.many(Arg::Many(x), Arg::One(c), x.len(), &mut left) & k.many(Arg::One(c), Arg::Many(x), x.len(), &mut right));
-                assert_eq!(left, x.iter().map(|&v| k.one(v, c)).collect::<Vec<_>>(), "{k:?} with {c:?} on the right");
-                assert_eq!(right, x.iter().map(|&v| k.one(c, v)).collect::<Vec<_>>(), "{k:?} with {c:?} on the left");
+                let left: Vec<bool> = many(k.clone(), t, [x, &[c]], x.len());
+                let right: Vec<bool> = many(k.clone(), t, [&[c], x], x.len());
+                assert_eq!(left, x.iter().map(|&v| one(v, c)).collect::<Vec<_>>());
+                assert_eq!(right, x.iter().map(|&v| one(c, v)).collect::<Vec<_>>());
             }
         }
         let x: Vec<F> = items.iter().map(|&v| F::narrow(v)).collect();
-        check(Equal(t), &x);
-        check(NotEqual(t), &x);
-        check(Less(t), &x);
-        check(LessEqual(t), &x);
-        check(Greater(t), &x);
-        check(GreaterEqual(t), &x);
-        check(Matches(t), &x);
+        check(Equal(t), t, &x, |a, b| t.equal(a, b));
+        check(NotEqual(t), t, &x, |a, b| !t.equal(a, b));
+        check(Less(t), t, &x, |a, b| t.less(a, b));
+        check(LessEqual(t), t, &x, |a, b| t.less_equal(a, b));
+        check(Greater(t), t, &x, |a, b| t.greater(a, b));
+        check(GreaterEqual(t), t, &x, |a, b| t.greater_equal(a, b));
     }
-    /// Each tolerant object gives its method's result for each item, at the default tolerance and at 0, for slices beside slices and one item beside a slice, at f32, f64 and complex items. Only `Gcd`'s infinite argument fails.
+
+    /// Tolerant kernels give the tolerance methods' results for native arrays, broadcasts and complex items.
     #[test]
     fn objects() {
         let (xs, ys) = (&[3.0, -3.0, 0.3, 0.0, f64::NAN, 2.0][..], &[-5.0, 5.0, 0.1 + 0.2, 7.0, 1.0, 2.9999999999999996][..]);
         let agree = |a: &[f64], b: &[f64]| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x == y || x.is_nan() && y.is_nan());
         for t in [T, Tolerance::EXACT] {
-            let (mut floors, mut residues, mut equal, mut order) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-            assert!(Floor(t).many(Arg::Many(ys), 6, &mut floors) & Ceil(t).many(Arg::Many(ys), 6, &mut floors));
-            assert!(Residue(t).many(Arg::Many(xs), Arg::Many(ys), 6, &mut residues) & Residue(t).many(Arg::One(3.0), Arg::Many(ys), 6, &mut residues));
-            assert!(Equal(t).many(Arg::Many(xs), Arg::Many(ys), 6, &mut equal) & Matches(t).many(Arg::Many(xs), Arg::One(f64::NAN), 6, &mut equal));
-            assert!(Compare(t).many(Arg::Many(xs), Arg::Many(ys), 6, &mut order));
+            let mut floors: Vec<f64> = many(Floor(t), t, [ys], 6);
+            floors.extend(many::<_, f64, _, 1>(Ceil(t), t, [ys], 6));
+            let mut residues: Vec<f64> = many(Residue(t), t, [xs, ys], 6);
+            residues.extend(many::<_, f64, _, 2>(Residue(t), t, [&[3.0], ys], 6));
             let floor: Vec<f64> = ys.iter().map(|&y| t.floor(y)).chain(ys.iter().map(|&y| t.ceil(y))).collect();
             let residue: Vec<f64> = (0..6).map(|i| t.residue(xs[i], ys[i])).chain(ys.iter().map(|&y| t.residue(3.0, y))).collect();
-            let eq: Vec<bool> = (0..6).map(|i| t.equal(xs[i], ys[i])).chain(xs.iter().map(|&x| t.matches(x, f64::NAN))).collect();
             assert!(agree(&floors, &floor) && agree(&residues, &residue), "{floors:?} {residues:?}");
-            assert_eq!(equal, eq);
-            assert_eq!(order, (0..6).map(|i| t.compare(xs[i], ys[i]).unwrap_or(Ordering::Greater)).collect::<Vec<_>>());
-            let check = |many: &dyn Fn(&mut Vec<bool>) -> bool, one: &dyn Fn(f64, f64) -> bool| {
-                let mut got = Vec::new();
-                assert!(many(&mut got));
+            let check = |got: Vec<bool>, one: &dyn Fn(f64, f64) -> bool| {
                 assert_eq!(got, (0..6).map(|i| one(xs[i], ys[i])).collect::<Vec<_>>());
             };
-            check(&|o| NotEqual(t).many(Arg::Many(xs), Arg::Many(ys), 6, o), &|x, y| !t.equal(x, y));
-            check(&|o| Less(t).many(Arg::Many(xs), Arg::Many(ys), 6, o), &|x, y| t.less(x, y));
-            check(&|o| LessEqual(t).many(Arg::Many(xs), Arg::Many(ys), 6, o), &|x, y| t.less_equal(x, y));
-            check(&|o| Greater(t).many(Arg::Many(xs), Arg::Many(ys), 6, o), &|x, y| t.greater(x, y));
-            check(&|o| GreaterEqual(t).many(Arg::Many(xs), Arg::Many(ys), 6, o), &|x, y| t.greater_equal(x, y));
-            let (ys32, mut floors32) = (ys.iter().map(|&y| y as f32).collect::<Vec<_>>(), Vec::new());
-            assert!(Floor(t).many(Arg::Many(&ys32), 6, &mut floors32));
+            check(many(Equal(t), t, [xs, ys], 6), &|x, y| t.equal(x, y));
+            check(many(NotEqual(t), t, [xs, ys], 6), &|x, y| !t.equal(x, y));
+            check(many(Less(t), t, [xs, ys], 6), &|x, y| t.less(x, y));
+            check(many(LessEqual(t), t, [xs, ys], 6), &|x, y| t.less_equal(x, y));
+            check(many(Greater(t), t, [xs, ys], 6), &|x, y| t.greater(x, y));
+            check(many(GreaterEqual(t), t, [xs, ys], 6), &|x, y| t.greater_equal(x, y));
+            let ys32 = ys.iter().map(|&y| y as f32).collect::<Vec<_>>();
+            let floors32: Vec<f32> = many(Floor(t), t, [&ys32], 6);
             assert_eq!(floors32, ys32.iter().map(|&y| t.floor(y)).collect::<Vec<_>>());
-            let (zs, mut complex) = (&[c(2.3, -1.7), c(0.5, 0.5), c(-1.0, 2.0)][..], Vec::new());
-            assert!(Floor(t).many(Arg::Many(zs), 3, &mut complex) & Residue(t).many(Arg::One(c(1.0, 1.0)), Arg::Many(zs), 3, &mut complex));
+            let zs = &[c(2.3, -1.7), c(0.5, 0.5), c(-1.0, 2.0)][..];
+            let mut complex: Vec<Complex64> = many(Floor(t), t, [zs], 3);
+            complex.extend(many::<_, Complex64, _, 2>(Residue(t), t, [&[c(1.0, 1.0)], zs], 3));
             let want: Vec<Complex64> = zs.iter().map(|&z| t.complex_floor(z)).chain(zs.iter().map(|&z| t.complex_residue(c(1.0, 1.0), z))).collect();
             assert_eq!(complex, want);
         }
-        // Many items against one number take the range of floats equal to it, in either order. Each test item serves as the number.
         let items = [3.0, -3.0, 0.3, 0.1 + 0.2, 0.0, -0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 2.0, 2.9999999999999996, 1e-310, 1.0 + 3e-14];
         for t in [T, Tolerance::EXACT] {
             against_one::<f64>(t, &items);
             against_one::<f32>(t, &items);
             against_one::<f16>(t, &items);
         }
-        assert_eq!(Gcd(T).one(12.0, 18.0), 6.0);
-        assert!(!Gcd(T).many(Arg::One(f64::INFINITY), Arg::Many(&[2.0][..]), 1, &mut Vec::new()));
-        // Lcm has the sign of x y, gives 0 where the gcd is 0, and divides at the tolerance's gcd.
-        assert_eq!([Lcm(T).one(-4.0, 6.0), Lcm(T).one(0.0, 5.0), Lcm(T).one(0.6, 0.4)], [-12.0, 0.0, 1.2000000000000002]);
-        assert_eq!(Lcm(T).one(c(2.0, 0.0), c(0.0, 3.0)), c(0.0, 6.0));
+        let real = |k| Kernel::new(k, Variant::checked(f64::DTYPE));
+        assert_eq!(real(Gcd(T)).real(&[12.0, 18.0], Settings { tolerance: T }).unwrap(), 6.0);
+        assert!(real(Gcd(T)).real(&[f64::INFINITY, 2.0], Settings { tolerance: T }).is_err());
+        let lcm = Kernel::new(Lcm(T), Variant::checked(f64::DTYPE));
+        assert_eq!([(-4.0, 6.0), (0.0, 5.0), (0.6, 0.4)].map(|(x, y)| lcm.real(&[x, y], Settings { tolerance: T }).unwrap()), [-12.0, 0.0, 1.2000000000000002]);
+        let lcm = Kernel::new(Lcm(T), Variant::checked(Complex64::DTYPE));
+        assert_eq!(lcm.complex(&[c(2.0, 0.0), c(0.0, 3.0)], Settings { tolerance: T }).unwrap(), c(0.0, 6.0));
     }
 
-    /// An `Indicator` gives each comparison's Booleans as 1 and 0 at each float width, over more items than its buffer holds, with one number on either side and with slices on both.
-    #[test]
-    fn indicator() {
-        fn check<F: Float + std::fmt::Debug, K: Binary<F, Out = bool> + Copy>(k: K) where Indicator<K>: Binary<F, Out = F> {
-            let x: Vec<F> = (0..700).map(|i| F::narrow(f64::from(i % 7) - 3.0)).collect();
-            let zero = F::narrow(0.0);
-            for (a, b) in [(Arg::Many(&x[..]), Arg::One(zero)), (Arg::One(zero), Arg::Many(&x[..])), (Arg::Many(&x[..]), Arg::Many(&x[1..]))] {
-                let (mut bools, mut lanes) = (Vec::new(), Vec::new());
-                assert!(k.many(a, b, 699, &mut bools) & Indicator(k).many(a, b, 699, &mut lanes));
-                assert_eq!(lanes, bools.iter().map(|&b| F::narrow(if b { 1.0 } else { 0.0 })).collect::<Vec<_>>());
-            }
-        }
-        macro_rules! comparisons {
-            ($f:ty, $t:expr) => {
-                check::<$f, _>(Equal($t));
-                check::<$f, _>(NotEqual($t));
-                check::<$f, _>(Less($t));
-                check::<$f, _>(LessEqual($t));
-                check::<$f, _>(Greater($t));
-                check::<$f, _>(GreaterEqual($t));
-                check::<$f, _>(Matches($t));
-            };
-        }
-        for t in [T, Tolerance::EXACT] {
-            comparisons!(f64, t);
-            comparisons!(f32, t);
-        }
-    }
 
     /// Tolerant search finds the first match that a brute-force search finds, at every width and at small and large tolerances, among floats crowded near a few values, and among zeros, infinities and NaN, whether it scans for a few items or indexes many.
     #[test]

@@ -10,7 +10,7 @@ pub use rustymath_core::{
     fused, unfused, half, num_complex,
 };
 pub use rustymath_core::{
-    FUSED, Float, Native, Arg, Unary, Binary, Ternary,
+    FUSED, Float, Native, Arg,
     Abs, Acos, Acosh, Add, Angle, Asin, Asinh, Atan, Atan2, Atanh, Betainc, BetaincAt, Betaincinv, Binom, BinomDk, BinomDn,
     BitAnd, BitOr, Bitwise, Cbrt, Choose, Cis, Clip, Conj, Cos, Cosh, Digamma, Divide, Erf, Erfc, Erfcinv, Erfinv, Exp, Expm1,
     Factorial, Gamma, Gammainc, Gammaincc, Gammaincinv, Hypot, Imag, Isfinite, Isinf, Isnan, LambertW, LeftShift, Lgamma, Ln, Log1p, Log2,

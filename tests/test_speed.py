@@ -13,8 +13,10 @@ def arrays():
     u = lambda *shape: rng.uniform(-1, 1, shape)
     x, y = u(N), u(N)
     xs = np.sort(x)
+    root_nf = rm.array(np.full(N, 5, dtype=np.float32))
+    root_yf = rm.array((1000 * ((np.arange(N) * 0.414_213_562_373_095_1) % 1)).astype(np.float32))
     return dict(np=np, rm=rm, xn=x, x=rm.array(x), y=rm.array(y), xf=rm.array(x.astype(np.float32)), yf=rm.array(y.astype(np.float32)),
-        xs=rm.array(xs), xsf=rm.array(xs.astype(np.float32)),
+        xs=rm.array(xs), xsf=rm.array(xs.astype(np.float32)), root_nf=root_nf, root_yf=root_yf,
         m=rm.array(u(256, 256)), a=rm.array(u(256, 256)), b=rm.array(u(256, 256)), row=rm.array(u(256)), idx=rm.array(rng.permutation(N)),
         img=rm.array(u(256, 256)), k=rm.array(u(3, 3)), kern=rm.array(u(16)), frames=rm.array(u(1024, 64)),
         r=rm.array(rng.integers(0, 256, N)), c=rm.array(rng.integers(0, 256, N)), mask=rm.array(u(N) > 0))
@@ -93,3 +95,24 @@ def test_speed(capsys):
         failures += [line for _, line in over]
         if timing.checks_budgets: assert not failures, '\n'.join(failures)
         for line in failures: print(f'{line}: over', file=sys.stderr)
+
+
+def test_conversion_controls(capsys):
+    "Public conversion workloads, including Python calls and result release; fill converts one scalar, and float-width astype uses ArrayView's reader."
+    with capsys.disabled(), held(rm.timing()):
+        for n in (16, 65_536):
+            x = rm.array((np.arange(n) % 31) / 4)
+            whole, outside = rm.array(np.arange(n) % 31, dtype='int16'), rm.array([n])
+            cases = [('floor', lambda: x.astype('int16'), (n,)),
+                ('float-width', lambda: x.astype('float32'), (n,)),
+                ('seeded-bool-scan', lambda: rm.accumulate(rm.equal, x, start=0), (n,)),
+                ('scalar-fill-keep', lambda: whole.take(outside, mode='fill', fill=3.).compact(), (1,))]
+            for name, run, shape in cases:
+                result = run()
+                assert result.shape == shape
+                del result
+                steps = max(1, 2048 // n)
+                def repeated():
+                    for _ in range(steps): run()
+                ns = fastest(repeated) * 1e9 / steps
+                print(f'conversion {name} n={n} output={shape[0]} ns/call={ns:.3f} ns/item={ns/shape[0]:.6f}', file=sys.stderr)

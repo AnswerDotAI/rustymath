@@ -95,11 +95,19 @@ fn inverse_result(result: Option<Result<(Buffer, bool), Error>>, items: usize) -
 fn native_read<T, R>(shape: &[usize], axis: Option<usize>, checked: bool, input: Read<'_>) -> Result<(Buffer, bool, Option<Vec<Steps>>), Error> where T: Cast,
     R: Reduction<T>, R::Total: Totals {
     let dims = match axis { Some(axis) => Lanes::new(shape, axis)?.dims(), None => [1, crate::layout::count(shape), 1] };
-    if let Some((view, mapping)) = input.positional(shape) && let Some(data) = T::of(view) {
+    let source = input.positional(shape).or_else(|| input.mapped_source().map(|(view, map)| (view, map.clone())));
+    if let Some((view, mapping)) = source && let Some(data) = T::of(view) {
         if axis.is_none() && R::COMMUTATIVE && let Some(block) = mapping.block(shape) {
             return crate::error::checked(|| {
                 let (dims, order) = block.fold(None);
                 let (totals, fits) = along::<T, R>(&data[block.range], dims);
+                Ok((R::Total::buffer_of(totals), fits, order))
+            });
+        }
+        let flat = [crate::layout::count(shape)];
+        if axis.is_none() && rereads_cheaply(&mapping, &flat) {
+            return crate::error::checked(|| {
+                let (totals, fits, order) = along_mapped::<T, R>(data, &mapping, &flat, 0);
                 Ok((R::Total::buffer_of(totals), fits, order))
             });
         }

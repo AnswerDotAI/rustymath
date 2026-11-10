@@ -389,6 +389,11 @@ impl<'s> Read<'s> {
         if range.start > range.end || range.end > self.plan.len() { return Err(Error::new(Kind::Length, "read range exceeds its result")); }
         self.bindings()
     }
+    /// Append the converted range without changing existing output items.
+    pub(crate) fn append<T: crate::buffer::Cast>(&self, range: Range<usize>, checked: bool, output: &mut Vec<T>) -> Result<(), Error> {
+        self.range(&range)?;
+        self.read_onto(range, checked, output)
+    }
     /// The items that `range` reads as one run of a source's storage, at whatever dtype it holds: the borrowed run and its stride, 1 for consecutive items and 0 for one item that every position reads (`ReadPlan::run`).
     fn run_view(&self, range: &Range<usize>) -> Option<(crate::buffer::View<'s>, usize)> {
         let (source, start, stride) = self.plan.run(range)?;
@@ -526,7 +531,7 @@ impl<'s> Read<'s> {
         let binding = self.sources.get(source)?;
         let len = binding.view.len();
         (binding.start == 0 && len == input.len() && match *map {
-            Mapping::Single => true, Mapping::Linear(r) => r > 0 && end.saturating_sub(1) / r < len, Mapping::Tiled(m) => m > 0 && m <= len,
+            Mapping::Single => len > 0, Mapping::Linear(r) => r > 0 && end.saturating_sub(1) / r < len, Mapping::Tiled(m) => m > 0 && m <= len,
             Mapping::Steps { base, ref steps } => Steps::furthest(base, &steps[..]).is_none_or(|furthest| furthest < len)
         }).then_some(binding)
     }
@@ -979,7 +984,7 @@ impl Mapping {
         let base = base + outer.iter().map(|s| if let Steps::Stride { start, .. } = *s { start } else { 0 }).sum::<usize>();
         Some(if base == 0 && Steps::in_order(inner) { Period::Cycles(p) } else { Period::Walks { len: p, base, steps: inner } })
     }
-    /// Whether `expanded` copies most blocks of `block` items read through this mapping, rather than reading them where they lie: steps whose runs of adjacent offsets (`Steps::contiguous`) are shorter than a block, as a transpose's, a reversal's, windows' and a column slice's are. Repeats and cycles don't count: a run that stays inside one repeat or cycle reads in place, and the caller decides where runs end.
+    /// Whether `expanded_items` copies most blocks of `block` items read through this mapping, rather than reading them where they lie: steps whose runs of adjacent offsets (`Steps::contiguous`) are shorter than a block, as a transpose's, a reversal's, windows' and a column slice's are. Repeats and cycles don't count: a run that stays inside one repeat or cycle reads in place, and the caller decides where runs end.
     pub fn copies(&self, block: usize) -> bool { match self { Self::Steps { steps, .. } => Steps::contiguous(steps) < block, _ => false } }
     /// Whether a walk of blocks of `block` items through this mapping reads each item from its own cache line, where a walk of the whole copy reads them through the tiled transpose (`Steps::transposing`): after `simplify`, the last two axes form a transpose whose inner axis holds a block or more, so that each block walks one strided run. A copy made whole then costs much less than reads through it a block at a time.
     pub fn tiles_whole(&self, block: usize) -> bool {
@@ -1218,23 +1223,17 @@ pub(crate) const LINE: usize = 128;
 /// The most items in a block of whole rows from [`Mapping::line_block`].
 const LINE_BLOCK: usize = 1 << 16;
 
-/// The one item that every position in `start..start + n` reads, where `mapping` repeats a single item over all of them. `None` where the positions read more than one item.
-fn single<A: Copy>(mapping: &Mapping, data: &[A], start: usize, n: usize) -> Option<A> {
-    mapping.run(start, n).and_then(|(o, step)| (step == 0).then(|| data[o]))
-}
-
-/// Items `start..start + n` of an argument that `mapping` lays out, read as `expanded` reads them but always as a slice of all `n` items. A repeated item fills `buf`.
+/// Items `start..start + n` of an argument that `mapping` lays out. Borrowed runs stay in place; other reads fill `buf` with all `n` items.
 pub fn expanded_items<'a, A: Element>(mapping: &Walked, data: &'a [A], start: usize, n: usize, buf: &'a mut Vec<A>) -> &'a [A] {
-    if let Some(x) = single(mapping, data, start, n) {
-        buf.clear();
-        buf.resize(n, x);
-        return buf;
+    match in_place(mapping, data, start, n) {
+        Some(Arg::Many(items)) => items,
+        Some(Arg::One(x)) => { buf.clear(); buf.resize(n, x); buf },
+        None => copied(mapping, data, start, n, buf)
     }
-    match expanded(mapping, data, start, n, buf) { Arg::Many(items) => items, Arg::One(_) => unreachable!("`single` gives every repeated item") }
 }
 
 /// Items `start..start + n` of an argument that `mapping` lays out, where they need no copy: a single item, a contiguous run, items within one repeat, or items of a cycle: within one period of a mapping that cycles (`Period::Cycles`), and as far as `data` holds a `Tiled` cycle, once or written out past its end (`tiled_cycle`). A `Steps` mapping reads a forward run in place through `run`.
-pub fn in_place<'a, A: Copy>(mapping: &Walked, data: &'a [A], start: usize, n: usize) -> Option<Arg<'a, A>> {
+fn in_place<'a, A: Copy>(mapping: &Walked, data: &'a [A], start: usize, n: usize) -> Option<Arg<'a, A>> {
     match mapping.run(start, n) {
         Some((o, 0)) => return data.get(o).copied().map(Arg::One),
         Some((o, 1)) => return data.get(o..o.checked_add(n)?).map(Arg::Many),
@@ -1250,11 +1249,6 @@ pub fn in_place<'a, A: Copy>(mapping: &Walked, data: &'a [A], start: usize, n: u
     data.get(from..from.checked_add(n)?).map(Arg::Many)
 }
 
-/// Items `start..start + n` of an argument that `mapping` lays out over the frame, read `in_place` where they can be. Others copy into `buf`. A repeated item fills each of its periods. A cycled argument copies through `gather::cycled`, and a `Steps` mapping through `walk_plan`, over the walk that its reader keeps (`Walked`).
-pub fn expanded<'a, A: Element>(mapping: &Walked, data: &'a [A], start: usize, n: usize, buf: &'a mut Vec<A>) -> Arg<'a, A> {
-    if let Some(arg) = in_place(mapping, data, start, n) { return arg; }
-    Arg::Many(copied(mapping, data, start, n, buf))
-}
 
 /// The cycle that `mapping`'s positions read from `data`, written into `buf` as `Period::tiling` says for runs of up to `run` positions, with the `Tiled` mapping that then reads it in place: a cycle read in order copies its first period, and one that walks entries (`Period::Walks`) gathers its period through them. A cycle shorter than its cover is written out past its end, so that a run reads it in place at any phase. `None` where `tiling` gives none, leaving `buf` alone.
 pub fn tiled_cycle<A: Element>(data: &[A], mapping: &Mapping, run: usize, buf: &mut Vec<A>) -> Option<Mapping> {
@@ -1272,7 +1266,7 @@ pub fn tiled_cycle<A: Element>(data: &[A], mapping: &Mapping, run: usize, buf: &
     Some(Mapping::Tiled(p))
 }
 
-/// Items `start..start + n` that `mapping` lays out, copied into `buf`, cleared first: what `expanded` gives where `in_place` refuses them. A caller that has just had `in_place` refuse them copies here directly, and the copy records that refusal.
+/// Items `start..start + n` that `mapping` lays out, copied into `buf`, cleared first: what `expanded_items` gives where `in_place` refuses them. A caller that has just had `in_place` refuse them copies here directly, and the copy records that refusal.
 pub fn copied<'a, A: Element>(mapping: &Walked, data: &[A], start: usize, n: usize, buf: &'a mut Vec<A>) -> &'a [A] {
     buf.clear();
     let reason = copy_walked(mapping, data, start, n, A::FILL, buf);

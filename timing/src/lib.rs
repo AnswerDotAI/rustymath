@@ -13,16 +13,25 @@ pub const RUNS: usize = 5;
 const ENOUGH: Duration = Duration::from_millis(20);
 
 /// The time of the fastest of `run`'s calls, in seconds. It stops after the second call, or any later one, once the calls have taken `ENOUGH` since the first began. Otherwise it makes `RUNS` calls, and goes on calling until the calls have taken `least`: a short case's fastest call then comes from many calls, and varies less between test runs. Call `k` is passed `k`, so it can read its own inputs. A caller whose inputs hold one set for each of `RUNS` calls passes `Duration::ZERO`.
-pub fn fastest(least: Duration, mut run: impl FnMut(usize)) -> f64 {
-    let (begun, mut best) = (Instant::now(), Duration::MAX);
-    for k in 0.. {
-        let start = Instant::now();
-        run(k);
-        best = best.min(start.elapsed());
-        let spent = begun.elapsed();
-        if k > 0 && spent >= ENOUGH || k + 1 >= RUNS && spent >= least { break; }
+pub fn fastest(least: Duration, run: impl FnMut(usize)) -> f64 { Sampling::Measure.fastest(least, run) }
+
+/// Routine budget checks need two completed samples; measurements retain the full sampling window.
+#[derive(Clone, Copy)]
+pub enum Sampling { Check, Measure }
+
+impl Sampling {
+    pub fn fastest(self, least: Duration, mut run: impl FnMut(usize)) -> f64 {
+        let (least, runs) = match self { Self::Check => (Duration::ZERO, 2), Self::Measure => (least, RUNS) };
+        let (begun, mut best) = (Instant::now(), Duration::MAX);
+        for k in 0.. {
+            let start = Instant::now();
+            run(k);
+            best = best.min(start.elapsed());
+            let spent = begun.elapsed();
+            if k > 0 && spent >= ENOUGH || k + 1 >= runs && spent >= least { break; }
+        }
+        best.as_secs_f64()
     }
-    best.as_secs_f64()
 }
 
 /// What `f` gives, and the instructions retired in user space while it ran. On Linux a `perf_event_open` counter counts the calling thread, without any threads that `f` starts. On macOS `proc_pid_rusage` counts the whole process. The speed tests run each case on one thread, where the two agree. `None` where the platform has no counter or refuses one, as Linux does where `/proc/sys/kernel/perf_event_paranoid` is above 2, and in the browser build.
