@@ -19,6 +19,10 @@ def test_selection_and_metadata():
     assert a[[2]].tolist() == a[[0.5]].tolist() == [[0, 0, 0]]
     repeated = keyed[['a', 'a']]
     assert repeated.tolist() == [[1, 2], [1, 2]] and repeated.keys == (None, None)
+    for s in (slice(None, -1, -1), slice(-1, None, -1), slice(-10**100, 10**100, 2), slice(10**100, -10**100, -2), slice(None, None, -10**100)):
+        assert a[:, s].tolist() == np.asarray(a)[:, s].tolist()
+    assert keyed['b':'a':-1].tolist() == [[3, 4], [1, 2]]
+    with pytest.raises(KeyError): keyed['missing':]
 
 def test_named_index_arrays_pair_and_address_by_name():
     a = rm.array([[0, 1, 2], [3, 4, 5], [6, 7, 8]])
@@ -100,6 +104,9 @@ def test_join_split_repeat_and_padding(a):
     assert rm.concatenate([a, a], axis=1).tolist() == [[1, 2, 1, 2], [3, 4, 3, 4]] and rm.concatenate([a, a]).shape == (4, 2)
     assert rm.concatenate([a, [5]], axis=None).tolist() == [1, 2, 3, 4, 5]
     assert rm.stack([a, a], axis=-1).tolist() == [[[1, 1], [2, 2]], [[3, 3], [4, 4]]]
+    pieces = [a, rm.array([[5], [6]]), rm.array([[7, 8], [9, 10]])]
+    assert rm.concatenate(pieces, axis=1).tolist() == [[1, 2, 5, 7, 8], [3, 4, 6, 9, 10]]
+    assert rm.concatenate([a[:, :0], a, a[:, :0]], axis=1).tolist() == [[1, 2], [3, 4]]
     assert [x.tolist() for x in rm.split(a, 2, axis=1)] == [[[1], [3]], [[2], [4]]]
     assert [x.tolist() for x in rm.split(a, 2, axis=None)] == [[1, 2], [3, 4]]
     assert [x.tolist() for x in rm.split([1, 2, 3], [1, 2])] == [[1], [2], [3]]

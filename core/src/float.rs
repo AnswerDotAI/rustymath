@@ -1,6 +1,5 @@
 //! The float types that rustymath's functions take, and the operations that its algorithms build on.
 use crate::search::{Key, RadixKey};
-use crate::{parallel::Slots, slice::{Arg, Ternary}};
 
 /// Whether `mla` fuses its multiply and add into one operation with one rounding. It does where the target has a fused multiply-add instruction, as on AArch64 and on x86-64 with FMA. Elsewhere, as in wasm and on baseline x86-64, `mul_add` calls a software `fma`, which is slow and stops the loop around it vectorizing. There `mla` multiplies and adds with two roundings.
 pub const FUSED: bool = cfg!(any(target_arch = "aarch64", target_feature = "fma"));
@@ -31,8 +30,6 @@ pub trait Float: num_traits::Float + sealed::Sealed + crate::slice::KernelItem +
     fn total_key(self) -> Self::OrderKey;
     /// The float whose `order_key` or `total_key` is `k`. A total key reads back exactly, apart from a NaN's sign. An order key reads `¯0` back as `0`, and every NaN as one NaN.
     fn from_order_key(k: Self::OrderKey) -> Self;
-    /// Writes `x` where `mask`'s lanes aren't zero and `y` where they are into the next `n` slots of `out`, through [`Choose`](crate::Choose), and gives whether every result succeeded. Fused graphs pass a comparison's lanes of 1 and 0 as the mask.
-    fn choose(x: Arg<'_, Self>, y: Arg<'_, Self>, mask: Arg<'_, Self>, n: usize, out: &mut Slots<'_, Self>) -> bool;
 }
 
 /// A float type that rustymath's algorithms run in: `f32` or `f64`.
@@ -149,8 +146,6 @@ macro_rules! native {
             #[inline]
             fn narrow(x: f64) -> $t { x as $t }
             #[inline]
-            fn choose(x: Arg<'_, $t>, y: Arg<'_, $t>, mask: Arg<'_, $t>, n: usize, out: &mut Slots<'_, $t>) -> bool { crate::Choose.many_into(x, y, mask, n, out) }
-            #[inline]
             fn next_up(self) -> $t { $t::next_up(self) }
             #[inline]
             fn next_down(self) -> $t { $t::next_down(self) }
@@ -222,10 +217,6 @@ impl Float for half::f16 {
     fn wide(self) -> f64 { self.to_f64() }
     #[inline]
     fn narrow(x: f64) -> Self { half::f16::from_f64(x) }
-    #[inline]
-    fn choose(x: Arg<'_, Self>, y: Arg<'_, Self>, mask: Arg<'_, Self>, n: usize, out: &mut Slots<'_, Self>) -> bool {
-        crate::Choose.many_into(x, y, mask, n, out)
-    }
     // The float above a positive float has the next bit pattern. The float above a negative float has the previous one. Both zeros step to the least positive subnormal.
     #[inline]
     fn next_up(self) -> Self {

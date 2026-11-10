@@ -162,14 +162,31 @@ fn log1p_usual<R: Native, const FUSED: bool>(x: R) -> R { let u = x + R::one(); 
 #[inline(always)]
 fn usual1p<R: Native>(x: R) -> bool { usual(x + R::one()) & (x != R::zero()) }
 
-usual_object!(/// [`ln`](crate::ln) as a function object.
-    Ln: ln, usual => #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), natural()));
-usual_object!(/// [`log2`](crate::log2) as a function object.
-    Log2: log2, usual => #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), base2(&crate::recipe::Floats)));
-usual_object!(/// [`log10`](crate::log10) as a function object.
-    Log10: log10, usual => #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), base10(&crate::recipe::Floats)));
-usual_object!(/// [`log1p`](crate::log1p) as a function object.
-    Log1p: log1p, usual1p => log1p_usual::<_, { crate::FUSED }>);
+/// [`ln`](crate::ln) as a function object.
+#[derive(Clone, Copy, Debug)]
+pub struct Ln;
+/// [`log2`](crate::log2) as a function object.
+#[derive(Clone, Copy, Debug)]
+pub struct Log2;
+/// [`log10`](crate::log10) as a function object.
+#[derive(Clone, Copy, Debug)]
+pub struct Log10;
+/// [`log1p`](crate::log1p) as a function object.
+#[derive(Clone, Copy, Debug)]
+pub struct Log1p;
+
+pub(crate) fn ln_slice<R: Native>(_: &Ln, _: &crate::recipe::NativeOps<{ crate::FUSED }>, [x]: [Arg<'_, R>; 1], n: usize, out: &mut [MaybeUninit<R>]) -> bool {
+    each_usual(x, n, out, (usual, #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), natural())), none(), ln::<_, { crate::FUSED }>)
+}
+pub(crate) fn log2_slice<R: Native>(_: &Log2, _: &crate::recipe::NativeOps<{ crate::FUSED }>, [x]: [Arg<'_, R>; 1], n: usize, out: &mut [MaybeUninit<R>]) -> bool {
+    each_usual(x, n, out, (usual, #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), base2(&crate::recipe::Floats))), none(), log2::<_, { crate::FUSED }>)
+}
+pub(crate) fn log10_slice<R: Native>(_: &Log10, _: &crate::recipe::NativeOps<{ crate::FUSED }>, [x]: [Arg<'_, R>; 1], n: usize, out: &mut [MaybeUninit<R>]) -> bool {
+    each_usual(x, n, out, (usual, #[inline(always)] |x| log_of::<_, { crate::FUSED }>(x.split(), base10(&crate::recipe::Floats))), none(), log10::<_, { crate::FUSED }>)
+}
+pub(crate) fn log1p_slice<R: Native>(_: &Log1p, _: &crate::recipe::NativeOps<{ crate::FUSED }>, [x]: [Arg<'_, R>; 1], n: usize, out: &mut [MaybeUninit<R>]) -> bool {
+    each_usual(x, n, out, (usual1p, log1p_usual::<_, { crate::FUSED }>), none(), log1p::<_, { crate::FUSED }>)
+}
 /// ln|x|, the real part of ln x, as a function object.
 #[derive(Clone, Copy, Debug)]
 pub struct RealLn;

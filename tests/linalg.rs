@@ -336,10 +336,7 @@ mod factor {
 
     pub(super) fn wide<T: RealItem>(x: &[T]) -> Vec<f64> { x.iter().map(|v| v.wide()).collect() }
 
-    /// The product of the `m`×`k` matrix `a` and the `k`×`n` matrix `b`, in f64, item by item.
-    pub(super) fn product(a: &[f64], b: &[f64], [m, k, n]: [usize; 3]) -> Vec<f64> {
-        (0..m * n).map(|ij| (0..k).map(|p| a[ij / n * k + p] * b[p * n + ij % n]).sum()).collect()
-    }
+    pub(super) fn product(a: &[f64], b: &[f64], size: [usize; 3]) -> Vec<f64> { PlusTimes.inner(a, b, size) }
 
     pub(super) fn norm(x: &[f64]) -> f64 { x.iter().map(|v| v * v).sum::<f64>().sqrt() }
 

@@ -15,7 +15,7 @@ Float functions give results within four units in the last place (ulps) of the c
 pip install rustymath
 ```
 
-Rust users can add the crate to `Cargo.toml`. See [Using rustymath from Rust](https://answerdotai.github.io/rustymath/rust.html) for scalar and slice forms, build settings, accuracy and speed.
+Rust users can add the crate to `Cargo.toml`. See [Using rustymath from Rust](https://answerdotai.github.io/rustymath/rust.html) for function objects and native bulk routines, build settings, accuracy and speed.
 
 ``` python
 import rustymath as rm

@@ -30,11 +30,11 @@ macro_rules! conversion {
                 with_width!(to, I => with_float_width!(width, F => $write!(F, I, |x| Ok(saturated(x)))))
             }
             (ConversionKind::Cast | ConversionKind::Truncate, DType::Integer(from), DType::Integer(to)) => with_width!(to, I => with_width!(from, S => {
-                $write!(S, I, |x| {
+                $write!(S, I, move |x| {
                     if $checked { I::try_from(x).map_err(|_| Error::new(Kind::Overflow, "integer doesn't fit its converted dtype")) } else { Ok(x as I) }
                 })
             })),
-            (ConversionKind::Truncate, input_type, DType::Character) if input_type.is_integral() => $write!(i64, char, |x| {
+            (ConversionKind::Truncate, input_type, DType::Character) if input_type.is_integral() => $write!(i64, char, move |x| {
                 match u32::try_from(x).ok().and_then(char::from_u32) {
                     Some(x) => Ok(x), None if $checked => Err(Error::new(Kind::Domain, "result is not a Unicode character")), None => Ok(char::FILL)
                 }
@@ -90,44 +90,36 @@ impl Conversion {
                         .validity::<f64, _>(&crate::recipe::RangeOps(self.input), crate::domain::Range::of_dtype(self.input))
                         .is_some_and(|(_, valid)| valid != Some(true)))
     }
-    /// Converts contiguous storage through the shared typed conversion rules, without a read plan.
+    /// Converts contiguous storage through the mapped conversion executor.
     pub(crate) fn buffer(self, view: crate::buffer::View<'_>, checked: bool, tolerance: crate::tolerant::Tolerance) -> Result<crate::buffer::Buffer, crate::error::Error> {
-        use crate::buffer::Cast;
-        macro_rules! write {
-            ($s:ty, $t:ty, $convert:expr) => { Ok(converted_buffer::<$s, $t>(view, checked, $convert)) };
-            (@keep $t:ty) => { Ok(<$t>::buffer((0..view.len()).map(|i| converted_item(crate::buffer::kept_as::<$t>(view, i)).0).collect())) };
-            (@cast $t:ty) => {{
-                let mut values = Vec::with_capacity(view.len());
-                if let Err(error) = <$t>::extend_cast(view, view.len(), checked, &mut values) { crate::error::record(error); values.resize(view.len(), <$t>::FILL); }
-                Ok(<$t>::buffer(values))
-            }};
-            (@unsupported) => { Err(crate::error::Error::new(crate::error::Kind::Domain, "unsupported resolved conversion")) };
-        }
-        crate::error::checked(|| conversion!(self, checked, tolerance, write))
+        let mut result = crate::buffer::Buffer::with_capacity(self.output, view.len());
+        self.append(view, checked, tolerance, None, crate::buffer::MapOutput::Buffer(&mut result))?;
+        Ok(result)
     }
     pub(crate) fn append<'a, 'b>(
         self, view: crate::buffer::View<'_>, checked: bool, tolerance: crate::tolerant::Tolerance,
-        scratch: &'a mut crate::buffer::Scratch, output: crate::buffer::MapOutput<'a, 'b>
+        scratch: Option<&'a mut crate::buffer::Scratch>, output: crate::buffer::MapOutput<'a, 'b>
     ) -> Result<(), crate::error::Error> {
         let sources = [crate::agreement::Binding::full(view)];
         let plan = crate::agreement::ReadPlan::input(0, view.len());
         self.map_in(crate::agreement::Read { sources: &sources, plan: &plan }, 0..view.len(), checked, tolerance, scratch, output)
     }
-    pub(crate) fn map(
-        self, input: crate::agreement::Read<'_>, range: std::ops::Range<usize>, checked: bool, output: &mut crate::buffer::Buffer
-    ) -> Result<(), crate::error::Error> {
-        if output.dtype() != self.output { *output = crate::buffer::Buffer::with_capacity(self.output, range.len()); } else { output.clear(); }
-        self.map_in(input, range, checked, crate::tolerant::Tolerance::EXACT, &mut crate::buffer::Scratch::default(), crate::buffer::MapOutput::Buffer(output))
-    }
-
     pub fn map_in<'a, 'b>(
         self, input: crate::agreement::Read<'_>, range: std::ops::Range<usize>, checked: bool, tolerance: crate::tolerant::Tolerance,
-        scratch: &'a mut crate::buffer::Scratch, target: crate::buffer::MapOutput<'a, 'b>
+        scratch: Option<&'a mut crate::buffer::Scratch>, target: crate::buffer::MapOutput<'a, 'b>
     ) -> Result<(), crate::error::Error> {
-        let mut output = crate::buffer::Output { target, result_dtype: self.output, checked, scratch: Some(scratch) };
+        let mut output = crate::buffer::Output { target, result_dtype: self.output, checked, scratch };
         macro_rules! write {
             ($s:ty, $t:ty, $convert:expr) => { written::<$s, $t>(input, range, checked, &mut output, $convert) };
-            (@cast $t:ty) => { write!($t, $t, Ok) };
+            (@cast $t:ty) => {{
+                if let crate::buffer::MapOutput::Buffer(buffer) = &mut output.target && let Some(values) = <$t>::vec_mut(buffer) {
+                    let (at, n) = (values.len(), range.len());
+                    if let Err(error) = input.append(range, checked, values) {
+                        crate::error::record(error); values.truncate(at); values.resize(at + n, <$t>::FILL);
+                    }
+                    Ok(())
+                } else { write!($t, $t, Ok) }
+            }};
             (@keep $t:ty) => { kept_mapped::<$t>(self.input, input, range, checked, &mut output) };
             (@unsupported) => {{ output.target.fill(range.len()); Err(Error::new(Kind::Domain, "unsupported resolved conversion")) }};
         }
@@ -138,24 +130,6 @@ impl Conversion {
 #[inline]
 fn converted_item<T: crate::buffer::Element>(value: Result<T, crate::error::Error>) -> (T, bool) {
     match value { Ok(value) => (value, true), Err(error) => { crate::error::record(error); (T::FILL, false) } }
-}
-
-fn converted_buffer<S: crate::buffer::Cast, T: crate::buffer::Element>(
-    view: crate::buffer::View<'_>, checked: bool, convert: impl Fn(S) -> Result<T, crate::error::Error>
-) -> crate::buffer::Buffer {
-    let (mut values, mut scratch) = (Vec::with_capacity(view.len()), Vec::new());
-    for from in (0..view.len()).step_by(crate::CHUNK) {
-        let part = view.slice(from..(from + crate::CHUNK).min(view.len()));
-        let items = if let Some(items) = S::of(part) { items } else {
-            scratch.clear();
-            if let Err(error) = S::extend_cast(part, part.len(), checked, &mut scratch) {
-                crate::error::record(error); values.resize(values.len() + part.len(), T::FILL); continue;
-            }
-            &scratch
-        };
-        values.extend(items.iter().map(|&x| converted_item(convert(x)).0));
-    }
-    T::buffer(values)
 }
 
 #[inline]

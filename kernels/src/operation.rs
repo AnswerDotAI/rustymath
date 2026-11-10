@@ -80,7 +80,7 @@ impl Map {
         if inputs.len() != self.arity() { output.fill(range.len()); return Err(Error::new(Kind::Length, "map arity does not match its operands")); }
         match self {
             Self::Kernel(kernel, settings) => kernel.map_in(inputs, range, *settings, scratch, output),
-            Self::Convert(conversion, settings, checked) => conversion.map_in(inputs[0], range, *checked, settings.tolerance, scratch, output)
+            Self::Convert(conversion, settings, checked) => conversion.map_in(inputs[0], range, *checked, settings.tolerance, Some(scratch), output)
         }
     }
 }
@@ -656,7 +656,7 @@ fn with_projected_view<R>(view: View<'_>, projection: Projection, f: impl FnOnce
 fn with_projected<R>(
     inputs: &[crate::agreement::Read<'_>], range: Option<std::ops::Range<usize>>, projection: Projection,
     call: impl FnOnce(&[crate::agreement::Read<'_>]) -> Result<R, Error>) -> Result<R, Error> {
-    use crate::{agreement::{Binding, Read, ReadPlan}, buffer::{FloatBuf, IntBuf}};
+    use crate::{agreement::{Binding, Read, ReadPlan}, buffer::{Floats, IntBuf}};
     let Some(t) = projection.wholes() else { return call(inputs) };
     let codes = matches!(projection, Projection::Codes(_));
     let sources: Vec<Vec<_>> = if codes { inputs.iter().map(|r| r.sources.iter().map(|s| s.as_codes()).collect()).collect() } else { Vec::new() };
@@ -677,9 +677,8 @@ fn with_projected<R>(
     let converted = projected.iter().map(|read| {
         if !read.sources.iter().any(|s| matches!(s.view.dtype(), DType::Float(_))) { return Ok(None); }
         let range = range.clone().unwrap_or(0..read.plan.len());
-        let mut floats = Buffer::with_capacity(DType::Float(FloatWidth::F64), range.len());
-        read.read_into(range.clone(), floats.dtype(), true, &mut floats)?;
-        let Buffer::Floats(FloatBuf::F64(values)) = &floats else { unreachable!("a read into 64-bit floats gives them") };
+        let mut floats = Buffer::with_capacity(DType::Float(FloatWidth::F64), 0);
+        let View::Floats(Floats::F64(values)) = read.part_view(range.clone(), floats.dtype(), true, &mut floats)? else { unreachable!("a read into 64-bit floats gives them") };
         Ok(Some((range.start, Buffer::Integers(IntBuf::I64(whole_numbers(t, values)?)))))
     }).collect::<Result<Vec<_>, Error>>()?;
     let bindings = converted.iter().zip(inputs)

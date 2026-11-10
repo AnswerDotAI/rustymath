@@ -1,6 +1,4 @@
 //! The magnitude, sign and angle of a number, as function objects.
-use crate::slice::Total;
-use num_complex::{Complex32, Complex64};
 
 /// |x|, or the magnitude |z| of a complex z, which is real, as a function object.
 #[derive(Clone, Copy, Debug)]
@@ -38,7 +36,7 @@ objects! {
     Rint;
     /// Clipping x between lower and upper bounds in one pass: `minimum(upper, maximum(lower, x))`. A lower bound above the upper one gives the upper. A NaN argument gives NaN, x or a bound, depending on the target.
     Clip;
-    /// `x` where `m` is nonzero and `y` where it's zero, item by item: a select, with the mask `m` as lanes of the items' type.
+    /// Choosing x where the mask is nonzero, otherwise y.
     Choose;
 }
 
@@ -73,9 +71,3 @@ pub(crate) fn rounded_wide(x: i128, scale: f64) -> i128 {
     let q = q + if away > scale || away == scale && q & 1 != 0 { x.signum() } else { 0 };
     q * scale
 }
-
-forms!(Choose at real: |_, [x, y, m]| Total(if m != 0.0 { x } else { y }));
-forms!(Choose at Complex32, Complex64: |_, [x, y, m]| Total(if m.re != 0.0 { x } else { y }));
-forms!(Choose at u8, i16, i32, i64: |_, [x, y, m]| if m != 0 { x } else { y });
-forms!(Choose at bool: |_, [x, y, m]| (m & x) | (!m & y));
-forms!(Choose at char: |_, [x, y, m]| if m == '\u{1}' { x } else { y });

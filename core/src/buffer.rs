@@ -303,8 +303,8 @@ impl DType {
     /// The float width that a Boolean or integer computes in under rustymath's own policy, NumPy's: the float that [`DType::inexact`] gives it under `f64`. `f64` for any other dtype.
     pub fn numpy_float(self) -> FloatWidth { match self.inexact(FloatWidth::F64) { Some((DType::Float(w), _)) => w, _ => FloatWidth::F64 } }
 
-    /// The dtype that an argument of this dtype computes in, for a function with a kernel at each dtype where `has` holds. That's this dtype where it has a kernel. Otherwise it's the first with a kernel of these: for a Boolean or an integer, integers of `int` or of this dtype's width, whichever is wider, then floats of `float`; for a float or a complex number, the dtype that [`DType::inexact`] gives it; then each wider float, and each complex dtype whose parts are at least as wide; and last, for a float, integers of `int`, which compute it as the whole number it holds (`operation::whole_numbers`). `int` and `float` are the caller's policy for exact numbers. NumPy's is `i64` and the float that `inexact` gives under `f64`. `None` where no dtype on the way has a kernel.
-    pub fn computes_in(self, int: Width, float: FloatWidth, has: impl Fn(DType) -> bool) -> Option<DType> {
+    /// The dtype that an argument of this dtype computes in, for a function with a kernel at each dtype where `has` holds. That's this dtype where it has a kernel. Otherwise it's the first with a kernel of these: for a Boolean or an integer, integers of `int` or of this dtype's width, whichever is wider, then floats of `float`; for a float or a complex number, the dtype that [`DType::inexact`] gives it; then each wider float, and each complex dtype whose parts are at least as wide; and last, for a float, integers of `int`, which compute it as the whole number it holds (`operation::whole_numbers`). `int` and `float` are the caller's policy for exact numbers. NumPy's is `i64` and the float that `inexact` gives under `f64`. `None` where no dtype on the way has a kernel. Calls to `has` stop at the first success.
+    pub fn computes_in(self, int: Width, float: FloatWidth, mut has: impl FnMut(DType) -> bool) -> Option<DType> {
         if has(self) { return Some(self); }
         let (integer, float, whole) = match self {
             Self::Boolean => (Some(Self::Integer(int)), Self::Float(float), None),
@@ -837,21 +837,12 @@ impl Buffer {
         }
     }
     /// The items of `view` at `dtype`. Matching dtypes copy. Otherwise each item converts as [`Source`] reads it, and conversions to a narrower dtype follow these rules. A float converts to an integer by truncating toward zero. A value that doesn't fit its target gives an Overflow error, as do NaN, infinities and anything but exactly 0 or 1 for Booleans. A complex number converts to a real dtype only when its imaginary part is zero, and otherwise gives a Domain error. Characters convert only to characters.
-    pub fn cast(view: View<'_>, dtype: DType) -> Result<Self, Error> { Self::cast_mapped(view, &crate::agreement::Mapping::Linear(1), view.len(), dtype) }
+    pub fn cast(view: View<'_>, dtype: DType) -> Result<Self, Error> {
+        crate::convert::Conversion { input: view.dtype(), output: dtype, kind: crate::convert::ConversionKind::Cast }.buffer(view, true, crate::tolerant::Tolerance::EXACT)
+    }
     /// The items of `view` at `dtype`, where every item keeps its value. Items convert as [`Buffer::cast`] converts them, and a float that becomes a Boolean or an integer must be whole. A float rounds to a float of another width. A Domain error where an item doesn't keep its value.
     pub fn kept(view: View<'_>, dtype: DType) -> Result<Self, Error> {
         crate::convert::Conversion { input: view.dtype(), output: dtype, kind: crate::convert::ConversionKind::Keep }.buffer(view, true, crate::tolerant::Tolerance::EXACT)
-    }
-    /// Shared conversion dispatch for compact and mapped logical items. Unselected storage never participates in checked conversion.
-    pub fn cast_mapped(view: View<'_>, mapping: &crate::agreement::Mapping, n: usize, dtype: DType) -> Result<Self, Error> {
-        use crate::agreement::{Binding, Missing, Read, ReadPlan};
-        let mut sources = vec![Binding::full(view)];
-        let missing = Missing::prototype(view.dtype(), &mut sources);
-        let plan = ReadPlan::copy(0, view.len(), mapping.clone(), n, missing);
-        let mut output = Self::with_capacity(dtype, n);
-        crate::convert::Conversion { input: view.dtype(), output: dtype, kind: crate::convert::ConversionKind::Cast }
-            .map(Read { sources: &sources, plan: &plan }, 0..n, true, &mut output)?;
-        Ok(output)
     }
 }
 

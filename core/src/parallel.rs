@@ -1,5 +1,5 @@
 //! Splitting work across threads. [`pieces`] cuts a call's items into pieces of the sizes its caller gives, and [`ranges`] into as many pieces as the time of its first unit justifies. The pieces run on a Rayon pool with Rayon's default number of threads: `RAYON_NUM_THREADS` where it's set, and otherwise one for each core. [`set_threads`] changes that number for the whole process. A call made on one of a pool's threads, such as a function that another call's piece runs, doesn't split again. In the browser build, which has no threads, every call runs its pieces in turn on the calling thread.
-use crate::slice::{Arg, CHUNK};
+use crate::slice::Arg;
 use crate::{error::Error, interrupt::check};
 /// The clock that `parallel`'s rounds and the speed tests' timings read: the browser's in a browser build, where `std::time::Instant` panics.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -258,13 +258,6 @@ impl<B> Slots<'_, B> {
     }
 }
 
-/// Runs `write` on each `CHUNK` of `slots` in turn, the results for the items from `start`, and gives whether every call said `true`. A slice form that makes several passes over buffers of its own keeps them in cache this way.
-#[inline]
-pub(crate) fn in_chunks<B>(start: usize, slots: &mut [MaybeUninit<B>], write: impl Fn(usize, &mut [MaybeUninit<B>]) -> bool) -> bool {
-    let (n, mut ok) = (slots.len(), true);
-    for at in (0..n).step_by(CHUNK) { ok &= write(start + at, &mut slots[at..n.min(at + CHUNK)]) }
-    ok
-}
 
 #[cfg(not(target_arch = "wasm32"))]
 mod pool {

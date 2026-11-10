@@ -627,14 +627,15 @@ fn erfcinv64<const FUSED: bool>(q: f64) -> f64 {
     maddock::<FUSED>((q - 1.0).abs(), q.min(2.0 - q)).copysign(1.0 - q)
 }
 
-/// [`erfc`](crate::erfc) as a function object, with the slice form `many`, which runs `erfc_blocks` on a slice.
+/// [`erfc`](crate::erfc) as a formula object, with a native bulk routine that groups inputs by region.
 #[derive(Clone, Copy, Debug)]
 pub struct Erfc;
-forms!(Erfc at real: |_, [x]| crate::slice::Total(erfc::<_, { crate::FUSED }>(x)),
-many |_, [x], n, out| match x {
-    Arg::Many(x) => erfc_blocks::<_, { crate::FUSED }>(&x[..n], out),
-    x => each!([x], n, out, |[x]| crate::slice::Total(erfc::<_, { crate::FUSED }>(x))),
-});
+pub(crate) fn erfc_slice<R: Native>(_: &Erfc, _: &crate::recipe::NativeOps<{ crate::FUSED }>, [x]: [Arg<'_, R>; 1], n: usize, out: &mut [MaybeUninit<R>]) -> bool {
+    match x {
+        Arg::Many(x) => erfc_blocks::<_, { crate::FUSED }>(&x[..n], out),
+        x => each!([x], n, out, |[x]| crate::slice::Total(erfc::<_, { crate::FUSED }>(x))),
+    }
+}
 
 /// `erfc` on each item of `x`, written into `out`, through `slice::blocks` of 512 items. A block whose magnitudes all lie below `ERFC_SPLIT` computes only `erfc_near`, and one whose magnitudes all reach it computes only `erfc_far`. Where `branches` holds, a mixed block's items are partitioned: `placed` puts the positions of those below `ERFC_SPLIT` at the front and the others' at the back, and each formula runs on its own items, gathered into one buffer, as `regions` does, because a branch on each item was mispredicted on mixed arguments. Elsewhere a mixed block runs `erfc`, which computes both formulas in every lane. Partitioning every block added about 12 instructions an item, more than computing in place where a block lies in one region. Blocks of 64, the size `each_usual` uses, cost the normal CDF about 7% more instructions on shuffled and on sorted items than blocks of 512.
 fn erfc_blocks<R: Native, const FUSED: bool>(x: &[R], out: &mut [MaybeUninit<R>]) -> bool {
@@ -662,17 +663,19 @@ fn erfc_blocks<R: Native, const FUSED: bool>(x: &[R], out: &mut [MaybeUninit<R>]
         true
     })
 }
-/// [`erfinv`](crate::erfinv) as a function object, with the slice form `many`, which runs `regions` on a slice of f64s.
+/// [`erfinv`](crate::erfinv) as a formula object, with a native bulk routine that groups f64 inputs by region.
 #[derive(Clone, Copy, Debug)]
 pub struct Erfinv;
-forms!(Erfinv at real: |_, [p]| erfinv::<_, { crate::FUSED }>(p),
-    many |_, [p], n, out| inverses(p, n, out, #[inline(always)] |p| erfinv::<_, { crate::FUSED }>(p), #[inline(always)] |p| (p.abs(), 1.0 - p.abs(), p)));
+pub(crate) fn erfinv_slice<R: Native>(_: &Erfinv, _: &crate::recipe::NativeOps<{ crate::FUSED }>, [p]: [Arg<'_, R>; 1], n: usize, out: &mut [MaybeUninit<R>]) -> bool {
+    inverses(p, n, out, #[inline(always)] |p| erfinv::<_, { crate::FUSED }>(p), #[inline(always)] |p| (p.abs(), 1.0 - p.abs(), p))
+}
 
-/// [`erfcinv`](crate::erfcinv) as a function object, with the slice form `many`, which runs `regions` on a slice of f64s.
+/// [`erfcinv`](crate::erfcinv) as a formula object, with a native bulk routine that groups f64 inputs by region.
 #[derive(Clone, Copy, Debug)]
 pub struct Erfcinv;
-forms!(Erfcinv at real: |_, [q]| erfcinv::<_, { crate::FUSED }>(q),
-    many |_, [q], n, out| inverses(q, n, out, #[inline(always)] |q| erfcinv::<_, { crate::FUSED }>(q), #[inline(always)] |q| ((q - 1.0).abs(), q.min(2.0 - q), 1.0 - q)));
+pub(crate) fn erfcinv_slice<R: Native>(_: &Erfcinv, _: &crate::recipe::NativeOps<{ crate::FUSED }>, [q]: [Arg<'_, R>; 1], n: usize, out: &mut [MaybeUninit<R>]) -> bool {
+    inverses(q, n, out, #[inline(always)] |q| erfcinv::<_, { crate::FUSED }>(q), #[inline(always)] |q| ((q - 1.0).abs(), q.min(2.0 - q), 1.0 - q))
+}
 
 /// The slice form of [`Erfinv`] and [`Erfcinv`]: `regions` on a slice of f64s, and `f` on each item otherwise. `parts` gives an f64 item's `maddock` arguments and the value whose sign its result takes.
 fn inverses<R: Native>(x: Arg<'_, R>, n: usize, out: &mut [MaybeUninit<R>], f: impl Fn(R) -> R, parts: impl Fn(f64) -> (f64, f64, f64)) -> bool {

@@ -1,15 +1,30 @@
 use crate::py_err;
 use pyo3::{exceptions::{PyIndexError, PyKeyError, PyTypeError}, prelude::*, types::{PyInt, PyList, PySlice, PyString, PyTuple}};
-use rustymath::{buffer::View, gather::{IndexSource, Table}, layout::{Layout, position}, structure::{self, IndexPart, Plan, Selector}};
+use rustymath::{buffer::View, gather::{IndexSource, Table}, layout::{Layout, position}, structure::{self, IndexPart, Plan, Selector, SliceBound, SliceSpec}};
 use std::sync::Arc;
 
-/// The position of key `name` on `axis` of `layout`, as a slice's bound reads it: a missing bound is a `KeyError`, since a slice needs a position on the axis.
-fn key(layout: &Layout, axis: usize, name: &str) -> PyResult<usize> {
-    layout.keys(axis).and_then(|k| k.position(name)).ok_or_else(|| PyKeyError::new_err(name.to_owned()))
+/// Decode a Python slice without binding it to an array's current length.
+fn slice_spec<'py>(slice: &Bound<'py, PySlice>) -> PyResult<SliceSpec> {
+    let py = slice.py();
+    let (start, stop, step) = (slice.getattr("start")?, slice.getattr("stop")?, slice.getattr("step")?);
+    let numeric = |v: &Bound<'py, PyAny>| if v.is_instance_of::<PyString>() { py.None().into_bound(py) } else { v.clone() };
+    let unpack = py.get_type::<PySlice>().call1((numeric(&start), numeric(&stop), step))?;
+    let (mut first, mut last, mut stride) = (0, 0, 0);
+    // SAFETY: unpack is a slice and the output pointers refer to local isize values.
+    let result = unsafe { pyo3::ffi::PySlice_Unpack(unpack.as_ptr(), &mut first, &mut last, &mut stride) };
+    if result < 0 { return Err(PyErr::fetch(py)); }
+    let bound = |v: &Bound<'_, PyAny>, at| -> PyResult<Option<SliceBound>> {
+        Ok(if v.is_none() { None }
+        else if let Ok(s) = v.cast::<PyString>() { Some(SliceBound::Key(s.to_str()?.into())) }
+        else { Some(SliceBound::Position(at)) })
+    };
+    Ok(SliceSpec { start: bound(&start, first)?, stop: bound(&stop, last)?, step: stride })
 }
 
-/// Whether `selector` decodes `obj` itself, with no conversion: a slice, a key, an integer or a list of keys. Other selectors go to its `array` callback.
-pub fn native(obj: &Bound<'_, PyAny>) -> bool { obj.is_instance_of::<PySlice>() || obj.is_instance_of::<PyInt>() || key_names(obj).is_some() }
+/// Selection errors, including a missing key used as a slice bound.
+pub fn error(error: rustymath::error::Error) -> PyErr {
+    if let Some(key) = error.message.strip_prefix("missing key: ") { PyKeyError::new_err(key.to_owned()) } else { py_err(error) }
+}
 
 /// The keys that `obj` names: one for a string, and one for each item of a list or tuple of strings. `None` for any other selector.
 pub fn key_names(obj: &Bound<'_, PyAny>) -> Option<Vec<String>> {
@@ -20,21 +35,8 @@ pub fn key_names(obj: &Bound<'_, PyAny>) -> Option<Vec<String>> {
 /// One Python selector, independent of the selectors on the other axes. Keys read by `structure::key_selector`, so a missing key reads the fill, as in BPL.
 pub fn selector(layout: &Layout, axis: usize, obj: &Bound<'_, PyAny>, array: impl FnOnce() -> PyResult<(Selector, bool)>) -> PyResult<(Selector, bool)> {
     let size = *layout.shape().get(axis).ok_or_else(|| PyIndexError::new_err("too many axis selectors"))?;
-    if !native(obj) { return array(); }
     if let Ok(slice) = obj.cast::<PySlice>() {
-        let py = obj.py();
-        let bound = |name| -> PyResult<Bound<'_, PyAny>> {
-            let value = slice.getattr(name)?;
-            if let Ok(s) = value.cast::<PyString>() { Ok(key(layout, axis, s.to_str()?)?.into_pyobject(py)?.into_any()) } else { Ok(value) }
-        };
-        let (start, mut stop, step) = (bound("start")?, bound("stop")?, slice.getattr("step")?);
-        if slice.getattr("stop")?.is_instance_of::<PyString>() {
-            let reverse = !step.is_none() && step.extract::<isize>()? < 0;
-            let at = stop.extract::<isize>()?;
-            stop = if reverse && at == 0 { py.None().into_bound(py) } else { (at + if reverse { -1 } else { 1 }).into_pyobject(py)?.into_any() };
-        }
-        let s = py.get_type::<PySlice>().call1((start, stop, step))?.cast_into::<PySlice>()?.indices(size as isize)?;
-        return Ok((Selector::Range { start: s.start.max(0) as usize, len: s.slicelength, step: s.step }, false));
+        return slice_spec(slice)?.selector(layout, axis).map(|s| (s, false)).map_err(error);
     }
     if let Some(names) = key_names(obj) {
         let one = obj.is_instance_of::<PyString>();
@@ -45,7 +47,7 @@ pub fn selector(layout: &Layout, axis: usize, obj: &Bound<'_, PyAny>, array: imp
         let i = obj.extract::<i64>()?;
         return Ok((Selector::At(position(i, size).ok_or_else(|| PyIndexError::new_err(format!("position {i} is outside an axis of length {size}")))?), true));
     }
-    unreachable!("`native` admits only the kinds decoded above")
+    array()
 }
 
 /// The selector that an array's items give: a character string picks a key, or the fill where the axis lacks it, and a table reads Booleans and other numbers in place as positions, as `⌷` does.
@@ -74,6 +76,7 @@ pub fn parts<'py>(index: &Bound<'py, PyAny>) -> PyResult<Vec<IndexPart<Bound<'py
         else if p.is(&ellipsis) {
             IndexPart::Rest
         } else if p.is_instance_of::<PySlice>() && ["start", "stop", "step"].iter().all(|n| p.getattr(*n).is_ok_and(|v| v.is_none())) { IndexPart::All }
+        else if let Ok(slice) = p.cast::<PySlice>() { IndexPart::Slice(Arc::new(slice_spec(slice)?)) }
         else { IndexPart::Axis(p) })
     }).collect()
 }
@@ -92,7 +95,7 @@ fn select_parts(
     structure::plan_parts(layout, &claims(&written, &names), None, true, |i, axis| {
         let IndexPart::Axis(p) = &written[i] else { unreachable!("an axis refers to its written payload") };
         selector(layout, axis, p, || array(layout, axis, p))
-    }, py_err)
+    }, error)
 }
 
 /// For each axis of `layout`, the keys that a write by `index` names with Python's own strings and lists of strings and the axis lacks (`structure::missing_keys`). The write adds them before it plans (`structure::extended`), as BPL's assignment does. `name` gives a part's one axis name, as for `selection`.

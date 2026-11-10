@@ -340,6 +340,8 @@ def test_view_folds(threads):
     for cols, in_place in [(slice(None, 512), True), (slice(None, None, 2), False)]:
         with rm.explain() as report:
             assert np.isclose(rm.sum(r[:, cols]), m[:, cols].sum())
+        assert ('in place' in report.routes) == in_place
+        with rm.explain() as report:
             assert all(np.allclose(rm.sum(r[:, cols], axis=a), m[:, cols].sum(a)) for a in [0, 1])
         assert 'mapped fold' in report.routes and ('in place' in report.routes) == in_place
 

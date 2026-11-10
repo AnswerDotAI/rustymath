@@ -19,29 +19,74 @@ impl Count {
     pub fn of(n: i64) -> Self { Count { negative: n < 0, magnitude: usize::try_from(n.unsigned_abs()).unwrap_or(usize::MAX) } }
 }
 
+/// A slice bound: a positional offset or a key on the selected axis.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SliceBound { Position(isize), Key(Arc<str>) }
+
+/// A slice before the selected axis's length and keys are known. A keyed stop includes its position.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SliceSpec { pub start: Option<SliceBound>, pub stop: Option<SliceBound>, pub step: isize }
+
+impl std::fmt::Display for SliceSpec {
+    /// Diagnostic spelling, not source syntax for a language's selectors.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let bound = |v: &Option<SliceBound>| match v {
+            Some(SliceBound::Position(i)) => i.to_string(), Some(SliceBound::Key(k)) => format!("{k:?}"), None => "None".into()
+        };
+        write!(f, "slice({}, {}, {})", bound(&self.start), bound(&self.stop), self.step)
+    }
+}
+
+impl SliceSpec {
+    /// Resolve this slice against the actual axis, clipping positional bounds to its length.
+    pub fn selector(&self, layout: &Layout, axis: usize) -> Result<Selector, Error> {
+        if self.step == 0 { return Err(Error::new(Kind::Domain, "slice step cannot be zero")); }
+        let n = *layout.shape().get(axis).ok_or_else(|| Error::new(Kind::Index, "too many axis selectors"))? as i128;
+        let direction = self.step.signum() as i128;
+        let (low, high) = if direction > 0 { (0, n) } else { (-1, n - 1) };
+        let bound = |value: Option<&SliceBound>, default: i128, stop: bool| -> Result<i128, Error> {
+            let at = match value {
+                None => return Ok(default),
+                Some(SliceBound::Position(i)) => { let i = *i as i128; if i < 0 { i + n } else { i } },
+                Some(SliceBound::Key(name)) => {
+                    let i = layout.keys(axis).and_then(|keys| keys.position(name))
+                        .ok_or_else(|| Error::new(Kind::Index, format!("missing key: {name}")))?;
+                    i as i128 + if stop { direction } else { 0 }
+                }
+            };
+            Ok(at.clamp(low, high))
+        };
+        let start = bound(self.start.as_ref(), if direction > 0 { 0 } else { n - 1 }, false)?;
+        let stop = bound(self.stop.as_ref(), if direction > 0 { n } else { -1 }, true)?;
+        let distance = (stop - start) * direction;
+        let len = if distance <= 0 { 0 } else { ((distance - 1) / (self.step as i128).abs() + 1) as usize };
+        Ok(Selector::Range { start: start.max(0) as usize, len, step: self.step })
+    }
+}
+
 /// Written index parts, before the selected axes and their lengths are known.
 #[derive(Clone, Debug, PartialEq)]
-pub enum IndexPart<T> { Axis(T), All, NewAxis, Rest }
+pub enum IndexPart<T> { Axis(T), Slice(Arc<SliceSpec>), All, NewAxis, Rest }
 impl<T> IndexPart<T> {
     /// The part with its axis payload borrowed.
     pub fn as_ref(&self) -> IndexPart<&T> {
         match self {
             IndexPart::Axis(t) => IndexPart::Axis(t), IndexPart::All => IndexPart::All, IndexPart::NewAxis => IndexPart::NewAxis,
-            IndexPart::Rest => IndexPart::Rest
+            IndexPart::Rest => IndexPart::Rest, IndexPart::Slice(slice) => IndexPart::Slice(slice.clone())
         }
     }
     /// The part with `f` applied to its axis payload. The structural markers stay as they are.
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> IndexPart<U> {
         match self {
             IndexPart::Axis(t) => IndexPart::Axis(f(t)), IndexPart::All => IndexPart::All, IndexPart::NewAxis => IndexPart::NewAxis,
-            IndexPart::Rest => IndexPart::Rest
+            IndexPart::Rest => IndexPart::Rest, IndexPart::Slice(slice) => IndexPart::Slice(slice)
         }
     }
     /// The part with fallible `f` applied to its axis payload, or `f`'s error.
     pub fn try_map<U, E>(self, f: impl FnOnce(T) -> Result<U, E>) -> Result<IndexPart<U>, E> {
         Ok(match self {
             IndexPart::Axis(t) => IndexPart::Axis(f(t)?), IndexPart::All => IndexPart::All, IndexPart::NewAxis => IndexPart::NewAxis,
-            IndexPart::Rest => IndexPart::Rest
+            IndexPart::Rest => IndexPart::Rest, IndexPart::Slice(slice) => IndexPart::Slice(slice)
         })
     }
     /// The axis payload, or `None` for a structural marker.
@@ -50,7 +95,7 @@ impl<T> IndexPart<T> {
 
 /// Expands Rest once geometry is known, with one source claim per consuming part. Axis payloads identify the original written part.
 pub fn index_claims<'a>(rank: usize, parts: &[IndexPart<(Option<&'a str>, usize)>]) -> Result<(Vec<IndexPart<usize>>, Vec<(Option<&'a str>, usize)>), Error> {
-    let used: usize = parts.iter().map(|p| match p { IndexPart::Axis((_, n)) => *n, IndexPart::All => 1, _ => 0 }).sum();
+    let used: usize = parts.iter().map(|p| match p { IndexPart::Axis((_, n)) => *n, IndexPart::All | IndexPart::Slice(_) => 1, _ => 0 }).sum();
     if used > rank { return Err(Error::new(Kind::Index, "too many axis selectors")); }
     if parts.iter().filter(|p| matches!(p, IndexPart::Rest)).count() > 1 { return Err(Error::new(Kind::Index, "only one rest selector is allowed")); }
     let mut written = Vec::new();
@@ -65,6 +110,7 @@ pub fn index_claims<'a>(rank: usize, parts: &[IndexPart<(Option<&'a str>, usize)
                 written.push(IndexPart::All);
                 claims.push((None, 1));
             }
+            IndexPart::Slice(slice) => { written.push(IndexPart::Slice(slice.clone())); claims.push((None, 1)); }
             IndexPart::NewAxis => written.push(IndexPart::NewAxis),
             IndexPart::Rest => {
                 for _ in used..rank {
@@ -136,6 +182,7 @@ pub fn routes<E>(
                 let (selector, single) = decode(i, axis)?;
                 (selector, width, single)
             }
+            IndexPart::Slice(slice) => (slice.selector(layout, axis).map_err(&err)?, 1, false),
             _ => (Selector::All, 1, false),
         };
         one &= single;
