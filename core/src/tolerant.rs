@@ -293,7 +293,6 @@ macro_rules! with_tolerance {
     }};
 }
 
-
 /// Where an item must lie against the range of floats equal to one number (`Tolerant::range`) for a comparison with that number to hold. `NotAbove` and `NotBelow` include the range itself.
 #[derive(Clone, Copy)]
 pub enum Band { Inside, Outside, Below, NotAbove, Above, NotBelow }
@@ -360,7 +359,6 @@ pub fn against<F: Float, O>(
     Some(true)
 }
 
-
 /// Wasm has no instruction that narrows a 64-bit lane to a byte. LLVM writes a float comparison's results two items at a time, in about ten instructions for each item. Where it can prove that lanes hold masks, it also replaces wasm's narrowing instructions with slower code. Here each block of 16 items compares with vector instructions, then shuffles the first byte of each mask into place: 7 shuffles for `f64`'s 8 vectors, and 3 for `f32`'s 4.
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 mod narrowed {
@@ -425,18 +423,24 @@ mod narrowed {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Equal(pub Tolerance);
 impl Banding for Equal { const BANDS: (Band, Band) = (Band::Inside, Band::Inside); }
-pub(crate) fn complex_equal_slice<R: Native>(k: &Equal, o: &recipe::NativeOps<{ crate::FUSED }>, args: [Arg<'_, Complex<R>>; 2], n: usize, out: &mut [std::mem::MaybeUninit<bool>]) {
+pub(crate) fn complex_equal_slice<R: Native>(
+    k: &Equal, o: &recipe::NativeOps<{ crate::FUSED }>, args: [Arg<'_, Complex<R>>; 2], n: usize, out: &mut [std::mem::MaybeUninit<bool>]) {
     let tolerance = k.0.overridden(o.tolerance);
-    with_tolerance!(tolerance, |t| { complex_equals(t, args, n, out, false); });
+    with_tolerance!(tolerance, |t| {
+        complex_equals(t, args, n, out, false);
+    });
 }
 
 /// The negation of [`Equal`] at the tolerance it holds, as a function object, for real and complex items.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NotEqual(pub Tolerance);
 impl Banding for NotEqual { const BANDS: (Band, Band) = (Band::Outside, Band::Outside); }
-pub(crate) fn complex_not_equal_slice<R: Native>(k: &NotEqual, o: &recipe::NativeOps<{ crate::FUSED }>, args: [Arg<'_, Complex<R>>; 2], n: usize, out: &mut [std::mem::MaybeUninit<bool>]) {
+pub(crate) fn complex_not_equal_slice<R: Native>(
+    k: &NotEqual, o: &recipe::NativeOps<{ crate::FUSED }>, args: [Arg<'_, Complex<R>>; 2], n: usize, out: &mut [std::mem::MaybeUninit<bool>]) {
     let tolerance = k.0.overridden(o.tolerance);
-    with_tolerance!(tolerance, |t| { complex_equals(t, args, n, out, true); });
+    with_tolerance!(tolerance, |t| {
+        complex_equals(t, args, n, out, true);
+    });
 }
 
 /// `Equal`'s slice form on complex items, or with `negate` `NotEqual`'s. Each `CHUNK` of items splits into slices of real and imaginary parts, as in `slice::split`, so `squared_equal` runs over plain slices with no branch and vectorizes. `scaled_equal` then takes the pairs it leaves undecided, one at a time. No result fails.
@@ -529,7 +533,6 @@ impl Stepped for GreaterEqual {
     fn steps<F: Float, O: recipe::Ops<F> + ?Sized>(self, o: &O, x: O::V, y: O::V) -> O::B { LessEqual(self.0).steps(o, y, x) }
 }
 
-
 /// [`Tolerant::floor`], or [`TolerantComplex::complex_floor`] for complex items, at the tolerance it holds, as a function object.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Floor(pub Tolerance);
@@ -541,11 +544,16 @@ pub struct Ceil(pub Tolerance);
 /// [`Tolerant::residue`], or [`TolerantComplex::complex_residue`] for complex items, at the tolerance it holds, as a function object: `y` modulo `x`, for arguments `x` and `y` in that order. At no tolerance, where `y/x` passes the float's precision ([`far`]), the rounded quotient has lost its low digits, and [`exact_residue`] gives the residue. The slice form recomputes those items in a second pass. Its `i64` form is [`integer::residue`](crate::integer::residue), which needs no tolerance.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Residue(pub Tolerance);
-pub(crate) fn residue_slice<R: Native>(k: &Residue, o: &recipe::NativeOps<{ crate::FUSED }>, [x, y]: [Arg<'_, R>; 2], n: usize, out: &mut [std::mem::MaybeUninit<R>]) -> bool {
+pub(crate) fn residue_slice<R: Native>(
+    k: &Residue, o: &recipe::NativeOps<{ crate::FUSED }>, [x, y]: [Arg<'_, R>; 2], n: usize, out: &mut [std::mem::MaybeUninit<R>]) -> bool {
     let tolerance = k.0.overridden(o.tolerance);
     with_tolerance!(tolerance, |t| {
-        if t.value() != 0.0 { return each!([x, y], n, out, |[x, y]| Total(t.residue(x, y))); }
-        if !each!([x, y], n, out, |[x, y]| (t.residue(x, y), near(x, y))) { replace_far(x, y, n, out); }
+        if t.value() != 0.0 {
+            return each!([x, y], n, out, |[x, y]| Total(t.residue(x, y)));
+        }
+        if !each!([x, y], n, out, |[x, y]| (t.residue(x, y), near(x, y))) {
+            replace_far(x, y, n, out);
+        }
         true
     })
 }

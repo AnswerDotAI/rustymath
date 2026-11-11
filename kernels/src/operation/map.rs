@@ -50,12 +50,10 @@ pub(super) fn map_formula<K: crate::facts::Formula<N>, const N: usize>(
         DType::Complex(crate::buffer::ComplexWidth::F64) if K::REAL_COMPLEX && inputs.real() => {
             map_real_complex::<K, f64, N>(object, variant, inputs, range, &ops, slices.and_then(|s| s.real_complex_double), output)
         }
-        DType::Complex(crate::buffer::ComplexWidth::F32) => {
-            map_complex::<K, f32, N>(object, variant, inputs, range, &ops, slices.as_ref().and_then(|s| s.complex_single), slices.and_then(|s| s.complex_test_single), judge, output)
-        }
-        DType::Complex(crate::buffer::ComplexWidth::F64) => {
-            map_complex::<K, f64, N>(object, variant, inputs, range, &ops, slices.as_ref().and_then(|s| s.complex_double), slices.and_then(|s| s.complex_test_double), judge, output)
-        }
+        DType::Complex(crate::buffer::ComplexWidth::F32) => map_complex::<K, f32, N>(
+            object, variant, inputs, range, &ops, slices.as_ref().and_then(|s| s.complex_single), slices.and_then(|s| s.complex_test_single), judge, output),
+        DType::Complex(crate::buffer::ComplexWidth::F64) => map_complex::<K, f64, N>(
+            object, variant, inputs, range, &ops, slices.as_ref().and_then(|s| s.complex_double), slices.and_then(|s| s.complex_test_double), judge, output),
         DType::Character => Err(Error::new(Kind::Domain, "characters are not numerical kernel operands")),
     }
 }
@@ -108,14 +106,18 @@ fn map_blocks<F: crate::buffer::Cast, O: OutputItem, const N: usize>(
     let recorded =
         |result: Result<(), Kind>| result.map_err(|kind| crate::error::record(Error::new(kind, "numerical kernel argument is outside its domain"))).is_ok();
     match inputs.borrowed::<F, N>(range.clone(), checked) {
-        Ok(Some(args)) => return output.write(range.len(), &|part, slots, _| unsafe {
-            slots.fill(part.len(), |out| recorded(apply(args.map(|arg| arg.part(part.start, part.len())), part.len(), out)))
-        }),
-        Ok(None) => {}, Err(error) => { output.target.fill(range.len()); return Err(error); }
+        Ok(Some(args)) => {
+            return output.write(range.len(), &|part, slots, _| unsafe {
+                slots.fill(part.len(), |out| recorded(apply(args.map(|arg| arg.part(part.start, part.len())), part.len(), out)))
+            });
+        }
+        Ok(None) => {}
+        Err(error) => { output.target.fill(range.len()); return Err(error); }
     }
     if let Some((len, rows)) = by_rows::<F, N>(inputs.0) {
-        return output
-            .write(range.len(), &|part, slots, _| unsafe { slots.fill(part.len(), |out| recorded(fill_rows(&rows, len, part.start + range.start, out, apply))) });
+        return output.write(range.len(), &|part, slots, _| unsafe {
+            slots.fill(part.len(), |out| recorded(fill_rows(&rows, len, part.start + range.start, out, apply)))
+        });
     }
     output.write(range.len(), &|part, slots, work| {
         let part = part.start + range.start..part.end + range.start;
@@ -150,10 +152,9 @@ fn by_rows<'a, F: crate::buffer::Cast, const N: usize>(inputs: &[crate::agreemen
     let len = inputs.iter().find_map(|read| match read.plan.route() {
         ReadRoute::Map(mapped) => match &mapped.map {
             Mapping::Linear(k) | Mapping::Tiled(k) => Some(*k),
-            Mapping::Steps { steps, .. } if Steps::count(steps) == read.plan.len() => steps.last().map(Steps::len),
-            _ => Some(read.plan.len()),
+            Mapping::Steps { steps, .. } if Steps::count(steps) == read.plan.len() => steps.last().map(Steps::len), _ => Some(read.plan.len())
         },
-        _ => None
+        _ => None,
     })?;
     let items = inputs.first()?.plan.len();
     if len < ROWS || items <= len || items % len != 0 { return None; }

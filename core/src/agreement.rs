@@ -61,9 +61,7 @@ pub struct ReadPart { pub end: usize, pub plan: ReadPlan }
 
 /// Data-free positional routes shared by readers, compilation and read-back. Leaves stay inline; maps and joins share their recursive payloads.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ReadRoute {
-    Input(usize), Index { base: i64, step: i64 }, Map(Arc<ReadMap>), Join(Arc<[ReadPart]>), Default, Invalid
-}
+pub enum ReadRoute { Input(usize), Index { base: i64, step: i64 }, Map(Arc<ReadMap>), Join(Arc<[ReadPart]>), Default, Invalid }
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ReadMap { pub input: ReadPlan, pub map: Mapping, pub missing: ReadPlan }
@@ -78,8 +76,8 @@ impl ReadPlan {
     fn fallback(missing: Missing, items: usize) -> Self {
         match missing {
             Missing::Input(plan) => plan.remapped(Mapping::Linear(1), items, Missing::Invalid),
-            Missing::Scalar(source) => Self::input(source, 1).remapped(Mapping::Single, items, Missing::Invalid),
-            Missing::Default => Self::fill(items), Missing::Invalid => Self { route: ReadRoute::Invalid, items }
+            Missing::Scalar(source) => Self::input(source, 1).remapped(Mapping::Single, items, Missing::Invalid), Missing::Default => Self::fill(items),
+            Missing::Invalid => Self { route: ReadRoute::Invalid, items }
         }
     }
     pub fn copy(source: usize, source_items: usize, map: Mapping, items: usize, missing: Missing) -> Self {
@@ -279,7 +277,7 @@ impl ReadPlan {
                 if n > after { return None; }
                 part.run(&(at..at.checked_add(n)?))?
             }
-            ReadRoute::Index { .. } | ReadRoute::Default | ReadRoute::Invalid => return None
+            ReadRoute::Index { .. } | ReadRoute::Default | ReadRoute::Invalid => return None,
         };
         Some((source, first, if n == 1 { 1 } else { stride }))
     }
@@ -405,9 +403,8 @@ impl<'s> Read<'s> {
     }
 
     /// A span at its actual storage dtype and the item count copied. Copied spans require sources of one dtype.
-    pub fn argument<'a>(
-        self, range: Range<usize>, checked: bool, scratch: &'a mut crate::buffer::Buffer
-    ) -> Result<(crate::buffer::View<'a>, usize), Error> where 's: 'a {
+    pub fn argument<'a>(self, range: Range<usize>, checked: bool, scratch: &'a mut crate::buffer::Buffer) -> Result<(crate::buffer::View<'a>, usize), Error>
+    where 's: 'a {
         self.range(&range)?;
         if let Some((view, _)) = self.run_view(&range) { return Ok((view, 0)); }
         let mut dtype = None;
@@ -433,8 +430,7 @@ impl<'s> Read<'s> {
     }
     /// The same read and the number of items it materialized in scratch; borrowed runs and scalar conversions count zero.
     pub fn part_counted<'a, T: crate::buffer::Cast>(
-        &'a self, range: Range<usize>, checked: bool, scratch: &'a mut Vec<T>
-    ) -> Result<(Arg<'a, T>, usize), Error> {
+        &'a self, range: Range<usize>, checked: bool, scratch: &'a mut Vec<T>) -> Result<(Arg<'a, T>, usize), Error> {
         self.range(&range)?;
         if range.is_empty() { return Ok((Arg::Many(&[]), 0)); }
         if let Some((view, stride)) = self.run_view(&range) {
@@ -552,9 +548,8 @@ impl<'s> Read<'s> {
         self.write_into(range, dtype, checked, output, run)
     }
     fn write_into(
-        &self, range: Range<usize>, dtype: crate::buffer::DType, checked: bool,
-        output: &mut crate::buffer::Buffer, run: Option<(crate::buffer::View<'s>, usize)>
-    ) -> Result<(), Error> {
+        &self, range: Range<usize>, dtype: crate::buffer::DType, checked: bool, output: &mut crate::buffer::Buffer,
+        run: Option<(crate::buffer::View<'s>, usize)>) -> Result<(), Error> {
         if output.dtype() != dtype { *output = crate::buffer::Buffer::with_capacity(dtype, range.len()); }
         with_dtype!(dtype, T => {
             let items = T::vec_mut(output).expect("output has the selected dtype");
@@ -606,7 +601,8 @@ fn borrowed_as<'a, T: crate::buffer::Cast>(view: crate::buffer::View<'a>, checke
 /// Appends a borrowed run as `T`, copying the same dtype or converting it in one typed loop. A stride of 0 repeats its one item.
 fn append_run<T: crate::buffer::Cast>(view: crate::buffer::View<'_>, stride: usize, len: usize, checked: bool, output: &mut Vec<T>) -> Result<(), Error> {
     if let Some(items) = T::of(view) {
-        if stride == 0 { output.resize(output.len() + len, items[0]); } else { output.extend_from_slice(&items[..len]); }
+        if stride == 0 { output.resize(output.len() + len, items[0]); }
+        else { output.extend_from_slice(&items[..len]); }
         return Ok(());
     }
     if stride == 0 { output.resize(output.len() + len, kept(T::cast(view, 0), checked)?); return Ok(()); }
@@ -620,10 +616,14 @@ enum Filled { Fill, Value(i64), Source(usize), Never }
 impl Filled {
     fn of(missing: &ReadPlan) -> Option<Self> {
         match missing.route() {
-            ReadRoute::Default => Some(Self::Fill), ReadRoute::Invalid => Some(Self::Never), &ReadRoute::Index { base, step: 0 } => Some(Self::Value(base)),
+            ReadRoute::Default => Some(Self::Fill),
+            ReadRoute::Invalid => Some(Self::Never),
+            &ReadRoute::Index { base, step: 0 } => Some(Self::Value(base)),
             &ReadRoute::Input(source) if missing.len() == 1 => Some(Self::Source(source)),
-            ReadRoute::Map(read) if matches!(&read.map, Mapping::Single) => match *read.input.route() { ReadRoute::Input(source) => Some(Self::Source(source)), _ => None },
-            _ => None
+            ReadRoute::Map(read) if matches!(&read.map, Mapping::Single) => match *read.input.route() {
+                ReadRoute::Input(source) => Some(Self::Source(source)), _ => None
+            },
+            _ => None,
         }
     }
     /// The item as an `A`, where it is exactly one: `None` where an index value doesn't convert, or the source holds another dtype or no first item.
@@ -651,8 +651,7 @@ impl Period<'_> {
     pub fn tiling(&self, run: usize) -> Option<(usize, usize)> {
         match *self {
             Self::Cycles(p) | Self::Walks { len: p, .. } if p > 0 && p < run => Some((p, p * (run.div_ceil(p) + 1))),
-            Self::Walks { len, .. } => Some((len, len)),
-            Self::Cycles(_) | Self::Repeats(_) => None
+            Self::Walks { len, .. } => Some((len, len)), Self::Cycles(_) | Self::Repeats(_) => None
         }
     }
 }
@@ -728,8 +727,7 @@ impl<'a> Walked<'a> {
     /// The length of the cycle whose items the mapping's positions read again in order (`Period::Cycles`), where it has one.
     pub fn cycle(&self) -> Option<usize> { *self.cycle.get_or_init(|| match self.mapping.period() { Some(Period::Cycles(p)) => Some(p), _ => None }) }
 
-    /// A walking copy, or one cycle written out to cover runs of up to `cover` items at any phase.
-    /// `None` only when the mapping has neither a tiling period nor explicit walking entries.
+    /// A walking copy, or one cycle written out to cover runs of up to `cover` items at any phase. `None` only when the mapping has neither a tiling period nor explicit walking entries.
     pub fn gathered(&self, input: crate::buffer::View<'_>, cover: usize) -> Option<crate::buffer::Buffer> {
         with_dtype!(input.dtype(), A => {
             let data = A::of(input).expect("the view has its dtype");
@@ -771,7 +769,10 @@ impl Mapping {
             });
         }
         if let Self::Linear(period) | Self::Tiled(period) = *self {
-            if period < count(shape) && period != 1 && !shape.iter().rev().scan(1, |p, &n| { *p *= n; Some(*p) }).any(|p| p == period) { return None; }
+            if period < count(shape) && period != 1 && !shape.iter().rev().scan(1, |p, &n| {
+                *p *= n;
+                Some(*p)
+            }).any(|p| p == period) { return None; }
         }
         let (base, mut stride) = (self.get(0)?, count(shape));
         for (k, &len) in shape.iter().enumerate() {
@@ -885,12 +886,9 @@ impl Mapping {
     pub fn run(&self, start: usize, n: usize) -> Option<(usize, isize)> {
         if n == 0 { return None; }
         match *self {
-            Self::Single => Some((0, 0)), Self::Linear(0) | Self::Tiled(0) => None,
-            Self::Linear(1) => Some((start, 1)),
-            Self::Linear(r) if n <= r - start % r => Some((start / r, 0)),
-            Self::Tiled(p) if n <= p - start % p => Some((start % p, 1)),
-            Self::Steps { base, ref steps } => Steps::run(base, steps, start, n),
-            _ => None
+            Self::Single => Some((0, 0)), Self::Linear(0) | Self::Tiled(0) => None, Self::Linear(1) => Some((start, 1)),
+            Self::Linear(r) if n <= r - start % r => Some((start / r, 0)), Self::Tiled(p) if n <= p - start % p => Some((start % p, 1)),
+            Self::Steps { base, ref steps } => Steps::run(base, steps, start, n), _ => None
         }
     }
     /// The offset for position `i`, or `None` where it reads a fill.
@@ -1212,28 +1210,27 @@ const LINE_BLOCK: usize = 1 << 16;
 pub fn expanded_items<'a, A: Element>(mapping: &Walked, data: &'a [A], start: usize, n: usize, buf: &'a mut Vec<A>) -> &'a [A] {
     match in_place(mapping, data, start, n) {
         Some(Arg::Many(items)) => items,
-        Some(Arg::One(x)) => { buf.clear(); buf.resize(n, x); buf },
-        None => copied(mapping, data, start, n, buf)
+        Some(Arg::One(x)) => {
+            buf.clear();
+            buf.resize(n, x);
+            buf
+        }
+        None => copied(mapping, data, start, n, buf),
     }
 }
 
 /// Items `start..start + n` of an argument that `mapping` lays out, where they need no copy: a single item, a contiguous run, items within one repeat, or items of a cycle: within one period of a mapping that cycles (`Period::Cycles`), and as far as `data` holds a `Tiled` cycle, once or written out past its end (`tiled_cycle`). A `Steps` mapping reads a forward run in place through `run`.
 fn in_place<'a, A: Copy>(mapping: &Walked, data: &'a [A], start: usize, n: usize) -> Option<Arg<'a, A>> {
     match mapping.run(start, n) {
-        Some((o, 0)) => return data.get(o).copied().map(Arg::One),
-        Some((o, 1)) => return data.get(o..o.checked_add(n)?).map(Arg::Many),
-        _ => {}
+        Some((o, 0)) => return data.get(o).copied().map(Arg::One), Some((o, 1)) => return data.get(o..o.checked_add(n)?).map(Arg::Many), _ => {}
     }
     // A `Tiled` source may already hold several periods (`tiled_cycle`); a cyclic Steps view only borrows within one.
     let period = match **mapping {
-        Mapping::Tiled(p) if p > 0 => p,
-        Mapping::Steps { .. } => mapping.cycle().filter(|&p| p > 0 && n <= p - start % p)?,
-        _ => return None
+        Mapping::Tiled(p) if p > 0 => p, Mapping::Steps { .. } => mapping.cycle().filter(|&p| p > 0 && n <= p - start % p)?, _ => return None
     };
     let from = start % period;
     data.get(from..from.checked_add(n)?).map(Arg::Many)
 }
-
 
 /// The cycle that `mapping`'s positions read from `data`, written into `buf` as `Period::tiling` says for runs of up to `run` positions, with the `Tiled` mapping that then reads it in place: a cycle read in order copies its first period, and one that walks entries (`Period::Walks`) gathers its period through them. A cycle shorter than its cover is written out past its end, so that a run reads it in place at any phase. `None` where `tiling` gives none, leaving `buf` alone.
 pub fn tiled_cycle<A: Element>(data: &[A], mapping: &Mapping, run: usize, buf: &mut Vec<A>) -> Option<Mapping> {

@@ -134,9 +134,7 @@ fn each_cell<S: Default>(count: usize, write: impl Fn(usize, &mut S) -> bool + S
     for first in (timed..count).step_by(round) {
         check()?;
         let cells = round.min(count - first);
-        if threads == 1 {
-            ok &= (first..first + cells).fold(true, |ok, i| write(i, &mut scratch) & ok);
-        } else {
+        if threads == 1 { ok &= (first..first + cells).fold(true, |ok, i| write(i, &mut scratch) & ok); } else {
             ok &= pieces(cells, cells.div_ceil(threads * PIECES).max(least).max(1), usize::MAX, &|range| {
                 let mut scratch = S::default();
                 range.map(|c| first + c).fold(true, |ok, i| write(i, &mut scratch) & ok)
@@ -257,7 +255,6 @@ impl<B> Slots<'_, B> {
         ok
     }
 }
-
 
 #[cfg(not(target_arch = "wasm32"))]
 mod pool {

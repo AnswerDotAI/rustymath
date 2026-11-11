@@ -406,7 +406,8 @@ mod integer {
         let t = rustymath::tolerant::Tolerance::DEFAULT;
         // Every pair of `u8`s agrees with the `i64` functions where the result fits, and fails where it doesn't.
         let v = Variant::checked(u8::DTYPE);
-        let (gcd_kernel, lcm_kernel, pow_kernel, residue_kernel) = (Kernel::new(Gcd(t), v), Kernel::new(Lcm(t), v), Kernel::new(Pow, v), Kernel::new(Residue(t), v));
+        let (gcd_kernel, lcm_kernel, pow_kernel, residue_kernel) =
+            (Kernel::new(Gcd(t), v), Kernel::new(Lcm(t), v), Kernel::new(Pow, v), Kernel::new(Residue(t), v));
         for x in 0..=u8::MAX {
             for y in 0..=u8::MAX {
                 let (a, b) = (i64::from(x), i64::from(y));
@@ -589,9 +590,9 @@ mod operation {
         fn convert(data: rustymath::buffer::View<'_>, dtype: DType, values: &mut Buffer) -> Result<(), Error> {
             let sources = [Binding::full(data)];
             let plan = ReadPlan::input(0, data.len());
-            let map = rustymath::operation::Map::Convert(rustymath::convert::Conversion {
-                input: data.dtype(), output: dtype, kind: rustymath::convert::ConversionKind::Cast
-            }, Settings { tolerance: Tolerance::EXACT }, true);
+            let map = rustymath::operation::Map::Convert(
+                rustymath::convert::Conversion { input: data.dtype(), output: dtype, kind: rustymath::convert::ConversionKind::Cast },
+                Settings { tolerance: Tolerance::EXACT }, true);
             map.run(&[Read { sources: &sources, plan: &plan }], 0..data.len(), &mut Scratch::default(), MapOutput::Buffer(values))
         }
         let float = f64::DTYPE;
@@ -833,9 +834,9 @@ mod operation {
                             if direction == Direction::Right { ordered.reverse(); }
                             let (mut carry, mut expected) = (initial, Vec::new());
                             for x in ordered {
-                                let value = carry.map_or(x, |c| {
-                                    u8::from(if direction == Direction::Left { tolerance.less(c, x) } else { tolerance.less(x, c) }) as f64
-                                });
+                                let value =
+                                    carry.map_or(x, |c| u8::from(if direction == Direction::Left { tolerance.less(c, x) }
+                                    else { tolerance.less(x, c) }) as f64);
                                 expected.push(value);
                                 carry = Some(value);
                             }

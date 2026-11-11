@@ -71,8 +71,8 @@ impl Event {
     /// The producer's designated text label, if this event has one.
     pub fn slow_name(&self) -> Option<&str> {
         match self {
-            Self::Route(Record { kind: EventKind::Stopped, reason, .. }) => Some(*reason),
-            Self::Row { fields, label: Some(i), .. } => Some(fields[*i].text()), _ => None,
+            Self::Route(Record { kind: EventKind::Stopped, reason, .. }) => Some(*reason), Self::Row { fields, label: Some(i), .. } => Some(fields[*i].text()),
+            _ => None
         }
     }
     pub fn fields(&self) -> Vec<Field<'_>> {
@@ -94,7 +94,9 @@ impl Report {
     pub fn record(&mut self, event: Event) {
         if let Event::Route(r) = &event {
             if let Some(existing) = self.records.iter_mut().find_map(|event| match event {
-                Event::Route(existing) if existing.kind == r.kind && existing.route == r.route && existing.reason == r.reason && existing.site == r.site => Some(existing),
+                Event::Route(existing) if existing.kind == r.kind && existing.route == r.route && existing.reason == r.reason && existing.site == r.site => {
+                    Some(existing)
+                }
                 _ => None,
             }) {
                 existing.calls += r.calls;
@@ -107,7 +109,6 @@ impl Report {
     pub fn extend(&mut self, other: &Self) { for event in &other.records { self.record(event.clone()); } }
     pub fn routes(&self) -> impl Iterator<Item = &Record> { self.records.iter().filter_map(Event::route) }
 }
-
 
 pub trait Sink: Send + Sync {
     fn sites(&self) -> bool { false }

@@ -35,9 +35,7 @@ pub fn key_names(obj: &Bound<'_, PyAny>) -> Option<Vec<String>> {
 /// One Python selector, independent of the selectors on the other axes. Keys read by `structure::key_selector`, so a missing key reads the fill, as in BPL.
 pub fn selector(layout: &Layout, axis: usize, obj: &Bound<'_, PyAny>, array: impl FnOnce() -> PyResult<(Selector, bool)>) -> PyResult<(Selector, bool)> {
     let size = *layout.shape().get(axis).ok_or_else(|| PyIndexError::new_err("too many axis selectors"))?;
-    if let Ok(slice) = obj.cast::<PySlice>() {
-        return slice_spec(slice)?.selector(layout, axis).map(|s| (s, false)).map_err(error);
-    }
+    if let Ok(slice) = obj.cast::<PySlice>() { return slice_spec(slice)?.selector(layout, axis).map(|s| (s, false)).map_err(error); }
     if let Some(names) = key_names(obj) {
         let one = obj.is_instance_of::<PyString>();
         let within = (!one).then(|| Layout::from([names.len()]));
@@ -75,8 +73,9 @@ pub fn parts<'py>(index: &Bound<'py, PyAny>) -> PyResult<Vec<IndexPart<Bound<'py
         Ok(if p.is_none() { IndexPart::NewAxis }
         else if p.is(&ellipsis) {
             IndexPart::Rest
-        } else if p.is_instance_of::<PySlice>() && ["start", "stop", "step"].iter().all(|n| p.getattr(*n).is_ok_and(|v| v.is_none())) { IndexPart::All }
-        else if let Ok(slice) = p.cast::<PySlice>() { IndexPart::Slice(Arc::new(slice_spec(slice)?)) }
+        } else if p.is_instance_of::<PySlice>() && ["start", "stop", "step"].iter().all(|n| p.getattr(*n).is_ok_and(|v| v.is_none())) {
+            IndexPart::All
+        } else if let Ok(slice) = p.cast::<PySlice>() { IndexPart::Slice(Arc::new(slice_spec(slice)?)) }
         else { IndexPart::Axis(p) })
     }).collect()
 }

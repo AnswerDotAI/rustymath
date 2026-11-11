@@ -38,8 +38,7 @@ pub fn map<const N: usize>(
 
 pub fn map_with<const N: usize>(
     kernel: &rustymath::operation::Kernel, args: [rustymath::buffer::View<'_>; N], n: usize, out: &mut rustymath::buffer::Buffer,
-    settings: rustymath::operation::Settings
-) -> Result<(), rustymath::error::Error> {
+    settings: rustymath::operation::Settings) -> Result<(), rustymath::error::Error> {
     use rustymath::agreement::{Binding, Mapping, Missing, Read, ReadPlan};
     let sources = args.map(Binding::full);
     let plans: [_; N] = std::array::from_fn(|i| {

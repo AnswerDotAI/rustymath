@@ -87,9 +87,7 @@ pub fn record(error: Error) {
     });
 }
 
-/// Checked eager entry for Rust and Python callers.
-/// Returns direct failures and, when no slot is active, the first recorded failure. With an
-/// active slot, recorded failures remain for its enclosing operation to collect.
+/// Checked eager entry for Rust and Python callers. Returns direct failures and, when no slot is active, the first recorded failure. With an active slot, recorded failures remain for its enclosing operation to collect.
 pub fn checked<R>(run: impl FnOnce() -> Result<R, Error>) -> Result<R, Error> {
     let (mut run, mut result) = (Some(run), None);
     let recorded = recorded(&mut || result = run.take().map(|run| run()));

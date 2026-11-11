@@ -91,37 +91,49 @@ impl Conversion {
                         .is_some_and(|(_, valid)| valid != Some(true)))
     }
     /// Converts contiguous storage through the mapped conversion executor.
-    pub(crate) fn buffer(self, view: crate::buffer::View<'_>, checked: bool, tolerance: crate::tolerant::Tolerance) -> Result<crate::buffer::Buffer, crate::error::Error> {
+    pub(crate) fn buffer(
+        self, view: crate::buffer::View<'_>, checked: bool, tolerance: crate::tolerant::Tolerance) -> Result<crate::buffer::Buffer, crate::error::Error> {
         let mut result = crate::buffer::Buffer::with_capacity(self.output, view.len());
         self.append(view, checked, tolerance, None, crate::buffer::MapOutput::Buffer(&mut result))?;
         Ok(result)
     }
     pub(crate) fn append<'a, 'b>(
-        self, view: crate::buffer::View<'_>, checked: bool, tolerance: crate::tolerant::Tolerance,
-        scratch: Option<&'a mut crate::buffer::Scratch>, output: crate::buffer::MapOutput<'a, 'b>
-    ) -> Result<(), crate::error::Error> {
+        self, view: crate::buffer::View<'_>, checked: bool, tolerance: crate::tolerant::Tolerance, scratch: Option<&'a mut crate::buffer::Scratch>,
+        output: crate::buffer::MapOutput<'a, 'b>) -> Result<(), crate::error::Error> {
         let sources = [crate::agreement::Binding::full(view)];
         let plan = crate::agreement::ReadPlan::input(0, view.len());
         self.map_in(crate::agreement::Read { sources: &sources, plan: &plan }, 0..view.len(), checked, tolerance, scratch, output)
     }
     pub fn map_in<'a, 'b>(
         self, input: crate::agreement::Read<'_>, range: std::ops::Range<usize>, checked: bool, tolerance: crate::tolerant::Tolerance,
-        scratch: Option<&'a mut crate::buffer::Scratch>, target: crate::buffer::MapOutput<'a, 'b>
-    ) -> Result<(), crate::error::Error> {
+        scratch: Option<&'a mut crate::buffer::Scratch>, target: crate::buffer::MapOutput<'a, 'b>) -> Result<(), crate::error::Error> {
         let mut output = crate::buffer::Output { target, result_dtype: self.output, checked, scratch };
         macro_rules! write {
-            ($s:ty, $t:ty, $convert:expr) => { written::<$s, $t>(input, range, checked, &mut output, $convert) };
+            ($s:ty, $t:ty, $convert:expr) => {
+                written::<$s, $t>(input, range, checked, &mut output, $convert)
+            };
             (@cast $t:ty) => {{
-                if let crate::buffer::MapOutput::Buffer(buffer) = &mut output.target && let Some(values) = <$t>::vec_mut(buffer) {
+                if let crate::buffer::MapOutput::Buffer(buffer) = &mut output.target
+                    && let Some(values) = <$t>::vec_mut(buffer)
+                {
                     let (at, n) = (values.len(), range.len());
                     if let Err(error) = input.append(range, checked, values) {
-                        crate::error::record(error); values.truncate(at); values.resize(at + n, <$t>::FILL);
+                        crate::error::record(error);
+                        values.truncate(at);
+                        values.resize(at + n, <$t>::FILL);
                     }
                     Ok(())
-                } else { write!($t, $t, Ok) }
+                } else {
+                    write!($t, $t, Ok)
+                }
             }};
-            (@keep $t:ty) => { kept_mapped::<$t>(self.input, input, range, checked, &mut output) };
-            (@unsupported) => {{ output.target.fill(range.len()); Err(Error::new(Kind::Domain, "unsupported resolved conversion")) }};
+            (@keep $t:ty) => {
+                kept_mapped::<$t>(self.input, input, range, checked, &mut output)
+            };
+            (@unsupported) => {{
+                output.target.fill(range.len());
+                Err(Error::new(Kind::Domain, "unsupported resolved conversion"))
+            }};
         }
         crate::error::checked(|| conversion!(self, checked, tolerance, write))
     }
@@ -135,15 +147,14 @@ fn converted_item<T: crate::buffer::Element>(value: Result<T, crate::error::Erro
 #[inline]
 fn written<S: crate::buffer::Cast, T: crate::buffer::OutputItem>(
     input: crate::agreement::Read<'_>, range: std::ops::Range<usize>, checked: bool, output: &mut crate::buffer::Output<'_, '_>,
-    convert: impl Fn(S) -> Result<T, crate::error::Error> + Sync
-) -> Result<(), crate::error::Error> {
+    convert: impl Fn(S) -> Result<T, crate::error::Error> + Sync) -> Result<(), crate::error::Error> {
     output.write::<T>(range.len(), &|part, slots, work| {
         let part = part.start + range.start..part.end + range.start;
         let in_place = input.in_place::<S>(&part);
         let len = if in_place { part.len().max(1) } else { crate::CHUNK };
         let mut local = Vec::new();
         let (mut work, mut copied) = (work, 0);
-        let scratch = match work.as_deref_mut() { Some(work) if !in_place => { let [scratch] = work.inputs::<S, 1>(); scratch }, _ => &mut local };
+        let scratch = match work.as_deref_mut() { Some(work) if !in_place => { let [scratch] = work.inputs::<S, 1>(); scratch } _ => &mut local };
         let ok = part.clone().step_by(len).fold(true, |ok, start| {
             let range = start..(start + len).min(part.end);
             let n = range.len();
@@ -317,15 +328,22 @@ fn kept_mapped<T: crate::buffer::OutputItem + crate::buffer::Cast>(
         let mut local = crate::buffer::Buffer::with_capacity(dtype, 0);
         let scratch = match work { Some(work) => work.buffer(dtype), None => &mut local };
         match input.part_view(part.start + range.start..part.end + range.start, dtype, checked, scratch) {
-            Ok(values) => unsafe { slots.fill(part.len(), |out| {
-                let mut good = true;
-                for (i, slot) in out.iter_mut().enumerate() {
-                    slot.write(match crate::buffer::kept_as::<T>(values, i) {
-                        Ok(value) => value, Err(error) => { crate::error::record(error); good = false; T::FILL }
-                    });
-                }
-                good
-            }) },
+            Ok(values) => unsafe {
+                slots.fill(part.len(), |out| {
+                    let mut good = true;
+                    for (i, slot) in out.iter_mut().enumerate() {
+                        slot.write(match crate::buffer::kept_as::<T>(values, i) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                crate::error::record(error);
+                                good = false;
+                                T::FILL
+                            }
+                        });
+                    }
+                    good
+                })
+            },
             Err(error) => {
                 crate::error::record(error);
                 unsafe { slots.fill(part.len(), |out| { for slot in out { slot.write(T::FILL); } false }) }
