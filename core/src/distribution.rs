@@ -66,18 +66,13 @@ trait Formulas {
     #[inline(always)]
     fn quantile_map<F: Float>(&self) -> impl Fn(F) -> F + Copy { move |p| narrowed(p, |p| self.quantile(p)) }
     #[inline(always)]
-    fn pdf_many<F: Native>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool {
-        let pdf = self.pdf_map();
-        each!([x], n, out, |[x]| pdf(x))
-    }
+    fn pdf_many<F: Native>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool { let pdf = self.pdf_map(); each!([x], n, out, |[x]| pdf(x)) }
     #[inline(always)]
-    fn cdf_many<F: Native>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool {
-        let cdf = self.cdf_map();
-        each!([x], n, out, |[x]| cdf(x))
-    }
+    fn cdf_many<F: Native>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool { let cdf = self.cdf_map(); each!([x], n, out, |[x]| cdf(x)) }
     #[inline(always)]
     fn quantile_many<F: Native>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool {
-        let q = self.quantile_map(); each!([p], n, out, |[p]| q(p))
+        let q = self.quantile_map();
+        each!([p], n, out, |[p]| q(p))
     }
 }
 
@@ -648,7 +643,8 @@ impl Formulas for LogNormal {
     fn cdf_many<F: Native>(&self, x: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool {
         let (line, half) = (self.normal().erfc_line(), F::narrow(0.5));
         composed(
-            x, n, out, #[inline(always)] move |x| line(ln(x)), through(Erfc, crate::special::erfc_slice), #[inline(always)] move |x, e| if x <= F::zero() { F::zero() } else { half * e })
+            x, n, out, #[inline(always)] move |x| line(ln(x)), through(Erfc, crate::special::erfc_slice), #[inline(always)]
+            move |x, e| if x <= F::zero() { F::zero() } else { half * e })
     }
     #[inline(always)]
     fn quantile_many<F: Native>(&self, p: Arg<'_, F>, n: usize, out: &mut [MaybeUninit<F>]) -> bool {

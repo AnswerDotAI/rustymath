@@ -59,16 +59,12 @@ impl Scratch {
     }
 }
 
-pub struct Output<'a, 'b> {
-    pub target: MapOutput<'a, 'b>, pub result_dtype: DType, pub checked: bool, pub scratch: Option<&'a mut Scratch>
-}
+pub struct Output<'a, 'b> { pub target: MapOutput<'a, 'b>, pub result_dtype: DType, pub checked: bool, pub scratch: Option<&'a mut Scratch> }
 
 impl Output<'_, '_> {
     /// The block body is erased before output conversion.
     pub fn write<O: OutputItem>(
-        &mut self, n: usize,
-        apply: &(dyn Fn(std::ops::Range<usize>, &mut Slots<'_, O>, Option<&mut Scratch>) -> bool + Sync)
-    ) -> Result<(), Error> {
+        &mut self, n: usize, apply: &(dyn Fn(std::ops::Range<usize>, &mut Slots<'_, O>, Option<&mut Scratch>) -> bool + Sync)) -> Result<(), Error> {
         let checked = self.checked;
         if let MapOutput::Buffer(buffer) = &mut self.target {
             if let Some(values) = O::vec_mut(buffer) { extended(values, n, self.scratch.as_deref_mut(), apply); } else {
@@ -88,8 +84,7 @@ impl Output<'_, '_> {
 
 fn extended<O: Element>(
     values: &mut Vec<O>, n: usize, scratch: Option<&mut Scratch>,
-    apply: &(dyn Fn(std::ops::Range<usize>, &mut Slots<'_, O>, Option<&mut Scratch>) -> bool + Sync)
-) {
+    apply: &(dyn Fn(std::ops::Range<usize>, &mut Slots<'_, O>, Option<&mut Scratch>) -> bool + Sync)) {
     match scratch {
         Some(scratch) => { Slots::append(values, n, |slots| apply(0..n, slots, Some(scratch))); }
         None => { crate::parallel::extended(values, n, crate::CHUNK, &|part, slots| apply(part, slots, None)); }
@@ -98,8 +93,7 @@ fn extended<O: Element>(
 
 fn converted<O: OutputItem>(
     target: &mut MapOutput<'_, '_>, range: std::ops::Range<usize>, checked: bool, mut work: Option<&mut Scratch>,
-    apply: &(dyn Fn(std::ops::Range<usize>, &mut Slots<'_, O>, Option<&mut Scratch>) -> bool + Sync)
-) -> Result<(), Error> {
+    apply: &(dyn Fn(std::ops::Range<usize>, &mut Slots<'_, O>, Option<&mut Scratch>) -> bool + Sync)) -> Result<(), Error> {
     let mut values = work.as_deref_mut().map_or_else(Vec::new, |work| std::mem::take(work.result::<O>()));
     let conversion = crate::convert::Conversion { input: O::DTYPE, output: target.dtype(), kind: crate::convert::ConversionKind::Truncate };
     let result = (|| {
@@ -107,8 +101,7 @@ fn converted<O: OutputItem>(
             let n = crate::CHUNK.min(range.end - at);
             values.clear();
             Slots::append(&mut values, n, |slots| apply(at..at + n, slots, work.as_deref_mut()));
-            if let Err(error) = conversion.append(O::view(&values), checked, crate::tolerant::Tolerance::EXACT,
-                work.as_deref_mut(), target.reborrow()) {
+            if let Err(error) = conversion.append(O::view(&values), checked, crate::tolerant::Tolerance::EXACT, work.as_deref_mut(), target.reborrow()) {
                 target.fill(range.end - at - n);
                 return Err(error);
             }

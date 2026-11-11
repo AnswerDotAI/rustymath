@@ -787,7 +787,6 @@ pub(crate) fn kept_as<T: Cast>(view: View<'_>, i: usize) -> Result<T, Error> {
     T::cast(view, i).map_err(|_| lost())
 }
 
-
 impl Buffer {
     /// Flattened positions whose item differs from its type's fill (zero, false or a space).
     pub fn nonzero(view: View<'_>) -> Vec<usize> {
@@ -838,11 +837,13 @@ impl Buffer {
     }
     /// The items of `view` at `dtype`. Matching dtypes copy. Otherwise each item converts as [`Source`] reads it, and conversions to a narrower dtype follow these rules. A float converts to an integer by truncating toward zero. A value that doesn't fit its target gives an Overflow error, as do NaN, infinities and anything but exactly 0 or 1 for Booleans. A complex number converts to a real dtype only when its imaginary part is zero, and otherwise gives a Domain error. Characters convert only to characters.
     pub fn cast(view: View<'_>, dtype: DType) -> Result<Self, Error> {
-        crate::convert::Conversion { input: view.dtype(), output: dtype, kind: crate::convert::ConversionKind::Cast }.buffer(view, true, crate::tolerant::Tolerance::EXACT)
+        crate::convert::Conversion { input: view.dtype(), output: dtype, kind: crate::convert::ConversionKind::Cast }.buffer(
+            view, true, crate::tolerant::Tolerance::EXACT)
     }
     /// The items of `view` at `dtype`, where every item keeps its value. Items convert as [`Buffer::cast`] converts them, and a float that becomes a Boolean or an integer must be whole. A float rounds to a float of another width. A Domain error where an item doesn't keep its value.
     pub fn kept(view: View<'_>, dtype: DType) -> Result<Self, Error> {
-        crate::convert::Conversion { input: view.dtype(), output: dtype, kind: crate::convert::ConversionKind::Keep }.buffer(view, true, crate::tolerant::Tolerance::EXACT)
+        crate::convert::Conversion { input: view.dtype(), output: dtype, kind: crate::convert::ConversionKind::Keep }.buffer(
+            view, true, crate::tolerant::Tolerance::EXACT)
     }
 }
 
@@ -853,7 +854,8 @@ impl Buffer {
         crate::convert::Conversion { input: view.dtype(), output: dtype, kind: crate::convert::ConversionKind::Floor }.buffer(view, true, tolerance)
     }
     pub fn cast_results(view: View<'_>, dtype: DType, checked: bool) -> Result<Self, Error> {
-        crate::convert::Conversion { input: view.dtype(), output: dtype, kind: crate::convert::ConversionKind::Truncate }.buffer(view, checked, crate::tolerant::Tolerance::EXACT)
+        crate::convert::Conversion { input: view.dtype(), output: dtype, kind: crate::convert::ConversionKind::Truncate }.buffer(
+            view, checked, crate::tolerant::Tolerance::EXACT)
     }
 }
 

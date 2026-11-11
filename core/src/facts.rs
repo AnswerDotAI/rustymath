@@ -186,11 +186,12 @@ impl Op {
 }
 /// A formula's native slice bodies. Real and integer variants run the body at their dtype (f32 for f16). Complex variants keep the real-input shortcut and final validity check at the map boundary; an absent body uses the scalar formula.
 pub struct NativeSlices<K, const N: usize> {
-    pub single: Option<Slice<K, f32, N>>, pub double: Option<Slice<K, f64, N>>, pub byte: Option<Slice<K, u8, N>>,
-    pub short: Option<Slice<K, i16, N>>, pub int: Option<Slice<K, i32, N>>, pub long: Option<Slice<K, i64, N>>,
-    pub complex_single: Option<Slice<K, num_complex::Complex32, N, ()>>, pub complex_double: Option<Slice<K, num_complex::Complex64, N, ()>>,
-    pub real_complex_single: Option<Slice<K, f32, N, (), num_complex::Complex32>>, pub real_complex_double: Option<Slice<K, f64, N, (), num_complex::Complex64>>,
-    pub complex_test_single: Option<Slice<K, num_complex::Complex32, N, (), bool>>, pub complex_test_double: Option<Slice<K, num_complex::Complex64, N, (), bool>>
+    pub single: Option<Slice<K, f32, N>>, pub double: Option<Slice<K, f64, N>>, pub byte: Option<Slice<K, u8, N>>, pub short: Option<Slice<K, i16, N>>,
+    pub int: Option<Slice<K, i32, N>>, pub long: Option<Slice<K, i64, N>>, pub complex_single: Option<Slice<K, num_complex::Complex32, N, ()>>,
+    pub complex_double: Option<Slice<K, num_complex::Complex64, N, ()>>, pub real_complex_single: Option<Slice<K, f32, N, (), num_complex::Complex32>>,
+    pub real_complex_double: Option<Slice<K, f64, N, (), num_complex::Complex64>>,
+    pub complex_test_single: Option<Slice<K, num_complex::Complex32, N, (), bool>>,
+    pub complex_test_double: Option<Slice<K, num_complex::Complex64, N, (), bool>>
 }
 /// A slice form writes all `n` results at `U` from arguments at `T`. The caller reports errors from its verdict `R`: `bool` for real/integer forms, `()` for complex forms.
 pub type Slice<K, T, const N: usize, R = bool, U = T> = fn(&K, &NativeOps<{ FUSED }>, [crate::Arg<'_, T>; N], usize, &mut [std::mem::MaybeUninit<U>]) -> R;
@@ -224,9 +225,8 @@ impl NativeSlices<crate::Root, 2> {
 }
 impl NativeSlices<Residue, 2> {
     fn residue() -> Self {
-        Self { single: Some(crate::tolerant::residue_slice), double: Some(crate::tolerant::residue_slice),
-            byte: Some(crate::integer::residue_byte), short: Some(crate::integer::residue_short),
-            int: Some(crate::integer::residue_int), long: Some(crate::integer::residue_long), ..Self::NONE }
+        Self { single: Some(crate::tolerant::residue_slice), double: Some(crate::tolerant::residue_slice), byte: Some(crate::integer::residue_byte),
+            short: Some(crate::integer::residue_short), int: Some(crate::integer::residue_int), long: Some(crate::integer::residue_long), ..Self::NONE }
     }
 }
 

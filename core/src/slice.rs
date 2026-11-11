@@ -104,7 +104,6 @@ impl<O: KernelItem> Outcome<O> for Total<O> {
     fn split(self) -> (O, bool) { (self.0, true) }
 }
 
-
 /// The items of `x` that result `i` takes.
 #[inline(always)]
 fn items<E: Copy, const N: usize>(x: &[Arg<'_, E>; N], i: usize) -> [E; N] { std::array::from_fn(|k| x[k].nth(i)) }
@@ -163,7 +162,6 @@ pub(crate) fn each_usual<E: KernelItem, O: KernelItem, R: Outcome<O>>(
         })
 }
 
-
 /// [`each`] with the item body marked `#[inline(always)]`, so native bulk loops inline their scalar body.
 macro_rules! each {
     ($x:expr, $n:expr, $out:expr, |$args:pat_param| $body:expr $(,)?) => {
@@ -172,7 +170,6 @@ macro_rules! each {
         )
     };
 }
-
 
 /// Runs `$body` for each item `$i` of a result of `$n` items, with `$a` and `$b` the items of `$x` and `$y` that pair with it. Each pairing of `One` and `Many` has a loop of its own. The loops index slices of the result's length with no iterator adapters, and vectorize at any build settings.
 macro_rules! each_pair {
@@ -310,7 +307,6 @@ pub(crate) fn two_pass<R, O, const N: usize>(
     }
     ok
 }
-
 
 /// `f`, a slice form writing `n` outputs of type `O`, run into a buffer, with `each` turning each output into the `P` that `out` takes. It gives `f`'s result.
 ///

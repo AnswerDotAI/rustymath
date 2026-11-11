@@ -1008,10 +1008,13 @@ impl Steps {
     pub fn furthest(base: usize, steps: &[impl std::borrow::Borrow<Self>]) -> Option<usize> {
         steps.iter().try_fold(base, |at, s| {
             let furthest = match *s.borrow() {
-                ref s if s.len() == 0 => return None, Self::Stride { start, len, step } => start.wrapping_add_signed(step.max(0) * (len - 1) as isize),
-                Self::Padded { size, stride, .. } => size.saturating_sub(1) * stride, Self::Rotated { len, stride, .. } => (len - 1) * stride,
-                Self::Table(ref t) => t.span().map_or_else(
-                    || (0..t.len()).filter_map(|j| t.get(j)).max().unwrap_or(0), |(scale, size)| size.saturating_sub(1) * scale)
+                ref s if s.len() == 0 => return None,
+                Self::Stride { start, len, step } => start.wrapping_add_signed(step.max(0) * (len - 1) as isize),
+                Self::Padded { size, stride, .. } => size.saturating_sub(1) * stride,
+                Self::Rotated { len, stride, .. } => (len - 1) * stride,
+                Self::Table(ref t) => {
+                    t.span().map_or_else(|| (0..t.len()).filter_map(|j| t.get(j)).max().unwrap_or(0), |(scale, size)| size.saturating_sub(1) * scale)
+                }
             };
             Some(at + furthest)
         })

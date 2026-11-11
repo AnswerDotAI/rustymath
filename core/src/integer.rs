@@ -211,16 +211,14 @@ fn decoded(bases: &[i64], digits: &[i64], step: impl Fn(i64, i64, i64) -> Option
     digits.chunks(bases.len()).map(|d| (1..d.len()).try_fold(d[0], |v, k| step(v, bases[k], d[k]))).collect()
 }
 
-pub(crate) fn residue_long(_: &Residue, _: &crate::recipe::NativeOps<{ crate::FUSED }>, [x, y]: [Arg<'_, i64>; 2], n: usize, out: &mut [std::mem::MaybeUninit<i64>]) -> bool {
+pub(crate) fn residue_long(
+    _: &Residue, _: &crate::recipe::NativeOps<{ crate::FUSED }>, [x, y]: [Arg<'_, i64>; 2], n: usize, out: &mut [std::mem::MaybeUninit<i64>]) -> bool {
     if let Arg::One(d) = x && let Some(m) = mask(d) {
         each!([y], n, out, |[y]| y & m)
     } else if let Arg::One(d) = x && let Some(r) = FloatDivisor::new(d) && fit(y, n) {
         each!([y], n, out, |[y]| r.residue(y))
-    } else if let Arg::One(d) = x && let Some(d) = Divisor::new(d) {
-        each!([y], n, out, |[y]| d.residue(y))
-    } else {
-        each!([x, y], n, out, |[x, y]| residue(x, y))
-    }
+    } else if let Arg::One(d) = x && let Some(d) = Divisor::new(d) { each!([y], n, out, |[y]| d.residue(y)) }
+    else { each!([x, y], n, out, |[x, y]| residue(x, y)) }
 }
 
 macro_rules! residues {

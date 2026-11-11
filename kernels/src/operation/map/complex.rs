@@ -3,14 +3,15 @@ use super::*;
 pub(super) fn map_complex<K, F, const N: usize>(
     object: &K, variant: crate::domain::Variant, inputs: Inputs<'_, '_>, range: std::ops::Range<usize>, ops: &NativeOps<{ FUSED }>,
     slice: Option<crate::facts::Slice<K, num_complex::Complex<F>, N, ()>>, test: Option<crate::facts::Slice<K, num_complex::Complex<F>, N, (), bool>>,
-    judge: crate::domain::Variant, output: &mut Output<'_, '_>) -> Result<(), Error>
-where K: crate::facts::Formula<N>, F: crate::Native + crate::buffer::Cast + OutputItem, num_complex::Complex<F>: crate::buffer::Cast + OutputItem {
+    judge: crate::domain::Variant, output: &mut Output<'_, '_>) -> Result<(), Error> where K: crate::facts::Formula<N>,
+    F: crate::Native + crate::buffer::Cast + OutputItem, num_complex::Complex<F>: crate::buffer::Cast + OutputItem {
     let value = |x| object.complex(ops, x).unwrap_or(num_complex::Complex::new(F::zero(), F::zero()));
     let invalid = |x, r| (!complex_valid::<K, F, N>(ops, x, r)).then_some(Kind::Domain);
     if const { K::BOOLEAN } {
         if let Some(test) = test {
             return map_blocks::<num_complex::Complex<F>, bool, N>(inputs, range, variant.checked, output, &|args, n, out| {
-                test(object, ops, args, n, out); Ok(())
+                test(object, ops, args, n, out);
+                Ok(())
             });
         }
         map_values::<num_complex::Complex<F>, bool, N>(
@@ -30,8 +31,8 @@ where K: crate::facts::Formula<N>, F: crate::Native + crate::buffer::Cast + Outp
 /// Complex results from real arguments through a native slice, or `Formula::real_complex` with `Formula::complex` for the items it declines.
 pub(super) fn map_real_complex<K, F, const N: usize>(
     object: &K, variant: crate::domain::Variant, inputs: Inputs<'_, '_>, range: std::ops::Range<usize>, ops: &NativeOps<{ FUSED }>,
-    slice: Option<crate::facts::Slice<K, F, N, (), num_complex::Complex<F>>>, output: &mut Output<'_, '_>
-) -> Result<(), Error> where K: crate::facts::Formula<N>, F: crate::Native + crate::buffer::Cast, num_complex::Complex<F>: OutputItem {
+    slice: Option<crate::facts::Slice<K, F, N, (), num_complex::Complex<F>>>, output: &mut Output<'_, '_>) -> Result<(), Error> where
+    K: crate::facts::Formula<N>, F: crate::Native + crate::buffer::Cast, num_complex::Complex<F>: OutputItem {
     map_blocks::<F, num_complex::Complex<F>, N>(inputs, range, variant.checked, output, &|args, n, out| {
         if let Some(slice) = slice { slice(object, ops, args, n, out); return Ok(()); }
         let nan = num_complex::Complex::new(F::nan(), F::nan());

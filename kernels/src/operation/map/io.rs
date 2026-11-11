@@ -18,13 +18,13 @@ impl<'a, 'b> Inputs<'a, 'b> {
         Ok(Some(args))
     }
     pub(crate) fn part<'s, F: Cast, const N: usize>(
-        self, range: std::ops::Range<usize>, checked: bool, scratch: &'s mut [&mut Vec<F>; N]
-    ) -> Result<([Arg<'s, F>; N], usize), Error> where 'a: 's, 'b: 's {
+        self, range: std::ops::Range<usize>, checked: bool, scratch: &'s mut [&mut Vec<F>; N]) -> Result<([Arg<'s, F>; N], usize), Error> where 'a: 's, 'b: 's {
         let (mut args, mut copied) = ([Arg::Many(&[]); N], 0);
         for (k, scratch) in scratch.iter_mut().enumerate() {
-            if let Some(j) = self.0[..k].iter().position(|read|
-                std::ptr::eq(read.plan, self.0[k].plan) && std::ptr::eq(read.sources, self.0[k].sources)
-            ) { args[k] = args[j]; continue; }
+            if let Some(j) = self.0[..k].iter().position(|read| std::ptr::eq(read.plan, self.0[k].plan) && std::ptr::eq(read.sources, self.0[k].sources)) {
+                args[k] = args[j];
+                continue;
+            }
             let (items, n) = self.0[k].part_counted(range.clone(), checked, scratch)?;
             args[k] = items;
             copied += n;

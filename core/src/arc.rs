@@ -70,7 +70,8 @@ pub(crate) fn atan<R: Native, const FUSED: bool>(x: R) -> R {
     (hi + ((u * z).mla::<FUSED>(p, u) + lo)).copysign(x)
 }
 
-pub(crate) fn atan_slice<R: Native>(_: &Atan, _: &crate::recipe::NativeOps<{ crate::FUSED }>, x: [crate::Arg<'_, R>; 1], n: usize, out: &mut [std::mem::MaybeUninit<R>]) -> bool {
+pub(crate) fn atan_slice<R: Native>(
+    _: &Atan, _: &crate::recipe::NativeOps<{ crate::FUSED }>, x: [crate::Arg<'_, R>; 1], n: usize, out: &mut [std::mem::MaybeUninit<R>]) -> bool {
     each!(x, n, out, |[x]| crate::slice::Total(atan::<_, { crate::FUSED }>(x)))
 }
 

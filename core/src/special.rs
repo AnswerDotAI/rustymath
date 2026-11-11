@@ -630,10 +630,10 @@ fn erfcinv64<const FUSED: bool>(q: f64) -> f64 {
 /// [`erfc`](crate::erfc) as a formula object, with a native bulk routine that groups inputs by region.
 #[derive(Clone, Copy, Debug)]
 pub struct Erfc;
-pub(crate) fn erfc_slice<R: Native>(_: &Erfc, _: &crate::recipe::NativeOps<{ crate::FUSED }>, [x]: [Arg<'_, R>; 1], n: usize, out: &mut [MaybeUninit<R>]) -> bool {
+pub(crate) fn erfc_slice<R: Native>(
+    _: &Erfc, _: &crate::recipe::NativeOps<{ crate::FUSED }>, [x]: [Arg<'_, R>; 1], n: usize, out: &mut [MaybeUninit<R>]) -> bool {
     match x {
-        Arg::Many(x) => erfc_blocks::<_, { crate::FUSED }>(&x[..n], out),
-        x => each!([x], n, out, |[x]| crate::slice::Total(erfc::<_, { crate::FUSED }>(x))),
+        Arg::Many(x) => erfc_blocks::<_, { crate::FUSED }>(&x[..n], out), x => each!([x], n, out, |[x]| crate::slice::Total(erfc::<_, { crate::FUSED }>(x)))
     }
 }
 
@@ -666,14 +666,16 @@ fn erfc_blocks<R: Native, const FUSED: bool>(x: &[R], out: &mut [MaybeUninit<R>]
 /// [`erfinv`](crate::erfinv) as a formula object, with a native bulk routine that groups f64 inputs by region.
 #[derive(Clone, Copy, Debug)]
 pub struct Erfinv;
-pub(crate) fn erfinv_slice<R: Native>(_: &Erfinv, _: &crate::recipe::NativeOps<{ crate::FUSED }>, [p]: [Arg<'_, R>; 1], n: usize, out: &mut [MaybeUninit<R>]) -> bool {
+pub(crate) fn erfinv_slice<R: Native>(
+    _: &Erfinv, _: &crate::recipe::NativeOps<{ crate::FUSED }>, [p]: [Arg<'_, R>; 1], n: usize, out: &mut [MaybeUninit<R>]) -> bool {
     inverses(p, n, out, #[inline(always)] |p| erfinv::<_, { crate::FUSED }>(p), #[inline(always)] |p| (p.abs(), 1.0 - p.abs(), p))
 }
 
 /// [`erfcinv`](crate::erfcinv) as a formula object, with a native bulk routine that groups f64 inputs by region.
 #[derive(Clone, Copy, Debug)]
 pub struct Erfcinv;
-pub(crate) fn erfcinv_slice<R: Native>(_: &Erfcinv, _: &crate::recipe::NativeOps<{ crate::FUSED }>, [q]: [Arg<'_, R>; 1], n: usize, out: &mut [MaybeUninit<R>]) -> bool {
+pub(crate) fn erfcinv_slice<R: Native>(
+    _: &Erfcinv, _: &crate::recipe::NativeOps<{ crate::FUSED }>, [q]: [Arg<'_, R>; 1], n: usize, out: &mut [MaybeUninit<R>]) -> bool {
     inverses(q, n, out, #[inline(always)] |q| erfcinv::<_, { crate::FUSED }>(q), #[inline(always)] |q| ((q - 1.0).abs(), q.min(2.0 - q), 1.0 - q))
 }
 

@@ -47,10 +47,9 @@ impl SliceSpec {
         let bound = |value: Option<&SliceBound>, default: i128, stop: bool| -> Result<i128, Error> {
             let at = match value {
                 None => return Ok(default),
-                Some(SliceBound::Position(i)) => { let i = *i as i128; if i < 0 { i + n } else { i } },
+                Some(SliceBound::Position(i)) => { let i = *i as i128; if i < 0 { i + n } else { i } }
                 Some(SliceBound::Key(name)) => {
-                    let i = layout.keys(axis).and_then(|keys| keys.position(name))
-                        .ok_or_else(|| Error::new(Kind::Index, format!("missing key: {name}")))?;
+                    let i = layout.keys(axis).and_then(|keys| keys.position(name)).ok_or_else(|| Error::new(Kind::Index, format!("missing key: {name}")))?;
                     i as i128 + if stop { direction } else { 0 }
                 }
             };
@@ -110,7 +109,10 @@ pub fn index_claims<'a>(rank: usize, parts: &[IndexPart<(Option<&'a str>, usize)
                 written.push(IndexPart::All);
                 claims.push((None, 1));
             }
-            IndexPart::Slice(slice) => { written.push(IndexPart::Slice(slice.clone())); claims.push((None, 1)); }
+            IndexPart::Slice(slice) => {
+                written.push(IndexPart::Slice(slice.clone()));
+                claims.push((None, 1));
+            }
             IndexPart::NewAxis => written.push(IndexPart::NewAxis),
             IndexPart::Rest => {
                 for _ in used..rank {

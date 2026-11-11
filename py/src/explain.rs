@@ -32,7 +32,8 @@ impl Explanation {
             record.set_item("kind", event.name())?;
             for ((name, _), field) in event.table().1.iter().zip(event.fields()) {
                 match field {
-                    Field::Text(t) => record.set_item(name, t.as_ref())?, Field::Count(n) => record.set_item(name, n)?, Field::Truth(t) => record.set_item(name, t)?
+                    Field::Text(t) => record.set_item(name, t.as_ref())?, Field::Count(n) => record.set_item(name, n)?,
+                    Field::Truth(t) => record.set_item(name, t)?
                 }
             }
             Ok(record.unbind())

@@ -68,19 +68,14 @@ impl std::fmt::Debug for Kernel {
 pub enum Map { Kernel(Kernel, Settings), Convert(crate::convert::Conversion, Settings, bool) }
 impl Map {
     pub fn arity(&self) -> usize { match self { Self::Kernel(kernel, _) => kernel.arity(), Self::Convert(..) => 1 } }
-    /// Appends every result, including initialized fallback items on a numerical error.
-    /// Errors are execution failures, not a pre-write refusal to handle the call.
-    /// Both variants follow [`crate::error::checked`]: an enclosing checked scope owns recorded
-    /// numerical failures. Under an active error slot, `Ok` alone does not establish success.
-    /// Discard private outputs when that scope fails; neither `Err` nor a recorded failure is a route refusal.
+    /// Appends every result, including initialized fallback items on a numerical error. Errors are execution failures, not a pre-write refusal to handle the call. Both variants follow [`crate::error::checked`]: an enclosing checked scope owns recorded numerical failures. Under an active error slot, `Ok` alone does not establish success. Discard private outputs when that scope fails; neither `Err` nor a recorded failure is a route refusal.
     pub fn run<'a, 'b>(
-        &self, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>,
-        scratch: &'a mut crate::buffer::Scratch, mut output: MapOutput<'a, 'b>
+        &self, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, scratch: &'a mut crate::buffer::Scratch, mut output: MapOutput<'a, 'b>
     ) -> Result<(), Error> {
         if inputs.len() != self.arity() { output.fill(range.len()); return Err(Error::new(Kind::Length, "map arity does not match its operands")); }
         match self {
             Self::Kernel(kernel, settings) => kernel.map_in(inputs, range, *settings, scratch, output),
-            Self::Convert(conversion, settings, checked) => conversion.map_in(inputs[0], range, *checked, settings.tolerance, Some(scratch), output)
+            Self::Convert(conversion, settings, checked) => conversion.map_in(inputs[0], range, *checked, settings.tolerance, Some(scratch), output),
         }
     }
 }
@@ -382,9 +377,11 @@ impl Kernel {
         let bounds = Range::of_dtype(self.result);
         // f64 endpoints cannot prove i64 wrapping bounds. Narrower integers are exact here until their result exceeds their type.
         if self.variant.dtype.is_integral() && !self.variant.fails_on_overflow() && self.result.is_integral()
-            && (self.result == DType::Integer(Width::I64) || !range.within(bounds.lo, bounds.hi)) { bounds }
+            && (self.result == DType::Integer(Width::I64) || !range.within(bounds.lo, bounds.hi))
+        { bounds }
         // Checked arithmetic can rerun wider; only a Boolean result is bounded independently of that attempt.
-        else if self.result == DType::Boolean { range.meet(bounds) } else { range }
+        else if self.result == DType::Boolean { range.meet(bounds) }
+        else { range }
     }
     pub fn identity(&self) -> Option<f64> { self.definition.identity() }
     /// The argument that a dyadic call returns unchanged where `constants` gives the arguments that are one number, 0 for the left and 1 for the right, from the formula's identities: `x+0` and `0+x` keep `x`, `x-0` keeps `x`, and `0-x` keeps nothing.
@@ -456,23 +453,21 @@ impl Kernel {
 
     /// Appends a mapped range using the caller's execution-local conversion buffers.
     pub fn map_in<'a, 'b>(
-        &self, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings,
-        scratch: &'a mut crate::buffer::Scratch, output: MapOutput<'a, 'b>
-    ) -> Result<(), Error> {
-        self.mapping(Inputs(inputs), range, settings, output, Some(scratch))
-    }
+        &self, inputs: &[crate::agreement::Read<'_>], range: std::ops::Range<usize>, settings: Settings, scratch: &'a mut crate::buffer::Scratch,
+        output: MapOutput<'a, 'b>) -> Result<(), Error> { self.mapping(Inputs(inputs), range, settings, output, Some(scratch)) }
 
     fn mapping<'a, 'b>(
         &self, inputs: Inputs<'_, '_>, range: std::ops::Range<usize>, settings: Settings, mut target: MapOutput<'a, 'b>,
-        scratch: Option<&'a mut crate::buffer::Scratch>
-    ) -> Result<(), Error> {
+        scratch: Option<&'a mut crate::buffer::Scratch>) -> Result<(), Error> {
         use crate::characters::{ByKinds, Policy};
         if inputs.len() != self.arity() { target.fill(range.len()); return Err(Error::new(Kind::Length, "kernel operand count changed")); }
         if range.is_empty() { return Ok(()); }
         let mut output = Output { target, result_dtype: self.result, checked: self.variant.fails_on_overflow(), scratch };
-        crate::error::checked(|| match self.policy {
-            Some(Policy::Kinds(ByKinds::Truth(value))) => map::constant(value, range.len(), &mut output),
-            Some(Policy::Kinds(side)) => map::copied(inputs.selected(usize::from(side == ByKinds::Right)), range, self.variant.checked, &mut output),
+        match self.policy {
+            Some(Policy::Kinds(side)) => crate::error::checked(|| match side {
+                ByKinds::Truth(value) => map::constant(value, range.len(), &mut output),
+                side => map::copied(inputs.selected(usize::from(side == ByKinds::Right)), range, self.variant.checked, &mut output),
+            }),
             _ => {
                 let mut entered = false;
                 let result = self.projected(inputs.0, Some(range.clone()), Seed::Identity, settings, |reads, _| {
@@ -482,7 +477,7 @@ impl Kernel {
                 if !entered { output.target.fill(range.len()); }
                 result
             }
-        })
+        }
     }
     pub fn fold_pieces(
         &self, dims: [usize; 3], seed: Seed<'_>, direction: Direction, settings: Settings, pieces: &Pieces<'_>, output: &mut Buffer) -> Result<(), Error> {
@@ -678,7 +673,9 @@ fn with_projected<R>(
         if !read.sources.iter().any(|s| matches!(s.view.dtype(), DType::Float(_))) { return Ok(None); }
         let range = range.clone().unwrap_or(0..read.plan.len());
         let mut floats = Buffer::with_capacity(DType::Float(FloatWidth::F64), 0);
-        let View::Floats(Floats::F64(values)) = read.part_view(range.clone(), floats.dtype(), true, &mut floats)? else { unreachable!("a read into 64-bit floats gives them") };
+        let View::Floats(Floats::F64(values)) = read.part_view(range.clone(), floats.dtype(), true, &mut floats)? else {
+            unreachable!("a read into 64-bit floats gives them")
+        };
         Ok(Some((range.start, Buffer::Integers(IntBuf::I64(whole_numbers(t, values)?)))))
     }).collect::<Result<Vec<_>, Error>>()?;
     let bindings = converted.iter().zip(inputs)

@@ -869,17 +869,15 @@ mod tolerant {
         let f64s = DType::Float(FloatWidth::F64);
         let quotient = Kernel::resolve(FloorDivide(Tolerance::EXACT), Variant::checked(f64s), [f64s; 2]).unwrap();
         assert_eq!(
-            (quotient.real(&[x, y], rustymath::operation::Settings { tolerance: Tolerance::EXACT }).unwrap(), Exactly.residue(y, x)),
-            (2.0, x - 2.0 * y)
+            (quotient.real(&[x, y], rustymath::operation::Settings { tolerance: Tolerance::EXACT }).unwrap(), Exactly.residue(y, x)), (2.0, x - 2.0 * y)
         );
         if rustymath::FUSED { assert_ne!(Exactly.residue(0.1, 1.0), 0.0); }
         assert_eq!(Exactly.residue(1e300, 1e-300), 1e-300);
         assert!((T.gcd(0.6, 0.4) - 0.2).abs() < 1e-15 && Exactly.gcd(0.6, 0.4) < 1e-15);
         let tiny = f64::from_bits(1);
-        for (x, y, g) in [
-            (0.75, 0.5, 0.25), (1.0, 0.75, 0.25), (3.0 * tiny, 9.0 * tiny, 3.0 * tiny),
-            (f64::MAX, tiny, tiny), (f64::MAX, f64::MAX, f64::MAX),
-        ] { assert_eq!(Exactly.gcd(x, y), g); }
+        for (x, y, g) in [(0.75, 0.5, 0.25), (1.0, 0.75, 0.25), (3.0 * tiny, 9.0 * tiny, 3.0 * tiny), (f64::MAX, tiny, tiny), (f64::MAX, f64::MAX, f64::MAX)] {
+            assert_eq!(Exactly.gcd(x, y), g);
+        }
         assert_eq!(Exactly.gcd(0.6, 0.4), f64::EPSILON / 2.0);
         assert_eq!((T.gcd(12.0, 18.0), T.gcd(-12.0, 18.0), T.gcd(0.0, 2.5), T.gcd(0.0, 0.0), T.gcd(12.0f32, 18.0)), (6.0, 6.0, 2.5, 0.0, 6.0));
         assert!(T.gcd(f64::NAN, 1.0).is_nan() && T.gcd(f64::NAN, f64::NAN).is_nan() && T.gcd(f64::INFINITY, 1.0).is_nan());
@@ -1001,7 +999,6 @@ mod tolerant {
         let lcm = Kernel::new(Lcm(T), Variant::checked(Complex64::DTYPE));
         assert_eq!(lcm.complex(&[c(2.0, 0.0), c(0.0, 3.0)], Settings { tolerance: T }).unwrap(), c(0.0, 6.0));
     }
-
 
     /// Tolerant search finds the first match that a brute-force search finds, at every width and at small and large tolerances, among floats crowded near a few values, and among zeros, infinities and NaN, whether it scans for a few items or indexes many.
     #[test]

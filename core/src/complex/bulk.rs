@@ -39,8 +39,7 @@ fn sin_cos<R: Native + Cast>(y: &[R], sin: &mut Vec<R>, cos: &mut Vec<R>) {
 }
 
 /// Real-input cis through the shared real sin/cos slices, with exact quarter turns.
-pub(crate) fn real_cis<R: Native + Cast>(
-    k: &crate::Cis, ops: &NativeOps<{ FUSED }>, [arg]: [Arg<'_, R>; 1], n: usize, out: &mut [MaybeUninit<Complex<R>>]) {
+pub(crate) fn real_cis<R: Native + Cast>(k: &crate::Cis, ops: &NativeOps<{ FUSED }>, [arg]: [Arg<'_, R>; 1], n: usize, out: &mut [MaybeUninit<Complex<R>>]) {
     let ys = match arg {
         Arg::One(y) => {
             let value = k.complex(ops, [c(y, R::zero())]).expect("cis has a complex scalar body");
@@ -61,7 +60,6 @@ pub(crate) fn real_cis<R: Native + Cast>(
         }
     }
 }
-
 
 fn split<K: Formula<N>, R: Native + Cast, const N: usize>(
     k: &K, ops: &NativeOps<{ FUSED }>, args: [Arg<'_, Complex<R>>; N], n: usize, out: &mut [MaybeUninit<Complex<R>>],
