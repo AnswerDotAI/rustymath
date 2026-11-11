@@ -470,9 +470,11 @@ impl Kernel {
         if inputs.len() != self.arity() { target.fill(range.len()); return Err(Error::new(Kind::Length, "kernel operand count changed")); }
         if range.is_empty() { return Ok(()); }
         let mut output = Output { target, result_dtype: self.result, checked: self.variant.fails_on_overflow(), scratch };
-        crate::error::checked(|| match self.policy {
-            Some(Policy::Kinds(ByKinds::Truth(value))) => map::constant(value, range.len(), &mut output),
-            Some(Policy::Kinds(side)) => map::copied(inputs.selected(usize::from(side == ByKinds::Right)), range, self.variant.checked, &mut output),
+        match self.policy {
+            Some(Policy::Kinds(side)) => crate::error::checked(|| match side {
+                ByKinds::Truth(value) => map::constant(value, range.len(), &mut output),
+                side => map::copied(inputs.selected(usize::from(side == ByKinds::Right)), range, self.variant.checked, &mut output),
+            }),
             _ => {
                 let mut entered = false;
                 let result = self.projected(inputs.0, Some(range.clone()), Seed::Identity, settings, |reads, _| {
@@ -482,7 +484,7 @@ impl Kernel {
                 if !entered { output.target.fill(range.len()); }
                 result
             }
-        })
+        }
     }
     pub fn fold_pieces(
         &self, dims: [usize; 3], seed: Seed<'_>, direction: Direction, settings: Settings, pieces: &Pieces<'_>, output: &mut Buffer) -> Result<(), Error> {
