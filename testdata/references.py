@@ -116,7 +116,7 @@ INCOMPLETE = dict(
 )
 # The special functions of two arguments that need no looser bound, with ranges for each argument. polygamma's order is whole.
 PAIRS = dict(
-    polygamma=(lambda n, x: mp.polygamma(int(n), x), [(range(1, 4), (0, 3)), (range(1, 21), (0.5, 60)), (range(1, 6), (10, 1e6))]),
+    polygamma=(lambda n, x: mp.polygamma(int(n), x), [(range(1, 4), (0, 3)), (range(1, 21), (0.5, 60)), (range(1, 6), (10, 1e6)), (range(21, 171), (0.5, 4)), (range(21, 171), (4, 1e6))]),
     beta=(mp.beta, [((0.1, 5), (0.1, 5)), ((1, 100), (1, 100)), ((-4.9, 5), (0.5, 20))]),
 )
 SAMPLES = 512

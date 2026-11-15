@@ -26,7 +26,7 @@ pub(crate) fn tanh_formula<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o
     let top = o.number(F::narrow(if o.width() == crate::buffer::FloatWidth::F64 { 20.0 } else { 9.0 }));
     let a = o.magnitude(x);
     let a = o.select(o.less(top, a), top, a);
-    let e = crate::exp::minus_one_formula(o, o.add(a, a), o.number(F::zero()));
+    let e = crate::exp::minus_one_normal_formula(o, o.add(a, a));
     let result = o.divide(e, o.add(e, o.number(F::narrow(2.0))));
     o.select(o.less(x, o.number(F::zero())), o.negate(result), result)
 }

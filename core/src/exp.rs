@@ -1,5 +1,7 @@
 //! e^x and e^x - 1. The f64 reduction and the form of the final step come from SLEEF's `xexp`, and the f32 polynomial of `exp` and the f32 split of ln 2 from Arm Optimized Routines' AdvSIMD `expf`. The other polynomials are minimax fits. See `THIRD-PARTY.md`.
+use crate::slice::{Arg, Total, each_usual, none};
 use crate::{dd::Double, float::{Native, horner, sealed::Core}};
+use std::mem::MaybeUninit;
 
 /// The coefficients of h(r) = (e^r - 1)/r, highest degree first, for |r| up to about ln 2 / 2. `exp` needs h only to within its error in e^r = 1 + r h, which shrinks with r.
 const EXP_64: [f64; 10] = [
@@ -35,6 +37,23 @@ pub(crate) fn exp<R: Native, const FUSED: bool>(x: R) -> R { exp_parts::<R, FUSE
 #[derive(Clone, Copy, Debug)]
 pub struct Exp;
 
+/// The range where one normal power of two scales the reduced exponential.
+#[inline(always)]
+fn usual<R: Native>(x: R) -> bool { x.abs() < R::narrow(if R::WIDE { 708.0 } else { 87.0 }) }
+
+#[inline(always)]
+fn exp_fast<R: Native>(x: R) -> R {
+    let (n, r) = reduce::<R, { crate::FUSED }>(x);
+    reduced_with(&crate::recipe::NativeOps::<{ crate::FUSED }>::DEFAULT, r) * R::pow2(n + R::SHIFT)
+}
+
+pub(crate) fn exp_slice<R: Native>(
+    _: &Exp, _: &crate::recipe::NativeOps<{ crate::FUSED }>, [x]: [Arg<'_, R>; 1], n: usize, out: &mut [MaybeUninit<R>]) -> bool {
+    each_usual(
+        x, n, out, (usual, exp_fast), (#[inline(always)] |x: R| x < R::narrow(if R::WIDE { -746.0 } else { -105.0 }), |_| R::zero()), #[inline(always)]
+        |x| Total(exp::<_, { crate::FUSED }>(x)))
+}
+
 /// e^x × 2^k, for a whole k.
 #[inline]
 pub(crate) fn exp_times<R: Native, const FUSED: bool>(x: R, k: R) -> R { exp_parts::<R, FUSED>(x, R::neg_zero(), k) }
@@ -45,6 +64,11 @@ pub(crate) fn expm1<R: Native, const FUSED: bool>(x: R) -> R { expm1_times::<R, 
 /// [`expm1`](crate::expm1) as a function object.
 #[derive(Clone, Copy, Debug)]
 pub struct Expm1;
+
+pub(crate) fn expm1_slice<R: Native>(
+    _: &Expm1, o: &crate::recipe::NativeOps<{ crate::FUSED }>, [x]: [Arg<'_, R>; 1], n: usize, out: &mut [MaybeUninit<R>]) -> bool {
+    each_usual(x, n, out, (usual, #[inline(always)] |x| minus_one_normal_formula(o, x),), none(), #[inline(always)] |x| Total(expm1::<_, { crate::FUSED }>(x)))
+}
 
 /// (e^x - 1) × 2^k, for a whole k. Below -40 at f64 and -18 at f32, e^x - 1 rounds to -1. n can exceed the greatest exponent by one while the result is still finite, so 2^n splits into 2^m and 2^(n-m), with m no greater than that exponent.
 #[inline]
@@ -100,6 +124,13 @@ pub(crate) fn formula<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O,
 fn minus_one_with<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, r: O::V, scale: O::V) -> O::V {
     let h = crate::recipe::horner(o, r, if o.width() == crate::buffer::FloatWidth::F64 { &H_64 } else { &H_32 });
     o.multiply_add(o.multiply(r, h), scale, o.subtract(scale, o.number(F::one())))
+}
+
+/// e^x - 1 where |x| < 708 at f64 or 87 at f32, with no clamps or split scaling.
+#[inline(always)]
+pub(crate) fn minus_one_normal_formula<F: crate::Float, O: crate::recipe::Ops<F> + ?Sized>(o: &O, x: O::V) -> O::V {
+    let (n, r) = reduce_with(o, x);
+    minus_one_with(o, r, crate::recipe::pow2(o, o.add(n, crate::recipe::rounding_shift(o))))
 }
 
 #[inline]

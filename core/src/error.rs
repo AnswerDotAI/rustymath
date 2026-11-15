@@ -58,9 +58,6 @@ struct Errors { count: std::sync::atomic::AtomicU64, first: std::sync::Mutex<Opt
 
 thread_local! { static ACTIVE: std::cell::RefCell<Option<ErrorSlot>> = const { std::cell::RefCell::new(None) }; }
 
-struct Restore(Option<ErrorSlot>);
-impl Drop for Restore { fn drop(&mut self) { ACTIVE.with(|active| active.replace(self.0.take())); } }
-
 impl ErrorSlot {
     pub fn new() -> Self { Self::default() }
     pub fn count(&self) -> u64 { self.0.count.load(std::sync::atomic::Ordering::Relaxed) }
@@ -73,7 +70,7 @@ impl ErrorSlot {
         self.enter(&mut || result = run.take().map(|run| run()));
         result.expect("the run ran")
     }
-    fn enter(&self, run: &mut dyn FnMut()) { let _restore = Restore(ACTIVE.with(|active| active.replace(Some(self.clone())))); run() }
+    fn enter(&self, run: &mut dyn FnMut()) { let _restore = std::mem::DropGuard::new(ACTIVE.replace(Some(self.clone())), |prior| ACTIVE.set(prior)); run() }
 }
 
 /// Record in the active read's slot; standalone scalar maths has no slot.

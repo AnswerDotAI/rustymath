@@ -952,6 +952,31 @@ impl Walk {
             match self.read(a, source[a])? { (0, read) => match read[..] { [[n, moves], [w, 1]] => Some([n, w, moves]), _ => None }, _ => None }
         }).collect()
     }
+    /// The transpose of a sum along a unit-step window axis: pad the sum's cotangent, read its windows with the window axis last, then add their sums through the remaining copy. Returns those three plans. The frame and window may lie on any source axis; other reads keep their positions.
+    pub fn transpose_sum(&self, axis: usize, source: &[usize]) -> Option<(Plan, Plan, Plan)> {
+        let a = self.along.get(axis).copied().flatten()?;
+        let others: Vec<_> = self.walking(a).filter(|&r| r != axis).collect();
+        let &[frame] = others.as_slice() else { return None };
+        let (first, read) = self.read(a, source[a])?;
+        if read.iter().any(|&[_, step]| step != 1) { return None; }
+        let (width, len) = (self.steps[axis].len(), 1 + read.iter().map(|&[n, _]| n - 1).sum::<usize>());
+        let at = frame - usize::from(axis < frame);
+        let shape: Vec<_> = self.steps.iter().enumerate().filter(|&(r, _)| r != axis).map(|(_, s)| s.len()).collect();
+        let widths: Vec<_> = (0..shape.len()).map(|r| if r == at { (width - 1, width - 1) } else { (0, 0) }).collect();
+        let padded = pad(&Layout::from(shape.clone()), &widths, Edge::Fill).ok()?;
+        let strides = strides(padded.layout.shape());
+        let mut steps: Vec<_> = padded.layout.shape().iter().zip(&strides).map(|(&n, &s)| Steps::along(n, s)).collect();
+        steps[at] = Steps::along(len, strides[at]);
+        steps.push(Steps::along(width, strides[at]));
+        let mut windows = padded.layout.shape().to_vec();
+        windows[at] = len;
+        windows.push(width);
+        let mut rest = shape;
+        rest[at] = len;
+        let steps_back = self.steps.iter().enumerate().filter(|&(r, _)| r != axis)
+            .map(|(r, s)| if r == frame { Steps::Stride { start: first * self.strides[a], len, step: self.strides[a] as isize } } else { s.clone() }).collect();
+        Some((padded, Plan { layout: windows.into(), steps }, Plan { layout: rest.into(), steps: Steps::with_base(self.base, steps_back) }))
+    }
     /// The transpose of unit-step leading windows as an axis order and copies to sum. The copies read the reordered windows back to the source, with zero at missing positions.
     pub fn transpose_windows(&self, source: &[usize]) -> Option<(Vec<usize>, Vec<Mapping>)> {
         let windows = self.windows(source)?;

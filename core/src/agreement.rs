@@ -353,8 +353,29 @@ impl<'a> Binding<'a> {
 #[derive(Clone, Copy)]
 pub struct Read<'a> { pub sources: &'a [Binding<'a>], pub plan: &'a ReadPlan }
 
-/// A read by rows, from [`Read::rows`]: row `r` starts at `items[first + r × step]`, and reads a run of items from there where `run` is true, and else that one item for the whole row.
-pub struct Rows<'a, T> { pub items: &'a [T], pub first: usize, pub step: isize, pub run: bool }
+/// A read by rows, from [`Read::rows`]: row `r` starts at `first + r × step`, and borrows a run or converts that one source item for the whole row.
+pub enum Rows<'a, T> {
+    Typed { items: &'a [T], first: usize, step: isize, run: bool }, ConvertedScalars { items: crate::buffer::View<'a>, first: usize, step: isize }
+}
+
+impl<'a, T: crate::buffer::Cast> Rows<'a, T> {
+    /// Whether the rows already read one contiguous run or one repeated item.
+    #[inline]
+    pub fn contiguous(&self, len: usize) -> bool {
+        match self { Self::Typed { step, run, .. } => *step == if *run { len as isize } else { 0 }, Self::ConvertedScalars { step, .. } => *step == 0 }
+    }
+    /// `len` items from `at` in row `row`. A scalar converts once, not once per repeated position.
+    #[inline]
+    pub fn part(&self, row: usize, at: usize, len: usize, checked: bool) -> Result<Arg<'a, T>, Error> {
+        Ok(match *self {
+            Self::Typed { items, first, step, run } => {
+                let k = first.wrapping_add_signed(step * row as isize);
+                if run { Arg::Many(&items[k + at..k + at + len]) } else { Arg::One(items[k]) }
+            }
+            Self::ConvertedScalars { items, first, step } => Arg::One(kept(T::cast(items, first.wrapping_add_signed(step * row as isize)), checked)?),
+        })
+    }
+}
 
 impl<'s> Read<'s> {
     /// Checks each source that the plan reads: bound, of the length the plan reads, with its window inside that length.
@@ -448,7 +469,7 @@ impl<'s> Read<'s> {
     pub fn in_place<T: crate::buffer::Cast>(&self, range: &Range<usize>) -> bool {
         self.run_view(range).is_some_and(|(view, _)| view.len() == 1 || view.dtype() == T::DTYPE)
     }
-    /// This read as rows over a result of `shape`, which is rows then items, where every source is bound as the plan reads it, the plan maps one source that holds `T` affinely over `shape`, and each row reads one item or a run of items. `None` for any other read.
+    /// This read as rows over a result of `shape`, which is rows then items, where every source is bound as the plan reads it and the plan maps one source affinely over `shape`. Each row reads one item at any source dtype, or a run of items that holds `T`. `None` for any other read.
     pub fn rows<T: crate::buffer::Cast>(&self, shape: [usize; 2]) -> Option<Rows<'s, T>> {
         self.bindings().ok()?;
         let mut strides = [0; 2];
@@ -456,7 +477,11 @@ impl<'s> Read<'s> {
         let binding = self.sources.get(source)?;
         binding.borrow(bounds)?;
         let [step, inner @ (0 | 1)] = strides else { return None };
-        Some(Rows { items: T::of(binding.view)?, first: base.checked_sub(binding.start)?, step, run: inner == 1 })
+        let first = base.checked_sub(binding.start)?;
+        match T::of(binding.view) {
+            Some(items) => Some(Rows::Typed { items, first, step, run: inner == 1 }),
+            None if inner == 0 => Some(Rows::ConvertedScalars { items: binding.view, first, step }), _ => None
+        }
     }
     /// Appends items `range` of the plan onto `output` at `T`, a run at a time (`ReadPlan::runs`): a map over one source walks whole where it can (`walk_onto`), and each other run copies a source's run, gives index values or fills.
     fn read_onto<T: crate::buffer::Cast>(&self, range: Range<usize>, checked: bool, output: &mut Vec<T>) -> Result<(), Error> {

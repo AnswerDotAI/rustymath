@@ -109,18 +109,17 @@ fn product_typed<T: crate::buffer::Cast, P: crate::linalg::Inner<T>>(
     use crate::agreement::{Mapping, Missing, Read, Walked};
     use crate::gather::Steps;
     use crate::linalg::{Mapped, Orientation};
-    let Some(matrix) = plan.matrix_for(inputs) else { return Ok(false); };
+    let expanded = std::array::from_fn::<_, 2, _>(|i| inputs[i].plan.remapped(plan.mappings[i].clone(), plan.iteration.count(), Missing::Invalid));
+    let reads = std::array::from_fn::<_, 2, _>(|i| Read { sources: inputs[i].sources, plan: &expanded[i] });
+    let positional = reads.each_ref().map(|read| read.positional(plan.iteration.shape()));
+    let Some(matrix) = plan.matrix_for(positional.each_ref().map(|p| p.as_ref().map(|(_, map)| map))) else { return Ok(false); };
     let [m, k, n] = matrix.size;
     if !variant.wrapping && matches!(P::Out::DTYPE, DType::Integer(w) if k > i64::MAX as usize || !w.holds(k as i64)) { return Ok(false); }
     let (r, frame_shape) = (matrix.frame_rank, &plan.layout.shape()[..matrix.frame_rank]);
     let frames = crate::layout::count(frame_shape);
-    let expanded = std::array::from_fn::<_, 2, _>(|i| inputs[i].plan.remapped(plan.mappings[i].clone(), plan.iteration.count(), Missing::Invalid));
-    let reads = std::array::from_fn::<_, 2, _>(|i| Read { sources: inputs[i].sources, plan: &expanded[i] });
     // Each operand's walk over the frames and the matrix axes `[m, n, k]`, composed once where it reads its source positionally: a frame moves only the walk's base. A source of another dtype converts to `T` once, whole.
     let walked: Vec<usize> = frame_shape.iter().copied().chain([m, n, k]).collect();
-    let positional = reads.each_ref().map(|read| match read.positional(&walked) {
-        Some((view, Mapping::Steps { base, steps })) => Some((view, base, steps)), _ => None
-    });
+    let positional = positional.map(|p| match p { Some((view, map)) => map.entries(&walked).map(|(base, steps)| (view, base, steps)), _ => None });
     let mut casts: [Vec<T>; 2] = [Vec::new(), Vec::new()];
     for (cast, p) in casts.iter_mut().zip(&positional) {
         if let Some((view, ..)) = p && T::of(*view).is_none() { T::extend_cast(*view, view.len(), variant.checked, cast)?; }

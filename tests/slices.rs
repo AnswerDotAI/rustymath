@@ -144,12 +144,18 @@ mod forms {
         unary(Log2, "Log2", &x);
         unary(Log10, "Log10", &x);
         unary(Log1p, "Log1p", &x.iter().map(|&v| v - 1.0).collect::<Vec<_>>());
+        let x32: Vec<f32> = x.iter().map(|&v| v as f32).collect();
+        unary(Ln, "Ln", &x32);
+        unary(Log1p, "Log1p", &x32.iter().map(|&v| v - 1.0).collect::<Vec<_>>());
         // `Exp` and `Expm1` take their fast form for blocks whose items all lie within ±708 at f64 and ±87 at f32. The same items, shifted into that range, put ∞ and NaN in two blocks.
         let (e64, e32): (Vec<f64>, Vec<f32>) = x.iter().map(|&v| (v - 700.0, (v / 10.0 - 50.0) as f32)).unzip();
         unary(Exp, "Exp", &e64);
         unary(Exp, "Exp", &e32);
         unary(Expm1, "Expm1", &e64);
         unary(Expm1, "Expm1", &e32);
+        // Whole underflow blocks use the zero form; the tail still takes the scalar form.
+        unary(Exp, "Exp", &[-1000.0f64; 129]);
+        unary(Exp, "Exp", &[-150.0f32; 129]);
         // `Erfc` computes one formula for a block of 512 items whose magnitudes all lie on one side of its split, and a mixed block takes both. A ramp from -5 to 5 holds blocks of each kind.
         let ramp: Vec<f64> = (0..4000).map(|i| i as f64 / 400.0 - 5.0).collect();
         let ramp32: Vec<f32> = ramp.iter().map(|&v| v as f32).collect();
@@ -1119,6 +1125,12 @@ mod gather {
             let mut summed = vec![0; scattered.len()];
             Writes::Walk { base: 0, steps: &tables }.combine(&mut summed, rustymath::Arg::Many(&u), |a, x| (a + x, None::<()>));
             assert_eq!(summed, scattered, "{tables:?}");
+            let mut target = rustymath::array::Array::new(source.to_vec().into(), f64::buffer(vec![3.; scattered.len()])).unwrap();
+            let values = rustymath::array::Array::new(shape.to_vec().into(), f64::buffer(u.iter().map(|&v| v as f64).collect())).unwrap();
+            let plan = rustymath::structure::Plan { layout: shape.to_vec().into(), steps: tables.clone() };
+            let kernel = rustymath::operation::Kernel::new(rustymath::Add, rustymath::domain::Variant::checked(f64::DTYPE));
+            target.combine_at(&kernel, &plan, &values).unwrap();
+            assert_eq!(f64::vec(target.into_compact().1).unwrap(), scattered.iter().map(|&v| v as f64 + 3.).collect::<Vec<_>>());
             let Some((order, terms)) = Walk::new(&tables, shape, source).and_then(|w| w.transpose_windows(source)) else { return false };
             let axes = rustymath::search::inverse_permutation(order.iter().copied());
             let moved = read(&u, 0, &rustymath::structure::transpose_steps(shape, &axes).unwrap());
@@ -1136,6 +1148,8 @@ mod gather {
             let frames = (17 - start) / s + 1;
             assert_eq!(check(&[20], &[frames, 3], vec![Steps::Stride { start, len: frames, step: s as isize }, along(3, 1)]), s == 1 && start == 0);
         }
+        let frames = rustymath_core::CHUNK / 3 + 2;
+        assert!(!check(&[(frames - 1) * 2 + 3], &[frames, 3], vec![along(frames, 2), along(3, 1)]));
         assert!(!check(&[20], &[6, 3], vec![along(6, 3), along(3, 2)]));
         assert!(!check(&[10, 12], &[4, 4, 3, 2], vec![along(4, 24), along(4, 3), along(3, 12), along(2, 1)]));
         assert!(check(&[20], &[2, 19], vec![along(2, 1), along(19, 1)]));

@@ -116,7 +116,7 @@ fn map_blocks<F: crate::buffer::Cast, O: OutputItem, const N: usize>(
     }
     if let Some((len, rows)) = by_rows::<F, N>(inputs.0) {
         return output.write(range.len(), &|part, slots, _| unsafe {
-            slots.fill(part.len(), |out| recorded(fill_rows(&rows, len, part.start + range.start, out, apply)))
+            slots.fill(part.len(), |out| fill_rows(&rows, len, part.start + range.start, checked, out, apply).map_err(crate::error::record).is_ok())
         });
     }
     output.write(range.len(), &|part, slots, work| {
@@ -161,24 +161,27 @@ fn by_rows<'a, F: crate::buffer::Cast, const N: usize>(inputs: &[crate::agreemen
     let mut rows = std::array::from_fn(|_| None);
     for k in 0..N { rows[k] = Some(inputs.get(k)?.rows([items / len, len])?); }
     let rows: [crate::agreement::Rows<'a, F>; N] = rows.map(Option::unwrap);
-    rows.iter().any(|row| if row.run { row.step != len as isize } else { row.step != 0 }).then_some((len, rows))
+    rows.iter().any(|row| !row.contiguous(len)).then_some((len, rows))
 }
 
 /// Writes `out`, the result's items from position `start`, by `apply` on each row of `len` items from `rows` in turn (`by_rows`). Every row is written, and the first error is the result.
-fn fill_rows<F: Copy, O, const N: usize>(
-    rows: &[crate::agreement::Rows<'_, F>], len: usize, start: usize, out: &mut [std::mem::MaybeUninit<O>],
-    apply: &(dyn Fn([Arg<'_, F>; N], usize, &mut [std::mem::MaybeUninit<O>]) -> Result<(), Kind> + Sync)) -> Result<(), Kind> {
+fn fill_rows<F: crate::buffer::Cast, O: OutputItem, const N: usize>(
+    rows: &[crate::agreement::Rows<'_, F>], len: usize, start: usize, checked: bool, out: &mut [std::mem::MaybeUninit<O>],
+    apply: &(dyn Fn([Arg<'_, F>; N], usize, &mut [std::mem::MaybeUninit<O>]) -> Result<(), Kind> + Sync)) -> Result<(), Error> {
+    let failed = |kind| Error::new(kind, "numerical kernel argument is outside its domain");
     let (mut done, mut r, mut at, mut result) = (0, start / len, start % len, Ok(()));
     while done < out.len() {
         let n = (len - at).min(out.len() - done);
-        let args = std::array::from_fn(|j| {
-            let (row, k) = (&rows[j], rows[j].first.wrapping_add_signed(rows[j].step * r as isize));
-            if row.run { Arg::Many(&row.items[k + at..k + at + n]) } else { Arg::One(row.items[k]) }
-        });
+        let mut args = [Arg::Many(&[]); N];
+        for j in 0..N {
+            args[j] = match rows[j].part(r, at, n, checked) {
+                Ok(items) => items, Err(error) => { for slot in &mut out[done..] { slot.write(O::FILL); } return result.map_err(failed).and(Err(error)); }
+            };
+        }
         result = result.and(apply(args, n, &mut out[done..done + n]));
         (done, r, at) = (done + n, r + 1, 0);
     }
-    result
+    result.map_err(failed)
 }
 
 pub(super) fn copied(inputs: Inputs<'_, '_>, range: std::ops::Range<usize>, checked: bool, output: &mut Output<'_, '_>) -> Result<(), Error> {

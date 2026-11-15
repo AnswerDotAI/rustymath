@@ -600,6 +600,17 @@ mod operation {
         let row_shape = Layout::from([2, 32]);
         let rows = view(&row_shape, f64::view(&[1., 2.]), &Mapping::Linear(32));
         assert!(add.map(&[rows.read(), rows.read()], 0..65, Settings { tolerance: Tolerance::EXACT }, &mut Buffer::with_capacity(float, 0)).is_err());
+        let narrow = [1i16, 2];
+        let mixed = view(&row_shape, i16::view(&narrow), &Mapping::Linear(32));
+        let ones = [1.; 64];
+        let dense = view(&row_shape, f64::view(&ones), &Mapping::Linear(1));
+        let out = apply(&add, [mixed, dense.clone()]).unwrap();
+        assert_eq!(f64::of(out.view()).unwrap(), &[vec![2.; 32], vec![3.; 32]].concat());
+        let complex = [num_complex::Complex64::new(1., 0.), num_complex::Complex64::new(2., 1.)];
+        let bad = view(&row_shape, num_complex::Complex64::view(&complex), &Mapping::Linear(32));
+        let mut out = Buffer::with_capacity(float, 0);
+        assert!(add.map(&[bad.read(), dense.read()], 0..64, Settings { tolerance: Tolerance::EXACT }, &mut out).is_err());
+        assert_eq!(out.len(), 64);
         let mut values = vec![10.];
         append(&add, &[f64::view(&[1.]), f64::view(&[2., 3., 4.])], 3, &mut values).unwrap();
         assert_eq!(values, [10., 3., 4., 5.]);
@@ -874,7 +885,9 @@ mod operation {
         let source = ReadPlan::input(0, data.len());
         assert!(Read { sources: &sources, plan: &source }.rows::<f64>([3, 2]).is_none());
         let slice = source.remapped(Mapping::Steps { base: 2, steps: vec![Steps::along(1, 0), Steps::along(2, 1)].into() }, 2, Missing::Invalid);
-        assert_eq!(Read { sources: &sources, plan: &slice }.rows::<f64>([1, 2]).unwrap().items, &data[2..4]);
+        assert!(
+            matches!(Read { sources: &sources, plan: &slice }.rows::<f64>([1, 2]).unwrap().part(0, 0, 2, true), Ok(rustymath::Arg::Many(x)) if x == &data[2..4])
+        );
         assert!(Read { sources: &sources, plan: &slice }.rows::<f64>([1, 1]).is_none());
         let broadcast = Mapping::Steps { base: 0, steps: vec![Steps::along(2, 2), Steps::along(3, 0), Steps::along(2, 1)].into() };
         assert_eq!(broadcast.affine(&[2, 3, 2]), Some((0, vec![2, 0, 1])));
