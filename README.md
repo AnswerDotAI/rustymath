@@ -23,7 +23,7 @@ import rustymath as rm
 
 ## Arrays and indexing
 
-Functions take Python numbers, nested lists, rustymath arrays or buffer exporters such as NumPy arrays. Broadcasting aligns leading axes. A two-item vector adds one value to each row of this matrix:
+Functions take Python numbers, nested lists, rustymath arrays or buffer exporters such as NumPy arrays. Broadcasting aligns leading axes. Here `rm.add` adds the vector’s first item to the matrix’s first row and its second item to the second row:
 
 ``` python
 rm.add([[1, 2, 3], [4, 5, 6]], [10, 20])
@@ -47,7 +47,7 @@ rm.exp([0., 1, 2]), rm.equal(0.1 + 0.2, 0.3)
 
 ## Searching, sorting and selection
 
-`unique` retains first-occurrence order and reports each value’s position, class number and count:
+`unique` keeps the order in which values first occur. It also gives each value’s first position (`firsts`) and count (`counts`), and for each item the position of its value in `values` (`numbers`):
 
 ``` python
 rm.unique([3, 1, 3, 2])
@@ -85,7 +85,7 @@ rm.linalg.solve([[4., 1], [1, 3]], [1., 2])
 
 ## Optimization and iterative solves
 
-Minimize functions, fit residuals or find roots. Here Brent’s method finds where cos x = x:
+Minimize functions, fit parameters by least squares or find roots. Here Brent’s method finds where cos x = x:
 
 ``` python
 rm.optimize.root_scalar(lambda x: rm.cos(x) - x, [0, 1]).root
@@ -110,7 +110,7 @@ rm.polynomial.polyroots([-6, 11, -6, 1]), rm.number_theory.factor(2**64 + 1)
 
 ## Accuracy and speed
 
-The Rust page’s [Accuracy and speed](https://answerdotai.github.io/rustymath/rust.html#accuracy-and-speed) section compares each function’s speed with Rust’s standard library. It also explains how the 4-ulp bound holds for `f16`, with and without fused multiply-add, and for `pow` and `root`.
+The Rust page’s [Accuracy and speed](https://answerdotai.github.io/rustymath/rust.html#accuracy-and-speed) section compares each function’s speed with the version in Rust’s standard library. It also explains how the 4-ulp bound holds for `f16`, with and without fused multiply-add, and for `pow` and `root`.
 
 ## Licence
 

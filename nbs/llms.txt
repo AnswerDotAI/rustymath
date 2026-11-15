@@ -22,7 +22,7 @@ Float functions give results within four units in the last place (ulps) of the c
 
 [Polynomials, exact arithmetic and number theory](https://answerdotai.github.io/rustymath/exact.html) includes rational matrix solves and calculations with `fractions.Fraction`.
 
-The Rust page's [Accuracy and speed](https://answerdotai.github.io/rustymath/rust.html#accuracy-and-speed) section compares each function's speed with Rust's standard library. It also explains how the 4-ulp bound holds for `f16`, with and without fused multiply-add, and for `pow` and `root`.
+The Rust page's [Accuracy and speed](https://answerdotai.github.io/rustymath/rust.html#accuracy-and-speed) section compares each function's speed with the version in Rust's standard library. It also explains how the 4-ulp bound holds for `f16`, with and without fused multiply-add, and for `pow` and `root`.
 
 ## Modules
 

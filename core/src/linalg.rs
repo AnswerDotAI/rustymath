@@ -203,15 +203,13 @@ impl ProductPlan {
         Ok(Self { layout, iteration, mappings, contracted })
     }
 
-    /// The matrix product that runs this plan, from the iteration axes each operand steps along: its read's steps where the read reaches its items positionally, and otherwise its `mappings` entry's, which says which items it reads. An axis that no read steps along, as a broadcast gives, takes the class of the operands whose free axis `mappings` makes it, and an axis of one item takes the class of the axis before it. `None` where the axes don't fall into frames, rows and columns, in that order.
-    pub fn matrix_for(&self, inputs: [crate::agreement::Read<'_>; 2]) -> Option<MatrixProduct> {
+    /// The matrix product of the prepared iteration reads, or the nominal mappings where a read is not positional. An axis that no read steps along takes its nominal class, and an axis of one item takes the class before it. `None` where the axes don't fall into frames, rows and columns, in that order.
+    pub fn matrix_for(&self, positional: [Option<&Mapping>; 2]) -> Option<MatrixProduct> {
         let shape = self.iteration.shape();
         let mut owners = vec![0; shape.len() - self.contracted];
         let mut nominal = owners.clone();
-        for (side, input) in inputs.iter().enumerate() {
-            let plan = input.plan.remapped(self.mappings[side].clone(), self.iteration.count(), crate::agreement::Missing::Invalid);
-            let map =
-                crate::agreement::Read { sources: input.sources, plan: &plan }.positional(shape).map_or_else(|| self.mappings[side].clone(), |(_, map)| map);
+        for (side, map) in positional.into_iter().enumerate() {
+            let map = map.unwrap_or(&self.mappings[side]);
             let (_, steps) = map.affine(shape)?;
             for (axis, owner) in owners.iter_mut().enumerate() { if steps[axis] != 0 { *owner |= 1 << side; } }
             if let Some((_, free)) = self.mappings[side].affine(shape) {

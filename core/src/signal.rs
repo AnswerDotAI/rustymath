@@ -87,11 +87,18 @@ pub fn correlate<T: Element, P: Inner<T>>(pair: &P, x: &[T], kernel: &[T], c: &C
 
 /// Each frame of `frames` added back where its window read: the transpose of the windows of `w` items that move `step` items at a time along an axis of `len` positions. `frames` has shape `[outer, n, mid, w, inner]`, with `n` frames along its second axis and each window along its fourth. Between them lie `mid` positions of other axes, which the result puts before the windows' axis: its shape is `[outer, mid, len, inner]`. Items that several windows read add up, and positions that no window read are 0. `len` must be at least `(n - 1) × step + w` where `n` isn't 0.
 pub fn overlap_add<T: Scalar>(frames: &[T], [outer, n, mid, w, inner]: [usize; 5], step: usize, len: usize) -> Vec<T> {
+    let mut out = vec![T::zero(); outer * mid * len * inner];
+    overlap_add_into(frames, [outer, n, mid, w, inner], step, len, &mut out);
+    out
+}
+
+/// Adds the windows of [`overlap_add`] into existing output storage. Items outside the windows keep their values.
+pub fn overlap_add_into<T: Scalar>(frames: &[T], [outer, n, mid, w, inner]: [usize; 5], step: usize, len: usize, out: &mut [T]) {
     assert_eq!(frames.len(), outer * n * mid * w * inner, "the frames must fill their dimensions");
     assert!(n == 0 || (n - 1) * step + w <= len, "the windows must lie inside the result");
     let (block, row) = (w * inner, len * inner);
-    let mut out = vec![T::zero(); outer * mid * row];
-    if n == 0 || row == 0 { return out; }
+    assert_eq!(out.len(), outer * mid * row, "the result must fill its dimensions");
+    if n == 0 || row == 0 { return; }
     // Row `i` of the result sums its `n` frames. Frame `f` of the row starts `f × mid × block` items after the row's first frame. It adds into the row from item `f × step × inner`. A block that fills a cache line is added whole. Slicing a shorter block costs more than adding it. Each item of a shorter block takes one strided pass across all the frames.
     for (i, out) in out.chunks_exact_mut(row).enumerate() {
         let first = &frames[(i / mid * n * mid + i % mid) * block..];
@@ -105,5 +112,4 @@ pub fn overlap_add<T: Scalar>(frames: &[T], [outer, n, mid, w, inner]: [usize; 5
             }
         }
     }
-    out
 }

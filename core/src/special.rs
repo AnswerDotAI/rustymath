@@ -1,6 +1,7 @@
 //! Special functions: gamma, its logarithm and its logarithmic derivative digamma, binomial coefficients, the error function and its inverses, and the regularized incomplete gamma and beta functions with their inverses. f64 computes in f64. Narrower types round an f64 result, from a cheaper f64 algorithm where one has the precision they need. `gamma`, `lgamma` and `erf` have no branch on their usual path, and loops that call them vectorize. The others choose a method by range, or iterate until they converge.
 use crate::{
-    Arg, Native, dd::Double, exp::{exp, exp_narrow, exp_plus}, float::{horner, sealed::Core}, ln::{ln, ln_double, ln_narrow, ln_split, log1p}, slice::written
+    Arg, Native, dd::Double, exp::{exp, exp_narrow, exp_plus}, float::{horner, pow2_times, sealed::Core, split_positive},
+    ln::{ln, ln_double, ln_narrow, ln_split, log1p}, slice::written
 };
 use std::{f64::consts::PI, mem::MaybeUninit};
 
@@ -359,21 +360,24 @@ fn digamma64<const FUSED: bool>(x: f64) -> f64 {
 const POLYGAMMA_SERIES: [f64; 8] =
     [1.0 / 12.0, -1.0 / 720.0, 1.0 / 30240.0, -1.0 / 1209600.0, 1.0 / 47900160.0, -691.0 / 1307674368000.0, 1.0 / 74724249600.0, -3617.0 / 10670622842880000.0];
 
-/// ψ⁽ⁿ⁾(x), the nth derivative of ψ, for a whole n from 1 to 170 and an x above 0: (-1)^(n+1) n! Σ 1/(x + k)^(n+1) over k from 0. The sum's first terms lift x to z = x + m of at least 15 + 2n, where the asymptotic series ψ⁽ⁿ⁾(z) ≈ (-1)^(n+1) ((n-1)!/zⁿ) (1 + n/(2z) + Σ B_2k n(n + 1)…(n + 2k - 1)/((2k)! z^2k)) gives the rest. Every term has one sign, so the double-word sum keeps the result's digits. n = 0 gives ψ. x from 0 down, a fractional or negative n, an n above 170, whose (n - 1)! overflows, and NaN give NaN.
+/// ψ⁽ⁿ⁾(x), the nth derivative of ψ, for a whole n from 1 to 170 and an x above 0: (-1)^(n+1) n! Σ 1/(x + k)^(n+1) over k from 0. The sum's first terms lift x to z = x + m of at least 15 + 2n, where the asymptotic series ψ⁽ⁿ⁾(z) ≈ (-1)^(n+1) ((n-1)!/zⁿ) (1 + n/(2z) + Σ B_2k n(n + 1)…(n + 2k - 1)/((2k)! z^2k)) gives the rest. Every term has one sign, so the double-word sum keeps the result's digits. Each base is divided by 2^e, which brings x to between 0.75 and 1.5, before it is raised to its power. The k = 0 term is then at least 1.5^-(n+1), and a power past the floats belongs to a term too small to change the sum, which counts as 0. (n - 1)!, a double word too, and the power of 2 apply last, so the result overflows or underflows only where ψ⁽ⁿ⁾ itself lies past the floats. n = 0 gives ψ. x from 0 down, a fractional or negative n, an n above 170, and NaN give NaN.
 fn polygamma64<const FUSED: bool>(n: f64, x: f64) -> f64 {
     if n == 0.0 { return digamma64::<FUSED>(x); }
     if !(n > 0.0 && n <= 170.0 && n == n.trunc() && x > 0.0) { return f64::NAN; }
     let odd = n % 2.0 == 1.0;
     if x == f64::INFINITY { return if odd { 0.0 } else { -0.0 }; }
-    // y^-e for an exact double word y and a whole e: y.hi^e by exact products, times 1 + e y.lo/y.hi for y's low word.
-    let inverse_power = |y: Double<f64>, e: f64| {
+    let scale = |y: Double<f64>, k: f64| Double::new(pow2_times::<f64, FUSED>(y.hi, k), pow2_times::<f64, FUSED>(y.lo, k));
+    let e = split_positive(x).1;
+    // y^-k for an exact double word y and a whole k: y.hi^k by exact products, times 1 + k y.lo/y.hi for y's low word.
+    let inverse_power = |y: Double<f64>, k: f64| {
         let mut p = Double::new(y.hi, 0.0);
-        for _ in 1..e as u32 { p = p.mul_float::<FUSED>(y.hi); }
-        Double::new(1.0, 0.0).div::<FUSED>(p.plus(p.mul_float::<FUSED>(e * y.lo / y.hi)))
+        for _ in 1..k as u32 { p = p.mul_float::<FUSED>(y.hi); }
+        if !p.hi.is_finite() { return Double::new(0.0, 0.0); }
+        Double::new(1.0, 0.0).div::<FUSED>(p.plus(p.mul_float::<FUSED>(k * y.lo / y.hi)))
     };
     let m = (15.0 + 2.0 * n - x).ceil().max(0.0);
     let mut lifted = Double::new(0.0, 0.0);
-    for k in (0..m as u32).rev() { lifted = lifted.plus(inverse_power(Double::sum(x, k as f64), n + 1.0)); }
+    for k in (0..m as u32).rev() { lifted = lifted.plus(inverse_power(scale(Double::sum(x, k as f64), -e), n + 1.0)); }
     let z = Double::sum(x, m);
     let w = 1.0 / (z.hi * z.hi);
     let (mut rising, mut tail) = (1.0, [0.0; 8]);
@@ -383,11 +387,18 @@ fn polygamma64<const FUSED: bool>(n: f64, x: f64) -> f64 {
         tail[7 - k] = c * rising;
     }
     let series = Double::sum(1.0, n / (2.0 * z.hi)).plus(Double::new(w * horner::<f64, FUSED, 8>(w, tail), 0.0));
-    let leading = inverse_power(z, n);
-    let total = lifted.mul_float::<FUSED>(n).plus(leading.mul_float::<FUSED>(series.hi).plus(Double::new(leading.hi * series.lo, 0.0)));
-    let r = total.mul_float::<FUSED>((1..n as u32).fold(1.0, |f, i| f * i as f64));
-    // An overflowing sum leaves NaN in the low word, so an infinite high word stands alone.
-    let r = if r.hi.is_finite() { r.hi + r.lo } else { r.hi };
+    let leading = inverse_power(scale(z, -e), n);
+    let rest = leading.mul_float::<FUSED>(series.hi).plus(Double::new(leading.hi * series.lo, 0.0));
+    // The sum is total × 2^power. With no lifting, x can be as large as any float, and 2^e would overflow.
+    let (total, power) = if m > 0.0 { (lifted.mul_float::<FUSED>(n).plus(scale(rest, e)), -e * (n + 1.0)) } else { (rest, -e * n) };
+    // total, then its product with (n - 1)!, scale to between 0.75 and 1.5, so the product can't overflow where the result doesn't.
+    let t = split_positive(total.hi).1;
+    let total = scale(total, -t);
+    let factorial = (1..n as u32).fold(Double::new(1.0, 0.0), |f, i| f.mul_float::<FUSED>(i as f64));
+    let r = total.mul_float::<FUSED>(factorial.hi).plus(Double::new(total.hi * factorial.lo, 0.0));
+    let p = split_positive(r.hi).1;
+    let r = scale(r, -p);
+    let r = pow2_times::<f64, FUSED>(r.hi + r.lo, (power + t + p).clamp(-2040.0, 2040.0));
     if odd { r } else { -r }
 }
 

@@ -147,7 +147,7 @@ impl Array {
         let source = source.view().remapped(agreement.right, agreement.len);
         let mut buffer = Buffer::with_capacity(self.dtype(), self.len());
         crate::operation::at(
-            combine, WriteRoot::Read(root.read()), source.read(), Writes::Walk { base: 0, steps: &plan.steps }, true,
+            combine, WriteRoot::Read(root.read()), self.layout.shape(), source.read(), Writes::Walk { base: 0, steps: &plan.steps }, true,
             Settings { tolerance: crate::tolerant::Tolerance::EXACT }, &mut buffer)?;
         Ok(buffer)
     }

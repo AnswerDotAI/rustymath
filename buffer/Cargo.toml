@@ -2,6 +2,7 @@
 name = "rustymath-buffer"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license = "Apache-2.0"
 description = "The Python buffer protocol for rustymath's compact buffers, shared by rustymath's and basedpl's Python extensions."
 repository = "https://github.com/AnswerDotAI/rustymath"
