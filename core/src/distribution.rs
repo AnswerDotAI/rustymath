@@ -1,7 +1,7 @@
 //! Probability distributions. Each has a density, a cumulative distribution, a quantile function and a sampler. The first three are also function objects, `Pdf`, `Cdf` and `Quantile`, which hold the distribution. Their native bulk routines choose the distribution's formulas outside the item loop. Closed-form distributions then vectorize. Scalar evaluation runs the same routine on one item. An item fails where its result is NaN and its argument isn't, as for a quantile of p outside 0 to 1. A discrete distribution's density is its mass at a whole x, and its quantile function and sampler give whole numbers.
 use crate::{
     Arg, Atan, Erfc, Erfcinv, Float, Ln, Log1p, Native, betainc, betaincinv, cos, erfcinv, exp, expm1, gammainc, gammaincc, gammaincinv, lgamma, ln, log1p, pow,
-    random::Items, sin, slice::{CHUNK, kept, written}
+    sin, slice::{CHUNK, kept, written}
 };
 use rand::{Rng, distr::{Distribution as _, Open01, StandardUniform}};
 use std::{f64::consts::{FRAC_1_SQRT_2, PI, SQRT_2, TAU}, mem::MaybeUninit};
@@ -56,9 +56,7 @@ trait Formulas {
     fn cdf(&self, x: f64) -> f64;
     fn quantile(&self, p: f64) -> f64;
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { self.quantile(open(rng)) }
-    /// The words that one attempt of a draw reads, which an item packs before its region's (`random::Items`).
-    fn words(&self) -> usize { 1 }
-    fn samples(&self, items: &mut Items, out: &mut [f64]) { for o in out { *o = self.sample(&mut items.item()); } }
+    fn samples<R: Rng + ?Sized>(&self, rng: &mut R, out: &mut [f64]) { for o in out { *o = self.sample(rng); } }
     #[inline(always)]
     fn pdf_map<F: Float>(&self) -> impl Fn(F) -> F + Copy { move |x| narrowed(x, |x| self.pdf(x)) }
     #[inline(always)]
@@ -199,10 +197,8 @@ impl Distribution {
     pub fn cdf(&self, x: f64) -> f64 { one_item(|out| cdf_slice(&Cdf(*self), &crate::recipe::NativeOps::DEFAULT, [Arg::One(x)], 1, out)) }
     /// The least x whose `cdf` is at least p. p outside 0 to 1 gives NaN.
     pub fn quantile(&self, p: f64) -> f64 { one_item(|out| quantile_slice(&Quantile(*self), &crate::recipe::NativeOps::DEFAULT, [Arg::One(p)], 1, out)) }
-    /// The words that one attempt of a draw reads, which each item of `samples` packs (`random::Items`).
-    pub fn words(&self) -> usize { each_law!(&self.0, d => d.words()) }
-    /// Fills `out` with values drawn from the distribution, one for each item of `items`, which packs this distribution's `words`. A normal distribution's item gives two values, from one pair of uniform words.
-    pub fn samples(&self, items: &mut Items, out: &mut [f64]) { each_law!(&self.0, d => d.samples(items, out)) }
+    /// Fills the output with values drawn from the distribution. Normal sampling uses both values of each Box-Muller pair.
+    pub fn samples<R: Rng + ?Sized>(&self, rng: &mut R, out: &mut [f64]) { each_law!(&self.0, d => d.samples(rng, out)) }
     /// Whether the distribution's values are whole numbers.
     pub fn is_discrete(&self) -> bool { matches!(self.0, Law::Binomial(_) | Law::Poisson(_)) }
 }
@@ -325,9 +321,6 @@ fn standard_normal<R: Rng + ?Sized>(rng: &mut R) -> f64 {
     (-2.0 * ln(u)).sqrt() * cos(TAU * v)
 }
 
-/// The words that one attempt of `standard_gamma` reads at `shape`: the normal draw's two and the test's one, and one more below a shape of 1.
-fn gamma_words(shape: f64) -> usize { if shape < 1.0 { 4 } else { 3 } }
-
 /// A value drawn from the gamma distribution with this shape and scale 1, by Marsaglia and Tsang's method. A shape below 1 draws with shape + 1 and scales by u^(1/shape).
 fn standard_gamma<R: Rng + ?Sized>(shape: f64, rng: &mut R) -> f64 {
     if shape < 1.0 { return standard_gamma(shape + 1.0, rng) * exp(ln(open(rng)) / shape); }
@@ -382,11 +375,9 @@ impl Formulas for Normal {
     }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { self.mean + self.sd * standard_normal(rng) }
     /// An item, a pair of uniform words, gives two values, from the cosine and the sine of one angle.
-    fn words(&self) -> usize { 2 }
-    fn samples(&self, items: &mut Items, out: &mut [f64]) {
+    fn samples<R: Rng + ?Sized>(&self, rng: &mut R, out: &mut [f64]) {
         for pair in out.chunks_mut(2) {
-            let mut item = items.item();
-            let (u, v): (f64, f64) = (open(&mut item), StandardUniform.sample(&mut item));
+            let (u, v): (f64, f64) = (open(rng), StandardUniform.sample(rng));
             let r = self.sd * (-2.0 * ln(u)).sqrt();
             pair[0] = self.mean + r * cos(TAU * v);
             if let Some(second) = pair.get_mut(1) { *second = self.mean + r * sin(TAU * v); }
@@ -437,7 +428,6 @@ impl Formulas for Beta {
     }
     fn cdf(&self, x: f64) -> f64 { betainc(self.a, self.b, x.clamp(0.0, 1.0)) }
     fn quantile(&self, p: f64) -> f64 { betaincinv(self.a, self.b, p) }
-    fn words(&self) -> usize { gamma_words(self.a) + gamma_words(self.b) }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { let x = standard_gamma(self.a, rng); x / (x + standard_gamma(self.b, rng)) }
 }
 
@@ -519,7 +509,6 @@ impl Formulas for Fisher {
     }
     fn cdf(&self, x: f64) -> f64 { if x <= 0.0 { 0.0 } else if x.is_infinite() { 1.0 } else { self.beta.cdf(self.y(x)) } }
     fn quantile(&self, p: f64) -> f64 { let y = self.beta.quantile(p); self.df2 * y / (self.df1 * (1.0 - y)) }
-    fn words(&self) -> usize { gamma_words(self.df1 / 2.0) + gamma_words(self.df2 / 2.0) }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 {
         let x = standard_gamma(self.df1 / 2.0, rng) / self.df1;
         x / (standard_gamma(self.df2 / 2.0, rng) / self.df2)
@@ -539,7 +528,6 @@ impl Formulas for Gamma {
     }
     fn cdf(&self, x: f64) -> f64 { if x <= 0.0 { 0.0 } else { gammainc(self.shape, x / self.scale) } }
     fn quantile(&self, p: f64) -> f64 { self.scale * gammaincinv(self.shape, p) }
-    fn words(&self) -> usize { gamma_words(self.shape) }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { self.scale * standard_gamma(self.shape, rng) }
 }
 
@@ -554,7 +542,6 @@ impl Formulas for InverseGamma {
     }
     fn cdf(&self, x: f64) -> f64 { if x <= 0.0 { 0.0 } else { gammaincc(self.shape, self.scale / x) } }
     fn quantile(&self, p: f64) -> f64 { self.scale / gammaincinv(self.shape, 1.0 - p) }
-    fn words(&self) -> usize { gamma_words(self.shape) }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { self.scale / standard_gamma(self.shape, rng) }
 }
 
@@ -651,7 +638,6 @@ impl Formulas for LogNormal {
         let (two, from) = (F::narrow(2.0), self.normal().from_erfcinv());
         composed(p, n, out, #[inline(always)] move |p| two * p, through(Erfcinv, crate::special::erfcinv_slice), #[inline(always)] move |_, e| exp(from(e)))
     }
-    fn words(&self) -> usize { 2 }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { exp(self.normal().sample(rng)) }
 }
 
@@ -676,7 +662,6 @@ impl Formulas for StudentT {
         else { let x = betaincinv(h, 0.5, q); (self.df * (1.0 - x) / x).sqrt() };
         if p < 0.5 { -t } else { t }
     }
-    fn words(&self) -> usize { 2 + gamma_words(self.df / 2.0) }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 { standard_normal(rng) / (standard_gamma(self.df / 2.0, rng) * 2.0 / self.df).sqrt() }
 }
 
@@ -772,7 +757,6 @@ impl Formulas for Binomial {
         if p == 0.0 { 0.0 } else if p == 1.0 { n } else { least(q, normal_guess(n * p, (n * p * (1.0 - p)).sqrt(), q), n, |k| self.cdf(k)) }
     }
     /// Inversion when the smaller of np and n(1-p) is below 10, and Hörmann's BTRD method otherwise. Both draw with p up to 1/2 and reflect. Inversion reads one uniform draw and BTRD two.
-    fn words(&self) -> usize { if self.n * self.p.min(1.0 - self.p) < 10.0 { 1 } else { 2 } }
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 {
         let flip = self.p > 0.5;
         let p = if flip { 1.0 - self.p } else { self.p };
@@ -870,9 +854,8 @@ impl Formulas for Poisson {
         else if q == 1.0 { f64::INFINITY }
         else { least(q, normal_guess(self.rate, self.rate.sqrt(), q), f64::INFINITY, |k| self.cdf(k)) }
     }
-    /// Below a rate of 10, an attempt multiplies uniform draws until their product passes e^-rate: the expected count, rate + 1, is packed. PTRS reads two.
-    fn words(&self) -> usize { if self.rate < 10.0 { (self.rate + 1.0).ceil() as usize } else { 2 } }
     /// Multiplying uniform draws below a rate of 10, and Hörmann's PTRS method (transformed rejection with squeeze) above.
+    #[inline]
     fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> f64 {
         let rate = self.rate;
         if rate < 10.0 {

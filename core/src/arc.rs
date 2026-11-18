@@ -90,7 +90,7 @@ pub(crate) fn atan2<R: Native, const FUSED: bool>(y: R, x: R) -> R {
     a.copysign(y)
 }
 
-/// `atan2(0, x)`, the angle of the real number `x`, with no arctangent: 0, π where `x`'s sign bit is set, or NaN, bit for bit as [`atan2`] gives them.
+/// The angle of the real number `x`, computed without an arctangent.
 #[inline(always)]
 pub(crate) fn real_angle<R: Native>(x: R) -> R {
     let (hi, lo) = half_pi::<R>();

@@ -403,7 +403,9 @@ impl Kernel {
     pub fn truth_table(&self) -> Option<u8> { self.definition.truth_table() }
     pub fn total_dtype(&self) -> Option<DType> { self.fold()?.total_dtype(self.variant) }
     pub fn fold_dtype(&self, input: DType, len: usize, seed: Option<DType>) -> DType {
-        self.total_dtype().unwrap_or_else(|| match (len, seed) { (0, Some(seed)) => seed, (1, None) if input != DType::Boolean => input, _ => self.result })
+        self.total_dtype().or_else(|| {
+            if seed.is_none() && self.variant.fails_on_overflow() { self.inverse_fold()?.inverse_dtype(self.variant.dtype) } else { None }
+        }).unwrap_or_else(|| match (len, seed) { (0, Some(seed)) => seed, (1, None) if input != DType::Boolean => input, _ => self.result })
     }
     /// The scan's result dtype. A seeded comparison stores only Boolean results; without a seed, each lane retains its original first item. Native reductions can accumulate at a wider type.
     pub fn scan_dtype(&self, seeded: bool) -> DType {

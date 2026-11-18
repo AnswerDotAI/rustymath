@@ -35,8 +35,8 @@ fn leading<T: Scalar>(Svd { size: [m, n], mut u, mut s, mut v, .. }: Svd<T>, k: 
     Svd::new([m, n], u, s, v)
 }
 
-/// `len` numbers uniform from -1 to 1, from the counter stream of a fixed key (`random::Key::seeded`).
+/// Uniform random numbers from -1 to 1 for the range finder.
 fn test_matrix<T: Scalar>(len: usize) -> Vec<T> {
-    let mut rng = crate::random::Key::seeded(0x9E37_79B9_7F4A_7C15).stream(0).at(0);
+    let mut rng: rand::rngs::ChaCha8Rng = rand::SeedableRng::seed_from_u64(0x9E37_79B9_7F4A_7C15);
     (0..len).map(|_| T::from_real(<T::Real as crate::Float>::narrow((rand::Rng::next_u64(&mut rng) >> 11) as f64 * 2f64.powi(-52) - 1.0))).collect()
 }

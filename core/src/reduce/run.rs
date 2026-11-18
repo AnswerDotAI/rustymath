@@ -33,7 +33,10 @@ impl Reduce {
 }
 impl Reduce {
     pub fn total_dtype(self, variant: crate::domain::Variant) -> Option<crate::buffer::DType> {
-        native_reduction!(self, variant.dtype, variant.fails_on_overflow(), |R, T| Some(<<R as Reduction<T>>::Total as Element>::DTYPE))
+        native_reduction!(self, variant.dtype, variant.fails_on_overflow(), |R, T| Some(<<R as Reduction<T>>::Total as Totals>::DTYPE))
+    }
+    pub fn inverse_dtype(self, dtype: crate::buffer::DType) -> Option<crate::buffer::DType> {
+        native_reduction!(@inverse self, dtype, |R, T| Some(<<R as Reduction<T>>::Total as Totals>::DTYPE))
     }
     pub fn run_pieces(self, variant: crate::domain::Variant, dims: [usize; 3], seed: Seed<'_>, pieces: &Pieces<'_>, output: &mut Buffer) -> Result<(), Error> {
         // No count of trues exceeds its lane's length: an unseeded count asked for in `i16` or `i32` totals in that type where the length fits.

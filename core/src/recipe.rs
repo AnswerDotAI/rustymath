@@ -528,7 +528,7 @@ pub fn power<F: Float, O: Ops<F> + ?Sized>(o: &O, e: Exponent, x: O::V) -> Optio
     let (m, negative, x) = match e {
         Exponent::Whole { m, negative } => (m, negative, x), Exponent::Halves { m, negative } => (m, negative, root2(o, x)), Exponent::General => return None
     };
-    Some(if !o.integral() && (m > crate::pow::MULTIPLIED || (negative && m > 1)) { whole(o, m, negative, x) } else { multiplied(o, m, negative, x) })
+    Some(if !o.integral() && (m > crate::pow::MULTIPLIED || (negative && m > 1)) { whole(o, m, u32::BITS - 1 - m.leading_zeros(), negative, x) } else { multiplied(o, m, negative, x) })
 }
 
 /// Positive powers up to `MULTIPLIED`, squaring from m's lowest set bit, and the reciprocal for m = 1. A rounding at the step that gives x^k carries into x^m about m/k times. A result that the float holds exactly comes out exactly.
@@ -553,10 +553,10 @@ pub(crate) type Word<V> = (V, Option<V>);
 
 /// Powers admitted for fused multiply-add. Negative powers start with the reciprocal and its rounding error, avoiding an overflowing positive power whose reciprocal is still representable. Raises [`base`] by squaring and multiplying from m's highest set bit, with a [`step`] for each lower bit. A result that the float holds exactly comes out exactly.
 #[inline(always)]
-pub(crate) fn whole<F: Float, O: Ops<F> + ?Sized>(o: &O, m: u32, negative: bool, x: O::V) -> O::V {
+pub(crate) fn whole<F: Float, O: Ops<F> + ?Sized>(o: &O, m: u32, steps: u32, negative: bool, x: O::V) -> O::V {
     let (b, mut error) = base(o, negative, x);
     let mut w = (b, None);
-    for i in (0..u32::BITS - 1 - m.leading_zeros()).rev() { w = step(o, w, b, m, i, &mut error); }
+    for i in (0..steps).rev() { w = step(o, w, b, m, i, &mut error); }
     w.0
 }
 

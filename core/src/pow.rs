@@ -191,10 +191,22 @@ pub(crate) fn powers<F: crate::Float>(e: Exponent, k: F, xs: &[F], out: &mut [st
         let o = crate::recipe::NativeOps::<{ crate::FUSED }>::DEFAULT;
         each(xs, out, #[inline(always)] |x| crate::recipe::power(&o, e, x).expect("a route off the general route"));
     }
+    // A fixed number of steps lets LLVM vectorize the outer item loop.
+    #[inline(always)]
+    fn whole<F: crate::Float, const STEPS: u32, const NEGATIVE: bool>(m: u32, xs: &[F], out: &mut [std::mem::MaybeUninit<F>]) {
+        let o = crate::recipe::NativeOps::<{ crate::FUSED }>::DEFAULT;
+        each(xs, out, #[inline(always)] |x| crate::recipe::whole(&o, m, STEPS, NEGATIVE, x));
+    }
     macro_rules! routes { ($($kind:ident $m:literal),+) => { match e {
         $(Exponent::$kind { m: $m, negative: false } => route(Exponent::$kind { m: $m, negative: false }, xs, out),
           Exponent::$kind { m: $m, negative: true } => route(Exponent::$kind { m: $m, negative: true }, xs, out),)+
         Exponent::General => { general_slice(crate::Arg::Many(xs), crate::Arg::One(k), xs.len(), out, false); }
+        Exponent::Whole { m, negative } => match (m.ilog2(), negative) {
+            (3, false) => whole::<F, 3, false>(m, xs, out), (3, true) => whole::<F, 3, true>(m, xs, out),
+            (4, false) => whole::<F, 4, false>(m, xs, out), (4, true) => whole::<F, 4, true>(m, xs, out),
+            (5, false) => whole::<F, 5, false>(m, xs, out), (5, true) => whole::<F, 5, true>(m, xs, out),
+            _ => unreachable!("a compensated exponent from 9 through 63"),
+        },
         e => route(e, xs, out),
     } } }
     routes!(Whole 1, Whole 2, Whole 3, Whole 4, Whole 5, Whole 6, Whole 7, Whole 8, Halves 1, Halves 3);

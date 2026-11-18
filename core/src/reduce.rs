@@ -129,20 +129,24 @@ pub trait Reduction<T> {
 
 /// A fold's total as an item of a buffer: an [`Element`] stores itself, a [`Scaled`] product stores its value, and [`Alternated`]'s total stores its fold without the parity of its count.
 pub trait Totals: Copy {
+    const DTYPE: crate::buffer::DType;
     /// The buffer that holds `totals`.
     fn buffer_of(totals: Vec<Self>) -> crate::buffer::Buffer;
     fn from_partial(_: Total) -> Result<Self, Error> { Err(Error::new(Kind::Domain, "this reduction cannot read compiled partial totals")) }
 }
 impl<T: crate::buffer::Cast> Totals for T {
+    const DTYPE: crate::buffer::DType = T::DTYPE;
     #[inline]
     fn buffer_of(totals: Vec<T>) -> crate::buffer::Buffer { T::buffer(totals) }
     fn from_partial(total: Total) -> Result<Self, Error> { total.value() }
 }
 impl<S: Totals> Totals for (S, bool) {
+    const DTYPE: crate::buffer::DType = S::DTYPE;
     #[inline]
     fn buffer_of(totals: Vec<(S, bool)>) -> crate::buffer::Buffer { S::buffer_of(totals.into_iter().map(|(s, _)| s).collect()) }
 }
 impl<F: Native + Element> Totals for Scaled<F> {
+    const DTYPE: crate::buffer::DType = F::DTYPE;
     #[inline]
     fn buffer_of(totals: Vec<Scaled<F>>) -> crate::buffer::Buffer { F::buffer(totals.into_iter().map(Scaled::value).collect()) }
 }

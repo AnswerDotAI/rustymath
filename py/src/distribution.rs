@@ -3,7 +3,7 @@ use crate::array::{core, give};
 use crate::convert::{convert, released};
 use crate::functions::{apply, select, settings};
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyFloat};
-use rustymath::random::{Items, Key, Stream};
+use rand::rngs::ChaCha8Rng;
 use rustymath::{distribution::{self as dist, standard::*}, facts::Op, layout::generated_len};
 use rustymath_buffer::py_err;
 
@@ -11,18 +11,17 @@ use rustymath_buffer::py_err;
 #[pyclass(module = "rustymath.distribution", frozen)]
 pub struct Distribution(pub(crate) dist::Distribution);
 
-/// The common sampler for fresh-seed distribution calls and persistent generators: one draw call, which reads `stream`.
-pub(crate) fn sampled<'py>(py: Python<'py>, distribution: dist::Distribution, stream: Stream, size: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
-    let mut items = Items::new(stream, distribution.words());
+/// Shared sampling for a fresh seed or a persistent generator.
+pub(crate) fn sampled<'py>(py: Python<'py>, distribution: dist::Distribution, rng: &mut ChaCha8Rng, size: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
     let Some(size) = size else {
         let mut one = [0.0];
-        distribution.samples(&mut items, &mut one);
+        distribution.samples(rng, &mut one);
         return Ok(PyFloat::new(py, one[0]).into_any());
     };
     let shape = crate::create::shape(size)?;
     let n = generated_len(&shape).map_err(py_err)?;
     let mut out = vec![0.0; n];
-    released(py, || distribution.samples(&mut items, &mut out));
+    released(py, || distribution.samples(rng, &mut out));
     give(py, core(out, &shape)?, false)
 }
 
@@ -52,10 +51,10 @@ impl Distribution {
         apply(py, &kernel, &call, settings(false))
     }
 
-    /// Values drawn from the distribution: one float with no `size`, or else an array of shape `size`. The same `seed` gives the same values.
+    /// Values drawn from the distribution: one float with no `size`, or else an array of shape `size`. A seed repeats draws for the same calls and configuration, not across builds or configurations.
     #[pyo3(signature = (size=None, seed=None))]
     fn sample<'py>(&self, py: Python<'py>, size: Option<&Bound<'py, PyAny>>, seed: Option<u64>) -> PyResult<Bound<'py, PyAny>> {
-        sampled(py, self.0, seed.map_or_else(crate::random::fresh, Key::seeded).stream(0), size)
+        sampled(py, self.0, &mut crate::random::seeded(seed), size)
     }
 
     /// Whether the distribution's values are whole numbers.

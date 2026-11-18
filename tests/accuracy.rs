@@ -365,6 +365,9 @@ fn pow_accuracy() {
     }
     constants(&[(1e10f32, -4.0), (1e28, -1.5)], BOUND);
     constants(&[(1e80f64, -4.0), (1e210, -1.5)], BOUND + LIBM);
+    let large = [9.0, -9.0, 16.0, -16.0, 32.0, -32.0, 63.0, -63.0];
+    constants(&large.map(|k| (1.0387f64, k)), BOUND + LIBM);
+    constants(&large.map(|k| (1.0387f32, k as f32)), BOUND);
 }
 
 #[test]

@@ -1,21 +1,15 @@
 //! Persistent RNG ownership; distributions, rolls, deals and gathering stay in the shared core.
 use crate::{array::{Array, core, give}, convert::{self, released}, distribution::{self, Distribution}};
 use pyo3::{exceptions::PyValueError, prelude::*};
-use rand::{Rng, rngs::StdRng};
-use rustymath::random::{Counter, Items, Key};
+use rand::{SeedableRng, rngs::ChaCha8Rng};
 use rustymath::{Arg, layout::generated_len, structure::{self, Selector}};
 use rustymath_buffer::py_err;
 
-/// One persistent generator: a key and the count of its draw calls, which draw through the same kernels as `rustymath.distribution` and BPL (`rustymath::random`).
+/// One persistent generator for shared distribution, roll and deal kernels.
 #[pyclass(subclass, module = "rustymath.random")]
-pub struct Generator(Counter);
+pub struct Generator(ChaCha8Rng);
 
-/// A key from the operating system's generator.
-pub(crate) fn fresh() -> Key {
-    let mut key = [0; 32];
-    rand::make_rng::<StdRng>().fill_bytes(&mut key);
-    Key(key)
-}
+pub(crate) fn seeded(seed: Option<u64>) -> ChaCha8Rng { seed.map_or_else(rand::make_rng::<ChaCha8Rng>, ChaCha8Rng::seed_from_u64) }
 
 impl Generator {
     fn positions(&mut self, py: Python<'_>, total: usize, n: usize, replace: bool) -> PyResult<Vec<u64>> {
@@ -23,8 +17,8 @@ impl Generator {
         Ok(released(py, || {
             let mut positions = Vec::with_capacity(n);
             if n != 0 {
-                if replace { rustymath::random::roll(Arg::One(total as u64), n, &mut Items::new(self.0.next(), 1), &mut positions); }
-                else { rustymath::random::deal(n as u64, total as u64, &mut self.0.next().at(0), &mut positions); }
+                if replace { rustymath::random::roll(Arg::One(total as u64), n, &mut self.0, &mut positions); }
+                else { rustymath::random::deal(n as u64, total as u64, &mut self.0, &mut positions); }
             }
             positions
         }))
@@ -37,11 +31,11 @@ fn dimensions(size: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<usize>> { size.ma
 impl Generator {
     #[new]
     #[pyo3(signature = (seed=None))]
-    fn new(seed: Option<u64>) -> Self { Self(Counter { key: seed.map_or_else(fresh, Key::seeded), count: 0 }) }
+    fn new(seed: Option<u64>) -> Self { Self(seeded(seed)) }
     /// Draw from any existing distribution, advancing this generator's state.
     #[pyo3(signature = (distribution, size=None))]
     fn sample<'py>(&mut self, py: Python<'py>, distribution: &Distribution, size: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
-        distribution::sampled(py, distribution.0, self.0.next(), size)
+        distribution::sampled(py, distribution.0, &mut self.0, size)
     }
     /// Uniform integers in [low, high), or [0, low) when `high` is omitted.
     #[pyo3(signature = (low, high=None, size=None))]
@@ -52,7 +46,7 @@ impl Generator {
         let n = generated_len(&shape).map_err(py_err)?;
         let values = released(py, || {
             let mut draws = Vec::with_capacity(n);
-            rustymath::random::roll(Arg::One((i128::from(high) - i128::from(low)) as u64), n, &mut Items::new(self.0.next(), 1), &mut draws);
+            rustymath::random::roll(Arg::One((i128::from(high) - i128::from(low)) as u64), n, &mut self.0, &mut draws);
             draws.into_iter().map(|x| (x as i64).wrapping_add(low)).collect::<Vec<_>>()
         });
         give(py, core(values, &shape)?, size.is_none())

@@ -114,25 +114,25 @@ macro_rules! functions {
 }
 
 functions! {
-    /// e^x. `exp(∞)` is ∞, `exp(-∞)` is 0, and `exp(NaN)` is NaN.
+    /// e^x.
     exp(x) in exp;
     /// e^x - 1, without the loss of digits near 0 that `exp(x) - 1` has.
     expm1(x) in exp;
-    /// The natural logarithm of x. `ln(0)` is -∞, `ln(∞)` is ∞, and a negative real x or NaN gives NaN.
+    /// The natural logarithm of x. A negative real x gives NaN.
     ln(x) in ln;
     /// ln(1 + x), without the loss of digits near 0 that `ln(1 + x)` has. `log1p(-1)` is -∞.
     log1p(x) in ln;
-    /// The logarithm of x to base 2. It is k exactly at 2^k.
+    /// The logarithm of x to base 2.
     log2(x) in ln;
-    /// The logarithm of x to base 10. It is k exactly at 10^k, and at the float nearest 10^k where 10^k isn't a float.
+    /// The logarithm of x to base 10.
     log10(x) in ln;
-    /// The logarithm of x to base b, ln x / ln b. Base 2 and base 10 take `log2` and `log10`, which are exact at powers of their base.
+    /// The logarithm of x to base b, ln x / ln b. Bases 2 and 10 use `log2` and `log10`.
     logb(b, x) in ln;
-    /// sin x. `sin(±0)` is ±0, and `sin(±∞)` and `sin(NaN)` are NaN. Beyond a magnitude of 2^23 at f64 or 2^20 at f32, x takes a slower, exact reduction.
+    /// sin x. Beyond a magnitude of 2^23 at f64 or 2^20 at f32, x takes a slower large-argument reduction.
     sin(x) in trig;
-    /// cos x. `cos(±0)` is 1, and `cos(±∞)` and `cos(NaN)` are NaN. Beyond the magnitude that `sin` gives, x takes the same exact reduction.
+    /// cos x. Beyond the magnitude that `sin` gives, x takes the same large-argument reduction.
     cos(x) in trig;
-    /// tan x. `tan(±0)` is ±0, and `tan(±∞)` and `tan(NaN)` are NaN. Beyond the magnitude that `sin` gives, x takes the same exact reduction.
+    /// tan x. Beyond the magnitude that `sin` gives, x takes the same large-argument reduction.
     tan(x) in trig;
     /// asin x. A real x gives a result from -π/2 to π/2 and NaN beyond a magnitude of 1.
     asin(x) in arc as Asin;
@@ -140,7 +140,7 @@ functions! {
     acos(x) in arc as Acos;
     /// atan x. A real x gives a result from -π/2 to π/2.
     atan(x) in arc as Atan;
-    /// The angle of the point (x, y) from the positive x axis, from -π to π, with y first as in C's `atan2`. Zeros and infinities give C99's angles: atan2(±0, -0) is ±π, and atan2(±∞, ±∞) is an odd multiple of ±π/4.
+    /// The angle of the point (x, y) from the positive x axis, from -π to π, with y first as in C's `atan2`. `atan2(0.0, 0.0)` returns 0.
     atan2(y, x) in arc as Atan2;
     /// sinh x. It stays finite up to where sinh itself overflows, beyond the point where e^x does.
     sinh(x) in hyperbolic as Sinh;
@@ -154,13 +154,13 @@ functions! {
     acosh(x) in hyperbolic as Acosh;
     /// atanh x. ±1 gives ±∞, and a real x of magnitude beyond 1 gives NaN.
     atanh(x) in hyperbolic as Atanh;
-    /// x^y. Special values follow IEEE 754's `pow`: x^0 and 1^y are 1, even for NaN, and a negative x has a power only for a whole y.
+    /// x^y. A negative real x has a real power only for a whole y.
     pow(x, y) in pow;
-    /// The real nth root of y, computed without rounding 1/n first. A negative y has one only for an odd whole n. n = 0, an infinite n and NaN give NaN.
+    /// The real nth root of y, computed without rounding 1/n first. A negative y has a real root only for an odd whole n.
     root(n, y) in pow;
     /// The cube root of x.
     cbrt(x) in pow as Cbrt;
-    /// √(x² + y²), with no overflow or underflow in between. An infinite argument gives ∞, even beside NaN.
+    /// √(x² + y²), without intermediate overflow or underflow.
     hypot(x, y) in pow as Hypot;
     /// √(1 - x²), without the digits that squaring x first loses near |x| = 1. A real x of magnitude beyond 1 gives NaN.
     sqrt1mx2(x) in sqrts as Sqrt1mx2;
@@ -168,13 +168,13 @@ functions! {
     sqrt1px2(x) in sqrts as Sqrt1px2;
     /// √(x - 1) √(x + 1): √(x² - 1) with the sign of a real x, without the digits that squaring x first loses near |x| = 1. A real x of magnitude below 1 gives NaN.
     sqrtx2m1(x) in sqrts as Sqrtx2m1;
-    /// Γ(x). Γ(±0) is ±∞, a negative whole x and -∞ give NaN, and Γ(∞) is ∞.
+    /// Γ(x). A negative whole real x gives NaN.
     gamma(x) in special as Gamma;
     /// Γ(x + 1), which is x! for a whole x from 0.
     factorial(x) in special as Factorial;
-    /// ln |Γ(x)|. It is ∞ at 0, at the negative whole numbers and at ±∞. Near its zeros at 1 and 2 its error is within 4 ulps of 2, not of the result.
+    /// ln |Γ(x)|. Near its zeros at 1 and 2 its error is within 4 ulps of 2, not of the result.
     lgamma(x) in special as Lgamma;
-    /// ψ(x), the digamma function: the derivative of ln Γ(x), Γ′(x)/Γ(x). ψ(+0) is -∞, ψ(-0) is ∞, a negative whole x and -∞ give NaN, and ψ(∞) is ∞. Near its zeros its error is within 4 ulps of 1, not of the result, and below -20 within 4 ulps of ln(1 - x).
+    /// ψ(x), the digamma function: the derivative of ln Γ(x), Γ′(x)/Γ(x). Near its zeros its error is within 4 ulps of 1, not of the result, and below -20 within 4 ulps of ln(1 - x).
     digamma(x) in special as Digamma;
     /// ψ⁽ⁿ⁾(x), the polygamma function: the nth derivative of ψ, for a whole n from 0 to 170. For n from 1, x from 0 down gives NaN, as do a fractional or negative n and an n above 170.
     polygamma(n, x) in special as Polygamma;

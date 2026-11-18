@@ -165,10 +165,10 @@ mod distribution {
     #[test]
     fn samples_follow_cdfs() {
         const N: usize = 20_000;
-        let key = rustymath::random::Key::seeded(1);
+        let mut rng = super::support::seeded(1);
         let mut out = vec![0.0; N];
-        for (c, d) in cases().into_iter().enumerate() {
-            d.samples(&mut rustymath::random::Items::new(key.stream(c as u64), d.words()), &mut out);
+        for d in cases() {
+            d.samples(&mut rng, &mut out);
             for p in [0.1, 0.5, 0.9] {
                 let x = d.quantile(p);
                 let c = d.cdf(x);
@@ -177,7 +177,7 @@ mod distribution {
             }
         }
         let mut one = [0.0; 1];
-        Distribution::poisson(0.0).unwrap().samples(&mut rustymath::random::Items::new(key.stream(99), 1), &mut one);
+        Distribution::poisson(0.0).unwrap().samples(&mut rng, &mut one);
         assert_eq!(one[0], 0.0);
     }
 
@@ -781,6 +781,13 @@ mod operation {
                 .is_err()
         );
         let byte = DType::Integer(Width::U8);
+        let small = i16::DTYPE;
+        let integer = Kernel::resolve(Subtract, Variant::checked(small), [small; 2]).unwrap();
+        for (values, expected) in [([i16::MAX, -1], 32768), ([i16::MIN, 1], -32769)] {
+            assert_eq!(i64::vec(fold(&integer, &[2], 0, Mapping::Linear(1), &i16::buffer(values.to_vec()))).unwrap(), [expected]);
+        }
+        let quotient = Kernel::resolve(rustymath::tolerant::FloorDivide(rustymath::tolerant::Tolerance::EXACT), Variant::checked(small), [small; 2]).unwrap();
+        assert_eq!(i16::vec(fold(&quotient, &[3], 0, Mapping::Linear(1), &i16::buffer(vec![8, 3, 2]))).unwrap(), [8]);
         let wrapped = Kernel::resolve(Subtract, Variant { wrapping: true, ..Variant::checked(byte) }, [byte; 2]).unwrap();
         assert_eq!(u8::vec(fold(&wrapped, &[2], 0, Mapping::Linear(1), &u8::buffer(vec![0, 255]))).unwrap(), [1]);
         let range = wrapped.range_on(&[Range::of(Some(0.)), Range::of(Some(255.))], false);
@@ -1428,45 +1435,23 @@ mod random {
 
     #[test]
     fn rolls_and_deals() {
-        let key = Key::seeded(1);
+        let mut rng = super::support::seeded(1);
         let mut out = vec![9];
-        roll(Arg::One(6), 60_000, &mut Items::new(key.stream(0), 1), &mut out);
+        roll(Arg::One(6), 60_000, &mut rng, &mut out);
         assert_eq!(out[0], 9);
         let counts = (0..6).map(|k| out[1..].iter().filter(|&&r| r == k).count());
         assert!(counts.into_iter().all(|c| (9_000..11_000).contains(&c)));
-        let bounds: Vec<u64> = (1..=1000).collect();
+        let bounds: Vec<u64> = (1..=1000).chain([1 << 62, (1 << 63) + 1, u64::MAX]).collect();
         let mut rolls = Vec::new();
-        roll(Arg::Many(&bounds), 1000, &mut Items::new(key.stream(1), 1), &mut rolls);
+        roll(Arg::Many(&bounds), bounds.len(), &mut rng, &mut rolls);
         assert!(rolls.iter().zip(&bounds).all(|(r, b)| r < b));
         let mut dealt = Vec::new();
-        deal(50, 60, &mut key.stream(2).at(0), &mut dealt);
+        deal(50, 60, &mut rng, &mut dealt);
         dealt.sort_unstable();
         dealt.dedup();
         assert!(dealt.len() == 50 && dealt.iter().all(|&d| d < 60));
     }
 
-    // Each draw is the number that `rand`'s `Uniform` gives for its bound from its item's words, from one bound or one for each draw, also for bounds near 2⁶³, where about half the items reject their packed word and read their regions.
-    #[test]
-    fn rolls_match_rand() {
-        use rand::distr::{Distribution, Uniform};
-        let mixed: Vec<u64> = (0..2000).map(|k| if k % 7 == 0 { (1 << 63) + 1 } else { k + 1 }).collect();
-        let rolled = |number: u64, bounds: Arg<'_, u64>| {
-            let mut out = Vec::new();
-            roll(bounds, 2000, &mut Items::new(Key::seeded(2).stream(number), 1), &mut out);
-            out
-        };
-        let theirs = |number: u64, bounds: &[u64]| {
-            let mut items = Items::new(Key::seeded(2).stream(number), 1);
-            bounds.iter().map(|&b| Uniform::new(0, b).unwrap().sample(&mut items.item())).collect::<Vec<_>>()
-        };
-        for b in [1, 6, 1 << 63, (1 << 63) + 1, u64::MAX] {
-            let ones = vec![b; 2000];
-            assert_eq!(rolled(0, Arg::One(b)), theirs(0, &ones));
-            assert_eq!(rolled(1, Arg::Many(&ones)), theirs(1, &ones));
-            assert_eq!(rolled(2, Arg::Many(&mixed)), theirs(2, &mixed));
-            assert_eq!(below(b, &mut Items::new(Key::seeded(2).stream(0), 1).item()), theirs(0, &ones)[0]);
-        }
-    }
 }
 
 mod circle_real_parts {
