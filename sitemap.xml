@@ -1,0 +1,43 @@
+<?xml version='1.0' encoding='utf-8'?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>https://answerdotai.github.io/rustymath/math.html</loc>
+    <lastmod>2026-11-21T05:33:45.251Z</lastmod>
+  </url>
+  <url>
+    <loc>https://answerdotai.github.io/rustymath/index.html</loc>
+    <lastmod>2026-11-21T05:33:44.938Z</lastmod>
+  </url>
+  <url>
+    <loc>https://answerdotai.github.io/rustymath/exact.html</loc>
+    <lastmod>2026-11-21T05:33:44.918Z</lastmod>
+  </url>
+<url>
+    <loc>https://answerdotai.github.io/rustymath/arrays.html</loc>
+    <lastmod>2026-11-21T05:33:44.970Z</lastmod>
+  </url>
+  <url>
+    <loc>https://answerdotai.github.io/rustymath/optimize.html</loc>
+    <lastmod>2026-11-21T05:33:45.210Z</lastmod>
+  </url>
+  <url>
+    <loc>https://answerdotai.github.io/rustymath/accuracy.html</loc>
+    <lastmod>2026-11-21T05:33:44.744Z</lastmod>
+  </url>
+<url>
+    <loc>https://answerdotai.github.io/rustymath/rust.html</loc>
+    <lastmod>2026-11-21T05:33:45.250Z</lastmod>
+  </url>
+  <url>
+    <loc>https://answerdotai.github.io/rustymath/search.html</loc>
+    <lastmod>2026-11-21T05:33:45.472Z</lastmod>
+  </url>
+<url>
+    <loc>https://answerdotai.github.io/rustymath/random.html</loc>
+    <lastmod>2026-11-21T05:33:45.241Z</lastmod>
+  </url>
+  <url>
+    <loc>https://answerdotai.github.io/rustymath/linalg.html</loc>
+    <lastmod>2026-11-21T05:33:45.010Z</lastmod>
+  </url>
+</urlset>
