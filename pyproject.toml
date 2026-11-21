@@ -41,7 +41,7 @@ cache-keys = [{ file = "pyproject.toml" }, { file = "Cargo.toml" }, { file = "co
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 session_timeout = 30
-asyncio_default_fixture_loop_scope = "function"
+addopts = "-p timeout"
 
 [tool.nbdev]
 lib_path = "python/rustymath"
