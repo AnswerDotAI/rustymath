@@ -16,6 +16,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - if: runner.os != 'Linux'
+        uses: AnswerDotAI/.github/actions/sccache@main
+        with:
+          r2-url: ${{ secrets.SCCACHE_R2 }}
       - uses: PyO3/maturin-action@v1
         with:
           args: --profile dist --no-default-features --compression-level 9 --out dist -i python3.11 -i python3.12 -i python3.13

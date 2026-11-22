@@ -16,11 +16,9 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
-      # The repository has no `Cargo.lock`. Creating one first makes rust-cache's key change when a dependency publishes a new version.
-      - run: cargo generate-lockfile
-      - uses: Swatinem/rust-cache@v2
+      - uses: AnswerDotAI/.github/actions/sccache@main
         with:
-          shared-key: native
+          r2-url: ${{ secrets.SCCACHE_R2 }}
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
