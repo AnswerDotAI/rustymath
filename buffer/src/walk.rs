@@ -1,4 +1,4 @@
-//! Nested Python values walked into a layout and the pieces that fill it, in row-major order. Lists, tuples and ranges are axes. A collector gives the piece for any other object, and a `dict` it doesn't take is an axis keyed by its keys. A level whose items differ in shape gives each item to its collector whole: rustymath's arrays raise there, and basedpl nests the items.
+//! Nested Python values walked into a layout and the pieces that fill it, in row-major order. Lists, tuples and ranges are axes. A collector gives the piece for any other object, and a `dict` it doesn't take is an axis keyed by its keys. A level whose items differ in shape nests each walked item through the collector: rustymath's arrays raise there, and basedpl keeps the nested items.
 use crate::{labels, py_err};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::{ffi, prelude::*, types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyRange, PyTuple}};
@@ -14,8 +14,8 @@ pub trait Collect {
     fn int(&mut self, n: i128) -> Self::Piece;
     /// The piece for `obj`, with the shape of its items, which is empty for one value. `None` for an object that holds no values of this kind.
     fn piece(&mut self, obj: &Bound<'_, PyAny>) -> PyResult<Option<(Self::Piece, Vec<usize>)>>;
-    /// The piece for an item of a level whose items differ in shape, taken whole. Such a level raises unless the collector nests its items.
-    fn element(&mut self, _obj: &Bound<'_, PyAny>) -> PyResult<Self::Piece> { Err(py_err(Error::new(Kind::Length, "ragged nested sequence"))) }
+    /// Wraps one walked item of a level whose items differ in shape into a single piece. Such a level raises unless the collector nests its items.
+    fn nest(&mut self, _layout: Layout, _pieces: Vec<Self::Piece>) -> PyResult<Self::Piece> { Err(py_err(Error::new(Kind::Length, "ragged nested sequence"))) }
 }
 
 thread_local! {
@@ -36,16 +36,20 @@ pub fn within<R>(obj: &Bound<'_, PyAny>, f: impl FnOnce() -> PyResult<R>) -> PyR
 /// An axis's length, with the keys of the dict that gave it.
 type Axis = (usize, Option<Vec<Option<Arc<str>>>>);
 
+fn layout(axes: &[Axis]) -> PyResult<Layout> {
+    let shape: Vec<usize> = axes.iter().rev().map(|a| a.0).collect();
+    element_count(&shape).map_err(py_err)?;
+    let layout = Layout::from(shape.as_slice());
+    if axes.iter().all(|a| a.1.is_none()) { return Ok(layout); }
+    let keys = axes.iter().rev().map(|a| a.1.clone().map(Keys::partial).transpose()).collect::<Result<Vec<_>, _>>().map_err(py_err)?;
+    layout.with_keys(keys).map_err(py_err)
+}
+
 /// The nested values of `obj`: their layout, with the keys of any dicts, and the pieces that `collect` gives them.
 pub fn walked<C: Collect>(obj: &Bound<'_, PyAny>, collect: &mut C) -> PyResult<(Layout, Vec<C::Piece>)> {
     let mut walk = Walk { collect, pieces: vec![], axes: vec![] };
     walk.walk(obj)?;
-    let shape: Vec<usize> = walk.axes.iter().rev().map(|a| a.0).collect();
-    element_count(&shape).map_err(py_err)?;
-    let layout = Layout::from(shape.as_slice());
-    if walk.axes.iter().all(|a| a.1.is_none()) { return Ok((layout, walk.pieces)); }
-    let keys = walk.axes.into_iter().rev().map(|a| a.1.map(Keys::partial).transpose()).collect::<Result<Vec<_>, _>>().map_err(py_err)?;
-    Ok((layout.with_keys(keys).map_err(py_err)?, walk.pieces))
+    Ok((layout(&walk.axes)?, walk.pieces))
 }
 
 /// Fast single-pass read of a nonempty rectangular nested `list`/`tuple` of exact Python `float`s, `i64`-fitting `int`s, or `bool`s into a compact [`Buffer`]. Returns `None` for empty, mixed, ragged, cyclic, subclassed, or overflowed inputs so callers fall back to [`walked`].
@@ -160,27 +164,41 @@ impl<C: Collect> Walk<'_, C> {
         if let Ok(d) = obj.cast::<PyDict>() { return self.items(obj, &d.values().into_any(), Some(labels(&d.keys())?)); }
         Err(PyTypeError::new_err(format!("can't convert {}", obj.get_type().name()?)))
     }
-    /// Adds the list, tuple or dict `obj`, whose items are `values`, keyed by `keys` for a dict, and gives where its axes start. Where its items differ in shape, each gives one piece whole.
+    /// Adds the list, tuple or dict `obj`, whose items are `values`, keyed by `keys` for a dict, and gives where its axes start. Where its items differ in shape, each walked item is nested into one piece.
     fn items(&mut self, obj: &Bound<'_, PyAny>, values: &Bound<'_, PyAny>, keys: Option<Vec<Option<Arc<str>>>>) -> PyResult<usize> {
         within(obj, || {
             let (pieces, start) = (self.pieces.len(), self.axes.len());
             if let Ok(n) = values.len() { self.pieces.reserve(n); }
-            let (mut first, mut ragged) = (true, false);
+            let (mut ends, mut ragged, mut count) = (Vec::new(), false, 0usize);
             for v in values.try_iter()? {
+                count += 1;
+                let before = self.pieces.len();
                 let item = self.walk(&v?)?;
-                if std::mem::take(&mut first) { continue; }
-                if self.axes[start..item] != self.axes[item..] { ragged = true; break; }
-                self.axes.truncate(item);
-            }
-            if ragged {
-                self.pieces.truncate(pieces);
-                self.axes.truncate(start);
-                for v in values.try_iter()? {
-                    let piece = self.collect.element(&v?)?;
-                    self.pieces.push(piece);
+                if ragged {
+                    let lay = layout(&self.axes[item..])?;
+                    self.axes.truncate(item);
+                    let nested = self.collect.nest(lay, self.pieces.split_off(before))?;
+                    self.pieces.push(nested);
+                } else if ends.is_empty() { ends.push(self.pieces.len()); }
+                else if self.axes[start..item] != self.axes[item..] {
+                    let (common, cur) = (layout(&self.axes[start..item])?, layout(&self.axes[item..])?);
+                    self.axes.truncate(start);
+                    let mut all = self.pieces.split_off(pieces).into_iter();
+                    let mut prev = pieces;
+                    for end in ends.drain(..) {
+                        let nested = self.collect.nest(common.clone(), all.by_ref().take(end - prev).collect())?;
+                        self.pieces.push(nested);
+                        prev = end;
+                    }
+                    let nested = self.collect.nest(cur, all.collect())?;
+                    self.pieces.push(nested);
+                    ragged = true;
+                } else {
+                    self.axes.truncate(item);
+                    ends.push(self.pieces.len());
                 }
             }
-            self.axes.push((values.len()?, keys));
+            self.axes.push((count, keys));
             Ok(start)
         })
     }

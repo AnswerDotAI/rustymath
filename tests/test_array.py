@@ -79,6 +79,9 @@ def test_python_values():
     assert repr(rm.array([1.5])) == 'Array([1.5], dtype=float64)'
     with pytest.raises(ValueError, match='ragged'): rm.array([[1], [2, 3]])
     with pytest.raises(ValueError, match='ragged'): rm.array([1, [2, 3]])
+    deep = [0.0]
+    for _ in range(30): deep = [deep, 0.0]
+    with pytest.raises(ValueError, match='ragged'): rm.array(deep)
     cyclic = [1]
     cyclic.append(cyclic)
     with pytest.raises(ValueError, match='cyclic'): rm.array(cyclic)
