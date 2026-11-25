@@ -78,9 +78,26 @@ opt-level = 3
 lto = false
 overflow-checks = false
 debug-assertions = false
-incremental = true
 # Line tables change with every shifted line and recompile the code below it.
 debug = false
+
+[profile.release.package.rustymath]
+incremental = true
+
+[profile.release.package.rustymath-core]
+incremental = true
+
+[profile.release.package.rustymath-kernels]
+incremental = true
+
+[profile.release.package.rustymath-timing]
+incremental = true
+
+[profile.release.package.rustymath-buffer]
+incremental = true
+
+[profile.release.package.rustymath-py]
+incremental = true
 
 [profile.quick]
 inherits = "release"
@@ -92,6 +109,24 @@ lto = "thin"
 codegen-units = 16
 incremental = false
 strip = true
+
+[profile.dist.package.rustymath]
+incremental = false
+
+[profile.dist.package.rustymath-core]
+incremental = false
+
+[profile.dist.package.rustymath-kernels]
+incremental = false
+
+[profile.dist.package.rustymath-timing]
+incremental = false
+
+[profile.dist.package.rustymath-buffer]
+incremental = false
+
+[profile.dist.package.rustymath-py]
+incremental = false
 
 # A local run before each release (`cargo test --profile checked`): debug assertions add the standard library's checks in unsafe code, which cost basedpl 12 to 55% per call.
 [profile.checked]

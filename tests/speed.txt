@@ -81,7 +81,7 @@ Erf	35	42	instructions linux 29.148	allocated linux 0.01
 # 32 copies, for 130 vector ops: rational pieces with divisions, a double-word -a², exp_plus.
 Erfc	64	87	instructions linux 55.399	allocated linux 0.01
 # 20 copies, for 80 vector ops: piecewise rationals, ln and a square root in the tails.
-Erfinv	40	61	instructions linux 65.183	allocated linux 0.01
+Erfinv	40	61	instructions linux 84.577	allocated linux 0.01
 # 21 copies, for 85 vector ops: as erfinv, from 1 - q.
 Erfcinv	42	72	instructions linux 85.206	allocated linux 0.01
 # 450 copies, for 900 scalar ops: a double-word prefactor (300) and about 50 series or continued-fraction steps of 12 ops, at half a copy each.

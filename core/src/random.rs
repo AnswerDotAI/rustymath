@@ -45,4 +45,3 @@ pub fn deal<R: Rng + ?Sized>(n: u64, total: u64, rng: &mut R, out: &mut Vec<u64>
     assert!(n <= total, "a deal can't take more items than its total");
     out.extend(rand::seq::index::sample(rng, total as usize, n as usize).into_iter().map(|i| i as u64));
 }
-

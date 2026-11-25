@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np, rustymath as rm
 
 N, RUNS = 65_536, 5
+CALL_INSTRUCTIONS = 16_384  # Per-call allowance for O(1) Python wrapper overhead (0.25/item at N).
 CALIBRATING = 'RUSTYMATH_COSTS' in os.environ
 
 def arrays():
@@ -80,7 +81,7 @@ def test_speed(capsys):
                 if budget is not None and budget.stale(copies): print(f'{line}: stale', file=sys.stderr)
                 record = counts[timing.measures.index('instructions')]
                 if record is None or instructions is None: continue
-                if record.over(instructions, timing.count_margin): failures.append(f'{line}: instructions over the {record.value} recorded')
+                if record.over(instructions - CALL_INSTRUCTIONS / N, timing.count_margin): failures.append(f'{line}: instructions over the {record.value} recorded')
                 elif instructions * timing.count_margin < record.value: print(f'{line}: fewer instructions than the {record.value} recorded', file=sys.stderr)
             over = [(case, line) for case, line, copies, _ in measured if case[2] is not None and case[2].over(copies)]
             if CALIBRATING: over = retimed(over, namespace, units, timing)

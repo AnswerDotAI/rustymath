@@ -11,7 +11,7 @@ use rustymath::layout::Layout;
 use rustymath::num_complex::{Complex32, Complex64};
 use rustymath::structure::transpose;
 use rustymath::with_dtype;
-use rustymath_buffer::{Read, frame::{Frame, frame}, py_err, read, read_array, walk::{Collect, walked}};
+use rustymath_buffer::{Read, frame::{Frame, frame}, py_err, read, read_array, walk::{Collect, numeric, walked}};
 use std::{borrow::Cow, cell::Cell, sync::Arc};
 
 /// The shared compact dtype named `name`, or a Python argument error.
@@ -195,7 +195,10 @@ impl Collect for Pieces {
     fn int(&mut self, n: i128) -> Piece { Piece::Leaf(i64::try_from(n).map_or(Leaf::Big(n as f64), Leaf::Int)) }
     /// A buffer is tested first, because NumPy's `float64` and `complex128` scalars are also Python floats and complex numbers.
     fn piece(&mut self, obj: &Bound<'_, PyAny>) -> PyResult<Option<(Piece, Vec<usize>)>> {
-        if let Some(r) = read(obj)? { let shape = r.shape().to_vec(); return Ok(Some((Piece::Block(r), shape))); }
+        if !(scalar(obj) || obj.is_none() || obj.is_exact_instance_of::<PyString>()) && let Some(r) = read(obj)? {
+            let shape = r.shape().to_vec();
+            return Ok(Some((Piece::Block(r), shape)));
+        }
         Ok(leaf(obj)?.map(|l| (Piece::Leaf(l), vec![])))
     }
 }
@@ -218,7 +221,7 @@ fn leaf(obj: &Bound<'_, PyAny>) -> PyResult<Option<Leaf>> {
 }
 
 /// An argument before the call's dtype is known: an array, or nested values with their layout and whether they were a Python scalar.
-enum Pending { Array(Arg), Values(Layout, Vec<Piece>, bool) }
+enum Pending { Array(Arg), Buffer(Layout, Buffer), Values(Layout, Vec<Piece>, bool) }
 
 /// Whether `obj` is a Python scalar: a `bool`, `int`, `float` or `complex`, not a subclass such as NumPy's `float64`.
 fn scalar(obj: &Bound<'_, PyAny>) -> bool {
@@ -229,6 +232,7 @@ fn scalar(obj: &Bound<'_, PyAny>) -> bool {
 /// Classifies one data argument, adding the dtype of any array it holds to `strong`.
 fn classify(obj: &Bound<'_, PyAny>, strong: &mut Option<DType>) -> PyResult<Pending> {
     if scalar(obj) { return Ok(Pending::Values(Layout::EMPTY, vec![Piece::Leaf(leaf(obj)?.expect("a Python scalar is a leaf"))], true)); }
+    if let Some((layout, buf)) = numeric(obj) { return Ok(Pending::Buffer(layout, buf)); }
     // `None` is a missing value only as an item, so an operator given a bare `None` returns `NotImplemented`.
     if obj.is_none() { return Err(PyTypeError::new_err("rustymath can't convert NoneType")); }
     if let Some(frame) = frame(obj)? { return framed(obj.py(), frame, strong); }
@@ -275,7 +279,7 @@ fn framed(py: Python<'_>, frame: Frame<'_>, strong: &mut Option<DType>) -> PyRes
 /// Nested values at `dtype` under `layout`.
 fn build(layout: Layout, pieces: &[Piece], dtype: DType) -> PyResult<Core> {
     let buffer = with_dtype!(dtype, T => {
-        let mut out: Vec<T> = Vec::new();
+        let mut out: Vec<T> = Vec::with_capacity(layout.count());
         for p in pieces {
             match p {
                 Piece::Leaf(l) => out.push(T::from_leaf(*l, dtype).map_err(py_err)?),
@@ -295,13 +299,15 @@ fn convert_at(args: &[&Bound<'_, PyAny>], forced: Option<DType>) -> PyResult<Cal
     let mut strong = None;
     let pending = args.iter().map(|a| classify(a, &mut strong)).collect::<PyResult<Vec<_>>>()?;
     let mut weak: Option<DType> = None;
+    let mut add_weak = |d: DType| -> PyResult<()> {
+        if weak.is_some_and(|w| (w == DType::Character) != (d == DType::Character)) { return Err(mixed()); }
+        if weak.is_none_or(|w| d.kind() > w.kind()) { weak = Some(d); }
+        Ok(())
+    };
     for p in &pending {
-        let Pending::Values(_, pieces, _) = p else { continue };
-        for p in pieces {
-            let Piece::Leaf(l) = p else { continue };
-            let d = l.dtype();
-            if weak.is_some_and(|w| (w == DType::Character) != (d == DType::Character)) { return Err(mixed()); }
-            if weak.is_none_or(|w| d.kind() > w.kind()) { weak = Some(d); }
+        match p {
+            Pending::Buffer(_, buf) => add_weak(buf.dtype())?,
+            Pending::Values(_, pieces, _) => { for p in pieces { if let Piece::Leaf(l) = p { add_weak(l.dtype())?; } } } Pending::Array(_) => {}
         }
     }
     let inferred = target(strong, weak)?;
@@ -313,6 +319,7 @@ fn convert_at(args: &[&Bound<'_, PyAny>], forced: Option<DType>) -> PyResult<Cal
     let args = pending.into_iter().map(|p| {
             let a = match p {
                 Pending::Array(a) => a,
+                Pending::Buffer(layout, buf) => Arg { source: Source::Owned(Core::new(layout, buf).map_err(py_err)?), scalar: false },
                 Pending::Values(layout, pieces, scalar) => {
                     // Leaf readers narrow within a kind. Lowering a kind uses the shared whole-buffer cast's truncation/validation rules.
                     let at = if target.kind() < inferred.kind() { inferred } else { target };

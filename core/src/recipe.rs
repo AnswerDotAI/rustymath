@@ -528,7 +528,8 @@ pub fn power<F: Float, O: Ops<F> + ?Sized>(o: &O, e: Exponent, x: O::V) -> Optio
     let (m, negative, x) = match e {
         Exponent::Whole { m, negative } => (m, negative, x), Exponent::Halves { m, negative } => (m, negative, root2(o, x)), Exponent::General => return None
     };
-    Some(if !o.integral() && (m > crate::pow::MULTIPLIED || (negative && m > 1)) { whole(o, m, u32::BITS - 1 - m.leading_zeros(), negative, x) } else { multiplied(o, m, negative, x) })
+    Some(if !o.integral() && (m > crate::pow::MULTIPLIED || (negative && m > 1)) { whole(o, m, u32::BITS - 1 - m.leading_zeros(), negative, x) }
+    else { multiplied(o, m, negative, x) })
 }
 
 /// Positive powers up to `MULTIPLIED`, squaring from m's lowest set bit, and the reciprocal for m = 1. A rounding at the step that gives x^k carries into x^m about m/k times. A result that the float holds exactly comes out exactly.

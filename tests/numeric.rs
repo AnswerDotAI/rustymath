@@ -1451,7 +1451,6 @@ mod random {
         dealt.dedup();
         assert!(dealt.len() == 50 && dealt.iter().all(|&d| d < 60));
     }
-
 }
 
 mod circle_real_parts {

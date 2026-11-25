@@ -1,6 +1,6 @@
 //! Python array interchange and selectors, shared by rustymath and basedpl. [`read`] borrows native contiguous buffers and normalizes other supported buffers. [`read_array`] preserves sibling-array metadata. [`export`] fills a `Py_buffer`, and [`lend`] fills one read-only for items that the export itself keeps alive. [`labels`] and [`frame`] read dict keys and data frames, [`rational`] reads a `fractions.Fraction`, [`selection`] decodes Python indexing, [`walk`] walks nested Python values, and [`py_err`] converts array errors to Python exceptions.
 use pyo3::exceptions::{PyBufferError, PyIndexError, PyKeyboardInterrupt, PyOverflowError, PyTimeoutError, PyTypeError, PyValueError};
-use pyo3::{IntoPyObjectExt, ffi, prelude::*, sync::PyOnceLock, types::{PyComplex, PyInt, PyList, PyString, PyType}};
+use pyo3::{IntoPyObjectExt, ffi, prelude::*, sync::PyOnceLock, types::{PyComplex, PyInt, PyString, PyType}};
 use rustymath::buffer::{Buffer, ComplexWidth, DType, Element, FloatWidth, View, Width};
 use rustymath::error::{Error, Kind};
 use rustymath::{layout::element_count, with_dtype};
@@ -67,7 +67,19 @@ pub fn item<'py>(py: Python<'py>, view: View<'_>, i: usize) -> PyResult<Bound<'p
 }
 
 /// The items of `view` under `shape` as nested lists of Python scalars, or one scalar when `shape` is empty. It needs no NumPy, and reads every dtype, complex numbers and characters included.
-pub fn tolist<'py>(py: Python<'py>, view: View<'_>, shape: &[usize]) -> PyResult<Bound<'py, PyAny>> { nested(py, shape, &|i| item(py, view, i)) }
+pub fn tolist<'py>(py: Python<'py>, view: View<'_>, shape: &[usize]) -> PyResult<Bound<'py, PyAny>> {
+    if shape.is_empty() { return item(py, view, 0); }
+    match view {
+        View::Floats(v) => nest_raw(py, shape, 0, |i| unsafe { ffi::PyFloat_FromDouble(v.get(i)) }),
+        View::Integers(v) => nest_raw(py, shape, 0, |i| unsafe { ffi::PyLong_FromLongLong(v.get(i)) }),
+        View::Booleans(v) => nest_raw(py, shape, 0, |i| unsafe { ffi::PyBool_FromLong(i64::from(v[i]) as _) }),
+        View::Complexes(v) => nest_raw(py, shape, 0, |i| {
+            let z = v.get(i);
+            unsafe { ffi::PyComplex_FromDoubles(z.re, z.im) }
+        }),
+        View::Characters(v) => nested(py, shape, &|i| v[i].into_bound_py_any(py)),
+    }
+}
 
 /// The items that `item` gives for each position in row-major order, nested in lists by `shape`, or the item at position 0 when `shape` is empty.
 pub fn nested<'py>(py: Python<'py>, shape: &[usize], item: &dyn Fn(usize) -> PyResult<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
@@ -76,9 +88,36 @@ pub fn nested<'py>(py: Python<'py>, shape: &[usize], item: &dyn Fn(usize) -> PyR
 
 fn nest<'py>(py: Python<'py>, shape: &[usize], start: usize, item: &dyn Fn(usize) -> PyResult<Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
     let [n, rest @ ..] = shape else { return item(start) };
+    let list_ptr = unsafe { ffi::PyList_New(*n as ffi::Py_ssize_t) };
+    if list_ptr.is_null() { return Err(PyErr::fetch(py)); }
+    let list = unsafe { Bound::from_owned_ptr(py, list_ptr) };
     let cell: usize = rest.iter().product();
-    let items = (0..*n).map(|k| nest(py, rest, start + k * cell, item)).collect::<PyResult<Vec<_>>>()?;
-    Ok(PyList::new(py, items)?.into_any())
+    for k in 0..*n {
+        let elem = nest(py, rest, start + k * cell, item)?;
+        unsafe { ffi::PyList_SetItem(list_ptr, k as ffi::Py_ssize_t, elem.into_ptr()) };
+    }
+    Ok(list)
+}
+
+fn nest_raw<'py, F: Copy + Fn(usize) -> *mut ffi::PyObject>(py: Python<'py>, shape: &[usize], start: usize, make: F) -> PyResult<Bound<'py, PyAny>> {
+    let [n, rest @ ..] = shape else { unreachable!("nest_raw requires nonempty shape") };
+    let list_ptr = unsafe { ffi::PyList_New(*n as ffi::Py_ssize_t) };
+    if list_ptr.is_null() { return Err(PyErr::fetch(py)); }
+    let list = unsafe { Bound::from_owned_ptr(py, list_ptr) };
+    if rest.is_empty() {
+        for k in 0..*n {
+            let p = make(start + k);
+            if p.is_null() { return Err(PyErr::fetch(py)); }
+            unsafe { ffi::PyList_SetItem(list_ptr, k as ffi::Py_ssize_t, p) };
+        }
+    } else {
+        let cell: usize = rest.iter().product();
+        for k in 0..*n {
+            let child = nest_raw(py, rest, start + k * cell, make)?;
+            unsafe { ffi::PyList_SetItem(list_ptr, k as ffi::Py_ssize_t, child.into_ptr()) };
+        }
+    }
+    Ok(list)
 }
 /// Each dtype, with the PEP 3118 format code that [`export`] writes for it.
 const DTYPES: [(DType, &CStr); 11] = [

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin>=1.0,<2.0", "fastws-cli>=0.0.25"]
+requires = ["maturin>=1.0,<2.0", "fastws-cli>=0.0.42"]
 build-backend = "fastws.build_backend"
 
 [project]
@@ -13,7 +13,8 @@ authors = [{name = "Jeremy Howard", email = "github@jhoward.fastmail.fm"}]
 classifiers = ["Programming Language :: Rust", "Programming Language :: Python :: Implementation :: CPython"]
 
 [project.optional-dependencies]
-dev = ["fastship>=0.0.11", "fastws-cli>=0.0.35", "maturin>=1.0,<2.0", "pytest", "pytest-timeout", "nbdev", "numpy", "pandas", "scipy"]
+test = ["fastws-cli>=0.0.42", "pytest", "pytest-timeout", "nbdev", "numpy", "pandas", "scipy"]
+dev = ["fastship>=0.0.11", "maturin>=1.0,<2.0", "rustymath[test]"]
 
 [project.urls]
 Homepage = "https://github.com/AnswerDotAI/rustymath"

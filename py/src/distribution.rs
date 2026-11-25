@@ -12,7 +12,8 @@ use rustymath_buffer::py_err;
 pub struct Distribution(pub(crate) dist::Distribution);
 
 /// Shared sampling for a fresh seed or a persistent generator.
-pub(crate) fn sampled<'py>(py: Python<'py>, distribution: dist::Distribution, rng: &mut ChaCha8Rng, size: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn sampled<'py>(
+    py: Python<'py>, distribution: dist::Distribution, rng: &mut ChaCha8Rng, size: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
     let Some(size) = size else {
         let mut one = [0.0];
         distribution.samples(rng, &mut one);

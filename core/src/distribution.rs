@@ -1,7 +1,7 @@
 //! Probability distributions. Each has a density, a cumulative distribution, a quantile function and a sampler. The first three are also function objects, `Pdf`, `Cdf` and `Quantile`, which hold the distribution. Their native bulk routines choose the distribution's formulas outside the item loop. Closed-form distributions then vectorize. Scalar evaluation runs the same routine on one item. An item fails where its result is NaN and its argument isn't, as for a quantile of p outside 0 to 1. A discrete distribution's density is its mass at a whole x, and its quantile function and sampler give whole numbers.
 use crate::{
-    Arg, Atan, Erfc, Erfcinv, Float, Ln, Log1p, Native, betainc, betaincinv, cos, erfcinv, exp, expm1, gammainc, gammaincc, gammaincinv, lgamma, ln, log1p, pow,
-    sin, slice::{CHUNK, kept, written}
+    Arg, Atan, Erfc, Erfcinv, Float, Ln, Log1p, Native, betainc, betaincinv, cos, erfcinv, exp, expm1, gammainc, gammaincc, gammaincinv, lgamma, ln, log1p,
+    pow, sin, slice::{CHUNK, kept, written}
 };
 use rand::{Rng, distr::{Distribution as _, Open01, StandardUniform}};
 use std::{f64::consts::{FRAC_1_SQRT_2, PI, SQRT_2, TAU}, mem::MaybeUninit};
