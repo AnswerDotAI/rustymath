@@ -45,6 +45,7 @@ session_timeout = 30
 addopts = "-p timeout"
 
 [tool.nbdev]
+to_meta = ["export"]
 lib_path = "python/rustymath"
 put_version_in_init = false
 custom_sidebar = true
