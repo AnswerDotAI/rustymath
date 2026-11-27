@@ -13,7 +13,7 @@ authors = [{name = "Jeremy Howard", email = "github@jhoward.fastmail.fm"}]
 classifiers = ["Programming Language :: Rust", "Programming Language :: Python :: Implementation :: CPython"]
 
 [project.optional-dependencies]
-test = ["fastws-cli>=0.0.42", "pytest", "pytest-timeout", "nbdev", "numpy", "pandas", "scipy"]
+test = ["fastws-cli>=0.0.42", "pytest", "pytest-timeout", "nbdev[exec]>=3.3.32", "numpy", "pandas", "scipy"]
 dev = ["fastship>=0.0.11", "maturin>=1.0,<2.0", "rustymath[test]"]
 
 [project.urls]
